@@ -92,7 +92,7 @@ VCPKG_ROOT_ARG="${VCPKG_ROOT:-${HOME}/vcpkg}"
 VCPKG_ROOT_EXPLICIT=0
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
@@ -508,7 +508,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   if probe --assume-true sudo grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+ident' \
        /var/lib/pgsql/data/pg_hba.conf; then
     warn "pg_hba.conf has host auth = ident; switching the two loopback 'all all' lines to scram-sha-256"
-    warn "  (original preserved as /var/lib/pgsql/data/pg_hba.conf.yuzu-orig)"
+    warn "  (first pre-edit copy kept as /var/lib/pgsql/data/pg_hba.conf.yuzu-orig; never overwritten on later runs)"
     run sudo cp -n /var/lib/pgsql/data/pg_hba.conf /var/lib/pgsql/data/pg_hba.conf.yuzu-orig
     run sudo sed -i -E \
       's@^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+)ident$@\1scram-sha-256@' \

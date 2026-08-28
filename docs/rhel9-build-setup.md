@@ -3,7 +3,8 @@
 This is the enterprise-Linux counterpart to the apt recipe in `.github/workflows/ci.yml`. CI
 exercises Ubuntu 24.04/26.04, macOS and Windows only — RHEL-family hosts are a supported *developer*
 platform, not a CI-covered one, so this doc records a verified sequence rather than an
-automatically-regression-tested one.
+automatically-regression-tested one. The reference run was Rocky 9.8; the RHEL and Alma paths use the
+same packages but have not been exercised.
 
 **One command:**
 
@@ -70,8 +71,8 @@ host    all             all             127.0.0.1/32            ident
 `ident` rejects the password auth in `YUZU_TEST_POSTGRES_DSN`, and the failure surfaces as a
 connection error deep inside the test run rather than as a config error. Change the two loopback
 `all all` lines to `scram-sha-256` and `systemctl reload postgresql`. `setup-rhel9.sh
---with-postgres` does this, preserves the original as `pg_hba.conf.yuzu-orig`, and prints a warning
-rather than editing silently.
+--with-postgres` does this, keeps the first pre-edit copy as `pg_hba.conf.yuzu-orig` (never
+overwritten on later runs), and prints a warning rather than editing silently.
 
 Remember the skip-vs-fail contract from `CLAUDE.md`: `YUZU_TEST_POSTGRES_DSN` **unset** → the `[pg]`
 tests skip cleanly; **set but broken** → hard FAIL. So a misconfigured cluster is worse than none.
