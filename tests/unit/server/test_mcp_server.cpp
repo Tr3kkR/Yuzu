@@ -5651,6 +5651,23 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     CHECK(out_body["error"]["message"].get<std::string>().starts_with("Agent not found: "));
     CHECK(nonexistent_body["error"]["message"].get<std::string>().starts_with("Agent not found: "));
 
+    // Gate 8 re-review (this round), quality-engineer finding: the prior two
+    // CHECKs above bound only the prefix -- a regression that appended a
+    // scope-revealing suffix to the RESPONSE message ("Agent not found:
+    // agent-002 (out of scope)") would pass both `starts_with` checks while
+    // reopening the existence oracle on the channel a caller reads directly,
+    // no query_audit_log pivot needed. Apply the same strip-both-sides
+    // byte-identity comparison used below for the audit detail to the
+    // response message too, so a distinguishing suffix on EITHER channel
+    // fails this test.
+    auto strip_agent_id = [](const std::string& text, const std::string& agent_id) {
+        auto pos = text.rfind(agent_id);
+        REQUIRE(pos != std::string::npos);
+        return std::make_pair(text.substr(0, pos), text.substr(pos + agent_id.size()));
+    };
+    CHECK(strip_agent_id(out_body["error"]["message"].get<std::string>(), "agent-002") ==
+          strip_agent_id(nonexistent_body["error"]["message"].get<std::string>(), "agent-999"));
+
     // Gate 6 sre finding: the RESPONSE collapses "out of scope" into "not
     // found" (by design, above), but the server-side audit trail must still
     // record the real reason -- same Pattern-D discipline as every other
@@ -5698,12 +5715,8 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     // id would false-green if a future template wording put the id
     // mid-string with a distinguishing trailing suffix -- strip AND compare
     // both sides of the id so the comparison stays sound across any
-    // template change, not just the current trailing-id shape.
-    auto strip_agent_id = [](const std::string& detail, const std::string& agent_id) {
-        auto pos = detail.rfind(agent_id);
-        REQUIRE(pos != std::string::npos);
-        return std::make_pair(detail.substr(0, pos), detail.substr(pos + agent_id.size()));
-    };
+    // template change, not just the current trailing-id shape. Reuses the
+    // strip_agent_id helper defined above for the response-message check.
     CHECK(strip_agent_id(denied_details[0], "agent-002") ==
           strip_agent_id(denied_details[1], "agent-999"));
 }

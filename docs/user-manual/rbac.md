@@ -57,7 +57,8 @@ enabled = true
 > the flat permission (globally, not confined) still gets an unscoped read/write
 > with no per-agent filter. Dashboard `/fragments/results/filter-bar`,
 > `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results`
-> (tracked #3525); REST `GET /api/v1/execution-statistics/agents` and the
+> (tracked #3489; #3525 tracked the same finding and was closed as its
+> duplicate); REST `GET /api/v1/execution-statistics/agents` and the
 > workflow executions LIST fragment `/fragments/executions` (tracked #3526). So
 > a degraded store looks like "no agents in scope" / "no responses" / `503`
 > across every reader on this page now — check the server startup log for

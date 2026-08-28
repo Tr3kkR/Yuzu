@@ -307,8 +307,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // perm_fn (the BLOCKING defect require_fleet_read's own doc
             // comment warns against). Scopes the "Responses" section below
             // (#1712); the per-agent status grid above it reads from
-            // ExecutionTracker, a distinct store this migration does not
-            // touch (flagged, not fixed, in the PR body).
+            // ExecutionTracker, a distinct store from ResponseStore -- it is
+            // filtered too, once, immediately after fetch (see the grid
+            // fetch below), a same-PR adversarial-review finding: the gate
+            // migration itself admits a confined caller class the old flat
+            // gate denied outright, so the grid needed the same filter as
+            // the responses section, not just the table.
             if (!fleet_read_fn) {
                 spdlog::error("/fragments/executions/.../detail: fleet_read_fn unwired — "
                               "misconfigured call site; failing closed");

@@ -640,6 +640,14 @@ TEST_CASE("executions detail: unwired fleet_read_fn -> 503, fail closed",
     auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
     REQUIRE(res);
     CHECK(res->status == 503);
+    // Gate 8 re-review (this round), quality-engineer finding: this route has
+    // TWO distinct 503 branches -- unwired fleet_read_fn ("Service
+    // unavailable") and a null execution_tracker ("Tracker not available").
+    // Asserting only the status lets a harness defect that leaves the
+    // tracker null (instead of, or in addition to, the gate) false-green on
+    // the wrong branch. Match the dashboard sibling's body-substring check
+    // (test_dashboard_results_fragment.cpp) to pin the actual branch.
+    CHECK(res->body.find("Service unavailable") != std::string::npos);
 }
 
 // #3565: this codebase has a documented prior incident (authz_model.hpp's

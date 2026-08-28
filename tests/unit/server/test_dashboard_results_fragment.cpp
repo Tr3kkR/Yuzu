@@ -251,3 +251,83 @@ TEST_CASE("/fragments/results: admitted + unfiltered (TOP) gate shows every agen
     CHECK(contains(res->body, "output b"));
     CHECK(contains(res->body, "2 agents"));
 }
+
+// Gate 6 enterprise-readiness finding (this round): "Create Group from N
+// Agents" hx-gets /fragments/create-group-form and POSTs to
+// /api/dashboard/group-from-results, both gated on ManagementGroup:Write
+// only (a securable unrelated to this caller's Response:Read confinement)
+// and unscoped to the caller's fleet-read visibility -- a confined caller
+// who couldn't reach /fragments/results at all before #1712 (the old flat
+// gate structurally denied an AdmitScoped-class caller) can now reach this
+// page and, if they separately hold ManagementGroup:Write, see a confined
+// N here but an unscoped M on the create-group-form/submit flow. Withhold
+// the button entirely when scope is engaged, deferring the underlying
+// sidecar-route gap to its own tracked fix (#3489).
+TEST_CASE("/fragments/results: Create Group button withheld for a scoped caller",
+          "[pg][server][dashboard][fragment][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-create-group-scoped-1";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-in";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "in-scope output";
+    // plugin must be set for ResponseStore::store() to populate
+    // response_facets at all -- the f_output filter below queries that
+    // table, not a substring match on the raw output.
+    r.plugin = "registry";
+    rs.store(r);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::unordered_set<std::string>{"agent-in"}};
+        });
+    // f_output is a real filter (plugin "registry" falls back to the
+    // default {Agent, Output} schema) -- the button's own render condition
+    // is `!filters.empty() && total_agent_count > 0 && !scope`, so a
+    // filter-less request would never exercise the branch under test.
+    auto res = h.get("/fragments/results?command_id=" + command_id +
+                      "&plugin=registry&f_output=in-scope+output");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "in-scope output"));
+    CHECK_FALSE(contains(res->body, "btn-create-group"));
+    CHECK_FALSE(contains(res->body, "Create Group from"));
+}
+
+TEST_CASE("/fragments/results: Create Group button still renders for an "
+          "unscoped (TOP) caller",
+          "[pg][server][dashboard][fragment][auth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    REQUIRE(rs.is_open());
+    const std::string command_id = "cmd-frag-create-group-unscoped-1";
+    StoredResponse r;
+    r.instruction_id = command_id;
+    r.agent_id = "agent-a";
+    r.received_at_ms = 1000;
+    r.status = 0;
+    r.output = "unscoped output";
+    r.plugin = "registry";
+    rs.store(r);
+
+    FragmentResultsHarness h(&rs);
+    h.routes.set_fleet_read_fn(
+        [](const httplib::Request&, httplib::Response&, const std::string&,
+          const std::string&) -> yuzu::server::authz::FleetReadGate {
+            return {true, std::nullopt};
+        });
+    auto res = h.get("/fragments/results?command_id=" + command_id +
+                      "&plugin=registry&f_output=unscoped+output");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(contains(res->body, "btn-create-group"));
+    CHECK(contains(res->body, "Create Group from 1 Agent"));
+}

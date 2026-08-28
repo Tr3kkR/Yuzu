@@ -256,7 +256,8 @@ gate.
     /`group-from-results` gate on a *different* securable (`ManagementGroup:Write`), which has no
     logical tie to a caller's `Response:Read` confinement — a real persona holding both (global
     group-write + confined response-read) can use the unscoped facet query to discover and enroll
-    out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3525.
+    out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3489
+    (canonical; #3525 tracked the same finding and was closed as its duplicate).
 - **Device list** — `/api/agents` (`server.cpp:5312`), `/fragments/devices/list`, the dashboard
   `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892`),
   `get_visible_agents_json` (`server.cpp:3784/8543`).
@@ -350,6 +351,19 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   still use the older, still-largely-inert `response_scope_fn`/`response_agent_in_scope` mechanism
   (#1634), a distinct primitive from `require_fleet_read`; see `docs/user-manual/mcp.md`'s
   `query_responses` row for that mechanism's current status.
+
+  **Also NOT covered by #1712, found during this PR's own governance re-review and previously
+  absent from this coverage map entirely — the live streaming twin of the exact data this PR just
+  confined on the request/response path:** the SSE channels `/sse/executions/{id}` (dashboard) and
+  `/api/v1/events` (REST), both backed by `ExecutionEventBus`, publish `agent-transition` events
+  (per-agent `agent_id`) and `execution-progress` events (unfiltered `agents_targeted`) for any
+  `execution_id` to any caller holding a flat `Execution:Read` grant — including a caller this PR's
+  own migration now narrows to `AdmitScoped` on the request/response drawer route. This is the
+  same data-shape test this ADR's methodology names above (does a returned row carry `agent_id`?
+  yes) reached via a route family the "grep every `perm_fn`/`require_permission` list-read site"
+  sweep did not enumerate, since a streaming `Server::Get` handler is not a request/response
+  list-read site in the shape the sweep was designed to find. Not introduced or worsened by #1712;
+  tracked as a follow-up — see #3699.
 
 ## Consequences
 

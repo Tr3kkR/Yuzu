@@ -2002,7 +2002,18 @@ std::string DashboardRoutes::render_results(
                 std::to_string(total_agent_count) + " agent" +
                 (total_agent_count != 1 ? "s" : "");
 
-        if (!filters.empty() && total_agent_count > 0) {
+        // Confined-caller withhold (Gate 6 enterprise-readiness finding, this
+        // round): /fragments/create-group-form and /api/dashboard/group-from-
+        // results gate on ManagementGroup:Write only — a DIFFERENT securable,
+        // unrelated to this caller's Response:Read confinement — and apply no
+        // per-agent scope filter of their own (tracked, deliberately deferred:
+        // ADR-0017 "Doc honesty"/#3489). Before this migration a confined-only
+        // (AdmitScoped) caller could not reach /fragments/results at all, so
+        // could never see this button. Now that require_fleet_read admits
+        // them, withhold the button itself when scope is engaged rather than
+        // surface an entry point into a flow that would silently re-widen to
+        // the unscoped facet count/ids on submit.
+        if (!filters.empty() && total_agent_count > 0 && !scope) {
             // Build filter params for the create-group-form URL
             std::string filter_params;
             for (const auto& f : filters) {
