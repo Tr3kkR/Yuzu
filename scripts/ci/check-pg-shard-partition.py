@@ -22,11 +22,13 @@ person to update it looked. This proves the actual property that matters —
 exact partitioning of the real case population — against the compiled
 binary, not against a remembered snapshot.
 
-Runs as its own meson test() entry (suite: 'server'), NOT inside the cheap
-flake-retry selftest (suite: 'docs'): it needs the real yuzu_server_tests
-binary built, which the docs suite deliberately does not depend on. No
-Postgres connection needed — --list-tests only enumerates registered
-TEST_CASE macros, it never executes a test body.
+Runs as its own meson test() entry (suite: ['server', 'server-checks'] —
+the second label is what lets the Windows non-pg Test step's
+assert-suite-cover.py select it), NOT inside the cheap flake-retry selftest
+(suite: 'docs'): it needs the real yuzu_server_tests binary built, which
+the docs suite deliberately does not depend on. No Postgres connection
+needed — --list-tests only enumerates registered TEST_CASE macros, it
+never executes a test body.
 
 Discovery is via `meson introspect <builddir> --tests`, keyed on suite
 membership (yuzu:server-pg), not a hardcoded shard-name list — so a shard

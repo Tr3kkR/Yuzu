@@ -51,9 +51,14 @@ namespace yuzu::test {
 /// to still answer something. `send` performs the request and returns an
 /// httplib::Result (e.g. `[&]{ return cli.Post(...); }`).
 ///
-/// - A response WAS read: its status MUST equal `expected_status`, on every
-///   platform. This is the normal, common path and the only one exercised
-///   on POSIX in practice.
+/// - A response WAS read: the witness MUST have advanced (proves THIS
+///   response came from the fixture's own pre-routing rejection, not some
+///   other 4xx path returning the same status - the increment happens on
+///   the server thread strictly before that thread writes the response, and
+///   `send()` only returns after the client has read it, so there is no
+///   race to check for) and its status MUST equal `expected_status`, on
+///   every platform. This is the normal, common path and the only one
+///   exercised on POSIX in practice.
 /// - No response was read, POSIX: fails via REQUIRE, unchanged from before
 ///   this helper existed - POSIX delivers a buffered response before the
 ///   reset in every observed case.
@@ -67,6 +72,7 @@ void expect_pre_routing_rejection(Send&& send, int expected_status,
     const int witness_before = witness.load();
     auto r = send();
     if (r) {
+        CHECK(witness.load() > witness_before);
         CHECK(r->status == expected_status);
         return;
     }
