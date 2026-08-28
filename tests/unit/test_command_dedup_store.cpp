@@ -188,27 +188,93 @@ TEST_CASE("CommandDedupStore: a crashed in-flight command is INDETERMINATE after
     CHECK(dup.state == DedupState::InFlight);
 }
 
-// ── Retention: clock-free rowid ring ───────────────────────────────────────────
+// ── record_terminal outcome semantics ──────────────────────────────────────────
 
-TEST_CASE("CommandDedupStore: retention bounds the table and evicts oldest",
-          "[command_dedup][retention]") {
+TEST_CASE("CommandDedupStore: record_terminal on a never-claimed id is a Miss, no row",
+          "[command_dedup][record]") {
     auto t = make_store();
-
-    // The very first id — should be evicted once the ring fills.
-    REQUIRE(t.store.claim("cmd-oldest").status == ClaimStatus::Claimed);
-    t.store.record_terminal("cmd-oldest", "SUCCESS");
-
-    // Drive enough distinct claims to overflow the ring and trigger a prune.
-    const std::int64_t overflow = CommandDedupStore::kMaxDedupRows + 1000;
-    for (std::int64_t i = 0; i < overflow; ++i) {
-        REQUIRE(t.store.claim("fill-" + std::to_string(i)).status == ClaimStatus::Claimed);
-    }
-
-    // Count stays bounded (kMaxDedupRows + at most one prune interval of slack).
+    CHECK(t.store.record_terminal("never-claimed", "SUCCESS") == RecordOutcome::Miss);
     auto c = t.store.count();
     REQUIRE(c.has_value());
-    CHECK(*c <= CommandDedupStore::kMaxDedupRows + 512);
+    CHECK(*c == 0); // Miss must NOT create a row
+    // ...and the id is still claimable fresh (nothing was memoised).
+    CHECK(t.store.claim("never-claimed").status == ClaimStatus::Claimed);
+}
 
-    // The oldest id was evicted, so it re-claims as fresh (proves ring eviction).
+TEST_CASE("CommandDedupStore: record_terminal is first-write-wins (second is a Miss)",
+          "[command_dedup][record]") {
+    auto t = make_store();
+    REQUIRE(t.store.claim("cmd-1").status == ClaimStatus::Claimed);
+    CHECK(t.store.record_terminal("cmd-1", "FIRST") == RecordOutcome::Recorded);
+    // A second terminal (e.g. a spurious post-terminal throw) must NOT overwrite.
+    CHECK(t.store.record_terminal("cmd-1", "SECOND") == RecordOutcome::Miss);
+    auto dup = t.store.claim("cmd-1");
+    CHECK(dup.state == DedupState::Terminal);
+    CHECK(dup.response == "FIRST"); // the original outcome is sticky
+}
+
+TEST_CASE("CommandDedupStore: a corrupt/non-proto stored blob round-trips byte-exact",
+          "[command_dedup][replay]") {
+    // The store is proto-agnostic — it must return whatever bytes were stored,
+    // even non-parseable ones (the agent then falls back to RUNNING). No
+    // cross-command mixup: command_id is the PK.
+    auto t = make_store();
+    REQUIRE(t.store.claim("cmd-garbage").status == ClaimStatus::Claimed);
+    const std::string garbage = std::string("\xff\x00\x01not-a-protobuf\x00", 18);
+    REQUIRE(t.store.record_terminal("cmd-garbage", garbage) == RecordOutcome::Recorded);
+    auto dup = t.store.claim("cmd-garbage");
+    CHECK(dup.state == DedupState::Terminal);
+    CHECK(dup.response == garbage);
+}
+
+// ── Retention: clock-free rowid ring over TERMINAL rows only ────────────────────
+
+TEST_CASE("CommandDedupStore: retention evicts oldest TERMINAL rows",
+          "[command_dedup][retention]") {
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(50); // exercise the ring without 20k fsyncs
+
+    REQUIRE(t.store.claim("cmd-oldest").status == ClaimStatus::Claimed);
+    REQUIRE(t.store.record_terminal("cmd-oldest", "SUCCESS") == RecordOutcome::Recorded);
+
+    // Drive enough claim+terminal PAIRS to overflow the terminal ring and prune.
+    const std::int64_t overflow =
+        50 + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval) + 100;
+    for (std::int64_t i = 0; i < overflow; ++i) {
+        auto id = "fill-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+
+    // Count stays bounded (50 + at most one prune interval of slack).
+    auto c = t.store.count();
+    REQUIRE(c.has_value());
+    CHECK(*c <= 50 + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval));
+
+    // The oldest TERMINAL row was evicted, so it re-claims fresh.
     CHECK(t.store.claim("cmd-oldest").status == ClaimStatus::Claimed);
+}
+
+TEST_CASE("CommandDedupStore: a live in-flight row is NEVER evicted by retention (UP-1)",
+          "[command_dedup][retention][effectively-once]") {
+    auto t = make_store();
+    t.store.set_max_dedup_rows_for_test(50);
+
+    // One long-running command: claimed, not yet resolved.
+    REQUIRE(t.store.claim("cmd-live").status == ClaimStatus::Claimed);
+
+    // Churn well past the ring with terminal commands while it "runs".
+    const std::int64_t churn =
+        50 + static_cast<std::int64_t>(CommandDedupStore::kPruneInterval) + 200;
+    for (std::int64_t i = 0; i < churn; ++i) {
+        auto id = "churn-" + std::to_string(i);
+        REQUIRE(t.store.claim(id).status == ClaimStatus::Claimed);
+        REQUIRE(t.store.record_terminal(id, "SUCCESS") == RecordOutcome::Recorded);
+    }
+
+    // The live claim MUST survive — evicting it would let its redelivery
+    // re-execute a possibly-destructive command (the failure the design forbids).
+    auto dup = t.store.claim("cmd-live");
+    CHECK(dup.status == ClaimStatus::Duplicate);
+    CHECK(dup.state == DedupState::InFlight);
 }

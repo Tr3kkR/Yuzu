@@ -3,7 +3,8 @@
  *
  * SQLite idioms (open flags, WAL, busy_timeout, StmtPtr RAII, the RETURNING
  * drain-to-DONE durability check) mirror kv_store.cpp deliberately — the two
- * stores share the agent's SQLite conventions.
+ * stores share the agent's SQLite conventions. This store additionally sets
+ * synchronous=FULL (host-failure durability) and prunes over terminal rows only.
  */
 
 #include <yuzu/agent/command_dedup_store.hpp>
@@ -19,7 +20,7 @@ namespace yuzu::agent {
 
 namespace {
 
-int64_t now_epoch_seconds() {
+std::int64_t now_epoch_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
@@ -87,6 +88,16 @@ CommandDedupStore::open(const std::filesystem::path& db_path) {
     rc = sqlite3_exec(raw_db, "PRAGMA journal_mode=WAL", nullptr, nullptr, &err_msg);
     if (rc != SQLITE_OK) {
         spdlog::warn("CommandDedupStore: WAL mode failed: {}", err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+    }
+    // synchronous=FULL (not the WAL default NORMAL): fsync every commit so a
+    // claim/terminal record survives a HOST power-loss, not just a process crash
+    // — the durability the effectively-once-across-host-failure guarantee needs.
+    // One write per command (not a hot path), so the cost is negligible.
+    err_msg = nullptr;
+    rc = sqlite3_exec(raw_db, "PRAGMA synchronous=FULL", nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK) {
+        spdlog::warn("CommandDedupStore: synchronous=FULL failed: {}", err_msg ? err_msg : "unknown");
         sqlite3_free(err_msg);
     }
     sqlite3_busy_timeout(raw_db, 5000);
@@ -195,20 +206,30 @@ ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
         if (state == kStateTerminal) {
             const auto* blob = static_cast<const char*>(sqlite3_column_blob(sel.get(), 1));
             const int bytes = sqlite3_column_bytes(sel.get(), 1);
-            return ClaimResult{
-                .status = ClaimStatus::Duplicate,
-                .state = DedupState::Terminal,
-                .response = blob ? std::string(blob, static_cast<std::size_t>(bytes))
-                                 : std::string{},
-            };
+            // The blob copy is the one unbounded allocation on this path; keep the
+            // noexcept boundary honest — an OOM here degrades to "proceed without
+            // dedup" (Error), it never std::terminate()s the agent.
+            try {
+                return ClaimResult{
+                    .status = ClaimStatus::Duplicate,
+                    .state = DedupState::Terminal,
+                    .response = blob ? std::string(blob, static_cast<std::size_t>(bytes))
+                                     : std::string{},
+                };
+            } catch (...) {
+                spdlog::error("CommandDedupStore::claim: allocation failed copying stored "
+                              "response for {}",
+                              command_id);
+                return ClaimResult{.status = ClaimStatus::Error};
+            }
         }
         return ClaimResult{.status = ClaimStatus::Duplicate, .state = DedupState::InFlight};
     }
     if (rc == SQLITE_DONE) {
         // The row vanished between the failed insert and this select (a
-        // concurrent prune of a just-evicted row is the only way, and it cannot
-        // hit a row this claim would have inserted). Treat as "proceed without
-        // dedup" rather than fabricate a state.
+        // concurrent prune of a just-evicted TERMINAL row is the only way, and it
+        // cannot hit the in-flight row this claim would have inserted). Treat as
+        // "proceed without dedup" rather than fabricate a state.
         spdlog::warn("CommandDedupStore::claim: conflicting row for {} not found on re-read",
                      command_id);
         return ClaimResult{.status = ClaimStatus::Error};
@@ -217,25 +238,30 @@ ClaimResult CommandDedupStore::claim(std::string_view command_id) noexcept {
     return ClaimResult{.status = ClaimStatus::Error};
 }
 
-void CommandDedupStore::record_terminal(std::string_view command_id,
-                                        std::string_view serialized_response) noexcept {
+RecordOutcome CommandDedupStore::record_terminal(std::string_view command_id,
+                                                 std::string_view serialized_response) noexcept {
     if (command_id.empty())
-        return;
+        return RecordOutcome::Miss;
     std::lock_guard lock(mu_);
     if (!db_)
-        return;
+        return RecordOutcome::Error;
 
-    // UPDATE-only: a terminal outcome is recorded against a row a prior claim()
-    // already created (the newest rowid, so prune never evicts it first). If the
-    // row is somehow gone, 0 rows change and durability degrades to at-least-once
-    // for this one command — never wrong, and never a fabricated row.
-    const char* sql =
-        "UPDATE command_outcomes SET state = ?, response = ? WHERE command_id = ?";
+    // FIRST-WRITE-WINS: flip an IN-FLIGHT row to terminal only. A second terminal
+    // (a spurious post-terminal throw) or a record against an evicted/never-
+    // claimed id matches no in-flight row → RETURNING yields nothing → Miss. A
+    // Miss on a command that WAS claimed is the signal a redelivery could
+    // re-execute; the caller counts it. RETURNING (not sqlite3_changes) keeps the
+    // rows-affected read #1033-safe on the shared FULLMUTEX connection.
+    const char* sql = R"(
+        UPDATE command_outcomes SET state = ?, response = ?
+        WHERE command_id = ? AND state = ?
+        RETURNING 1
+    )";
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
         spdlog::error("CommandDedupStore::record_terminal prepare failed: {}", sqlite3_errmsg(db_));
-        return;
+        return RecordOutcome::Error;
     }
     StmtPtr stmt(raw_stmt);
     sqlite3_bind_int(stmt.get(), 1, kStateTerminal);
@@ -243,10 +269,21 @@ void CommandDedupStore::record_terminal(std::string_view command_id,
                       static_cast<int>(serialized_response.size()), SQLITE_STATIC);
     sqlite3_bind_text(stmt.get(), 3, command_id.data(), static_cast<int>(command_id.size()),
                       SQLITE_STATIC);
+    sqlite3_bind_int(stmt.get(), 4, kStateInFlight);
 
     rc = sqlite3_step(stmt.get());
-    if (rc != SQLITE_DONE)
-        spdlog::error("CommandDedupStore::record_terminal step failed: {}", sqlite3_errmsg(db_));
+    if (rc == SQLITE_ROW) {
+        // Drain to DONE so the WAL-fsync commit failure surfaces as Error.
+        rc = sqlite3_step(stmt.get());
+        if (rc == SQLITE_DONE)
+            return RecordOutcome::Recorded;
+        spdlog::error("CommandDedupStore::record_terminal commit failed: {}", sqlite3_errmsg(db_));
+        return RecordOutcome::Error;
+    }
+    if (rc == SQLITE_DONE)
+        return RecordOutcome::Miss; // no in-flight row matched (evicted / never claimed / already terminal)
+    spdlog::error("CommandDedupStore::record_terminal step failed: {}", sqlite3_errmsg(db_));
+    return RecordOutcome::Error;
 }
 
 void CommandDedupStore::release(std::string_view command_id) noexcept {
@@ -276,16 +313,19 @@ void CommandDedupStore::release(std::string_view command_id) noexcept {
 }
 
 void CommandDedupStore::prune_locked() noexcept {
-    // Clock-free ring: keep the newest kMaxDedupRows by rowid (monotonic with
-    // insert order), evict the rest. No wall clock is consulted, so the
-    // clock-guarded-retention hazard does not apply. A rare old in-flight row
-    // (crashed mid-execution, never redelivered) can be evicted here — bounded,
-    // and its only cost is that a later redelivery would re-execute.
+    // Clock-free ring over TERMINAL rows ONLY: keep the newest kMaxDedupRows
+    // terminal rows by rowid (monotonic with insert order), evict older terminal
+    // rows. No wall clock is consulted, so the clock-guarded-retention hazard
+    // does not apply. IN-FLIGHT rows are NEVER evicted here — a live command's
+    // claim can never be pruned out from under its still-running worker (which
+    // would silently permit a re-execution). A crashed in-flight row (response
+    // NULL, tiny) persists until reinstall; bounding that is a follow-up.
     const char* sql = R"(
         DELETE FROM command_outcomes
-        WHERE rowid NOT IN (
-            SELECT rowid FROM command_outcomes ORDER BY rowid DESC LIMIT ?
-        )
+        WHERE state = ?
+          AND rowid NOT IN (
+              SELECT rowid FROM command_outcomes WHERE state = ? ORDER BY rowid DESC LIMIT ?
+          )
     )";
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
@@ -294,10 +334,17 @@ void CommandDedupStore::prune_locked() noexcept {
         return;
     }
     StmtPtr stmt(raw_stmt);
-    sqlite3_bind_int64(stmt.get(), 1, kMaxDedupRows);
+    sqlite3_bind_int(stmt.get(), 1, kStateTerminal);
+    sqlite3_bind_int(stmt.get(), 2, kStateTerminal);
+    sqlite3_bind_int64(stmt.get(), 3, max_dedup_rows_);
     rc = sqlite3_step(stmt.get());
     if (rc != SQLITE_DONE)
         spdlog::error("CommandDedupStore::prune step failed: {}", sqlite3_errmsg(db_));
+}
+
+void CommandDedupStore::set_max_dedup_rows_for_test(std::int64_t n) {
+    std::lock_guard lock(mu_);
+    max_dedup_rows_ = n;
 }
 
 std::optional<std::int64_t> CommandDedupStore::count() const {

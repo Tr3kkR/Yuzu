@@ -352,14 +352,16 @@ Plugins not listed or with a hash mismatch are rejected before any code executes
 
 ## Command Replay Protection
 
-The agent tracks recently-executed `command_id` values per connection and rejects duplicates. This prevents replay attacks where a captured command is retransmitted to re-execute actions.
+The agent deduplicates commands by `command_id` so a captured or redelivered command cannot re-execute an action. Deduplication is **durable**: it is backed by a small SQLite store (`command_dedup.db`) in the agent's data directory, so protection survives an agent **restart**, not just a reconnect (HA delivery-matrix WS-0, ADR-2002).
 
-- The dedup set is reset on each reconnect (new Subscribe stream).
-- Uses a double-buffer strategy with 5,000 entries per buffer (10,000 total). When the current buffer fills, the previous buffer is discarded and the current becomes the previous — recently-seen IDs are always protected.
-- Replayed commands receive a `REJECTED` response with reason `"command replay rejected: duplicate command_id"`.
-- The server generates unique `command_id` values per invocation, so legitimate commands are never affected.
+- **Terminal-outcome replay.** When a command's outcome has been recorded, a redelivery replays the **original terminal result** (its real status, exit code, and output) rather than a generic rejection. This closes the "effect-once, result-maybe-lost" gap where a dropped acknowledgement of a completed command would otherwise discard its real result.
+- **In-flight duplicate.** A command still executing (or one that was mid-execution when the agent last stopped) is answered with a non-terminal `RUNNING` frame (output `"duplicate command still in flight"`) and is **never re-executed** — re-running a possibly-destructive command is deliberately avoided. This is *effectively-once*, not exactly-once.
+- **Retention.** The store keeps the most recent commands (a fixed-size, clock-free ring); an outcome older than the retention window is forgotten, after which a redelivery would run again. The server generates a unique `command_id` per invocation, so legitimate commands are never affected.
+- **Degraded (fail-open) mode.** If the store cannot be opened or written (e.g. a full disk), the agent continues executing commands **undeduplicated** rather than refusing them (so a single disk fault does not drop the endpoint out of remote-control reach). This is surfaced, not silent — the agent emits a `yuzu.dedup_degraded` heartbeat signal and increments local counters — so an operator can detect an agent running without replay protection.
 
-No additional configuration is required — replay protection is always active.
+No configuration is required — replay protection is always active.
+
+> **Changed in this release (automation/SIEM):** older agents rejected a redelivered command with a `REJECTED` response whose reason was `"command replay rejected: duplicate command_id"`. That fixed string **no longer exists** on the terminal path — a duplicate now replays the command's *real* terminal status (or an in-flight `RUNNING`). Any detection rule that keyed on the old rejection string must be updated. See the corresponding entry in `docs/user-manual/upgrading.md`.
 
 ## Device Quarantine
 

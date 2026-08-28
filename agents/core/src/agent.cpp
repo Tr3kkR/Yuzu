@@ -740,7 +740,8 @@ public:
                 spdlog::error("Failed to open command dedup store: {}",
                               dedup_result.error().message);
                 spdlog::warn("Durable command replay protection unavailable — a redelivered "
-                             "command may re-execute");
+                             "command may re-execute (fail-open, degraded)");
+                metrics_.counter("yuzu_agent_dedup_open_failed_total").increment();
             }
         }
 
@@ -2167,6 +2168,21 @@ public:
                             tags["yuzu.commands_executed"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_commands_executed_total").value()));
                             tags["yuzu.plugins_loaded"] = std::to_string(plugins_.size());
+                            // HA WS-0 dedup safety-net signal. "degraded"=1 means the
+                            // durable store never opened, so this agent runs commands
+                            // undeduplicated (fail-open) — a real reading emitted every
+                            // heartbeat, so an operator can spot it fleet-wide (the
+                            // server-side yuzu_fleet_* derivation + alert land with
+                            // WS-11). record_terminal_misses is the count of terminal
+                            // outcomes that matched no in-flight row — the signal a
+                            // redelivery could re-execute.
+                            tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            tags["yuzu.dedup_replays"] = std::to_string(static_cast<int64_t>(
+                                metrics_.counter("yuzu_agent_dedup_replays_total").value()));
+                            tags["yuzu.dedup_record_terminal_misses"] =
+                                std::to_string(static_cast<int64_t>(
+                                    metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total")
+                                        .value()));
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
@@ -2551,18 +2567,23 @@ public:
                     // design forbids. An empty command_id cannot be keyed and
                     // proceeds unprotected; a store failure (Error) degrades to no
                     // dedup for that one command, both falling through to dispatch.
-                    // Reserved-plugin dispatches (the Guardian __guard__ side
-                    // channel below) are NOT normal command execution — they carry
-                    // no dedupable side effect and must stay free to re-run (e.g.
-                    // reconcile). They bypass the claim entirely: claiming one would
-                    // leak an unresolved in-flight record (that branch continues via
-                    // its own write) AND wrongly answer a re-sent control command
-                    // RUNNING instead of re-running it.
+                    // The Guardian __guard__ side channel (handled below) is NOT
+                    // normal command execution — it carries no dedupable side
+                    // effect, must stay free to re-run (e.g. reconcile), and its
+                    // branch resolves via its own write + continue, so claiming it
+                    // would leak an unresolved in-flight record AND wrongly answer a
+                    // re-sent control command RUNNING. It is the ONLY dispatch that
+                    // bypasses the claim: gating on the literal (not the whole
+                    // reserved-name set) keeps durable idempotency the SAFE DEFAULT
+                    // for any future reserved-name command — a future __update__ OTA
+                    // path is deduplicated unless it, too, opts out here.
                     if (cmd.command_id().empty()) {
                         spdlog::warn("Received command with empty command_id — replay "
                                      "protection cannot apply");
-                    } else if (command_dedup_ && !is_reserved_plugin_name(cmd.plugin())) {
+                    } else if (command_dedup_ && cmd.plugin() != "__guard__") {
                         auto claim = command_dedup_->claim(cmd.command_id());
+                        if (claim.status == ClaimStatus::Error)
+                            metrics_.counter("yuzu_agent_dedup_claim_errors_total").increment();
                         if (claim.status == ClaimStatus::Duplicate) {
                             pb::CommandResponse dup_resp;
                             bool replayed = false;
@@ -2576,6 +2597,7 @@ public:
                                             .count();
                                     dup_resp.mutable_sent_at()->set_millis_epoch(now_ms);
                                     replayed = true;
+                                    metrics_.counter("yuzu_agent_dedup_replays_total").increment();
                                     spdlog::info("Replay of command {} — returning stored "
                                                  "terminal outcome",
                                                  cmd.command_id());
@@ -2588,7 +2610,9 @@ public:
                             if (!replayed) {
                                 dup_resp.set_command_id(cmd.command_id());
                                 dup_resp.set_status(pb::CommandResponse::RUNNING);
-                                dup_resp.set_output("__dedup__|duplicate command still in flight");
+                                // Plain progress text — NOT a parsed sentinel (no
+                                // "__x__|" contract); nothing consumes this string.
+                                dup_resp.set_output("duplicate command still in flight");
                                 if (claim.state == DedupState::InFlight)
                                     spdlog::warn("Duplicate command {} still in flight — "
                                                  "answering RUNNING",
@@ -2687,9 +2711,7 @@ public:
                         // Deterministic terminal for a claimed command (the plugin
                         // set is fixed at boot): memoise so a redelivery replays
                         // this REJECTED rather than re-running the claim path.
-                        if (command_dedup_)
-                            command_dedup_->record_terminal(cmd.command_id(),
-                                                            resp.SerializeAsString());
+                        record_command_terminal(cmd.command_id(), resp);
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(resp, grpc::WriteOptions());
                         continue;
@@ -3081,9 +3103,7 @@ private:
 
                     // Deterministic terminal (expires_at is fixed): memoise so a
                     // redelivery replays this rather than sleeping the stagger again.
-                    if (command_dedup_)
-                        command_dedup_->record_terminal(cmd.command_id(),
-                                                        expired_resp.SerializeAsString());
+                    record_command_terminal(cmd.command_id(), expired_resp);
                     std::lock_guard lock(stream_write_mu_);
                     stream->Write(expired_resp, grpc::WriteOptions());
                     return;
@@ -3198,12 +3218,49 @@ private:
 
             // Persist the terminal outcome BEFORE the wire send (HA WS-0): the
             // durable record is the source of truth, the send is best-effort and
-            // replayable. record_terminal is noexcept + runs before the terminal
-            // Write, so it cannot cause the #2037 second-terminal hazard.
-            if (command_dedup_)
-                command_dedup_->record_terminal(cmd.command_id(), final_resp.SerializeAsString());
+            // replayable. record_command_terminal is noexcept + runs before the
+            // terminal Write, so it cannot cause the #2037 second-terminal hazard.
+            record_command_terminal(cmd.command_id(), final_resp);
             std::lock_guard lock(stream_write_mu_);
             stream->Write(final_resp, grpc::WriteOptions());
+        }
+    }
+
+    // Record a claimed command's terminal outcome into the durable dedup store
+    // (HA WS-0). Caps the stored blob so a huge plugin output cannot bloat
+    // command_dedup.db across up to kMaxDedupRows rows: beyond the cap the slim
+    // form preserves status/exit_code/result-status (the effectively-once signal)
+    // and drops the full output (a replay then returns the status, not the
+    // bytes). A Miss — the terminal matched no in-flight row (evicted or never
+    // claimed) — is counted: it is the signal a redelivery of this command could
+    // re-execute. noexcept + internally guarded: a failure here only degrades
+    // durability, it never propagates into the command path.
+    void record_command_terminal(const std::string& command_id,
+                                 const pb::CommandResponse& resp) noexcept {
+        if (!command_dedup_ || command_id.empty())
+            return;
+        try {
+            static constexpr size_t kMaxDedupResponseBytes = 64 * 1024;
+            std::string blob;
+            if (resp.ByteSizeLong() > kMaxDedupResponseBytes) {
+                pb::CommandResponse slim;
+                slim.set_command_id(resp.command_id());
+                slim.set_status(resp.status());
+                slim.set_exit_code(resp.exit_code());
+                slim.set_plugin_result_status(resp.plugin_result_status());
+                if (resp.has_sent_at())
+                    *slim.mutable_sent_at() = resp.sent_at();
+                slim.set_output("[output omitted from dedup store: exceeded size cap; "
+                                "command completed]");
+                blob = slim.SerializeAsString();
+            } else {
+                blob = resp.SerializeAsString();
+            }
+            if (command_dedup_->record_terminal(command_id, blob) == RecordOutcome::Miss)
+                metrics_.counter("yuzu_agent_dedup_record_terminal_miss_total").increment();
+        } catch (...) {
+            // best-effort: an allocation/serialization failure only degrades
+            // durability (a redelivery may re-execute); never terminate.
         }
     }
 
@@ -3232,8 +3289,7 @@ private:
             // Terminal outcome for a claimed command whose task threw before its
             // own terminal write — memoise it so a redelivery replays this FAILURE
             // instead of re-running (HA WS-0).
-            if (command_dedup_)
-                command_dedup_->record_terminal(command_id, resp.SerializeAsString());
+            record_command_terminal(command_id, resp);
             std::lock_guard lock(stream_write_mu_);
             if (stream)
                 stream->Write(resp, grpc::WriteOptions());

@@ -19,6 +19,13 @@
  * (RUNNING) on redelivery and never silently re-executed — re-running a
  * destructive command is the one failure the whole HA design forbids.
  *
+ * Durability: the store opens with `journal_mode=WAL` AND `synchronous=FULL`.
+ * FULL (not the WAL default NORMAL) fsyncs each commit, so a claim/terminal
+ * record survives a HOST failure (power-loss), not only a process crash — which
+ * is the failure mode HA actually cares about. The write rate is one row per
+ * command, not a hot path, so the fsync cost is negligible against command
+ * latency.
+ *
  * Lifecycle (one claim resolves exactly once):
  *   claim(id)  -> Claimed   : first sighting; the caller owns the in-flight
  *                             record and MUST resolve it via record_terminal()
@@ -29,13 +36,27 @@
  *                             Terminal, replay `response`; if InFlight, answer
  *                             RUNNING (indeterminate).
  *              -> Error     : store write failed; the caller proceeds WITHOUT
- *                             dedup for this one command (degraded, not wrong).
+ *                             dedup for this one command — a DELIBERATE fail-OPEN
+ *                             to availability (ADR-2002): when the durable store
+ *                             cannot function no dedup mechanism can, and the
+ *                             chosen degradation is at-least-once (a redelivery
+ *                             may re-execute) rather than refusing the command
+ *                             and dropping the endpoint out of remote-control
+ *                             reach. This is degraded, not wrong, and the caller
+ *                             is expected to make it OBSERVABLE (a counter/tag),
+ *                             never silent.
  *
- * Retention is a clock-free rowid ring (keep the most recent kMaxDedupRows) —
- * deliberately NOT a wall-clock delete, so it sidesteps the clock-guarded-
- * retention hazard (routed concern #2360/#2361) entirely on an endpoint whose
- * clock the user controls. `claimed_at` is diagnostic ONLY and MUST NEVER
- * become a retention cutoff.
+ * Retention is a clock-free rowid ring over TERMINAL rows only (keep the most
+ * recent kMaxDedupRows). Deliberately NOT a wall-clock delete, so it sidesteps
+ * the clock-guarded-retention hazard (routed concern #2360/#2361) entirely on an
+ * endpoint whose clock the user controls; `claimed_at` is diagnostic ONLY and
+ * MUST NEVER become a retention cutoff. IN-FLIGHT rows are NEVER evicted by the
+ * ring: a live command's claim can never be pruned out from under its still-
+ * running worker (the double-execution that would otherwise occur under high
+ * volume). The only cost is that a crashed-mid-execution in-flight row (response
+ * is NULL, so ~tens of bytes) persists until the agent is reinstalled; bounding
+ * that with a stale-in-flight reconciliation is a tracked follow-up, not a
+ * slice-1 concern (crash-looping is the larger problem, and the rows are tiny).
  *
  * Thread-safe: a std::mutex serialises every sqlite3* operation. The reader
  * thread calls claim()/release() and the bounded dispatch-pool workers call
@@ -75,21 +96,32 @@ enum class ClaimStatus {
     Error,     ///< store write failed; caller proceeds WITHOUT dedup for this command
 };
 
+/// Outcome of record_terminal() — lets the caller observe the "0 rows updated"
+/// case, which is the signal that a re-execution is about to be permitted
+/// (the row was evicted or never claimed) and must be counted, not swallowed.
+enum class RecordOutcome {
+    Recorded, ///< an in-flight row was flipped to terminal (the normal path)
+    Miss,     ///< no in-flight row matched (evicted, never claimed, or already terminal)
+    Error,    ///< store write failed
+};
+
 struct ClaimResult {
     ClaimStatus status = ClaimStatus::Error;
     DedupState state = DedupState::InFlight; ///< meaningful only when status==Duplicate
     /// Serialized terminal CommandResponse (CommandResponse::SerializeAsString()); populated
     /// only when status==Duplicate && state==Terminal. Bytes are exact (blob column), so an
-    /// embedded NUL in the proto survives.
-    std::string response;
+    /// embedded NUL in the proto survives. Default member initializer so a designated-init
+    /// that omits it does not warn (-Wmissing-field-initializers, warning_level=3).
+    std::string response{};
 };
 
 class YUZU_EXPORT CommandDedupStore {
 public:
     /**
-     * Open (or create) the store at the given path. Sets WAL + busy_timeout=5000
-     * and creates the schema if absent. Fails only on an unusable path/DB — the
-     * caller treats a failure as "durable dedup unavailable" and runs degraded.
+     * Open (or create) the store at the given path. Sets WAL + synchronous=FULL
+     * + busy_timeout=5000 and creates the schema if absent. Fails only on an
+     * unusable path/DB — the caller treats a failure as "durable dedup
+     * unavailable" and runs degraded (fail-open), which it MUST surface.
      */
     static std::expected<CommandDedupStore, CommandDedupError>
     open(const std::filesystem::path& db_path);
@@ -113,12 +145,15 @@ public:
     /**
      * Flip a claimed in-flight record to its terminal outcome so a later
      * duplicate replays `serialized_response` (= CommandResponse::SerializeAsString()).
-     * Best-effort: a failure only degrades durability (a redelivery may
-     * re-execute). Never creates a row (only a prior claim's row is updated) and
-     * never throws. No-op on an empty id / closed store.
+     * FIRST-WRITE-WINS: only an in-flight row is flipped, so a second terminal
+     * (e.g. a spurious post-terminal throw) is a Miss, never an overwrite. A Miss
+     * on a command that WAS claimed means its row was evicted — the signal a
+     * redelivery could re-execute; the caller counts it. Best-effort + noexcept:
+     * a failure only degrades durability. No-op (Miss) on an empty id / closed
+     * store.
      */
-    void record_terminal(std::string_view command_id,
-                         std::string_view serialized_response) noexcept;
+    RecordOutcome record_terminal(std::string_view command_id,
+                                  std::string_view serialized_response) noexcept;
 
     /**
      * Drop a claimed in-flight record that produced NO memoizable outcome (the
@@ -132,26 +167,39 @@ public:
     [[nodiscard]] std::optional<std::int64_t> count() const;
 
     /**
-     * The most recent kMaxDedupRows commands are retained; older rows are evicted
-     * by rowid (insert order), never by clock. Exceeding this between a command's
-     * execution and a possible redelivery is what would let a duplicate
-     * re-execute, so it MUST stay well above the server's max retry/outbox
-     * horizon (WS-1/WS-3). Substrate-tuned; do not copy the number elsewhere.
+     * TEST-ONLY: lower the terminal-ring bound so retention tests exercise the
+     * real prune path without driving kMaxDedupRows (20000) fsync'd commits.
+     * Production never calls this; the default is kMaxDedupRows.
+     */
+    void set_max_dedup_rows_for_test(std::int64_t n);
+
+    /**
+     * The most recent kMaxDedupRows TERMINAL commands are retained; older
+     * terminal rows are evicted by rowid (insert order), never by clock, never
+     * touching in-flight rows. Exceeding this between a command's execution and a
+     * possible redelivery is what would let a duplicate re-execute, so it MUST
+     * stay well above the server's max retry/outbox horizon (WS-1/WS-3).
+     * Substrate-tuned; do not copy the number elsewhere.
      */
     static constexpr std::int64_t kMaxDedupRows = 20000;
+
+    /**
+     * Prune cadence: prune after this many claims, so eviction is O(rows)
+     * amortised rather than per-claim. Bounds terminal rows at kMaxDedupRows +
+     * kPruneInterval. Public so tests can assert the bound without hardcoding it.
+     */
+    static constexpr std::uint64_t kPruneInterval = 512;
 
 private:
     explicit CommandDedupStore(sqlite3* db);
 
-    /// Clock-free ring eviction (keep newest kMaxDedupRows by rowid). Caller holds mu_.
+    /// Clock-free ring eviction over TERMINAL rows only. Caller holds mu_.
     void prune_locked() noexcept;
 
     sqlite3* db_{nullptr};
     mutable std::mutex mu_;
-    /// Prune cadence: prune after this many claims, so eviction is O(rows) amortised
-    /// rather than per-claim. Bounds the table at kMaxDedupRows + kPruneInterval.
-    static constexpr std::uint64_t kPruneInterval = 512;
     std::uint64_t claims_since_prune_{0};
+    std::int64_t max_dedup_rows_{kMaxDedupRows}; ///< effective ring bound (test-lowerable)
 };
 
 } // namespace yuzu::agent
