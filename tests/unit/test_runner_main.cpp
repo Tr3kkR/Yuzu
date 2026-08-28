@@ -61,11 +61,17 @@
 // never through flake-retry.py, so the #1648 exit-42 misclassification this
 // hard_exit call exists to prevent cannot occur on that leg — excluding it
 // costs this file's own stated purpose nothing. __SANITIZE_ADDRESS__ is a
-// real, portable MSVC/GCC/Clang macro (confirmed already in production use
-// in this exact codebase for the identical cross-toolchain sanitizer-detect
-// need: tests/unit/test_helpers.hpp's kSpinScale,
+// real macro GCC and MSVC both define directly under their ASan flag
+// (Clang instead answers __has_feature(address_sanitizer) - irrelevant
+// here since Windows never uses Clang, docs/windows-build.md's standing
+// rule, and windows-asan's toolchain is confirmed cl.exe). This is not a
+// new, untested pattern: the identical cross-toolchain sanitizer-detect
+// need already lives in this exact codebase at
+// tests/unit/test_helpers.hpp's kSpinScale and
 // agents/core/include/yuzu/agent/guardian_engine.hpp's
-// YUZU_WORKER_MUTEX_GUARD) — not a new, untested pattern.
+// YUZU_WORKER_MUTEX_GUARD (both OR in the __has_feature branch too, since
+// they also compile on Linux/macOS Clang; this Windows-only call site
+// doesn't need to).
 //
 // Session's own destructor (and any Catch2/system atexit handler) never
 // runs on this path. Verified empirically (2026-08-27, scratch experiment
