@@ -39,8 +39,30 @@ only inside the opaque `yaml_source` blob) for a control the platform doctrine
 (`authz_model.hpp:174`: "this schema classifies a capability, it never grants
 one") already says shouldn't be role-shaped. Per-definition granularity is not
 lost: the governed path keeps enforcing each definition's own `approval_mode`
-(`workflow_routes.cpp:1735-1746`) — the pair gate is a floor under raw dispatch,
-not a replacement for the governed path's finer check.
+(`workflow_routes.cpp:1735-1746`) as an ADDITIONAL, earlier check — an
+`always`-mode definition's caller sees a pending-approval ticket before dispatch
+is ever attempted, for instance.
+
+**Correction (governance Gate 4 consistency-auditor finding, folded in
+2026-08-28):** the sentence this replaced claimed the pair gate is "a floor
+under raw dispatch, not a replacement for the governed path's finer check" —
+true of the approval-mode pre-check, but misleading about what actually happens
+at dispatch. The governed path's own dispatch call (`workflow_routes.cpp:1843`,
+`cmd_dispatch` -> the shared chokepoint) reaches the IDENTICAL
+`classify_and_authorize_dispatch` raw dispatch uses. So the pair-derived
+`ExecuteGate` is not scoped to raw dispatch at all — it is the floor under
+EVERY dispatch, governed path included. The practical consequence: an
+`auto`-mode definition whose pair is `AdminOrApproval`/`AlwaysApproval` because
+a SIBLING definition on that pair is `role-gated`/`always` will still be denied
+`ApprovalRequired` for a non-admin, non-ticketed caller at governed-path
+dispatch, even though that definition's own mode says no approval is needed.
+This is deliberate defense-in-depth (no individual definition can locally
+override a pair the catalogue classifies as sensitive) but was not what the
+original wording described, and is a real operator-visible surprise worth
+knowing about — filed as a design gap in this ladder's follow-up list (item 10
+below), since shipped content today has zero such conflicts (verified by the
+rung-2 cross-check) but a future runtime import is not yet protected against
+creating one.
 
 Instead: add an approval-gate dimension to `CommandCapability` itself — the
 struct that already carries `securable`/`operation`/`risk_tier` per pair and is
@@ -328,8 +350,21 @@ Every claim above was checked against a full parse of all 69
 `approval.mode` pairs — the files are multi-document YAML streams, one
 definition per `---`-separated document). The complete post-remap table (214
 pairs) is committed at `tests/fixtures/1398_pair_gate_table.json`; rung 2's
-`ExecuteGate` authoring and CI cross-check derive from this same table, so
-catalogue and content cannot silently drift apart. Rung 2 must also replicate
+`ExecuteGate` authoring (the 184 `.execute_gate = ...` values across the six
+`capability_decls/*.hpp` fragments) was derived from this table mechanically.
+
+**Correction (governance Gate 4 consistency-auditor finding, folded in
+2026-08-28):** the sentence this replaced additionally claimed the CI
+cross-check (`tests/test_capability_gate_consistency.py`) "derive[s] from this
+same table" — false as shipped. The script never reads the fixture
+(`grep -rn "1398_pair_gate_table" tests/test_capability_gate_consistency.py`
+returns nothing); it independently re-parses `content/definitions/*.yaml` and
+the six fragments fresh on every run, which is actually the STRONGER
+guarantee (a fixture can go stale; a live parse cannot) but is a different
+mechanism than authoring claimed, and means the fixture today has no
+consumer except a human re-deriving it by hand. Either wire the fixture in as
+a golden-file comparison or accept it as authoring-time scaffolding only —
+undecided, not blocking. Rung 2 must also replicate
 `embed_content.py`'s exact mode-defaulting semantics (`approval.get("mode") or
 "auto"`, `embed_content.py:69,89`) so a definition with no `approval:` block
 derives `auto` identically in both places (architect requirement). Headline
@@ -481,6 +516,22 @@ spot check.
    gated pairs; a non-admin operator-tier MCP token loses those pairs on
    `execute_instruction` unless the definition is dispatched via a
    supervised-tier ticket instead. Fold into rung 5.
+10. **NEW (governance Gate 4 consistency-auditor, 2026-08-28 hardening
+    round):** the inverse of item 8 — an `auto`-mode definition targeting a
+    pair whose compiled gate is `AdminOrApproval`/`AlwaysApproval` *because a
+    sibling definition on that pair is stricter* is denied `ApprovalRequired`
+    at governed-path dispatch too, even though its own `approval_mode` says
+    no approval is needed (see Decision 1's correction above — the pair floor
+    is not scoped to raw dispatch). Zero shipped definitions hit this today
+    (verified by the rung-2 cross-check: no pair has both an `auto` and a
+    stricter sibling), so it is latent, not live — but nothing prevents a
+    future runtime import from creating one, and rung 4's planned
+    import-refusal check (item 8) only catches a definition *stricter* than
+    its pair, not one *looser* than a stricter sibling. A complete fix needs
+    a second import-time check: refuse importing/creating an `auto`-mode
+    definition on a pair whose compiled gate is already
+    `AdminOrApproval`/`AlwaysApproval`, or accept the surprise and document it
+    as intentional defense-in-depth. Undecided; not blocking this ladder.
 
 ## Sign-off record
 

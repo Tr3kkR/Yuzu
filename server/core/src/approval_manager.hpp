@@ -102,6 +102,32 @@ struct Approval {
     /// v5); rows that predate it are rewritten by v7 and read back as
     /// kUnrecognised, NOT kUnspecified — see `to_string`'s comment.
     ApprovalOrigin origin{ApprovalOrigin::kUnspecified};
+    /// `"plugin.action"`, snapshotted at `submit()` time (#1398 hardening,
+    /// governance Gate 4 unhappy-path CRITICAL finding). `Approval` binds a
+    /// human review to `definition_id` only — but `InstructionDefinition::
+    /// plugin`/`.action` are MUTABLE (`PUT /api/instructions/{id}`, gated on
+    /// nothing stronger than `InstructionDefinition:Write`), so a ticket
+    /// approved while a definition pointed at one action remains matchable
+    /// by `definition_id` alone after the definition is repointed at a
+    /// DIFFERENT one — no human ever reviewed the content that actually
+    /// dispatches. `ScheduleRunner::fire_with_approval` is the one redemption
+    /// path this binds: it re-fetches the definition fresh every tick and
+    /// must refuse a ticket whose `target_action` no longer matches what is
+    /// about to dispatch, exactly as ADR-0033 §1 requires for any filter
+    /// that applies ("unresolvable/missing/unparseable denies") — a plain
+    /// string mismatch (including empty, for a pre-migration row) already
+    /// falls out of a strict `==` with no special-casing needed. Empty for
+    /// an interactive (workflow_routes.cpp) or MCP-minted (mcp_server.cpp)
+    /// ticket: MCP already binds redemption to `definition_id = "mcp."+
+    /// tool_name` (a code constant, not an editable row) plus a canonical
+    /// hash of the full call arguments, an orthogonal and already-sufficient
+    /// binding this field does not need to duplicate; the interactive REST
+    /// path has no redemption flow at all today (a separate, pre-existing,
+    /// already-tracked gap — see the design doc's follow-up list) so the
+    /// field is populated there only so a FUTURE redemption implementation
+    /// inherits this protection for free rather than needing its own round.
+    /// Additive column (migration v8).
+    std::string target_action;
 };
 
 struct ApprovalQuery {
@@ -301,10 +327,16 @@ public:
     /// it is now a compile error rather than a silent `kUnspecified`, which
     /// itself refuses at redemption today, not grants (see
     /// `declares_non_mcp_surface`).
+    ///
+    /// `target_action` (#1398 hardening): see `Approval::target_action`'s doc
+    /// comment. DEFAULTED (unlike `origin`) because it has no meaning at the
+    /// generic MCP mint call site (one shared helper across several tools,
+    /// no single plugin/action in scope) — callers that DO have one
+    /// (`ScheduleRunner`, the interactive workflow route) must pass it.
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
            const std::string& scope_expression, const std::string& schedule_id,
-           ApprovalOrigin origin);
+           ApprovalOrigin origin, std::string target_action = {});
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 

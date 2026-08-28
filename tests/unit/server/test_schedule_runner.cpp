@@ -398,6 +398,55 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
 }
 
+// #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding): a
+// ticket is minted for the definition's CONTENT at submit time, but
+// `fire()` re-fetches the definition fresh every tick and previously
+// matched a ticket by `(definition_id, scope_expression, schedule_id)`
+// alone — so a definition mutated between ticket-approval and the next
+// tick would fire under review that was never given for the NEW content.
+// Concrete exploit this closes: a seeded non-admin role (e.g. Operator,
+// which holds InstructionDefinition:Write + Schedule:Write + Execution:
+// Execute) gets a benign action approved, then mutates the SAME
+// definition to point at `script_exec.bash` (also `Execution:Execute`,
+// also gated) before the next tick — without this fix, the stale ticket
+// would silently cover the swapped, unreviewed action.
+TEST_CASE("ScheduleRunner: a definition mutated AFTER ticket approval does not fire under "
+          "the stale ticket (#1398 content-swap hardening)",
+          "[schedule][runner][approval][1398]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits a ticket for procs.list (test.def's content)
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+
+    // Mutate the definition's plugin/action AFTER approval, BEFORE the next
+    // tick — exactly the PUT /api/instructions/{id} write an operator with
+    // only InstructionDefinition:Write can perform.
+    auto def_result = h.is.get_definition("test.def");
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    InstructionDefinition mutated = **def_result;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+
+    h.runner.tick(); // must NOT fire the swapped action under the old ticket
+
+    CHECK(h.calls.empty()); // no dispatch happened at all — the swap was refused
+    // A fresh ticket for the NEW content is submitted and held, distinct
+    // from the original (now permanently stale — target_action mismatched)
+    // approved one.
+    auto still_pending = h.approvals.query({.status = "pending"});
+    REQUIRE(still_pending.size() == 1);
+    CHECK(still_pending[0].target_action == "script_exec.bash");
+    auto approved_now = h.approvals.query({.status = "approved"});
+    REQUIRE(approved_now.size() == 1);
+    CHECK(approved_now[0].target_action == "procs.list"); // the stale, never-consumed ticket
+    CHECK(approved_now[0].consumed_at == 0);               // never redeemed
+}
+
 TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks next time",
           "[schedule][runner][approval]") {
     Harness h;

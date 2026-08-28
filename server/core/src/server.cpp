@@ -10326,8 +10326,13 @@ private:
         if (!finalized) {
             // The only denial `finalize_classified_command` can produce is
             // KillSwitched — classification/authorization already succeeded
-            // above.
-            metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
+            // above. #1398 hardening (Gate 4 consistency-auditor, INFO): route
+            // through the shared to_string() rather than a hand-duplicated
+            // literal — the exact drift this helper exists to prevent.
+            metrics_
+                .counter("yuzu_server_dispatch_denied_total",
+                         {{"reason", std::string(yuzu::server::detail::to_string(
+                                        yuzu::server::detail::DispatchDenialReason::KillSwitched))}})
                 .increment();
             spdlog::warn("dispatch denied: {}:{} reason=kill_switched caller={}", plugin, action,
                          caller.system ? std::string("system")
