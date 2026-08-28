@@ -2063,46 +2063,47 @@ TEST_CASE("#2233 item 3: a hung watch() wedges stop() until released",
 
     std::atomic<int> push_exit_code{-1};
     std::atomic<bool> push_done{false};
-    std::thread pusher{[&] {
-        gpb::GuaranteedStatePush p;
-        p.set_full_sync(true);
-        *p.add_rules() = make_service_rule("r1");
-        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine,
-                                                                     p.SerializeAsString());
-        push_exit_code.store(dr.exit_code, std::memory_order_release);
-        push_done.store(true, std::memory_order_release);
-    }};
 
-    // Single cleanup guard, constructed immediately after pusher (before anything that
-    // could throw) and extended with stopper once it exists. On ANY unwind (a fatal
-    // REQUIRE below), the destructor releases the mechanism's hang gate FIRST - so
-    // whichever thread is parked in watch() can actually finish - THEN joins whichever
-    // of pusher/stopper are still running. Order matters: joining before releasing
-    // would deadlock the test's own cleanup (this is #2233 item 3's exact hazard; the
-    // last thing this test should do is reproduce it in its teardown). A joinable
-    // std::thread destructing during unwind is std::terminate, so both must be joined
-    // before they go out of scope.
+    // Cleanup OWNS both worker threads as members (never a pointer to a separately-
+    // declared local) - its destructor is then the ONLY thing that ever destroys them,
+    // so C++'s reverse-declaration-order destruction rule can't race a bare std::thread
+    // local's own destructor against this guard on an unwind (an earlier draft held
+    // stopper_thread by pointer to a LATER-declared local; that local's own destructor
+    // would run BEFORE Cleanup's on an unwind between its construction and its explicit
+    // join, joinable and un-joined -> std::terminate - the exact failure this guard
+    // exists to prevent, caught by adversarial review). On ANY unwind (a fatal REQUIRE
+    // below), the destructor releases the mechanism's hang gate FIRST - so whichever
+    // thread is parked in watch() can actually finish - THEN joins both. Joining before
+    // releasing would deadlock the test's own cleanup (this is #2233 item 3's exact
+    // hazard; the last thing this test should do is reproduce it in its teardown).
     struct Cleanup {
         FakeServiceMechanism* mech;
-        std::thread* pusher_thread;
-        std::thread* stopper_thread = nullptr;
+        std::thread pusher_thread;
+        std::optional<std::thread> stopper_thread;
         ~Cleanup() {
             mech->release_hang();
-            if (pusher_thread->joinable())
-                pusher_thread->join();
+            if (pusher_thread.joinable())
+                pusher_thread.join();
             if (stopper_thread && stopper_thread->joinable())
                 stopper_thread->join();
         }
-    } cleanup{f.mechanism, &pusher};
+    } cleanup{f.mechanism, std::thread{[&] {
+                  gpb::GuaranteedStatePush p;
+                  p.set_full_sync(true);
+                  *p.add_rules() = make_service_rule("r1");
+                  auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(
+                      *f.engine, p.SerializeAsString());
+                  push_exit_code.store(dr.exit_code, std::memory_order_release);
+                  push_done.store(true, std::memory_order_release);
+              }}};
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
     std::atomic<bool> stop_returned{false};
-    std::thread stopper{[&] {
+    cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
-    }};
-    cleanup.stopper_thread = &stopper;
+    });
 
     // Weak half: a short "still blocked" sample. This is inherently non-vacuous-adjacent
     // on a starved CI box (a slow scheduler could plausibly make stop() late for reasons
@@ -2120,8 +2121,8 @@ TEST_CASE("#2233 item 3: a hung watch() wedges stop() until released",
           std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-    stopper.join();
-    pusher.join();
+    cleanup.stopper_thread->join();
+    cleanup.pusher_thread.join();
 
     CHECK(blocked_before_release);
     CHECK(stop_returned.load(std::memory_order_acquire));
@@ -2136,31 +2137,29 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
 
     std::atomic<int> push_a_exit_code{-1};
     std::atomic<bool> push_a_done{false};
-    std::thread pusher_a{[&] {
-        gpb::GuaranteedStatePush p;
-        p.set_full_sync(true);
-        *p.add_rules() = make_service_rule("r1");
-        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine,
-                                                                     p.SerializeAsString());
-        push_a_exit_code.store(dr.exit_code, std::memory_order_release);
-        push_a_done.store(true, std::memory_order_release);
-    }};
 
-    // See the "hung watch() wedges stop()" test above for why release must precede
-    // both joins, and why that ordering is encoded via a single guard mutated as
-    // threads come into scope rather than several separately-ordered RAII structs.
+    // See the "hung watch() wedges stop()" test above for why Cleanup must OWN both
+    // threads as members rather than point to separately-declared locals.
     struct Cleanup {
         FakeServiceMechanism* mech;
-        std::thread* pusher_a_thread;
-        std::thread* pusher_b_thread = nullptr;
+        std::thread pusher_a_thread;
+        std::optional<std::thread> pusher_b_thread;
         ~Cleanup() {
             mech->release_hang();
-            if (pusher_a_thread->joinable())
-                pusher_a_thread->join();
+            if (pusher_a_thread.joinable())
+                pusher_a_thread.join();
             if (pusher_b_thread && pusher_b_thread->joinable())
                 pusher_b_thread->join();
         }
-    } cleanup{f.mechanism, &pusher_a};
+    } cleanup{f.mechanism, std::thread{[&] {
+                  gpb::GuaranteedStatePush p;
+                  p.set_full_sync(true);
+                  *p.add_rules() = make_service_rule("r1");
+                  auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(
+                      *f.engine, p.SerializeAsString());
+                  push_a_exit_code.store(dr.exit_code, std::memory_order_release);
+                  push_a_done.store(true, std::memory_order_release);
+              }}};
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
@@ -2169,7 +2168,7 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
     // alone, independent of r1's own arm outcome.
     std::atomic<int> push_b_exit_code{-1};
     std::atomic<bool> push_b_done{false};
-    std::thread pusher_b{[&] {
+    cleanup.pusher_b_thread.emplace([&] {
         gpb::GuaranteedStatePush p;
         p.set_full_sync(false);
         *p.add_rules() = make_service_rule("r2", true, "OtherSvc");
@@ -2177,8 +2176,7 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
                                                                      p.SerializeAsString());
         push_b_exit_code.store(dr.exit_code, std::memory_order_release);
         push_b_done.store(true, std::memory_order_release);
-    }};
-    cleanup.pusher_b_thread = &pusher_b;
+    });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     const bool b_blocked_before_release = !push_b_done.load(std::memory_order_acquire);
@@ -2190,8 +2188,8 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
           std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-    pusher_a.join();
-    pusher_b.join();
+    cleanup.pusher_a_thread.join();
+    cleanup.pusher_b_thread->join();
 
     CHECK(b_blocked_before_release);
     CHECK(push_b_done.load(std::memory_order_acquire));
@@ -2212,37 +2210,35 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
 
     std::atomic<int> push_exit_code{-1};
     std::atomic<bool> push_done{false};
-    std::thread pusher{[&] {
-        gpb::GuaranteedStatePush p;
-        p.set_full_sync(true);
-        *p.add_rules() = make_service_rule("r1", /*enabled=*/false);
-        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine,
-                                                                     p.SerializeAsString());
-        push_exit_code.store(dr.exit_code, std::memory_order_release);
-        push_done.store(true, std::memory_order_release);
-    }};
 
     struct Cleanup {
         FakeServiceMechanism* mech;
-        std::thread* pusher_thread;
-        std::thread* stopper_thread = nullptr;
+        std::thread pusher_thread;
+        std::optional<std::thread> stopper_thread;
         ~Cleanup() {
             mech->release_hang();
-            if (pusher_thread->joinable())
-                pusher_thread->join();
+            if (pusher_thread.joinable())
+                pusher_thread.join();
             if (stopper_thread && stopper_thread->joinable())
                 stopper_thread->join();
         }
-    } cleanup{f.mechanism, &pusher};
+    } cleanup{f.mechanism, std::thread{[&] {
+                  gpb::GuaranteedStatePush p;
+                  p.set_full_sync(true);
+                  *p.add_rules() = make_service_rule("r1", /*enabled=*/false);
+                  auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(
+                      *f.engine, p.SerializeAsString());
+                  push_exit_code.store(dr.exit_code, std::memory_order_release);
+                  push_done.store(true, std::memory_order_release);
+              }}};
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
     std::atomic<bool> stop_returned{false};
-    std::thread stopper{[&] {
+    cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
-    }};
-    cleanup.stopper_thread = &stopper;
+    });
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     const bool blocked_before_release = !stop_returned.load(std::memory_order_acquire);
@@ -2254,8 +2250,8 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
           std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
 
-    stopper.join();
-    pusher.join();
+    cleanup.stopper_thread->join();
+    cleanup.pusher_thread.join();
 
     CHECK(blocked_before_release);
     CHECK(stop_returned.load(std::memory_order_acquire));
