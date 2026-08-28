@@ -177,7 +177,7 @@ public:
     /// client leaf bound to agent_id from the agent's CSR, returning
     /// {leaf_pem, ca_chain_pem}; nullopt = signing unavailable/failed. The revocation
     /// checker returns true iff a presented peer leaf PEM is revoked (checked against
-    /// ca.db). set_require_client_identity recomputes the mTLS-identity-required
+    /// ca_store). set_require_client_identity recomputes the mTLS-identity-required
     /// posture AFTER bootstrap — require_client_identity_ is otherwise baked at ctor,
     /// before the default CA exists. All set once during bring-up, before the gRPC
     /// dispatcher accepts traffic.

@@ -32,6 +32,11 @@ TEST_CASE("classify_engine_store_error: transient / conflict / client classes",
     // Unrecognized store error -> Transient (fail-safe default, never a
     // misleading client error).
     CHECK(classify_engine_store_error("rotation failed") == E::Transient);
+    // #3015: the PoP hash-read-failure string (nullopt token_hash) has no keyed
+    // needle and MUST fall through to the fail-safe Transient default (503),
+    // distinct from SecretMismatch — locked so a future needle can't silently
+    // reclassify it.
+    CHECK(classify_engine_store_error("failed to verify rotation secret") == E::Transient);
     CHECK(classify_engine_store_error("failed to mint successor credential: connection reset") ==
           E::Transient);
     CHECK(classify_engine_store_error("no active credential to rotate — mint one first") ==
@@ -250,11 +255,19 @@ TEST_CASE("classify_engine_store_error: round-trip over every error string "
         {"failed to revoke predecessor on confirm", E::Transient},
         {"failed to clear successor rotation state on confirm", E::Transient},
         {"confirm failed", E::Transient}, // generic with_txn_for-failed fallback
+        // #3015 proof-of-possession: the caller-input guard is a permanent
+        // client error; the PoP mismatch itself is its OWN distinct class —
+        // never folded into ClientValidation or Conflict — reachable only
+        // after every earlier admission gate already passed.
+        {"secret required", E::ClientValidation},
+        {"rotation secret mismatch — the presented secret does not verify against the "
+         "pending successor",
+         E::SecretMismatch},
     };
 
     // See the TEST_CASE-level comment: this pins accidental drift in THIS
     // table, not drift between this table and the source.
-    REQUIRE(cases.size() == 39); // 38 -> 39: #2943 malformed-pair terminal string
+    REQUIRE(cases.size() == 41); // 39 -> 41: #3015 secret-required + secret-mismatch strings
 
     for (const auto& c : cases) {
         CAPTURE(c.message);
@@ -271,4 +284,8 @@ TEST_CASE("confirm_result_label maps every class to a pre-seeded metric label",
     CHECK(std::string_view(confirm_result_label(E::ClientValidation)) == "client_error");
     CHECK(std::string_view(confirm_result_label(E::Conflict)) == "conflict");
     CHECK(std::string_view(confirm_result_label(E::Transient)) == "transient");
+    // #3015: added alongside the pre-seeded set's fifth label — see
+    // server.cpp's kApiTokenConfirmTotalMetric/yuzu_engine_principal_confirm_total
+    // pre-seed loops.
+    CHECK(std::string_view(confirm_result_label(E::SecretMismatch)) == "secret_mismatch");
 }

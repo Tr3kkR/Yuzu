@@ -18,6 +18,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <yuzu/agent/guardian_engine.hpp>
 #include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/server_address_resolver.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/trigger_engine.hpp>
 #include <yuzu/agent/updater.hpp>
@@ -683,6 +684,14 @@ public:
         plugin_ctx_.config["agent.build_number"] = std::to_string(yuzu::kBuildNumber);
         plugin_ctx_.config["agent.git_commit"] = std::string{yuzu::kGitCommitHash};
         plugin_ctx_.config["agent.server_address"] = cfg_.server_address;
+        // Resolved ONCE, here, at startup -- see server_address_resolver.hpp
+        // for why this must not be re-resolved later by a plugin at
+        // quarantine-dispatch time (the quarantine plugin used to do this
+        // itself; #3429 round 4 moved it here after round 3's review found
+        // that let a possibly-already-compromised host's own DNS resolution
+        // decide what survives its own containment).
+        plugin_ctx_.config["agent.server_address_resolved"] =
+            yuzu::agent::resolve_server_address_literals(cfg_.server_address);
         plugin_ctx_.config["agent.tls_enabled"] = cfg_.tls_enabled ? "true" : "false";
         plugin_ctx_.config["agent.heartbeat_interval"] =
             std::to_string(cfg_.heartbeat_interval.count());

@@ -1,7 +1,10 @@
-// bounded_wait.hpp bounds the WAIT on an uncancellable blocking call (Wave 2
-// PR2.1c, governance Gate 4 unhappy-path fix: getnameinfo's reverse-DNS
-// lookup has no per-call timeout, and a black-holing resolver could
-// otherwise pin a worker on the agent's bounded ThreadPool indefinitely).
+// bounded_wait.hpp (agents/shared) bounds the WAIT on an uncancellable
+// blocking call (Wave 2 PR2.1c, governance Gate 4 unhappy-path fix:
+// getnameinfo's reverse-DNS lookup has no per-call timeout, and a
+// black-holing resolver could otherwise pin a worker on the agent's bounded
+// ThreadPool indefinitely). Hoisted here from the discovery plugin (#3429
+// round 4) once agent-core's server_address_resolver.cpp needed the same
+// primitive to bound its own getaddrinfo() call.
 // These tests use a synthetic slow callable rather than real DNS, so the
 // timeout behaviour is deterministic and network-independent.
 #include <catch2/catch_test_macros.hpp>
@@ -14,7 +17,7 @@
 #include <vector>
 
 using namespace std::chrono_literals;
-using yuzu::discovery::bounded_call;
+using yuzu::shared::bounded_call;
 
 TEST_CASE("bounded_call: a fast function returns its result well before the timeout",
           "[agent][bounded_wait]") {
@@ -100,7 +103,7 @@ TEST_CASE("bounded_call: caps concurrently-outstanding detached threads, degradi
     // other test case in this binary. Wait for the slot-acquiring callers'
     // detached threads to finish (they were sleeping 4s) and decrement it,
     // so a later test case doesn't start against a still-saturated ceiling.
-    for (int i = 0; i < 100 && yuzu::discovery::detail::g_outstanding_bounded_calls.load() > 0;
+    for (int i = 0; i < 100 && yuzu::shared::detail::g_outstanding_bounded_calls.load() > 0;
         ++i) {
         std::this_thread::sleep_for(100ms);
     }
@@ -117,8 +120,8 @@ TEST_CASE("OutstandingCallGuard: releases the ceiling slot when an exception unw
     // body, so a throw on either of those two lines permanently leaked a slot. This proves the
     // guard's destructor runs during unwinding and releases the slot even when nothing ever
     // reaches the point that used to do the decrementing.
-    using yuzu::discovery::detail::g_outstanding_bounded_calls;
-    using yuzu::discovery::detail::OutstandingCallGuard;
+    using yuzu::shared::detail::g_outstanding_bounded_calls;
+    using yuzu::shared::detail::OutstandingCallGuard;
 
     const int baseline = g_outstanding_bounded_calls.load();
 
@@ -145,8 +148,8 @@ TEST_CASE("OutstandingCallGuard: move-construction transfers ownership so only t
     // the detached thread's lambda. If the move constructor failed to clear the source's
     // "held" flag, both the moved-from local and the moved-to copy would decrement --
     // double-releasing the slot and driving the counter negative for a later caller.
-    using yuzu::discovery::detail::g_outstanding_bounded_calls;
-    using yuzu::discovery::detail::OutstandingCallGuard;
+    using yuzu::shared::detail::g_outstanding_bounded_calls;
+    using yuzu::shared::detail::OutstandingCallGuard;
 
     const int baseline = g_outstanding_bounded_calls.load();
 

@@ -80,8 +80,8 @@ TEST_CASE("evaluate_scope: props.<key> resolves preloaded values, unaffected whe
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     REQUIRE(store.set_property("agent-win", "role", "web").has_value());
     REQUIRE(store.set_property("agent-lin", "role", "db").has_value());
@@ -124,8 +124,8 @@ TEST_CASE("evaluate_scope: a degraded CustomPropertiesStore ABORTS — never exp
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
-    registry.register_agent(info("agent-lin"));
+    (void)registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-lin"));
 
     REQUIRE(store.set_property("agent-win", "role", "web").has_value());
 
@@ -166,7 +166,7 @@ TEST_CASE("evaluate_scope: props.<key> atom with no CustomPropertiesStore ABORTS
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    registry.register_agent(info("agent-win"));
+    (void)registry.register_agent(info("agent-win"));
 
     auto expr = yuzu::scope::parse(R"(NOT props.role == "web")");
     REQUIRE(expr.has_value());

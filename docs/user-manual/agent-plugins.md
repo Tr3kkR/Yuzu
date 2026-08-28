@@ -65,6 +65,8 @@ Plugins for querying operating system details, hardware inventory, device identi
 | `disks` | Physical disk model, size, interface type, and health status. |
 | `drivers` | Installed device drivers: name, version, date, provider, and device class. Uses `Win32_PnPSignedDriver` on Windows (the query takes several seconds — the `device.hardware.drivers` definition gathers it with a daily TTL); loaded kernel modules via `/proc/modules` on Linux (module name only — version/date not available). Not supported on macOS. |
 
+**Sentinel rows.** Any field the underlying probe cannot read (WMI/DMI/`sysctl` call failed, or ran on an unsupported platform) is emitted as the literal string `unknown` rather than being omitted — this applies to `manufacturer`, `model`, `bios`, `processors`, `memory`, and `disks`. `drivers` additionally emits a `__truncated__` sentinel in the driver-name field on Windows when the WMI enumeration hit its row cap (`agents/shared/wmi_bounded.hpp`, 512 rows) — the reached count rides in the row-index column, and `__truncated__` cannot collide with a real `DeviceName`, so a consumer can distinguish "no more drivers" from "the list was cut short."
+
 ### device_identity
 
 | | |
@@ -225,22 +227,12 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Active network connections (similar to the `netstat` command-line tool). |
+| **Description** | Active network connections (similar to the `netstat` command-line tool), and socket-to-process attribution. |
 
 | Action | Description |
 |---|---|
 | `netstat_list` | List all TCP and UDP connections with local/remote address, port, state, and owning PID. |
-
-### sockwho
-
-| | |
-|---|---|
-| **Platforms** | W L M |
-| **Description** | Maps open sockets to the processes that own them. |
-
-| Action | Description |
-|---|---|
-| `sockwho_list` | For each listening or established socket, returns the owning process name and PID alongside connection details. |
+| `attribution` | Same enumeration, plus the owning process's name and executable path for each socket. Folds the retired `sockwho` plugin's functionality into netstat (#3403). On macOS, a socket shared across a fork (multiple processes holding the same fd) is deduplicated to one owner row, matching `netstat_list` — unlike the retired `sockwho`, which emitted one row per (pid, fd). |
 
 ### network_diag
 
@@ -333,9 +325,9 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list` | All installed applications with name, version, publisher, and install date. Windows machine-scope only — the `HKCU` read is the agent's own service-account hive, never a logged-in user's; see `list_per_user` for per-user apps. |
-| `query` | Search installed applications by name pattern. |
-| `list_per_user` | Available on all three platforms as an alternative to the machine-scope `list` path, but only Windows is a genuine per-local-profile walk — see each platform's actual scope below. **Windows**: walks each local profile's registry hive via the shared ladder in `agents/shared/win_profiles.hpp` (#2771) — loaded `HKU\<SID>` hives read live, logged-out profiles mounted offline. Rows: `user_app\|<username>\|<name>\|<version>\|<publisher>\|<install_date>`; `username` is the resolved profile name or `-` when unresolvable (never the SID, ADR-0024 D11). May also emit `error\|profile_list_unreadable`, `warning\|profile_list_truncated at 512 entries`, `warning\|privilege_missing: …` (a logged-out profile's apps could not be read because the offline-mount privileges could not be enabled), and `warning\|hive_unload_failed: …` (a leaked offline mount). **Linux**: system-wide packages (dpkg/rpm/pacman), reported with `username=system` since Linux package managers have no per-user install concept. **macOS**: system apps (`system_profiler`) reported with `username=system`, plus per-user Homebrew formulae (`brew list --versions`, run as the calling account) reported with `username=brew`. |
+| `list` | All installed applications with name, version, publisher, and install date. Windows machine-scope only — the `HKCU` read is the agent's own service-account hive, never a logged-in user's; see `list_per_user` for per-user apps. On Linux/macOS, if the underlying enumeration (dpkg-query/rpm/pacman/apk/system_profiler) does not complete on its own terms — timeout, kill, spawn failure, truncation, or a nonzero exit — the action emits a single `error\|installed_apps: acquisition degraded (...)` row and returns nonzero rather than reporting an empty or partial list as complete (Wave 4 PR4.3a). Windows has no such signal today: a partial registry walk still reports success. |
+| `query` | Search installed applications by name pattern. Same degraded-acquisition `error\|...` behaviour as `list` on Linux/macOS. |
+| `list_per_user` | Available on all three platforms as an alternative to the machine-scope `list` path, but only Windows is a genuine per-local-profile walk — see each platform's actual scope below. **Windows**: walks each local profile's registry hive via the shared ladder in `agents/shared/win_profiles.hpp` (#2771) — loaded `HKU\<SID>` hives read live, logged-out profiles mounted offline. Rows: `user_app\|<username>\|<name>\|<version>\|<publisher>\|<install_date>`; `username` is the resolved profile name or `-` when unresolvable (never the SID, ADR-0024 D11). May also emit `error\|profile_list_unreadable`, `warning\|profile_list_truncated at 512 entries`, `warning\|privilege_missing: …` (a logged-out profile's apps could not be read because the offline-mount privileges could not be enabled), and `warning\|hive_unload_failed: …` (a leaked offline mount). **Linux**: system-wide packages (dpkg/rpm/pacman), reported with `username=system` since Linux package managers have no per-user install concept; same degraded-acquisition `error\|installed_apps: acquisition degraded (...)` behaviour as `list`. **macOS**: system apps (`system_profiler`) reported with `username=system`, plus per-user Homebrew formulae (`brew list --versions`, run as the calling account) reported with `username=brew`; either leg degrading emits the same `error\|installed_apps: acquisition degraded (...)` row. |
 
 ### msi_packages
 
@@ -346,8 +338,8 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list` | All installed packages with name, version, and location. On macOS, `pkgutil` receipts (reverse-domain identifier, derived name, version, install location). |
-| `product_codes` | Package identifiers — MSI product code GUIDs (Windows) or reverse-domain `pkgutil` identifiers (macOS). Useful for silent uninstall automation. |
+| `list` | All installed packages with name, version, and location. On macOS, `pkgutil` receipts (reverse-domain identifier, derived name, version, install location). On macOS, if `pkgutil` does not complete on its own terms (timeout, kill, spawn failure, truncation, or a nonzero exit — on either the initial enumeration or any per-receipt lookup) the action emits a single `error\|msi_packages: acquisition degraded (...)` row and returns nonzero rather than reporting an empty or partial list as complete (Gate-8 governance remediation, Wave 4 PR4.3a). |
+| `product_codes` | Package identifiers — MSI product code GUIDs (Windows) or reverse-domain `pkgutil` identifiers (macOS). Useful for silent uninstall automation. Same degraded-acquisition `error\|...` behaviour as `list` on macOS. |
 
 ### windows_updates
 
@@ -416,7 +408,7 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | Action | Description |
 |---|---|
 | `state` | Whether the firewall is enabled, per profile (domain, private, public on Windows). On macOS, reports the Application Firewall global state (`backend\|appfirewall` + `state\|…`, plus `mode\|block_all` when block-all is set) and a secondary `pf\|<state>` row for the pf packet filter. `state\|unknown` means the check output was unreadable or unrecognised — never assumed safe; `pf\|unknown` is expected on agents not running as root (reading `/dev/pf` needs root) and is not a fault. |
-| `rules` | List firewall rules with direction, action, port, and protocol. |
+| `rules` | List firewall rules with direction, action, port, and protocol. On Linux, the nftables backend (probed before ufw/iptables) reports only base-chain hook/policy and per-rule table/chain/handle — no per-rule action/port/protocol (expression-level decoding is out of scope); the ufw/iptables fallback rows do carry action. |
 
 ### bitlocker
 
@@ -434,9 +426,9 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v1.0.0 |
+| **Version** | v1.1.0 |
 | **Platforms** | W L M |
-| **Description** | Query OS event logs. Uses Windows Event Log API, `journalctl` on Linux, and macOS unified log. |
+| **Description** | Query OS event logs. Reads in-process via the Windows Event Log API (wevtapi) on Windows and `sd_journal` on Linux — falling back to a bounded `journalctl` invocation where libsystemd is unavailable or the journal cannot be read — and the unified log (`log show`) on macOS. A read that fails, is denied, or is cut short by its bound reports a typed status rather than an empty result. |
 
 | Action | Description |
 |---|---|
@@ -531,14 +523,14 @@ Supported indicator types for the `check` action:
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Network quarantine for compromised or suspicious devices. Uses `netsh` on Windows, `iptables`/`nftables` on Linux, and `pfctl` on macOS. |
+| **Description** | Network quarantine for compromised or suspicious devices. Uses `netsh` on Windows, `iptables` **and `ip6tables`** on Linux, and `pfctl` on macOS. There is no `nftables` path — an earlier version of this line claimed one. On a dual-stack Linux host both families are contained, so a whitelist must name the management server's IPv6 address as well as its IPv4 one or the device can be stranded on its next reconnect; see [Security Hardening](security-hardening.md#whitelisting-on-a-dual-stack-host-read-this-before-quarantining-one). |
 
 | Action | Description |
 |---|---|
 | `quarantine` | Isolate the device by blocking all network traffic except the Yuzu server connection. |
-| `unquarantine` | Remove quarantine rules and restore normal network access. |
+| `unquarantine` | Remove quarantine rules and restore normal network access. Reports `release_uncertain` rather than `released` when the teardown could not be confirmed. |
 | `status` | Check whether quarantine is currently active. |
-| `whitelist` | Add an IP or CIDR range to the quarantine exception list. |
+| `whitelist` | Add an IP or CIDR range to the quarantine exception list — the repair path for a contained device whose whitelist is wrong. **On macOS this action is itself a quarantine-time operation**: it rebuilds and reloads the whole pf ruleset, which includes the `block all` default-deny, and enables pf — so dispatching it at a device that is not already quarantined will isolate it. Check `status` first if unsure. |
 
 ---
 

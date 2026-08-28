@@ -28,7 +28,7 @@ columns are elsewhere:
 | MFA TOTP secrets | Postgres `auth.users.mfa_totp_secret` | **`SecretCodec`-encrypted (shipped 2026-07-16)** — see the Update below |
 | Webhook signing secrets | `webhooks.db` `webhooks.secret` | plaintext (omitted from `list()`) |
 | Offload-target credentials | `offload_targets.db` `auth_credential` | plaintext |
-| OIDC client secret | `runtime_config.db` (`oidc_client_secret` key) | plaintext |
+| OIDC client secret | Postgres `runtime_config_store.runtime_config_secrets.sealed_value` | **`SecretCodec`-encrypted (ADR-0060)** |
 
 > Historical note: the original table (2026-06-10) also listed a `sessions.session_token`
 > row against the then-SQLite `auth.db`. The `auth`/`scim_store` Postgres cutover (ADR-0006

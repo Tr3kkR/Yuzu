@@ -23,9 +23,10 @@ namespace yuzu::server {
 /// still see that a secret is set and who set it.
 ///
 /// Safe under EITHER input: it omits a secret's value whether it was handed redacted
-/// or plaintext entries, so a future caller who wires `get_all_with_secrets()` into
-/// it does not leak. That is deliberate -- do not "simplify" it into trusting the
-/// caller to have redacted first.
+/// or plaintext entries (`is_secret_key()` decides, not whether the caller already
+/// redacted), so a future caller building a `RuntimeConfigEntry` list some OTHER way
+/// still does not leak through this function. That is deliberate -- do not
+/// "simplify" it into trusting the caller to have redacted first.
 ///
 /// `is_set` is derived from a non-empty value, which is why `get_all()` leaves an
 /// EMPTY secret empty rather than placeholdering it.
