@@ -164,6 +164,7 @@ check() { # check <label> <condition-cmd...>
 # call; the status is the compile+run chain's, never the cleanup's.
 cxx23_probe() (
   d="$(mktemp -d)" || exit 1
+  # shellcheck disable=SC2154  # rc is assigned inside the trap string
   trap 'rc=$?; rm -rf -- "$d"; exit "$rc"' EXIT
   printf '#include <print>\n#include <expected>\nint main(){std::println("{}", std::expected<int,int>{1}.value());}\n' > "$d/c23.cpp" \
     && g++ -std=c++23 "$d/c23.cpp" -o "$d/c23" \
@@ -496,7 +497,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
     ok "initdb complete"
   fi
 
-  if systemctl is-active --quiet postgresql; then
+  if probe systemctl is-active --quiet postgresql; then
     skip "postgresql already running"
   else
     run sudo systemctl enable --now postgresql

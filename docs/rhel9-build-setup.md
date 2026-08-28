@@ -412,7 +412,7 @@ today this is a documented limitation rather than something the setup script can
 | `server pg unit tests shard B` TIMEOUT / SIGKILL after 600 s | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
 | `permission denied to terminate process` in test output | Same — trap 4. |
 | `near "RETURNING": syntax error` from a Python script | System SQLite is 3.34.1; `RETURNING` needs 3.35+. Known limitation, see above. |
-| pip: `Could not find a version that satisfies the requirement meson==1.12.0` (with `Ignored the following versions that require a different python version`) | You asked the 3.9 `python3` for the CI pin. This recipe installs `meson==1.11.2`; the python3.12 route is #3696. |
+| pip: `Could not find a version that satisfies the requirement meson==1.12.0` (the listed versions stop at 1.11.2) | You asked the 3.9 `python3` for the CI pin. This recipe installs `meson==1.11.2`; the python3.12 route is #3696. |
 | `[fail] sudo is required` | Stock container images and minimal installs have no `sudo`. As root: `dnf install -y sudo`. |
 | vcpkg `openssl` port fails in `Configure` | Missing perl modules. Install `perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html`. |
 | vcpkg `libpq` port fails looking for `bison`/`flex` | Those two packages are not installed. |
