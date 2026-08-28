@@ -106,7 +106,18 @@ TEST_CASE("VulnFindingStore ctor fail-closed + idempotent migration", "[pg][vuln
         CHECK_FALSE(store.is_open());
     }
     SECTION("good pool → is_open; re-construct is idempotent") {
-        YUZU_REQUIRE_PG_DB(db);
+        // YUZU_REQUIRE_PG_MIGRATION_DB is NOT this TEST_CASE's first
+        // statement (unlike every other of the 44 migration-skip sites) —
+        // safe ONLY because this is Catch2's LAST SECTION in this
+        // TEST_CASE with nothing shared following it: each SECTION gets
+        // its own full re-invocation of the TEST_CASE body, so a Windows
+        // SKIP here unwinds only THIS invocation (this section never runs
+        // on Windows) and never touches the sibling "broken pool" SECTION
+        // above, which runs to completion in its own separate invocation
+        // either way. If a third SECTION or trailing shared code is ever
+        // added to this TEST_CASE, move this macro to guard only itself —
+        // do not assume this placement generalizes.
+        YUZU_REQUIRE_PG_MIGRATION_DB(db);
         PgPool pool{{.conninfo = db.dsn(), .size = 4}};
         REQUIRE(pool.valid());
         VulnFindingStore s1{pool};
@@ -436,7 +447,7 @@ TEST_CASE("VulnFindingStore bad row rolls the whole batch back", "[pg][vuln][sto
 
 // (14) migration idempotency (construct twice on the same DB).
 TEST_CASE("VulnFindingStore migration is idempotent", "[pg][vuln][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     VulnFindingStore a{pool};

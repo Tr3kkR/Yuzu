@@ -28,6 +28,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <libpq-fe.h>
 
@@ -37,6 +38,7 @@
 #include <vector>
 
 using namespace yuzu::server;
+using Catch::Matchers::ContainsSubstring;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -135,7 +137,7 @@ yuzu::test::PgTestTemplate policy_store_tpl{
 // ============================================================================
 
 TEST_CASE("PolicyStore reports !is_open on a migration failure", "[policy_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -281,6 +283,13 @@ TEST_CASE("PolicyStore: create fragment with wrong kind", "[policy_store][pg][fr
 
     auto result = store.create_fragment("kind: Policy\nname: oops\n");
     REQUIRE(!result.has_value());
+    CHECK_THAT(result.error(), ContainsSubstring("kind must be 'PolicyFragment'"));
+    // Issue #621: error must include a worked example so operators sending
+    // partial YAML (or sending `kind` as a request param) get unstuck without
+    // having to find the docs separately. The prefix above stays stable so
+    // existing scripts that grep on it keep working.
+    CHECK_THAT(result.error(), ContainsSubstring("apiVersion: yuzu.io/v1alpha1"));
+    CHECK_THAT(result.error(), ContainsSubstring("docs/user-manual/policy-engine.md"));
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
     CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
     CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
@@ -293,6 +302,12 @@ TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][pg][
 
     auto result = store.create_fragment("name: no-kind\ndescription: missing kind field\n");
     REQUIRE(!result.has_value());
+    CHECK_THAT(result.error(), ContainsSubstring("kind must be 'PolicyFragment'"));
+    CHECK_THAT(result.error(), ContainsSubstring("apiVersion: yuzu.io/v1alpha1"));
+    // Governance Gate 7 (consistency S2 / QA SHOULD): docs link must be
+    // pinned on this branch too — not just the wrong-kind branch — so the
+    // operator-facing UX is symmetric across both `kind`-failure modes.
+    CHECK_THAT(result.error(), ContainsSubstring("docs/user-manual/policy-engine.md"));
     CHECK(result.error().find("kind must be 'PolicyFragment'") != std::string::npos);
     CHECK(result.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
     CHECK(result.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
@@ -449,7 +464,7 @@ scope:
 )";
     auto result = store.create_policy(yaml);
     REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().find("fromResultSet") != std::string::npos);
+    CHECK_THAT(result.error(), ContainsSubstring("fromResultSet"));
 }
 
 TEST_CASE("PolicyStore: scalar scope.fromResultSet is also rejected (#1221 MEDIUM-1)",
@@ -470,7 +485,7 @@ scope: from_result_set:rs_abc
 )";
     auto result = store.create_policy(yaml);
     REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().find("fromResultSet") != std::string::npos);
+    CHECK_THAT(result.error(), ContainsSubstring("fromResultSet"));
 
     std::string yaml2 = R"(
 apiVersion: yuzu.io/v1alpha1
@@ -482,7 +497,7 @@ scope: ostype == "windows" AND from_result_set:rs_abc
 )";
     auto result2 = store.create_policy(yaml2);
     REQUIRE_FALSE(result2.has_value());
-    CHECK(result2.error().find("fromResultSet") != std::string::npos);
+    CHECK_THAT(result2.error(), ContainsSubstring("fromResultSet"));
 }
 
 TEST_CASE("PolicyStore: inline flow-mapping scope is rejected (UP-6)",
@@ -503,7 +518,7 @@ scope: {selector: {platform: windows}}
 )";
     auto result = store.create_policy(yaml);
     REQUIRE_FALSE(result.has_value());
-    CHECK(result.error().find("inline flow-mapping") != std::string::npos);
+    CHECK_THAT(result.error(), ContainsSubstring("inline flow-mapping"));
 }
 
 TEST_CASE("PolicyStore: query policies with filters", "[policy_store][pg][policy]") {
@@ -677,6 +692,11 @@ TEST_CASE("PolicyStore: create policy with wrong kind", "[policy_store][pg][poli
 
     auto r = store.create_policy("kind: PolicyFragment\nname: wrong\n");
     REQUIRE(!r.has_value());
+    CHECK_THAT(r.error(), ContainsSubstring("kind must be 'Policy'"));
+    // Issue #621: same UX expectation as create_fragment — operators must
+    // see a worked example in the error body, not just the prefix.
+    CHECK_THAT(r.error(), ContainsSubstring("apiVersion: yuzu.io/v1alpha1"));
+    CHECK_THAT(r.error(), ContainsSubstring("docs/user-manual/policy-engine.md"));
     CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
     CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
     CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
@@ -689,9 +709,9 @@ TEST_CASE("PolicyStore: create policy with missing kind", "[policy_store][pg][po
 
     auto r = store.create_policy("name: no-kind\ndescription: missing kind field\n");
     REQUIRE(!r.has_value());
-    CHECK(r.error().find("kind must be 'Policy'") != std::string::npos);
-    CHECK(r.error().find("apiVersion: yuzu.io/v1alpha1") != std::string::npos);
-    CHECK(r.error().find("docs/user-manual/policy-engine.md") != std::string::npos);
+    CHECK_THAT(r.error(), ContainsSubstring("kind must be 'Policy'"));
+    CHECK_THAT(r.error(), ContainsSubstring("apiVersion: yuzu.io/v1alpha1"));
+    CHECK_THAT(r.error(), ContainsSubstring("docs/user-manual/policy-engine.md"));
 }
 
 TEST_CASE("PolicyStore: create policy with missing fragment", "[policy_store][pg][policy]") {
@@ -702,7 +722,7 @@ TEST_CASE("PolicyStore: create policy with missing fragment", "[policy_store][pg
     auto yaml = make_policy_yaml("nonexistent-fragment-id");
     auto r = store.create_policy(yaml);
     REQUIRE(!r.has_value());
-    CHECK(r.error().find("not found") != std::string::npos);
+    CHECK_THAT(r.error(), ContainsSubstring("not found"));
 }
 
 TEST_CASE("PolicyStore: create policy without fragment field", "[policy_store][pg][policy]") {
@@ -718,7 +738,7 @@ description: missing fragment field
 )";
     auto r = store.create_policy(yaml);
     REQUIRE(!r.has_value());
-    CHECK(r.error().find("fragment") != std::string::npos);
+    CHECK_THAT(r.error(), ContainsSubstring("fragment"));
 }
 
 // ============================================================================
@@ -811,7 +831,7 @@ TEST_CASE("PolicyStore: update agent status with invalid status", "[policy_store
 
     auto r = store.update_agent_status("pol-1", "agent-1", "garbage");
     REQUIRE(!r.has_value());
-    CHECK(r.error().find("invalid status") != std::string::npos);
+    CHECK_THAT(r.error(), ContainsSubstring("invalid status"));
 }
 
 TEST_CASE("PolicyStore: update agent status with empty IDs", "[policy_store][pg][compliance]") {
@@ -1127,7 +1147,7 @@ TEST_CASE("PolicyStore: invalidate empty policy ID", "[policy_store][pg][invalid
 
     auto r = store.invalidate_policy("");
     REQUIRE(!r.has_value());
-    CHECK(r.error().find("required") != std::string::npos);
+    CHECK_THAT(r.error(), ContainsSubstring("required"));
 }
 
 TEST_CASE("PolicyStore: invalidate all policies", "[policy_store][pg][invalidation]") {

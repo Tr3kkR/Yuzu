@@ -368,7 +368,7 @@ TEST_CASE("InventoryStore migration upgrades published v2 and repairs the incomp
     // Migration tests deliberately use one private database rather than the
     // pre-migrated shared fixture: both scenarios rewrite schema_meta and DDL.
     // Reusing that one database keeps this regression cheap on the [pg] shard.
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
 

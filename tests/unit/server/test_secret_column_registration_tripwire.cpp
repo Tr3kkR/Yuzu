@@ -57,7 +57,7 @@ using yuzu::server::pg::SecretCodec;
 TEST_CASE("SecretCodec registered-column trip-wire: production AuthDB registration is exactly "
           "{auth, users, mfa_totp_secret, id} (#2530)",
           "[pg][secret_codec][kek][tripwire]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     yuzu::test::TempDir keys{"yuzu_test_"};
     FileKeyProvider provider(keys.path);
