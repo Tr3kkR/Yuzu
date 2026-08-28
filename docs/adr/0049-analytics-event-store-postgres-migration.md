@@ -275,8 +275,9 @@ A second, separate divergence from the sibling PG-backed stores, found and close
   tests, which call `stop_drain()` then read `pending_count()` to observe final state — the
   intended, established usage, not a test bug. Root cause was never actually reachable for these
   two methods: their sole production callers are `web_server_->Get(...)` HTTP handlers, and
-  `server.cpp`'s `web_thread_` join (with its own bounded wait/`_Exit` escalation) completes well
-  before `pg_pool_.reset()` runs — no in-flight handler can still be here when the pool is freed.
+  `server.cpp`'s `web_thread_` join (with its own bounded wait/`_Exit` escalation) completes
+  strictly before `pg_pool_.reset()` runs — every httplib worker thread, including any in-flight
+  analytics handler, is already joined by then. That's a join ordering, not a timing margin.
   The gate was defense-in-depth for a caller that doesn't exist on these two paths; removed. This
   first surfaced on CI's initial real `[pg]` execution (these tests skip locally without
   `YUZU_TEST_ENABLE_PG`) — verified by hand against a real local Postgres before re-pushing.

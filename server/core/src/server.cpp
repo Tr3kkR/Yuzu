@@ -645,7 +645,7 @@ public:
                           "gauge");
         metrics_.describe("yuzu_http_held_open_responses",
                           "SSE responses held open right now across ALL surfaces (MCP GET, "
-                          "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events) — "
+                          "MCP streamed POST, /api/v1/events, dashboard drawer, legacy /events) - "
                           "each pins one HTTP worker thread",
                           "gauge");
         metrics_.describe("yuzu_http_held_open_capacity",
@@ -655,7 +655,7 @@ public:
         metrics_.describe("yuzu_http_worker_pool_size", "Shared HTTP worker pool size", "gauge");
         metrics_.gauge("yuzu_http_held_open_responses").set(0);
         metrics_.describe("yuzu_mcp_streams_handover_pending",
-                          "Superseded MCP SSE streams still draining — each still pins a worker",
+                          "Superseded MCP SSE streams still draining - each still pins a worker",
                           "gauge");
         // The EFFECTIVE cap, after the boot-time clamp. Without this an operator who set
         // --max-sse-streams and is being rejected at 12 has only a boot log line to
@@ -667,14 +667,14 @@ public:
                           "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
                           "Ships 1: the four defects that gated the on-by-default flip "
                           "(#2739, #2740, #2785, #2789) are fixed. Size shutdown grace per the "
-                          "Sizing bullet in docs/user-manual/server-admin.md — that guidance is "
+                          "Sizing bullet in docs/user-manual/server-admin.md - that guidance is "
                           "now the default posture. If this reads 0, the operator opted out "
                           "with --no-mcp-streamed-post.",
                           "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_frames_dropped_total",
-                          "Frames dropped before reaching a connection's per-connection queue — "
+                          "Frames dropped before reaching a connection's per-connection queue - "
                           "usually a slow consumer's queue overflow, also a rare producer-side "
                           "post-commit allocation failure (#2366); recoverable via Last-Event-ID",
                           "counter");
@@ -683,7 +683,7 @@ public:
                           "per-session replay-ring byte budget",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_replay_ring_evictions_total",
-                          "Frames evicted from a session's bounded replay ring — a client whose "
+                          "Frames evicted from a session's bounded replay ring - a client whose "
                           "cursor falls behind gets a 404 and must re-initialize",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_rejects_total",
@@ -693,7 +693,7 @@ public:
                           // reject is counted by the bridge's own
                           // yuzu_mcp_bridge_reject_total. Two families, split by who
                           // refused, not by surface.
-                          "MCP SSE stream denials by reason — GET attach denials plus "
+                          "MCP SSE stream denials by reason - GET attach denials plus "
                           "streamed-POST admission denials",
                           "counter");
         metrics_.describe("yuzu_mcp_initialize_protocol_total",
@@ -708,13 +708,13 @@ public:
                           "stops the execution - it detaches the response only",
                           "counter");
         metrics_.describe("yuzu_mcp_stream_publish_failures_total",
-                          "publish() exception-boundary catches — a producer's frame "
+                          "publish() exception-boundary catches - a producer's frame "
                           "construction failed before commit (#2366); the frame was never "
                           "published and no event id was consumed",
                           "counter");
         metrics_.describe("yuzu_mcp_tool_security_misconfig_total",
                           "MCP tools/call denials for a served tool with no security "
-                          "registration (C8 fail-closed, #2383) — the boot validator makes "
+                          "registration (C8 fail-closed, #2383) - the boot validator makes "
                           "this state unbootable, so any non-zero value means it was "
                           "bypassed; alert on > 0 "
                           "(docs/ops-runbooks/mcp-tool-registration-recovery.md)",
@@ -731,14 +731,14 @@ public:
                           "on another surface, or a store failure at either step. A store "
                           "failure is already exposed to the caller through the A4 retry "
                           "envelope (-32603 vs -32003); what stays withheld is the split "
-                          "WITHIN a -32003 consume denial — a foreign-origin ticket reads "
+                          "WITHIN a -32003 consume denial - a foreign-origin ticket reads "
                           "exactly like an ordinary replay, so this counter deliberately "
                           "carries NO reason label, and /metrics is not a stronger reader "
                           "than the caller. Read the audit trail for the kind",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_masked_denials_total",
                           "MCP approval-ticket recalls refused by a store fault at a point "
-                          "where the #2442 cross-surface origin check could not run — the "
+                          "where the #2442 cross-surface origin check could not run - the "
                           "lookup step, or the consume step's own origin-check read (#2786 "
                           "arm 1). A foreign-origin ticket is exactly as likely to be behind "
                           "one of these refusals as an innocent one while the fault holds, so "
@@ -749,25 +749,25 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
                           "MCP approval-ticket recalls refused by a pre-consume precondition "
-                          "(#2443) — the ticket matched and was approved, but the underlying "
+                          "(#2443) - the ticket matched and was approved, but the underlying "
                           "operation's live state had already moved on since mint. A subset "
                           "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
                           "the masked-denial split above, a precondition denial is already "
                           "distinguishable to the caller from the response body, so this "
-                          "carries no anti-oracle restriction — it is not a `reason` label on "
+                          "carries no anti-oracle restriction - it is not a `reason` label on "
                           "the shared counter because the shared counter's other kinds "
                           "(foreign-origin vs ordinary replay) still must not be",
                           "counter");
         metrics_.describe("yuzu_mcp_approval_burned_total",
                           "MCP approval-ticket recalls that SUCCESSFULLY consumed a one-time, "
                           "human-approved ticket and then still failed at the tool handler "
-                          "(#2444 item 3) — args that pass the published input schema (the "
+                          "(#2444 item 3) - args that pass the published input schema (the "
                           "#2441 pre-consume gate) but fail the handler's own business/state "
                           "check, plus any handler-side infra failure (e.g. a degraded store) "
                           "discovered only after consume_ticket() has already spent the "
                           "ticket. Distinct from the three counters above, which all fire "
                           "BEFORE a ticket is consumed; this one only fires after. reason is a "
-                          "single literal today (handler_reject) — see the mcp_audit lambda in "
+                          "single literal today (handler_reject) - see the mcp_audit lambda in "
                           "mcp_server.cpp for the exact scope. Does not interact with the "
                           "kMcpSubmitterPendingCap 25-slot cap: a ticket leaves the pending "
                           "bucket at admin-approval time, before it can ever reach this class",
@@ -823,7 +823,7 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
                           "Terminal-frame publish failures seen by the bridge's "
-                          "publish_final → fallback → poison ladder (Decision 15(f))",
+                          "publish_final -> fallback -> poison ladder (Decision 15(f))",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_projector_cycles_total",
                           "Progress-bridge projector wake cycles. An event-driven liveness signal: "
@@ -1290,7 +1290,7 @@ public:
         }
         metrics_.describe("yuzu_server_dispatch_tag_invalid_total",
                           "ClassifiedCommands whose dispatch_tag failed to decode at the send "
-                          "path — a defensive check behind the type invariant, so any non-zero "
+                          "path - a defensive check behind the type invariant, so any non-zero "
                           "value is a server-side defect.",
                           "counter");
         metrics_.counter("yuzu_server_dispatch_tag_invalid_total");
@@ -1347,8 +1347,8 @@ public:
             "unmeasurable: a chunked/undeclared body refused outright for a "
             "class that requires one it can size; unsupported_encoding: a "
             "non-identity Content-Encoding, refused on every class; "
-            "over_cap_post_read: the body was read in full — because it could not be "
-            "sized in advance — and turned out to be over the class's cap)",
+            "over_cap_post_read: the body was read in full - because it could not be "
+            "sized in advance - and turned out to be over the class's cap)",
             "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
@@ -1409,7 +1409,7 @@ public:
                           "PostgreSQL pool connections currently open (leased + idle)", "gauge");
         metrics_.describe("yuzu_pg_pool_size", "PostgreSQL pool configured maximum size", "gauge");
         metrics_.describe("yuzu_pg_pool_waiters",
-                          "Threads currently blocked waiting for a PostgreSQL pool connection — "
+                          "Threads currently blocked waiting for a PostgreSQL pool connection - "
                           "the saturation signal between fully-leased and an acquire timeout",
                           "gauge");
         metrics_.describe("yuzu_pg_connect_failed_total",
@@ -1421,7 +1421,7 @@ public:
         metrics_.describe("yuzu_pg_unhealthy_discard_total",
                           "Total PostgreSQL connections discarded as unhealthy on return", "counter");
         metrics_.describe("yuzu_pg_acquire_wait_seconds",
-                          "Wall time spent waiting to acquire a PostgreSQL pool connection — the "
+                          "Wall time spent waiting to acquire a PostgreSQL pool connection - the "
                           "leading pool-saturation indicator",
                           "histogram");
         // Birth the series with the extended 10-60s buckets ONCE here (#1686) so the
@@ -1434,7 +1434,7 @@ public:
                           "(stored/touched/need_full/error/dropped/rejected)",
                           "counter");
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
-                          "Time to apply one inventory source's report — the pooled-connection + "
+                          "Time to apply one inventory source's report - the pooled-connection + "
                           "transaction hold time per ingest, by source and phase "
                           "(full = full-payload replace; hash_only = hash-skip compare)",
                           "histogram");
@@ -1448,16 +1448,16 @@ public:
                           "(pool_acquire_timeout/query_error = a check denied fail-closed rather "
                           "than returning data; generation_refresh_failed = the cross-replica "
                           "generation/enabled-flag refresh failed PAST the bounded ~5s stale-serve "
-                          "window and the perm cache was dropped — denying; "
+                          "window and the perm cache was dropped - denying; "
                           "generation_refresh_failed_within_bound/rbac_enabled_non_canonical/"
-                          "stale_beyond_accepted_bound are OBSERVE-ONLY — the store still served "
+                          "stale_beyond_accepted_bound are OBSERVE-ONLY - the store still served "
                           "its existing decision from cache, this counts a data-quality or "
-                          "staleness condition rather than a denied check — see the alert's "
+                          "staleness condition rather than a denied check - see the alert's "
                           "reason filter before assuming any nonzero rate here pages). "
                           "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
-                          "availability event, not mass access-denial — alert on it. "
+                          "availability event, not mass access-denial - alert on it. "
                           "A circuit-breaker-open denial (#2703 Gate 7 item 1 commit B) is recorded "
-                          "under pool_acquire_timeout, not a distinct reason — it is one of that "
+                          "under pool_acquire_timeout, not a distinct reason - it is one of that "
                           "reason's own two contributing failure modes (see "
                           "yuzu_server_rbac_breaker_open for whether the pool is actually being "
                           "touched right now).",
@@ -1467,7 +1467,7 @@ public:
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
         metrics_.describe("yuzu_server_rbac_backfill_total",
-                          "One-time legacy rbac.db → rbac_store PostgreSQL backfill outcome on "
+                          "One-time legacy rbac.db -> rbac_store PostgreSQL backfill outcome on "
                           "first PG boot, by result (fresh = no legacy DB, marked complete; "
                           "completed = migrated + reconciled; failed = fail-closed, boot refused, "
                           "next start retries).",
@@ -1489,7 +1489,7 @@ public:
             "yuzu_server_rbac_authz_check_seconds",
             "End-to-end latency of RbacStore::check_permission (acquire + query + "
             "cache lookup, all outcomes including cache hits and breaker-denied "
-            "fast paths) — NOT the same as yuzu_pg_acquire_wait_seconds, which "
+            "fast paths) - NOT the same as yuzu_pg_acquire_wait_seconds, which "
             "reads fast even when the acquire succeeds but the query itself "
             "blocks (e.g. cancelled by PgPool's injected lock_timeout).",
             "histogram");
@@ -1506,10 +1506,10 @@ public:
         metrics_.describe(
             "yuzu_server_rbac_breaker_open",
             "1 when the authz-hot-path fail-fast breaker is open (2 consecutive "
-            "pool-acquire-timeout or query-error failures — #2703 Gate 7 item 1 "
+            "pool-acquire-timeout or query-error failures - #2703 Gate 7 item 1 "
             "commit B), 0 when closed. While open, every authz check on this "
             "replica is denied WITHOUT touching the pool except one probe per "
-            "kRbacGenerationRefreshMs. Per-process, per-replica — not fleet-wide.",
+            "kRbacGenerationRefreshMs. Per-process, per-replica - not fleet-wide.",
             "gauge");
         metrics_.gauge("yuzu_server_rbac_breaker_open");
         metrics_.describe("yuzu_inventory_read_degrade_total",
@@ -1517,7 +1517,7 @@ public:
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "generic — generic is the ADR-0037 InventoryStore). /readyz stays "
+                          "generic - generic is the ADR-0037 InventoryStore). /readyz stays "
                           "green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
@@ -1584,7 +1584,7 @@ public:
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",
             "Generic InventoryStore upsert calls that did not persist, by reason "
-            "(store_not_open/pool_acquire_timeout/query_error/invalid_key/stale) — the next "
+            "(store_not_open/pool_acquire_timeout/query_error/invalid_key/stale) - the next "
             "changed/full report re-sends the blob (weekly full floor), but a sustained "
             "non-zero rate means writes are silently not landing",
             "counter");
@@ -1596,18 +1596,18 @@ public:
             metrics_.counter("yuzu_inventory_ingest_dropped_total", {{"reason", reason}});
         metrics_.describe("yuzu_inventory_query_truncated_total",
                           "Generic InventoryStore query() calls whose result hit the effective "
-                          "row limit or aggregate byte cap — more rows may exist past what was "
+                          "row limit or aggregate byte cap - more rows may exist past what was "
                           "returned",
                           "counter");
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
-                          "staleness window (two missed daily cycles) — a freshness/liveness signal, "
+                          "staleness window (two missed daily cycles) - a freshness/liveness signal, "
                           "by source",
                           "gauge");
         metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
                           "Times the stale-agents freshness count could not be computed (pool "
                           "saturation / query timeout) and the yuzu_inventory_stale_agents gauge "
-                          "was held at its prior value — a non-zero rate means that gauge may be "
+                          "was held at its prior value - a non-zero rate means that gauge may be "
                           "frozen, not genuinely low",
                           "counter");
         // ResponseStore observability (ADR-0039). Described + seeded up front so
@@ -1617,31 +1617,31 @@ public:
         metrics_.describe("yuzu_server_response_ingest_dropped_total",
                           "Response result rows that did not persist (fail-soft ingest, ADR-0039), "
                           "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                          "malformed_identity_field) — the executions ladder still tracks the "
+                          "malformed_identity_field) - the executions ladder still tracks the "
                           "command; a sustained non-zero rate means drawer/TAR result history is "
                           "silently lossy. malformed_identity_field is distinct: an "
                           "instruction_id/execution_id/plugin containing an embedded NUL byte was "
-                          "rejected rather than silently truncated (#2691 UP-5) — a non-zero rate "
+                          "rejected rather than silently truncated (#2691 UP-5) - a non-zero rate "
                           "here means an agent sent a malformed identity field, not store "
                           "unhealth",
                           "counter");
         metrics_.describe("yuzu_server_response_read_degrade_total",
                           "Response reads that returned a degrade (nullopt, not empty) rather than "
                           "a result, by reason (store_not_open/pool_acquire_timeout/query_error) "
-                          "and source (response_store) — the seam distinguishes empty from "
+                          "and source (response_store) - the seam distinguishes empty from "
                           "degraded so a consumer can render a degrade banner, never misread a "
                           "blip as 'no responses'",
                           "counter");
         metrics_.describe("yuzu_server_response_reap_passes_total",
                           "TTL reap passes (clock-guarded gc_sweep, ADR-0039), by result "
                           "(swept = deleted the full expired set; capped = deleted the per-pass "
-                          "cap of 10000 and a backlog likely remains — sustained non-zero means "
+                          "cap of 10000 and a backlog likely remains - sustained non-zero means "
                           "expiry is outrunning the drain; noop = nothing expired; declined = "
                           "retention classifier vetoed a would-wipe/clock-ahead pass; "
                           "declined_no_anchor = first pass ever against a store with expired rows "
                           "present, declines once, the next pass drains; skipped_lock = another "
                           "replica held the advisory lock; failed = pass errored). Alert on the "
-                          "TOTAL (sum across result) not increasing, never on one label alone — "
+                          "TOTAL (sum across result) not increasing, never on one label alone - "
                           "see YuzuResponseReapNotRunning.",
                           "counter");
         // malformed_identity_field is a write-path-only reason (never a read
@@ -1721,17 +1721,17 @@ public:
         metrics_.describe("yuzu_fleet_agents_dex_observer_disarmed",
                           "Windows agents (DEX enabled) reporting their DEX signal observer is not "
                           "fully healthy (no channel armed, or a channel subscription dropped at "
-                          "runtime) — >0 means reliability telemetry is off or degraded on that "
+                          "runtime) - >0 means reliability telemetry is off or degraded on that "
                           "many endpoints. (Per-channel partial-arm granularity is a follow-up; "
                           "today this is the agent's own health flag.)",
                           "gauge");
         metrics_.describe("yuzu_fleet_dex_observed_total",
                           "Fleet-wide DEX signals observed (crashes, hangs, service failures, "
-                          "boot reports, …; sum of agent-reported counts since each agent "
+                          "boot reports, ...; sum of agent-reported counts since each agent "
                           "started)", "gauge");
         // D3 blast-radius detector observability (gov SRE OBS-1 / compliance S1).
         metrics_.describe("yuzu_server_dex_blast_radius_incidents_total",
-                          "Fleet-incident alerts fired (≥min_devices distinct devices, same "
+                          "Fleet-incident alerts fired (>=min_devices distinct devices, same "
                           "obs_type+subject, within the window)", "counter");
         metrics_.describe("yuzu_server_dex_blast_radius_fires_dropped_total",
                           "Incident fires suppressed by the global per-minute fan-out rate cap",
@@ -1748,7 +1748,7 @@ public:
         // sets a cohort export tag key in Settings → DEX alerts; absent otherwise).
         metrics_.describe("yuzu_fleet_perf_cohort_cpu_pct",
                           "Per-cohort device CPU utilization % (avg/p50/p90/max by {stat}; "
-                          "cohorts of the configured export tag key, ≥10 reporting devices)",
+                          "cohorts of the configured export tag key, >=10 reporting devices)",
                           "gauge");
         metrics_.describe("yuzu_fleet_perf_cohort_commit_pct",
                           "Per-cohort memory commit-charge % (avg/p50/p90/max by {stat})",
@@ -1766,7 +1766,7 @@ public:
                           "Operator-routed per-signal alerts fired (notification + dex.signal "
                           "webhook event)", "counter");
         metrics_.describe("yuzu_server_dex_alert_delivery_failed_total",
-                          "Routed alerts whose sink (notification/webhook) threw — fired but not "
+                          "Routed alerts whose sink (notification/webhook) threw - fired but not "
                           "delivered; the cooldown is already armed so the alert is lost until the "
                           "next episode", "counter");
         metrics_.describe("yuzu_server_dex_alert_suppressed_total",
@@ -1796,7 +1796,7 @@ public:
         // the comment above this block already names for their siblings.
         metrics_.describe("yuzu_server_webhook_delivery_secret_unavailable_total",
                           "Webhook deliveries skipped because the signing secret could not be "
-                          "decrypted (tamper, KEK loss, or a malformed blob) — never fired "
+                          "decrypted (tamper, KEK loss, or a malformed blob) - never fired "
                           "unsigned or with an empty secret",
                           "counter");
         metrics_.describe("yuzu_server_webhook_fire_event_degraded_total",
@@ -1806,7 +1806,7 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_webhook_delivery_log_failed_total",
                           "Delivery-log INSERTs (webhook_deliveries) that failed against an open "
-                          "store — the delivery itself still ran; only its record did not persist",
+                          "store - the delivery itself still ran; only its record did not persist",
                           "counter");
         metrics_.describe("yuzu_server_webhook_backfill_total",
                           "One-time legacy webhooks.db -> webhook_store PostgreSQL backfill "
@@ -1958,7 +1958,7 @@ public:
         // A4 fleet device-utilization rollup (heartbeat perf tags; absent when
         // no agent reports — never a fabricated zero).
         metrics_.describe("yuzu_fleet_perf_reporting",
-                          "Agents whose latest heartbeat carried at least ONE perf tag — the "
+                          "Agents whose latest heartbeat carried at least ONE perf tag - the "
                           "same any-of-three definition the /dex Performance tab's Reporting "
                           "card uses, so the two always agree. Each per-metric gauge may cover "
                           "a SUBSET of this population (its {stat} series carry their own n via "
@@ -1980,18 +1980,18 @@ public:
         // design (Windows + Linux retransmit rates are not comparable).
         metrics_.describe("yuzu_fleet_net_reporting",
                           "Agents (per `os`) whose latest heartbeat carried at least ONE network "
-                          "fact — the same any-of definition the /network Overview's Reporting card "
+                          "fact - the same any-of definition the /network Overview's Reporting card "
                           "uses", "gauge");
         metrics_.describe("yuzu_fleet_net_retrans_reporting",
                           "Agents (per `os`) that contributed an interval retransmit RATE to the "
                           "gauge this cycle (a subset of net_reporting{os}). Denominator for "
-                          "net_retrans_pct{stat,os}. Loss-validated OSes only (Linux today) — a "
+                          "net_retrans_pct{stat,os}. Loss-validated OSes only (Linux today) - a "
                           "Windows device reports a retransmit fact but it is withheld from the "
                           "gauge, so Windows is absent here", "gauge");
         metrics_.describe("yuzu_fleet_net_degraded",
                           "DORMANT (measurement-first), per `os`: absent unless an agent still emits "
                           "the retired net_degraded tag (e.g. mid rolling-upgrade). A degraded "
-                          "classification needs real-fleet baseline calibration (a later slice) — "
+                          "classification needs real-fleet baseline calibration (a later slice) - "
                           "treat ABSENT as 'not classified', never 0 as 'healthy'", "gauge");
         metrics_.describe("yuzu_fleet_net_rtt_ms",
                           "Fleet smoothed round-trip time in ms, by {stat,os}: avg / p50 / p90 / max "
@@ -2002,7 +2002,7 @@ public:
                           "rate (interval delta of retransmits / segments over recent heartbeats), "
                           "not the lifetime ratio. Loss-validated OSes only: Linux (netem-validated). "
                           "The Windows rate is system-wide (loopback-inclusive, biased low, "
-                          "unvalidated #1465) and is WITHHELD here — it shows on the /network page + "
+                          "unvalidated #1465) and is WITHHELD here - it shows on the /network page + "
                           "REST until validated. Never alert on a cross-OS aggregate", "gauge");
         metrics_.describe("yuzu_fleet_net_throughput_bps",
                           "Fleet device network throughput in bytes/s, by {stat,os}: avg / p50 / p90 "
@@ -2255,13 +2255,13 @@ public:
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
                           "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
                           "WAS USABLE; 0 if no pass has ever run on this DATABASE (seeded from "
-                          "the durable retention-meta anchor at startup, #2854 — survives a "
+                          "the durable retention-meta anchor at startup, #2854 - survives a "
                           "restart, including the first Postgres boot). A value of "
-                          "-9223372036854775808 (INT64_MIN) is a distinct anomaly sentinel — the "
-                          "durable anchor could not be read or trusted as a plausible integer — "
+                          "-9223372036854775808 (INT64_MIN) is a distinct anomaly sentinel - the "
+                          "durable anchor could not be read or trusted as a plausible integer - "
                           "not a genuine timestamp; self-corrects at the next pass whose own clock "
-                          "reading is plausible — even if that pass then declines or fails for an "
-                          "unrelated reason — but NOT at a pass refusing on its own implausible clock, "
+                          "reading is plausible - even if that pass then declines or fails for an "
+                          "unrelated reason - but NOT at a pass refusing on its own implausible clock, "
                           "which skips the stamp entirely (see below). Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
                           "is alive but refusing an implausible clock, which is a different fault "
@@ -2299,7 +2299,7 @@ public:
                           "counter");
         metrics_.describe("yuzu_device_token_unbound_legacy_total",
                           "Device-token validation refused because the stored row has "
-                          "empty device_id (W1.2 R2 HIGH-1/HIGH-2 — pre-#824 legacy)",
+                          "empty device_id (W1.2 R2 HIGH-1/HIGH-2 - pre-#824 legacy)",
                           "counter");
         metrics_.describe("yuzu_device_token_revoked_attempt_total",
                           "Replay attempt against a revoked device token", "counter");
@@ -2337,7 +2337,7 @@ public:
         metrics_.describe("yuzu_grpc_subscribe_peer_mismatch_total",
                           "Subscribe RPC rejected because the peer IP differs from the "
                           "Register peer IP and is not a trusted gateway (stolen-session "
-                          "signal, #1059). Labelled event=security (SIEM-routing tag — "
+                          "signal, #1059). Labelled event=security (SIEM-routing tag - "
                           "Splunk et al. ingest via their Prometheus receiver and filter "
                           "on event) and gateway_mode (true|false)",
                           "counter");
@@ -2389,7 +2389,7 @@ public:
                           "counter");
         metrics_.counter("yuzu_server_ca_reissue_blocked_total", {{"reason", "revoked_identity"}});
         metrics_.describe("yuzu_server_ca_revocation_sweep_read_failures_total",
-                          "Revocation-sweep tick's list_revoked_serials() read failed — that "
+                          "Revocation-sweep tick's list_revoked_serials() read failed - that "
                           "tick's sweep was skipped entirely rather than treating every live "
                           "agent as revoked (ADR-0053 UP-1). A sustained non-zero rate means "
                           "already-revoked agents' live streams may not be torn down promptly",
@@ -2408,7 +2408,7 @@ public:
         metrics_.describe("yuzu_register_denied_total",
                           "Register/ProxyRegister rejected an admin-denied agent before "
                           "consuming its enrollment token. Labelled source "
-                          "(direct|gateway_proxy) and event=security (SIEM-routing tag) — a "
+                          "(direct|gateway_proxy) and event=security (SIEM-routing tag) - a "
                           "persistently-denied identity hammering Register is a "
                           "credential-abuse signal",
                           "counter");
@@ -2449,6 +2449,30 @@ public:
         for (auto route : {"login", "mfa_verify", "mfa_stepup", "mfa_enroll", "elevate"}) {
             metrics_.counter("yuzu_auth_secret_unavailable_total", {{"route", route}});
         }
+        // #2396 / #2401: reason-labelled sibling of the counter above. Same
+        // fail-closed 503 sites in the initial POST /login handler, but split by
+        // WHY the auth store was unavailable — a transient pool-acquire timeout
+        // (reason=pool_acquire_timeout: the shared pool's connect-backoff
+        // breaker or saturation, the class the bounded acquire-retry in
+        // auth_db.cpp rides out) vs a query that ran and errored
+        // (reason=query_error) vs an undecryptable/absent secret
+        // (reason=secret_unavailable). Lets SRE tell a transient retry-storm
+        // apart from a uniform outage, which the route-only counter above cannot
+        // (#2401). Only the initial POST /login handler is instrumented; the
+        // other is_store_unavailable->503 auth sites (login/mfa, stepup, enroll,
+        // elevate) keep only yuzu_auth_secret_unavailable_total{route}. Reason
+        // token matches the yuzu_*_read_degrade_total family. Bounded, pre-seeded
+        // closed label set per docs/observability-conventions.md so absent()
+        // alerts stay meaningful.
+        metrics_.describe("yuzu_auth_read_degrade_total",
+                          "Requests refused 503 by an is_store_unavailable fail-closed guard in "
+                          "the initial POST /login handler, labelled by why the auth store was "
+                          "unavailable (pool_acquire_timeout / query_error / secret_unavailable)",
+                          "counter");
+        for (auto reason : {"pool_acquire_timeout", "query_error", "secret_unavailable"}) {
+            metrics_.counter("yuzu_auth_read_degrade_total",
+                             {{"route", "login"}, {"reason", reason}});
+        }
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -2475,7 +2499,7 @@ public:
                           "group_delete for Groups) and status (2xx|4xx|5xx)",
                           "counter");
         metrics_.describe("yuzu_scim_auth_failures_total",
-                          "Total /scim/v2/* requests rejected by the bearer gate — a "
+                          "Total /scim/v2/* requests rejected by the bearer gate - a "
                           "credential-guess/replay signal against a surface that can "
                           "provision/deprovision operator accounts",
                           "counter");
@@ -2484,14 +2508,14 @@ public:
                           "action on this surface, including the three termination actions "
                           "(deactivated/deleted/reactivated), is set-and-proceed: the mutation "
                           "already committed, so a lost audit row does not roll it back. This "
-                          "metric is the CC6.8 evidence-integrity alert signal — a sustained "
+                          "metric is the CC6.8 evidence-integrity alert signal - a sustained "
                           "non-zero rate means the SCIM audit trail has gaps, not that the "
                           "mutation itself failed",
                           "counter");
         metrics_.describe("yuzu_scim_provenance_denied_total",
                           "Total SCIM mutations refused because the target account's "
                           "provisioning_source is not 'scim' (or its role was elevated outside "
-                          "SCIM's ownership) — SCIM attempting to touch an account it does not "
+                          "SCIM's ownership) - SCIM attempting to touch an account it does not "
                           "own is a misconfigured-IdP or compromised-IdP signal",
                           "counter");
         // SCIM v2 Groups->role application core (#2021). Bumped only when
@@ -2525,14 +2549,14 @@ public:
         // yet. Mirrors every other SCIM counter in this block.
         metrics_.describe("yuzu_scim_deprovision_role_refused_with_active_link_total",
                           "Total SCIM deprovisions refused (#2021's role-refusal fork) for a "
-                          "slug that has at least one active linked OIDC identity — the "
+                          "slug that has at least one active linked OIDC identity - the "
                           "termination did NOT complete: the federated identity's tokens were "
                           "NOT auto-revoked and a human must terminate them manually",
                           "counter");
         metrics_.describe("yuzu_scim_deprovision_unlinked_total",
                           "ADR-2001 D2 tripwire: a deprovision resolved NO linked OIDC identity "
                           "for a slug, but a recorded login-observation claim value matches that "
-                          "slug's externalId — the user DID authenticate via OIDC but the "
+                          "slug's externalId - the user DID authenticate via OIDC but the "
                           "identity link never formed, almost certainly a misconfigured "
                           "--oidc-scim-link-claim (a deprovision that revoked nothing for a "
                           "federated user who exists)",
@@ -2545,7 +2569,7 @@ public:
         // failure.
         metrics_.describe("yuzu_scim_oidc_link_write_failures_total",
                           "Total ADR-2001 identity-link/login-observation writes that failed "
-                          "during OIDC login (ScimStore outage) — the login itself always "
+                          "during OIDC login (ScimStore outage) - the login itself always "
                           "succeeds (fail-OPEN by design), but a sustained non-zero rate means "
                           "identity links and/or D2 login observations are silently not being "
                           "recorded",
@@ -2562,7 +2586,7 @@ public:
         // alert rule to discover the series does not exist yet).
         metrics_.describe("yuzu_scim_saml_link_write_failures_total",
                           "Total ADR-2001 PR4a SAML identity-link/login-observation writes that "
-                          "failed during SAML login (ScimStore outage) — the login itself "
+                          "failed during SAML login (ScimStore outage) - the login itself "
                           "always succeeds (fail-OPEN by design), but a sustained non-zero rate "
                           "means SAML identities are silently not being linked and won't be "
                           "revoked on deprovision",
@@ -2573,14 +2597,14 @@ public:
         // ADR-2001 pattern — see the SAML link/deny counters above).
         metrics_.describe("yuzu_scim_saml_link_unmatched_total",
                           "Total SAML logins with a linkable NameID Format for which ZERO "
-                          "active SCIM resources matched the NameID as an externalId — the "
+                          "active SCIM resources matched the NameID as an externalId - the "
                           "identity authenticated but could not be linked (no such SCIM user, "
                           "or externalId drift between the IdP and SCIM provisioning)",
                           "counter");
         metrics_.describe("yuzu_scim_saml_link_ambiguous_total",
                           "Total SAML logins with a linkable NameID Format for which MORE THAN "
                           "ONE active SCIM resource matched the NameID as an externalId "
-                          "(ADR-2001 §2 mis-link guard) — a distinct, more actionable "
+                          "(ADR-2001 section 2 mis-link guard) - a distinct, more actionable "
                           "misconfiguration than ordinary link drift (duplicate/stale SCIM "
                           "externalId), kept in its own series rather than folded into "
                           "yuzu_scim_saml_link_unmatched_total",
@@ -2588,7 +2612,7 @@ public:
         metrics_.describe("yuzu_scim_saml_link_lookup_failures_total",
                           "Total SAML logins with a linkable NameID Format for which the "
                           "ScimStore active-externalId lookup itself could not answer (store "
-                          "outage, lease timeout, or a failed statement) — distinct from "
+                          "outage, lease timeout, or a failed statement) - distinct from "
                           "yuzu_scim_saml_link_unmatched_total (a genuine zero-match answer); "
                           "a sustained non-zero rate means SAML link formation cannot even be "
                           "attempted, not just that it is failing to match",
@@ -2596,7 +2620,7 @@ public:
         metrics_.describe("yuzu_scim_deprovision_saml_unlinked_total",
                           "ADR-2001 #3072 SAML D2 tripwire: a deprovision resolved NO linked "
                           "SAML identity for a slug, but a recorded SAML login observation "
-                          "shows a NameID matching that slug's externalId — the user DID "
+                          "shows a NameID matching that slug's externalId - the user DID "
                           "authenticate via SAML but the identity link never formed (a "
                           "deprovision that revoked nothing for a federated user who exists)",
                           "counter");
@@ -2615,10 +2639,10 @@ public:
                           "TOTAL OIDC logins denied at /auth/callback because the identity's "
                           "linked SCIM resource is deprovisioned (deactivated, or orphaned by a "
                           "hard-deleted scim_resources row) OR because the ScimStore could not "
-                          "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
-                          "closing the re-login-mints-fresh-tokens window. This is the SUM of "
-                          "yuzu_auth_oidc_deprovisioned_denied_genuine_total and "
-                          "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total below — "
+                          "be reached (fail-closed) - the ADR-2001 section 4 deny-at-login "
+                          "backstop closing the re-login-mints-fresh-tokens window. This is the "
+                          "SUM of yuzu_auth_oidc_deprovisioned_denied_genuine_total and "
+                          "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total below - "
                           "alert on the genuine sub-counter, not this total (#3069)",
                           "counter");
         // #3069 — split the total above into a genuine-deny signal and a
@@ -2629,12 +2653,12 @@ public:
         metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_genuine_total",
                           "OIDC logins denied at /auth/callback because the identity's linked "
                           "SCIM resource is genuinely deprovisioned (a real deactivated-identity "
-                          "re-login was refused) — the CC6.8-alertable signal; excludes "
+                          "re-login was refused) - the CC6.8-alertable signal; excludes "
                           "store-unavailable fail-closed denies",
                           "counter");
         metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
                           "OIDC logins denied at /auth/callback because the ScimStore could not "
-                          "be reached (fail-closed deny during a ScimStore outage) — an "
+                          "be reached (fail-closed deny during a ScimStore outage) - an "
                           "AVAILABILITY signal, not a termination event; correlate with "
                           "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
@@ -2647,10 +2671,10 @@ public:
                           "TOTAL SAML logins denied at /saml/acs because the identity's linked "
                           "SCIM resource is deprovisioned (deactivated, or orphaned by a "
                           "hard-deleted scim_resources row) OR because the ScimStore could not "
-                          "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
-                          "closing the re-login-mints-fresh-tokens window. This is the SUM of "
-                          "yuzu_auth_saml_deprovisioned_denied_genuine_total and "
-                          "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total below — "
+                          "be reached (fail-closed) - the ADR-2001 section 4 deny-at-login "
+                          "backstop closing the re-login-mints-fresh-tokens window. This is the "
+                          "SUM of yuzu_auth_saml_deprovisioned_denied_genuine_total and "
+                          "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total below - "
                           "alert on the genuine sub-counter, not this total (#3069)",
                           "counter");
         // #3069 — SAML analogue of the OIDC split above; same
@@ -2658,12 +2682,12 @@ public:
         metrics_.describe("yuzu_auth_saml_deprovisioned_denied_genuine_total",
                           "SAML logins denied at /saml/acs because the identity's linked SCIM "
                           "resource is genuinely deprovisioned (a real deactivated-identity "
-                          "re-login was refused) — the CC6.8-alertable signal; excludes "
+                          "re-login was refused) - the CC6.8-alertable signal; excludes "
                           "store-unavailable fail-closed denies",
                           "counter");
         metrics_.describe("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
                           "SAML logins denied at /saml/acs because the ScimStore could not be "
-                          "reached (fail-closed deny during a ScimStore outage) — an "
+                          "reached (fail-closed deny during a ScimStore outage) - an "
                           "AVAILABILITY signal, not a termination event; correlate with "
                           "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
@@ -2707,7 +2731,7 @@ public:
                           "'drift silently discarded' (CC7.3 evidence gap #1414).",
                           "counter");
         metrics_.describe("yuzu_server_guardian_events_redelivered_total",
-                          "Cumulative idempotent event redeliveries at ingest — a matching-fields "
+                          "Cumulative idempotent event redeliveries at ingest - a matching-fields "
                           "event_id conflict, i.e. the durable agent lifecycle journal's expected "
                           "at-least-once retry. High is normal after an agent outage/reconnect; this "
                           "is NOT a loss signal (that is ..._events_dropped_total).",
@@ -2716,7 +2740,7 @@ public:
                           "Cumulative OPERATIONAL Guardian ingest faults (a failed BEGIN/prepare/"
                           "insert/commit, or a redelivery compare that could not run). A sustained "
                           "rate means conflicts are going UNCLASSIFIED, so a genuine collision can "
-                          "escape ..._events_dropped_total — this is itself alertable (sec-M2). "
+                          "escape ..._events_dropped_total - this is itself alertable (sec-M2). "
                           "Excludes malformed embedded-NUL input (attacker-drivable). Resets on "
                           "server restart.",
                           "counter");
@@ -2745,7 +2769,7 @@ public:
         metrics_.describe("yuzu_server_guardian_proj_failures_total",
                           "DEX observation projection failures. The source event is preserved "
                           "(degrade-don't-destroy); only the derived guardian_observations read "
-                          "model row is lost. >0 means /dex is under-counting — investigate "
+                          "model row is lost. >0 means /dex is under-counting - investigate "
                           "(commonly a stale-schema dev DB; see docs/user-manual/dex.md).",
                           "counter");
         metrics_.describe("yuzu_server_guardian_observations_reaped_total",
@@ -2759,7 +2783,7 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_guardian_reap_passes_total",
                           "Retention-reaper pass outcomes by result "
-                          "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) — the "
+                          "(swept/noop/declined/declined_no_anchor/failed/skipped_lock) - the "
                           "clock-guard observability the reaped counters lacked (ADR-0038, #2634).",
                           "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
@@ -3187,7 +3211,7 @@ public:
                           "gauge");
         metrics_.describe("yuzu_viz_pushed_map_size",
                           "Current occupancy of the FleetTopologyStore pushed_ map. Primary "
-                          "memory-pressure signal — alert before it approaches "
+                          "memory-pressure signal - alert before it approaches "
                           "kPushedMapHardCap (100000).",
                           "gauge");
 
@@ -4786,7 +4810,7 @@ public:
             metrics_.describe("yuzu_server_analytics_emit_dropped_total",
                               "AnalyticsEventStore::emit() drops (fail-soft ingest, ADR-0049) "
                               "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                              "serialize_error) — never a silent swallow",
+                              "serialize_error) - never a silent swallow",
                               "counter");
             for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
                                       "serialize_error"})
@@ -4817,7 +4841,7 @@ public:
             metrics_.describe("yuzu_server_analytics_drain_last_pass_unixtime",
                               "Wall-clock reading stamped at the start of every drain pass "
                               "attempt, success or failure. Flat means the drain thread is not "
-                              "running — the one condition drain_pass_failed_total cannot "
+                              "running - the one condition drain_pass_failed_total cannot "
                               "report (a wedged/exited thread never gets to increment it)",
                               "gauge");
             metrics_.gauge("yuzu_server_analytics_drain_last_pass_unixtime").set(0);
@@ -4928,7 +4952,7 @@ public:
                 metrics_.describe("yuzu_server_instruction_bundled_content_total",
                                   "Bundled-content boot-time reseed outcome by result (clean = "
                                   "zero import errors; errored = at least one definition/set "
-                                  "failed to import against an open store — the boot refuses "
+                                  "failed to import against an open store - the boot refuses "
                                   "to serve, ADR-0058 Gate 8). Every-boot, not one-time, unlike "
                                   "sibling *_backfill_total counters.",
                                   "counter");
@@ -6614,7 +6638,7 @@ public:
         std::shared_ptr<grpc::ServerCredentials> mgmt_creds = grpc::InsecureServerCredentials();
         if (cfg_.tls_enabled) {
             auto tls = build_tls_credentials(cfg_.tls_server_cert, cfg_.tls_server_key,
-                                             cfg_.tls_ca_cert, cfg_.allow_one_way_tls,
+                                             cfg_.tls_ca_cert, cfg_.insecure_skip_client_verify,
                                              /*require_client_cert=*/!cfg_.using_default_agent_certs,
                                              "agent listener");
             if (tls) {
@@ -6636,7 +6660,7 @@ public:
                 // unauthenticated peer on the management plane.
                 auto mgmt_tls = build_tls_credentials(
                     cfg_.mgmt_tls_server_cert, cfg_.mgmt_tls_server_key, cfg_.mgmt_tls_ca_cert,
-                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
+                    cfg_.insecure_skip_client_verify, /*require_client_cert=*/true, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials are invalid; refusing to start");
                     startup_failed_ = true;
@@ -6656,7 +6680,7 @@ public:
                 // so the gateway-upstream listener still connects.
                 auto mgmt_tls = build_tls_credentials(
                     cfg_.tls_server_cert, cfg_.tls_server_key, cfg_.tls_ca_cert,
-                    cfg_.allow_one_way_tls, /*require_client_cert=*/true, "management listener");
+                    cfg_.insecure_skip_client_verify, /*require_client_cert=*/true, "management listener");
                 if (!mgmt_tls) {
                     spdlog::error("Management TLS credentials (strict, default certs) are invalid; "
                                   "refusing to start");
@@ -7528,7 +7552,7 @@ public:
         // so SOC 2 CC7.2 evidence is collected for the duration the server runs
         // in a degraded posture (otherwise spdlog-only output would not survive
         // log rotation or land in audit.db).
-        const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.allow_one_way_tls;
+        const bool insecure_skip_verify_active = cfg_.tls_enabled && cfg_.insecure_skip_client_verify;
         const bool no_tls_active = !cfg_.tls_enabled;
         const bool default_certs_active = cfg_.using_default_certs;
         if (insecure_skip_verify_active || no_tls_active || default_certs_active) {
@@ -8975,7 +8999,7 @@ private:
     [[nodiscard]] std::shared_ptr<grpc::ServerCredentials>
     build_tls_credentials(const std::filesystem::path& cert_path,
                           const std::filesystem::path& key_path,
-                          const std::filesystem::path& ca_path, bool allow_one_way_tls,
+                          const std::filesystem::path& ca_path, bool insecure_skip_client_verify,
                           bool require_client_cert, std::string_view listener_name) const {
         if (cert_path.empty() || key_path.empty()) {
             spdlog::error("{} TLS requires certificate and key", listener_name);
@@ -9015,7 +9039,7 @@ private:
                 require_client_cert ? GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY
                                     : GRPC_SSL_REQUEST_CLIENT_CERTIFICATE_AND_VERIFY;
         } else {
-            if (!allow_one_way_tls) {
+            if (!insecure_skip_client_verify) {
                 spdlog::error("{} TLS requires --ca-cert (or enable "
                               "--insecure-skip-client-verify with YUZU_ALLOW_INSECURE_TLS=1)",
                               listener_name);

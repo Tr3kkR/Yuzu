@@ -473,7 +473,7 @@ TEST_CASE("ResultSetStore: members paginate past the page size", "[pg][result_se
 // by pre-seeding a conflicting table with no schema_meta row: the migration
 // runner's schema-drift guard refuses (version 0 but tables exist).
 TEST_CASE("ResultSetStore reports !is_open on a migration failure", "[pg][result_set]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};

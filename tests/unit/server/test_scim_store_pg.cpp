@@ -45,7 +45,7 @@ yuzu::test::PgTestTemplate scim_tpl{"scimstore", [](const std::string& dsn) {
 } // namespace
 
 TEST_CASE("ScimStore fresh-start construction succeeds on an empty database", "[pg][scim]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     REQUIRE(pool.valid());
     ScimStore store{pool};
@@ -56,7 +56,7 @@ TEST_CASE("ScimStore fresh-start construction succeeds on an empty database", "[
 // whose schema migration FAILS must leave the store !is_open() — the server
 // wires that to startup_failed_ (fail closed, never serve-degraded).
 TEST_CASE("ScimStore reports !is_open on a migration failure", "[pg][scim]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     // Pre-seed: create the scim_store schema + a conflicting table, but no
     // public.schema_meta row for the store — the runner's schema-drift guard
@@ -1341,7 +1341,7 @@ TEST_CASE("ScimStore: find_unique_active_by_external_id_checked — matched / no
 TEST_CASE("ScimStore reports !is_open when v3 migration finds pre-existing duplicate "
          "external_ids (dup-detecting fail-closed migration)",
          "[pg][scim][2001][migration][failclosed]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};

@@ -358,11 +358,8 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
 
     auto kind = extract_yaml_value(yaml_source, "kind");
     if (kind != "PolicyFragment")
-        return std::unexpected(
-            "kind must be 'PolicyFragment', got '" + kind +
-            "'. yaml_source must be a complete YAML document including "
-            "'apiVersion: yuzu.io/v1alpha1' and 'kind: PolicyFragment'. "
-            "Example:\n"
+        return std::unexpected(kind_mismatch_error(
+            "PolicyFragment", kind,
             "  apiVersion: yuzu.io/v1alpha1\n"
             "  kind: PolicyFragment\n"
             "  metadata:\n"
@@ -371,8 +368,8 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
             "    check:\n"
             "      plugin: <plugin>\n"
             "      action: <action>\n"
-            "      compliance: <CEL expression>\n"
-            "See docs/user-manual/policy-engine.md.");
+            "      compliance: <CEL expression>\n",
+            "docs/user-manual/policy-engine.md"));
 
     auto id_val = extract_yaml_value(yaml_source, "id");
     auto id = id_val.empty() ? generate_id() : id_val;
@@ -561,11 +558,8 @@ PolicyStore::create_policy(const std::string& yaml_source) {
 
     auto kind = extract_yaml_value(yaml_source, "kind");
     if (kind != "Policy")
-        return std::unexpected(
-            "kind must be 'Policy', got '" + kind +
-            "'. yaml_source must be a complete YAML document including "
-            "'apiVersion: yuzu.io/v1alpha1' and 'kind: Policy'. "
-            "Example:\n"
+        return std::unexpected(kind_mismatch_error(
+            "Policy", kind,
             "  apiVersion: yuzu.io/v1alpha1\n"
             "  kind: Policy\n"
             "  metadata:\n"
@@ -575,8 +569,8 @@ PolicyStore::create_policy(const std::string& yaml_source) {
             "    scope: <scope-expression>\n"
             "    triggers:\n"
             "      - type: interval\n"
-            "        interval: 3600\n"
-            "See docs/user-manual/policy-engine.md.");
+            "        interval: 3600\n",
+            "docs/user-manual/policy-engine.md"));
 
     auto id_val = extract_yaml_value(yaml_source, "id");
     auto id = id_val.empty() ? generate_id() : id_val;

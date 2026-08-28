@@ -90,7 +90,7 @@ License make_license(const std::string& org = "Acme Corp", int64_t seats = 100,
 // ── Construction fail-closed ────────────────────────────────────────────────
 
 TEST_CASE("LicenseStore reports !is_open on a migration failure", "[license_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
