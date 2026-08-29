@@ -30,8 +30,8 @@ in confusing ways.
 
 RHEL 9's `gcc` is 11. Yuzu is C++23 and the documented floor is **GCC 13+ / Clang 18+**. The fix is
 a **Software Collection**: `gcc-toolset-14` ships GCC 14.2.1 *and its own libstdc++ 14 headers*,
-which is the part that matters — `<print>`, `<expected>`, and the C++23 `<format>` additions live in
-libstdc++, and the base system's `libstdc++-devel` is 11.5.
+which is the part that matters — `<expected>` and the C++23 `<format>` additions live in libstdc++,
+and the base system's `libstdc++-devel` is 11.5.
 
 This also rules out the obvious-looking alternative: AppStream carries `clang` 21, but Clang uses
 the *system* libstdc++ headers, so a bare `clang++ -std=c++23` still gets the 11.5 library. Using
@@ -159,7 +159,7 @@ sudo dnf install -y \
   cmake ninja-build pkgconf-pkg-config make \
   bison flex autoconf automake libtool \
   perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html \
-  systemd-devel glibc-devel kernel-headers \
+  systemd-devel glibc-devel kernel-headers libblkid-devel \
   python3-pip zip unzip tar git
 
 sudo dnf install -y ccache          # optional, EPEL only — see above
@@ -177,6 +177,7 @@ package conflict that aborts `dnf`. The script adds `curl` only when no `curl` b
 | `bison`, `flex` | vcpkg's `libpq` port builds PostgreSQL from source and cannot auto-acquire these on Linux. |
 | `perl` + `perl-IPC-Cmd`, `perl-FindBin`, `perl-File-Compare`, `perl-Pod-Html` | vcpkg's `openssl` port is a Perl-driven build. A minimal RHEL install has no `perl` at all. |
 | `systemd-devel` | `agents/core/meson.build` takes a **required** `libsystemd` dependency (`systemd_guard` defaults to `enabled` in `meson.options`). The RHEL name for CI's `libsystemd-dev`. Opt out with `-Dsystemd_guard=disabled` if you must. |
+| `libblkid-devel` | `agents/plugins/bitlocker/meson.build` takes a **required** `blkid` dependency on Linux (in-process libblkid, util-linux). The RHEL name for CI's `libblkid-dev`; not pulled in transitively. |
 | `autoconf`, `automake`, `libtool` | Needed by several vcpkg ports (grpc/c-ares, xmlsec, libpq's autoreconf path). |
 | `glibc-devel`, `kernel-headers` | RHEL equivalent of CI's `linux-libc-dev`. |
 | `ccache` | **Optional, EPEL-only.** `CC`/`CXX` are set to `ccache gcc` / `ccache g++` when present (matching CI), plain `gcc`/`g++` otherwise. |
@@ -298,8 +299,7 @@ Manually:
 g++ --version                      # 14.2.1
 meson --version                    # 1.11.2
 python3 -c "import yaml; print(yaml.__version__)"
-printf '#include <print>\nint main(){std::println("c++23 ok");}\n' > /tmp/c23.cpp
-g++ -std=c++23 /tmp/c23.cpp -o /tmp/c23 && /tmp/c23     # proves libstdc++ 14 is in play
+bash scripts/setup-rhel9.sh --check     # includes a <expected> compile probe: proves the toolset's libstdc++ is in play
 psql "$YUZU_TEST_POSTGRES_DSN" -tAc 'SELECT 1'
 ```
 
@@ -417,7 +417,7 @@ today this is a documented limitation rather than something the setup script can
 | `ERROR: PyYAML is required to embed bundled content` at configure time | `python3` resolved to an interpreter without PyYAML. Check `python3 -c 'import yaml'` with the *same* `python3` meson found. |
 | `ERROR: Unknown compiler(s): [['gcc-14']]` | You passed `--native-file meson/native/linux-gcc14.ini`. Use `linux-gcc13.ini`. See trap 2. |
 | `cannot find -lmold` / `unrecognized option '-fuse-ld=mold'` | You passed the gcc15 or clang21 native file. See trap 2. |
-| `error: 'print' is not a member of 'std'` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-14/enable`. |
+| `fatal error: expected: No such file or directory` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-14/enable`. |
 | `FATAL: Ident authentication failed for user "yuzu"` | `pg_hba.conf` trap 3. |
 | `server pg unit tests shard B` TIMEOUT / SIGKILL after 600 s | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
 | `permission denied to terminate process` in test output | Same — trap 4. |

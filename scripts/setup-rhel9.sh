@@ -81,8 +81,10 @@ PKGS=(
   # vcpkg port build prerequisites
   bison flex autoconf automake libtool
   perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html
-  # headers the build links against
-  systemd-devel glibc-devel kernel-headers
+  # headers the build links against. libblkid-devel: the bitlocker plugin takes
+  # a required blkid dependency on Linux (agents/plugins/bitlocker/meson.build),
+  # CI installs libblkid-dev; it is not pulled in transitively.
+  systemd-devel glibc-devel kernel-headers libblkid-devel
   # python + archive tools vcpkg needs. curl is deliberately NOT listed: stock
   # images ship curl-minimal, which provides /usr/bin/curl but does not satisfy
   # `rpm -q curl`, and asking dnf for the full package on top of it is a
@@ -191,14 +193,17 @@ check() { # check <label> <condition-cmd...>
   fi
 }
 
-# The one check that proves libstdc++ 14 is in play: <print> does not exist in
-# the system libstdc++ 11. Subshell body so the EXIT trap is scoped to this
-# call; the status is the compile+run chain's, never the cleanup's.
+# The one check that proves the toolset's libstdc++ is in play rather than the
+# system libstdc++ 11: <expected> is C++23, absent from 11 and present from 12
+# on, so the documented GCC 13 floor passes too. (<print> is deliberately not
+# used: the project does not use it and libstdc++ 13 lacks it.) Subshell body
+# so the EXIT trap is scoped to this call; the status is the compile+run
+# chain's, never the cleanup's.
 cxx23_probe() (
   d="$(mktemp -d)" || exit 1
   # shellcheck disable=SC2154  # rc is assigned inside the trap string
   trap 'rc=$?; rm -rf -- "$d"; exit "$rc"' EXIT
-  printf '#include <print>\n#include <expected>\nint main(){std::println("{}", std::expected<int,int>{1}.value());}\n' > "$d/c23.cpp" \
+  printf '#include <expected>\nint main(){std::expected<int,int> e{1}; return e.value() == 1 ? 0 : 1;}\n' > "$d/c23.cpp" \
     && g++ -std=c++23 "$d/c23.cpp" -o "$d/c23" \
     && "$d/c23"
 )
@@ -209,7 +214,7 @@ cxx23_probe() (
 # shellcheck disable=SC1091
 . /etc/os-release
 DISTRO_ID="${ID:-unknown}"
-DISTRO_MAJOR="${VERSION_ID%%.*}"
+DISTRO_MAJOR="${VERSION_ID:-}"; DISTRO_MAJOR="${DISTRO_MAJOR%%.*}"
 
 case "${DISTRO_ID}" in
   rhel|rocky|almalinux) ;;
@@ -238,7 +243,7 @@ if [ "$CHECK_ONLY" = 1 ]; then
 
   check "${GCC_TOOLSET} present"           test -f "/opt/rh/${GCC_TOOLSET}/enable"
   check "g++ is GCC 13+"                   bash -c 'v=$(g++ -dumpfullversion -dumpversion 2>/dev/null | cut -d. -f1); [ -n "$v" ] && [ "$v" -ge 13 ]'
-  check "C++23 <print>/<expected> compile" cxx23_probe
+  check "C++23 <expected> compile"         cxx23_probe
   check "meson ${MESON_VERSION}"           bash -c "meson --version | grep -qx '${MESON_VERSION}'"
   check "ninja present"                    command -v ninja
   check "cmake present"                    command -v cmake
@@ -249,8 +254,13 @@ if [ "$CHECK_ONLY" = 1 ]; then
   check "curl present"                     command -v curl
   check "pyyaml ${PYYAML_VERSION}"           python3 -c "import yaml, sys; sys.exit(yaml.__version__ != '${PYYAML_VERSION}')"
   check "libsystemd headers present"       pkg-config --exists libsystemd
-  check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
-  check "vcpkg pinned to baseline"         test "$(git -C "${VCPKG_ROOT_ARG}" rev-parse HEAD 2>/dev/null)" = "${VCPKG_COMMIT}"
+  check "libblkid headers present"         pkg-config --exists blkid
+  if [ "$SKIP_VCPKG" = 1 ]; then
+    skip "vcpkg checks (--skip-vcpkg)"
+  else
+    check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
+    check "vcpkg pinned to baseline"         test "$(git -C "${VCPKG_ROOT_ARG}" rev-parse HEAD 2>/dev/null)" = "${VCPKG_COMMIT}"
+  fi
 
   if [ "$WITH_POSTGRES" = 1 ]; then
     check "env file exports the DSN"       grep -qxF "export YUZU_TEST_POSTGRES_DSN=\"${PG_DSN}\"" "${ENV_FILE}"
@@ -286,9 +296,21 @@ fi
 # single biggest RHEL-vs-Rocky divergence in the whole setup. (ccache is one
 # repo further out - EPEL, not CRB; see CCACHE_PKG above.)
 
+# Detected by effect as well as by repo id: a corporate mirror or Satellite
+# names the repo whatever it likes, and what matters is that ninja-build
+# resolves.
+crb_enabled() {
+  dnf repolist --enabled 2>/dev/null | grep -qiE '^(crb|codeready-builder)' \
+    || dnf --quiet repoquery --qf '%{name}' ninja-build 2>/dev/null | grep -qx ninja-build
+}
+epel_enabled() {
+  dnf repolist --enabled 2>/dev/null | grep -qE '^epel[[:space:]]' \
+    || dnf --quiet repoquery --qf '%{name}' "${CCACHE_PKG}" 2>/dev/null | grep -qx "${CCACHE_PKG}"
+}
+
 step "Enabling repositories (CRB)"
-if dnf repolist --enabled 2>/dev/null | grep -qiE '^(crb|codeready-builder)'; then
-  skip "CRB already enabled"
+if crb_enabled; then
+  skip "CRB already enabled (ninja-build resolves)"
 else
   run sudo dnf install -y dnf-plugins-core
   case "${DISTRO_ID}" in
@@ -301,6 +323,8 @@ enable 'codeready-builder-for-rhel-9-${ARCH}-rpms' by hand and re-run."
       run sudo dnf config-manager --set-enabled crb
       ;;
   esac
+  [ "$DRY_RUN" = 1 ] || crb_enabled \
+    || die "CRB still not reachable: ninja-build does not resolve from any enabled repo. Enable CodeReady Builder (or your mirror of it) by hand and re-run."
   ok "CRB enabled"
 fi
 
@@ -309,13 +333,15 @@ fi
 # EPEL-only on this family), mold, and Erlang for the gateway.
 if [ "$WITH_EPEL" = 1 ]; then
   step "Enabling EPEL (for ccache)"
-  if dnf repolist --enabled 2>/dev/null | grep -qE '^epel[[:space:]]'; then
-    skip "EPEL already enabled"
+  if epel_enabled; then
+    skip "EPEL already enabled (${CCACHE_PKG} resolves)"
   else
     case "${DISTRO_ID}" in
       rhel) run sudo dnf install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm" ;;
       *)    run sudo dnf install -y epel-release ;;
     esac
+    [ "$DRY_RUN" = 1 ] || epel_enabled \
+      || die "EPEL still not reachable: ${CCACHE_PKG} does not resolve from any enabled repo. Enable EPEL (or your mirror of it) by hand and re-run."
     ok "EPEL enabled"
   fi
 fi
