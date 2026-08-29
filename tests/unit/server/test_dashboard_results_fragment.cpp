@@ -297,6 +297,13 @@ TEST_CASE("/fragments/results: Create Group button withheld for a scoped caller"
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(contains(res->body, "in-scope output"));
+    // Gate 8 quality-engineer finding (this round): the assertion above is
+    // reachable via the thead sort-link's raw f_output echo even at zero
+    // matching rows (render_results' base_url() re-embeds every active
+    // filter regardless of match count) -- assert an actual result row
+    // rendered so a facet-population regression (the earlier draft's
+    // false-pass class) can't silently zero out this test's positive half.
+    CHECK(contains(res->body, "class=\"result-row\""));
     CHECK_FALSE(contains(res->body, "btn-create-group"));
     CHECK_FALSE(contains(res->body, "Create Group from"));
 }

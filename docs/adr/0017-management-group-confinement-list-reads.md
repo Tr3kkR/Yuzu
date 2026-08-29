@@ -365,6 +365,16 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   list-read site in the shape the sweep was designed to find. Not introduced or worsened by #1712;
   tracked as a follow-up — see #3699.
 
+  **Also NOT covered by #1712, found during this PR's own governance re-review — a WRITE-path
+  sibling of the same shape, undisclosed in this coverage map until now:** `GET`/`PUT`/
+  `DELETE /api/agents/:id/properties[/:key]` (`server.cpp`) reads and writes per-agent
+  custom-properties data behind bare `require_permission("Infrastructure","Read"/"Write")` with no
+  per-agent scope filter at all. Not introduced or worsened by #1712 — pre-existing, and absent from
+  every prior enumeration of this ADR's surface list. The WRITE path is a stronger risk class than
+  the read-only surfaces #1712 addressed: a caller holding global `Infrastructure:Write` can mutate
+  custom-properties data for any agent regardless of their otherwise-confined visibility elsewhere.
+  Tracked as a follow-up — see #3700.
+
 ## Consequences
 
 - A new, named authorization pattern (the admit-then-filter list gate, expressed as the
