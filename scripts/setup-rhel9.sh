@@ -132,7 +132,15 @@ if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; N=$
 else B=""; G=""; Y=""; R=""; N=""; fi
 
 step() { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
-ok()   { printf '  %s[ ok ]%s %s\n' "$G" "$N" "$*"; }
+# Under --dry-run the `run` wrapper prints and no-ops, so the success line
+# that follows it must not claim the action happened; it says what a real run
+# would then report. --check is read-only and reports real results.
+ok() {
+  if [ "$DRY_RUN" = 1 ] && [ "$CHECK_ONLY" = 0 ]; then
+    printf '  (dry-run) would then report: %s\n' "$*"; return 0
+  fi
+  printf '  %s[ ok ]%s %s\n' "$G" "$N" "$*"
+}
 skip() { printf '  %s[skip]%s %s\n' "$Y" "$N" "$*"; }
 warn() { printf '  %s[warn]%s %s\n' "$Y" "$N" "$*" >&2; }
 die()  { printf '  %s[fail]%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
@@ -634,7 +642,10 @@ fi
 # failure.
 jstr() { python3 -c 'import json, sys; sys.stdout.write(json.dumps(sys.argv[1]))' "$1"; }
 
-if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 0 ]; then
+if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 1 ]; then
+  step "Provenance manifest"
+  printf '  (dry-run) write manifest %s\n' "${MANIFEST}"
+elif [ -n "${MANIFEST}" ]; then
   step "Writing provenance manifest to ${MANIFEST}"
   # shellcheck disable=SC1090
   . "${ENV_FILE}"
@@ -691,7 +702,7 @@ fi
 
 if [ "$DRY_RUN" = 1 ]; then
   step "Dry run complete - nothing was changed"
-  printf '\n  Every "(dry-run)" line above is a command that was NOT executed;\n  %s was not written. Re-run without --dry-run to provision.\n\n' "${ENV_FILE}"
+  printf '\n  Every "(dry-run)" line above is a command that was NOT executed or a result\n  that was NOT achieved; %s was not written.\n  Re-run without --dry-run to provision.\n\n' "${ENV_FILE}"
   exit 0
 fi
 
