@@ -2318,6 +2318,54 @@ Any target registered through `POST /api/v1/offload-targets` on the Postgres-bac
 binary lives only in Postgres and is lost on rollback (re-register it after rolling
 forward again).
 
+## ⚠️ Behaviour change: OTA package catalog resets on Postgres cutover (UpdateRegistry, ADR-0061)
+
+`UpdateRegistry` — the OTA agent-update catalog behind the gRPC `CheckForUpdate`/
+`DownloadUpdate` handlers and the Settings → Updates admin page — moves from the SQLite
+`update_packages.db` file to the server's PostgreSQL substrate in this release, schema
+`update_registry`, on the existing shared pool. Like `OffloadTargetStore`/`ResponseStore`,
+this is a **fresh-start cutover with no data migration** (ADR-0009's 2026-08-25
+fresh-start-by-default amendment), so the legacy `update_packages.db` is **never read for
+data migration/backfill** on upgrade — the server does open it read-only once, at boot, to
+count rows and warn if it finds any (see "What happens on first PG boot" below), but never
+to carry any of them over.
+
+**Before you upgrade, if you have OTA packages configured:** list them via the Settings →
+Updates page first so you know what to re-upload. Package **binaries already on disk under
+your configured `update_dir` are untouched** by this cutover — only the metadata row (sha256,
+rollout percentage, mandatory flag) is lost — so re-uploading the same file after upgrading
+reproduces the identical sha256/size.
+
+**What happens on first PG boot (OTA is on by default — see the note below if you've passed
+`--no-ota`):**
+- The server logs a one-time `UpdateRegistry initialized (schema update_registry) — fresh
+  start, no legacy backfill` line.
+- Every previously-configured package's metadata is gone; agents see "no update available"
+  until packages are re-uploaded via `POST /api/settings/updates/upload`.
+- No operator action required beyond re-uploading packages.
+
+**Also in this release:** construction is now fail-closed for OTA (on by default; disable with
+`--no-ota`, not an opt-in flag) — a reachable database whose `update_registry` schema fails to
+migrate/open now refuses to start the server, rather than silently serving with OTA dead (the
+pre-migration code had no such check). `ca_store`/`scim_store`'s own fail-closed construction
+is already unconditional on every deployment (only their probe checks are gated, on whether
+you're using default certs / have SCIM enabled) — `UpdateRegistry` is simply the first of the
+three where that same construction-time posture applies with **no opt-out flag set by
+default**. Plan accordingly if you're upgrading a fleet you haven't audited for Postgres
+reachability — this now affects the ordinary default deployment, not an opt-in minority. `UpdateRegistry` now appears in `/readyz`'s check list and in
+`/health`'s `stores` object (previously absent from both). On `/readyz`, a deployment running
+with `--no-ota` sees no change — the check is vacuously true and never enters the failed list. On
+`/health`/`/api/health`, a new `stores.update_registry: "ok"`/`"error"` key appears in the JSON
+body for **every** deployment, `--no-ota` or not.
+
+**Rolling back:** because the legacy `update_packages.db` is never written by the
+Postgres-backed binary (opened read-only at most once, at boot, for the row-count warning
+above — never moved, never deleted, never modified), reverting to a pre-cutover binary
+restores whatever was in that file **before** the cutover, exactly as it was. Any package
+uploaded through the Postgres-backed binary lives only in Postgres and is lost on rollback
+(re-upload it after rolling forward again) — but its binary on disk under `update_dir`
+survives regardless, since the cutover never touches that directory.
+
 ## ⚠️ Behaviour change: quarantine is now enforced at instruction dispatch (#881, #3127)
 
 Quarantine previously isolated a device's network without stopping the control plane from
