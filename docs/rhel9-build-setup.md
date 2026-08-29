@@ -4,7 +4,8 @@ This is the enterprise-Linux counterpart to the apt recipe in `.github/workflows
 exercises Ubuntu 24.04/26.04, macOS and Windows only — RHEL-family hosts are a supported *developer*
 platform, not a CI-covered one, so this doc records a verified sequence rather than an
 automatically-regression-tested one. The reference run was Rocky 9.8; the RHEL and Alma paths use the
-same packages but have not been exercised.
+same packages but have not been exercised, and SELinux enforcing has not been deliberately exercised
+either (the container checks run unconfined; the reference run did not record its mode).
 
 **One command:**
 
@@ -86,22 +87,25 @@ tests skip cleanly; **set but broken** → hard FAIL. So a misconfigured cluster
 
 ### 4. The test role needs `pg_signal_backend`, not just `CREATEDB`
 
-This one cost a 600-second timeout to find, and it is the least obvious failure in this document.
+This one cost a shard timeout to find, and it is the least obvious failure in this document.
 
 `PostgresTestDb` creates an ephemeral `yuzu_test_<epoch>_<salt>_<n>` database per test and drops it
-`WITH (FORCE)`. `FORCE` terminates the backends still attached to the database, and terminating
-another role's backend requires membership in the predefined **`pg_signal_backend`** role. A test
-role with only `LOGIN CREATEDB` gets:
+`WITH (FORCE)`. `FORCE` terminates the backends still attached to the database - in practice an
+autovacuum worker, which runs under no role at all - and terminating a backend that is not your own
+requires membership in the predefined **`pg_signal_backend`** role. A test role with only
+`LOGIN CREATEDB` gets:
 
 ```
 PostgresTestDb: DROP DATABASE failed — leaked yuzu_test_1786828330_843575621_1284:
 ERROR:  permission denied to terminate process
 ```
 
-Nothing fails at that moment. The tests keep passing, each one leaking a database, and the cluster
-gets progressively slower until the `server pg unit tests shard B` target blows its 600 s meson
-timeout and is SIGKILLed — with the actual cause buried in thousands of lines of per-test `NOTICE:`
-output. On the reference box this left **70 orphaned databases** behind.
+Nothing fails at that moment. The tests keep passing; every test whose drop races an attached
+autovacuum worker leaks its database, the cluster gets slower, the race gets likelier, and the
+`server pg unit tests shard B` target blows its meson timeout (`tests/meson.build`; 700 s on current
+dev, 600 s at the time of the reference run) and is SIGKILLed — with the actual cause buried in
+thousands of lines of per-test `NOTICE:` output. On the reference box this left **70 orphaned
+databases** behind.
 
 ```sql
 GRANT pg_signal_backend TO yuzu;
@@ -344,8 +348,9 @@ by `--manifest`, and the `verified_run` block is hand-recorded from the session.
 The repo's own "~65–70 min cold vcpkg" estimate is calibrated for a smaller machine; 16 cores cut it
 to 20 minutes.
 
-> **Timeout headroom:** even when healthy, `server pg unit tests shard B` takes **523 s against a
-> 600 s meson timeout** on this box. On a slower machine, raise the timeout rather than assuming a
+> **Timeout headroom:** even when healthy, `server pg unit tests shard B` took **523 s against the
+> 600 s meson timeout** of the reference run on this box (700 s on current dev). On a slower machine,
+> raise the timeout rather than assuming a
 > hang — but check trap 4 first, because a missing `pg_signal_backend` produces a *real* timeout.
 
 ### Two remaining failures
@@ -414,16 +419,17 @@ today this is a documented limitation rather than something the setup script can
 | Symptom | Cause |
 |---|---|
 | `meson.build:1: ERROR: Meson version is 0.63.3 but project requires >=1.3.0` | dnf's meson is on `PATH` ahead of `~/.local/bin`. Source the env file. |
-| `ERROR: PyYAML is required to embed bundled content` at configure time | `python3` resolved to an interpreter without PyYAML. Check `python3 -c 'import yaml'` with the *same* `python3` meson found. |
+| `PyYAML is required to embed shipped InstructionDefinitions but is not importable from ...` at configure time | `python3` resolved to an interpreter without PyYAML. Check `python3 -c 'import yaml'` with the *same* `python3` meson found. |
 | `ERROR: Unknown compiler(s): [['gcc-14']]` | You passed `--native-file meson/native/linux-gcc14.ini`. Use `linux-gcc13.ini`. See trap 2. |
-| `cannot find -lmold` / `unrecognized option '-fuse-ld=mold'` | You passed the gcc15 or clang21 native file. See trap 2. |
+| `collect2: fatal error: cannot find 'ld'` right after `-fuse-ld=mold` | You passed the gcc15 or clang21 native file and mold is not installed. See trap 2. |
 | `fatal error: expected: No such file or directory` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-14/enable`. |
 | `FATAL: Ident authentication failed for user "yuzu"` | `pg_hba.conf` trap 3. |
-| `server pg unit tests shard B` TIMEOUT / SIGKILL after 600 s | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
+| `server pg unit tests shard B` TIMEOUT / SIGKILL at its meson timeout | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
 | `permission denied to terminate process` in test output | Same — trap 4. |
 | `near "RETURNING": syntax error` from a Python script | System SQLite is 3.34.1; `RETURNING` needs 3.35+. Known limitation, see above. |
 | pip: `Could not find a version that satisfies the requirement meson==1.12.0` (the listed versions stop at 1.11.2) | You asked the 3.9 `python3` for the CI pin. This recipe installs `meson==1.11.2`; the python3.12 route is #3696. |
 | `[fail] sudo is required` | Stock container images and minimal installs have no `sudo`. As root: `dnf install -y sudo`. |
+| Undoing the shell hook | Delete the block between `# >>> yuzu toolchain >>>` and `# <<< yuzu toolchain <<<` in `~/.bashrc`, then `rm ~/.config/yuzu/toolchain-env.sh`. The cluster, role and `~/vcpkg` are left to you. |
 | vcpkg `openssl` port fails in `Configure` | Missing perl modules. Install `perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html`. |
 | vcpkg `libpq` port fails looking for `bison`/`flex` | Those two packages are not installed. |
 
