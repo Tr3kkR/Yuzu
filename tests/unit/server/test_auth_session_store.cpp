@@ -14,6 +14,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "session_store.hpp"
 
@@ -149,7 +150,7 @@ TEST_CASE("AuthManager+SessionStore: elevation persists and is honored on a fres
     }
 
     // Revoke on A → the fresh replica no longer sees an elevation.
-    CHECK(a->revoke_elevation(token));
+    CHECK(a->revoke_elevation(token).value_or(false));
     {
         auto c = make_mgr(store);
         auto s = c->validate_session(token);
@@ -218,4 +219,37 @@ TEST_CASE("AuthManager+SessionStore: a role change durably wipes the user's sess
     CHECK_FALSE(a->validate_session(token).has_value());
     auto b = make_mgr(store);
     CHECK_FALSE(b->validate_session(token).has_value()); // gone fleet-wide
+}
+
+TEST_CASE("AuthManager+SessionStore: a durable-clear failure fails revoke CLOSED, not false-ok",
+          "[auth][session_store][pg][jit]") {
+    // Adversarial C2: a durable elevation-clear that fails must be
+    // type-distinguishable from a legitimate no-op, so the route fails closed
+    // instead of auditing a false revocation while the elevation stays live.
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto a = make_mgr(store);
+    auto token = a->create_local_session("jack", Role::user, /*mfa_verified=*/true);
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(120)).has_value());
+    REQUIRE(is_elevated(*a->validate_session(token))); // live elevation, cached on `a`
+
+    // Fault-inject: drop the schema so the durable clear_elevation UPDATE fails.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::exec_params(lease.get(), "DROP SCHEMA session_store CASCADE",
+                                      std::vector<std::string>{});
+    }
+
+    // revoke_elevation must return `unexpected` (a store error), NOT expected(false)
+    // (a successful no-op). value_or(false) would mask it; assert on has_value().
+    auto rev = a->revoke_elevation(token);
+    CHECK_FALSE(rev.has_value()); // fail closed — the elevation is still live durably
+
+    // revoke_user_elevations likewise surfaces the failure, not a false "0 cleared".
+    auto rvu = a->revoke_user_elevations("jack");
+    CHECK_FALSE(rvu.has_value());
 }

@@ -133,16 +133,16 @@ TEST_CASE("AuthManager::elevate_session sets the window; revoke clears it", "[ji
     CHECK(auth::effective_role(*s) == Role::admin);
 
     // Manual revoke reverts to base and reports it WAS elevated.
-    CHECK(mgr->revoke_elevation(*token));
+    CHECK(mgr->revoke_elevation(*token).value_or(false));
     auto s2 = mgr->validate_session(*token);
     REQUIRE(s2.has_value());
     CHECK_FALSE(auth::is_elevated(*s2));
     CHECK(auth::effective_role(*s2) == Role::user);
     // Revoking an un-elevated session is a no-op (returns false).
-    CHECK_FALSE(mgr->revoke_elevation(*token));
+    CHECK_FALSE(mgr->revoke_elevation(*token).value_or(false));
     // Unknown token → nullopt / false.
     CHECK_FALSE(mgr->elevate_session("deadbeef", std::chrono::seconds(60)).has_value());
-    CHECK_FALSE(mgr->revoke_elevation("deadbeef"));
+    CHECK_FALSE(mgr->revoke_elevation("deadbeef").value_or(false));
 }
 
 // ── Follow-up B: clamp to the session's absolute lifetime ──────────────────
@@ -222,7 +222,7 @@ TEST_CASE("AuthManager::reap_expired_elevation is a no-op after a manual revoke"
     // Manual step-down clears elevated_until to the same sentinel a passive
     // reap would — so a manually-revoked window must never ALSO report an
     // "expired" event (it already has its own role.elevation.revoked row).
-    CHECK(mgr->revoke_elevation(*token));
+    CHECK(mgr->revoke_elevation(*token).value_or(false));
     CHECK_FALSE(mgr->reap_expired_elevation(*token).has_value());
 
     // Not-yet-elevated / never-elevated is likewise a no-op.

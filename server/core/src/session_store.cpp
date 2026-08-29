@@ -319,12 +319,17 @@ SessionStore::touch_activity(const std::string& token_hash, std::int64_t last_ac
         return std::unexpected(Error{"session store not open"});
     // NO generation bump — a sliding idle update is not an authz change, and
     // bumping here would invalidate every replica's cache on every request.
+    // MONOTONIC: GREATEST() so an out-of-order / cross-replica-skewed write
+    // cannot REGRESS last_activity_ms and prematurely idle-out a session whose
+    // latest authenticated activity is newer (adversarial C3). A later request
+    // that commits first must not be overwritten by an earlier, slower one.
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(Error{"database unavailable"});
     PgResult r = exec_params(
         lease.get(),
-        "UPDATE session_store.sessions SET last_activity_ms=$2::bigint WHERE token_hash=$1 "
+        "UPDATE session_store.sessions "
+        "SET last_activity_ms=GREATEST(last_activity_ms, $2::bigint) WHERE token_hash=$1 "
         "RETURNING token_hash",
         std::vector<std::string>{token_hash, std::to_string(last_activity_ms)});
     if (r.status() != PGRES_TUPLES_OK)
@@ -418,6 +423,19 @@ std::expected<int, SessionStore::Error> SessionStore::reap_expired(std::int64_t 
             spdlog::warn("SessionStore::reap declined: now_ms {} implausibly ahead of anchor {}",
                          now_ms, anchor);
             return true; // decline (commit the no-op lock release), anchor unchanged
+        }
+        // BACKWARD-anomaly guard (adversarial C8/K5): now_ms below the highest
+        // accepted reading means the wall clock moved backward — either a genuine
+        // backward step, or an earlier forward-skewed pass poisoned the anchor.
+        // Decline (never delete under a rewound clock; never regress the anchor).
+        // This is the SAFE direction: a poisoned anchor disables reap (rows
+        // accrue, alertable via this warning) rather than mass-deleting live
+        // sessions when a later, smaller forward skew reads as "behind" it.
+        if (has_anchor && now_ms < anchor) {
+            spdlog::warn("SessionStore::reap declined: now_ms {} is behind anchor {} (backward "
+                         "clock movement or a poisoned anchor) — not deleting under a rewound clock",
+                         now_ms, anchor);
+            return true;
         }
         // Accepted pass: capped delete of absolutely-expired sessions.
         PgResult dr = exec_params(

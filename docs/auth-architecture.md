@@ -29,8 +29,25 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 ### Durable operator sessions (HA WS-1/1a, ADR-2002 §4)
 
 Operator sessions are durable Postgres rows so a session survives a core-replica
-restart/failover and validates identically on any replica — a prerequisite of
-the HA "safe-to-scale" gate. The design:
+restart/failover and (once the clock-authority item below lands) validates
+identically on any replica — a prerequisite of the HA "safe-to-scale" gate. The
+design:
+
+> **KNOWN GAP — cross-host clock authority (tracked, multi-replica prerequisite).**
+> As shipped in WS-1/1a, durable timestamps are authored and adjudicated with
+> the **core replica's** `system_clock`, NOT PostgreSQL `now()`. On a **single
+> replica** (the only supported topology until the safe-to-scale gate) this is
+> self-consistent and satisfies ADR-2002 §4's required mitigations — (a) the one
+> host's clock is the monitored security dependency, (b) the JIT-elevation / MFA
+> short windows carry the issue-time + `kMaxElevationWindow` ceilings. But it
+> does NOT yet realize ADR-2002 §4's choice of Postgres `now()` as the shared
+> clock that *fixes cross-host skew*: with two replicas, a backward-skewed
+> replica could accept a session past its DB-authored absolute expiry (bounded by
+> the skew). Making the durable base-session lifetime DB-clock-authored (author
+> via `now()`; derive a local monotonic remaining-duration deadline at
+> cache-populate time) is a **required item before a second replica is enabled**,
+> tracked with the rest of the safe-to-scale gate. Until then "validates
+> identically on any replica" holds only under a common/synchronised clock.
 
 - **Store.** `SessionStore` (`server/core/src/session_store.{hpp,cpp}`, schema
   `session_store`) is a born-on-PG, fail-closed store (ADR-0012). The row key is
@@ -181,7 +198,8 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   advanced via `SessionStore::touch_activity`, which deliberately does NOT bump
   the write-generation (a slide is not an authz change, so it never invalidates
   any replica's cache), and mirrored into the cache. It survives a replica
-  restart/failover and validates identically on any replica. (Before HA WS-1/1a
+  restart/failover and validates identically on any replica under a common clock
+  (see the cross-host clock-authority gap above). (Before HA WS-1/1a
   the idle state lived only in-memory on a monotonic `steady_clock`; the clock
   is now wall-clock, with the JIT-elevation/MFA windows carrying hard wall-clock
   ceilings — see below.) `AuthManager::session_inactivity_` holds the configured

@@ -17,7 +17,17 @@
  * WALL-CLOCK (ADR-2002 §4, the reversal). Sessions were in-memory on a MONOTONIC
  * (steady_clock) clock specifically for NTP-step resistance. Durability forces
  * wall-clock: rows store absolute `system_clock` epoch-millis, and validation
- * compares against wall time. A backward clock step on the DB primary would
+ * compares against wall time.
+ *
+ * CLOCK-AUTHORITY GAP (WS-1/1a → tracked multi-replica prerequisite). Every
+ * timestamp here is CALLER-SUPPLIED (the AuthManager passes its own
+ * `system_clock` ms); this store never reads Postgres `now()`. That is
+ * self-consistent on a SINGLE replica but does NOT yet realise ADR-2002 §4's
+ * choice of `now()` as the shared clock that fixes cross-HOST skew — see
+ * docs/auth-architecture.md "Durable operator sessions → KNOWN GAP". Authoring
+ * durable timestamps via `now()` is a required item before a 2nd replica.
+ *
+ * A backward clock step on the DB primary would
  * un-expire sessions and extend live JIT-elevation / MFA windows, so two
  * defences are layered (the store carries the data; AuthManager enforces):
  *   (1) elevation carries an `elevation_issued_ms` anchor: `is_elevated()`

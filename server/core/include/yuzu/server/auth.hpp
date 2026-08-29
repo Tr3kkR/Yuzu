@@ -399,16 +399,24 @@ public:
     elevate_session(const std::string& token, std::chrono::seconds duration);
 
     /// Revoke an active JIT elevation (manual step-down): clear `elevated_until`
-    /// on the named session. Returns true if the session existed and was
-    /// elevated (so the route can distinguish a real revoke from a no-op).
-    bool revoke_elevation(const std::string& token);
+    /// on the named session. On success the value is whether the session existed
+    /// AND was elevated (so the route can distinguish a real revoke from a
+    /// no-op). Returns `unexpected` ONLY when a durable `SessionStore` clear
+    /// FAILED — the route MUST fail closed there (the elevation is still live
+    /// durably; reporting success would falsely tell an incident responder the
+    /// admin was revoked, governance-missed / adversarial C2). Store-less
+    /// (legacy) mode never errors.
+    [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
 
     /// Clear any active JIT elevation on EVERY session of `username` (all
     /// devices). Called when an admin removes a user's elevation eligibility so
     /// an in-flight elevation is terminated immediately — symmetric with the
-    /// session wipe on demote/delete (governance UP-1). Returns the number of
-    /// sessions whose elevation was cleared.
-    int revoke_user_elevations(const std::string& username);
+    /// session wipe on demote/delete (governance UP-1). On success the value is
+    /// the number of sessions whose elevation was cleared. Returns `unexpected`
+    /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
+    /// closed (an in-flight elevation may still be live durably; the eligibility
+    /// flip alone does not drop it). Store-less (legacy) mode never errors.
+    [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
 
     /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
     /// security review 2026-06-30): if `token`'s session holds an elevation

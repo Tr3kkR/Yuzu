@@ -4105,8 +4105,30 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // actually drops the operator's admin access rather than
         // leaving it standing for up to the window.
         int cleared = 0;
-        if (!eligible)
-            cleared = auth_mgr_.revoke_user_elevations(target);
+        if (!eligible) {
+            auto rv = auth_mgr_.revoke_user_elevations(target);
+            if (!rv) {
+                // The eligibility flag persisted, but clearing the in-flight
+                // elevation failed durably — the "revoke now" is NOT complete, an
+                // active admin elevation may still be live. Fail CLOSED (503 +
+                // error audit) rather than a false "ok" that tells an incident
+                // responder the access was dropped (adversarial C2). The
+                // eligibility flip is durable, so a retry re-runs only the clear.
+                spdlog::error("elevation-eligibility: durable elevation clear failed for '{}': {}",
+                              target, rv.error());
+                audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
+                          "eligible=false elevation_clear_failed=true detail=" + rv.error());
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503,
+                                          "eligibility updated but active elevations could not be "
+                                          "cleared; retry to complete the revocation",
+                                          cid),
+                    "application/json");
+                return;
+            }
+            cleared = *rv;
+        }
         audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
                   std::string(eligible ? "eligible=true" : "eligible=false") +
                       (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
@@ -4448,7 +4470,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                          " mfa=" + mfa_factor_label +
                                          " expires_at=" + expires_at_str +
                                          " justification=" + justification)) {
-            auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
+            auto rollback = auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
+            if (!rollback) {
+                // The compensating revoke itself failed durably: the elevation is
+                // LIVE AND UNRECORDED — the worst state. Do not claim "not
+                // granted"; escalate loudly (CRITICAL) so an operator manually
+                // revokes, and still fail the request (adversarial C2).
+                spdlog::critical("role.elevation.granted audit FAILED for '{}' AND the compensating "
+                                 "revoke ALSO FAILED ({}) — elevation is LIVE and UNRECORDED; "
+                                 "manual revocation required",
+                                 session->username, rollback.error());
+                res.status = 500;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    detail::error_json_a4(500,
+                                          "elevation could neither be recorded nor rolled back; it "
+                                          "may be active — revoke it manually and check the stores",
+                                          cid, "revoke manually; check the audit + session stores"),
+                    "application/json");
+                return;
+            }
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
                           session->username);
             res.status = 500;
@@ -4491,7 +4532,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
-                  const bool was_elevated = auth_mgr_.revoke_elevation(token);
+                  auto rev = auth_mgr_.revoke_elevation(token);
+                  if (!rev) {
+                      // Durable clear failed — the elevation may still be LIVE.
+                      // Fail CLOSED (503 + error audit) rather than auditing a
+                      // false `role.elevation.revoked ok` (adversarial C2).
+                      spdlog::error("elevate/revoke: durable clear failed for '{}': {}",
+                                    session->username, rev.error());
+                      audit_log_for_principal(req, "role.elevation.revoked", "error",
+                                              session->username,
+                                              auth::role_to_string(session->role), "User",
+                                              session->username,
+                                              "durable_clear_failed=true detail=" + rev.error());
+                      res.status = 503;
+                      res.set_content(
+                          detail::a4_denial(res, 503, "could not revoke the elevation; retry"),
+                          "application/json");
+                      return;
+                  }
+                  const bool was_elevated = *rev;
                   audit_log_for_principal(req, "role.elevation.revoked", "ok", session->username,
                                           auth::role_to_string(session->role), "User",
                                           session->username,

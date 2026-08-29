@@ -745,6 +745,7 @@ bool AuthManager::mark_session_mfa_verified(const std::string& token) {
         if (!r) {
             spdlog::error("mark_session_mfa_verified: durable write failed ({})",
                           r.error().message);
+            note_session_store_degrade("mark_mfa");
             return false;
         }
         if (!*r)
@@ -792,6 +793,7 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
         auto r = session_store_->set_elevation(key, ms_from_tp(until), ms_from_tp(now));
         if (!r) {
             spdlog::error("elevate_session: durable set_elevation failed ({})", r.error().message);
+            note_session_store_degrade("elevate");
             return std::nullopt;
         }
         if (!*r)
@@ -834,7 +836,7 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     return until;
 }
 
-bool AuthManager::revoke_elevation(const std::string& token) {
+std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string& token) {
     if (token.size() > auth::kMaxSessionTokenLength)
         return false;
     if (session_store_) {
@@ -850,15 +852,26 @@ bool AuthManager::revoke_elevation(const std::string& token) {
         }
         if (!s) {
             auto found = session_store_->find(key);
-            if (!found || !found->has_value())
-                return false;
+            if (!found) {
+                // Degraded authoritative read — cannot tell if an elevation is
+                // live. Fail closed: do NOT report a successful no-op over a
+                // possibly-live durable elevation (adversarial C2).
+                note_session_store_degrade("validate");
+                return std::unexpected(std::string("session lookup degraded: ") +
+                                       found.error().message);
+            }
+            if (!found->has_value())
+                return false; // definitively no such session → genuine no-op
             s = session_from_row(**found);
         }
         const bool was_elevated = is_elevated(*s);
         auto r = session_store_->clear_elevation(key);
         if (!r) {
             spdlog::error("revoke_elevation: durable clear failed ({})", r.error().message);
-            return false;
+            note_session_store_degrade("invalidate_user");
+            // The durable elevation is STILL LIVE — surface the failure so the
+            // route fails closed instead of auditing a false revocation.
+            return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
         std::unique_lock lock(mu_);
         if (auto it = sessions_.find(key); it != sessions_.end()) {
@@ -981,7 +994,7 @@ void AuthManager::expire_session_for_test(const std::string& token, std::chrono:
     }
 }
 
-int AuthManager::revoke_user_elevations(const std::string& username) {
+std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::string& username) {
     if (session_store_) {
         // Durable clear FIRST (bumps the generation → every replica drops the
         // stale elevations on refresh); the store's count is authoritative
@@ -989,7 +1002,10 @@ int AuthManager::revoke_user_elevations(const std::string& username) {
         auto r = session_store_->clear_user_elevations(username);
         if (!r) {
             spdlog::error("revoke_user_elevations: durable clear failed ({})", r.error().message);
-            return 0;
+            note_session_store_degrade("invalidate_user");
+            // Elevations may still be live durably — surface so the caller fails
+            // closed rather than reporting a successful "0 cleared" (C2).
+            return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
         std::unique_lock lock(mu_);
         for (auto& [key, s] : sessions_) {
@@ -1211,7 +1227,18 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         // Durable mirror, throttled to kActivityPersistGranularity. touch_activity
         // deliberately does NOT bump the generation, so it never invalidates any
         // replica's cache — the whole point of a sliding update being cheap.
-        if (now - session_copy->last_activity_persisted_at >= kActivityPersistGranularity) {
+        //
+        // C5/K10: the durable row can lag real activity by at most this throttle,
+        // so a cache-COLD replica (that reads the row on a miss) could otherwise
+        // idle-evict a still-active session when the configured idle window is
+        // SHORTER than the throttle. Clamp the durable-persist interval strictly
+        // below the idle window (half it) so the durable row is never staler than
+        // the window a cold replica ages it against — keeping the "an active
+        // session is never wrongly evicted" contract on any replica.
+        const auto durable_persist_gran =
+            idle_enabled ? (std::min)(kActivityPersistGranularity, session_inactivity_ / 2)
+                         : kActivityPersistGranularity;
+        if (now - session_copy->last_activity_persisted_at >= durable_persist_gran) {
             session_copy->last_activity_persisted_at = now;
             if (auto r = session_store_->touch_activity(key, ms_from_tp(now)); !r) {
                 spdlog::debug("validate_session: durable touch_activity failed ({})",
@@ -1236,6 +1263,7 @@ void AuthManager::invalidate_session(const std::string& token) {
         // out NOW" intent is honored on this replica; the row is reaped later.
         if (auto r = session_store_->invalidate(key); !r)
             spdlog::error("invalidate_session: durable delete failed ({})", r.error().message);
+            note_session_store_degrade("invalidate");
     }
     std::unique_lock lock(mu_);
     sessions_.erase(key);

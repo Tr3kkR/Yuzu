@@ -209,3 +209,48 @@ TEST_CASE("SessionStore: reap declines an implausibly-forward clock reading",
     CHECK(*reaped == 0);
     CHECK(store.find("dead2")->has_value()); // survived the declined pass
 }
+
+TEST_CASE("SessionStore: reap declines a reading BEHIND the anchor (backward/poisoned)",
+          "[session_store][pg][retention]") {
+    // Adversarial C8/K5: a now_ms below the highest accepted anchor means the
+    // clock moved backward (or an earlier forward-skewed pass poisoned the
+    // anchor); the pass must decline, never mass-delete under a rewound clock.
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    const auto now = now_ms();
+
+    auto dead = make_row("dead", "hank", now);
+    dead.expires_at_ms = now - 1000;
+    REQUIRE(store.create(dead).has_value());
+    REQUIRE(store.reap_expired(now).has_value()); // anchors at `now`
+
+    auto dead2 = make_row("dead2", "hank", now);
+    dead2.expires_at_ms = now - 1000;
+    REQUIRE(store.create(dead2).has_value());
+
+    // A reading an hour BEHIND the anchor is declined (would otherwise delete a
+    // still-live-under-true-time session when the anchor is poisoned forward).
+    auto reaped = store.reap_expired(now - 3600LL * 1000);
+    REQUIRE(reaped.has_value());
+    CHECK(*reaped == 0);
+    CHECK(store.find("dead2")->has_value());
+}
+
+TEST_CASE("SessionStore: touch_activity is monotonic — never regresses last_activity",
+          "[session_store][pg]") {
+    // Adversarial C3: GREATEST() so an out-of-order / skewed write cannot move
+    // the idle anchor backward and prematurely idle-out an active session.
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    const auto now = now_ms();
+    REQUIRE(store.create(make_row("h", "ivy", now)).has_value());
+
+    REQUIRE(store.touch_activity("h", now + 5000).has_value()); // forward
+    CHECK((*store.find("h"))->last_activity_ms == now + 5000);
+    REQUIRE(store.touch_activity("h", now + 1000).has_value()); // stale/out-of-order
+    CHECK((*store.find("h"))->last_activity_ms == now + 5000);   // NOT regressed
+}
