@@ -11,6 +11,7 @@
 # Usage:
 #   bash scripts/setup-rhel9.sh                    # toolchain + vcpkg
 #   bash scripts/setup-rhel9.sh --with-postgres    # ... plus a local PG 18 for the server tests
+#   bash scripts/setup-rhel9.sh --with-postgres --adopt-cluster   # ... managing a cluster it did not create
 #   bash scripts/setup-rhel9.sh --with-epel        # ... plus EPEL, for the optional ccache
 #   bash scripts/setup-rhel9.sh --check            # verify only, change nothing
 #   bash scripts/setup-rhel9.sh --manifest out.json
@@ -54,6 +55,17 @@ PYYAML_VERSION="6.0.3"
 PG_STREAM="18"
 # Address/role/db match the native-cluster branch of scripts/ci/ensure-postgres.sh.
 PG_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
+PGDATA="/var/lib/pgsql/data"
+# Ownership marker, deliberately OUTSIDE PGDATA (backups and replica bootstraps
+# copy PGDATA). Written only after an initdb this script ran completed, or on
+# --adopt-cluster. The ident->scram flip, the role password and the
+# pg_signal_backend grant are cluster-wide mutations: they happen only on a
+# cluster carrying this marker. Anything else is verified, never changed.
+PG_MARK="/var/lib/pgsql/.yuzu-provisioned"
+PG_OWNED=0
+# Loopback `all all` lines still on ident. Anchored at the end so `ident map=x`
+# is neither matched nor rewritten; shared by the grep and the sed below.
+HBA_IDENT_RE='^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+)ident[[:space:]]*$'
 
 # ccache is deliberately NOT in PKGS: on the RHEL 9 family it exists only in
 # EPEL (verified — it is in neither BaseOS, AppStream nor CRB), and enabling
@@ -83,6 +95,7 @@ ENV_FILE="${HOME}/.config/yuzu/toolchain-env.sh"
 # --- Options -----------------------------------------------------------------
 
 WITH_POSTGRES=0
+ADOPT_CLUSTER=0
 WITH_EPEL=0
 SKIP_VCPKG=0
 CHECK_ONLY=0
@@ -92,13 +105,15 @@ VCPKG_ROOT_ARG="${VCPKG_ROOT:-${HOME}/vcpkg}"
 VCPKG_ROOT_EXPLICIT=0
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+  # The header comment up to (not including) the `set -euo pipefail` line.
+  sed -n '2,/^set -euo pipefail/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
   exit 0
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-postgres) WITH_POSTGRES=1 ;;
+    --adopt-cluster) ADOPT_CLUSTER=1 ;;
     --with-epel)     WITH_EPEL=1 ;;
     --skip-vcpkg)    SKIP_VCPKG=1 ;;
     --check)         CHECK_ONLY=1 ;;
@@ -148,6 +163,15 @@ probe() { # probe [--assume-true] <predicate-cmd...>
 # an exported-but-unreachable DSN turns every [pg] test from a clean skip into
 # a hard failure (CLAUDE.md skip-vs-fail contract).
 pg_answers() { psql "${PG_DSN}" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' 2>/dev/null | grep -qx 1; }
+# Reachability is not identity: something else could be listening on
+# 127.0.0.1:5432. True only when the DSN's listener is the cluster reached over
+# the local socket as postgres (same postmaster start time).
+pg_same_cluster() {
+  local a b
+  a="$(sudo -u postgres psql -tAc 'SELECT pg_postmaster_start_time()' 2>/dev/null)" || return 1
+  b="$(psql "${PG_DSN}" -tAc 'SELECT pg_postmaster_start_time()' 2>/dev/null)" || return 1
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
 PG_VERIFIED=0
 
 FAILURES=0
@@ -425,7 +449,7 @@ write_env_file() {
 if [ "$DRY_RUN" = 0 ]; then
   # Under --with-postgres the DSN line survives only if the cluster answers on
   # it right now; otherwise it is withheld until step 6 has verified it.
-  if [ "$WITH_POSTGRES" = 1 ] && pg_answers; then PG_VERIFIED=1; fi
+  if [ "$WITH_POSTGRES" = 1 ] && pg_answers && pg_same_cluster; then PG_VERIFIED=1; fi
   write_env_file
 
   if grep -q 'yuzu/toolchain-env.sh' "${HOME}/.bashrc" 2>/dev/null; then
@@ -490,30 +514,51 @@ if [ "$WITH_POSTGRES" = 1 ]; then
     ok "postgresql ${PG_STREAM} installed"
   fi
 
-  if probe sudo test -f /var/lib/pgsql/data/PG_VERSION; then
+  if probe sudo test -f "${PGDATA}/PG_VERSION"; then
+    # initdb writes PG_VERSION early and postgresql.conf / global/pg_control at
+    # the end, so an interrupted initdb is detected rather than trusted.
+    { probe sudo test -f "${PGDATA}/postgresql.conf" && probe sudo test -f "${PGDATA}/global/pg_control"; } \
+      || die "${PGDATA} holds an incomplete initdb (PG_VERSION without postgresql.conf or global/pg_control). Move it aside, then re-run."
     skip "data directory already initialised"
   else
     run sudo /usr/bin/postgresql-setup --initdb
-    ok "initdb complete"
+    run sudo -u postgres touch "${PG_MARK}"
+    PG_OWNED=1
+    ok "initdb complete (cluster created by this script; marker ${PG_MARK})"
+  fi
+
+  if [ "$PG_OWNED" = 1 ] || probe sudo test -f "${PG_MARK}"; then
+    PG_OWNED=1
+  elif [ "$ADOPT_CLUSTER" = 1 ]; then
+    warn "--adopt-cluster: taking over the existing cluster at ${PGDATA}; its loopback auth, role 'yuzu' and that role's password are managed by this script from now on"
+    run sudo -u postgres touch "${PG_MARK}"
+    PG_OWNED=1
+  else
+    warn "${PGDATA} was not created by this script: it is verified below, never changed (pass --adopt-cluster to let this script manage it)"
   fi
 
   if probe systemctl is-active --quiet postgresql; then
     skip "postgresql already running"
-  else
+  elif [ "$PG_OWNED" = 1 ]; then
     run sudo systemctl enable --now postgresql
     ok "postgresql started"
+  else
+    die "postgresql is installed but not running, and ${PGDATA} is not managed by this script. Start it yourself (sudo systemctl enable --now postgresql) or pass --adopt-cluster."
   fi
 
   # RHEL's initdb leaves host connections on `ident`, which rejects the
   # password auth the DSN uses. Report the change rather than doing it silently.
-  if probe --assume-true sudo grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+ident' \
-       /var/lib/pgsql/data/pg_hba.conf; then
+  if [ "$PG_OWNED" != 1 ]; then
+    skip "pg_hba.conf not managed (cluster not created by this script)"
+  elif probe --assume-true sudo grep -qE "${HBA_IDENT_RE}" "${PGDATA}/pg_hba.conf"; then
     warn "pg_hba.conf has host auth = ident; switching the two loopback 'all all' lines to scram-sha-256"
-    warn "  (first pre-edit copy kept as /var/lib/pgsql/data/pg_hba.conf.yuzu-orig; never overwritten on later runs)"
-    run sudo cp -n /var/lib/pgsql/data/pg_hba.conf /var/lib/pgsql/data/pg_hba.conf.yuzu-orig
-    run sudo sed -i -E \
-      's@^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+)ident$@\1scram-sha-256@' \
-      /var/lib/pgsql/data/pg_hba.conf
+    warn "  (first pre-edit copy kept as ${PGDATA}/pg_hba.conf.yuzu-orig, owner and mode preserved; never overwritten on later runs)"
+    run sudo cp -n -p "${PGDATA}/pg_hba.conf" "${PGDATA}/pg_hba.conf.yuzu-orig"
+    run sudo sed -i -E "s@${HBA_IDENT_RE}@\\1scram-sha-256@" "${PGDATA}/pg_hba.conf"
+    # The sed must have consumed every line the grep matched.
+    if [ "$DRY_RUN" = 0 ] && sudo grep -qE "${HBA_IDENT_RE}" "${PGDATA}/pg_hba.conf" 2>/dev/null; then
+      die "a loopback ident rule survived the edit of ${PGDATA}/pg_hba.conf; fix it by hand and re-run"
+    fi
     run sudo systemctl reload postgresql
     ok "host auth set to scram-sha-256"
   else
@@ -521,14 +566,18 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   fi
 
   # CREATEDB is REQUIRED: PostgresTestDb (tests/unit/test_helpers.hpp) creates
-  # and drops an ephemeral yuzu_test_<salt>_<n> database per test. The first
-  # probe logs in with exactly the credentials the env file will export
-  # (against the always-present `postgres` db: yuzu_test may not exist yet), so
-  # an existing role that lost LOGIN, CREATEDB or the password is repaired, not
-  # accepted on its name. The password reset is deliberate: the DSN this script
-  # writes hardcodes it.
+  # and drops an ephemeral yuzu_test_<epoch>_<salt>_<n> database per test. The
+  # first probe logs in with exactly the credentials the env file will export
+  # (against the always-present `postgres` db: yuzu_test may not exist yet).
+  # On a cluster this script manages, an existing role that lost LOGIN,
+  # CREATEDB or the password is repaired, not accepted on its name - the
+  # password reset is deliberate, the DSN this script writes hardcodes it. On
+  # any other cluster the role is somebody else's: report and stop.
+  PG_HAND_STEPS="as postgres: CREATE ROLE yuzu LOGIN CREATEDB PASSWORD 'yuzu'; GRANT pg_signal_backend TO yuzu; CREATE DATABASE yuzu_test OWNER yuzu; (or pass --adopt-cluster)"
   if probe psql "${PG_DSN%/*}/postgres" -tAc "SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user" | grep -qx t; then
     skip "role 'yuzu' logs in with CREATEDB"
+  elif [ "$PG_OWNED" != 1 ]; then
+    die "role 'yuzu' cannot log in on ${PG_DSN%/*}/postgres with the password this recipe exports, and ${PGDATA} is not managed by this script. Do it by hand ${PG_HAND_STEPS}"
   elif probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='yuzu'" | grep -qx 1; then
     run sudo -u postgres psql -c "ALTER ROLE yuzu WITH LOGIN CREATEDB PASSWORD 'yuzu';"
     ok "role 'yuzu' repaired (LOGIN CREATEDB, password reset to match the DSN)"
@@ -540,18 +589,24 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   # pg_signal_backend is REQUIRED too, and its absence is expensive rather than
   # obvious: PostgresTestDb drops each ephemeral database WITH (FORCE), which
   # terminates the backends still attached to it. Without membership in
-  # pg_signal_backend that termination is denied, every test LEAKS its database,
-  # and the [pg] shard slows down until it blows its 600 s meson timeout — with
-  # the real cause buried in per-test log noise. GRANT is idempotent.
+  # pg_signal_backend that termination is denied (the attached backends are
+  # typically autovacuum workers, which run under no role), a test whose drop
+  # races one LEAKS its database, and the [pg] shard slows down until it blows
+  # its meson timeout - with the real cause buried in per-test log noise.
+  # GRANT is idempotent.
   if probe sudo -u postgres psql -tAc \
        "SELECT pg_has_role('yuzu','pg_signal_backend','member')" | grep -qx t; then
     skip "role 'yuzu' already has pg_signal_backend"
+  elif [ "$PG_OWNED" != 1 ]; then
+    die "role 'yuzu' lacks pg_signal_backend and ${PGDATA} is not managed by this script. Do it by hand ${PG_HAND_STEPS}"
   else
     run sudo -u postgres psql -c "GRANT pg_signal_backend TO yuzu;"
     ok "granted pg_signal_backend to 'yuzu'"
   fi
   if probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='yuzu_test'" | grep -qx 1; then
     skip "database 'yuzu_test' exists"
+  elif [ "$PG_OWNED" != 1 ]; then
+    die "database 'yuzu_test' is missing and ${PGDATA} is not managed by this script. Do it by hand ${PG_HAND_STEPS}"
   else
     run sudo -u postgres psql -c "CREATE DATABASE yuzu_test OWNER yuzu;"
     ok "database 'yuzu_test' created"
@@ -561,12 +616,14 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   # it. Everything above already aborted under set -e if it failed.
   if [ "$DRY_RUN" = 1 ]; then
     printf '  (dry-run) verify %s answers, then add YUZU_TEST_POSTGRES_DSN to %s\n' "${PG_DSN}" "${ENV_FILE}"
-  elif pg_answers; then
+  elif pg_answers && pg_same_cluster; then
     ok "cluster answers on ${PG_DSN}"
     PG_VERIFIED=1
     write_env_file
+  elif pg_answers; then
+    die "something answers on ${PG_DSN} but it is not the cluster at ${PGDATA} (another listener on 127.0.0.1:5432?), so YUZU_TEST_POSTGRES_DSN was NOT exported."
   else
-    die "PostgreSQL is provisioned but ${PG_DSN} does not answer, so YUZU_TEST_POSTGRES_DSN was NOT exported (exported-but-broken fails the [pg] tests instead of skipping them). Check 'systemctl status postgresql' and pg_hba.conf, then re-run."
+    die "PostgreSQL is provisioned but ${PG_DSN} does not answer, so YUZU_TEST_POSTGRES_DSN was NOT exported (exported-but-broken fails the [pg] tests instead of skipping them). Check 'systemctl status postgresql' and ${PGDATA}/pg_hba.conf, then re-run."
   fi
 fi
 

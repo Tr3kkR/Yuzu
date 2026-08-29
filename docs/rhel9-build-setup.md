@@ -71,8 +71,15 @@ host    all             all             127.0.0.1/32            ident
 `ident` rejects the password auth in `YUZU_TEST_POSTGRES_DSN`, and the failure surfaces as a
 connection error deep inside the test run rather than as a config error. Change the two loopback
 `all all` lines to `scram-sha-256` and `systemctl reload postgresql`. `setup-rhel9.sh
---with-postgres` does this, keeps the first pre-edit copy as `pg_hba.conf.yuzu-orig` (never
-overwritten on later runs), and prints a warning rather than editing silently.
+--with-postgres` does this, keeps the first pre-edit copy as `pg_hba.conf.yuzu-orig` (owner and mode
+preserved, never overwritten on later runs), and prints a warning rather than editing silently.
+
+**The recipe assumes a dedicated local cluster.** That edit, the `yuzu` role's password and the
+`pg_signal_backend` grant are cluster-wide, so the script performs them only on a cluster it created
+itself (marker `/var/lib/pgsql/.yuzu-provisioned`, outside the data directory) or one you hand it
+with `--adopt-cluster`. Any other cluster at `/var/lib/pgsql/data` - say, one already serving a
+native Yuzu server under its own `yuzu` role - is verified, never changed: the script stops and names
+the three statements to run by hand.
 
 Remember the skip-vs-fail contract from `CLAUDE.md`: `YUZU_TEST_POSTGRES_DSN` **unset** → the `[pg]`
 tests skip cleanly; **set but broken** → hard FAIL. So a misconfigured cluster is worse than none.
@@ -81,7 +88,7 @@ tests skip cleanly; **set but broken** → hard FAIL. So a misconfigured cluster
 
 This one cost a 600-second timeout to find, and it is the least obvious failure in this document.
 
-`PostgresTestDb` creates an ephemeral `yuzu_test_<salt>_<n>` database per test and drops it
+`PostgresTestDb` creates an ephemeral `yuzu_test_<epoch>_<salt>_<n>` database per test and drops it
 `WITH (FORCE)`. `FORCE` terminates the backends still attached to the database, and terminating
 another role's backend requires membership in the predefined **`pg_signal_backend`** role. A test
 role with only `LOGIN CREATEDB` gets:
@@ -100,8 +107,8 @@ output. On the reference box this left **70 orphaned databases** behind.
 GRANT pg_signal_backend TO yuzu;
 ```
 
-`setup-rhel9.sh --with-postgres` grants it, `--check` verifies both the membership and that no
-`yuzu_test_*` databases have leaked. If you are cleaning up after hitting this:
+`setup-rhel9.sh --with-postgres` grants it, `--check --with-postgres` verifies both the membership and
+that no `yuzu_test_*` databases have leaked. If you are cleaning up after hitting this:
 
 ```bash
 sudo -u postgres psql -tAc \
@@ -270,9 +277,12 @@ skip - the safe direction); keep passing the flag. `YUZU_TEST_ENABLE_PG` is a co
 The DSN address/role/database match the native-cluster branch of `scripts/ci/ensure-postgres.sh`, so
 that script is a no-op on a box provisioned this way. The `yuzu` role needs **`CREATEDB`** —
 `PostgresTestDb` (`tests/unit/test_helpers.hpp`) creates and drops an ephemeral
-`yuzu_test_<salt>_<n>` database per test. The script logs in with the DSN's own credentials before
-deciding: a pre-existing `yuzu` role that lacks `LOGIN`, `CREATEDB`, or the `yuzu` password is
-repaired with `ALTER ROLE` rather than accepted on its name.
+`yuzu_test_<epoch>_<salt>_<n>` database per test. The script logs in with the DSN's own credentials
+before deciding: on a cluster it manages, a `yuzu` role that lacks `LOGIN`, `CREATEDB`, or the `yuzu`
+password is repaired with `ALTER ROLE` rather than accepted on its name; on any other cluster it
+stops and tells you what to run (see trap 3). The DSN is exported only once the listener on
+`127.0.0.1:5432` is proven to be that cluster (same postmaster start time over the socket and over
+TCP), not merely something that answers.
 
 ---
 
