@@ -2452,7 +2452,7 @@ surface dispatched it**:
 
 - **REST** (`/api/command`, and the legacy `chargen`/`procfetch` routes): `403`, naming the gate
   and pointing at the governed alternative (`{"error":{"code":403,"message":"approval required
-  for &lt;plugin&gt;.&lt;action&gt; — ... dispatch it via POST /api/instructions/{id}/execute instead,
+  for <plugin>.<action> — ... dispatch it via POST /api/instructions/{id}/execute instead,
   which supports the approval workflow"}}`). Denials are audited (`command.dispatch`,
   `result=denied`, `detail=reason=approval_required`) and counted
   (`yuzu_server_dispatch_denied_total{reason="approval_required"}`).
