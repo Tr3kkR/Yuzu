@@ -6,6 +6,7 @@
 #include "audit_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
 
@@ -212,8 +213,10 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
             if (mismatch_audit_detail.empty()) {
                 mismatch_audit_detail =
                     "approval_content_mismatch approval_id=" + a.id + " schedule_id=" + s.id +
-                    " approved_target=" + a.target_plugin + "." + a.target_action +
-                    " current_target=" + plugin + "." + action;
+                    " approved_target=" + onbehalf::sanitize_for_log(a.target_plugin, 128) + "." +
+                    onbehalf::sanitize_for_log(a.target_action, 128) +
+                    " current_target=" + onbehalf::sanitize_for_log(plugin, 128) + "." +
+                    onbehalf::sanitize_for_log(action, 128);
             }
             continue;
         }
