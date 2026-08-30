@@ -127,7 +127,7 @@ independent before this migration, and a probe call belongs next to the construc
 ### Component 2/3: ApprovalManager (commit 2)
 
 `ApprovalManager` (`approval_manager.{hpp,cpp}`) stores one-time MCP approval tickets and REST
-instruction-approval requests (`approvals`, one table, 13 columns) — a security control, not
+instruction-approval requests (`approvals`, one table, 15 columns) — a security control, not
 ordinary CRUD state.
 
 **Not a posture upgrade, unlike ScheduleEngine.** This store was ALREADY fail-closed in the
@@ -137,10 +137,13 @@ no-op/empty-return, not a crash). Construction is fail-**closed** exactly as bef
 now additionally checks `is_open()` and sets `startup_failed_` on failure, matching the ladder's
 uniform wiring pattern, but the store's own internal posture is unchanged.
 
-**Schema** (Postgres schema `approval_manager`, one table, folding the SQLite-era v1..v7 ladder
+**Schema** (Postgres schema `approval_manager`, one table, folding the SQLite-era v1..v8 ladder
 into one PG v1 DDL — every column the ladder ever added is present from creation, and all six
 indexes the ladder accumulated are included; v7's `origin='legacy'` back-fill has no fresh-start
-equivalent — see "Considered and rejected"):
+equivalent — see "Considered and rejected". v8 landed on `origin/dev` as #1398's
+dispatch-approval-gate hardening (`target_plugin`/`target_action`, merged after this branch
+forked) and was folded into this same PG v1 DDL when the branch reconciled against it, rather
+than shipping a separate v2 migration for a still-unreleased column pair):
 
 ```sql
 CREATE TABLE approvals (
@@ -156,7 +159,9 @@ CREATE TABLE approvals (
     consumed_at       BIGINT  NOT NULL DEFAULT 0,
     consumed_by       TEXT    NOT NULL DEFAULT '',
     schedule_id       TEXT    NOT NULL DEFAULT '',
-    origin            TEXT    NOT NULL DEFAULT ''
+    origin            TEXT    NOT NULL DEFAULT '',
+    target_plugin     TEXT    NOT NULL DEFAULT '',
+    target_action     TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_approvals_status ON approvals(status);
 CREATE INDEX idx_approvals_submitted_at ON approvals(submitted_at);
