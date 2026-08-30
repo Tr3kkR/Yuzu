@@ -267,8 +267,8 @@ legitimate double-delete) is caller input, not a store-health signal, and does n
 
 ### Mid-execution write degradation
 
-The private per-step helpers (`create_step_result`/`update_step_result`/`update_execution_status`)
-stay best-effort/log-and-continue on a lease timeout, matching their pre-migration `void`-returning,
+The private per-step helpers (`create_step_result`/`update_step_result`) stay best-effort/
+log-and-continue on a lease timeout, matching their pre-migration `void`-returning,
 unchecked-`sqlite3_step()` shape. **Explicit decision, not an unexamined default:** a bounded-lease
 timeout mid-`execute()` degrades to unrecorded step history for that one step rather than aborting
 an in-flight, already-dispatched fleet operation — aborting a workflow whose steps may have already
@@ -284,17 +284,25 @@ degrade-and-continue posture as the write helpers above, for the same reason —
 in-flight fleet operation over a transient read failure would be strictly worse than one missed
 cancellation check (the loop re-checks on the very next step).
 
-**Finalize's own status write is guarded, unlike the mid-loop "running" update** (governance
-finding, cpp-expert): the terminal `UPDATE ... SET status = 'failed'/'completed'` at the end of
-`execute()` carries `WHERE status = 'running'`, so it cannot clobber a status a concurrent
-`cancel_execution()` already moved to `'cancelled'` — mirroring `cancel_execution()`'s own atomic
-transition from the other direction. Pre-migration, the `std::unique_lock mtx_` serialized cancel
-against finalize, so whichever ran last silently won; that "last writer wins" characteristic was
-already present, just achieved by serialization rather than a missing guard. The Postgres port
-removes the serialization, so finalize needs its own compare-and-guard to keep the same
-never-overwrite-a-terminal-cancel property. Currently unreachable in production —
-`cancel_execution()` has no REST/MCP caller today (verified: grepped the whole tree) — but closes
-the gap correctly ahead of that route eventually being wired, rather than leaving a latent trap.
+**Both the mid-loop "running" update and finalize's status write are guarded** (governance findings,
+cpp-expert + security-guardian + happy-path + sre + docs-writer across two review rounds): the
+per-step `UPDATE ... SET status = 'running', current_step = $1` and the terminal
+`UPDATE ... SET status = 'failed'/'completed'` both carry `WHERE status = 'running'`, so neither can
+clobber a status a concurrent `cancel_execution()` already moved to `'cancelled'` — mirroring
+`cancel_execution()`'s own atomic transition from the other direction. Pre-migration, the
+`std::unique_lock mtx_` serialized cancel against every one of `execute()`'s writes, so whichever ran
+last silently won; that "last writer wins" characteristic was already present, just achieved by
+serialization rather than a missing guard. The Postgres port removes the serialization, so each write
+site needs its own compare-and-guard to keep the same never-overwrite-a-terminal-cancel property (the
+shared `update_execution_status` helper that predated this fix was deleted once both call sites carried
+their own inline guard — nothing else called it). Finalize additionally uses `RETURNING status` to
+confirm what was actually written: if the guard matched zero rows (a concurrent cancel already claimed
+it) or a lease timeout dropped the write, `execute()` reads back the execution's real status via
+`get_execution()` before reporting the write-outcome metric and log line, rather than trusting the
+in-process `execution_failed` bool — which would otherwise misreport a dropped write as success or a
+cancellation as a plain failure. Currently unreachable in production — `cancel_execution()` has no
+REST/MCP caller today (verified: grepped the whole tree) — but closes the gap correctly ahead of that
+route eventually being wired, rather than leaving a latent trap.
 
 ### Lease discipline — the retry-loop hazard
 
