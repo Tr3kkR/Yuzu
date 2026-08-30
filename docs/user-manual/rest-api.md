@@ -6615,6 +6615,36 @@ Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",r
 write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body
 must be a JSON object; anything else is `400`.
 
+**Response (403): unauthorized dispatch.** Two distinct causes share the `403` status but carry
+different messages (#1398) — an incident review can tell them apart from the audit trail's
+`detail=reason=<reason>` field alone (`forbidden` vs `approval_required`), even without the
+response body.
+
+A plain RBAC denial (the caller holds no grant for the pair's classified securable/operation):
+
+```json
+{"error": {"code": 403, "message": "permission denied: Execution:Execute"}, "meta": {"api_version": "v1"}}
+```
+
+A caller who *does* hold the grant but is dispatching one of the ~42 `plugin.action` pairs a
+compiled `ExecuteGate` marks `AdminOrApproval`/`AlwaysApproval` (e.g. `script_exec.exec`,
+`filesystem.delete`, `registry.set_value`), with no approval provenance and no admin role:
+
+```json
+{
+  "error": {
+    "code": 403,
+    "message": "approval required for script_exec.exec — this action requires either an admin caller or an approved request; dispatch it via POST /api/instructions/{id}/execute instead, which supports the approval workflow"
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+The governed path this message points at (`POST /api/instructions/{id}/execute`) supports the
+approval workflow this route deliberately does not — `/api/command` mints no approval ticket of
+its own (one core-owned approval primitive, ADR-1005). An admin caller, or a caller redispatching
+with a redeemed approval ticket via the governed path, is not subject to this denial.
+
 ---
 
 ### Agents

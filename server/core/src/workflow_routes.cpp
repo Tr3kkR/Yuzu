@@ -1834,8 +1834,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // `kUnspecified` — but get it wrong (e.g. pass kMcp for a
                 // non-MCP mint) and the ticket is falsely refusable or, worse,
                 // falsely exempt.
+                // #1398 hardening: bind target_plugin/target_action (two
+                // separate fields, not a concatenated string — see
+                // Approval::target_plugin's doc comment) so a FUTURE
+                // interactive ticket-redemption implementation (design doc
+                // follow-up #6 — none exists on this route today) inherits
+                // the same definition-mutation protection ScheduleRunner
+                // needed, rather than requiring its own security round later.
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
-                                                       ApprovalOrigin::kInstruction);
+                                                       ApprovalOrigin::kInstruction, def.plugin,
+                                                       def.action);
                 if (!result) {
                     spdlog::error("approval submit failed for '{}': {}", def_id, result.error());
                     res.status = 500;

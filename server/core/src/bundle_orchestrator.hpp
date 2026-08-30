@@ -123,9 +123,26 @@ public:
     /// this orchestrator is not itself the confinement chokepoint, only a
     /// faithful conduit for whichever caller-derived set the wrapper already
     /// checked `agent_id` against.
+    ///
+    /// #1398 (adversarial-review finding, both reviewers independently):
+    /// `principal_is_admin`/`approval_provenance` are the SAME pass-through
+    /// contract as `exec_visible` above, for the two `DispatchCaller` fields
+    /// the dispatch chokepoint's `ExecuteGate` gate consults. Before this fix,
+    /// this method reconstructed a `DispatchCaller` carrying only `principal`
+    /// + `exec_visible`, so BOTH fields silently defaulted to `false`/`None`
+    /// regardless of who the real caller was — an admin's (or a
+    /// ticket-holding supervised MCP caller's) bundle step targeting any of
+    /// the ~42 `AdminOrApproval` pairs was refused `ApprovalRequired`
+    /// unconditionally, with no way to satisfy the gate via this surface at
+    /// all. Both wrappers already derive the caller's real values (the SAME
+    /// `derive_dispatch_caller`/`caller_fn` every other surface uses) before
+    /// calling this method; they must pass them through rather than let this
+    /// method drop them on the floor.
     DispatchResult dispatch(const std::string& agent_id, const std::vector<BundleStepSpec>& steps,
                             const std::string& principal, const AuditSink& audit,
-                            const yuzu::server::authz::VisibleSet& exec_visible = {});
+                            const yuzu::server::authz::VisibleSet& exec_visible = {},
+                            bool principal_is_admin = false,
+                            ApprovalProvenance approval_provenance = ApprovalProvenance::None);
 
     /// Collate the bundle's responses. Returns `unexpected(kNotFoundOrDenied)`
     /// when the correlation id is unknown/expired OR not owned by `principal`
