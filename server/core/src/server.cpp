@@ -182,6 +182,7 @@
 #include "tag_store.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
+#include "legacy_sqlite_probe.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
 #include "workflow_engine.hpp"
@@ -3610,16 +3611,11 @@ public:
             // only after every fail-closed check and the listeners are up.
         }
 
-        // Initialize OTA update registry
-        if (cfg_.ota_enabled) {
-            auto update_db_path = cfg_.db_dir() / "update_packages.db";
-            auto update_dir =
-                cfg_.update_dir.empty() ? cfg_.db_dir() / "agent-updates" : cfg_.update_dir;
-            std::error_code ec;
-            std::filesystem::create_directories(update_dir, ec);
-            update_registry_ = std::make_unique<UpdateRegistry>(update_db_path, update_dir);
-            agent_service_.set_update_registry(update_registry_.get());
-        }
+        // OTA update registry (ADR-0061): moved below, after the PostgreSQL
+        // substrate is constructed — UpdateRegistry is now a Postgres-backed
+        // store and needs pg_pool_ to exist first. See the
+        // "if (cfg_.ota_enabled && pg_pool_ && !startup_failed_)" block
+        // following the offline-endpoint store below.
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)
@@ -3692,6 +3688,55 @@ public:
                               "failed (database reachable but the endpoint_state schema could "
                               "not be created/opened)");
                 startup_failed_ = true;
+            }
+        }
+
+        // OTA update registry — Postgres store (ADR-0061, Wave 4 ladder blind
+        // spot). Only constructed when cfg_.ota_enabled is true (default —
+        // opt-out via --no-ota, not an opt-in flag), same gate as
+        // pre-migration; with --no-ota, update_registry_ stays null, unchanged
+        // behaviour. Otherwise, construction is now FAIL-CLOSED per ADR-0012 §1
+        // — a posture upgrade: the pre-migration constructor had NO is_open()
+        // check at this call site at all (silently served with a null db_ on
+        // open failure). A reachable database whose update_registry schema
+        // can't be created/opened is now a fatal startup error.
+        if (cfg_.ota_enabled && pg_pool_ && !startup_failed_) {
+            auto update_dir =
+                cfg_.update_dir.empty() ? cfg_.db_dir() / "agent-updates" : cfg_.update_dir;
+            std::error_code ec;
+            std::filesystem::create_directories(update_dir, ec);
+            update_registry_ = std::make_unique<UpdateRegistry>(*pg_pool_, update_dir);
+            if (!update_registry_->is_open()) {
+                spdlog::error("[PG] Refusing to start: update registry migration/open failed "
+                              "(database reachable but the update_registry schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                agent_service_.set_update_registry(update_registry_.get());
+                // Detect-and-warn (docs/postgres-store-playbook.md's Backfill
+                // bullet): silent unless the legacy file actually holds real
+                // package rows this fresh-start cutover will not carry over.
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "update_packages.db",
+                                                         "UpdateRegistry", {"update_packages"});
+                // Read/write degrade-total counters (gov sre finding, adversarial
+                // review 2026-08-28) — mirrors InstructionStore's #1675 convention:
+                // pre-seed every {reason} series so a dashboard/alert never reads
+                // "no data" for a reason that simply hasn't fired yet.
+                update_registry_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_update_registry_read_degrade_total",
+                                  "UpdateRegistry reads that degraded instead of answering, "
+                                  "by reason",
+                                  "counter");
+                metrics_.describe("yuzu_server_update_registry_write_degrade_total",
+                                  "UpdateRegistry writes that degraded instead of succeeding, "
+                                  "by reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_update_registry_read_degrade_total",
+                                     {{"reason", reason}});
+                    metrics_.counter("yuzu_server_update_registry_write_degrade_total",
+                                     {{"reason", reason}});
+                }
             }
         }
 
@@ -8448,6 +8493,15 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr);
         quarantine_reconciler_.reset();
+        // UpdateRegistry (ADR-0061) borrows pg_pool_ — same discipline: null the
+        // borrowed raw pointer in agent_service_'s OTA gRPC handlers
+        // (CheckForUpdate/DownloadUpdate) before dropping it, then drop before
+        // the pool. settings_routes_ also holds a raw pointer, wired once at
+        // route-registration time rather than through a live setter — every
+        // HTTP handler thread that could reach it is already quiesced by the
+        // drains above (same as runtime_config_store_'s identical shape).
+        agent_service_.set_update_registry(nullptr);
+        update_registry_.reset();
         // Generic InventoryStore (ADR-0037): same discipline as the typed PG
         // stores below — null the borrowed pointer in the ingest service
         // that actually borrows it (the gateway ProxyInventory path; the
@@ -12535,6 +12589,13 @@ private:
             // the /readyz conjunction; trivially true when not on default certs
             // (the operator brought their own, so ca_store isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
+            // ADR-0061: UpdateRegistry — only load-bearing when cfg_.ota_enabled
+            // is true (default ON, opt-out via --no-ota). Mirrors /readyz's own
+            // entry; NOT analogous to ca_ok just above (using_default_certs is
+            // itself true for the ordinary out-of-box self-signed deployment,
+            // not an "off by default" gate).
+            bool update_registry_ok =
+                !cfg_.ota_enabled || (update_registry_ && update_registry_->is_open());
             // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
             // not here, so /healthz could report "healthy" with a degraded store —
             // the same gap the Guardian/CA rows above closed. The server fails
@@ -12614,11 +12675,11 @@ private:
             bool all_stores_ok =
                 pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
                 guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok && ca_ok &&
-                offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
-                app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok &&
-                runtime_config_ok;
+                update_registry_ok && offline_endpoint_ok && software_inventory_ok &&
+                vuln_finding_ok && app_perf_daily_ok && app_perf_fleet_ok &&
+                device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
+                mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
+                notification_ok && upload_grant_ok && tag_ok && runtime_config_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12645,6 +12706,7 @@ private:
                   // StoreCheck vector); matching that name here.
                   {"approval_manager", approval_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
+                  {"update_registry", update_registry_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
                   {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
@@ -12915,6 +12977,18 @@ private:
                 {"scim_store", !cfg_.scim_enable ||
                                    (scim_store_ && scim_store_->is_open() &&
                                     scim_store_->has_token())},
+                // ADR-0061: UpdateRegistry is only constructed when
+                // cfg_.ota_enabled is true, which defaults ON (opt-out via
+                // --no-ota) — unlike ca_store/scim_store's construction
+                // (unconditional whenever pg_pool_ is up; only their /readyz
+                // CHECK above is flag-gated), this store's CONSTRUCTION itself
+                // has the opt-out. So the check below
+                // covers the ordinary default deployment, not an opt-in
+                // minority. A failed migration/open would otherwise silently
+                // disable OTA (CheckForUpdate/DownloadUpdate always answering
+                // "no update") while /readyz reported "ready".
+                {"update_registry", !cfg_.ota_enabled ||
+                                        (update_registry_ && update_registry_->is_open())},
                 // Wave 2 migrated Postgres store (ADR-0006/0009/0044, schema
                 // `discovery_store`). AUTHORITATIVE per ADR-0012 §1 — the
                 // operator-set `managed` flag is real state. Construction
@@ -21308,7 +21382,11 @@ private:
     // can't double-apply the same per-reason delta (#1912 review).
     mutable std::mutex nvd_metrics_scrape_mu_;
 
-    // OTA agent updates
+    // OTA agent updates — born-on-PG store (ADR-0061). Borrows pg_pool_
+    // (declared earlier, destructs later) and is borrowed by agent_service_'s
+    // OTA gRPC handlers + settings_routes_'s Updates admin surface; declared
+    // here so it destructs AFTER those consumers' own quiesce/drain and
+    // BEFORE the pool. explicit reset() in stop() before pg_pool_.reset().
     std::unique_ptr<UpdateRegistry> update_registry_;
 
     // Analytics
