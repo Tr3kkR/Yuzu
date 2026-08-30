@@ -371,18 +371,12 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     // the uniform idiom across every store in this ladder).
     std::string queue_full_error;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        pg::PgResult cnt = pg::exec_params(
-            conn, "SELECT COUNT(*) FROM approval_manager.approvals WHERE status = 'pending'",
-            std::vector<std::string>{});
-        if (cnt.status() != PGRES_TUPLES_OK)
-            return false;
-        int pending = static_cast<int>(to_i64(col(cnt.get(), 0, 0)));
-        if (pending >= kMaxPendingApprovals) {
-            queue_full_error = "approval queue is full (" +
-                               std::to_string(kMaxPendingApprovals) + " pending)";
-            return false;
-        }
-
+        // Expiry sweep runs BEFORE the pending-count cap check, not after: the
+        // cap is exactly the state the sweep exists to relieve, and a stale
+        // queue full of 1000 unreviewed tickets must not be able to wedge
+        // itself past its own recovery path (governance adversarial review,
+        // 2026-08-31 — the sweep-after-cap ordering made a full stale queue
+        // permanently unrecoverable without manual database intervention).
         pg::PgResult exp = pg::exec_params(
             conn,
             "UPDATE approval_manager.approvals SET status = 'expired' "
@@ -402,6 +396,18 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             return false;
         if (int n = PQntuples(expa.get()); n > 0)
             spdlog::info("ApprovalManager: expired {} approved-but-unconsumed approval tickets", n);
+
+        pg::PgResult cnt = pg::exec_params(
+            conn, "SELECT COUNT(*) FROM approval_manager.approvals WHERE status = 'pending'",
+            std::vector<std::string>{});
+        if (cnt.status() != PGRES_TUPLES_OK)
+            return false;
+        int pending = static_cast<int>(to_i64(col(cnt.get(), 0, 0)));
+        if (pending >= kMaxPendingApprovals) {
+            queue_full_error = "approval queue is full (" +
+                               std::to_string(kMaxPendingApprovals) + " pending)";
+            return false;
+        }
 
         pg::PgResult ins = pg::exec_params(
             conn,

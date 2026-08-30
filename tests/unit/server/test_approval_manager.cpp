@@ -874,6 +874,65 @@ void backdate(pg::PgPool& pool, const std::string& id, const char* column, int64
 constexpr int64_t k8Days = 8 * 24 * 3600;
 } // namespace
 
+namespace {
+/// Bulk-inserts `count` pending approvals directly via SQL (bypassing
+/// `submit()`'s own cap, which would refuse past 1000) so cap-boundary tests
+/// stay fast — one INSERT instead of `count` round-trips through submit().
+void seed_pending(pg::PgPool& pool, const std::string& id_prefix, int count, int64_t age_seconds) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto sql = std::string(
+                   "INSERT INTO approval_manager.approvals "
+                   "(id, definition_id, status, submitted_by, submitted_at) "
+                   "SELECT '") +
+               id_prefix +
+               "' || gs, 'def-seeded', 'pending', 'operator1', "
+               "extract(epoch from now())::bigint - $1 "
+               "FROM generate_series(1, $2) AS gs";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{std::to_string(age_seconds), std::to_string(count)});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+} // namespace
+
+TEST_CASE("ApprovalManager: a full stale pending queue self-heals on the next submit "
+          "(governance adversarial review 2026-08-31 — was permanently wedged)",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    // 1000 pending approvals, all 8 days old — at the cap, and all expirable.
+    seed_pending(mgr_bundle.pool(), "stale-", 1000, k8Days);
+
+    // Before the fix, this returned "approval queue is full" and never ran
+    // the expiry sweep, permanently wedging the store.
+    auto id = mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+
+    // The stale queue was swept, not just tolerated once.
+    auto pending = mgr.pending_count();
+    CHECK(pending == 1); // only the new one — all 1000 stale rows expired
+}
+
+TEST_CASE("ApprovalManager: a full queue of NON-stale pending approvals still rejects",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    // 1000 pending approvals, fresh (not expirable) — the cap must still bind
+    // when there is genuinely nothing for the sweep to clear.
+    seed_pending(mgr_bundle.pool(), "fresh-", 1000, /*age_seconds=*/60);
+
+    auto id = mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction);
+    REQUIRE(!id.has_value());
+    CHECK(id.error().find("queue is full") != std::string::npos);
+}
+
 TEST_CASE("ApprovalManager: stale pending approvals expire on the next submit",
           "[pg][approval_manager][approval]") {
     yuzu::test::ApprovalManagerPg mgr_bundle;

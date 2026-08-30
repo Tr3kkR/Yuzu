@@ -230,6 +230,22 @@ compound cap-check + sweep + insert sequence — `consume_ticket`'s CAS and ever
 longer take it at all, since a single Postgres statement is already atomic under the target row's
 own lock.
 
+**Correction (adversarial review, 2026-08-31):** "ports shape-preserved" above was true of the two
+`UPDATE` statements themselves but not of their ORDER relative to the pending-count cap check.
+Both Kimi and Codex independently found — and cross-examination confirmed unanimously — that
+`submit()` ran the cap check BEFORE the expiry sweep (inherited unchanged from the pre-migration
+SQLite ordering), so a queue that reached exactly the state the sweep exists to relieve (1000
+pending rows, all stale) permanently refused every subsequent `submit()` with "queue is full"
+without ever running the sweep that would have cleared it — a durable denial of service across
+every approval-gated surface (MCP, REST instruction-approval, schedule), recoverable only by
+manual database intervention. Fixed by running both expiry `UPDATE`s before the pending-count
+`SELECT COUNT(*)` inside the same transaction, so a full stale queue clears itself on the very
+call that would otherwise have been refused. Two regression tests added
+(`tests/unit/server/test_approval_manager.cpp`): a full stale queue accepts the next `submit()`
+and clears down to just the new row, and a full queue of genuinely non-stale rows still rejects
+(the cap must still bind when there is nothing for the sweep to clear). Verified empirically that
+the new test fails against the pre-fix ordering and passes against the fix.
+
 ### Component 3/3: ExecutionTracker + `InstructionDbPool` deletion (commit 3)
 
 `ExecutionTracker` (`execution_tracker.{hpp,cpp}`) stores execution history and per-agent
