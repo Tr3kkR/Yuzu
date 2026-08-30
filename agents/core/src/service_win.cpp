@@ -105,10 +105,13 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
         // own WaitToKillServiceTimeout instead, which can be shorter and is outside this
         // process's control either way. No checkpoint-bumping thread added regardless: a wedge
         // that outlives the 30s hint now hard_exit()s the whole process before the SCM's own
-        // timeout would matter, rather than needing a live checkpoint to survive it - but note
-        // this box has no SCM FailureActions/recovery config configured today, so unlike the
-        // Linux systemd Restart=always path, a Windows watchdog fire does not auto-restart
-        // (governance Gate 6 sre finding; docs/user-manual/server-admin.md).
+        // timeout would matter, rather than needing a live checkpoint to survive it. --install-
+        // service's own SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 - SC_ACTION_RESTART
+        // x3, with SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it fires on a clean exit with
+        // no SERVICE_STOPPED report too, not just a crash) DOES auto-restart a watchdog-fired
+        // TerminateProcess, similar to the Linux systemd Restart=always path (an earlier
+        // revision of this comment claimed the opposite - governance Gate 6 sre finding,
+        // corrected at Gate 8 re-verify after direct code read).
         report_status(SERVICE_STOP_PENDING, NO_ERROR, 0, 30000);
         {
             std::lock_guard<std::mutex> lock(g_agent_mu);

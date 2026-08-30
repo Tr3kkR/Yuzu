@@ -3148,10 +3148,12 @@ instead of after the 20s deadline (code 4). If a wedge triggers both at once
 code is actually reported is a race — treat it as a hint, not a certain
 diagnosis. On Windows, a second Ctrl-C also terminates promptly (via the
 escalation or the CRT's default disposition); the service path (`sc stop`) is
-now also bounded by the same 20s watchdog — but note Windows has no automatic
-service-recovery action configured today, unlike the Linux `Restart=always`
-unit below, so a Windows watchdog fire is a clean stop, not a self-healing
-restart, and `TerminateProcess` bypasses `report_status`, so a code-4 exit
+now also bounded by the same 20s watchdog. The agent's own `--install-service`
+path (see below) does configure automatic service recovery — 3 restarts, 60s
+apart, resetting after 24h, firing on both a crash and a clean exit that never
+reported `SERVICE_STOPPED` (#1822) — so a watchdog fire there behaves similarly
+to the Linux `Restart=always` unit, not as a permanent stop. What it does
+change: `TerminateProcess` bypasses `report_status`, so a code-4 exit
 does not land in the `sc query`/Event Viewer "specific error" buckets
 described further down — it surfaces as a generic unexpected termination. If
 the agent logs `shutdown watcher unavailable` at boot (thread/fd

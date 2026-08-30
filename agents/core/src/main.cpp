@@ -218,9 +218,11 @@ static void on_signal(int sig) {
         // wedged stop can trigger BOTH this handler (an operator sending a second signal) AND
         // the watchdog above for the SAME wedge, and whichever one's exit call the kernel
         // schedules first wins — governance Gate 5 chaos-injector reproduced this empirically
-        // (900/900 trials: always exactly one of the two codes, never a third value or a
-        // crash, but genuinely nondeterministic which one). Treat the exit code as a useful
-        // hint, not a certain diagnosis, when both paths could plausibly have fired.
+        // across many repeated trials: always exactly one of the two codes, never a third
+        // value or a crash, but genuinely nondeterministic which one (exact trial counts in
+        // the governance.d/2233-shutdown-deadline-guard.*.jsonl ledger for this PR). Treat the
+        // exit code as a useful hint, not a certain diagnosis, when both paths could plausibly
+        // have fired.
         // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7, chaos-injector; this PR.)
         // See hard_exit.hpp: TerminateProcess on Windows (no DllMain, no loader
         // lock), ::_exit() on POSIX (async-signal-safe, cannot block).

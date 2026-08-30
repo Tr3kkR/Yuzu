@@ -106,10 +106,14 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // hint to the Windows SCM, so this must stay under that or the SCM could act on an
 // unresponsive service before this watchdog even fires — 20s leaves only a 10s margin,
 // not a comfortable one (matching service_win.cpp's own wording on the same relationship,
-// not "well under"). That margin matters more on Windows than it sounds: this box has no
-// SCM FailureActions/recovery config today (governance Gate 6 sre finding), so a watchdog
-// fire there is a clean stop with no automatic restart, unlike the systemd Restart=always
-// path — see "Stopping a wedged agent" in docs/user-manual/server-admin.md.
+// not "well under"). That margin matters on Windows: --install-service's own
+// SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 — SC_ACTION_RESTART x3, and
+// SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it also fires on a clean exit with no
+// SERVICE_STOPPED report, not just a crash) DOES auto-restart on a watchdog fire — an
+// earlier revision of this comment claimed the opposite (governance Gate 6 sre finding,
+// corrected at Gate 8 re-verify after direct code read) — but that restart only happens if
+// TerminateProcess actually lands inside this margin before the SCM gives up waiting on
+// STOP_PENDING; see "Stopping a wedged agent" in docs/user-manual/server-admin.md.
 constexpr std::chrono::milliseconds kShutdownDeadlineGrace{20'000};
 
 // #2303 sec-L. The daily-sync scheduler (ADR-0016) persists last-hash / need_full state in this
@@ -1001,7 +1005,9 @@ public:
             // regression (adversarial review Kimi K1): the spark variant set its "done"
             // flag even when the boot-latch gate below caused it to skip the actual call,
             // permanently disabling the ScopeExit's own retry. Reverted - trust each
-            // engine's own proven completion-barrier instead of re-deriving one here.
+            // engine's own proven safety on a repeat call instead of re-deriving one here
+            // (SparkEngine's genuine completion barrier; GuardianEngine's verified
+            // idempotency - see above, neither needed an AgentImpl-level layer on top).
             if (guardian_)
                 guardian_->stop();
             // Before thread_pool_ is reset below. Rung 1's engine does not

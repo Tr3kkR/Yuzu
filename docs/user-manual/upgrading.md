@@ -2720,9 +2720,10 @@ Before upgrading any component:
   instead of after the 20s deadline (code 4); which code is actually reported
   is a race if both happen for the same wedge, so treat it as a hint, not a
   certain diagnosis. On Windows, `sc stop`/service shutdown is now also bounded
-  by the same 20s watchdog, but this platform has no automatic-restart
-  recovery action configured, unlike the Linux `Restart=always` unit — a
-  watchdog fire there is a clean stop, not a self-healing restart. See
+  by the same 20s watchdog; the agent's `--install-service` recovery-actions
+  configuration (#1822) auto-restarts on a watchdog fire similarly to the
+  Linux `Restart=always` unit, but the exit shows up as a generic unexpected
+  termination rather than one of the SCM's own "specific error" buckets. See
   *Stopping a wedged agent* in [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
