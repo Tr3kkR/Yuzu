@@ -460,7 +460,13 @@ private:
 public:
 
     /// Destroy a session (logout).
-    void invalidate_session(const std::string& token);
+    /// Destroy a session (logout). Returns whether the durable delete
+    /// persisted: true when no store is configured OR the durable row was
+    /// deleted; FALSE on a durable-delete store error (the local cache is still
+    /// erased, but the durable row survives and can rehydrate a valid session on
+    /// another replica / from a copied cookie, so the caller MUST NOT report a
+    /// clean logout — adversarial-round blocker #3).
+    [[nodiscard]] bool invalidate_session(const std::string& token);
 
     /// Outcome of `invalidate_user_sessions`. The in-memory `count` is the
     /// number of session cookies erased; `db_persisted` is true iff the
@@ -864,6 +870,15 @@ private:
     /// sub-interval window until then.
     void maybe_refresh_session_generation() const;
 
+    /// True when the validate-cache's generation view is too stale to trust — the
+    /// generation was never confirmed, OR the last SUCCESSFUL refresh is older
+    /// than kSessionGenStaleServeBoundMs (a sustained refresh outage). A cache
+    /// hit is served only when this is false; past the bound, validate falls to
+    /// the authoritative store and fails closed if it too is degraded (the
+    /// rbac_store bounded-stale-serve pattern, ADR-2002 §4). No-op-false without
+    /// a store. Takes `session_gen_mtx_`; caller must NOT hold it.
+    [[nodiscard]] bool session_generation_view_stale() const;
+
     /// Persist enrollment tokens to disk.
     bool save_tokens() const;
     /// Load enrollment tokens from disk.
@@ -905,6 +920,11 @@ private:
     mutable std::uint64_t cached_session_gen_ = 0;
     mutable bool session_gen_valid_ = false;
     mutable std::int64_t last_session_gen_refresh_ms_ = 0;
+    // steady-ms of the last SUCCESSFUL generation read (bounded stale-serve, the
+    // rbac_store pattern). 0 = never succeeded. Read by
+    // session_generation_view_stale() to decide when a cache hit is too stale to
+    // trust during a refresh outage.
+    mutable std::int64_t last_successful_session_gen_refresh_ms_ = 0;
 
     /// Idle-timeout window (SOC 2 CC6.3). 0 = disabled (absolute expiry only).
     /// Read on the validate_session hot path; set once at startup before any

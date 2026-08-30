@@ -2816,17 +2816,31 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // -- Logout ---------------------------------------------------------------
     sink.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
-        audit_log(req, "auth.logout", "success");
-        emit_event("auth.logout", req);
         auto token = extract_session_cookie(req);
-        if (!token.empty()) {
-            auth_mgr_.invalidate_session(token);
-        }
+        // db_persisted=false ⇒ the durable session row was NOT deleted (store
+        // error); the cookie can still rehydrate a valid session on another
+        // replica / if copied, so logout is only PARTIAL — do not audit/report a
+        // clean success (adversarial-round blocker #3). The local cache is erased
+        // and the client cookie is cleared regardless (this browser is logged
+        // out), but ops + API callers are told the durable delete failed so it
+        // can be retried; the degrade metric was already incremented in
+        // invalidate_session.
+        const bool db_persisted = token.empty() ? true : auth_mgr_.invalidate_session(token);
+        audit_log(req, "auth.logout", db_persisted ? "success" : "partial", /*target_type=*/{},
+                  /*target_id=*/{}, db_persisted ? "" : "db_error=true");
+        emit_event("auth.logout", req);
         res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-        // HTMX clients get a redirect header; non-HTMX get JSON
+        // HTMX clients (a human browser) get a redirect header either way — this
+        // browser IS logged out. Non-HTMX (API/automation) get an honest 503 on a
+        // partial logout so a caller can retry the durable delete.
         if (!req.get_header_value("HX-Request").empty()) {
             res.set_header("HX-Redirect", "/login");
             res.set_content("", "text/plain");
+        } else if (!db_persisted) {
+            res.status = 503;
+            res.set_content(
+                R"({"status":"partial","detail":"session cookie cleared but the durable session could not be deleted; retry to complete logout"})",
+                "application/json");
         } else {
             res.set_content(R"({"status":"ok"})", "application/json");
         }

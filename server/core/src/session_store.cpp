@@ -375,7 +375,8 @@ std::expected<std::uint64_t, SessionStore::Error> SessionStore::read_generation(
     return to_u64(PQgetvalue(r.get(), 0, 0));
 }
 
-std::expected<int, SessionStore::Error> SessionStore::reap_expired(std::int64_t now_ms) {
+std::expected<SessionStore::ReapOutcome, SessionStore::Error>
+SessionStore::reap_expired(std::int64_t now_ms) {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
 
@@ -398,6 +399,7 @@ std::expected<int, SessionStore::Error> SessionStore::reap_expired(std::int64_t 
     // separate a true from a false positive here. The magnitude guard
     // (kMaxPlausibleSkewMs) still declines a later implausibly-forward reading.
     int deleted = 0;
+    bool clock_anomaly = false;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         if (exec_params(c, "SELECT pg_advisory_xact_lock(hashtext('session_store:reap'))",
@@ -422,6 +424,7 @@ std::expected<int, SessionStore::Error> SessionStore::reap_expired(std::int64_t 
         if (has_anchor && now_ms > anchor + kMaxPlausibleSkewMs) {
             spdlog::warn("SessionStore::reap declined: now_ms {} implausibly ahead of anchor {}",
                          now_ms, anchor);
+            clock_anomaly = true;
             return true; // decline (commit the no-op lock release), anchor unchanged
         }
         // BACKWARD-anomaly guard (adversarial C8/K5): now_ms below the highest
@@ -435,6 +438,7 @@ std::expected<int, SessionStore::Error> SessionStore::reap_expired(std::int64_t 
             spdlog::warn("SessionStore::reap declined: now_ms {} is behind anchor {} (backward "
                          "clock movement or a poisoned anchor) — not deleting under a rewound clock",
                          now_ms, anchor);
+            clock_anomaly = true;
             return true;
         }
         // Accepted pass: capped delete of absolutely-expired sessions.
@@ -463,7 +467,7 @@ std::expected<int, SessionStore::Error> SessionStore::reap_expired(std::int64_t 
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "reap failed" : err});
-    return deleted;
+    return ReapOutcome{deleted, clock_anomaly};
 }
 
 } // namespace yuzu::server

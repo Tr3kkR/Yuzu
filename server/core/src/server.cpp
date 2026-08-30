@@ -2520,6 +2520,17 @@ public:
                           "retention sweep",
                           "counter");
         metrics_.counter("yuzu_auth_session_reap_total");
+        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a)): incremented
+        // when a session reap pass is DECLINED because the wall clock read is
+        // implausibly ahead of, or behind, the persisted anchor — i.e. a DB/host
+        // clock anomaly (a backward step un-expires sessions). Pre-seeded to 0 so
+        // YuzuSessionReapClockAnomaly's `increase() > 0` alert is meaningful.
+        metrics_.describe("yuzu_auth_session_reap_clock_anomaly_total",
+                          "Session reap passes declined due to an implausible (forward or backward) "
+                          "wall-clock reading vs the persisted anchor — the DB-clock-integrity "
+                          "signal for durable sessions (ADR-2002 §4)",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -18491,9 +18502,17 @@ private:
                                     std::chrono::system_clock::now().time_since_epoch())
                                     .count();
                             if (auto reaped = session_store_->reap_expired(now_ms)) {
-                                if (*reaped > 0)
+                                if (reaped->deleted > 0)
                                     metrics_.counter("yuzu_auth_session_reap_total")
-                                        .increment(static_cast<double>(*reaped));
+                                        .increment(static_cast<double>(reaped->deleted));
+                                // DB-clock-integrity monitor (ADR-2002 §4 mitigation
+                                // (a)): a declined pass due to a forward/backward
+                                // clock anomaly is the "monitor for backward
+                                // movement; alert" signal. Surfaced as a counter so
+                                // YuzuSessionReapClockAnomaly can fire on it.
+                                if (reaped->clock_anomaly)
+                                    metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
+                                        .increment();
                             } else {
                                 metrics_.counter("yuzu_auth_session_store_degrade_total",
                                                  {{"op", "reap"}})

@@ -171,7 +171,7 @@ TEST_CASE("AuthManager+SessionStore: invalidate deletes the durable session",
     auto token = a->create_local_session("dave", Role::admin, /*mfa_verified=*/true);
     REQUIRE(a->validate_session(token).has_value());
 
-    a->invalidate_session(token);
+    CHECK(a->invalidate_session(token)); // happy path: durable delete persisted
     // Gone on A (local cache + durable row erased)…
     CHECK_FALSE(a->validate_session(token).has_value());
     // …and on a fresh replica (the durable row is deleted).

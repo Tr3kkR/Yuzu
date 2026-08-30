@@ -178,7 +178,8 @@ TEST_CASE("SessionStore: reap deletes only absolutely-expired sessions",
 
     auto reaped = store.reap_expired(now);
     REQUIRE(reaped.has_value());
-    CHECK(*reaped == 1);
+    CHECK(reaped->deleted == 1);
+    CHECK_FALSE(reaped->clock_anomaly); // a normal accepted pass is not an anomaly
     CHECK(store.find("live")->has_value());
     CHECK_FALSE(store.find("dead")->has_value());
 }
@@ -206,7 +207,8 @@ TEST_CASE("SessionStore: reap declines an implausibly-forward clock reading",
     // the pass must NOT delete under an anomalous clock.
     auto reaped = store.reap_expired(now + 2LL * 366 * 24 * 3600 * 1000);
     REQUIRE(reaped.has_value());
-    CHECK(*reaped == 0);
+    CHECK(reaped->deleted == 0);
+    CHECK(reaped->clock_anomaly); // forward-skew decline is a clock anomaly
     CHECK(store.find("dead2")->has_value()); // survived the declined pass
 }
 
@@ -234,7 +236,8 @@ TEST_CASE("SessionStore: reap declines a reading BEHIND the anchor (backward/poi
     // still-live-under-true-time session when the anchor is poisoned forward).
     auto reaped = store.reap_expired(now - 3600LL * 1000);
     REQUIRE(reaped.has_value());
-    CHECK(*reaped == 0);
+    CHECK(reaped->deleted == 0);
+    CHECK(reaped->clock_anomaly); // backward-skew decline is a clock anomaly
     CHECK(store.find("dead2")->has_value());
 }
 

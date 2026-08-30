@@ -161,11 +161,22 @@ public:
 
     // ── Retention (clock-guarded, single-writer across replicas) ───────────────
 
+    /// Outcome of one reap pass. `clock_anomaly` is set when the pass was
+    /// DECLINED because `now_ms` was implausibly ahead of, or behind, the
+    /// persisted anchor — the DB-clock-integrity signal ADR-2002 §4 mitigation
+    /// (a) requires the caller to monitor/alert on (a backward DB clock step is
+    /// exactly this). A declined pass has `deleted == 0`.
+    struct ReapOutcome {
+        int deleted = 0;
+        bool clock_anomaly = false;
+    };
+
     /// Delete sessions whose absolute lifetime has passed. Guarded per the
     /// clock-guarded-retention rule and serialized cluster-wide by an advisory
     /// lock. `now_ms` is the caller's wall clock; the guard sanitises it against
-    /// the durable anchor. Returns the number deleted (0 on a declined pass).
-    [[nodiscard]] std::expected<int, Error> reap_expired(std::int64_t now_ms);
+    /// the durable anchor. Returns {deleted, clock_anomaly} (deleted==0 on a
+    /// declined pass; clock_anomaly true iff the decline was clock-driven).
+    [[nodiscard]] std::expected<ReapOutcome, Error> reap_expired(std::int64_t now_ms);
 
 private:
     pg::PgPool& pool_;

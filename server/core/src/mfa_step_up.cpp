@@ -9,7 +9,9 @@
 #include <spdlog/spdlog.h>
 #include <yuzu/metrics.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <string_view>
 
 namespace yuzu::server {
@@ -219,7 +221,20 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     const auto age = no_proof ? std::chrono::seconds::max()
                               : std::chrono::duration_cast<std::chrono::seconds>(
                                     now - session.mfa_verified_at);
-    if (!no_proof && age <= std::chrono::seconds(window_secs)) {
+    // Hard wall-clock ceiling on the step-up window (ADR-2002 §4 mitigation (b),
+    // parity with JIT elevation's kMaxElevationWindow). The effective freshness
+    // window is min(configured window_secs, kMaxMfaStepUpWindowSecs): a proof
+    // older than the hard ceiling never counts, regardless of a large/misconfigured
+    // window_secs — a defense-in-depth bound independent of the operator setting,
+    // mirroring is_elevated()'s `(elevated_until - issued) <= kMaxElevationWindow`.
+    // (mfa_verified_at is the issued-at anchor.) The residual smaller-backward-
+    // clock-step risk — which this ceiling, like JIT's, does not resist because
+    // `age` is computed against `now` — is the WS-11 DB-clock-integrity monitor's
+    // job (see the reap clock-anomaly signal), the same residual JIT carries.
+    constexpr std::int64_t kMaxMfaStepUpWindowSecs = 24 * 3600; // 24h backstop
+    const auto effective_window =
+        std::chrono::seconds((std::min<std::int64_t>)(window_secs, kMaxMfaStepUpWindowSecs));
+    if (!no_proof && age <= effective_window) {
         return true;
     }
 

@@ -39,6 +39,14 @@ namespace {
 // bump clears the whole cache is cheap.
 constexpr std::int64_t kSessionGenRefreshMs = 1000;
 
+// Bounded stale-serve window (the rbac_store pattern the ADR names, ADR-2002 §4).
+// The validate-cache is trusted only within this window of the last SUCCESSFUL
+// generation refresh; once a refresh outage exceeds it, a cache hit is no longer
+// trusted (validate falls through to the authoritative store, failing closed to
+// 401 while the store stays degraded) — so a revoked/demoted/elevated session
+// cannot ride a stale cache up to its 8h absolute expiry during a PG brownout.
+constexpr std::int64_t kSessionGenStaleServeBoundMs = 30'000; // 30s
+
 std::int64_t steady_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -548,6 +556,7 @@ void AuthManager::maybe_refresh_session_generation() const {
     bool advanced = false;
     {
         std::lock_guard<std::mutex> g(session_gen_mtx_);
+        last_successful_session_gen_refresh_ms_ = steady_now_ms(); // bounded stale-serve anchor
         if (!session_gen_valid_ || *gen > cached_session_gen_) {
             cached_session_gen_ = *gen;
             session_gen_valid_ = true;
@@ -561,6 +570,16 @@ void AuthManager::maybe_refresh_session_generation() const {
         std::unique_lock lock(mu_);
         sessions_.clear();
     }
+}
+
+bool AuthManager::session_generation_view_stale() const {
+    if (!session_store_)
+        return false; // legacy in-memory: no cross-replica coherence to bound
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    if (!session_gen_valid_)
+        return true; // never confirmed a generation → don't trust the cache
+    return (steady_now_ms() - last_successful_session_gen_refresh_ms_) >
+           kSessionGenStaleServeBoundMs;
 }
 
 // ── Authentication ──────────────────────────────────────────────────────────
@@ -1149,15 +1168,20 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
 
     const std::string key = hash_token(token);
 
-    // 1. Cache-first (shared lock). Copy the session out before releasing.
+    // 1. Cache-first (shared lock) — but ONLY when the generation view is fresh
+    // enough to trust. Past the stale-serve bound (a sustained refresh outage),
+    // a cache hit is discarded so we go authoritative below (rbac_store pattern,
+    // blocker #2): this bounds how long a revoked/demoted/elevated session can
+    // ride a stale cache during a PG brownout to ~kSessionGenStaleServeBoundMs
+    // rather than its 8h absolute expiry.
     std::optional<Session> session_copy;
-    {
+    if (!session_generation_view_stale()) {
         std::shared_lock lock(mu_);
         if (auto it = sessions_.find(key); it != sessions_.end())
             session_copy = it->second;
     }
 
-    // 2. Cache miss → authoritative store lookup.
+    // 2. Cache miss (or a distrusted stale cache) → authoritative store lookup.
     bool from_store = false;
     if (!session_copy) {
         auto found = session_store_->find(key);
@@ -1254,19 +1278,29 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
     return session_copy;
 }
 
-void AuthManager::invalidate_session(const std::string& token) {
+bool AuthManager::invalidate_session(const std::string& token) {
     const std::string key = session_store_ ? hash_token(token) : token;
+    bool db_persisted = true;
     if (session_store_) {
         // Durable delete FIRST (bumps the generation so every replica drops its
         // cached copy on the next refresh), then the local cache erase for
-        // immediacy. A store error still erases locally — the operator's "sign
-        // out NOW" intent is honored on this replica; the row is reaped later.
-        if (auto r = session_store_->invalidate(key); !r)
+        // immediacy. On a store error the local cache is still erased (the
+        // operator's "sign out NOW" intent is honored on THIS replica), but
+        // db_persisted=false is returned so the caller does NOT report a clean
+        // logout: the durable row survives, and validate_session_durable
+        // rehydrates a valid Session from it on a cache miss (another replica,
+        // or a copied cookie) — the exact fail-open (adversarial-round blocker
+        // #3) this return closes. reap_expired only deletes by absolute expiry,
+        // so an un-deleted row is NOT swept early.
+        if (auto r = session_store_->invalidate(key); !r) {
             spdlog::error("invalidate_session: durable delete failed ({})", r.error().message);
             note_session_store_degrade("invalidate");
+            db_persisted = false;
+        }
     }
     std::unique_lock lock(mu_);
     sessions_.erase(key);
+    return db_persisted;
 }
 
 AuthManager::RevokeResult
@@ -1301,6 +1335,7 @@ AuthManager::invalidate_user_sessions(const std::string& username) {
             db_persisted = false;
             spdlog::error("invalidate_user_sessions: durable delete failed ({})",
                           r.error().message);
+            note_session_store_degrade("invalidate_user"); // parity with wipe/other sites
         }
         std::unique_lock lock(mu_);
         const auto before = sessions_.size();

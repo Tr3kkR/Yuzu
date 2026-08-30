@@ -38,8 +38,13 @@ design:
 > the **core replica's** `system_clock`, NOT PostgreSQL `now()`. On a **single
 > replica** (the only supported topology until the safe-to-scale gate) this is
 > self-consistent and satisfies ADR-2002 §4's required mitigations — (a) the one
-> host's clock is the monitored security dependency, (b) the JIT-elevation / MFA
-> short windows carry the issue-time + `kMaxElevationWindow` ceilings. But it
+> host's clock is the monitored security dependency (the reap clock-anomaly
+> signal + its alert), (b) both short windows carry a hard issue-time + max-delta
+> ceiling independent of their configured length: JIT elevation via
+> `elevation_issued_at` + `kMaxElevationWindow` (24 h), and MFA step-up via
+> `mfa_verified_at` + `kMaxMfaStepUpWindowSecs` (24 h) in `require_mfa_step_up`.
+> (Both ceilings, like JIT's, bound the authored/forward direction; the residual
+> smaller-backward-step is what mitigation (a)'s monitor covers.) But it
 > does NOT yet realize ADR-2002 §4's choice of Postgres `now()` as the shared
 > clock that *fixes cross-host skew*: with two replicas, a backward-skewed
 > replica could accept a session past its DB-authored absolute expiry (bounded by
@@ -88,9 +93,17 @@ design:
 - **Retention.** `SessionStore::reap_expired` is a wall-clock bulk delete, so it
   joins the clock-guarded-retention set (routed concern #2360/#2361): an
   advisory lock taken as its own statement, a persisted `reap_anchor_ms`
-  sanitised against implausible skew (declined, not acted on), and an
-  unconditional per-pass cap. Single-writer today (one server); it becomes
-  PG-shared state under the ADR-0012 advisory lock when a second replica lands.
+  sanitised against implausible forward *and* backward skew (declined, not acted
+  on), an unconditional per-pass cap, and a recorded missing-anchor decision
+  (proceed — sessions are re-mintable). It **deliberately carves out** two of the
+  seven parts, the `api_token_store` precedent (recorded here per the rule's
+  "record which way you went"): part (1) the would-wipe probe — sessions reach
+  100% expiry as routine drain, so it cannot separate a true from a false
+  positive; and part (4) fact-set anomaly dedup — a declined pass is logged and
+  surfaced as `yuzu_auth_session_reap_clock_anomaly_total` (the DB-clock-integrity
+  monitor) rather than deduped by fact identity. Single-writer today (one
+  server); it becomes PG-shared state under the ADR-0012 advisory lock when a
+  second replica lands.
 - **Legacy path.** Config-file-only deployments (no `--postgres-dsn`, so no
   pool) leave `AuthManager::session_store_` null and keep the pre-HA in-memory
   sessions unchanged. The store is wired at boot only when the PG substrate is

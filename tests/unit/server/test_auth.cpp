@@ -352,7 +352,7 @@ TEST_CASE("invalidate_session destroys session", "[auth][session]") {
     auto token = mgr->authenticate("alice", "secret123456");
     REQUIRE(token.has_value());
 
-    mgr->invalidate_session(*token);
+    CHECK(mgr->invalidate_session(*token)); // legacy in-memory: always true
     REQUIRE_FALSE(mgr->validate_session(*token).has_value());
 }
 
