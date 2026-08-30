@@ -3,7 +3,7 @@
 This is the enterprise-Linux counterpart to the apt recipe in `.github/workflows/ci.yml`. CI
 exercises Ubuntu 24.04/26.04, macOS and Windows only — RHEL-family hosts are a supported *developer*
 platform, not a CI-covered one, so this doc records a verified sequence rather than an
-automatically-regression-tested one. Both verified runs were Rocky 9.8 - the 2026-08-30 one with
+automatically-regression-tested one. Both verified runs were Rocky 9.8 - the re-verification with
 SELinux enforcing (see the verified-run section); the RHEL and Alma branches use the same packages
 but have not been exercised, arm64 is unverified, and the container checks run unconfined.
 
@@ -364,7 +364,7 @@ original bare-metal record remains in that file's git history. Still unexercised
 Rocky Linux 9.8, 16 cores / 23 GB RAM, `dev` at `c01493d3`, 2026-08-15. The same recipe was also run
 end-to-end on `main` at `88f9397d` (the 0.13.0 cut, meson 1.11.1) with the same outcome. Full
 provenance — every package version with the repo it came from — was recorded in
-`docs/rhel9-toolchain-manifest.json`, which now holds the 2026-08-30 re-verification (this run's
+`docs/rhel9-toolchain-manifest.json`, which now holds the re-verification (this run's
 record lives in that file's git history); everything above `verified_run` in that file is
 machine-collected by `--manifest`, and the `verified_run` block is hand-recorded from the session.
 
