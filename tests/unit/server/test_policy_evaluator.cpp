@@ -600,3 +600,90 @@ TEST_CASE("policy evaluator: two instances sharing one store dispatch a policy e
     // truly claimed nothing.
     CHECK(h.dispatch_calls == 2);
 }
+
+// #3495 governance Gate 3 re-review (architect, 2026-08-30): PolicyEvaluator
+// was the fourth production consumer of the shared command_dispatch_fn
+// closure and was missed by the original #3495 fix — dispatch_due()'s
+// per-policy loop had no interior cancellation check, exactly the same gap
+// QuarantineContainmentReconciler/PreflightRunner/ScheduleRunner already
+// closed. Deps::should_stop ports the same field: checked once per claimed
+// policy, before that policy's kickoff_check (and its blocking dispatch_fn
+// call) begins, so a policy already dispatching still completes cleanly —
+// this only stops the NEXT policy from starting. Safe to defer: the durable
+// claim (claim_due_policies, above) is recovered by the staleness sweep the
+// same way an ordinary dispatch failure already is.
+TEST_CASE("policy evaluator: dispatch_due() stops claiming further policies once "
+          "should_stop() reports true, deferring the rest to the next tick",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+
+    // A second check instruction/plugin distinct from Harness's own
+    // "test.check" -> "checkp", so the two policies' dispatches are
+    // distinguishable BY PLUGIN NAME. Both policies dispatch the same
+    // targets under the same generated-execution_id shape, and a status row
+    // is only written later by collect_ready() (not by this single tick) —
+    // dispatched_plugins is the one signal available within one tick call
+    // that ties a dispatch back to a specific policy.
+    InstructionDefinition d2;
+    d2.id = "test.check2";
+    d2.name = "test.check2";
+    d2.version = "1.0.0";
+    d2.type = "question";
+    d2.plugin = "checkp2";
+    d2.action = "run";
+    d2.enabled = true;
+    REQUIRE(h.is.create_definition(d2).has_value());
+
+    // Two distinct policies, each with exactly one applicable check — a
+    // fresh policy has no policy_dispatch_state row yet, so claim_due_policies
+    // claims it on its very first tick with no preceding evaluate_now().
+    h.author("result.hostname != ''"); // check: test.check -> checkp
+    const std::string frag_b = "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n"
+                               "spec:\n  check:\n    instruction: test.check2\n    compliance: "
+                               "\"result.hostname != ''\"\n";
+    auto fid_b = h.ps.create_fragment(frag_b);
+    REQUIRE(fid_b.has_value());
+    const std::string pol_b = "apiVersion: yuzu.io/v1alpha1\nkind: Policy\n"
+                              "spec:\n  fragment: " +
+                              *fid_b + "\n  managementGroups:\n    - " + h.group_id + "\n";
+    REQUIRE(h.ps.create_policy(pol_b).has_value()); // check: test.check2 -> checkp2
+
+    auto deps = h.deps();
+    // Stop signals true once the first policy has dispatched — proving the
+    // loop actually checks should_stop() before the SECOND policy and exits
+    // early rather than pushing through both.
+    deps.should_stop = [&h] { return h.dispatch_calls >= 1; };
+    PolicyEvaluator ev(deps);
+
+    ev.tick(); // collect_ready() is a no-op (nothing in flight yet); dispatch_due() claims both, dispatches one
+
+    REQUIRE(h.dispatch_calls == 1); // NOT 2 — the loop stopped before the second policy
+    REQUIRE(h.dispatched_plugins.size() == 1);
+    // Exactly one plugin fired — proves ONE policy's kickoff_check ran and
+    // the other's never started (a clean defer, not a partial dispatch).
+    const bool checkp_fired = h.dispatched_plugins[0] == "checkp";
+    const bool checkp2_fired = h.dispatched_plugins[0] == "checkp2";
+    CHECK(checkp_fired != checkp2_fired);
+}
+
+// #3495 companion (mirrors the PreflightRunner/ScheduleRunner control cases,
+// governance quality-engineer, 2026-08-30): should_stop literally UNSET
+// (every pre-existing production/test Deps that predates this field) must
+// still process every due policy in one tick, not just the first — the
+// classic off-by-one risk for a newly added optional predicate.
+TEST_CASE("policy evaluator: an unset should_stop claims every due policy, "
+          "not just the first",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.author("result.hostname != ''");
+    h.author("result.hostname != ''");
+
+    PolicyEvaluator ev(h.deps()); // .should_stop left unset (default std::function<bool()>{})
+    ev.tick();
+
+    CHECK(h.dispatch_calls == 2);
+}

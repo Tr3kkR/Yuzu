@@ -524,6 +524,13 @@ public:
         }
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
+        metrics_.describe(
+            "yuzu_server_shutdown_dispatch_reach_zero_total",
+            "#3495: dispatches that reached zero agents while a shutdown was in progress — a "
+            "correlated signal (may reflect Shutdown(deadline) forcibly cancelling a stream "
+            "write mid-dispatch, or an ordinary zero-reach dispatch that happened to land "
+            "during the shutdown window; this metric cannot distinguish the two)",
+            "counter");
         metrics_.describe("yuzu_commands_completed_total",
                           "Total number of completed commands by status", "counter");
         metrics_.describe("yuzu_command_duration_seconds", "Command execution latency in seconds",
@@ -8236,46 +8243,61 @@ public:
             health_recompute_thread_.join();
         }
 
-        // Join the policy evaluation thread (uses policy_evaluator_ + stores,
-        // so it must stop before any of them are torn down)
-        if (policy_eval_thread_.joinable()) {
-            policy_eval_thread_.join();
-        }
-
         // Join the app-perf roll-up thread (borrows app_perf_rollup_ +
         // app_perf_fleet_store_ — must stop before they / the pool are torn down).
+        // Pure PG I/O (roll_window/prune) — no AgentRegistry/dispatch
+        // involvement, so unlike the four threads below it does not need to
+        // sit after Shutdown(deadline) (verified governance Gate 3
+        // cpp-safety, 2026-08-30: grepped for dispatch_fn/send_to/
+        // AgentRegistry in this thread's body, none found).
         if (app_perf_rollup_thread_.joinable()) {
             app_perf_rollup_thread_.join();
         }
-        // #3495: Shutdown gRPC with a deadline BEFORE joining the three
-        // background threads below (pre-flight runner, quarantine
-        // containment reconciler, schedule tick) — all three synchronously
-        // call into AgentRegistry::send_to() -> stream->Write(), which can
-        // block indefinitely on an HTTP/2 flow-control window with no bound
-        // of its own. Previously this call ran AFTER these joins (see the
-        // "now safe" block further down, where the drain-then-null sequence
-        // for execution_tracker_ etc. still lives): a thread blocked inside
-        // such a write had no path to unblock, because stop_requested_ (and
-        // each Deps::should_stop it's wired into, where these threads are
+        // #3495: Shutdown gRPC with a deadline BEFORE joining the four
+        // background threads below (policy evaluation, pre-flight runner,
+        // quarantine containment reconciler, schedule tick) — all four
+        // synchronously call into AgentRegistry::send_to() ->
+        // stream->Write(), which can block indefinitely on an HTTP/2
+        // flow-control window with no bound of its own (PolicyEvaluator via
+        // dispatch_instruction() -> the same shared command_dispatch_fn
+        // closure the other three use — governance Gate 3 architect,
+        // 2026-08-30: the original #3495 fix moved this call ahead of only
+        // three of command_dispatch_fn's four production consumers, missing
+        // policy_eval_thread_; that gap derived the same BLOCKING band as
+        // the original bug and is closed here, not deferred). Previously
+        // this call ran AFTER these joins (see the "now safe" block further
+        // down, where the drain-then-null sequence for execution_tracker_
+        // etc. still lives): a thread blocked inside such a write had no
+        // path to unblock, because stop_requested_ (and each
+        // Deps::should_stop it's wired into, where these threads are
         // started) only stops the NEXT dispatch from starting, not one
-        // already in flight — and Shutdown(deadline), the
-        // one thing that forcibly cancels an in-flight RPC, hadn't run yet.
-        // Calling it here first means a blocked write is forcibly cancelled
-        // within `deadline`, so every join below is now bounded by this same
-        // window instead of unbounded (governance #3495: chaos-injector HIGH
-        // + codex external tie-break, 2026-08-24; found on this exact three-
-        // thread shape while reviewing #3425's addition of the third one).
+        // already in flight — and Shutdown(deadline), the one thing that
+        // forcibly cancels an in-flight RPC, hadn't run yet. Calling it
+        // here first means a blocked write is forcibly cancelled within
+        // `deadline`, so every join below is now bounded by `deadline` plus
+        // whatever fast-fail unwind/store-call tail follows cancellation
+        // (same shape as the fn-null-wait's bound, further down) instead of
+        // unbounded (governance #3495: chaos-injector
+        // HIGH + codex external tie-break, 2026-08-24; found on the
+        // three-thread shape while reviewing #3425's addition of the third
+        // one; the fourth found in Gate 3 re-review).
         //
         // Safe against #1867's lesson (drain producers before nulling the
         // borrowed pointers they use — see the "now safe" block below,
         // unchanged): every pointer that drain protects is still nulled
-        // AFTER both this call and the three joins below. Moving this call
+        // AFTER both this call and the four joins below. Moving this call
         // earlier only widens that margin; it does not narrow it.
         auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
         if (agent_server_)
             agent_server_->Shutdown(deadline);
         if (mgmt_server_)
             mgmt_server_->Shutdown(deadline);
+
+        // Join the policy evaluation thread (uses policy_evaluator_ +
+        // stores + the dispatch path — stop before teardown).
+        if (policy_eval_thread_.joinable()) {
+            policy_eval_thread_.join();
+        }
 
         // Join the pre-flight runner thread (uses preflight_run_store_ +
         // response_store_ + the dispatch path — stop before teardown), then drop
@@ -10763,6 +10785,25 @@ private:
         forward_gateway_pending();
         if (outcome.sent > 0)
             metrics_.counter("yuzu_commands_dispatched_total").increment();
+        // #3495 (sre governance finding, 2026-08-30): before this PR, a
+        // dispatch cancelled mid-write by ServerImpl::stop()'s newly-earlier
+        // agent_server_->Shutdown(deadline) call left zero trace anywhere —
+        // PreflightRunner discards this return value entirely, and only
+        // ScheduleRunner logs (misleadingly, "reached no agents", with no
+        // shutdown context) on a total-reach-zero dispatch. This is a
+        // CORRELATED signal, not a precise one: `stop_requested_` true and
+        // `outcome.sent == 0` together may mean Shutdown(deadline) forcibly
+        // cancelled the underlying stream write, or may just be an ordinary
+        // zero-reach dispatch (every target offline, quarantine denial) that
+        // happened to land during the shutdown window — this metric cannot
+        // tell the two apart, and does not try to.
+        if (outcome.sent == 0 && stop_requested_.load(std::memory_order_acquire)) {
+            metrics_.counter("yuzu_server_shutdown_dispatch_reach_zero_total").increment();
+            spdlog::warn("dispatch {}:{} reached 0 agents while a shutdown was in progress "
+                         "(command_id={}) — may reflect a forced stream cancellation, not "
+                         "necessarily a routine zero-reach dispatch",
+                         plugin, norm_action, command_id);
+        }
         return {command_id, outcome.sent};
     }
 
@@ -17968,6 +18009,11 @@ private:
             .mgmt_group_store = mgmt_group_store_.get(),
             .metrics = &metrics_,
             .dispatch_fn = command_dispatch_fn,
+            // #3495: lets a shutdown request stop tick() from starting
+            // further dispatch_instruction() calls once stop_requested_
+            // flips — same field and wiring as the other three background
+            // engines' Deps.
+            .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         policy_eval_thread_ = std::thread([this]() {
             spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");

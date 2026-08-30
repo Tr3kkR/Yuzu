@@ -2,31 +2,38 @@
  * test_shutdown_join_order.cpp -- #3495 regression guard: ServerImpl::stop()
  * must call agent_server_->Shutdown(deadline) BEFORE joining any background
  * thread that can be blocked inside AgentRegistry::send_to() ->
- * stream->Write() (pre-flight runner, quarantine containment reconciler,
- * schedule tick).
+ * stream->Write() (policy evaluation, pre-flight runner, quarantine
+ * containment reconciler, schedule tick).
  *
- * WHY THIS GUARD EXISTS. All three of those threads synchronously call into
+ * WHY THIS GUARD EXISTS. All four of those threads synchronously call into
  * a gRPC stream write with no bound of its own -- it can stall indefinitely
  * on an HTTP/2 flow-control window. `agent_server_->Shutdown(deadline)` is
  * the ONLY thing in `stop()` that forcibly cancels such a write. Before
- * #3495, Shutdown(deadline) ran AFTER the three joins, so a thread blocked
+ * #3495, Shutdown(deadline) ran AFTER the joins, so a thread blocked
  * inside a write had no path to unblock: a normal SIGTERM had no in-process
  * timed escalation for this case, so `stop()` could hang until an external
  * SIGKILL (e.g. Kubernetes' post-grace-period kill) arrived, losing the
  * final audit/evidence rows for whatever was in flight and skipping every
  * later teardown step. Found via governance #3495 (chaos-injector HIGH +
- * codex external tie-break, 2026-08-24) on the same three-thread shape #3042
- * and #3007 already document for other components.
+ * codex external tie-break, 2026-08-24) on the same shape #3042 and #3007
+ * already document for other components. The original #3495 fix covered
+ * only three of the four threads (missed `policy_eval_thread_`, which
+ * dispatches through the identical shared `command_dispatch_fn` closure) --
+ * caught in this PR's own Gate 3 governance re-review, closed in the same
+ * PR rather than deferred. This test now covers all four so a future
+ * regression on any one of them fails loudly, not silently like the
+ * original miss did.
  *
  * MECHANISM -- no hand-copied line numbers. This test opens server.cpp (via
  * `YUZU_SERVER_SRC_DIR`, injected by tests/meson.build) AT TEST RUN TIME and
  * locates, by regex, the single call sites for:
  *   - `agent_server_->Shutdown(deadline)`
+ *   - `policy_eval_thread_.join()`
  *   - `preflight_runner_thread_.join()`
  *   - `quarantine_reconcile_thread_.join()`
  *   - `schedule_tick_thread_.join()`
  *   - `heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr)`
- * then asserts Shutdown's line number is strictly BEFORE each of the three
+ * then asserts Shutdown's line number is strictly BEFORE each of the four
  * joins', and strictly BEFORE the fn-null wait's (re-verifying the #3495
  * acceptance criterion that this wait's already-bounded shape must not
  * regress to unbounded when the reorder lands).
@@ -37,18 +44,33 @@
  * a function this large without standing up a live gRPC server and
  * deliberately stalling a stream write (issue #3495's own suggested-scope
  * item 6 notes that would need an integration or TSan-assisted test, not a
- * unit test -- this guard covers the ordering property directly instead).
+ * unit test -- this guard covers the ordering property directly instead;
+ * governance Gate 3 cpp-safety, 2026-08-30, recommended a follow-up issue
+ * for that runtime-level coverage rather than adding it to this PR).
  *
  * WHAT THIS SCAN DOES NOT CATCH: that Shutdown's 5s deadline is itself
  * sufficient in practice, that the join actually completes once cancellation
  * lands, or any change to whichever OTHER statements sit between these call
  * sites. It proves relative source order only -- exactly the property that
  * regressed once already (the joins predate Shutdown's call site by ~150
- * lines before this fix).
+ * lines before this fix), and that a fourth caller of the same shared
+ * dispatch closure can be missed even by a reviewer looking directly at this
+ * function (the original #3495 PR's own diff touched this exact area and
+ * still missed policy_eval_thread_).
+ *
+ * WHAT THIS SCAN DELIBERATELY DOES NOT DO: assert that command_dispatch_fn
+ * has exactly four production consumers, or catch a FIFTH one added later
+ * with its join placed correctly relative to the others but still by
+ * coincidence rather than by any enforced rule. There is no compile-time or
+ * test-time chokepoint tying "joins command_dispatch_fn" to "joins after
+ * Shutdown(deadline)" -- Gate 3 architect flagged this absence explicitly
+ * (2026-08-30) as a standing risk for the next thread added to this
+ * closure's caller list, not something this PR's scope closes.
  */
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <regex>
@@ -75,7 +97,8 @@ std::string read_server_cpp() {
 }
 
 int line_of(const std::string& text, std::size_t pos) {
-    return static_cast<int>(std::count(text.begin(), text.begin() + static_cast<long>(pos), '\n')) +
+    return static_cast<int>(std::count(
+               text.begin(), text.begin() + static_cast<std::string::difference_type>(pos), '\n')) +
            1;
 }
 
@@ -105,14 +128,16 @@ int require_one_line(const std::string& text, const std::regex& re, const char* 
 
 } // namespace
 
-TEST_CASE("server.cpp: agent_server_->Shutdown(deadline) runs before the pre-flight/"
-          "quarantine/schedule joins and the heartbeat fn-null wait (#3495)",
+TEST_CASE("server.cpp: agent_server_->Shutdown(deadline) runs before the policy-eval/"
+          "pre-flight/quarantine/schedule joins and the heartbeat fn-null wait (#3495)",
           "[shutdown_order]") {
     const std::string text = strip_line_comments(read_server_cpp());
 
     const int shutdown_line =
         require_one_line(text, std::regex(R"(agent_server_->Shutdown\(deadline\))"),
                           "agent_server_->Shutdown(deadline)");
+    const int policy_eval_join_line = require_one_line(
+        text, std::regex(R"(policy_eval_thread_\.join\(\))"), "policy_eval_thread_.join()");
     const int preflight_join_line = require_one_line(
         text, std::regex(R"(preflight_runner_thread_\.join\(\))"), "preflight_runner_thread_.join()");
     const int quarantine_join_line =
@@ -125,6 +150,10 @@ TEST_CASE("server.cpp: agent_server_->Shutdown(deadline) runs before the pre-fli
                           "heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr)");
 
     INFO("Shutdown(deadline) at server.cpp:" << shutdown_line);
+
+    INFO("policy_eval_thread_.join() at server.cpp:" << policy_eval_join_line);
+    CHECK(shutdown_line < policy_eval_join_line);
+
     INFO("preflight_runner_thread_.join() at server.cpp:" << preflight_join_line);
     CHECK(shutdown_line < preflight_join_line);
 
@@ -137,7 +166,7 @@ TEST_CASE("server.cpp: agent_server_->Shutdown(deadline) runs before the pre-fli
     // #3495 acceptance criterion: the fn-null wait's already-bounded shape
     // (Shutdown's deadline plus whatever store-call timeout was already in
     // flight) must not regress to unbounded -- it stays sequenced after
-    // Shutdown regardless of where the three joins above land relative to it.
+    // Shutdown regardless of where the four joins above land relative to it.
     INFO("heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr) at server.cpp:"
          << fn_null_wait_line);
     CHECK(shutdown_line < fn_null_wait_line);

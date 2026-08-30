@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -198,6 +199,17 @@ TEST_CASE("PreflightRunner tick: stops starting further runs once should_stop() 
     REQUIRE(run_store.create_run(make_run("run-a", t), {{"agent-1", "host-1", "windows"}}));
     REQUIRE(run_store.create_run(make_run("run-b", t), {{"agent-2", "host-2", "windows"}}));
 
+    // Snapshot BEFORE tick() — the deferred run's should_stop check trips
+    // before it does any work at all, so its row is provably UNCHANGED by
+    // this tick (exact equality below), not merely "changed less recently
+    // than the other one" (governance quality-engineer, 2026-08-30: the
+    // original version compared against `t + 500`, a wall-clock margin the
+    // repo's test standard rules out — this replaces it).
+    auto run_a_before = run_store.get_devices("run-a");
+    auto run_b_before = run_store.get_devices("run-b");
+    REQUIRE(run_a_before.size() == 1);
+    REQUIRE(run_b_before.size() == 1);
+
     // kPreflightChecks has 5 entries and cfg's empty app_name makes exactly
     // 4 of them applicable (every key but "app" is unconditionally
     // applicable) — so a single run in progress fires several dispatch_fn
@@ -240,20 +252,76 @@ TEST_CASE("PreflightRunner tick: stops starting further runs once should_stop() 
         REQUIRE(agent_ids.size() == 1);
         CHECK(agent_ids[0] == processed_agent);
     }
+    // The processed run must have fired MORE THAN ONE dispatch — locking in
+    // the granularity claim in Deps::should_stop's doc comment ("an
+    // already-in-flight run still finishes ALL of its own applicable
+    // checks"). Without this, a future regression that checks should_stop
+    // INSIDE the per-check loop too (cutting run A off after its first
+    // dispatch) would still pass every assertion above (governance
+    // quality-engineer, 2026-08-30).
+    REQUIRE(calls.size() >= 2);
 
-    // Both runs' devices exist from create_run's frozen-cohort insert (bucket
-    // seeded 'inc' regardless), so device PRESENCE doesn't distinguish
-    // processed from deferred — updated_at_ms does. create_run stamps it with
-    // real wall-clock `now_ms()` (≈ `t`, captured just above); this runner's
-    // injected `.now_ms_fn` returns `t + 1000` and persist_and_maybe_complete
-    // stamps whatever it processes with that value. So the deferred run's row
-    // stays at its create_run timestamp (≈ t) while the processed run's jumps
-    // to t + 1000 — a >=500ms gap comfortably separates the two given normal
-    // test execution jitter.
-    auto processed_devices = run_store.get_devices(processed_run);
+    // The deferred run's should_stop check trips before it does ANY work —
+    // its row must be byte-identical to its pre-tick snapshot, not merely
+    // "less recently touched" than the processed run's.
+    const auto& deferred_before = (deferred_run == "run-a") ? run_a_before : run_b_before;
     auto deferred_devices = run_store.get_devices(deferred_run);
-    REQUIRE(processed_devices.size() == 1);
     REQUIRE(deferred_devices.size() == 1);
-    CHECK(processed_devices[0].updated_at_ms >= t + 500); // touched THIS tick
-    CHECK(deferred_devices[0].updated_at_ms < t + 500);   // untouched — still its create_run stamp
+    CHECK(deferred_devices[0].updated_at_ms == deferred_before[0].updated_at_ms);
+    CHECK(deferred_devices[0].bucket == deferred_before[0].bucket);
+
+    // The processed run's row DID change — its checks actually ran.
+    auto processed_devices = run_store.get_devices(processed_run);
+    REQUIRE(processed_devices.size() == 1);
+    CHECK(processed_devices[0].updated_at_ms > t); // t+1000 via the injected now_ms_fn
+}
+
+// #3495 companion (governance quality-engineer, 2026-08-30): the SET-to-stop
+// case above never exercises should_stop literally UNSET (every pre-existing
+// production/test Deps that predates this field) across more than one
+// iteration — the classic off-by-one risk for a newly added optional
+// predicate ("does unset silently stop after the first item too?"). This is
+// the control case: same 2-run setup, should_stop left default-constructed,
+// both runs must dispatch.
+TEST_CASE("PreflightRunner tick: an unset should_stop processes every run, "
+          "not just the first",
+          "[pg][preflight][runner]") {
+    YUZU_REQUIRE_PG_DB_TPL(run_db, preflight_tpl);
+    PgPool run_pool{{.conninfo = run_db.dsn(), .size = 4}};
+    PreflightRunStore run_store{run_pool};
+    REQUIRE(run_store.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(resp_db, responsestore_tpl);
+    PgPool resp_pool{{.conninfo = resp_db.dsn(), .size = 4}};
+    ResponseStore resp_store{resp_pool};
+    REQUIRE(resp_store.is_open());
+
+    const auto t = now_ms();
+    REQUIRE(run_store.create_run(make_run("run-a", t), {{"agent-1", "host-1", "windows"}}));
+    REQUIRE(run_store.create_run(make_run("run-b", t), {{"agent-2", "host-2", "windows"}}));
+
+    std::vector<std::vector<std::string>> calls;
+    PreflightRunner runner(PreflightRunner::Deps{
+        .run_store = &run_store,
+        .response_store = &resp_store,
+        .dispatch_fn =
+            [&](const std::string&, const std::string&, const std::vector<std::string>& agent_ids,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&) -> std::pair<std::string, int> {
+            calls.push_back(agent_ids);
+            return {"cmd-x", 1};
+        },
+        .now_ms_fn = [t] { return t + 1000; },
+        .retention_days = 14,
+        // .should_stop left unset (default std::function<bool()>{}).
+    });
+
+    runner.tick();
+
+    std::set<std::string> targeted;
+    for (const auto& agent_ids : calls) {
+        REQUIRE(agent_ids.size() == 1);
+        targeted.insert(agent_ids[0]);
+    }
+    CHECK(targeted == std::set<std::string>{"agent-1", "agent-2"});
 }

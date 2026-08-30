@@ -112,6 +112,21 @@ public:
         // minutes) is not false-positive reset mid-flight; short enough that
         // a truly stranded fix does not sit invisible indefinitely.
         int64_t fixing_stale_seconds{1800};
+        // #3495 (Gate 3 architect, governance re-review): lets a shutdown
+        // request stop tick() from starting further dispatch_instruction()
+        // calls once stop_requested_ flips — checked once per in-flight
+        // item in collect_ready()'s loop and once per claimed policy in
+        // dispatch_due()'s loop, so an item already being processed still
+        // completes cleanly (this only stops the NEXT one from starting).
+        // Ports the same field QuarantineContainmentReconciler::Deps /
+        // PreflightRunner::Deps / ScheduleRunner::Deps already carry.
+        // PolicyEvaluator was the fourth production consumer of the shared
+        // command_dispatch_fn closure and was missed in the original #3495
+        // fix — its dispatch_instruction() calls the identical blocking
+        // dispatch_fn the other three do. Unset (default) = never stop,
+        // matching every existing production/test Deps that predates this
+        // field.
+        std::function<bool()> should_stop;
     };
 
     explicit PolicyEvaluator(Deps deps);

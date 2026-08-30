@@ -371,6 +371,15 @@ void PolicyEvaluator::dispatch_due() {
         return;
     }
     for (const auto& p : *claimed) {
+        // #3495: bounds how many MORE policies a single tick() call starts
+        // once shutdown begins — a policy already being kicked off below
+        // still completes cleanly, this only stops the next one from
+        // starting. Safe to defer: this policy's durable claim (recorded by
+        // claim_due_policies, above) is recovered by the staleness sweep
+        // (fixing_stale_seconds) the same way an ordinary dispatch failure
+        // already is — see the comment on that failure path below.
+        if (d_.should_stop && d_.should_stop())
+            break;
         auto k = kickoff_check(p); // does its own brief locking; dispatch runs without mu_
         if (!k) {
             // Governance UP-2 (2026-08-24): this policy's durable dispatch
@@ -630,6 +639,16 @@ void PolicyEvaluator::collect_ready() {
     }
 
     for (auto& f : ready) {
+        // #3495: bounds how many MORE ready items this call processes once
+        // shutdown begins — an item already being processed below still
+        // finishes cleanly. Safe to defer the rest: `ready` is already
+        // per-replica, in-memory-only state (see this file's header doc) —
+        // an entry dropped here by a deferred break is lost the same way
+        // EVERY entry in `in_flight_` already is on an ordinary process
+        // restart; this does not add a new class of loss, only moves an
+        // already-accepted one slightly earlier during a graceful shutdown.
+        if (d_.should_stop && d_.should_stop())
+            break;
         // Degrade → empty (ADR-0039 deny-or-benign): a transient read failure
         // reads as "no terminal response yet", the same as a genuinely slow
         // agent — verdict_for() below already treats an unmatched target as

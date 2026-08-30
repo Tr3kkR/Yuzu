@@ -1151,12 +1151,13 @@ server `PgPool`).
   CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
   120 s. Stacked, this can reach **~115 s** in the worst case if more than
   one stage is genuinely wedged; the total and each stage's own bound are
-  unchanged by the reorder, only their relative sequence is. **(#3495) The pre-flight
-  runner, quarantine containment reconciler, and schedule tick background
-  thread joins ride on the same 5 s gRPC shutdown deadline bucket above, not
-  a separate stage** — `ServerImpl::stop()` now cancels in-flight gRPC RPCs
-  before joining those three threads (previously it cancelled them after,
-  so a thread genuinely blocked inside a gRPC stream write had no bound at
+  unchanged by the reorder, only their relative sequence is. **(#3495) The policy
+  evaluation, pre-flight runner, quarantine containment reconciler, and
+  schedule tick background thread joins ride on the same 5 s gRPC shutdown
+  deadline bucket above, not a separate stage** — `ServerImpl::stop()` now
+  cancels in-flight gRPC RPCs before joining those four threads (previously
+  it cancelled them after, so a thread genuinely blocked inside a gRPC
+  stream write had no bound at
   all — not covered by the ~115 s figure, and not fixable by raising the
   grace period, since nothing in `stop()` would ever reach the cancellation
   that unblocks it). If you sized a grace period around the pre-#3495
