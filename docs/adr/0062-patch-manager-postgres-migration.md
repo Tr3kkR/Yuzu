@@ -130,6 +130,13 @@ transaction actually creates. The SQLite era's `total_targets` was set from the 
 the real row count — this closes that pre-existing accounting bug as a side effect of adding the
 atomicity.
 
+**Cap on `agent_ids` (governance sre finding, closed 2026-08-30):** an unbounded caller-supplied
+`agent_ids` list would hold the shared pool connection for the duration of the `unnest()` batch
+target insert, contributing to pool starvation for unrelated stores under a near-fleet-wide
+deploy request. `deploy_patch` now rejects a de-duplicated list over `kMaxDeployTargets` (5000)
+before any DB work — matching the DoS-cap default used for the same class of bulk
+operator-supplied fleet-wide list elsewhere (fleet-viz `machines_max`).
+
 `record_patches`'s existing SQLite transaction translates directly to one `with_txn_for`, with
 its per-row prepared-statement loop replaced by a single `unnest()`-driven batch `INSERT ...
 ON CONFLICT (agent_id, kb_id) DO UPDATE` (the same batching shape `PreflightRunStore::create_run`

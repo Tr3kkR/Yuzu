@@ -238,6 +238,27 @@ TEST_CASE("PatchManager: deploy_patch de-duplicates agent_ids", "[patch_manager]
     CHECK(depl->targets.size() == 2);
 }
 
+// ── Test: deploy_patch rejects an oversized agent_ids list ─────────────────
+// New coverage (governance sre finding, closed 2026-08-30): an unbounded
+// agent_ids list would hold the shared pool connection for the duration of
+// a near-fleet-wide unnest() batch insert, contributing to pool starvation
+// for unrelated stores. deploy_patch now rejects a list over kMaxDeployTargets
+// (5000) before touching the database.
+
+TEST_CASE("PatchManager: deploy_patch rejects an oversized agent_ids list",
+          "[patch_manager][pg][deploy][validation]") {
+    PATCH_MANAGER(mgr);
+
+    std::vector<std::string> agent_ids;
+    agent_ids.reserve(5001);
+    for (int i = 0; i < 5001; ++i)
+        agent_ids.push_back("agent-" + std::to_string(i));
+
+    auto result = mgr.deploy_patch("KB1234567", agent_ids, false, "admin");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("too many target agents") != std::string::npos);
+}
+
 // ── Test: record_patches upserts inventory ──────────────────────────────────
 // New coverage (ADR-0062): record_patches's batch upsert (unnest()-driven
 // INSERT ... ON CONFLICT DO UPDATE, replacing the SQLite-era per-row

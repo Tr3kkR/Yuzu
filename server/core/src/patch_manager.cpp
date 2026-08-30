@@ -37,6 +37,14 @@ constexpr const char* kTargetCols = "agent_id, status, error, started_at, comple
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
+// Bounds deploy_patch's unnest()-driven target batch insert. An
+// unbounded agent_ids list would hold the shared pool connection for
+// the duration of the insert, contributing to pool starvation for
+// unrelated stores under a near-fleet-wide deploy request. 5000
+// matches the DoS-cap default used for the same class of bulk
+// operator-supplied fleet-wide list elsewhere (fleet-viz machines_max).
+constexpr std::size_t kMaxDeployTargets = 5000;
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
     // the migration txn. Runtime statements below schema-qualify explicitly.
@@ -394,6 +402,10 @@ PatchManager::deploy_patch(const DeploymentRequest& req) {
         if (seen.insert(id).second)
             agent_ids.push_back(id);
     }
+
+    if (agent_ids.size() > kMaxDeployTargets)
+        return std::unexpected("too many target agents (max " +
+                               std::to_string(kMaxDeployTargets) + ")");
 
     if (!open_)
         return std::unexpected("patch manager not available");

@@ -6235,7 +6235,7 @@ The one device list behind every network-quality drill: worst devices by a metri
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `kb_id` | string | Yes | — | KB identifier (format: `KBnnnnnnn`) |
-| `agent_ids` | string[] | Yes | — | Target agent IDs |
+| `agent_ids` | string[] | Yes | — | Target agent IDs (max 5000 after de-duplication; a longer list is rejected with `too many target agents`) |
 | `reboot_if_needed` | bool | No | `false` | Reboot agents after patching |
 | `reboot_delay_seconds` | int | No | `300` | Seconds to wait before reboot (clamped to 60–86400). A desktop notification warns the user before reboot. |
 | `reboot_at` | int64 | No | `0` | Optional epoch timestamp for scheduled reboot. Must be in the future. `0` = use delay instead. |
