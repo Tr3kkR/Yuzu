@@ -13596,6 +13596,8 @@ private:
 
             auto result = custom_properties_store_->set_property(agent_id, key, value, type);
             if (!result) {
+                (void)audit_log(req, "custom_property.set", "failure", "Agent", agent_id,
+                                key + ": " + result.error());
                 if (is_custom_properties_db_error(result.error())) {
                     spdlog::error("PUT /api/agents/{}/properties/{}: {}", agent_id, key,
                                   result.error());
@@ -13651,6 +13653,8 @@ private:
 
             bool deleted = custom_properties_store_->delete_property(agent_id, key);
             if (!deleted) {
+                (void)audit_log(req, "custom_property.delete", "not_found", "Agent", agent_id,
+                                "key=" + key);
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"property not found"},"meta":{"api_version":"v1"}})",
