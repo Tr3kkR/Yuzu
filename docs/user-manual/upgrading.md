@@ -1155,17 +1155,22 @@ server `PgPool`).
   one stage is genuinely wedged; the total and each stage's own bound are
   unchanged by the reorder, only their relative sequence is. **(#3495) The policy
   evaluation, pre-flight runner, quarantine containment reconciler, and
-  schedule tick background thread joins ride on the same 5 s gRPC shutdown
-  deadline bucket above, not a separate stage** — `ServerImpl::stop()` now
-  cancels in-flight gRPC RPCs before joining those four threads (previously
-  it cancelled them after, so a thread genuinely blocked inside a gRPC
-  stream write had no bound at
+  schedule tick background threads' gRPC dispatch calls now ride on the
+  same 5 s gRPC shutdown deadline bucket above, not a separate stage** —
+  `ServerImpl::stop()` now cancels in-flight gRPC RPCs before joining those
+  four threads (previously it cancelled them after, so a thread genuinely
+  blocked inside a gRPC stream write had no bound at
   all — not covered by the ~115 s figure, and not fixable by raising the
   grace period, since nothing in `stop()` would ever reach the cancellation
-  that unblocks it). If you sized a grace period around the pre-#3495
-  figure and never hit that gap in practice, no action is needed; it was a
-  real but narrow window (a stalled agent stream during shutdown), not a
-  routine occurrence. The shipped
+  that unblocks it). This is a strictly protective fix — no grace-period
+  change is needed on upgrade, whether or not you ever hit the pre-#3495
+  gap in practice; it was a real but narrow window (a stalled agent stream
+  during shutdown), not a routine occurrence. **One narrower residual is NOT covered by this fix**:
+  the policy-evaluation thread's join can also stall on its own Postgres
+  claim call (`PolicyStore::claim_due_policies`), which isn't a gRPC
+  operation and isn't bounded by `Shutdown(deadline)` — tracked separately
+  (#3706), not fixed here; the shipped 210 s grace period below already
+  comfortably covers its ordinary-contention case. The shipped
   docker-compose/systemd units already set a 210 s grace period
   (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this —
   but if you deploy under Kubernetes or another orchestrator, its default is

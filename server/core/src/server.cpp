@@ -531,6 +531,12 @@ public:
             "write mid-dispatch, or an ordinary zero-reach dispatch that happened to land "
             "during the shutdown window; this metric cannot distinguish the two)",
             "counter");
+        // Pre-seed so the series is present-at-0 on a healthy boot rather than
+        // absent until it first fires (enterprise-readiness governance
+        // finding, 2026-08-30 — `describe()` alone only registers HELP/TYPE
+        // text, not the series itself; `serialize()` emits only families that
+        // exist in `counters_`, populated solely by a `.counter(name)` call).
+        metrics_.counter("yuzu_server_shutdown_dispatch_reach_zero_total");
         metrics_.describe("yuzu_commands_completed_total",
                           "Total number of completed commands by status", "counter");
         metrics_.describe("yuzu_command_duration_seconds", "Command execution latency in seconds",
@@ -8292,6 +8298,14 @@ public:
             agent_server_->Shutdown(deadline);
         if (mgmt_server_)
             mgmt_server_->Shutdown(deadline);
+
+        // #3495 (sre governance finding, 2026-08-30): a bare join gives an
+        // operator watching a slow shutdown no breadcrumb distinguishing
+        // "these four threads are still finishing up" from "stop() is
+        // wedged somewhere else entirely" — each thread's own start/stop
+        // lines (below, at construction) narrow it further once this fires.
+        spdlog::info("Shutting down server: joining policy-eval/pre-flight/"
+                     "quarantine/schedule background threads...");
 
         // Join the policy evaluation thread (uses policy_evaluator_ +
         // stores + the dispatch path — stop before teardown).
@@ -18039,6 +18053,11 @@ private:
                     }
                 }
             }
+            // #3495 (sre governance finding, 2026-08-30): mirrors the
+            // quarantine reconciler's exit log — an operator watching a slow
+            // shutdown otherwise sees silence after the last progress line
+            // with no way to tell whether this thread already finished.
+            spdlog::info("Policy evaluation thread stopped");
         });
 
         // App-perf B1->B2 roll-up thread (DEX app-perf-over-time). Re-rolls the
@@ -18140,6 +18159,10 @@ private:
                     }
                 }
             }
+            // #3495 (sre governance finding, 2026-08-30): mirrors the
+            // quarantine reconciler's exit log — see policy_eval_thread_'s
+            // matching line for the full rationale.
+            spdlog::info("Pre-flight runner thread stopped");
         });
 
         // QuarantineContainmentReconciler (#3425) — re-applies endpoint
@@ -18323,6 +18346,10 @@ private:
                     }
                 }
             }
+            // #3495 (sre governance finding, 2026-08-30): mirrors the
+            // quarantine reconciler's exit log — see policy_eval_thread_'s
+            // matching line for the full rationale.
+            spdlog::info("Schedule runner thread stopped");
         });
 
         // Result-set maintenance thread (capability §30) — materialises pending
