@@ -2,9 +2,10 @@
 
 - **Status:** Accepted — all three components ported, the whole binary compiles and links, and
   both the full `[pg]`-tagged suite (2888 cases, 2885 passed, 3 pre-existing unrelated skips —
-  see "Considered and rejected") and the full non-pg suite (2976 cases, 2895 passed, 81
-  pre-existing unrelated skips) pass with zero failures; `check-pg-shard-partition.py` confirms
-  an exact 11-pg/4-non-pg partition.
+  unconditional placeholders in `test_saml_routes.cpp` for coverage unreachable via a real
+  HTTP-POST binding at `kMaxGroupValues=200`, unrelated to this migration) and the full non-pg
+  suite (2976 cases, 2895 passed, 81 pre-existing unrelated skips) pass with zero failures;
+  `check-pg-shard-partition.py` confirms an exact 11-pg/4-non-pg partition.
 - **Date:** 2026-08-30
 - **Deciders:** pg workstream (migration-programme PR 5, the last of the 7-store SQLite→Postgres
   ladder, #1328/#1325/#3653)

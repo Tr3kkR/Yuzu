@@ -583,6 +583,39 @@ TEST_CASE("ExecutionTracker: a later frame overwrites the typed status via ON CO
     CHECK(statuses[0].plugin_result_status == 2);
 }
 
+TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every method, "
+          "never crashes",
+          "[execution_tracker]") {
+    // A store that never opened, ported to Postgres (ADR-0065): an unreachable
+    // port fails construction's own connect attempt deterministically
+    // (test_engine_principal_store.cpp's #2456 precedent) — no live database
+    // needed, so this test carries no [pg] tag. Mirrors
+    // test_approval_manager.cpp's equivalent closed-store coverage.
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+
+    CHECK(closed.query_executions(ExecutionQuery{}).empty());
+    CHECK_FALSE(closed.get_execution("exec-1").has_value());
+    CHECK(closed.get_summary("exec-1").id == "exec-1"); // id echoed, everything else defaulted
+    CHECK(closed.get_agent_statuses("exec-1").empty());
+
+    auto created = closed.create_execution(make_execution());
+    REQUIRE_FALSE(created.has_value());
+    CHECK(created.error() == "database not open");
+
+    // Mutations on a closed store are silent no-ops, not crashes.
+    AgentExecStatus status;
+    status.agent_id = "agent-1";
+    status.status = "running";
+    closed.update_agent_status("exec-1", status);
+    closed.refresh_counts("exec-1");
+    closed.mark_cancelled("exec-1", "tester");
+}
+
 // "v2 probe stamps straight through..."/"v2 probe does not silently skip
 // v1's CREATE INDEX..."/"v2 probe refuses to stamp when only SOME of v1's
 // indexes are present" (UP-12/A-5/D4(a)/CDX-P1-04) are DELETED, not ported
