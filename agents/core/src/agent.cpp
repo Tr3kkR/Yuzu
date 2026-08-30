@@ -976,20 +976,38 @@ public:
             // internal admission (spark_runtime_/scheduler/drain-worker) FIRST,
             // so the EXTERNAL spark_engine_->stop() below can safely tear down
             // the SparkEngine consumer afterward without racing a live commit.
-            // stop_guardian_once()/stop_spark_engine_once() (#2233 item 3) make this
-            // "may already have called both" idempotency a real, mutex-enforced
-            // guarantee instead of an assumption - stop() and this ScopeExit can now
-            // race each other from different threads without either re-executing or
-            // double-racing the other's in-progress call.
-            stop_guardian_once();
+            // An earlier version of this guard had these reversed (governance
+            // Gate 3/4 finding, this PR) - harmless only because no production
+            // call site wires a consumer onto spark_engine_ yet. Idempotent:
+            // Agent::stop() may already have called both - each of
+            // GuardianEngine::stop()/SparkEngine::stop() has its OWN internal
+            // completion-barrier mutex (mtx_ / lifecycle_mu_+teardown_complete_) making a
+            // second, concurrent call from a different thread block-then-return rather
+            // than race (SparkEngine::stop()'s own header comment names this exact
+            // stop()-vs-ScopeExit scenario explicitly). #2233 item 3's watchdog above
+            // covers the case where the call THIS thread is executing hangs; it is
+            // deliberately NOT layered with an AgentImpl-level once-only guard on top of
+            // these calls - an earlier revision of this PR added one (stop_guardian_once/
+            // stop_spark_engine_once, mutex + bool flags) and it introduced a real
+            // regression (adversarial review Kimi K1): the spark variant set its "done"
+            // flag even when the boot-latch gate below caused it to skip the actual call,
+            // permanently disabling the ScopeExit's own retry. Reverted - trust each
+            // engine's own proven completion-barrier instead of re-deriving one here.
+            if (guardian_)
+                guardian_->stop();
             // Before thread_pool_ is reset below. Rung 1's engine does not
             // borrow the pool, but rung 2's queued Guardian consumer is expected
             // to dispatch through it (#2037's bounded-dispatch pattern), and this
             // guard resets the pool on every run() exit. Stopping spark here
             // means its threads are quiesced before anything it may borrow goes
             // away - on the exception and early-return paths too, not just the
-            // graceful one.
-            stop_spark_engine_once();
+            // graceful one. Deliberately NO boot-latch gate here (unlike stop()'s own
+            // call above) - this runs on run()'s own thread, after run()'s boot block has
+            // already executed one way or another, so there is no cross-thread pointer
+            // race to guard against; gating this call the same way stop()'s is gated was
+            // exactly the mistake reverted above.
+            if (spark_engine_)
+                spark_engine_->stop();
             // #1420 / #1434 — quiesce and join the Run()-spawned worker threads
             // (snapshot pump, heartbeat, OTA updater) FIRST, before any plugin
             // teardown. The snapshot pump dispatches `tar.fleet_snapshot` into
@@ -3023,10 +3041,25 @@ public:
         // Cancel under ctx_mu_ — see the member's note. The context is a STACK object owned
         // by run()'s reconnect frame, and this runs on the watcher / SCM thread.
         cancel_ctx(subscribe_ctx_);
-        stop_guardian_once();
+        if (guardian_)
+            guardian_->stop();
         if (dex_observer_)
             dex_observer_->stop();
-        stop_spark_engine_once(); // boot-latch race + idempotency: see the method's own comment
+        // Gate on the boot latch BEFORE touching the pointer. This runs on the watcher /
+        // SCM / console thread; run()'s boot block stores AND (on the degrade path) FREES
+        // spark_engine_ until the latch flips — a bare `if (spark_engine_)` here raced
+        // that window (TSan-confirmed via the randomized-SIGTERM fuzz at 101 ms).
+        // Skipping spark pre-latch is safe: run()'s ScopeExit stops the engine on every
+        // run() exit, on run()'s own thread, with NO boot-latch gate of its own (adversarial
+        // review Kimi K1: an earlier revision of this PR gave the ScopeExit's call the same
+        // gate via a shared once-only-flag method, which broke this exact safety net - a
+        // stop() that raced the boot window would set the flag without ever having called
+        // spark_engine_->stop(), permanently skipping the ScopeExit's retry too. Reverted -
+        // each caller keeps its own, deliberately different, gating). Acquire pairs with the
+        // release store at the end of the boot block, so a post-latch read sees the final
+        // pointer value.
+        if (spark_boot_done_.load(std::memory_order_acquire) && spark_engine_)
+            spark_engine_->stop(); // idempotent; completion-barriered by lifecycle_mu_
         // LOCAL COPY. This runs on the watcher / SCM thread while run() may be publishing a
         // fresh Updater on reconnect; the copy keeps this one alive for the whole stop().
         if (auto u = updater())
@@ -3450,36 +3483,6 @@ private:
             update_thread_.join();
     }
 
-    // #2233 item 3: the shared, once-only half of AgentImpl::stop() and run()'s teardown
-    // ScopeExit. See teardown_mu_'s own comment for why this pair, and only this pair, is
-    // factored out. The caller (either stop() or the ScopeExit) is responsible for having
-    // its own ShutdownDeadlineGuard already armed before calling these — that deadline
-    // covers both the mutex wait AND the wrapped stop() call.
-    void stop_guardian_once() noexcept {
-        std::lock_guard<std::mutex> lk(teardown_mu_);
-        if (guardian_stopped_)
-            return;
-        if (guardian_)
-            guardian_->stop();
-        guardian_stopped_ = true;
-    }
-    void stop_spark_engine_once() noexcept {
-        std::lock_guard<std::mutex> lk(teardown_mu_);
-        if (spark_stopped_)
-            return;
-        // Gate on the boot latch before touching the pointer — see stop()'s own historical
-        // comment on this exact race (run()'s boot block stores/frees spark_engine_ until
-        // the latch flips; a bare pointer check here would race that window, TSan-confirmed
-        // via the randomized-SIGTERM fuzz at 101ms). Always true by the time the ScopeExit
-        // reaches this call (it runs on run()'s own thread, after run()'s boot block has
-        // necessarily already executed), so folding the gate into the shared method changes
-        // nothing observable for that caller — it matters only for stop(), which can run on
-        // a different thread than the boot block.
-        if (spark_boot_done_.load(std::memory_order_acquire) && spark_engine_)
-            spark_engine_->stop(); // idempotent; completion-barriered by lifecycle_mu_
-        spark_stopped_ = true;
-    }
-
     Config cfg_;
     PluginContextImpl plugin_ctx_;
     // Per-plugin contexts: each plugin gets its own PluginContextImpl with the
@@ -3507,17 +3510,18 @@ private:
     // Makes Agent::stop()'s own "Thread-safe" doc comment (agent.hpp) actually true.
     std::mutex stop_mu_;
     bool stop_completed_{false};
-    // #2233 item 3: serializes ONLY guardian_->stop()/spark_engine_->stop() — the two
-    // calls genuinely duplicated between AgentImpl::stop() and run()'s teardown ScopeExit
-    // (both call them, in the same load-bearing guardian-then-spark order, each with its
-    // own comment claiming the other side "may already have called" them — an assumption
-    // that was true for correctness but not for concurrency-safety until this lock existed).
-    // A separate mutex from stop_mu_ (not reused) because the ScopeExit runs on run()'s own
-    // thread and must never contend with, or be blocked by, an unrelated stop() caller's
-    // dex_observer_/updater/cancel_ctx work — only the two calls it actually shares.
-    std::mutex teardown_mu_;
-    bool guardian_stopped_{false};
-    bool spark_stopped_{false};
+    // NOTE: an earlier revision of this PR also added teardown_mu_/guardian_stopped_/
+    // spark_stopped_ to serialize guardian_->stop()/spark_engine_->stop() specifically
+    // (the two calls duplicated between stop() and run()'s teardown ScopeExit). Removed
+    // (adversarial review Kimi K1): GuardianEngine::stop()/SparkEngine::stop() already have
+    // their OWN internal completion-barrier mutexes for exactly this concurrent-caller
+    // scenario (mtx_ / lifecycle_mu_+teardown_complete_ — SparkEngine::stop()'s own header
+    // comment names the stop()-vs-ScopeExit race explicitly as the reason that barrier
+    // exists), so the extra AgentImpl-level layer was redundant for safety and, as
+    // implemented, introduced a real regression: a stop() that raced spark_engine_'s boot
+    // window would mark the flag done without ever having called spark_engine_->stop(),
+    // permanently disabling the ScopeExit's retry. See stop()'s and the ScopeExit's own
+    // call-site comments for the restored, deliberately-different-per-caller gating.
 
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
