@@ -1,20 +1,32 @@
 /**
  * test_update_registry.cpp — Unit tests for the OTA update registry
+ * (ADR-0061, Postgres-backed, schema `update_registry`)
  *
  * Covers: UpdateRegistry CRUD, latest_for version selection,
- *         is_eligible rollout logic, binary_path, upsert-replace.
+ *         is_eligible rollout logic, binary_path, upsert-replace,
+ *         the not-open degrade path, and a migration-failure fail-closed
+ *         probe (mirrors OfflineEndpointStore's precedent).
  */
 
 #include "update_registry.hpp"
 
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 namespace fs = std::filesystem;
 
 namespace {
@@ -53,24 +65,38 @@ UpdatePackage make_pkg(const std::string& platform = "windows", const std::strin
     return pkg;
 }
 
-} // anonymous namespace
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp).
+yuzu::test::PgTestTemplate update_registry_tpl{
+    "update_registry", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        UpdateRegistry reg{pool, fs::temp_directory_path()};
+        if (!reg.is_open())
+            throw std::runtime_error("update_registry template: store failed to migrate");
+    }};
+
+} // namespace
 
 // ── Database Lifecycle ──────────────────────────────────────────────────────
 
-TEST_CASE("UpdateRegistry: open in-memory", "[update_registry][db]") {
+TEST_CASE("UpdateRegistry: opens and migrates", "[update_registry][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 }
 
 // ── Upsert & List ───────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: upsert_package + list_packages returns it",
-          "[update_registry][upsert]") {
+          "[update_registry][pg][upsert]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     auto pkg = make_pkg();
     reg.upsert_package(pkg);
@@ -81,16 +107,17 @@ TEST_CASE("UpdateRegistry: upsert_package + list_packages returns it",
     REQUIRE(packages[0].arch == "x86_64");
     REQUIRE(packages[0].version == "0.1.0");
     REQUIRE(packages[0].filename == "yuzu-agent-0.1.0-x64-windows.exe");
-
 }
 
 // ── latest_for ──────────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: latest_for returns package for matching platform/arch",
-          "[update_registry][latest]") {
+          "[update_registry][pg][latest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     reg.upsert_package(make_pkg("linux", "x86_64", "0.1.0", "yuzu-agent-0.1.0-linux"));
 
@@ -98,27 +125,29 @@ TEST_CASE("UpdateRegistry: latest_for returns package for matching platform/arch
     REQUIRE(result.has_value());
     REQUIRE(result->version == "0.1.0");
     REQUIRE(result->platform == "linux");
-
 }
 
 TEST_CASE("UpdateRegistry: latest_for returns nullopt for unknown platform",
-          "[update_registry][latest]") {
+          "[update_registry][pg][latest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0"));
 
     auto result = reg.latest_for("freebsd", "x86_64");
     REQUIRE_FALSE(result.has_value());
-
 }
 
 TEST_CASE("UpdateRegistry: latest_for returns newest version when multiple exist",
-          "[update_registry][latest]") {
+          "[update_registry][pg][latest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-0.1.0.exe"));
     reg.upsert_package(make_pkg("windows", "x86_64", "0.2.0", "agent-0.2.0.exe"));
@@ -126,14 +155,15 @@ TEST_CASE("UpdateRegistry: latest_for returns newest version when multiple exist
     auto result = reg.latest_for("windows", "x86_64");
     REQUIRE(result.has_value());
     REQUIRE(result->version == "0.2.0");
-
 }
 
 TEST_CASE("UpdateRegistry: latest_for handles numeric version comparison (0.10.0 > 0.9.0)",
-          "[update_registry][latest]") {
+          "[update_registry][pg][latest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     reg.upsert_package(make_pkg("linux", "aarch64", "0.9.0", "agent-0.9.0"));
     reg.upsert_package(make_pkg("linux", "aarch64", "0.10.0", "agent-0.10.0"));
@@ -141,40 +171,41 @@ TEST_CASE("UpdateRegistry: latest_for handles numeric version comparison (0.10.0
     auto result = reg.latest_for("linux", "aarch64");
     REQUIRE(result.has_value());
     REQUIRE(result->version == "0.10.0");
-
 }
 
 // ── Remove ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: remove_package makes latest_for return nullopt",
-          "[update_registry][remove]") {
+          "[update_registry][pg][remove]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0"));
     reg.remove_package("windows", "x86_64", "0.1.0");
 
     auto result = reg.latest_for("windows", "x86_64");
     REQUIRE_FALSE(result.has_value());
-
 }
 
 TEST_CASE("UpdateRegistry: remove_package for nonexistent does not crash",
-          "[update_registry][remove]") {
+          "[update_registry][pg][remove]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     // Should not throw or crash
     reg.remove_package("darwin", "aarch64", "9.9.9");
 
     auto packages = reg.list_packages();
     REQUIRE(packages.empty());
-
 }
 
-// ── Rollout Eligibility ─────────────────────────────────────────────────────
+// ── Rollout Eligibility (pure — no DB) ───────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: is_eligible at 100% always returns true", "[update_registry][rollout]") {
     for (int i = 0; i < 50; ++i) {
@@ -214,26 +245,29 @@ TEST_CASE("UpdateRegistry: is_eligible distributes roughly 50% at rollout_pct=50
     REQUIRE(eligible_count <= 70);
 }
 
-// ── binary_path ─────────────────────────────────────────────────────────────
+// ── binary_path (pure — no DB) ────────────────────────────────────────────
 
-TEST_CASE("UpdateRegistry: binary_path returns update_dir / filename", "[update_registry][path]") {
+TEST_CASE("UpdateRegistry: binary_path returns update_dir / filename", "[update_registry][pg][path]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     auto pkg = make_pkg("windows", "x86_64", "0.1.0", "yuzu-agent.exe");
     auto path = reg.binary_path(pkg);
-    REQUIRE(path == dir / "yuzu-agent.exe");
-
+    REQUIRE(path == tmp.path() / "yuzu-agent.exe");
 }
 
 // ── list_packages ───────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: list_packages returns all upserted packages",
-          "[update_registry][list]") {
+          "[update_registry][pg][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-win-0.1.0.exe"));
     reg.upsert_package(make_pkg("linux", "x86_64", "0.1.0", "agent-linux-0.1.0"));
@@ -241,16 +275,17 @@ TEST_CASE("UpdateRegistry: list_packages returns all upserted packages",
 
     auto packages = reg.list_packages();
     REQUIRE(packages.size() == 3);
-
 }
 
 // ── Upsert Replace ─────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: upsert same platform/arch/version replaces existing",
-          "[update_registry][upsert]") {
+          "[update_registry][pg][upsert]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
     TempUpdateDir tmp;
-    const auto& dir = tmp.path();
-    UpdateRegistry reg(":memory:", dir);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
 
     auto pkg = make_pkg("windows", "x86_64", "0.1.0", "agent-v1.exe");
     pkg.sha256 = "original_hash";
@@ -267,5 +302,160 @@ TEST_CASE("UpdateRegistry: upsert same platform/arch/version replaces existing",
     REQUIRE(packages[0].sha256 == "updated_hash");
     REQUIRE(packages[0].filename == "agent-v1-rebuilt.exe");
     REQUIRE(packages[0].file_size == 2048);
+}
 
+// ── Not-open degrade path (deliberately NOT typed-error — see the header doc
+//    comment's ADR-0036 deny-or-benign rationale) — no live Postgres needed,
+//    the malformed conninfo never dials out (mirrors test_pg_pool.cpp's
+//    "malformed conninfo" case). ────────────────────────────────────────────
+
+TEST_CASE("UpdateRegistry: a store that fails to open degrades every method to a benign "
+          "empty/false/nullopt, never crashes",
+          "[update_registry][pg]") {
+    TempUpdateDir tmp;
+    PgPool pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 2}};
+    REQUIRE_FALSE(pool.valid());
+
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE_FALSE(reg.is_open());
+
+    CHECK(reg.list_packages().empty());
+    CHECK_FALSE(reg.latest_for("windows", "x86_64").has_value());
+    // Neither call should throw or crash against a never-opened store.
+    reg.upsert_package(make_pkg());
+    reg.remove_package("windows", "x86_64", "0.1.0");
+    CHECK(reg.list_packages().empty());
+}
+
+// gov sre finding (Gate 8 re-review, adversarial review 2026-08-28), mirrors
+// test_instruction_store.cpp's "read and write degrade counters increment on
+// a store that failed to open" precedent exactly: a code-read confirmation
+// that note_read_degrade/note_write_degrade are called is not the same as
+// proof the counters actually move. Same malformed-conninfo store_not_open
+// path as the test above, but with a MetricsRegistry wired and inspected.
+TEST_CASE("UpdateRegistry: read and write degrade counters increment on a store "
+          "that failed to open",
+          "[update_registry][pg]") {
+    TempUpdateDir tmp;
+    PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(broken_pool.valid());
+    UpdateRegistry reg(broken_pool, tmp.path());
+    REQUIRE_FALSE(reg.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    reg.set_metrics(&metrics); // wired after construction — construction's own
+                              // failed lease attempt must not touch the counter.
+
+    auto packages = reg.list_packages();
+    CHECK(packages.empty());
+    CHECK(metrics.counter("yuzu_server_update_registry_read_degrade_total",
+                          {{"reason", "store_not_open"}})
+              .value() == 1.0);
+
+    reg.upsert_package(make_pkg());
+    CHECK(metrics.counter("yuzu_server_update_registry_write_degrade_total",
+                          {{"reason", "store_not_open"}})
+              .value() == 1.0);
+}
+
+// gov fjarvis B1 precedent (OfflineEndpointStore): a reachable database whose
+// schema migration FAILS must leave the store !is_open() — which server.cpp
+// wires to startup_failed_ (fail closed, not serve-degraded). Force the
+// failure by pre-seeding a table in the store's schema with no schema_meta
+// row: the migration runner's schema-drift guard refuses (version 0 but
+// tables exist), so run() returns false.
+//
+// gov fjarvis C2 (PR #3695 review, 2026-08-28): this is exactly the
+// fresh-migrate/"!is_open on a migration failure" case
+// YUZU_REQUIRE_PG_MIGRATION_DB's own docstring names as its target — an
+// earlier version of this test stayed on plain YUZU_REQUIRE_PG_DB with a
+// comment claiming the two macros hand out different databases. They don't:
+// YUZU_REQUIRE_PG_MIGRATION_DB is YUZU_REQUIRE_PG_DB plus a Windows skip for
+// the #2354 EXEC_BACKEND fresh-DB cost, nothing else.
+TEST_CASE("UpdateRegistry reports !is_open on a migration failure", "[update_registry][pg]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    TempUpdateDir tmp;
+
+    // Pre-seed: create the update_registry schema + a conflicting table, but
+    // no public.schema_meta row for the store — the drift guard will refuse.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA update_registry")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(), "CREATE TABLE update_registry.update_packages (bogus int)")};
+        REQUIRE(t.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    UpdateRegistry reg(pool, tmp.path());
+    CHECK_FALSE(reg.is_open()); // → server.cpp sets startup_failed_ = true
+}
+
+// gov quality-engineer/cpp-safety (adversarial review, 2026-08-28, converged
+// independently across 2 reviewers), modelled directly on
+// test_api_token_store.cpp's "#2961 round-2" precedent: the migration-failure
+// test above exercises PgMigrationRunner's own schema-drift guard (version 0
+// but tables exist) — a DIFFERENT failure mode from the post-migration
+// projection smoke-read added in this PR's own hardening round. The runner's
+// guard can only see a version collision baked into THIS binary's own
+// migrations() vector; it cannot see a version already recorded by a
+// DIFFERENT binary whose schema doesn't match what THIS binary's runtime
+// queries select. Force exactly that: stamp schema_meta at v1 (a lie — no
+// real v1 migration ran against this schema) against a table that is
+// missing `file_size`, one of the columns list_packages()/latest_for()
+// actually select. Disabling the smoke-read would leave this green with
+// !is_open() never firing until the first runtime read hit `undefined
+// column` instead.
+TEST_CASE("UpdateRegistry reports !is_open when schema_meta claims v1 but update_packages "
+          "is missing a selected column (post-migration smoke-read guard)",
+          "[update_registry][pg]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    TempUpdateDir tmp;
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA update_registry")};
+        REQUIRE(schema.ok());
+
+        // v1 DDL copied from migrations() in update_registry.cpp, deliberately
+        // missing the file_size column that list_packages()/latest_for()'s
+        // SELECT actually projects.
+        PgResult table{PQexec(conn.get(),
+                              "CREATE TABLE update_registry.update_packages ("
+                              "  platform    TEXT    NOT NULL,"
+                              "  arch        TEXT    NOT NULL,"
+                              "  version     TEXT    NOT NULL,"
+                              "  sha256      TEXT    NOT NULL,"
+                              "  filename    TEXT    NOT NULL,"
+                              "  mandatory   BOOLEAN NOT NULL DEFAULT FALSE,"
+                              "  rollout_pct INTEGER NOT NULL DEFAULT 100,"
+                              "  uploaded_at TEXT    NOT NULL DEFAULT '',"
+                              "  PRIMARY KEY (platform, arch, version))")};
+        REQUIRE(table.ok());
+
+        // Stamp schema_meta at v1 — a LIE: no real v1 migration ran against
+        // this schema, it's missing file_size. Models a database another
+        // binary's runner believed it already migrated (so
+        // PgMigrationRunner::run sees nothing pending and returns true),
+        // never a real migration run against this exact schema.
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('update_registry', 1, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    UpdateRegistry reg(pool, tmp.path());
+    CHECK_FALSE(reg.is_open()); // → smoke-read fails closed, not just the runner's own guard
 }

@@ -81,8 +81,9 @@ constexpr std::size_t kMaxDetailValueLength = 128;
 // guardian_ingest.cpp's ts_to_iso8601 / rest_api_v1.cpp's iso_now pattern —
 // the established per-file idiom for this codebase (no shared formatter
 // header exists yet). Used for JIT elevation's `expires_at` (follow-up B,
-// security review 2026-06-30): the wall-clock projection of an internally
-// steady_clock-tracked window.
+// security review 2026-06-30): since HA WS-1/1a (ADR-2002 §4) the elevation
+// window is itself wall-clock (`system_clock`, durably persisted), so this
+// formats the absolute `elevated_until` directly — no steady→system projection.
 std::string iso8601_utc(std::chrono::system_clock::time_point tp) {
     std::time_t t = std::chrono::system_clock::to_time_t(tp);
     std::tm tm{};
@@ -2780,8 +2781,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             return;
         }
 
-        // Success — stamp `mfa_verified_at = steady_clock::now()` on the
-        // existing session row. The cookie itself does NOT rotate — the
+        // Success — stamp `mfa_verified_at = system_clock::now()` on the
+        // existing session row (wall-clock since HA WS-1/1a). The cookie itself
+        // does NOT rotate — the
         // step-up refreshes a session attribute, it does not mint a new
         // session (which would break in-flight HTMX requests from the
         // same browser tab).
@@ -2814,15 +2816,44 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
     // -- Logout ---------------------------------------------------------------
     sink.Post("/logout", [this](const httplib::Request& req, httplib::Response& res) {
-        audit_log(req, "auth.logout", "success");
-        emit_event("auth.logout", req);
         auto token = extract_session_cookie(req);
-        if (!token.empty()) {
-            auth_mgr_.invalidate_session(token);
+        // db_persisted=false ⇒ the durable session row was NOT deleted (store
+        // error); the cookie can still rehydrate a valid session on another
+        // replica / if copied, so logout is only PARTIAL — do not audit/report a
+        // clean success (adversarial-round blocker #3). The local cache is erased
+        // and the client cookie is cleared regardless (this browser is logged
+        // out), but ops + API callers are told the durable delete failed so it
+        // can be retried; the degrade metric was already incremented in
+        // invalidate_session.
+        const bool db_persisted = token.empty() ? true : auth_mgr_.invalidate_session(token);
+        audit_log(req, "auth.logout", db_persisted ? "success" : "partial", /*target_type=*/{},
+                  /*target_id=*/{}, db_persisted ? "" : "db_error=true");
+        emit_event("auth.logout", req);
+        const bool is_htmx = !req.get_header_value("HX-Request").empty();
+        if (!db_persisted) {
+            // FAIL CLOSED (adversarial-round #2, C2): the durable row was NOT
+            // deleted, so the session is still valid (it rehydrates on any cache
+            // miss / on another replica / from a copied cookie). Do NOT clear the
+            // cookie — that would look like a clean logout AND destroy the only
+            // credential a retry needs — and do NOT redirect an HTMX client to
+            // /login. Return a visible error on BOTH surfaces so the human/API
+            // caller knows logout is incomplete and retries (the durable delete
+            // is idempotent). The degrade metric already fired in
+            // invalidate_session; ops sees the `partial` audit row.
+            res.status = 503;
+            if (is_htmx)
+                res.set_content("<div class=\"error\">Logout could not be completed (the session "
+                                "store is unavailable). You are still signed in — please retry.</div>",
+                                "text/html");
+            else
+                res.set_content(
+                    R"({"status":"partial","detail":"the durable session could not be deleted; you are still signed in, retry to complete logout"})",
+                    "application/json");
+            return;
         }
+        // Success — the durable row is gone; clear the cookie and finish.
         res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-        // HTMX clients get a redirect header; non-HTMX get JSON
-        if (!req.get_header_value("HX-Request").empty()) {
+        if (is_htmx) {
             res.set_header("HX-Redirect", "/login");
             res.set_content("", "text/plain");
         } else {
@@ -3122,36 +3153,27 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // step-up gate (mfa_step_up.cpp) consumes this so an MFA'd SSO
         // session clears high-risk endpoints without a redundant local
         // prompt, while a single-factor SSO login is gated. Anchor the
-        // steady-clock timestamp to the IdP-asserted `iat` so a stale
-        // assertion still re-prompts: a token issued `age` ago is treated
-        // as proven `age` ago. `iat` is wall-clock; convert the age into
-        // the steady-clock domain (never store `iat` directly — an NTP
-        // step must not be able to extend the step-up window, hard
-        // invariant #5). Negative ages (IdP clock ahead of ours) clamp to
-        // "just now".
+        // proof to the IdP-asserted `iat` so a stale assertion still
+        // re-prompts: a token issued `age` ago is treated as proven `age`
+        // ago. Since HA WS-1/1a the proof timestamp IS wall-clock
+        // (`system_clock`, durable rows, ADR-2002 §4), so `iat` seeds it
+        // directly — the former steady-clock age-projection is gone. The
+        // NTP-step resistance hard-invariant #5 asked for is now provided by
+        // the short step-up window plus mfa_step_up.cpp's fail-closed guard
+        // on a future-dated proof. A future `iat` (IdP clock ahead of ours)
+        // is clamped to "now" so it can only ever shorten the window, never
+        // extend it. `iat<=0` (missing/0) is NOT seeded — fabricating a fresh
+        // window from a timestampless assertion would let a replayed
+        // amr-without-iat token look fresh (governance UP-9); an un-seeded
+        // OIDC session simply passes the step-up gate like any non-MFA SSO
+        // identity.
         const bool amr_mfa_asserted = amr_asserts_mfa(claims.amr);
-        std::chrono::steady_clock::time_point mfa_at{};
+        std::chrono::system_clock::time_point mfa_at{};
         if (amr_mfa_asserted && claims.iat > 0) {
-            // Anchor the steady-clock proof to the IdP-asserted `iat` so a
-            // stale assertion still re-prompts: a token issued `age` ago is
-            // treated as proven `age` ago. Clamp the system-clock domain
-            // BEFORE the cast to steady_clock::duration (a future editor
-            // casting first then clamping against steady_clock::zero risks
-            // truncation skew; cpp-expert SHOULD). Negative age (IdP clock
-            // ahead of ours) clamps to "just now"; it can only ever shorten
-            // the window, never extend it. `iat<=0` (missing/0) is NOT
-            // seeded — fabricating a fresh window from a timestampless
-            // assertion would let a replayed amr-without-iat token look
-            // fresh (governance UP-9). An un-seeded OIDC session simply
-            // passes the step-up gate like any non-MFA SSO identity.
-            auto asserted =
+            const auto asserted =
                 std::chrono::system_clock::from_time_t(static_cast<std::time_t>(claims.iat));
-            auto age = std::chrono::system_clock::now() - asserted;
-            if (age < std::chrono::system_clock::duration::zero()) {
-                age = std::chrono::system_clock::duration::zero();
-            }
-            mfa_at = std::chrono::steady_clock::now() -
-                     std::chrono::duration_cast<std::chrono::steady_clock::duration>(age);
+            const auto now = std::chrono::system_clock::now();
+            mfa_at = (asserted > now) ? now : asserted; // clamp a future iat to "now"
         }
 
         auto session_token = auth_mgr_.create_oidc_session(display, email, claims.sub, claims.iss,
@@ -3778,8 +3800,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 break; // existing behaviour — no new login-time audit row
             }
 
-            session_token = auth_mgr_.create_saml_session(saml_name_id, saml_entity_id,
-                                                           result.value().groups, saml_admin_gid);
+            session_token = auth_mgr_.create_saml_session(
+                saml_name_id, saml_entity_id, result.value().groups, saml_admin_gid,
+                result.value().display_name, result.value().email);
 
             // ADR-2001 §4 (PR4b) — deny-at-login backstop, POST-MINT
             // RE-CHECK (the codex-caught check-then-mint race, mirrors the
@@ -4111,8 +4134,30 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // actually drops the operator's admin access rather than
         // leaving it standing for up to the window.
         int cleared = 0;
-        if (!eligible)
-            cleared = auth_mgr_.revoke_user_elevations(target);
+        if (!eligible) {
+            auto rv = auth_mgr_.revoke_user_elevations(target);
+            if (!rv) {
+                // The eligibility flag persisted, but clearing the in-flight
+                // elevation failed durably — the "revoke now" is NOT complete, an
+                // active admin elevation may still be live. Fail CLOSED (503 +
+                // error audit) rather than a false "ok" that tells an incident
+                // responder the access was dropped (adversarial C2). The
+                // eligibility flip is durable, so a retry re-runs only the clear.
+                spdlog::error("elevation-eligibility: durable elevation clear failed for '{}': {}",
+                              target, rv.error());
+                audit_log(req, "user.elevation_eligibility.set", "error", "User", target,
+                          "eligible=false elevation_clear_failed=true detail=" + rv.error());
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503,
+                                          "eligibility updated but active elevations could not be "
+                                          "cleared; retry to complete the revocation",
+                                          cid),
+                    "application/json");
+                return;
+            }
+            cleared = *rv;
+        }
         audit_log(req, "user.elevation_eligibility.set", "ok", "User", target,
                   std::string(eligible ? "eligible=true" : "eligible=false") +
                       (cleared > 0 ? " elevations_cleared=" + std::to_string(cleared) : ""));
@@ -4420,15 +4465,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // re-sampled a moment later) would falsely report 0 across all three
         // channels (HIGH, adversarial review). Only a non-live/edge window
         // (until <= now) floors to 0.
-        const auto elevate_now = std::chrono::steady_clock::now();
+        const auto elevate_now = std::chrono::system_clock::now();
         auto remaining = (*until > elevate_now)
                               ? std::chrono::ceil<std::chrono::seconds>(*until - elevate_now)
                               : std::chrono::seconds(0);
-        // steady_clock has no wall-clock meaning across a restart/off-process,
-        // so the absolute `expires_at` is a system_clock projection of the
-        // steady remaining duration, taken at essentially the same instant.
-        const std::string expires_at_str =
-            iso8601_utc(std::chrono::system_clock::now() + remaining);
+        // `*until` is an absolute wall-clock instant since HA WS-1/1a (durable
+        // session, ADR-2002 §4), so it reports directly — no steady→system
+        // projection needed. iso8601_utc formats the true (post-clamp) expiry.
+        const std::string expires_at_str = iso8601_utc(*until);
         // FAIL-CLOSED on the mandatory grant audit (review UP-3): a privileged
         // activation must never stand without a durable record. If the audit row
         // can't persist, ROLL BACK the elevation (compensating revoke, mirrors
@@ -4455,7 +4499,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                          " mfa=" + mfa_factor_label +
                                          " expires_at=" + expires_at_str +
                                          " justification=" + justification)) {
-            auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
+            auto rollback = auth_mgr_.revoke_elevation(token); // un-elevate — no record, no grant
+            if (!rollback) {
+                // The compensating revoke itself failed durably: the elevation is
+                // LIVE AND UNRECORDED — the worst state. Do not claim "not
+                // granted"; escalate loudly (CRITICAL) so an operator manually
+                // revokes, and still fail the request (adversarial C2).
+                spdlog::critical("role.elevation.granted audit FAILED for '{}' AND the compensating "
+                                 "revoke ALSO FAILED ({}) — elevation is LIVE and UNRECORDED; "
+                                 "manual revocation required",
+                                 session->username, rollback.error());
+                res.status = 500;
+                res.set_header("Sec-Audit-Failed", "true");
+                res.set_content(
+                    detail::error_json_a4(500,
+                                          "elevation could neither be recorded nor rolled back; it "
+                                          "may be active — revoke it manually and check the stores",
+                                          cid, "revoke manually; check the audit + session stores"),
+                    "application/json");
+                return;
+            }
             spdlog::error("role.elevation.granted audit FAILED for '{}' — elevation rolled back",
                           session->username);
             res.status = 500;
@@ -4498,7 +4561,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                       res.set_content(detail::a4_denial(res, 401, "unauthorized"), "application/json");
                       return;
                   }
-                  const bool was_elevated = auth_mgr_.revoke_elevation(token);
+                  auto rev = auth_mgr_.revoke_elevation(token);
+                  if (!rev) {
+                      // Durable clear failed — the elevation may still be LIVE.
+                      // Fail CLOSED (503 + error audit) rather than auditing a
+                      // false `role.elevation.revoked ok` (adversarial C2).
+                      spdlog::error("elevate/revoke: durable clear failed for '{}': {}",
+                                    session->username, rev.error());
+                      audit_log_for_principal(req, "role.elevation.revoked", "error",
+                                              session->username,
+                                              auth::role_to_string(session->role), "User",
+                                              session->username,
+                                              "durable_clear_failed=true detail=" + rev.error());
+                      res.status = 503;
+                      res.set_content(
+                          detail::a4_denial(res, 503, "could not revoke the elevation; retry"),
+                          "application/json");
+                      return;
+                  }
+                  const bool was_elevated = *rev;
                   audit_log_for_principal(req, "role.elevation.revoked", "ok", session->username,
                                           auth::role_to_string(session->role), "User",
                                           session->username,

@@ -366,7 +366,11 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
-    {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
+    {"get_agent_details",
+     "Get detailed info for a single agent including tags and inventory. "
+     "An \"Agent not found\" error means either the agent does not exist or "
+     "it exists outside your management-group scope -- deliberately "
+     "indistinguishable to prevent scope-probing.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version"]})j"},
 
@@ -1793,7 +1797,14 @@ struct ToolSecurityEntry {
 static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
-    {"get_agent_details", {"Infrastructure", "Read"}},
+    // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
+    // this tool a REAL confinement mechanism (meet(management-group,
+    // service-scope)) — reclassified from the default `denied` to
+    // `confined`, same as query_installed_software below, so a correctly-
+    // confined service-scoped token gets a real, filtered answer instead of
+    // a blanket 403 (routed-concern clause 3: a `confined` label needs a
+    // real mechanism, and conversely a tool that HAS one should carry it).
+    {"get_agent_details", {"Infrastructure", "Read", ServiceScopeClass::confined}},
     {"query_audit_log", {"AuditLog", "Read"}},
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
@@ -4851,37 +4862,98 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_agent_details ─────────────────────────────────────────
+            // #1700 / #3290 Phase 2 — migrated onto require_fleet_read
+            // (fleet_read_fn_), mirroring query_installed_software exactly:
+            // fleet_read_fn_ is now the SOLE gate — it already covers
+            // mcp_tier internally (require_fleet_read's own caller-class
+            // ladder) and RBAC, so no separate tier_allows/perm_fn call here
+            // (stacking either would be the BLOCKING defect require_fleet_read's
+            // doc comment warns against).
             if (tool_name == "get_agent_details") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_agent_details: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
                 auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
                     return;
                 }
-                // Find agent in registry
+                // Find agent in registry. An out-of-scope agent collapses to
+                // the SAME "not found" response as a genuinely nonexistent
+                // one (#1700) — the existence probe (hostname/os disclosure
+                // for an agent outside the caller's confinement) IS the
+                // vulnerability this migration closes, so the response must
+                // not distinguish "doesn't exist" from "exists, not yours".
                 const auto& agents = get_agents();
                 JObj agent_obj;
                 bool found = false;
+                bool exists_out_of_scope = false;
                 for (const auto& a : agents) {
-                    if (a.value("agent_id", "") == agent_id) {
+                    if (a.value("agent_id", "") != agent_id)
+                        continue;
+                    if (authz::in_scope(gate.scope, agent_id)) {
                         agent_obj.add("agent_id", a.value("agent_id", ""))
                             .add("hostname", a.value("hostname", ""))
                             .add("os", a.value("os", ""))
                             .add("arch", a.value("arch", ""))
                             .add("agent_version", a.value("agent_version", ""));
                         found = true;
-                        break;
+                        break; // only the in-scope match short-circuits the scan.
                     }
+                    // Gate 8 re-review finding: an out-of-scope match must NOT
+                    // break here -- doing so would let scan length itself
+                    // distinguish "exists, out of scope" (early break, at this
+                    // agent's position) from "genuinely nonexistent" (full
+                    // scan), a timing signal the ORIGINAL pre-#1700 loop never
+                    // had (it only ever broke on match-AND-in-scope, so an
+                    // out-of-scope match fell through and scanned to the end
+                    // exactly like a nonexistent one). Record the fact and
+                    // keep scanning so both !found sub-cases stay scan-length
+                    // symmetric, matching that original behavior.
+                    exists_out_of_scope = true;
                 }
                 if (!found) {
+                    // #1700 / Gate 6 sre finding: the RESPONSE never
+                    // distinguishes "genuinely nonexistent" from "exists,
+                    // out of scope" (that collapse IS the fix), but the
+                    // server-side audit trail should -- same Pattern-D
+                    // discipline as every other 404-collapse in this
+                    // codebase, and the scope-drop half mirrors
+                    // query_installed_software's "denied" audit row.
+                    //
+                    // Gate 8 re-review found and fixed two timing side-
+                    // channels here (synchronous-audit-write asymmetry,
+                    // scan-length asymmetry) -- both closed by making the
+                    // audit call and the scan unconditional. #3564 (external
+                    // adversarial review, Codex) then found the detail
+                    // STRING itself was still the leak: query_audit_log is a
+                    // documented MCP tool gated only on flat AuditLog:Read
+                    // (carried by the seeded Operator/PlatformEngineer roles)
+                    // and echoes every event's `detail` field back verbatim
+                    // -- a caller holding AuditLog:Read could call this tool,
+                    // then query_audit_log(principal=self), and read back
+                    // which detail string her own event got, learning
+                    // existence directly with no timing analysis at all.
+                    // Unlike query_installed_software's "denied" row (a
+                    // COUNT, safe because it never confirms/denies one
+                    // specific caller-supplied id), a single-agent lookup's
+                    // detail string cannot safely distinguish the two
+                    // sub-cases in ANY caller-queryable channel. Both now
+                    // audit the IDENTICAL detail string; the distinction is
+                    // recorded ONLY server-side, in the log line below, which
+                    // no MCP tool exposes back to a caller.
+                    spdlog::debug("get_agent_details: {} for {} (caller-visible audit unchanged)",
+                                  exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                    mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
+                                            agent_id);
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
@@ -8040,6 +8112,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                     // (server.cpp); a test wanting unfiltered wires a
                                     // callback whose exec_visible is nullopt.
                               : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                // #1398: a supervised-tier call reaches here only after C8
+                // consumed a real ticket for THIS request
+                // (approval_ticket_just_consumed); an operator-tier call
+                // (auto-approved, no ticket ever minted) or a non-MCP-tiered
+                // caller relies solely on caller.principal_is_admin (already
+                // stamped by caller_fn/derive_dispatch_caller above) at the
+                // chokepoint's ExecuteGate::AdminOrApproval arm.
+                caller.approval_provenance = approval_ticket_just_consumed
+                                                 ? yuzu::server::ApprovalProvenance::Ticket
+                                                 : yuzu::server::ApprovalProvenance::None;
                 std::string command_id;
                 int agents_reached = 0;
                 try {
@@ -8103,23 +8185,37 @@ McpServer::HandlerFn McpServer::build_handler(
                             // this can be zero — a target that is QUARANTINED
                             // is withheld by the containment gate before
                             // dispatch, which is a permanent policy denial,
-                            // not transient unreachability. The dispatch
-                            // closure's return carries only (command_id,
-                            // sent), so this handler cannot yet tell the two
-                            // apart; saying so is better than asserting the
-                            // wrong one, because an agentic caller that reads
-                            // "unreachable" retries a denial forever. The
-                            // authoritative answer is the
-                            // quarantine.dispatch_denied audit row and
+                            // not transient unreachability. #1398 (governance
+                            // Gate 6 enterprise-readiness finding): a THIRD
+                            // cause collapses into this same envelope —
+                            // ExecuteGate::AdminOrApproval/AlwaysApproval
+                            // denying a non-admin, non-ticketed caller at the
+                            // dispatch chokepoint reaches this exact code
+                            // path too (mcp_server.cpp has no
+                            // classify_and_authorize_dispatch call of its own;
+                            // the shared dispatch_fn's internal chokepoint
+                            // denial surfaces as command_id/sent=0, same as
+                            // offline or quarantined). The dispatch closure's
+                            // return carries only (command_id, sent), so this
+                            // handler cannot yet tell any of the three apart;
+                            // naming all three is better than asserting one,
+                            // because an agentic caller that reads only
+                            // "unreachable" retries a permanent denial
+                            // forever. The authoritative answer is the
+                            // quarantine.dispatch_denied audit row,
                             // yuzu_server_dispatch_target_rejected_total
-                            // {reason="quarantined"}. A programmatic
+                            // {reason="quarantined"}, or
+                            // yuzu_server_dispatch_denied_total
+                            // {reason="approval_required"}. A programmatic
                             // discriminator needs a wider DispatchFn return —
-                            // tracked as a follow-up.
+                            // tracked as a follow-up (#1398 Rung 4 / #3687).
                             .add("message",
-                                 "No agents reached: every target was either unreachable or "
-                                 "withheld by the quarantine containment gate. If the device is "
-                                 "quarantined this is a policy denial and retrying will not "
-                                 "help — check quarantine status before retrying.")
+                                 "No agents reached: every target was either unreachable, "
+                                 "withheld by the quarantine containment gate, or denied "
+                                 "approval-required by the dispatch gate. A quarantine or "
+                                 "approval denial is a permanent policy refusal and retrying "
+                                 "will not help — check quarantine status, or dispatch via "
+                                 "POST /api/instructions/{id}/execute, before retrying.")
                             .str();
                     mcp_audit("failure",
                               std::string("no_agents_reached execution_id=") + execution_id);
@@ -9037,7 +9133,34 @@ McpServer::HandlerFn McpServer::build_handler(
                     .principal = session->username,
                     .principal_role = auth::role_to_string(session->role),
                     .exec_visible =
-                        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}}};
+                        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}},
+                    // #1398: JIT-elevation-aware, matching every other
+                    // session-derived caller. Applies to BOTH branches below
+                    // (the already-existing-record reapply via
+                    // redispatch_stored_containment, and the newly-created
+                    // record) — this shared caller is exactly why a single
+                    // fix here covers both, where the pre-#3425-refactor code
+                    // this diff originally targeted only touched the
+                    // newly-created branch's own inline construction.
+                    .principal_is_admin =
+                        auth::effective_role(*session) == auth::Role::admin,
+                    // #1398: quarantine.quarantine is AdminOrApproval-gated.
+                    // A supervised-tier MCP token reaches here only after C8
+                    // consumed a real ticket for THIS request
+                    // (approval_ticket_just_consumed); a non-MCP-tiered
+                    // caller (requires_approval short-circuits false for an
+                    // empty tier, so no ticket is ever minted) relies solely
+                    // on principal_is_admin above. The background
+                    // QuarantineContainmentReconciler's OWN redispatch calls
+                    // through a SEPARATE `.system = true` closure
+                    // (CommandDispatchFn, quarantine_containment_reconciler.hpp)
+                    // and bypasses this gate entirely via the chokepoint's
+                    // system-caller early return — it is not this caller and
+                    // needs no equivalent stamp.
+                    .approval_provenance =
+                        approval_ticket_just_consumed
+                            ? yuzu::server::ApprovalProvenance::Ticket
+                            : yuzu::server::ApprovalProvenance::None};
                 if (record_pre_existing) {
                     // #3425: the shared recipe (quarantine_reapply.hpp) owns
                     // the read-stored-row + validate + dispatch sequence —
@@ -9102,6 +9225,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!effective_whitelist.empty())
                         qparams["whitelist_ips"] = effective_whitelist;
                     try {
+                        // governance UP-9: thread a set CONFINED to the single
+                        // scope-gate-checked target, not an unfiltered VisibleSet{} —
+                        // defense in depth matching the bundle/execute_instruction
+                        // dispatch arms (this was the last arm still passing
+                        // unfiltered on a single already-authorized target).
+                        // PLAN-006: `session` was authenticated at handler entry and
+                        // is already used for the store write above — identify the
+                        // caller to dispatch_confined too, not just its visible set.
+                        // #1398: quarantine_caller (defined above this if/else,
+                        // shared with the reapply branch) already carries
+                        // principal_is_admin/approval_provenance.
                         std::tie(command_id, agents_reached) =
                             dispatch_fn("quarantine", "quarantine", {agent_id}, /*scope=*/"",
                                         qparams, /*execution_id=*/"", quarantine_caller);
@@ -9344,8 +9478,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     // checked above through to the orchestrator, rather than let it
                     // default to unfiltered — defense in depth if a future dispatch_fn
                     // starts consulting it itself.
-                    r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit,
-                                              caller.exec_visible);
+                    //
+                    // #1398 (adversarial-review finding): thread caller.principal_is_admin
+                    // and this request's ticket-consumption state too — dropping them
+                    // (as this call used to) unconditionally denied every admin/
+                    // ticket-holding caller's bundle step on an AdminOrApproval/
+                    // AlwaysApproval pair, regardless of who was actually calling.
+                    // execute_bundle is in the same approval-gated tool set as
+                    // execute_instruction/quarantine_device (kToolSecurity), so a
+                    // supervised-tier caller can reach here only after C8 consumed a
+                    // real ticket for THIS request.
+                    r = bundle_orch->dispatch(
+                        agent_id, *specs, session->username, bundle_audit, caller.exec_visible,
+                        caller.principal_is_admin,
+                        approval_ticket_just_consumed ? yuzu::server::ApprovalProvenance::Ticket
+                                                       : yuzu::server::ApprovalProvenance::None);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_bundle: dispatch failed: {}", e.what());
                     mcp_audit("failure", std::string("dispatch_exception: ") + e.what());

@@ -49,6 +49,17 @@ except ImportError:
     sys.exit(1)
 
 
+# The three modes InstructionStore::import_definition_json_impl and the
+# governed-execute path (workflow_routes.cpp) actually understand. Any other
+# value falls through the governed path's fail-closed "unknown mode" arm —
+# approval-required for every caller including admins — which is safe but
+# means the definition is effectively unexecutable via the governed REST
+# path. Rejecting it here at build time (#1398) surfaces that as a build
+# failure instead of a silent, permanently-pending definition discovered
+# only at runtime.
+VALID_APPROVAL_MODES = {"auto", "role-gated", "always"}
+
+
 def to_string_list(v):
     if v is None:
         return ""
@@ -202,6 +213,15 @@ def main() -> int:
                         f"action={(exec_.get('action') or spec.get('action'))!r}",
                     ))
                     continue
+                if env["approval_mode"] not in VALID_APPROVAL_MODES:
+                    bad_defs.append((
+                        str(yf),
+                        f"invalid approval.mode {env['approval_mode']!r} for "
+                        f"id={env['id']!r} plugin={env['plugin']!r} "
+                        f"action={env['action']!r} — must be one of "
+                        f"{sorted(VALID_APPROVAL_MODES)}",
+                    ))
+                    continue
                 if env["id"] not in seen_def_ids:
                     seen_def_ids.add(env["id"])
                     defs_json.append(json.dumps(env))
@@ -216,7 +236,8 @@ def main() -> int:
     if bad_defs:
         print(
             f"ERROR: embed_content.py: {len(bad_defs)} "
-            f"InstructionDefinition doc(s) missing required fields:",
+            f"InstructionDefinition doc(s) failed validation "
+            f"(missing required fields or invalid approval.mode):",
             file=sys.stderr,
         )
         for path, reason in bad_defs:

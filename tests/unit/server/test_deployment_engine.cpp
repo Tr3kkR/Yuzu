@@ -343,3 +343,44 @@ TEST_CASE("H1: advance() threads the caller it is given to dispatch_fn, never a 
     CHECK(reached.principal == "carol");
     CHECK(reached.principal_role == "PlatformEngineer");
 }
+
+// #1398: content_dist.{stage,execute_staged} are role-gated content, so their
+// compiled dispatch-chokepoint gate is ExecuteGate::AdminOrApproval. Without
+// this stamp, a non-admin operator's `/auto` Deploy advance would be denied
+// ApprovalRequired at the chokepoint despite the pipeline's own governance
+// (creator-authority go-cohort, guarded transitions, execute-once CAS,
+// per-tick re-authorization) already being the accepted substitute control
+// (design doc Decision 5) — proving THAT admission end-to-end is
+// test_dispatch_chokepoint.cpp's job (the pure decision, gate x provenance
+// matrix); this test proves advance() actually produces the stamp the
+// chokepoint needs to admit a non-admin caller in the first place.
+TEST_CASE("#1398: advance() stamps GovernedPipeline provenance on every content_dist dispatch, "
+          "for a non-admin caller",
+          "[pg][deployment][engine][security][1398]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "gov-pipeline-1398";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("w1")}));
+
+    Harness h{store};
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"w1"};
+
+    // Deliberately non-admin, no ticket, no other provenance — the ONLY
+    // thing that should let a role-gated content_dist dispatch through the
+    // chokepoint for this caller is the stamp advance() adds.
+    const yuzu::server::DispatchCaller non_admin_caller{
+        .principal = "dana", .principal_role = "PlatformEngineer", .principal_is_admin = false};
+    advance(deps, id, cfg, authorized, non_admin_caller);
+
+    REQUIRE_FALSE(h.dispatch_callers.empty());
+    const auto& reached = h.dispatch_callers.front();
+    CHECK(reached.principal == "dana");
+    CHECK_FALSE(reached.principal_is_admin);
+    CHECK(reached.approval_provenance == yuzu::server::ApprovalProvenance::GovernedPipeline);
+}

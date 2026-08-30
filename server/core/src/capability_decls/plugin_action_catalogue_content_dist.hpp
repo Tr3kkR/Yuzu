@@ -85,6 +85,7 @@ inline constexpr std::array<CommandCapability, 5> kContentDistCapabilities{{
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::High,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "content_dist",
@@ -95,6 +96,7 @@ inline constexpr std::array<CommandCapability, 5> kContentDistCapabilities{{
         .operation = authz::Operation::Execute,
         .risk_tier = authz::RiskTier::High,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "content_dist",
@@ -105,6 +107,7 @@ inline constexpr std::array<CommandCapability, 5> kContentDistCapabilities{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "content_dist",
@@ -115,6 +118,7 @@ inline constexpr std::array<CommandCapability, 5> kContentDistCapabilities{{
         .operation = authz::Operation::Delete,
         .risk_tier = authz::RiskTier::High,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "content_dist",
@@ -125,8 +129,17 @@ inline constexpr std::array<CommandCapability, 5> kContentDistCapabilities{{
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::High,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 }};
+
+// #1398: every row in kContentDistCapabilities must author .execute_gate — an
+// omission would value-initialize to ExecuteGate::Unspecified (the zero
+// enumerator), which is a genuine compile failure here rather than a
+// silent runtime gap. See ExecuteGate's doc comment in
+// command_capability.hpp.
+static_assert(::yuzu::server::detail::all_gates_specified(kContentDistCapabilities),
+              "every row in kContentDistCapabilities must author .execute_gate");
 
 } // namespace detail
 
