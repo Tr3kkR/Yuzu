@@ -85,6 +85,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // fields; pointers are trivially copied.
     auto auth_fn = std::move(deps.auth_fn);
     auto perm_fn = std::move(deps.perm_fn);
+    // #1712 / #3290 Phase 2 — see WorkflowRoutes::FleetReadFn's doc comment.
+    auto fleet_read_fn = std::move(deps.fleet_read_fn);
     auto audit_fn = std::move(deps.audit_fn);
     auto emit_fn = std::move(deps.emit_fn);
     auto scope_fn = std::move(deps.scope_fn);
@@ -293,13 +295,35 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // to exact `execution_id` correlation transparently).
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
-        [auth_fn, perm_fn, audit_fn, execution_tracker, instruction_store,
+        [fleet_read_fn, audit_fn, execution_tracker, instruction_store,
          response_store](const httplib::Request& req, httplib::Response& res) {
-            auto session = auth_fn(req, res);
-            if (!session)
+            // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
+            // (fleet_read_fn), mirroring query_installed_software / the REST
+            // /api/v1/inventory/software twin exactly: the gate is now the
+            // SOLE auth+authz check for this route (it calls require_auth
+            // internally, so the previous standalone auth_fn existence
+            // check is retired too — its only use was the existence check
+            // itself, the body never read the session) — never stacked with
+            // perm_fn (the BLOCKING defect require_fleet_read's own doc
+            // comment warns against). Scopes the "Responses" section below
+            // (#1712); the per-agent status grid above it reads from
+            // ExecutionTracker, a distinct store from ResponseStore -- it is
+            // filtered too, once, immediately after fetch (see the grid
+            // fetch below), a same-PR adversarial-review finding: the gate
+            // migration itself admits a confined caller class the old flat
+            // gate denied outright, so the grid needed the same filter as
+            // the responses section, not just the table.
+            if (!fleet_read_fn) {
+                spdlog::error("/fragments/executions/.../detail: fleet_read_fn unwired — "
+                              "misconfigured call site; failing closed");
+                res.status = 503;
+                res.set_content("<div class=\"empty-state\">Service unavailable</div>",
+                                "text/html; charset=utf-8");
                 return;
-            if (!perm_fn(req, res, "Execution", "Read"))
-                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the A4 error body + status.
             if (!execution_tracker) {
                 res.status = 503;
                 res.set_content("<div class=\"empty-state\">Tracker not available</div>",
@@ -316,6 +340,26 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             const auto& exec = *exec_opt;
             auto agents = execution_tracker->get_agent_statuses(exec_id);
+            // #1712 adversarial-review finding (blocker): migrating this route's
+            // gate onto require_fleet_read admits a caller class (confined-only
+            // via the #1715(a) additive grant) the OLD flat perm_fn gate denied
+            // outright -- that caller previously got a 403 for this whole route,
+            // never partial data. Filtering ONLY the "Responses" section (below)
+            // and not this status grid would mean the gate migration itself
+            // WIDENS what a newly-admitted confined caller sees, not narrows it.
+            // Filtered here, once, so every downstream consumer (KPI counts,
+            // decile bucketing, the per-agent table, and the legacy-fallback
+            // in_set join) sees only in-scope agents -- same pattern as the
+            // Responses section's authz::in_scope filter below.
+            if (gate.scope) {
+                std::vector<AgentExecStatus> visible;
+                visible.reserve(agents.size());
+                for (auto& a : agents) {
+                    if (authz::in_scope(gate.scope, a.agent_id))
+                        visible.push_back(std::move(a));
+                }
+                agents.swap(visible);
+            }
 
             // -- Definition lookup -------------------------------------------
             std::string def_name = exec.definition_id;
@@ -386,9 +430,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // listeners locate this strip via id and swap individual cell
             // values rather than re-rendering the whole strip.
             html += "<div class=\"exec-kpi-strip\" id=\"exec-kpi-" + html_escape(exec.id) + "\">";
+            // #1712 adversarial-review + Gate 4 unhappy-path finding UP-1: for
+            // an unscoped caller this must stay exec.agents_targeted (the
+            // legitimate mid-dispatch total, byte-identical to pre-migration
+            // -- see the SSE live-update path in instruction_ui.cpp's
+            // execApplyProgress, which pushes this same field and must not
+            // regress for that caller class). For a scoped caller, using the
+            // unfiltered dispatch total here -- while Succeeded/Failed/the
+            // grid are all correctly filtered -- discloses how many
+            // out-of-scope agents exist by simple subtraction, the same
+            // disclosure class dashboard_routes.cpp's render_results()
+            // guards against by recomputing total_agent_count post-filter.
             html += std::format("<div class=\"exec-kpi\"><div class=\"exec-kpi-value\">{}</div>"
                                 "<div class=\"exec-kpi-label\">Total</div></div>",
-                                exec.agents_targeted);
+                                gate.scope ? agents.size() : static_cast<std::size_t>(exec.agents_targeted));
             html += std::format(
                 "<div class=\"exec-kpi\"><div class=\"exec-kpi-value exec-kpi-value--ok\">{}</div>"
                 "<div class=\"exec-kpi-label\">Succeeded</div></div>",
@@ -620,6 +675,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     }
                 }
                 std::vector<StoredResponse> filtered = std::move(responses);
+
+                // #1712 / #3290 Phase 2 — scope filter (the gate's composed
+                // meet(management-group, service-scope) VisibleSet). Applied
+                // once, after the primary + legacy-window fallback have
+                // already been merged into `filtered` above, so this single
+                // filter covers both fetch paths. nullopt (TOP) ⇒ unfiltered
+                // — byte-identical to the pre-#1712 path for that caller
+                // class.
+                if (gate.scope) {
+                    std::vector<StoredResponse> visible;
+                    visible.reserve(filtered.size());
+                    for (auto& r : filtered) {
+                        if (authz::in_scope(gate.scope, r.agent_id))
+                            visible.push_back(std::move(r));
+                    }
+                    filtered.swap(visible);
+                }
 
                 html += std::format("<details class=\"per-agent-responses\">"
                                     "<summary>Show responses ({})</summary>",

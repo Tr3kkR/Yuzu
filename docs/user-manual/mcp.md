@@ -403,7 +403,7 @@ for the tool to execute.
 | # | Tool | Description | RBAC Permission |
 |---|------|-------------|-----------------|
 | 1 | `list_agents` | List all connected agents with hostname, OS, architecture, and version. | `Infrastructure:Read` |
-| 2 | `get_agent_details` | Get detailed info for a single agent including tags and inventory. | `Infrastructure:Read` |
+| 2 | `get_agent_details` | Get detailed info for a single agent including tags and inventory. **Confined (#1700, #3290 Phase 2 continuation):** gated by `require_fleet_read`, the admit-then-filter fleet-read gate — an `agent_id` outside the caller's management-group/service-scope confinement returns the same "Agent not found" error as a genuinely nonexistent id (a 404-collapse; the tool never discloses whether an out-of-scope agent exists). | `Infrastructure:Read` |
 | 3 | `query_audit_log` | Query the audit log with filters (principal, action, target, time range). | `AuditLog:Read` |
 | 4 | `list_definitions` | List available instruction definitions (filterable by plugin, type, enabled). A degraded InstructionStore returns `kInternalError` (-32603, "Instruction store unavailable") — retryable, never an empty list (ADR-0058). | `InstructionDefinition:Read` |
 | 5 | `get_definition` | Get a single instruction definition with parameter and result schemas. A degraded InstructionStore returns `kInternalError` (-32603, "Instruction store unavailable") — retryable, distinct from `kInvalidParams` ("Definition not found") for a genuinely unknown id (ADR-0058). | `InstructionDefinition:Read` |

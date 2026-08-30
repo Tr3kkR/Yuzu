@@ -77,6 +77,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include "../test_helpers.hpp"
 #include "pg/pg_pool.hpp"
@@ -5594,6 +5595,178 @@ TEST_CASE("MCP Integration: tools/call get_agent_details unknown agent", "[mcp][
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(body["error"]["message"].get<std::string>().find("no-such-agent") != std::string::npos);
+}
+
+// #1700 / #3290 Phase 2: get_agent_details migrated onto require_fleet_read
+// (mirrors query_installed_software's fake-gate scope test). An out-of-scope
+// agent must collapse to the SAME "not found" response as a genuinely
+// nonexistent one — the existence probe (hostname/os for an agent outside
+// the caller's confinement) IS the vulnerability this migration closes.
+TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
+          "[mcp][auth]") {
+    McpTestServer ts;
+    // Caller may see agent-001, never agent-002 (the gate's own composed
+    // meet(management-group, service-scope) VisibleSet, #3290 — fake twin of
+    // require_fleet_read admitting a scoped, not unfiltered, witness).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-001"}};
+    };
+    ts.start();
+
+    auto in_scope = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":19,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(in_scope);
+    CHECK(in_scope->status == 200);
+    auto in_body = nlohmann::json::parse(in_scope->body);
+    REQUIRE(in_body.contains("result"));
+
+    auto out_of_scope = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":20,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    REQUIRE(out_of_scope);
+    CHECK(out_of_scope->status == 200);
+    auto out_body = nlohmann::json::parse(out_of_scope->body);
+    // Same shape as the genuinely-nonexistent-agent case above — never a
+    // distinct "forbidden"/"exists but out of scope" response.
+    REQUIRE(out_body.contains("error"));
+    CHECK(out_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(out_body["error"]["message"].get<std::string>().find("agent-002") != std::string::npos);
+
+    // A genuinely nonexistent agent_id -- distinct from agent-002 above,
+    // which exists in the registry but is out of scope.
+    auto nonexistent = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-999"}}})");
+    REQUIRE(nonexistent);
+    CHECK(nonexistent->status == 200);
+    auto nonexistent_body = nlohmann::json::parse(nonexistent->body);
+    REQUIRE(nonexistent_body.contains("error"));
+
+    // #3565 (external adversarial review, Codex): the two prior CHECKs only
+    // asserted `out_body` on its own -- tighten to a direct byte-identity
+    // comparison between the two error CODES (the messages legitimately
+    // differ only by the caller-supplied agent_id substring, which is
+    // expected input-echo, not a scope-vs-absence signal).
+    CHECK(out_body["error"]["code"] == nonexistent_body["error"]["code"]);
+    CHECK(out_body["error"]["message"].get<std::string>().starts_with("Agent not found: "));
+    CHECK(nonexistent_body["error"]["message"].get<std::string>().starts_with("Agent not found: "));
+
+    // Gate 8 re-review (this round), quality-engineer finding: the prior two
+    // CHECKs above bound only the prefix -- a regression that appended a
+    // scope-revealing suffix to the RESPONSE message ("Agent not found:
+    // agent-002 (out of scope)") would pass both `starts_with` checks while
+    // reopening the existence oracle on the channel a caller reads directly,
+    // no query_audit_log pivot needed. Apply the same strip-both-sides
+    // byte-identity comparison used below for the audit detail to the
+    // response message too, so a distinguishing suffix on EITHER channel
+    // fails this test.
+    auto strip_agent_id = [](const std::string& text, const std::string& agent_id) {
+        auto pos = text.rfind(agent_id);
+        REQUIRE(pos != std::string::npos);
+        return std::make_pair(text.substr(0, pos), text.substr(pos + agent_id.size()));
+    };
+    CHECK(strip_agent_id(out_body["error"]["message"].get<std::string>(), "agent-002") ==
+          strip_agent_id(nonexistent_body["error"]["message"].get<std::string>(), "agent-999"));
+
+    // Gate 6 sre finding: the RESPONSE collapses "out of scope" into "not
+    // found" (by design, above), but the server-side audit trail must still
+    // record the real reason -- same Pattern-D discipline as every other
+    // 404-collapse in this codebase, mirroring query_installed_software's
+    // "denied" audit row on a scope drop.
+    //
+    // Gate 8 re-review finding: mcp_audit's try_persist_audit is a
+    // SYNCHRONOUS write, so auditing only ONE of the two !found sub-cases
+    // would itself be a (weaker) timing side-channel echoing the exact
+    // existence-probe #1700 closes. Both agent-002 (out-of-scope) and
+    // agent-999 (nonexistent) must audit "denied" -- same code path, same
+    // cost, no distinguishing signal.
+    int denied_count = 0;
+    bool saw_success = false;
+    std::vector<std::string> denied_details;
+    REQUIRE(ts.audit_log.size() == ts.audit_details.size());
+    for (std::size_t i = 0; i < ts.audit_log.size(); ++i) {
+        if (ts.audit_log[i] == "mcp.get_agent_details|denied") {
+            ++denied_count;
+            denied_details.push_back(ts.audit_details[i]);
+        }
+        if (ts.audit_log[i] == "mcp.get_agent_details|success")
+            saw_success = true;
+    }
+    CHECK(denied_count == 2);  // agent-002 (out-of-scope) + agent-999 (nonexistent)
+    CHECK(saw_success);        // the in-scope agent-001 lookup
+
+    // #3564 (the blocking finding this section exists to close): the audit
+    // DETAIL string -- not just the count/result -- must be identical for
+    // both !found sub-cases too. query_audit_log echoes `detail` back
+    // verbatim to any caller holding flat AuditLog:Read; a distinguishing
+    // detail string would let such a caller learn "out of scope" vs
+    // "genuinely nonexistent" by simply reading her own audit rows back,
+    // no timing analysis required -- the exact existence-oracle the
+    // response-body collapse above exists to prevent, reopened through a
+    // different, more direct channel.
+    REQUIRE(denied_details.size() == 2);
+    // The two details differ only by the caller-echoed agent_id suffix
+    // ("agent-002" vs "agent-999", expected input-echo); the TEMPLATE --
+    // everything that could carry a scope-vs-absence signal -- must be
+    // identical. Compare with each detail's own trailing agent_id stripped
+    // rather than a fixed prefix length, so this stays correct if the
+    // template wording ever changes.
+    // Gate 3 quality-engineer finding: comparing only the prefix before the
+    // id would false-green if a future template wording put the id
+    // mid-string with a distinguishing trailing suffix -- strip AND compare
+    // both sides of the id so the comparison stays sound across any
+    // template change, not just the current trailing-id shape. Reuses the
+    // strip_agent_id helper defined above for the response-message check.
+    CHECK(strip_agent_id(denied_details[0], "agent-002") ==
+          strip_agent_id(denied_details[1], "agent-999"));
+}
+
+// #3565: this codebase has a documented prior incident (authz_model.hpp's
+// own doc comment on VisibleSet{}) of an engaged-empty scope (deny_all(),
+// zero visible agents) being mishandled as unfiltered/nullopt, serving the
+// whole fleet to a caller with no grants at all. Pin the distinction: an
+// ADMITTED caller with scope=deny_all() must see NOTHING, not everything.
+TEST_CASE("MCP get_agent_details: admitted-but-deny_all() scope sees nothing",
+          "[mcp][auth]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()}; // admitted=true, engaged-empty scope
+    };
+    ts.start();
+
+    // agent-001 genuinely exists in the fixture registry -- a mishandled
+    // deny_all() (silently read as unfiltered) would find and return it.
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":22,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK_FALSE(body.contains("result"));
+}
+
+// require_fleet_read's own doc comment: unwired = misconfiguration, FAILS
+// CLOSED (503) — never silently falls back to an unfiltered read. Mirrors
+// query_installed_software's "unwired fleet_read_fn_" test (#3290) — the
+// fixture default (fleet_read_fn_for_test) always admits unfiltered, so no
+// prior test exercised production's genuinely-empty McpServer::fleet_read_fn_
+// state on this tool.
+TEST_CASE("MCP get_agent_details: unwired fleet_read_fn_ -> fail-closed",
+          "[mcp][auth]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {}; // genuinely empty std::function
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":19,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-001"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC envelope stays 200; the error is inside the body
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
 // ── 21. preview_scope_targets via HTTP ──────────────────────────────────────

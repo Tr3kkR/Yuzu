@@ -366,7 +366,11 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
-    {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
+    {"get_agent_details",
+     "Get detailed info for a single agent including tags and inventory. "
+     "An \"Agent not found\" error means either the agent does not exist or "
+     "it exists outside your management-group scope -- deliberately "
+     "indistinguishable to prevent scope-probing.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version"]})j"},
 
@@ -1793,7 +1797,14 @@ struct ToolSecurityEntry {
 static const ToolSecurityEntry kToolSecurityRows[] = {
     // Phase 1 read-only tools
     {"list_agents", {"Infrastructure", "Read"}},
-    {"get_agent_details", {"Infrastructure", "Read"}},
+    // #1700 / #3290 Phase 2: migrated onto require_fleet_read, which gives
+    // this tool a REAL confinement mechanism (meet(management-group,
+    // service-scope)) — reclassified from the default `denied` to
+    // `confined`, same as query_installed_software below, so a correctly-
+    // confined service-scoped token gets a real, filtered answer instead of
+    // a blanket 403 (routed-concern clause 3: a `confined` label needs a
+    // real mechanism, and conversely a tool that HAS one should carry it).
+    {"get_agent_details", {"Infrastructure", "Read", ServiceScopeClass::confined}},
     {"query_audit_log", {"AuditLog", "Read"}},
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
@@ -4851,37 +4862,98 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_agent_details ─────────────────────────────────────────
+            // #1700 / #3290 Phase 2 — migrated onto require_fleet_read
+            // (fleet_read_fn_), mirroring query_installed_software exactly:
+            // fleet_read_fn_ is now the SOLE gate — it already covers
+            // mcp_tier internally (require_fleet_read's own caller-class
+            // ladder) and RBAC, so no separate tier_allows/perm_fn call here
+            // (stacking either would be the BLOCKING defect require_fleet_read's
+            // doc comment warns against).
             if (tool_name == "get_agent_details") {
-                if (!tier_allows(tier, "Infrastructure", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_agent_details: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status.
                 auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
                     return;
                 }
-                // Find agent in registry
+                // Find agent in registry. An out-of-scope agent collapses to
+                // the SAME "not found" response as a genuinely nonexistent
+                // one (#1700) — the existence probe (hostname/os disclosure
+                // for an agent outside the caller's confinement) IS the
+                // vulnerability this migration closes, so the response must
+                // not distinguish "doesn't exist" from "exists, not yours".
                 const auto& agents = get_agents();
                 JObj agent_obj;
                 bool found = false;
+                bool exists_out_of_scope = false;
                 for (const auto& a : agents) {
-                    if (a.value("agent_id", "") == agent_id) {
+                    if (a.value("agent_id", "") != agent_id)
+                        continue;
+                    if (authz::in_scope(gate.scope, agent_id)) {
                         agent_obj.add("agent_id", a.value("agent_id", ""))
                             .add("hostname", a.value("hostname", ""))
                             .add("os", a.value("os", ""))
                             .add("arch", a.value("arch", ""))
                             .add("agent_version", a.value("agent_version", ""));
                         found = true;
-                        break;
+                        break; // only the in-scope match short-circuits the scan.
                     }
+                    // Gate 8 re-review finding: an out-of-scope match must NOT
+                    // break here -- doing so would let scan length itself
+                    // distinguish "exists, out of scope" (early break, at this
+                    // agent's position) from "genuinely nonexistent" (full
+                    // scan), a timing signal the ORIGINAL pre-#1700 loop never
+                    // had (it only ever broke on match-AND-in-scope, so an
+                    // out-of-scope match fell through and scanned to the end
+                    // exactly like a nonexistent one). Record the fact and
+                    // keep scanning so both !found sub-cases stay scan-length
+                    // symmetric, matching that original behavior.
+                    exists_out_of_scope = true;
                 }
                 if (!found) {
+                    // #1700 / Gate 6 sre finding: the RESPONSE never
+                    // distinguishes "genuinely nonexistent" from "exists,
+                    // out of scope" (that collapse IS the fix), but the
+                    // server-side audit trail should -- same Pattern-D
+                    // discipline as every other 404-collapse in this
+                    // codebase, and the scope-drop half mirrors
+                    // query_installed_software's "denied" audit row.
+                    //
+                    // Gate 8 re-review found and fixed two timing side-
+                    // channels here (synchronous-audit-write asymmetry,
+                    // scan-length asymmetry) -- both closed by making the
+                    // audit call and the scan unconditional. #3564 (external
+                    // adversarial review, Codex) then found the detail
+                    // STRING itself was still the leak: query_audit_log is a
+                    // documented MCP tool gated only on flat AuditLog:Read
+                    // (carried by the seeded Operator/PlatformEngineer roles)
+                    // and echoes every event's `detail` field back verbatim
+                    // -- a caller holding AuditLog:Read could call this tool,
+                    // then query_audit_log(principal=self), and read back
+                    // which detail string her own event got, learning
+                    // existence directly with no timing analysis at all.
+                    // Unlike query_installed_software's "denied" row (a
+                    // COUNT, safe because it never confirms/denies one
+                    // specific caller-supplied id), a single-agent lookup's
+                    // detail string cannot safely distinguish the two
+                    // sub-cases in ANY caller-queryable channel. Both now
+                    // audit the IDENTICAL detail string; the distinction is
+                    // recorded ONLY server-side, in the log line below, which
+                    // no MCP tool exposes back to a caller.
+                    spdlog::debug("get_agent_details: {} for {} (caller-visible audit unchanged)",
+                                  exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                    mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
+                                            agent_id);
                     res.set_content(
                         error_response(id, kInvalidParams, "Agent not found: " + agent_id),
                         "application/json");
