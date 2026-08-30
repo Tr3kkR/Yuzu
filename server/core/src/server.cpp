@@ -6369,12 +6369,26 @@ public:
             }
         }
 
-        // Phase 7: Directory Sync (AD/Entra integration)
-        {
-            auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
-            directory_sync_ = std::make_unique<DirectorySync>(dirsync_db);
-            if (directory_sync_ && directory_sync_->is_open()) {
-                spdlog::info("DirectorySync initialized at {}", dirsync_db.string());
+        // Phase 7: Directory Sync (AD/Entra integration) — migrated to
+        // Postgres (ADR-0063, migration-programme PR 3, schema
+        // `directory_sync`). Fail-CLOSED per ADR-0012 §1 (posture upgrade —
+        // the SQLite era was fail-OPEN here, never checking is_open()).
+        if (pg_pool_ && !startup_failed_) {
+            directory_sync_ = std::make_unique<DirectorySync>(*pg_pool_);
+            if (!directory_sync_->is_open()) {
+                spdlog::error("[PG] Refusing to start: directory sync store migration/open "
+                              "failed (database reachable but the directory_sync schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                // Detect-and-warn (docs/postgres-store-playbook.md's Backfill
+                // bullet): silent unless the legacy file actually holds real
+                // rows this cutover will not carry over — see the store's
+                // own doc comment. Never read for data, never blocks boot.
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "directory-sync.db", "DirectorySync",
+                    {"directory_users", "directory_groups", "directory_memberships",
+                     "directory_group_role_mappings", "directory_sync_status"});
             }
         }
 
@@ -12770,6 +12784,11 @@ private:
             // "reported at /readyz and /healthz" contract. is_session_store_ok()
             // is true on legacy config-file-only deployments (no store wired).
             bool session_store_ok = auth_mgr_.is_session_store_ok();
+            // ADR-0063 (migration-programme PR 3) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Construction is fail-closed,
+            // so this is belt-and-braces against a runtime is_open() flip.
+            bool directory_sync_ok = directory_sync_ && directory_sync_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12780,7 +12799,7 @@ private:
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
                 notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-                patch_manager_ok && session_store_ok;
+                patch_manager_ok && session_store_ok && directory_sync_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12826,7 +12845,8 @@ private:
                   {"tag_store", tag_ok ? "ok" : "error"},
                   {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
                   {"patch_manager", patch_manager_ok ? "ok" : "error"},
-                  {"session_store", session_store_ok ? "ok" : "error"}}},
+                  {"session_store", session_store_ok ? "ok" : "error"},
+                  {"directory_sync", directory_sync_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -12936,6 +12956,11 @@ private:
                 {"runtime_config_store", runtime_config_store_ && runtime_config_store_->is_open()},
                 {"inventory_store", inventory_store_ && inventory_store_->is_open()},
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
+                // ADR-0063 (migration-programme PR 3): DirectorySync became a
+                // fail-closed Postgres store (was fail-open SQLite, never
+                // checked here before) — load-bearing for /api/directory/*
+                // and the access-review export's optional email enrichment.
+                {"directory_sync", directory_sync_ && directory_sync_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
                 {"guaranteed_state_store",
