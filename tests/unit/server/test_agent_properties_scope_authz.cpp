@@ -1,0 +1,241 @@
+/**
+ * test_agent_properties_scope_authz.cpp — #3700: GET/PUT/DELETE
+ * /api/agents/:id/properties[/:key] must gate on per-agent
+ * `require_scoped_permission("Infrastructure", "Read"/"Write", agent_id)`,
+ * not a bare global `require_permission`.
+ *
+ * The three route handlers are inline `web_server_->Get/Put/Delete` lambdas
+ * in `ServerImpl` with no route-injection seam (matching every sibling
+ * server.cpp handler — see test_auth_routes.cpp's
+ * `deny_service_scoped_service_tag_mutation` tests for the same convention),
+ * so this drives the gate directly through `AuthRoutes::require_scoped_permission`
+ * rather than through an httplib route harness. This is also net-new
+ * coverage for that gate's ordinary-RBAC branch composed with a REAL
+ * `ManagementGroupStore` through `AuthRoutes` — the primitive
+ * (`RbacStore::check_scoped_permission`) is covered directly in
+ * test_rbac_store.cpp, but no prior test drove it through this gate with
+ * group-scoped confinement.
+ */
+
+#include "audit_store.hpp"
+#include "auth_routes.hpp"
+#include "management_group_store.hpp"
+#include "oidc_provider.hpp"
+#include "pg/pg_pool.hpp"
+#include "rbac_store.hpp"
+#include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
+#include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
+
+#include "../test_helpers.hpp"
+
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp>
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <httplib.h>
+
+#include <chrono>
+#include <memory>
+#include <shared_mutex>
+#include <string>
+
+using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
+using pg::PgPool;
+
+namespace {
+
+httplib::Request bearer_request(const std::string& token) {
+    httplib::Request req;
+    req.headers.emplace("Authorization", "Bearer " + token);
+    return req;
+}
+
+int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// Distinct template name from every other file's "rbacstore*" registrations
+// (test_authz_gates.cpp's "rbacstore_authzgates", test_list_read_confinement.cpp's
+// "rbacstore") — same registry, no shared-state risk.
+yuzu::test::PgTestTemplate rbac_props_scope_tpl{
+    "rbacstore_propsscope", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        RbacStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("rbac (props scope) template: store failed to migrate/seed");
+    }};
+
+/// Minimal rig for `require_scoped_permission("Infrastructure", ...)`: real
+/// RbacStorePg + ManagementGroupStorePg + AuthRoutes wired exactly as
+/// ServerImpl wires it. Tree mirrors test_authz_gates.cpp's GatesRig:
+///   P ─── C1        S   (P and S are roots; C1 is a child of P)
+/// a_c1 is reachable from a P-scoped grant (ancestor-aware); a_s is not.
+struct PropsScopeRig {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    PgPool pool;
+    RbacStore rbac;
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<AuthRoutes> ar;
+    std::string gP, gC1, gS;
+
+    explicit PropsScopeRig(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool} {
+        REQUIRE(pool.valid());
+        REQUIRE(rbac.is_open());
+        rbac.set_rbac_enabled(true); // enforcement in effect, not legacy-open
+
+        REQUIRE(rbac.create_role({"InfraReader", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"InfraReader", "Infrastructure", "Read", "allow"})
+                    .has_value());
+        REQUIRE(rbac.create_role({"InfraWriter", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"InfraWriter", "Infrastructure", "Write", "allow"})
+                    .has_value());
+
+        gP = make_group("P", "");
+        gC1 = make_group("C1", gP);
+        gS = make_group("S", "");
+
+        REQUIRE(mgmt.add_member(gP, "a_p").has_value());
+        REQUIRE(mgmt.add_member(gC1, "a_c1").has_value());
+        REQUIRE(mgmt.add_member(gS, "a_s").has_value());
+
+        REQUIRE(auth_mgr.upsert_user("operator", "correct-horse-battery-staple",
+                                     auth::Role::admin));
+
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
+                                          /*audit_store=*/nullptr, &mgmt,
+                                          /*tag_store=*/nullptr,
+                                          /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+    }
+
+    std::string make_group(const std::string& name, const std::string& parent) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = "static";
+        g.parent_id = parent;
+        auto id = mgmt.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    void group_assign(const std::string& group, const std::string& user,
+                      const std::string& role) {
+        REQUIRE(mgmt.assign_role({group, "user", user, role}).has_value());
+    }
+
+    std::string mint(const std::string& user = "operator") {
+        auto raw = api_tokens->create_token("props-scope-test", user, now_epoch() + 3600);
+        REQUIRE(raw.has_value());
+        return *raw;
+    }
+};
+
+} // namespace
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #3700 acceptance criterion: a confined caller must not read or write
+// custom-properties for an out-of-scope agent.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operator "
+          "admitted on an in-scope agent",
+          "[pg][auth_routes][authz_gates][properties_authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraReader");
+    auto req = bearer_request(r.mint());
+    httplib::Response res;
+
+    CHECK(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_c1"));
+}
+
+TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operator "
+          "denied on an out-of-scope agent",
+          "[pg][auth_routes][authz_gates][properties_authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraReader");
+    auto req = bearer_request(r.mint());
+    httplib::Response res;
+
+    CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_s"));
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("require_scoped_permission(Infrastructure,Write): group-confined operator "
+          "denied on an out-of-scope agent (the WRITE path #3700 flags as higher risk)",
+          "[pg][auth_routes][authz_gates][properties_authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraWriter");
+    auto req = bearer_request(r.mint());
+    httplib::Response res;
+
+    CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Write", "a_s"));
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("require_scoped_permission(Infrastructure,Write): group-confined operator "
+          "admitted on an in-scope agent",
+          "[pg][auth_routes][authz_gates][properties_authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "operator", "InfraWriter");
+    auto req = bearer_request(r.mint());
+    httplib::Response res;
+
+    CHECK(r.ar->require_scoped_permission(req, res, "Infrastructure", "Write", "a_c1"));
+}
+
+TEST_CASE("require_scoped_permission(Infrastructure,Write): a GLOBAL grant holder is "
+          "admitted on every agent (no behaviour change for unconfined operators)",
+          "[pg][auth_routes][authz_gates][properties_authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "operator", "InfraWriter"}).has_value()); // GLOBAL allow
+    auto req = bearer_request(r.mint());
+    httplib::Response res;
+
+    CHECK(r.ar->require_scoped_permission(req, res, "Infrastructure", "Write", "a_s"));
+    CHECK(r.ar->require_scoped_permission(req, res, "Infrastructure", "Write", "a_p"));
+}
+
+TEST_CASE("require_scoped_permission(Infrastructure,Read): RBAC disabled — legacy "
+          "fallback is unchanged (Infrastructure is not topology-floored)",
+          "[pg][auth_routes][authz_gates][properties_authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false);
+    REQUIRE(r.auth_mgr.upsert_user("plain_user", "correct-horse-battery-staple",
+                                   auth::Role::user));
+    auto req = bearer_request(r.mint("plain_user"));
+    httplib::Response res;
+
+    // Legacy Read is any-authenticated-user — same as require_permission's
+    // legacy branch, so RBAC-off deployments see no behaviour change.
+    CHECK(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_s"));
+}
+
+TEST_CASE("require_scoped_permission(Infrastructure,Write): RBAC disabled — legacy "
+          "fallback requires admin, matching require_permission's legacy branch",
+          "[pg][auth_routes][authz_gates][properties_authz]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_props_scope_tpl);
+    PropsScopeRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false);
+    REQUIRE(r.auth_mgr.upsert_user("plain_user", "correct-horse-battery-staple",
+                                   auth::Role::user));
+    auto req = bearer_request(r.mint("plain_user"));
+    httplib::Response res;
+
+    CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Write", "a_s"));
+    CHECK(res.status == 403);
+}
