@@ -345,7 +345,7 @@ tests-build-server-linux_x64/yuzu_server_tests "[pg]"
 
 ## Verified reference run
 
-**Re-verified 2026-08-30 at this branch's head (`85fac0969`)** in a Rocky 9.8 KVM guest (12 vCPU /
+**Re-verified 2026-08-30 (script as of `85fac0969`; unchanged provisioning logic since)** in a Rocky 9.8 KVM guest (12 vCPU /
 23 GB) with SELinux **enforcing** and real systemd - the `postgresql-setup --initdb` + `systemctl`
 path ran genuinely, not shimmed. The recipe (`--with-postgres --manifest`) completed with zero
 failed steps, `--check --with-postgres` passed all 22 checks, and the full

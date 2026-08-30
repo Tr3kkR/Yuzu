@@ -28,14 +28,22 @@ set -euo pipefail
 # rewrite — which deploy/windows/Test-ToolchainContract.ps1 rightly fails on
 # ("the baseline updater covers every active tracked SHA reference").
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VCPKG_COMMIT="$(python3 -c '
+# Resolved lazily (needs python3 + a readable vcpkg.json): --help must work on
+# a bare box before any dependency exists, and a failure here must be loud,
+# never a silent set -e abort (that class shipped defects twice in review).
+VCPKG_COMMIT=""
+resolve_vcpkg_commit() {
+  [ -n "${VCPKG_COMMIT}" ] && return 0
+  VCPKG_COMMIT="$(python3 -c '
 import json, sys
 path = sys.argv[1]
 try:
     print(json.load(open(path))["builtin-baseline"])
 except Exception as exc:
     sys.exit(f"cannot read builtin-baseline from {path}: {exc}")
-' "${REPO_ROOT}/vcpkg.json")" || { echo "Error: could not resolve the vcpkg baseline from vcpkg.json." >&2; exit 1; }
+' "${REPO_ROOT}/vcpkg.json")" || VCPKG_COMMIT=""
+  [ -n "${VCPKG_COMMIT}" ] || die "could not resolve the vcpkg baseline from ${REPO_ROOT}/vcpkg.json (python3 present? file readable?)"
+}
 
 # GCC 13+ is the documented floor (README "Prerequisites"). RHEL 9's system GCC
 # is 11, so the compiler must come from a gcc-toolset Software Collection.
@@ -199,6 +207,7 @@ pg_same_cluster() {
   [ "$a" = "$b" ]
 }
 PG_VERIFIED=0
+PG_KEPT_UNVERIFIED=0
 
 FAILURES=0
 check() { # check <label> <condition-cmd...>
@@ -273,11 +282,18 @@ if [ "$CHECK_ONLY" = 1 ]; then
   check "perl present"                     command -v perl
   check "curl present"                     command -v curl
   check "pyyaml ${PYYAML_VERSION}"           python3 -c "import yaml, sys; sys.exit(yaml.__version__ != '${PYYAML_VERSION}')"
+  # Every PKGS entry by rpm name (perl modules and header packages have no
+  # binary for command -v): a green --check must not precede a vcpkg-port
+  # failure on a missing autotool.
+  MISSING_RPMS="$(for p in "${PKGS[@]}"; do rpm -q "$p" >/dev/null 2>&1 || printf '%s ' "$p"; done)"
+  check "all ${#PKGS[@]} PKGS rpms installed"  test -z "${MISSING_RPMS}"
+  [ -z "${MISSING_RPMS}" ] || printf '         missing: %s\n' "${MISSING_RPMS}" >&2
   check "libsystemd headers present"       pkg-config --exists libsystemd
   check "libblkid headers present"         pkg-config --exists blkid
   if [ "$SKIP_VCPKG" = 1 ]; then
     skip "vcpkg checks (--skip-vcpkg)"
   else
+    resolve_vcpkg_commit
     check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
     check "vcpkg pinned to baseline"         test "$(git -C "${VCPKG_ROOT_ARG}" rev-parse HEAD 2>/dev/null)" = "${VCPKG_COMMIT}"
   fi
@@ -525,8 +541,9 @@ if [ "$DRY_RUN" = 0 ]; then
     if [ "${SAME}" = 0 ]; then
       PG_VERIFIED=1
     elif [ "${SAME}" = 2 ] && grep -qxF "export YUZU_TEST_POSTGRES_DSN=\"${PG_DSN}\"" "${ENV_FILE}" 2>/dev/null; then
-      warn "cannot re-verify the DSN's cluster identity (sudo or pg_controldata unavailable); keeping the previously verified export"
-      PG_VERIFIED=1
+      warn "cannot re-verify the DSN's cluster identity (sudo or pg_controldata unavailable); the previously verified export is KEPT, not re-verified"
+      PG_KEPT_UNVERIFIED=1
+      PG_VERIFIED=1   # render keeps the existing line; the step-6 gate still reports honestly
     fi
   fi
   write_env_file
@@ -557,6 +574,7 @@ else
   else
     run git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT_ARG}"
   fi
+  resolve_vcpkg_commit
   if [ "$(git -C "${VCPKG_ROOT_ARG}" rev-parse HEAD 2>/dev/null)" = "${VCPKG_COMMIT}" ]; then
     skip "already at pinned baseline ${VCPKG_COMMIT:0:12}"
   else
@@ -587,6 +605,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
     [ "${PG_INSTALLED%%.*}" = "${PG_STREAM}" ] \
       || die "postgresql-server ${PG_INSTALLED} is installed; this recipe needs the postgresql:${PG_STREAM} stream (ADR-0006). Remove it, or enable the ${PG_STREAM} stream and upgrade, then re-run."
     skip "postgresql-server ${PG_INSTALLED} already installed"
+    rpm -q postgresql-contrib >/dev/null 2>&1 || run sudo dnf install -y postgresql-contrib
   else
     run sudo dnf -qy module enable "postgresql:${PG_STREAM}"
     run sudo dnf install -y postgresql-server postgresql-contrib
@@ -728,7 +747,12 @@ if [ "$WITH_POSTGRES" = 1 ]; then
         PG_VERIFIED=1
         write_env_file
         ;;
-      2) die "cannot verify that the listener on ${PG_DSN} is the cluster at ${PGDATA} (sudo or pg_controldata unavailable), so YUZU_TEST_POSTGRES_DSN was NOT exported." ;;
+      2)
+        if [ "${PG_KEPT_UNVERIFIED}" = 1 ]; then
+          die "cannot re-verify that the listener on ${PG_DSN} is the cluster at ${PGDATA} (sudo or pg_controldata unavailable); the PREVIOUSLY verified export was left in place, but this run verified nothing - re-run once sudo/pg_controldata work."
+        else
+          die "cannot verify that the listener on ${PG_DSN} is the cluster at ${PGDATA} (sudo or pg_controldata unavailable), so YUZU_TEST_POSTGRES_DSN was NOT exported."
+        fi ;;
       *) die "something answers on ${PG_DSN} but it is not the cluster at ${PGDATA} (another listener on 127.0.0.1:5432?), so YUZU_TEST_POSTGRES_DSN was NOT exported." ;;
     esac
   fi
@@ -746,6 +770,7 @@ if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 1 ]; then
   printf '  (dry-run) write manifest %s\n' "${MANIFEST}"
 elif [ -n "${MANIFEST}" ]; then
   step "Writing provenance manifest to ${MANIFEST}"
+  resolve_vcpkg_commit
   # shellcheck disable=SC1090
   . "${ENV_FILE}"
   case "${ARCH}" in
@@ -781,7 +806,7 @@ elif [ -n "${MANIFEST}" ]; then
     printf '  "postgresql": "%s",\n' "$(/usr/bin/postgres --version 2>/dev/null | awk '{print $3}')"
     printf '  "packages": {\n'
     first=1
-    for p in "${PKGS[@]}" "${CCACHE_PKG}" ${CURL_PKG:+"${CURL_PKG}"}; do
+    for p in "${PKGS[@]}" "${CCACHE_PKG}" ${CURL_PKG:+"${CURL_PKG}"} postgresql-server postgresql-contrib postgresql; do
       rpm -q "$p" >/dev/null 2>&1 || continue
       evr="$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p")"
       # sed, not head: head closes the pipe early and pipefail would abort this assignment.
