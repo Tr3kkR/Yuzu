@@ -3,9 +3,9 @@
 This is the enterprise-Linux counterpart to the apt recipe in `.github/workflows/ci.yml`. CI
 exercises Ubuntu 24.04/26.04, macOS and Windows only — RHEL-family hosts are a supported *developer*
 platform, not a CI-covered one, so this doc records a verified sequence rather than an
-automatically-regression-tested one. The reference run was Rocky 9.8; the RHEL and Alma paths use the
-same packages but have not been exercised, and SELinux enforcing has not been deliberately exercised
-either (the container checks run unconfined; the reference run did not record its mode).
+automatically-regression-tested one. Both verified runs were Rocky 9.8 - the 2026-08-30 one with
+SELinux enforcing (see the verified-run section); the RHEL and Alma branches use the same packages
+but have not been exercised, arm64 is unverified, and the container checks run unconfined.
 
 **One command:**
 
@@ -340,7 +340,7 @@ tests-build-server-linux_x64/yuzu_server_tests "[pg]"
 23 GB) with SELinux **enforcing** and real systemd - the `postgresql-setup --initdb` + `systemctl`
 path ran genuinely, not shimmed. The recipe (`--with-postgres --manifest`) completed with zero
 failed steps, `--check --with-postgres` passed all 22 checks, and the full
-`setup.sh --tests` -> `meson compile` -> `meson test` sequence gave 35 OK / 2 skipped / 2 failed -
+`setup.sh --tests` → `meson compile` → `meson test` sequence gave 35 OK / 2 skipped / 2 failed -
 the same two pre-existing failures as the original run below (the SQLite `RETURNING` telemetry
 limitation, and the known Linux-only MCP case, #2610 family). All 11 `[pg]` shards passed against
 the recipe-provisioned cluster. `docs/rhel9-toolchain-manifest.json` now records this run; the
@@ -351,9 +351,10 @@ original bare-metal record remains in that file's git history. Still unexercised
 
 Rocky Linux 9.8, 16 cores / 23 GB RAM, `dev` at `c01493d3`, 2026-08-15. The same recipe was also run
 end-to-end on `main` at `88f9397d` (the 0.13.0 cut, meson 1.11.1) with the same outcome. Full
-provenance — every package version with the repo it came from — is in
-`docs/rhel9-toolchain-manifest.json`; everything above `verified_run` in that file is machine-collected
-by `--manifest`, and the `verified_run` block is hand-recorded from the session.
+provenance — every package version with the repo it came from — was recorded in
+`docs/rhel9-toolchain-manifest.json`, which now holds the 2026-08-30 re-verification (this run's
+record lives in that file's git history); everything above `verified_run` in that file is
+machine-collected by `--manifest`, and the `verified_run` block is hand-recorded from the session.
 
 | Stage | Result |
 |---|---|
@@ -453,6 +454,6 @@ today this is a documented limitation rather than something the setup script can
 
 ## Related
 
-- `docs/rhel9-toolchain-manifest.json` — exact provenance of the verified reference box.
+- `docs/rhel9-toolchain-manifest.json` — exact provenance of the most recent verified run.
 - `docs/windows-build.md`, `docs/darwin-compat.md` — the other two platform runbooks.
 - `.github/workflows/ci.yml` — the Ubuntu recipe this one is derived from.
