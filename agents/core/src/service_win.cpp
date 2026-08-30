@@ -100,9 +100,15 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
         // (agents/core/src/shutdown_deadline_guard.hpp, kShutdownDeadlineGrace = 20s) as its
         // first statement. 20s leaves only a 10s margin under this 30s hint, not "well under"
         // it - a wedge diagnosed slowly by the guard's own worker dispatch could still cost
-        // the SCM's patience in a worst case. No checkpoint-bumping thread added regardless:
-        // a wedge that outlives the 30s hint now hard_exit()s the whole process before the
-        // SCM's own timeout would matter, rather than needing a live checkpoint to survive it.
+        // the SCM's patience in a worst case. That reasoning is about SERVICE_CONTROL_STOP's
+        // own STOP_PENDING hint specifically; on SERVICE_CONTROL_SHUTDOWN the OS applies its
+        // own WaitToKillServiceTimeout instead, which can be shorter and is outside this
+        // process's control either way. No checkpoint-bumping thread added regardless: a wedge
+        // that outlives the 30s hint now hard_exit()s the whole process before the SCM's own
+        // timeout would matter, rather than needing a live checkpoint to survive it - but note
+        // this box has no SCM FailureActions/recovery config configured today, so unlike the
+        // Linux systemd Restart=always path, a Windows watchdog fire does not auto-restart
+        // (governance Gate 6 sre finding; docs/user-manual/server-admin.md).
         report_status(SERVICE_STOP_PENDING, NO_ERROR, 0, 30000);
         {
             std::lock_guard<std::mutex> lock(g_agent_mu);

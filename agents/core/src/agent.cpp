@@ -103,9 +103,13 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // the named floor without claiming to be a derived guarantee (matching spark_file.cpp's
 // arm_ancestor deadline comment: state plainly that it's not a wall-clock bound where it
 // isn't one). Also constrained from above: service_win.cpp reports a 30s STOP_PENDING
-// hint to the Windows SCM, so this MUST stay comfortably under that or the SCM could act
-// on an unresponsive service before this watchdog even fires — 20s leaves a full 10s
-// margin for the SCM to observe and act.
+// hint to the Windows SCM, so this must stay under that or the SCM could act on an
+// unresponsive service before this watchdog even fires — 20s leaves only a 10s margin,
+// not a comfortable one (matching service_win.cpp's own wording on the same relationship,
+// not "well under"). That margin matters more on Windows than it sounds: this box has no
+// SCM FailureActions/recovery config today (governance Gate 6 sre finding), so a watchdog
+// fire there is a clean stop with no automatic restart, unlike the systemd Restart=always
+// path — see "Stopping a wedged agent" in docs/user-manual/server-admin.md.
 constexpr std::chrono::milliseconds kShutdownDeadlineGrace{20'000};
 
 // #2303 sec-L. The daily-sync scheduler (ADR-0016) persists last-hash / need_full state in this
@@ -979,12 +983,17 @@ public:
             // An earlier version of this guard had these reversed (governance
             // Gate 3/4 finding, this PR) - harmless only because no production
             // call site wires a consumer onto spark_engine_ yet. Idempotent:
-            // Agent::stop() may already have called both - each of
-            // GuardianEngine::stop()/SparkEngine::stop() has its OWN internal
-            // completion-barrier mutex (mtx_ / lifecycle_mu_+teardown_complete_) making a
-            // second, concurrent call from a different thread block-then-return rather
-            // than race (SparkEngine::stop()'s own header comment names this exact
-            // stop()-vs-ScopeExit scenario explicitly). #2233 item 3's watchdog above
+            // Agent::stop() may already have called both - safe, but the two engines get
+            // there differently (governance Gate 2 finding, this PR - corrected from an
+            // earlier draft that overclaimed symmetry). SparkEngine::stop() has a genuine
+            // completion barrier (lifecycle_mu_+teardown_complete_, early-out on repeat -
+            // its own header comment names this exact stop()-vs-ScopeExit scenario as the
+            // reason). GuardianEngine::stop() has no such early-out: it takes mtx_ and
+            // RE-EXECUTES its whole body on a second call, safe only because every
+            // downstream step in it (ConvergenceScheduler::stop(), OutboxDrainWorker::stop(),
+            // stop_all_guards_locked(), GuardianSparkRuntime::begin_stop(),
+            // lifecycle_journal_->request_stop()) is independently idempotent - verified, not
+            // a barrier. #2233 item 3's watchdog above
             // covers the case where the call THIS thread is executing hangs; it is
             // deliberately NOT layered with an AgentImpl-level once-only guard on top of
             // these calls - an earlier revision of this PR added one (stop_guardian_once/
@@ -3509,15 +3518,27 @@ private:
     // outside state_->mu_; its Linux implementation can double-join the same std::thread).
     // Makes Agent::stop()'s own "Thread-safe" doc comment (agent.hpp) actually true.
     std::mutex stop_mu_;
+    // A plain bool guarded by stop_mu_, not std::atomic<bool> like stop_requested_/
+    // spark_boot_done_ above - deliberate, not a drift from that idiom: every read and write
+    // of this flag already falls inside the same stop_mu_ critical section (it gates
+    // whole-method mutual exclusion, not just a single flag check), so a bare atomic would
+    // add nothing and would invite a future edit to check it outside the lock.
+    // #2233 item 3: this stop_mu_/stop_completed_ pair itself has no direct test - AgentImpl
+    // has no test seam (grep "_for_test\b" agent.cpp), so the concurrent-stop()-entry fix it
+    // provides is verified by code review only, not exercised by any test in this repo today
+    // (governance Gate 3 quality-engineer SHOULD-FIX; tracked, not blocking - a future test
+    // seam for AgentImpl would close this).
     bool stop_completed_{false};
     // NOTE: an earlier revision of this PR also added teardown_mu_/guardian_stopped_/
     // spark_stopped_ to serialize guardian_->stop()/spark_engine_->stop() specifically
     // (the two calls duplicated between stop() and run()'s teardown ScopeExit). Removed
-    // (adversarial review Kimi K1): GuardianEngine::stop()/SparkEngine::stop() already have
-    // their OWN internal completion-barrier mutexes for exactly this concurrent-caller
-    // scenario (mtx_ / lifecycle_mu_+teardown_complete_ — SparkEngine::stop()'s own header
-    // comment names the stop()-vs-ScopeExit race explicitly as the reason that barrier
-    // exists), so the extra AgentImpl-level layer was redundant for safety and, as
+    // (adversarial review Kimi K1): SparkEngine::stop() already has its OWN internal
+    // completion-barrier mutex for exactly this concurrent-caller scenario
+    // (lifecycle_mu_+teardown_complete_ — its own header comment names the stop()-vs-
+    // ScopeExit race explicitly as the reason that barrier exists); GuardianEngine::stop()
+    // has no equivalent barrier but is safe on a repeat call because every step inside it is
+    // independently idempotent (see the ScopeExit's own comment above for the verified list) -
+    // so the extra AgentImpl-level layer was redundant for safety either way and, as
     // implemented, introduced a real regression: a stop() that raced spark_engine_'s boot
     // window would mark the flag done without ever having called spark_engine_->stop(),
     // permanently disabling the ScopeExit's retry. See stop()'s and the ScopeExit's own

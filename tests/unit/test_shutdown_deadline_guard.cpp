@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <thread>
 #include <type_traits>
 
 #ifndef _WIN32
@@ -127,7 +128,8 @@ TEST_CASE("cancel racing the deadline is race-free under repeat",
         // short window for EITHER outcome to settle before the shared_ptrs go out of
         // scope naturally (they stay alive as long as the detached worker holds its own
         // copy, so this is a liveness convenience, not a correctness requirement).
-        yuzu::test::spin_until([&] { return retired->load(std::memory_order_acquire); }, 20ms);
+        (void)yuzu::test::spin_until([&] { return retired->load(std::memory_order_acquire); },
+                                      20ms);
     }
     SUCCEED("50 cancel-vs-fire races completed without crash/hang");
 }

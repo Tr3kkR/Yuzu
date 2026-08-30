@@ -213,9 +213,15 @@ static void on_signal(int sig) {
         // "ordinary thread where logging is safe" in the sense this comment originally meant —
         // it still does not log, for the same blocking-pipe reason this handler doesn't. A
         // wedged stop is diagnosed from the supervisor's log, the absence of "Yuzu agent
-        // stopped", and now also the process's own exit code (4 = the deadline fired; distinct
-        // from this handler's exit 1 and F3's exit 3).
-        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7; consistency, this PR.)
+        // stopped", and usually also the process's own exit code (4 = the deadline fired,
+        // vs. this handler's exit 1, vs. F3's exit 3) — "usually", not reliably: a genuinely
+        // wedged stop can trigger BOTH this handler (an operator sending a second signal) AND
+        // the watchdog above for the SAME wedge, and whichever one's exit call the kernel
+        // schedules first wins — governance Gate 5 chaos-injector reproduced this empirically
+        // (900/900 trials: always exactly one of the two codes, never a third value or a
+        // crash, but genuinely nondeterministic which one). Treat the exit code as a useful
+        // hint, not a certain diagnosis, when both paths could plausibly have fired.
+        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7, chaos-injector; this PR.)
         // See hard_exit.hpp: TerminateProcess on Windows (no DllMain, no loader
         // lock), ::_exit() on POSIX (async-signal-safe, cannot block).
         yuzu::agent::hard_exit(1);

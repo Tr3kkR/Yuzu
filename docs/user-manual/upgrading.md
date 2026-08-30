@@ -2710,6 +2710,20 @@ Before upgrading any component:
   force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
   also terminates promptly. See *Stopping a wedged agent* in
   [Server Administration](server-admin.md).
+- [ ] **New agent shutdown watchdog (#2233 item 3, "S+"):** on upgrade, both
+  `AgentImpl::stop()` and the agent's own `run()`-exit teardown arm a 20-second
+  internal deadline; if guardian/spark/DEX teardown or any other blocking step
+  hasn't returned within it, the agent self-terminates (`hard_exit`, **exit
+  code 4** — new, distinct from the existing codes 1 and 3 above) instead of
+  hanging indefinitely. You do not need to send a second signal to recover from
+  this class of wedge — sending one just makes the exit happen sooner (code 1)
+  instead of after the 20s deadline (code 4); which code is actually reported
+  is a race if both happen for the same wedge, so treat it as a hint, not a
+  certain diagnosis. On Windows, `sc stop`/service shutdown is now also bounded
+  by the same 20s watchdog, but this platform has no automatic-restart
+  recovery action configured, unlike the Linux `Restart=always` unit — a
+  watchdog fire there is a clean stop, not a self-healing restart. See
+  *Stopping a wedged agent* in [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
