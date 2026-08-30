@@ -24,6 +24,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
 #include "workflow_engine.hpp"
@@ -98,6 +99,10 @@ struct ExecHarness {
     /// file leaves it nullptr, and a fourth SQLite file per harness would be
     /// unpaid cost on ~60 constructions (CLAUDE.md test-efficiency discipline).
     std::unique_ptr<WorkflowEngine> workflows;
+    /// Opt-in `ProductPackStore` so `/api/product-packs*` (install/uninstall fan-out into
+    /// InstructionStore/PolicyStore/WorkflowEngine, ADR-0064) is reachable. Opt-in for the same
+    /// reason as `workflows` above — unpaid cost on every other test in this file.
+    std::unique_ptr<ProductPackStore> product_pack_store;
     /// PR 3: per-execution SSE bus. Constructed BEFORE the tracker (see
     /// member-order comment) so the tracker can attach. Pointer is also
     /// passed into WorkflowRoutes::Deps so the SSE handler is registered.
@@ -197,7 +202,8 @@ struct ExecHarness {
                          yuzu::server::detail::StreamBudget* budget = nullptr,
                          bool wire_exec_visible_arg = true,
                          bool with_workflow_engine = false,
-                         bool wire_fleet_read_fn_arg = true)
+                         bool wire_fleet_read_fn_arg = true,
+                         bool with_product_pack_store = false)
         : stream_budget(budget),
           tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -232,12 +238,18 @@ struct ExecHarness {
         responses = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(responses->is_open());
 
-        // CDX-FV-03: a plain on-disk SQLite file — the engine's whole ctor is
-        // sqlite3_open_v2 + CREATE TABLE, so the "disproportionate scaffolding"
-        // this file previously claimed does not exist.
+        // ADR-0064: WorkflowEngine is now Postgres-backed — shares this harness's `pool`
+        // (schema-per-store, ADR-0008), same as InstructionStore/ResponseStore above. wf_db (the
+        // old SQLite path) is unused dead weight in the fs::remove cleanup loops below, harmless.
         if (with_workflow_engine) {
-            workflows = std::make_unique<WorkflowEngine>(wf_db);
+            workflows = std::make_unique<WorkflowEngine>(pool);
             REQUIRE(workflows->is_open());
+        }
+
+        if (with_product_pack_store) {
+            product_pack_store = std::make_unique<ProductPackStore>(pool);
+            REQUIRE(product_pack_store->is_open());
+            product_pack_store->set_require_signed_packs(false); // unsigned test bundles
         }
 
         auto auth_fn = [this](const httplib::Request&,
@@ -335,6 +347,7 @@ struct ExecHarness {
         // CDX-FV-03: nullptr unless opted in, so /api/workflows/* keeps its 503
         // path for every pre-existing test.
         wf_deps.workflow_engine = workflows.get();
+        wf_deps.product_pack_store = product_pack_store.get();
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
         // nullptr but is still registered, which is the qe-S1 path.
@@ -2205,6 +2218,104 @@ TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible der
     CHECK(h.last_dispatch_exec_visible->empty());      // EMPTY → production sink reaches no one
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ADR-0064 — ProductPackStore install/uninstall fan-out into WorkflowEngine,
+// exercised through the REAL production install_fn/uninstall_fn (workflow_routes.cpp),
+// not a hand-rolled stub. No prior test anywhere covered the Workflow arm of either
+// callback through the actual REST wiring — this closes that gap for the migration.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("ADR-0064: POST/DELETE /api/product-packs installs and uninstalls a Workflow item "
+          "via the real install_fn/uninstall_fn", "[pg][workflow][workflow_engine][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true, /*with_product_pack_store=*/true);
+
+    const std::string bundle = "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: ProductPack\n"
+                               "name: test-workflow-pack\n"
+                               "version: 1.0.0\n"
+                               "description: pack containing one workflow\n"
+                               "---\n"
+                               "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: Workflow\n"
+                               "metadata:\n"
+                               "  displayName: pack-workflow\n"
+                               "spec:\n"
+                               "  steps:\n"
+                               "    - instruction: inst-1\n";
+
+    auto install_res = h.sink.Post("/api/product-packs", bundle, "text/x-yaml");
+    REQUIRE(install_res);
+    REQUIRE(install_res->status == 201);
+    auto install_body = nlohmann::json::parse(install_res->body);
+    const auto pack_id = install_body.at("id").get<std::string>();
+
+    // The workflow was really created via WorkflowEngine — not just recorded as a
+    // ProductPackItem row.
+    auto listed = h.workflows->list_workflows();
+    REQUIRE(listed.has_value());
+    REQUIRE(listed->size() == 1);
+    CHECK((*listed)[0].name == "pack-workflow");
+    const auto workflow_id = (*listed)[0].id;
+
+    auto uninstall_res = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(uninstall_res);
+    CHECK(uninstall_res->status == 200);
+
+    // Uninstall really called delete_workflow() (soft-delete) via the fixed uninstall_fn arm —
+    // absent from ordinary reads afterward.
+    auto listed_after = h.workflows->list_workflows();
+    REQUIRE(listed_after.has_value());
+    CHECK(listed_after->empty());
+    auto got = h.workflows->get_workflow(workflow_id);
+    REQUIRE(got.has_value());
+    CHECK_FALSE(got->has_value());
+}
+
+TEST_CASE("ADR-0064: uninstalling a pack whose Workflow item was already deleted directly "
+          "reports a not_found item, not a crash", "[pg][workflow][workflow_engine][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true, /*with_product_pack_store=*/true);
+
+    const std::string bundle = "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: ProductPack\n"
+                               "name: test-workflow-pack-2\n"
+                               "version: 1.0.0\n"
+                               "description: pack containing one workflow\n"
+                               "---\n"
+                               "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: Workflow\n"
+                               "metadata:\n"
+                               "  displayName: pack-workflow-2\n"
+                               "spec:\n"
+                               "  steps:\n"
+                               "    - instruction: inst-1\n";
+
+    auto install_res = h.sink.Post("/api/product-packs", bundle, "text/x-yaml");
+    REQUIRE(install_res);
+    REQUIRE(install_res->status == 201);
+    const auto pack_id = nlohmann::json::parse(install_res->body).at("id").get<std::string>();
+
+    auto listed = h.workflows->list_workflows();
+    REQUIRE(listed.has_value());
+    REQUIRE(listed->size() == 1);
+    // Delete the workflow directly (bypassing the pack), simulating drift between the pack's
+    // item row and the underlying store — the uninstall_fn Workflow arm must report this as an
+    // ordinary not_found item (via delete_workflow()'s own "not_found:" prefix), not crash or
+    // silently succeed.
+    REQUIRE(h.workflows->delete_workflow((*listed)[0].id).has_value());
+
+    auto uninstall_res = h.sink.Delete("/api/product-packs/" + pack_id);
+    REQUIRE(uninstall_res);
+    // ProductPackStore::uninstall's own tolerated-not_found handling — the pack itself still
+    // uninstalls cleanly even though the workflow item was already gone.
+    CHECK(uninstall_res->status == 200);
+}
+
 // ── /fragments/schedules confinement (guardian-confinement-2298) ──────────
 //
 // Previously reachable by ANY authenticated session with no RBAC check at
@@ -2319,24 +2430,7 @@ TEST_CASE("POST /api/scope/estimate: an ordinary session reaches the estimator",
     }
 }
 
-// #3503 review finding: WorkflowEngine::create_workflow()'s wrong-kind path
-// routes through the shared kind_mismatch_error() helper (workflow_engine.cpp
-// :300), but until now was only pinned at the helper's own raw two-argument
-// level (test_store_errors.cpp) -- never exercised through the real
-// create_workflow() call site the way PolicyStore's equivalent path is
-// (test_policy_store.cpp's "create fragment with wrong kind"). A future edit
-// that stops WorkflowEngine routing through the shared helper would go
-// undetected without this. No PG/ExecHarness needed -- WorkflowEngine's
-// whole ctor is sqlite3_open_v2 + CREATE TABLE (CDX-FV-03).
-TEST_CASE("WorkflowEngine::create_workflow rejects a wrong kind via the shared "
-         "kind-mismatch helper", "[workflow][workflow_engine]") {
-    WorkflowEngine engine(uniq("wf-engine-kind-mismatch"));
-    REQUIRE(engine.is_open());
-
-    auto result = engine.create_workflow("kind: Policy\nmetadata:\n  displayName: oops\n");
-    REQUIRE(!result.has_value());
-    CHECK(result.error() ==
-          "kind must be 'Workflow', got 'Policy'. yaml_source must be a "
-          "complete YAML document including 'apiVersion: yuzu.io/v1alpha1' "
-          "and 'kind: Workflow'.");
-}
+// #3503 review finding: WorkflowEngine::create_workflow()'s wrong-kind path routes through the
+// shared kind_mismatch_error() helper — pinned in test_workflow_engine.cpp (ADR-0064: moved
+// there since it's a store-behaviour test, and YUZU_REQUIRE_PG_DB_TPL is reserved for
+// migration/fresh-DB tests, not ordinary store CRUD).

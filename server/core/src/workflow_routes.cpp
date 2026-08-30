@@ -1234,9 +1234,20 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto workflows = workflow_engine->list_workflows(q);
+        auto workflows_result = workflow_engine->list_workflows(q);
+        if (!workflows_result) {
+            res.status = 503;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 503},
+                                           {"message", yuzu::server::genericize_db_error(
+                                                           "list_workflows", workflows_result.error())}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return;
+        }
         nlohmann::json arr = nlohmann::json::array();
-        for (const auto& w : workflows) {
+        for (const auto& w : *workflows_result) {
             nlohmann::json steps_arr = nlohmann::json::array();
             for (const auto& s : w.steps) {
                 steps_arr.push_back({{"index", s.index},
@@ -1290,6 +1301,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto result = workflow_engine->create_workflow(yaml_source);
         if (!result) {
+            if (yuzu::server::is_generic_db_error(result.error())) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json({{"error", {{"code", 503},
+                                               {"message", yuzu::server::genericize_db_error(
+                                                               "create_workflow", result.error())}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
             res.status = 400;
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
@@ -1317,17 +1339,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        auto workflow = workflow_engine->get_workflow(id);
-        if (!workflow) {
+        auto workflow_result = workflow_engine->get_workflow(id);
+        if (!workflow_result) {
+            res.status = 503;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 503},
+                                           {"message", yuzu::server::genericize_db_error(
+                                                           "get_workflow", workflow_result.error())}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return;
+        }
+        if (!*workflow_result) {
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"workflow not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        const auto& workflow = **workflow_result;
 
         nlohmann::json steps_arr = nlohmann::json::array();
-        for (const auto& s : workflow->steps) {
+        for (const auto& s : workflow.steps) {
             steps_arr.push_back({{"index", s.index},
                                  {"instruction_id", s.instruction_id},
                                  {"label", s.label},
@@ -1338,13 +1372,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                  {"on_failure", s.on_failure}});
         }
 
-        res.set_content(nlohmann::json({{"id", workflow->id},
-                                        {"name", workflow->name},
-                                        {"description", workflow->description},
-                                        {"yaml_source", workflow->yaml_source},
+        res.set_content(nlohmann::json({{"id", workflow.id},
+                                        {"name", workflow.name},
+                                        {"description", workflow.description},
+                                        {"yaml_source", workflow.yaml_source},
                                         {"steps", steps_arr},
-                                        {"created_at", workflow->created_at},
-                                        {"updated_at", workflow->updated_at}})
+                                        {"created_at", workflow.created_at},
+                                        {"updated_at", workflow.updated_at}})
                             .dump(),
                         "application/json");
     });
@@ -1364,7 +1398,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        bool deleted = workflow_engine->delete_workflow(id);
+        auto del = workflow_engine->delete_workflow(id);
+        // ADR-0064: delete_workflow() now returns std::expected — a genuine store-unavailable
+        // condition (kDbErrorPrefix) 503s instead of silently reporting {"deleted": false} as if
+        // the workflow simply didn't exist; "not_found:" (missing OR already soft-deleted) keeps
+        // the pre-migration {"deleted": false}/200 contract byte-identical.
+        if (!del && yuzu::server::is_generic_db_error(del.error())) {
+            res.status = 503;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 503},
+                                           {"message", yuzu::server::genericize_db_error(
+                                                           "delete_workflow", del.error())}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return;
+        }
+        bool deleted = del.has_value();
         if (deleted) {
             audit_fn(req, "workflow.delete", "success", "workflow", id, "");
             emit_fn("workflow.deleted", req);
@@ -1430,12 +1480,27 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // If any instruction in the workflow requires approval, reject the
         // entire execution rather than allowing partial bypass.
         if (approval_manager && instruction_store && instruction_store->is_open()) {
-            auto workflow = workflow_engine->get_workflow(workflow_id);
-            if (workflow) {
+            auto workflow_result = workflow_engine->get_workflow(workflow_id);
+            if (!workflow_result) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                    {"message", yuzu::server::genericize_db_error(
+                                                    "get_workflow", workflow_result.error())}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            // Not-found falls through unchanged — execute() below reports the same
+            // "workflow not found" error this pre-check would otherwise skip ahead of.
+            if (*workflow_result) {
+                const auto& workflow = **workflow_result;
                 auto session = auth_fn(req, res);
                 if (!session)
                     return;
-                for (const auto& step : workflow->steps) {
+                for (const auto& step : workflow.steps) {
                     // ADR-0058: get_definition now returns std::expected — distinguish a
                     // genuine DB error (503) from "no such instruction" (400, unchanged).
                     auto step_def_result = instruction_store->get_definition(step.instruction_id);
@@ -1590,6 +1655,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto result = workflow_engine->execute(workflow_id, agent_ids, dispatch_fn, condition_fn);
 
         if (!result) {
+            if (yuzu::server::is_generic_db_error(result.error())) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json({{"error", {{"code", 503},
+                                               {"message", yuzu::server::genericize_db_error(
+                                                               "execute", result.error())}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
             res.status = 400;
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
@@ -1620,17 +1696,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        auto exec = workflow_engine->get_execution(id);
-        if (!exec) {
+        auto exec_result = workflow_engine->get_execution(id);
+        if (!exec_result) {
+            res.status = 503;
+            res.set_content(
+                nlohmann::json({{"error", {{"code", 503},
+                                           {"message", yuzu::server::genericize_db_error(
+                                                           "get_execution", exec_result.error())}}},
+                                {"meta", {{"api_version", "v1"}}}})
+                    .dump(),
+                "application/json");
+            return;
+        }
+        if (!*exec_result) {
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        const auto& exec = **exec_result;
 
         nlohmann::json steps_arr = nlohmann::json::array();
-        for (const auto& sr : exec->step_results) {
+        for (const auto& sr : exec.step_results) {
             steps_arr.push_back({{"step_index", sr.step_index},
                                  {"instruction_id", sr.instruction_id},
                                  {"status", sr.status},
@@ -1640,14 +1728,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                  {"attempt", sr.attempt}});
         }
 
-        res.set_content(nlohmann::json({{"id", exec->id},
-                                        {"workflow_id", exec->workflow_id},
-                                        {"status", exec->status},
-                                        {"agent_ids", nlohmann::json::parse(exec->agent_ids_json,
+        res.set_content(nlohmann::json({{"id", exec.id},
+                                        {"workflow_id", exec.workflow_id},
+                                        {"status", exec.status},
+                                        {"agent_ids", nlohmann::json::parse(exec.agent_ids_json,
                                                                             nullptr, false)},
-                                        {"current_step", exec->current_step},
-                                        {"started_at", exec->started_at},
-                                        {"completed_at", exec->completed_at},
+                                        {"current_step", exec.current_step},
+                                        {"started_at", exec.started_at},
+                                        {"completed_at", exec.completed_at},
                                         {"steps", steps_arr}})
                             .dump(),
                         "application/json");
@@ -2276,9 +2364,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     return {};
                 return std::unexpected("not_found: policy '" + item_id + "'");
             } else if (kind == "Workflow") {
-                if (workflow_engine && workflow_engine->delete_workflow(item_id))
-                    return {};
-                return std::unexpected("not_found: workflow '" + item_id + "'");
+                // Mirrors the InstructionDefinition arm above (ADR-0064): a null
+                // workflow_engine is a genuine unavailability, not "this item doesn't
+                // exist" — the tolerated-not-found prefix here would let
+                // ProductPackStore::uninstall delete the pack row while a still-live
+                // workflow stays undeleted underneath it.
+                if (!workflow_engine)
+                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                           "workflow engine unavailable");
+                return workflow_engine->delete_workflow(item_id);
             }
             return std::unexpected("not_found: unsupported item kind '" + kind + "'");
         };

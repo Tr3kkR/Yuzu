@@ -5872,12 +5872,36 @@ public:
             }
         }
 
-        // Phase 7: Workflow Engine
-        {
-            auto wf_db = cfg_.db_dir() / "workflows.db";
-            workflow_engine_ = std::make_unique<WorkflowEngine>(wf_db);
-            if (workflow_engine_ && workflow_engine_->is_open()) {
-                spdlog::info("WorkflowEngine initialized at {}", wf_db.string());
+        // Phase 7: Workflow Engine — Migrated Postgres store (ADR-0006/0009/0064, schema
+        // `workflow_engine`). Construction fail-CLOSED per ADR-0012 §1 — a posture UPGRADE from
+        // the SQLite era, where construction was unconditional/best-effort and is_open() was
+        // never checked by any caller. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment): the legacy workflows.db is never copied; the detect-and-warn obligation
+        // still applies (this store holds real operator-authored workflow definitions + their
+        // execution history), so legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            workflow_engine_ = std::make_unique<WorkflowEngine>(*pg_pool_);
+            if (!workflow_engine_->is_open()) {
+                spdlog::error("[PG] Refusing to start: workflow engine migration/open failed "
+                              "(database reachable but the workflow_engine schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                workflow_engine_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_workflow_engine_writes_total",
+                                  "WorkflowEngine create_workflow/delete_workflow/execute/"
+                                  "cancel_execution outcomes, by op and result. ADR-0064.",
+                                  "counter");
+                for (const auto op :
+                    {"create_workflow", "delete_workflow", "execute", "cancel_execution"})
+                    for (const auto result : {"success", "failed"})
+                        metrics_.counter("yuzu_server_workflow_engine_writes_total",
+                                         {{"op", op}, {"result", result}});
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "workflows.db", "WorkflowEngine",
+                    {"workflows", "workflow_steps", "workflow_executions",
+                     "workflow_step_results"});
             }
         }
 
@@ -12789,6 +12813,10 @@ private:
             // start rather than shipping the gap. Construction is fail-closed,
             // so this is belt-and-braces against a runtime is_open() flip.
             bool directory_sync_ok = directory_sync_ && directory_sync_->is_open();
+            // ADR-0064 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz drift class:
+            // workflow_engine was already in /readyz's StoreCheck vector (below) but absent
+            // here in the SQLite era.
+            bool workflow_engine_ok = workflow_engine_ && workflow_engine_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12799,7 +12827,7 @@ private:
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
                 notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-                patch_manager_ok && session_store_ok && directory_sync_ok;
+                patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12846,7 +12874,8 @@ private:
                   {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
                   {"patch_manager", patch_manager_ok ? "ok" : "error"},
                   {"session_store", session_store_ok ? "ok" : "error"},
-                  {"directory_sync", directory_sync_ok ? "ok" : "error"}}},
+                  {"directory_sync", directory_sync_ok ? "ok" : "error"},
+                  {"workflow_engine", workflow_engine_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
