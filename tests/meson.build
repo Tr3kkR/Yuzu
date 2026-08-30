@@ -873,6 +873,7 @@ if build_server
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
+      'unit/server/test_directory_sync.cpp', # ADR-0063: directory_sync Postgres migration
       'unit/server/test_fleet_topology_store.cpp',
       'unit/server/test_viz_routes.cpp',
       'unit/server/test_product_pack_store.cpp',
