@@ -181,7 +181,8 @@ No `migrate_from_sqlite`, no legacy-table-reading code. The legacy `patches.db` 
 for data — same posture as `ResponseStore`/`OffloadTargetStore`. Because this store holds real
 operator-initiated state (deployment records, per-target progress), the playbook's
 detect-and-warn obligation applies: `server.cpp` calls the new shared
-`legacy_sqlite_probe::warn_if_legacy_rows()` helper (`server/core/src/legacy_sqlite_probe.{hpp,cpp}`)
+`legacy_sqlite_probe::warn_if_legacy_rows()` helper (`server/core/src/legacy_sqlite_probe.hpp`,
+shared with `UpdateRegistry`'s ADR-0061 — see "Reconciled post-rebase" below)
 over the legacy file's three tables after a successful open, logging a `spdlog::warn` with a
 summed row count only if the legacy file actually holds rows — silence is the ordinary case (a
 genuinely fresh install).
@@ -191,9 +192,17 @@ genuinely fresh install).
 (3-5). It deliberately does NOT force the legacy file to 0600 before reading — that obligation
 applies only to a legacy file that may hold a plaintext secret column, and none of the 7 Wave-4
 components hold secret material (`PatchManager` included — patch titles/severities/deployment
-metadata are not secrets). The `UpdateRegistry` migration (PR 1, sibling, in flight) was expected
-to land this helper first; it had not yet merged to `origin/dev` when this PR was authored, so
-this PR introduces it — a small reconciliation diff is expected when the two branches meet.
+metadata are not secrets). **Reconciled post-rebase:** this PR originally authored its own
+`legacy_sqlite_probe.{hpp,cpp}` (split header+impl, a caller-string-based signature, an up-front
+identifier-validation loop) because the sibling `UpdateRegistry` migration (PR 1) had not yet
+merged when this PR was first authored. `UpdateRegistry` landed first (PR #3695), with a
+header-only, `string_view`-based, more thoroughly hardened version (adversarial-review findings:
+refuses to block on a FIFO/symlink/device node at the legacy path via `is_regular_file` rather
+than `exists()`, distinguishes a permission-check failure from genuine absence, binds the
+existence-check identifier as a parameter rather than string-concatenating it). This PR's own
+copy — implementation, header, and test file — was retired in favor of that canonical version on
+rebase; `PatchManager`'s call site needed no changes (the canonical signature accepts the same
+string-literal call shape).
 
 Construction logs a one-time line: `PatchManager initialized (schema patch_manager) — fresh
 start, no legacy backfill`.

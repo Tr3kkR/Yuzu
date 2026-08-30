@@ -188,7 +188,6 @@
 #include "workflow_engine.hpp"
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
-#include "legacy_sqlite_probe.hpp"
 #include "process_health.hpp"
 #include "rate_limiter.hpp"
 #include "security_headers.hpp"
