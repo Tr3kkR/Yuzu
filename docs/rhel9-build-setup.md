@@ -22,7 +22,7 @@ manual-configure marks `-Dpkg_config_path` load-bearing too - spdlog/fmt resolve
 first, and relying on the cmake fallback to chain fmt is at the mercy of the port version.
 `yz_pkgconfig` (defined in the generated env file) puts the checkout's vcpkg `.pc` directory on
 `PKG_CONFIG_PATH` for tools run by hand; the `meson configure` line pins the same path into the
-build directory so later reconfigures keep it. (Aligning `setup.sh` itself is tracked separately.)
+build directory so later reconfigures keep it. (Aligning `setup.sh` itself is #3725.)
 ```
 
 The script is idempotent — re-running it on a provisioned box changes nothing. Verify a machine at
