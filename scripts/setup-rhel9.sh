@@ -179,7 +179,11 @@ pg_answers() { psql "${PG_DSN}" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' 2>/dev/null |
 # The durable identity of the cluster at PGDATA: survives restarts, changes on
 # re-initdb. pg_controldata reads it from disk, so it works with the server
 # stopped.
-pg_sysid() { sudo -u postgres pg_controldata "${PGDATA}" 2>/dev/null | awk '/^Database system identifier:/ {print $NF}'; }
+# LC_ALL=C pins the label this parses: Rocky 9's PG 18 module ships no
+# pg_controldata translations today (verified: de/fr langpacks leave the output
+# English), but sudoers env_keep passes LANG/LC_* through, so a future package
+# adding them would otherwise break the match on a non-English box.
+pg_sysid() { sudo -u postgres env LC_ALL=C pg_controldata "${PGDATA}" 2>/dev/null | awk '/^Database system identifier:/ {print $NF}'; }
 # Reachability is not identity: something else could be listening on
 # 127.0.0.1:5432. Returns 0 when the DSN's listener is the cluster at PGDATA
 # (same pg_control system identifier - a session-invariant bigint any role can
@@ -612,7 +616,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
         || die "could not record consent in ${PG_MARK}"
       PG_OWNED=1
     elif [ -n "${MARK_SYSID}" ]; then
-      warn "${PG_MARK} names a different cluster (recorded ${MARK_SYSID}, found ${CUR_SYSID}): the cluster at ${PGDATA} was replaced since consent was given. It is verified below, never changed (pass --adopt-cluster to manage THIS cluster)."
+      warn "${PG_MARK} names a different cluster (recorded ${MARK_SYSID}, found ${CUR_SYSID}): the cluster at ${PGDATA} was replaced since consent was given (a re-initdb, a restore, or a major-version upgrade). It is verified below, never changed (pass --adopt-cluster to manage THIS cluster)."
     else
       warn "${PGDATA} was not created by this script: it is verified below, never changed (pass --adopt-cluster to let this script manage it)"
     fi

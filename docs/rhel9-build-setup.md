@@ -80,7 +80,9 @@ preserved, never overwritten on later runs), and prints a warning rather than ed
 itself or one you hand it with `--adopt-cluster`. Consent is recorded in a marker
 (`/var/lib/pgsql/.yuzu-provisioned`, outside the data directory) holding the cluster's `pg_control`
 system identifier, so it binds to the *cluster*, not the path: a cluster replaced at
-`/var/lib/pgsql/data` - a hand re-initdb, a restore - is "any other cluster" again. Any other cluster
+`/var/lib/pgsql/data` - a hand re-initdb, a restore - is "any other cluster" again. That includes the
+most routine cause: a major-version `postgresql-setup --upgrade` rewrites the cluster under a new
+identifier, so re-run with `--adopt-cluster` once afterwards. Any other cluster
 - say, one already serving a native Yuzu server under its own `yuzu` role - is verified, never
 changed: the script stops and names the statement to run by hand.
 
