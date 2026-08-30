@@ -210,6 +210,44 @@ REST contract byte-identical to today, including `DELETE /api/workflows/:id`'s
 `{"deleted": true|false}` body shape (`false` now covers both "never existed" and "already
 deleted", same tolerant meaning the bool return had pre-migration).
 
+**Child reads (adversarial-review finding, both reviewers independently, fixed):** the parent-row
+reads above were widened, but `wf_load_steps()` (backing `list_workflows`/`get_workflow`) and
+`get_execution()`'s step-results query initially kept the SQLite-era fail-soft shape — a genuine
+`workflow_steps`/`workflow_step_results` query failure logged a warning and returned the parent row
+with an empty/silently-incomplete child collection, rather than surfacing as a typed failure. This
+broke the authoritative-read contract this section claims: a caller could not distinguish "this
+workflow has no steps" from "the steps table could not be read", and `execute()` could
+misreport a real DB outage as the business error `"workflow has no steps"` (400) instead of 503.
+Fixed: `wf_load_steps()` now returns `std::expected<std::vector<WorkflowStep>, std::string>` and
+`get_workflow`/`list_workflows` propagate its failure; `get_execution()`'s step-results block
+returns `unexpected(kDbErrorPrefix + ...)` on a genuine query failure instead of returning the
+execution row with empty `step_results`. Proven with two PG tests that drop the child table via a
+second raw connection to force a real query failure (not a mock) and assert the typed failure.
+
+**`ProductPackStore::install()` cross-store gap (adversarial-review finding, both reviewers
+independently, fixed):** `ProductPackStore::install()`'s per-item error aggregation
+(`errors.push_back(kind + ": " + result.error())`, then `"no items installed: " + errors[0]` on
+total failure) prepends text ahead of any `install_fn` callback's error string — which strips the
+`kDbErrorPrefix`/`kProductPackDbErrorPrefix` byte-0 marker `is_generic_db_error()` and
+`product_pack_error_status()` rely on, turning a genuine `WorkflowEngine` DB failure during
+`POST /api/product-packs` into a misclassified 400 instead of 503. In a multi-document bundle where
+an earlier item already installed successfully, the loop would continue past the DB failure
+entirely and the pack could persist with the failed item silently missing. **This bug pre-dates
+this migration** (verified directly: `InstructionStore::insert_definition_row` already emits a
+`kInstructionStoreDbErrorPrefix`-tagged error on genuine failure today, so the identical
+prefix-stripping affects the `InstructionDefinition` install arm too) — but this migration is what
+first makes it reachable for the `Workflow` kind, since the pre-migration SQLite `create_workflow`
+never used the `db_error:` convention at all. Fixed in `ProductPackStore::install()` (not scoped to
+Workflow — the fix is kind-agnostic): a callback failure whose error `is_generic_db_error()`
+immediately aborts the whole install with a `kProductPackDbErrorPrefix`-tagged error, before
+aggregating validation errors or persisting any partial pack — mirrors `uninstall()`'s already-
+correct identical pattern (`product_pack_store.cpp:1357-1363`, `starts_with(kProductPackDbErrorPrefix)`
+→ abort). Also tightened the Workflow install arm's null/unopen-engine message to carry the
+`kProductPackDbErrorPrefix` tag (matching the `InstructionDefinition` arm), closing the same gap on
+that path. Proven with a REST-level test that drops `workflow_engine.workflow_steps` to force a
+genuine `create_workflow()` DB failure, then asserts `POST /api/product-packs` returns 503 (not
+400) and persists no pack row.
+
 ### Write-outcome metrics
 
 `yuzu_server_workflow_engine_writes_total{op,result}` (matching `PatchManager`'s convention)
@@ -250,6 +288,21 @@ defect being fixed here.
 **Follow-up, not fixed here:** the blocking `sleep_for` itself — a worker thread parked for up to
 `retry_delay_seconds` (clamped 0-3600) per retry — is a separate, pre-existing scalability concern
 independent of storage backend. Tracked as a follow-up issue, out of scope for this migration.
+
+### `cancel_execution` atomicity (adversarial-review finding, both reviewers independently, fixed)
+
+The pre-migration SQLite `cancel_execution` held `std::unique_lock lock(mtx_)` across a
+SELECT-then-UPDATE pair, so the read-check-write was serialized in-process. The initial Postgres
+port preserved the two-statement shape but dropped the mutex, opening a real race: a concurrent
+`execute()` finalizing the same execution to `completed`/`failed` between `cancel_execution`'s
+SELECT and its follow-up UPDATE would still be overwritten to `cancelled` by the unconditional
+`UPDATE ... WHERE id = $n`. Fixed: the transition is now one atomic statement —
+`UPDATE workflow_engine.workflow_executions SET status = 'cancelled', completed_at = $1 WHERE id =
+$2 AND status IN ('pending', 'running') RETURNING id` — with a follow-up read only when it matches
+zero rows, purely to shape the not-found-vs-already-terminal message (not to drive control flow).
+This also closes a related gap: the UPDATE's own failure is now propagated as
+`unexpected(kDbErrorPrefix + ...)` instead of being silently logged while `cancel_execution`
+reports success.
 
 ### Posture (ADR-0012 §1)
 
@@ -304,6 +357,12 @@ in neither in the SQLite era (the same readyz-vs-healthz drift class `PatchManag
   what's needed.** Rejected — `create_workflow`'s failure modes are already fully validation
   (malformed YAML, missing fields) except for the transaction itself, which is exactly where the
   new `kDbErrorPrefix` tagging applies; no further widening had a concrete consumer.
+- **Batching `list_workflows`' per-workflow step load into one `WHERE workflow_id = ANY($1)` query**
+  (adversarial-review finding, both reviewers, LOW/judgment). Deferred, not fixed — this is a
+  faithful port of the pre-migration SQLite shape (N+1 there too), the route is admin-facing with a
+  100-row default limit (not a heartbeat hot path), and it is a performance concern with no
+  contract/ADR anchor, unlike the two HIGH findings above. Left as a follow-up rather than folded
+  into this PR.
 
 ## Consequences
 

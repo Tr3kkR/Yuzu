@@ -23,7 +23,9 @@
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
@@ -31,6 +33,7 @@
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
@@ -44,7 +47,9 @@
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
@@ -2314,6 +2319,49 @@ TEST_CASE("ADR-0064: uninstalling a pack whose Workflow item was already deleted
     // ProductPackStore::uninstall's own tolerated-not_found handling — the pack itself still
     // uninstalls cleanly even though the workflow item was already gone.
     CHECK(uninstall_res->status == 200);
+}
+
+// adversarial-review CDX-P1-002/WF-4: a genuine WorkflowEngine DB failure during
+// POST /api/product-packs must classify as 503, not fall through ProductPackStore::install()'s
+// per-item error aggregation as a 400 validation rejection. Forces a REAL query failure (drops
+// the child table create_workflow's transaction writes into) rather than a mock, and proves
+// nothing gets persisted.
+TEST_CASE("ADR-0064: a genuine WorkflowEngine DB failure during pack install 503s, not 400s, "
+          "and persists no pack row", "[pg][workflow][workflow_engine][product_pack]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true, /*with_product_pack_store=*/true);
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult drop = yuzu::server::pg::exec_params(
+        conn.get(), "DROP TABLE workflow_engine.workflow_steps", std::vector<std::string>{});
+    REQUIRE(drop.status() == PGRES_COMMAND_OK);
+
+    const std::string bundle = "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: ProductPack\n"
+                               "name: test-workflow-pack-3\n"
+                               "version: 1.0.0\n"
+                               "description: pack whose workflow item fails to install\n"
+                               "---\n"
+                               "apiVersion: yuzu.io/v1alpha1\n"
+                               "kind: Workflow\n"
+                               "metadata:\n"
+                               "  displayName: pack-workflow-3\n"
+                               "spec:\n"
+                               "  steps:\n"
+                               "    - instruction: inst-1\n";
+
+    auto install_res = h.sink.Post("/api/product-packs", bundle, "text/x-yaml");
+    REQUIRE(install_res);
+    CHECK(install_res->status == 503); // NOT 400 — a genuine store failure, not validation
+
+    auto list_res = h.sink.Get("/api/product-packs");
+    REQUIRE(list_res);
+    REQUIRE(list_res->status == 200);
+    auto listed = nlohmann::json::parse(list_res->body);
+    CHECK(listed.at("product_packs").empty()); // nothing persisted
 }
 
 // ── /fragments/schedules confinement (guardian-confinement-2298) ──────────

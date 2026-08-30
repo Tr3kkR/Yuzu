@@ -270,7 +270,12 @@ std::vector<RawStep> extract_steps(const std::string& yaml) {
 // Every call site controls its own lease/transaction scope — see workflow_engine.hpp's private
 // section comment and ADR-0064 "Lease discipline". None of these are declared in the header.
 
-std::vector<WorkflowStep> wf_load_steps(PGconn* conn, const std::string& workflow_id) {
+// Authoritative child read — returns unexpected(kDbErrorPrefix) on a genuine query failure
+// rather than an empty vector, so a caller can never mistake "workflow_steps failed to read"
+// for "this workflow has no steps" (governance finding: the parent read was widened to
+// std::expected, but this child read had kept the SQLite-era fail-soft shape underneath it).
+std::expected<std::vector<WorkflowStep>, std::string> wf_load_steps(PGconn* conn,
+                                                                     const std::string& workflow_id) {
     std::vector<WorkflowStep> steps;
     pg::PgResult res = pg::exec_params(
         conn,
@@ -279,9 +284,9 @@ std::vector<WorkflowStep> wf_load_steps(PGconn* conn, const std::string& workflo
         "WHERE workflow_id = $1 ORDER BY step_index",
         std::vector<std::string>{workflow_id});
     if (res.status() != PGRES_TUPLES_OK) {
-        spdlog::warn("WorkflowEngine: load_steps failed for {}: {}", workflow_id,
-                    PQresultErrorMessage(res.get()));
-        return steps;
+        spdlog::error("WorkflowEngine: load_steps failed for {}: {}", workflow_id,
+                     PQresultErrorMessage(res.get()));
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
     }
     const int rows = PQntuples(res.get());
     steps.reserve(static_cast<std::size_t>(rows));
@@ -588,7 +593,10 @@ std::expected<std::vector<Workflow>, std::string> WorkflowEngine::list_workflows
         w.yaml_source = col_str(res.get(), i, 3);
         w.created_at = to_i64(col(res.get(), i, 4));
         w.updated_at = to_i64(col(res.get(), i, 5));
-        w.steps = wf_load_steps(lease.get(), w.id);
+        auto steps_result = wf_load_steps(lease.get(), w.id);
+        if (!steps_result)
+            return std::unexpected(steps_result.error());
+        w.steps = std::move(*steps_result);
         result.push_back(std::move(w));
     }
     return result;
@@ -620,7 +628,10 @@ std::expected<std::optional<Workflow>, std::string> WorkflowEngine::get_workflow
     w.yaml_source = col_str(res.get(), 0, 3);
     w.created_at = to_i64(col(res.get(), 0, 4));
     w.updated_at = to_i64(col(res.get(), 0, 5));
-    w.steps = wf_load_steps(lease.get(), w.id);
+    auto steps_result = wf_load_steps(lease.get(), w.id);
+    if (!steps_result)
+        return std::unexpected(steps_result.error());
+    w.steps = std::move(*steps_result);
     return w;
 }
 
@@ -978,8 +989,12 @@ std::expected<std::optional<WorkflowExecution>, std::string> WorkflowEngine::get
             exec.step_results.push_back(std::move(sr));
         }
     } else {
-        spdlog::warn("WorkflowEngine::get_execution: step-results query failed for {}: {}", id,
-                    PQresultErrorMessage(sres.get()));
+        // Authoritative child read (same reasoning as wf_load_steps above) — a genuine
+        // step-results query failure must surface as a typed failure, never as a successful
+        // execution row with silently-empty step_results.
+        spdlog::error("WorkflowEngine::get_execution: step-results query failed for {}: {}", id,
+                     PQresultErrorMessage(sres.get()));
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(sres.get()));
     }
 
     return exec;
@@ -1034,28 +1049,43 @@ std::expected<void, std::string> WorkflowEngine::cancel_execution(const std::str
     if (!lease)
         return std::unexpected(std::string(kDbErrorPrefix) + "pool exhausted");
 
-    // Verify it exists and is running — same lease, two sequential statements (not
-    // transactional, matches the pre-migration mutex-held-but-not-BEGIN'd shape).
+    // Atomic transition (governance finding): a separate SELECT-then-UPDATE let a concurrent
+    // execute() finalize the same row to completed/failed between the two statements, and the
+    // unconditional UPDATE would still overwrite that terminal status back to "cancelled". The
+    // WHERE clause makes the pending/running check and the write one statement — the same class
+    // of fix create_workflow/execute's admission guard already applies elsewhere in this file.
     pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE workflow_engine.workflow_executions SET status = 'cancelled', "
+        "completed_at = $1::bigint WHERE id = $2 AND status IN ('pending', 'running') "
+        "RETURNING id",
+        std::vector<std::string>{std::to_string(now_epoch()), id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_workflow_engine_writes_total",
+                              {{"op", "cancel_execution"}, {"result", "failed"}})
+                .increment();
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(res.get()));
+    }
+
+    if (PQntuples(res.get()) > 0) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_workflow_engine_writes_total",
+                              {{"op", "cancel_execution"}, {"result", "success"}})
+                .increment();
+        return {};
+    }
+
+    // Zero rows: either unknown id or already-terminal — the UPDATE above already made the real
+    // decision atomically; this follow-up read only shapes which message to return.
+    pg::PgResult check = pg::exec_params(
         lease.get(), "SELECT status FROM workflow_engine.workflow_executions WHERE id = $1",
         std::vector<std::string>{id});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string(kDbErrorPrefix) +
-                               PQresultErrorMessage(res.get()));
-    if (PQntuples(res.get()) == 0)
+    if (check.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kDbErrorPrefix) + PQresultErrorMessage(check.get()));
+    if (PQntuples(check.get()) == 0)
         return std::unexpected("execution not found");
-
-    auto status = col_str(res.get(), 0, 0);
-    if (status != "pending" && status != "running")
-        return std::unexpected("execution is already " + status);
-
-    wf_update_execution_status(lease.get(), id, "cancelled");
-
-    if (metrics_)
-        metrics_->counter("yuzu_server_workflow_engine_writes_total",
-                          {{"op", "cancel_execution"}, {"result", "success"}})
-            .increment();
-    return {};
+    return std::unexpected("execution is already " + col_str(check.get(), 0, 0));
 }
 
 } // namespace yuzu::server

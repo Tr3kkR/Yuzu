@@ -476,3 +476,71 @@ TEST_CASE("WorkflowEngine schema: workflow_executions -> workflows has no cascad
         std::vector<std::string>{wf_id});
     CHECK(del.status() == PGRES_FATAL_ERROR); // FK violation — RESTRICT/NO ACTION, not CASCADE
 }
+
+// ── Child-read failure propagation (adversarial-review CDX-P1-001/WF-3) ──────
+//
+// A genuine child-table query failure must surface as a typed kDbErrorPrefix failure, never as
+// a successful parent row with silently-empty children — the bug this closes: the parent read
+// was widened to std::expected, but wf_load_steps()/get_execution()'s step-results load kept
+// the SQLite-era fail-soft shape underneath it. Each case drops the child table via a second raw
+// connection to force a real query failure (not a mock), then asserts the typed-failure contract.
+
+TEST_CASE("WorkflowEngine: get_workflow surfaces a genuine workflow_steps query failure as "
+          "kDbErrorPrefix, not an empty steps list",
+          "[workflow_engine][pg][crud][degrade]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kOneStepYaml);
+
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult drop = yuzu::server::pg::exec_params(
+        conn.get(), "DROP TABLE workflow_engine.workflow_steps", std::vector<std::string>{});
+    REQUIRE(drop.status() == PGRES_COMMAND_OK);
+
+    auto got = engine.get_workflow(wf_id);
+    REQUIRE_FALSE(got.has_value());
+    CHECK(got.error().starts_with(kDbErrorPrefix));
+
+    auto listed = engine.list_workflows();
+    REQUIRE_FALSE(listed.has_value());
+    CHECK(listed.error().starts_with(kDbErrorPrefix));
+}
+
+TEST_CASE("WorkflowEngine: get_execution surfaces a genuine workflow_step_results query "
+          "failure as kDbErrorPrefix, not an execution with empty step_results",
+          "[workflow_engine][pg][execute][degrade]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kOneStepYaml);
+    auto exec_id = *engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn());
+
+    PgConn conn{PQconnectdb(wf_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult drop = yuzu::server::pg::exec_params(
+        conn.get(), "DROP TABLE workflow_engine.workflow_step_results",
+        std::vector<std::string>{});
+    REQUIRE(drop.status() == PGRES_COMMAND_OK);
+
+    auto exec = engine.get_execution(exec_id);
+    REQUIRE_FALSE(exec.has_value());
+    CHECK(exec.error().starts_with(kDbErrorPrefix));
+}
+
+// ── cancel_execution atomicity (adversarial-review CDX-P1-003/WF-2/WF-5) ─────
+
+TEST_CASE("WorkflowEngine: cancel_execution's transition is one atomic statement",
+          "[workflow_engine][pg][cancel]") {
+    WORKFLOW_ENGINE(engine);
+    auto wf_id = *engine.create_workflow(kOneStepYaml);
+    auto exec_id = *engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn());
+
+    // Already terminal ("completed") — the atomic UPDATE...WHERE status IN (...) matches zero
+    // rows, so cancel must report the already-terminal message, never silently overwrite it.
+    auto cancel = engine.cancel_execution(exec_id);
+    REQUIRE_FALSE(cancel.has_value());
+    CHECK(cancel.error() == "execution is already completed");
+
+    auto exec = engine.get_execution(exec_id);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "completed"); // never overwritten to "cancelled"
+}

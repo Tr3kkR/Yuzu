@@ -2208,8 +2208,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     return std::unexpected("policy store not available");
                 return policy_store->create_policy(yaml_source);
             } else if (kind == "Workflow") {
+                // kProductPackDbErrorPrefix-tagged (ADR-0064 governance fix): a null/unopen
+                // engine is a genuine unavailability the REST layer must 503, not a validation
+                // rejection — matches the InstructionDefinition arm's identical shape above.
                 if (!workflow_engine || !workflow_engine->is_open())
-                    return std::unexpected("workflow engine not available");
+                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                           "workflow engine unavailable");
                 return workflow_engine->create_workflow(yaml_source);
             } else {
                 return std::unexpected("unsupported kind: " + kind);
