@@ -6323,12 +6323,41 @@ public:
             }
         }
 
-        // Phase 7: Patch Manager
-        {
-            auto patch_db = cfg_.db_dir() / "patches.db";
-            patch_manager_ = std::make_unique<PatchManager>(patch_db);
-            if (patch_manager_ && patch_manager_->is_open()) {
-                spdlog::info("PatchManager initialized at {}", patch_db.string());
+        // Phase 7: Patch Manager — Migrated Postgres store (ADR-0006/0009/
+        // 0062, schema `patch_manager`). Construction fail-CLOSED per
+        // ADR-0012 §1 — a posture UPGRADE from the SQLite era, where
+        // construction was unconditional/best-effort and is_open() was
+        // never even checked by any caller. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // patches.db is never copied; the detect-and-warn obligation still
+        // applies (this store holds real operator-initiated
+        // deployment/inventory state), so legacy_sqlite_probe::
+        // warn_if_legacy_rows() opens the legacy file read-only and warns
+        // (with a row count) only if it actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            patch_manager_ = std::make_unique<PatchManager>(*pg_pool_);
+            if (!patch_manager_->is_open()) {
+                spdlog::error("[PG] Refusing to start: patch manager migration/open failed "
+                              "(database reachable but the patch_manager schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                patch_manager_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_patch_manager_writes_total",
+                                  "PatchManager record_patches/deploy_patch/cancel_deployment "
+                                  "outcomes, by op and result. ADR-0062.",
+                                  "counter");
+                for (const auto op : {"record_patches", "deploy_patch", "cancel_deployment"})
+                    for (const auto result : {"success", "failed"})
+                        metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                         {{"op", op}, {"result", result}});
+                // deploy_patch's own cap-rejection path (kMaxDeployTargets) never
+                // reaches the success/failed branch above — zero-seed separately.
+                metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                 {{"op", "deploy_patch"}, {"result", "rejected_oversized"}});
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "patches.db", "PatchManager",
+                    {"patch_inventory", "patch_deployments", "patch_deployment_targets"});
             }
         }
 
@@ -12670,6 +12699,11 @@ private:
             // gap, not an availability one, but the two probes should agree on which
             // stores exist.
             bool runtime_config_ok = runtime_config_store_ && runtime_config_store_->is_open();
+            // ADR-0062 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Construction is fail-closed,
+            // so this is belt-and-braces against a runtime is_open() flip.
+            bool patch_manager_ok = patch_manager_ && patch_manager_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12679,7 +12713,8 @@ private:
                 vuln_finding_ok && app_perf_daily_ok && app_perf_fleet_ok &&
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
-                notification_ok && upload_grant_ok && tag_ok && runtime_config_ok;
+                notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
+                patch_manager_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12723,7 +12758,8 @@ private:
                   {"notification_store", notification_ok ? "ok" : "error"},
                   {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
                   {"tag_store", tag_ok ? "ok" : "error"},
-                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"}}},
+                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
+                  {"patch_manager", patch_manager_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -13020,6 +13056,11 @@ private:
                 // /readyz still reported "ready".
                 {"upload_grant_store",
                  upload_grant_store_ && upload_grant_store_->is_open()},
+                // ADR-0062 (Wave 4 non-`*Store` migration) — was in neither
+                // /readyz nor /healthz in the SQLite era (no caller ever
+                // checked is_open() at all). Load-bearing for every
+                // /api/patches/* route now that construction is fail-closed.
+                {"patch_manager", patch_manager_ && patch_manager_->is_open()},
             };
 
             // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction

@@ -6223,6 +6223,10 @@ The one device list behind every network-quality drill: worst devices by a metri
 - **Permission:** `Patch:Read`
 - **Query params:** `agent_id`, `severity`, `status`, `limit` (default 100)
 
+> **Note:** patch inventory is populated only by `PatchManager::record_patches()`, which has no
+> production caller today — this endpoint returns an empty result in every real deployment, not
+> because the fleet has no missing patches. See `docs/capability-map.md` §8.5/§8.7 and #3676.
+
 **`POST /api/patches/deploy`** — Create a patch deployment targeting specific agents.
 
 - **Permission:** `Patch:Write`
@@ -6231,19 +6235,33 @@ The one device list behind every network-quality drill: worst devices by a metri
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `kb_id` | string | Yes | — | KB identifier (format: `KBnnnnnnn`) |
-| `agent_ids` | string[] | Yes | — | Target agent IDs |
+| `agent_ids` | string[] | Yes | — | Target agent IDs (max 5000 after de-duplication; a longer list is rejected with `too many target agents`) |
 | `reboot_if_needed` | bool | No | `false` | Reboot agents after patching |
 | `reboot_delay_seconds` | int | No | `300` | Seconds to wait before reboot (clamped to 60–86400). A desktop notification warns the user before reboot. |
 | `reboot_at` | int64 | No | `0` | Optional epoch timestamp for scheduled reboot. Must be in the future. `0` = use delay instead. |
 
 - **Response (201):** `{"deployment_id": "...", "kb_id": "...", "target_count": N, "status": "pending"}`
 
-> **Note:** Reboot orchestration requires the Yuzu agent to run with root (Linux/macOS) or Administrator (Windows) privileges. If the agent lacks these privileges, the reboot command will fail silently; the patch installation itself will still succeed.
+> **Note:** this creates a deployment record + a `pending` row per target — there is no server-side
+> scan/install/verify/reboot orchestration (`PatchManager::execute_deployment()` was removed;
+> ADR-0062, `docs/capability-map.md` §8.3/§8.4/§8.6, tracking issue #3669). Nothing advances a
+> target past `pending` except `POST /api/patches/deployments/:id/cancel` (→ `cancelled`).
+> `reboot_if_needed`/`reboot_delay_seconds`/`reboot_at` are accepted, clamped, and stored, but
+> nothing acts on them.
+
+Successful deploys are recorded in the audit log with `action=patch.deploy`, `result=success`.
+A validation rejection (invalid KB format, an oversized `agent_ids` list, or a failed
+transaction) is recorded with `result=denied` and `detail` carrying the error message — see
+`docs/user-manual/audit-log.md`'s `patch.deploy` row for the known gaps (#3705) in this
+outcome's granularity.
 
 **`GET /api/patches/deployments/:id`** — Deployment details with per-target status.
 
 - **Permission:** `Patch:Read`
-- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` (pending, scanning, downloading, installing, verifying, rebooting, completed, failed, skipped, cancelled).
+- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` — always `pending`
+  or `cancelled` today (the fuller `scanning`/`downloading`/`installing`/`verifying`/`rebooting`/
+  `completed`/`failed`/`skipped` vocabulary is reserved by the schema but nothing currently sets
+  it). `completed_targets`/`failed_targets` are set once at creation and never recalculated.
 
 **`GET /api/patches/deployments`** — List deployments (paginated, default limit 50).
 
