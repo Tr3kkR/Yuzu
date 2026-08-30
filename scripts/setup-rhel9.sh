@@ -485,8 +485,9 @@ fi
 # friends resolve via pkg-config first (CLAUDE.md "Manual configure" marks both
 # paths load-bearing); today the cmake fallback happens to chain them, but that
 # is the port's courtesy, not a contract. yz_pkgconfig is a function so it
-# tracks whichever repo you cd into; appended, never clobbering (the
-# gcc-toolset enable script exports its own PKG_CONFIG_PATH).
+# tracks whichever repo you cd into; PREPENDED so vcpkg's .pc files win, with
+# any existing entries kept (the gcc-toolset enable script exports its own
+# PKG_CONFIG_PATH).
 yz_pkgconfig() {
   local d="\$PWD/vcpkg_installed/x64-linux/lib/pkgconfig"
   [ -d "\$d" ] || { echo "no \$d - run vcpkg install (or scripts/setup.sh) from the repo root first" >&2; return 1; }
@@ -837,7 +838,7 @@ cat <<EOF
     source ${ENV_FILE}
     cd <repo> && ./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini
     yz_pkgconfig            # vcpkg .pc dir onto PKG_CONFIG_PATH (see the env file)
-    meson configure build-linux -Dpkg_config_path=\$PWD/vcpkg_installed/x64-linux/lib/pkgconfig
+    meson configure build-linux --clearcache -Dpkg_config_path=\$PWD/vcpkg_installed/x64-linux/lib/pkgconfig
     meson compile -C build-linux
 
   Note: use linux-gcc13.ini (cpp_std only). linux-gcc14.ini hard-codes gcc-14/g++-14,

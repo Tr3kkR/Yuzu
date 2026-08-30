@@ -13,7 +13,7 @@ but have not been exercised, arm64 is unverified, and the container checks run u
 bash scripts/setup-rhel9.sh --with-postgres          # provision
 source ~/.config/yuzu/toolchain-env.sh               # activate (also hooked into ~/.bashrc)
 ./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini
-yz_pkgconfig && meson configure build-linux -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig
+yz_pkgconfig && meson configure build-linux --clearcache -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig
 meson compile -C build-linux
 ```
 
@@ -21,11 +21,14 @@ The fourth line matters: `scripts/setup.sh` passes only `-Dcmake_prefix_path`, w
 manual-configure marks `-Dpkg_config_path` load-bearing too - spdlog/fmt resolve via pkg-config
 first, and relying on the cmake fallback to chain fmt is at the mercy of the port version.
 `yz_pkgconfig` (defined in the generated env file) puts the checkout's vcpkg `.pc` directory on
-`PKG_CONFIG_PATH` for tools run by hand; the `meson configure` line pins the same path into the
-build directory so later reconfigures keep it. (Aligning `setup.sh` itself is #3725.)
-```
+`PKG_CONFIG_PATH` for tools run by hand. `--clearcache` is load-bearing, not hygiene: setup.sh's
+configure has already resolved and cached spdlog/fmt through cmake, and meson's dependency cache is
+consulted before `pkg_config_path`, so without it the pin never takes effect for exactly the
+dependencies it exists for. (Aligning `setup.sh` itself so none of this is needed is #3725.)
 
-The script is idempotent — re-running it on a provisioned box changes nothing. Verify a machine at
+The script is idempotent — re-running it on a provisioned box changes nothing. (One exception by
+design: a box provisioned before a recipe update gets the updated env file - `yz_pkgconfig` and
+friends - only on re-run; re-run once and re-source after pulling a newer recipe.) Verify a machine at
 any time with `bash scripts/setup-rhel9.sh --check --with-postgres`.
 
 The rest of this doc explains *why* each piece is what it is, because the four things most likely
@@ -348,7 +351,7 @@ tests-build-server-linux_x64/yuzu_server_tests "[pg]"
 **Re-verified 2026-08-31 (script as of `45fdd3556`)** in a Rocky 9.8 KVM guest (12 vCPU /
 23 GB) with SELinux **enforcing** and real systemd - the `postgresql-setup --initdb` + `systemctl`
 path ran genuinely, not shimmed. The recipe (`--with-postgres --manifest`) completed with zero
-failed steps, `--check --with-postgres` passed all 22 checks, and the full
+failed steps, `--check --with-postgres` passed every check, and the full
 `setup.sh --tests` → `meson compile` → `meson test` sequence gave 35 OK / 2 skipped / 2 failed -
 the same two pre-existing failures as the original run below (the SQLite `RETURNING` telemetry
 limitation, and the known Linux-only MCP case, #2610 family). All 11 `[pg]` shards passed against
