@@ -151,6 +151,8 @@
 #include "preflight_run_store.hpp"
 #include "vuln_finding_store.hpp"
 #include "access_review_store.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — campaign persistence
+#include "clock_drift_monitor.hpp" // HA WS-1/1a — backward wall-clock drift detector (ADR-2002 §4)
+#include "session_store.hpp"       // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -2510,6 +2512,39 @@ public:
             metrics_.counter("yuzu_auth_read_degrade_total",
                              {{"route", "login"}, {"reason", reason}});
         }
+        // HA WS-1/1a: durable SessionStore degradation on the auth hot path
+        // (validate/create/touch/generation-refresh/reap). Mirrors the
+        // yuzu_auth_read_degrade_total / yuzu_server_rbac_read_degrade_total
+        // pattern so an operator can see a PG blip/failover degrade session
+        // handling (stale-cache-or-401) without grepping logs. `op` labels the
+        // degrading operation. Wired from AuthManager (validate/create/touch/
+        // generation) + the maintenance-thread reap above.
+        metrics_.describe("yuzu_auth_session_store_degrade_total",
+                          "Durable session-store operations that hit a degraded PostgreSQL read/"
+                          "write on the auth hot path (labelled by op: validate / create / touch / "
+                          "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
+                          "elevate); a validate degrade fails the request closed, and elevate / "
+                          "revoke (via invalidate_user) degrades fail the privileged op closed",
+                          "counter");
+        for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
+                        "invalidate_user", "invalidate", "mark_mfa", "elevate"})
+            metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        metrics_.describe("yuzu_auth_session_reap_total",
+                          "Expired durable operator-session rows deleted by the clock-guarded "
+                          "retention sweep",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_reap_total");
+        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a)): incremented
+        // when a session reap pass is DECLINED because the wall clock read is
+        // implausibly ahead of, or behind, the persisted anchor — i.e. a DB/host
+        // clock anomaly (a backward step un-expires sessions). Pre-seeded to 0 so
+        // YuzuSessionReapClockAnomaly's `increase() > 0` alert is meaningful.
+        metrics_.describe("yuzu_auth_session_reap_clock_anomaly_total",
+                          "Session reap passes declined due to an implausible (forward or backward) "
+                          "wall-clock reading vs the persisted anchor - the DB-clock-integrity "
+                          "signal for durable sessions (ADR-2002 section 4)",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -3929,6 +3964,26 @@ public:
                         auth_mgr_.set_auth_db(auth_db_.get());
                     }
                 }
+            }
+        }
+
+        // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
+        // ADR-2002 §4). Same fail-CLOSED construction posture as the other
+        // born-on-PG stores (ADR-0012 §1): a reachable database whose schema
+        // can't migrate/open is a deploy error, not a serve-degraded state.
+        // Wired into AuthManager so sessions write-through to Postgres and
+        // survive a replica restart/failover; without it (config-file-only
+        // deployments never reach this block — pg_pool_ is null) AuthManager
+        // keeps its legacy in-memory sessions.
+        if (pg_pool_ && !startup_failed_) {
+            session_store_ = std::make_unique<SessionStore>(*pg_pool_);
+            if (!session_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: session store migration/open failed "
+                              "(database reachable but the session_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auth_mgr_.set_session_store(session_store_.get());
             }
         }
 
@@ -6336,12 +6391,41 @@ public:
             }
         }
 
-        // Phase 7: Patch Manager
-        {
-            auto patch_db = cfg_.db_dir() / "patches.db";
-            patch_manager_ = std::make_unique<PatchManager>(patch_db);
-            if (patch_manager_ && patch_manager_->is_open()) {
-                spdlog::info("PatchManager initialized at {}", patch_db.string());
+        // Phase 7: Patch Manager — Migrated Postgres store (ADR-0006/0009/
+        // 0062, schema `patch_manager`). Construction fail-CLOSED per
+        // ADR-0012 §1 — a posture UPGRADE from the SQLite era, where
+        // construction was unconditional/best-effort and is_open() was
+        // never even checked by any caller. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // patches.db is never copied; the detect-and-warn obligation still
+        // applies (this store holds real operator-initiated
+        // deployment/inventory state), so legacy_sqlite_probe::
+        // warn_if_legacy_rows() opens the legacy file read-only and warns
+        // (with a row count) only if it actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            patch_manager_ = std::make_unique<PatchManager>(*pg_pool_);
+            if (!patch_manager_->is_open()) {
+                spdlog::error("[PG] Refusing to start: patch manager migration/open failed "
+                              "(database reachable but the patch_manager schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                patch_manager_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_patch_manager_writes_total",
+                                  "PatchManager record_patches/deploy_patch/cancel_deployment "
+                                  "outcomes, by op and result. ADR-0062.",
+                                  "counter");
+                for (const auto op : {"record_patches", "deploy_patch", "cancel_deployment"})
+                    for (const auto result : {"success", "failed"})
+                        metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                         {{"op", op}, {"result", result}});
+                // deploy_patch's own cap-rejection path (kMaxDeployTargets) never
+                // reaches the success/failed branch above — zero-seed separately.
+                metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                 {{"op", "deploy_patch"}, {"result", "rejected_oversized"}});
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "patches.db", "PatchManager",
+                    {"patch_inventory", "patch_deployments", "patch_deployment_targets"});
             }
         }
 
@@ -8526,6 +8610,11 @@ public:
         // TrackerScope contract, auth_db_'s destruct-before-drop still holds
         // regardless — this only protects the OUTSIDE-owned raw pointer).
         auth_mgr_.set_auth_db(nullptr);
+        // Same contract for the durable SessionStore raw pointer (HA WS-1/1a):
+        // auth_mgr_ (main.cpp-owned) borrows session_store_ via
+        // set_session_store; null it before session_store_ destructs with the
+        // rest of this object's members.
+        auth_mgr_.set_session_store(nullptr);
 
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
@@ -12764,6 +12853,17 @@ private:
             // gap, not an availability one, but the two probes should agree on which
             // stores exist.
             bool runtime_config_ok = runtime_config_store_ && runtime_config_store_->is_open();
+            // ADR-0062 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Construction is fail-closed,
+            // so this is belt-and-braces against a runtime is_open() flip.
+            bool patch_manager_ok = patch_manager_ && patch_manager_->is_open();
+            // HA WS-1/1a: durable operator sessions. /readyz's StoreCheck vector
+            // names this store; mirror it here so the two probes agree (same
+            // anti-drift rule as runtime_config above) and match the documented
+            // "reported at /readyz and /healthz" contract. is_session_store_ok()
+            // is true on legacy config-file-only deployments (no store wired).
+            bool session_store_ok = auth_mgr_.is_session_store_ok();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12773,7 +12873,8 @@ private:
                 vuln_finding_ok && app_perf_daily_ok && app_perf_fleet_ok &&
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
-                notification_ok && upload_grant_ok && tag_ok && runtime_config_ok;
+                notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
+                patch_manager_ok && session_store_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12817,7 +12918,9 @@ private:
                   {"notification_store", notification_ok ? "ok" : "error"},
                   {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
                   {"tag_store", tag_ok ? "ok" : "error"},
-                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"}}},
+                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
+                  {"patch_manager", patch_manager_ok ? "ok" : "error"},
+                  {"session_store", session_store_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -12939,6 +13042,13 @@ private:
                 // an operator can detect a corrupt auth.db without scraping
                 // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
                 {"auth_db", auth_mgr_.is_auth_db_ok()},
+                // HA WS-1/1a (ADR-2002 §4): durable operator sessions. Reports
+                // "ok" on legacy config-file-only deployments (no store wired in
+                // AuthManager) and false only when a wired SessionStore failed
+                // to migrate/open — a half-open store cannot mint or validate
+                // durable sessions, so the node is not ready to front the LB.
+                // Same is_*_ok() fail-closed shape as auth_db above.
+                {"session_store", auth_mgr_.is_session_store_ok()},
                 // Phase 8.3 #255 — load-bearing for /api/v1/offload-targets
                 // and the AgentService fan-out path. A migration failure
                 // would silently no-op all offload deliveries while the
@@ -13114,6 +13224,11 @@ private:
                 // /readyz still reported "ready".
                 {"upload_grant_store",
                  upload_grant_store_ && upload_grant_store_->is_open()},
+                // ADR-0062 (Wave 4 non-`*Store` migration) — was in neither
+                // /readyz nor /healthz in the SQLite era (no caller ever
+                // checked is_open() at all). Load-bearing for every
+                // /api/patches/* route now that construction is fail-closed.
+                {"patch_manager", patch_manager_ && patch_manager_->is_open()},
             };
 
             // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
@@ -18385,6 +18500,25 @@ private:
                 // is_open-gated (JC-6 decoupling — a response-store outage must
                 // not wedge the result-set GC/materialize work above).
                 constexpr int kResponseReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // HA WS-1/1a: durable session retention sweep. Tighter than the
+                // 60m stores above — expired session rows carry username /
+                // display_name / oidc_sub (identity/PII), so age them out on a
+                // ~15m cadence. reap_expired is clock-guarded + capped (5000/pass).
+                constexpr int kSessionReapEveryNTicks = 450; // ~15 minutes at 2s/tick
+                // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
+                // adversarial-round #2 C1): each ~2s tick compares wall-clock
+                // advance against MONOTONIC (steady_clock) elapsed. A backward
+                // wall-clock step — even a small one BETWEEN reap samples that the
+                // reap anchor check cannot see — shows up here as wall advancing
+                // materially LESS than monotonic; that un-expires sessions and
+                // extends JIT/MFA windows, so it increments the clock-anomaly
+                // counter the YuzuSessionReapClockAnomaly alert fires on. Only
+                // armed with a durable session store (the clock that matters here).
+                // Cumulative-offset detector (NOT a per-tick delta — a per-tick
+                // tolerance that re-baselines each tick is blind to a stopped
+                // clock, adversarial-round C1). Tolerance ignores sub-3s jitter;
+                // a stopped/slewed-back wall clock accumulates until it crosses it.
+                ClockDriftMonitor session_clock_monitor{/*tolerance_ms=*/3000};
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -18404,6 +18538,31 @@ private:
                         // never starves the response/Guardian reap cadences.
                         const bool rs_ok = result_set_store_ && result_set_store_->is_open();
                         ++tick;
+
+                        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
+                        // C1): compare the wall clock against a monotonic reference
+                        // via ClockDriftMonitor, which ACCUMULATES sub-threshold
+                        // backward drift — so a stopped / slowly-slewed-back wall
+                        // clock (each ~2s sample diverging by less than the
+                        // tolerance) is still caught, unlike a per-sample delta.
+                        // Runs every ~2s tick, independent of the 15m reap anchor.
+                        if (session_store_ && session_store_->is_open()) {
+                            const int64_t wall_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            const int64_t steady_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+                            if (session_clock_monitor.observe(wall_ms, steady_ms)) {
+                                spdlog::warn("session clock monitor: wall clock has fallen behind "
+                                             "monotonic time (backward step / stall / slow negative "
+                                             "slew) — un-expires sessions / extends JIT+MFA windows");
+                                metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
+                                    .increment();
+                            }
+                        }
 
                         // 1) Materialise terminal pending sets (result-set store
                         // only; the thread may be running solely for the response
@@ -18486,6 +18645,39 @@ private:
                         if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                             tick % kGuardianReapEveryNTicks == 0) {
                             guaranteed_state_store_->reap_expired();
+                        }
+
+                        // 2d) Durable session retention reap (HA WS-1/1a, ADR-2002 §4).
+                        // Expired session rows carry identity/PII (username /
+                        // display_name / oidc_sub) and accrue one-per-login, so age
+                        // them out on a ~15m cadence. reap_expired is clock-guarded
+                        // (advisory-lock own-statement + persisted anchor +
+                        // implausible-skew decline + 5000/pass cap) and single-writer-
+                        // safe. now_ms is this server's wall clock; the guard sanitises
+                        // it. A returned count>0 is counted for retention auditability.
+                        if (session_store_ && session_store_->is_open() &&
+                            tick % kSessionReapEveryNTicks == 0) {
+                            const std::int64_t now_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            if (auto reaped = session_store_->reap_expired(now_ms)) {
+                                if (reaped->deleted > 0)
+                                    metrics_.counter("yuzu_auth_session_reap_total")
+                                        .increment(static_cast<double>(reaped->deleted));
+                                // DB-clock-integrity monitor (ADR-2002 §4 mitigation
+                                // (a)): a declined pass due to a forward/backward
+                                // clock anomaly is the "monitor for backward
+                                // movement; alert" signal. Surfaced as a counter so
+                                // YuzuSessionReapClockAnomaly can fire on it.
+                                if (reaped->clock_anomaly)
+                                    metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
+                                        .increment();
+                            } else {
+                                metrics_.counter("yuzu_auth_session_store_degrade_total",
+                                                 {{"op", "reap"}})
+                                    .increment();
+                            }
                         }
 
                         // 3) Refresh alive gauges.
@@ -21858,6 +22050,12 @@ private:
     std::unique_ptr<FileKeyProvider> auth_key_provider_;
     std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
     std::unique_ptr<AuthDB> auth_db_;
+    // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
+    // ADR-2002 §4). Borrows pg_pool_ by reference, so (like every member here)
+    // it destructs before pg_pool_. auth_mgr_ holds a raw pointer to it via
+    // set_session_store; that pointer is nulled at teardown before this
+    // destructs (see set_session_store(nullptr) beside set_auth_db(nullptr)).
+    std::unique_ptr<SessionStore> session_store_;
     // SCIM v2 provisioning (/scim/v2/*) — the store is constructed
     // unconditionally alongside AuthDB (born-on-PG, cheap to open); only
     // route registration + the configured bearer token are gated on
