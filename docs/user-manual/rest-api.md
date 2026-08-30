@@ -6249,6 +6249,12 @@ The one device list behind every network-quality drill: worst devices by a metri
 > `reboot_if_needed`/`reboot_delay_seconds`/`reboot_at` are accepted, clamped, and stored, but
 > nothing acts on them.
 
+Successful deploys are recorded in the audit log with `action=patch.deploy`, `result=success`.
+A validation rejection (invalid KB format, an oversized `agent_ids` list, or a failed
+transaction) is recorded with `result=denied` and `detail` carrying the error message — see
+`docs/user-manual/audit-log.md`'s `patch.deploy` row for the known gaps (#3705) in this
+outcome's granularity.
+
 **`GET /api/patches/deployments/:id`** — Deployment details with per-target status.
 
 - **Permission:** `Patch:Read`
