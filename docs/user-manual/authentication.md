@@ -357,6 +357,8 @@ SAML is enabled via CLI flags (or the matching environment variables). All five 
 | `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI this SP advertises to the IdP |
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full public URL of the ACS endpoint (`https://<host>/saml/acs`) |
 | `--saml-sp-key` | `YUZU_SAML_SP_KEY` | Optional. Path to an SP AuthnRequest signing private key PEM (**RSA only**). When set, AuthnRequests are signed — see [AuthnRequest Signing](#authnrequest-signing) below. Left unset (the default), AuthnRequests remain unsigned |
+| `--saml-name-attribute` | `YUZU_SAML_NAME_ATTRIBUTE` | Optional. `<Attribute Name="...">` whose first value is the user's display name (e.g. Entra's `displayname` claim URI). The session display is then derived name → email → raw NameID. Empty (default) leaves it as the raw NameID. Display/audit only — never identity or authz |
+| `--saml-email-attribute` | `YUZU_SAML_EMAIL_ATTRIBUTE` | Optional. `<Attribute Name="...">` whose first value is the user's email (e.g. Entra's `emailaddress` claim URI). Used as a display fallback and logged only — never stored durably or used for identity |
 
 Example startup:
 

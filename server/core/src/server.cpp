@@ -3369,7 +3369,8 @@ public:
 #ifdef _WIN32
         if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
             !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
-            !cfg_.saml_sp_key.empty()) {
+            !cfg_.saml_sp_key.empty() || !cfg_.saml_name_attribute.empty() ||
+            !cfg_.saml_email_attribute.empty()) {
             spdlog::error("SAML is not supported on Windows builds; SAML login disabled"
                           " — fail-closed");
         }
@@ -3496,6 +3497,8 @@ public:
                         saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
                         saml_cfg.idp_cert_pem   = std::move(cert_pem);
                         saml_cfg.group_attribute = cfg_.saml_group_attribute;
+                        saml_cfg.name_attribute  = cfg_.saml_name_attribute;
+                        saml_cfg.email_attribute = cfg_.saml_email_attribute;
                         saml_cfg.sp_signing_key_pem = std::move(sp_signing_key_pem);
                         saml_cfg.enabled        = true;
                         // Construct in the single-threaded startup phase — xmlsec global init
