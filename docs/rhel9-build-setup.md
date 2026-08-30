@@ -77,10 +77,12 @@ preserved, never overwritten on later runs), and prints a warning rather than ed
 
 **The recipe assumes a dedicated local cluster.** That edit, the `yuzu` role's password and the
 `pg_signal_backend` grant are cluster-wide, so the script performs them only on a cluster it created
-itself (marker `/var/lib/pgsql/.yuzu-provisioned`, outside the data directory) or one you hand it
-with `--adopt-cluster`. Any other cluster at `/var/lib/pgsql/data` - say, one already serving a
-native Yuzu server under its own `yuzu` role - is verified, never changed: the script stops and names
-the three statements to run by hand.
+itself or one you hand it with `--adopt-cluster`. Consent is recorded in a marker
+(`/var/lib/pgsql/.yuzu-provisioned`, outside the data directory) holding the cluster's `pg_control`
+system identifier, so it binds to the *cluster*, not the path: a cluster replaced at
+`/var/lib/pgsql/data` - a hand re-initdb, a restore - is "any other cluster" again. Any other cluster
+- say, one already serving a native Yuzu server under its own `yuzu` role - is verified, never
+changed: the script stops and names the statement to run by hand.
 
 Remember the skip-vs-fail contract from `CLAUDE.md`: `YUZU_TEST_POSTGRES_DSN` **unset** → the `[pg]`
 tests skip cleanly; **set but broken** → hard FAIL. So a misconfigured cluster is worse than none.
@@ -286,8 +288,8 @@ that script is a no-op on a box provisioned this way. The `yuzu` role needs **`C
 before deciding: on a cluster it manages, a `yuzu` role that lacks `LOGIN`, `CREATEDB`, or the `yuzu`
 password is repaired with `ALTER ROLE` rather than accepted on its name; on any other cluster it
 stops and tells you what to run (see trap 3). The DSN is exported only once the listener on
-`127.0.0.1:5432` is proven to be that cluster (same postmaster start time over the socket and over
-TCP), not merely something that answers.
+`127.0.0.1:5432` is proven to be that cluster (same `pg_control` system identifier read locally and
+over TCP), not merely something that answers.
 
 ---
 

@@ -57,10 +57,13 @@ PG_STREAM="18"
 PG_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
 PGDATA="/var/lib/pgsql/data"
 # Ownership marker, deliberately OUTSIDE PGDATA (backups and replica bootstraps
-# copy PGDATA). Written only after an initdb this script ran completed, or on
+# copy PGDATA). It holds the cluster's pg_control system identifier, so consent
+# is bound to the CLUSTER, not the path: a cluster replaced at PGDATA does not
+# inherit it. Written only after this script's own initdb completes, or on
 # --adopt-cluster. The ident->scram flip, the role password and the
 # pg_signal_backend grant are cluster-wide mutations: they happen only on a
-# cluster carrying this marker. Anything else is verified, never changed.
+# cluster whose identity matches this marker. Anything else is verified, never
+# changed.
 PG_MARK="/var/lib/pgsql/.yuzu-provisioned"
 PG_OWNED=0
 # Loopback `all all` lines still on ident. Anchored at the end so `ident map=x`
@@ -173,14 +176,22 @@ probe() { # probe [--assume-true] <predicate-cmd...>
 # an exported-but-unreachable DSN turns every [pg] test from a clean skip into
 # a hard failure (CLAUDE.md skip-vs-fail contract).
 pg_answers() { psql "${PG_DSN}" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' 2>/dev/null | grep -qx 1; }
+# The durable identity of the cluster at PGDATA: survives restarts, changes on
+# re-initdb. pg_controldata reads it from disk, so it works with the server
+# stopped.
+pg_sysid() { sudo -u postgres pg_controldata "${PGDATA}" 2>/dev/null | awk '/^Database system identifier:/ {print $NF}'; }
 # Reachability is not identity: something else could be listening on
-# 127.0.0.1:5432. True only when the DSN's listener is the cluster reached over
-# the local socket as postgres (same postmaster start time).
+# 127.0.0.1:5432. Returns 0 when the DSN's listener is the cluster at PGDATA
+# (same pg_control system identifier - a session-invariant bigint any role can
+# read, unlike timestamp TEXT, which renders per-session), 1 when it is a
+# different cluster, 2 when the local identity cannot be read (sudo or
+# pg_controldata unavailable).
 pg_same_cluster() {
   local a b
-  a="$(sudo -u postgres psql -tAc 'SELECT pg_postmaster_start_time()' 2>/dev/null)" || return 1
-  b="$(psql "${PG_DSN}" -tAc 'SELECT pg_postmaster_start_time()' 2>/dev/null)" || return 1
-  [ -n "$a" ] && [ "$a" = "$b" ]
+  a="$(pg_sysid)"
+  [ -n "$a" ] || return 2
+  b="$(psql "${PG_DSN}" -tAc 'SELECT system_identifier FROM pg_control_system()' 2>/dev/null)" || return 1
+  [ "$a" = "$b" ]
 }
 PG_VERIFIED=0
 
@@ -207,6 +218,10 @@ cxx23_probe() (
     && g++ -std=c++23 "$d/c23.cpp" -o "$d/c23" \
     && "$d/c23"
 )
+
+if [ "$ADOPT_CLUSTER" = 1 ] && [ "$WITH_POSTGRES" = 0 ]; then
+  die "--adopt-cluster does nothing without --with-postgres; pass both."
+fi
 
 # --- Distro gate -------------------------------------------------------------
 
@@ -482,8 +497,18 @@ write_env_file() {
 
 if [ "$DRY_RUN" = 0 ]; then
   # Under --with-postgres the DSN line survives only if the cluster answers on
-  # it right now; otherwise it is withheld until step 6 has verified it.
-  if [ "$WITH_POSTGRES" = 1 ] && pg_answers && pg_same_cluster; then PG_VERIFIED=1; fi
+  # it right now AND is the cluster at PGDATA. When the identity cannot be
+  # read (say, an expired sudo cache on a re-run), a previously verified
+  # export is kept rather than withdrawn - but never a new one added.
+  if [ "$WITH_POSTGRES" = 1 ] && pg_answers; then
+    pg_same_cluster && SAME=0 || SAME=$?
+    if [ "${SAME}" = 0 ]; then
+      PG_VERIFIED=1
+    elif [ "${SAME}" = 2 ] && grep -qxF "export YUZU_TEST_POSTGRES_DSN=\"${PG_DSN}\"" "${ENV_FILE}" 2>/dev/null; then
+      warn "cannot re-verify the DSN's cluster identity (sudo or pg_controldata unavailable); keeping the previously verified export"
+      PG_VERIFIED=1
+    fi
+  fi
   write_env_file
 
   if grep -q 'yuzu/toolchain-env.sh' "${HOME}/.bashrc" 2>/dev/null; then
@@ -548,27 +573,49 @@ if [ "$WITH_POSTGRES" = 1 ]; then
     ok "postgresql ${PG_STREAM} installed"
   fi
 
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  (dry-run) %s cannot be inspected without sudo: the lines below describe a run on a box\n  with no existing cluster, which this script then owns. On any other cluster a real run\n  verifies, warns and stops - it changes nothing without --adopt-cluster.\n' "${PGDATA}"
+  fi
+
   if probe sudo test -f "${PGDATA}/PG_VERSION"; then
-    # initdb writes PG_VERSION early and postgresql.conf / global/pg_control at
-    # the end, so an interrupted initdb is detected rather than trusted.
-    { probe sudo test -f "${PGDATA}/postgresql.conf" && probe sudo test -f "${PGDATA}/global/pg_control"; } \
-      || die "${PGDATA} holds an incomplete initdb (PG_VERSION without postgresql.conf or global/pg_control). Move it aside, then re-run."
+    # initdb writes PG_VERSION and the config files BEFORE the bootstrap run
+    # that creates global/pg_control, and pg_control cannot live outside
+    # PGDATA - so its absence alone marks an interrupted initdb, while a
+    # legitimately relocated postgresql.conf (-c config_file=) passes.
+    probe sudo test -f "${PGDATA}/global/pg_control" \
+      || die "${PGDATA} has PG_VERSION but no global/pg_control: an interrupted initdb. If this cluster is not yours, investigate by hand; if it was an interrupted initdb, clear the directory and re-run."
     skip "data directory already initialised"
   else
     run sudo /usr/bin/postgresql-setup --initdb
-    run sudo -u postgres touch "${PG_MARK}"
+    if [ "$DRY_RUN" = 1 ]; then
+      printf "  (dry-run) record the new cluster's identity in %s\n" "${PG_MARK}"
+    else
+      pg_sysid | sudo -u postgres tee "${PG_MARK}" >/dev/null
+      sudo test -s "${PG_MARK}" || die "could not record the cluster identity in ${PG_MARK}"
+    fi
     PG_OWNED=1
-    ok "initdb complete (cluster created by this script; marker ${PG_MARK})"
+    ok "initdb complete (cluster created by this script; identity recorded in ${PG_MARK})"
   fi
 
-  if [ "$PG_OWNED" = 1 ] || probe sudo test -f "${PG_MARK}"; then
-    PG_OWNED=1
-  elif [ "$ADOPT_CLUSTER" = 1 ]; then
-    warn "--adopt-cluster: taking over the existing cluster at ${PGDATA}; its loopback auth, role 'yuzu' and that role's password are managed by this script from now on"
-    run sudo -u postgres touch "${PG_MARK}"
-    PG_OWNED=1
+  if [ "$PG_OWNED" = 1 ] || [ "$DRY_RUN" = 1 ]; then
+    PG_OWNED=1   # dry-run narrates the fresh-box arm declared above
   else
-    warn "${PGDATA} was not created by this script: it is verified below, never changed (pass --adopt-cluster to let this script manage it)"
+    CUR_SYSID="$(pg_sysid)"
+    MARK_SYSID="$(sudo cat "${PG_MARK}" 2>/dev/null | tr -d '[:space:]')" || MARK_SYSID=""
+    if [ -z "${CUR_SYSID}" ]; then
+      warn "cannot read the cluster identity at ${PGDATA} (sudo or pg_controldata unavailable); treating it as not managed by this script"
+    elif [ "${CUR_SYSID}" = "${MARK_SYSID}" ]; then
+      PG_OWNED=1
+    elif [ "$ADOPT_CLUSTER" = 1 ]; then
+      warn "--adopt-cluster: taking over the cluster at ${PGDATA} (identity ${CUR_SYSID}); its loopback auth, role 'yuzu' and that role's password are managed by this script from now on"
+      printf '%s\n' "${CUR_SYSID}" | sudo -u postgres tee "${PG_MARK}" >/dev/null \
+        || die "could not record consent in ${PG_MARK}"
+      PG_OWNED=1
+    elif [ -n "${MARK_SYSID}" ]; then
+      warn "${PG_MARK} names a different cluster (recorded ${MARK_SYSID}, found ${CUR_SYSID}): the cluster at ${PGDATA} was replaced since consent was given. It is verified below, never changed (pass --adopt-cluster to manage THIS cluster)."
+    else
+      warn "${PGDATA} was not created by this script: it is verified below, never changed (pass --adopt-cluster to let this script manage it)"
+    fi
   fi
 
   if probe systemctl is-active --quiet postgresql; then
@@ -606,12 +653,13 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   # On a cluster this script manages, an existing role that lost LOGIN,
   # CREATEDB or the password is repaired, not accepted on its name - the
   # password reset is deliberate, the DSN this script writes hardcodes it. On
-  # any other cluster the role is somebody else's: report and stop.
-  PG_HAND_STEPS="as postgres: CREATE ROLE yuzu LOGIN CREATEDB PASSWORD 'yuzu'; GRANT pg_signal_backend TO yuzu; CREATE DATABASE yuzu_test OWNER yuzu; (or pass --adopt-cluster)"
+  # any other cluster the role is somebody else's: each die below names only
+  # what that branch found missing (run it as postgres, then re-run this
+  # script - or pass --adopt-cluster).
   if probe psql "${PG_DSN%/*}/postgres" -tAc "SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user" | grep -qx t; then
     skip "role 'yuzu' logs in with CREATEDB"
   elif [ "$PG_OWNED" != 1 ]; then
-    die "role 'yuzu' cannot log in on ${PG_DSN%/*}/postgres with the password this recipe exports, and ${PGDATA} is not managed by this script. Do it by hand ${PG_HAND_STEPS}"
+    die "role 'yuzu' cannot log in on ${PG_DSN%/*}/postgres with the password this recipe exports, and ${PGDATA} is not managed by this script. As postgres, create or repair it (CREATE ROLE yuzu LOGIN CREATEDB PASSWORD 'yuzu'; or the matching ALTER ROLE), then re-run - or pass --adopt-cluster."
   elif probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='yuzu'" | grep -qx 1; then
     run sudo -u postgres psql -c "ALTER ROLE yuzu WITH LOGIN CREATEDB PASSWORD 'yuzu';"
     ok "role 'yuzu' repaired (LOGIN CREATEDB, password reset to match the DSN)"
@@ -632,7 +680,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
        "SELECT pg_has_role('yuzu','pg_signal_backend','member')" | grep -qx t; then
     skip "role 'yuzu' already has pg_signal_backend"
   elif [ "$PG_OWNED" != 1 ]; then
-    die "role 'yuzu' lacks pg_signal_backend and ${PGDATA} is not managed by this script. Do it by hand ${PG_HAND_STEPS}"
+    die "role 'yuzu' lacks pg_signal_backend and ${PGDATA} is not managed by this script. As postgres: GRANT pg_signal_backend TO yuzu; then re-run - or pass --adopt-cluster."
   else
     run sudo -u postgres psql -c "GRANT pg_signal_backend TO yuzu;"
     ok "granted pg_signal_backend to 'yuzu'"
@@ -640,7 +688,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   if probe sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='yuzu_test'" | grep -qx 1; then
     skip "database 'yuzu_test' exists"
   elif [ "$PG_OWNED" != 1 ]; then
-    die "database 'yuzu_test' is missing and ${PGDATA} is not managed by this script. Do it by hand ${PG_HAND_STEPS}"
+    die "database 'yuzu_test' is missing and ${PGDATA} is not managed by this script. As postgres: CREATE DATABASE yuzu_test OWNER yuzu; then re-run - or pass --adopt-cluster."
   else
     run sudo -u postgres psql -c "CREATE DATABASE yuzu_test OWNER yuzu;"
     ok "database 'yuzu_test' created"
@@ -649,15 +697,20 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   # Last word: the DSN goes into the env file only once the cluster answers on
   # it. Everything above already aborted under set -e if it failed.
   if [ "$DRY_RUN" = 1 ]; then
-    printf '  (dry-run) verify %s answers, then add YUZU_TEST_POSTGRES_DSN to %s\n' "${PG_DSN}" "${ENV_FILE}"
-  elif pg_answers && pg_same_cluster; then
-    ok "cluster answers on ${PG_DSN}"
-    PG_VERIFIED=1
-    write_env_file
-  elif pg_answers; then
-    die "something answers on ${PG_DSN} but it is not the cluster at ${PGDATA} (another listener on 127.0.0.1:5432?), so YUZU_TEST_POSTGRES_DSN was NOT exported."
-  else
+    printf '  (dry-run) verify %s answers and is this cluster, then add YUZU_TEST_POSTGRES_DSN to %s\n' "${PG_DSN}" "${ENV_FILE}"
+  elif ! pg_answers; then
     die "PostgreSQL is provisioned but ${PG_DSN} does not answer, so YUZU_TEST_POSTGRES_DSN was NOT exported (exported-but-broken fails the [pg] tests instead of skipping them). Check 'systemctl status postgresql' and ${PGDATA}/pg_hba.conf, then re-run."
+  else
+    pg_same_cluster && SAME=0 || SAME=$?
+    case "${SAME}" in
+      0)
+        ok "cluster answers on ${PG_DSN}"
+        PG_VERIFIED=1
+        write_env_file
+        ;;
+      2) die "cannot verify that the listener on ${PG_DSN} is the cluster at ${PGDATA} (sudo or pg_controldata unavailable), so YUZU_TEST_POSTGRES_DSN was NOT exported." ;;
+      *) die "something answers on ${PG_DSN} but it is not the cluster at ${PGDATA} (another listener on 127.0.0.1:5432?), so YUZU_TEST_POSTGRES_DSN was NOT exported." ;;
+    esac
   fi
 fi
 
