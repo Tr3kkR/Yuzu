@@ -3697,7 +3697,8 @@ Custom properties are operator-defined key-value pairs on agents, separate from 
 
 List all custom properties for a specific agent.
 
-**Permission:** `Infrastructure:Read`
+**Permission:** `Infrastructure:Read`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor; RBAC-off legacy behavior is unchanged)
 
 **Error (503) -- store degraded:** `custom_properties_store` is a migrated Postgres store
 (authoritative posture); a transient database read failure returns `503` rather than an
@@ -3732,7 +3733,8 @@ properties."
 
 Set or update a custom property value on an agent. If a property schema exists for the key, the value is validated against it.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor; RBAC-off legacy behavior is unchanged)
 
 **Request body:**
 
@@ -3783,7 +3785,8 @@ accepting it unvalidated); this change only affects which status code that rejec
 
 Delete a custom property from an agent.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor; RBAC-off legacy behavior is unchanged)
 
 **Response:**
 
