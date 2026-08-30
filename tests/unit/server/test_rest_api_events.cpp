@@ -36,6 +36,7 @@
 #include "execution_tracker.hpp"
 #include "rest_a4_envelope.hpp"
 #include "rest_api_v1.hpp"
+#include "test_approval_manager_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -1097,25 +1098,24 @@ TEST_CASE("GET /api/v1/executions/{id}: permission denied → 403",
 
 namespace {
 
-/// Minimal harness that wires a real ApprovalManager (in-memory SQLite) into
-/// RestApiV1 so the versioned single-approval route can be driven end-to-end
-/// via the TestRouteSink dispatch pattern. `with_manager=false` exercises the
-/// 503-on-unwired-store path.
+/// Minimal harness that wires a real ApprovalManager (ADR-0065, Postgres —
+/// PgSkipGate-style, migration-programme PR 5 commit 2/3) into RestApiV1 so
+/// the versioned single-approval route can be driven end-to-end via the
+/// TestRouteSink dispatch pattern. `with_manager=false` exercises the
+/// 503-on-unwired-store path and deliberately does NOT SKIP on a missing PG
+/// DSN — no database is needed for that path.
 struct RestApprovalsHarness {
     yuzu::server::test::TestRouteSink sink;
-    sqlite3* db{nullptr};
-    std::unique_ptr<ApprovalManager> approvals;
+    std::optional<yuzu::test::ApprovalManagerPg> approvals_bundle;
     bool session_present{true};
     bool perm_grant{true};
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
     explicit RestApprovalsHarness(bool with_manager = true) {
-        if (with_manager) {
-            REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-            approvals = std::make_unique<ApprovalManager>(db);
-            approvals->create_tables();
-        }
+        if (with_manager)
+            approvals_bundle.emplace();
+        ApprovalManager* approvals = with_manager ? approvals_bundle->get() : nullptr;
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response& res) -> std::optional<auth::Session> {
             if (!session_present) {
@@ -1150,24 +1150,23 @@ struct RestApprovalsHarness {
                             /*instruction_store=*/nullptr,
                             /*execution_tracker=*/nullptr,
                             /*schedule_engine=*/nullptr,
-                            /*approval_manager=*/approvals.get(),
+                            /*approval_manager=*/approvals,
                             /*tag_store=*/nullptr,
                             /*audit_store=*/nullptr);
     }
 
-    ~RestApprovalsHarness() {
-        approvals.reset();
-        if (db)
-            sqlite3_close(db);
-    }
+    /// Convenience accessor so a TEST_CASE can write `h->submit(...)`
+    /// directly, only valid when `with_manager=true` (the harness's own
+    /// 503-unwired-store test never dereferences it).
+    ApprovalManager* operator->() const { return approvals_bundle->get(); }
 };
 
 } // namespace
 
 TEST_CASE("GET /api/v1/approvals/{id}: existing approval → 200 with full object",
-          "[events][approvals][a4]") {
+          "[pg][events][approvals][a4]") {
     RestApprovalsHarness h;
-    auto id = h.approvals->submit("def-123", "alice", "tag:prod", "", ApprovalOrigin::kInstruction);
+    auto id = h->submit("def-123", "alice", "tag:prod", "", ApprovalOrigin::kInstruction);
     REQUIRE(id.has_value());
 
     auto res = h.sink.Get("/api/v1/approvals/" + *id);
@@ -1185,7 +1184,7 @@ TEST_CASE("GET /api/v1/approvals/{id}: existing approval → 200 with full objec
 }
 
 TEST_CASE("GET /api/v1/approvals/{id}: unknown id → 404 A4 envelope",
-          "[events][approvals][a4]") {
+          "[pg][events][approvals][a4]") {
     RestApprovalsHarness h;
     auto res = h.sink.Get("/api/v1/approvals/deadbeefdeadbeefdeadbeefdeadbeef");
     REQUIRE(res);
@@ -1209,7 +1208,7 @@ TEST_CASE("GET /api/v1/approvals/{id}: unwired store → 503 A4 envelope with re
     REQUIRE(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
 }
 
-TEST_CASE("GET /api/v1/approvals/{id}: auth denied → 401", "[events][approvals][auth]") {
+TEST_CASE("GET /api/v1/approvals/{id}: auth denied → 401", "[pg][events][approvals][auth]") {
     RestApprovalsHarness h;
     h.session_present = false;
     auto res = h.sink.Get("/api/v1/approvals/anything");
@@ -1217,7 +1216,7 @@ TEST_CASE("GET /api/v1/approvals/{id}: auth denied → 401", "[events][approvals
     REQUIRE(res->status == 401);
 }
 
-TEST_CASE("GET /api/v1/approvals/{id}: permission denied → 403", "[events][approvals][perm]") {
+TEST_CASE("GET /api/v1/approvals/{id}: permission denied → 403", "[pg][events][approvals][perm]") {
     RestApprovalsHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/approvals/anything");

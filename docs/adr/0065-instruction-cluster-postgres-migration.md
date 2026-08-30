@@ -1,9 +1,9 @@
 # ADR-0065: Instruction Cluster (ScheduleEngine / ApprovalManager / ExecutionTracker) → PostgreSQL
 
-- **Status:** Proposed (this ADR lands with commit 1/3 of the PR; ApprovalManager and
-  ExecutionTracker sections are placeholders until commits 2/3 land — see the TODO markers below.
+- **Status:** Proposed (this ADR lands with commit 1/3 of the PR, and now covers commit 2/3;
+  ExecutionTracker's section is a placeholder until commit 3 lands — see its TODO marker below.
   Flip to Accepted once all three components are ported and the sections below are verified.)
-- **Date:** 2026-08-30 (commit 1/3); TBD (final)
+- **Date:** 2026-08-30 (commits 1-2/3); TBD (final)
 - **Deciders:** pg workstream (migration-programme PR 5, the last of the 7-store SQLite→Postgres
   ladder, #1328/#1325/#3653)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009 (including its 2026-08-25
@@ -117,31 +117,106 @@ legacy backfill` line; `server.cpp` calls the shared `legacy_sqlite_probe::warn_
 helper (already established by the earlier Wave 4 PRs) over `instructions.db`, naming the
 `schedules` table, to warn (never fail, never block boot) if the legacy file still holds rows.
 
-### Component 2/3: ApprovalManager — TODO, lands with commit 2
+### Component 2/3: ApprovalManager (this commit)
 
-Per **claim-discipline**: this section intentionally does not assert facts about ApprovalManager's
-ported behavior yet — that work has not happened as of this commit. Planned shape (from the
-migration-programme plan, to be verified against the actual diff when commit 2 lands):
+`ApprovalManager` (`approval_manager.{hpp,cpp}`) stores one-time MCP approval tickets and REST
+instruction-approval requests (`approvals`, one table, 13 columns) — a security control, not
+ordinary CRUD state.
 
-- Schema `approval_manager`, collapsing the SQLite-era v1..v7 ladder into one PG v1 DDL (all
-  columns + all six indexes carried forward; v7's `origin='legacy'` backfill is moot on a fresh
-  start).
-- `consume_ticket`'s one-time CAS (`UPDATE ... WHERE status='approved' AND consumed_at=0
-  RETURNING`) ports shape-for-shape — a security control, not a mechanical schema translation.
-- The one genuinely non-mechanical consumer seam in the whole cluster: `StoreReadError`/
-  `ConsumeError`'s `int extended_errcode` (a raw `sqlite3_extended_errcode()`) is consumed by
-  `mcp_approval_error.hpp` to pick the MCP A4 permanent-vs-transient error arm. This is replaced by
-  a `std::string sqlstate` field + a new `pg_error_class.hpp::is_permanent_pg_error()` classifier;
-  `sqlite_error_class.hpp` is deleted (single includer, verified).
-- The two SQLite `BEGIN EXCLUSIVE` contention tests pinning this classification (`test_
-  approval_manager.cpp`) port to a `.lock_timeout_ms`-based deterministic-error technique.
-- The lazy 7-day expiry sweep (a wall-clock bulk `UPDATE`, not a `DELETE` — the clock-guard
-  seven-part apparatus's own trigger, which fires on bulk DELETEs, is not met) ports
-  shape-preserved; this is a deliberate adjudication, not an oversight (routed-concerns row 38 part
-  6 requires recording which way this went).
+**Not a posture upgrade, unlike ScheduleEngine.** This store was ALREADY fail-closed in the
+SQLite era (a failed migration nulled `db_`, and `server.cpp` never checked `is_open()` before
+this migration only because it never needed to — the null-`db_` state degraded every method to a
+no-op/empty-return, not a crash). Construction is fail-**closed** exactly as before; `server.cpp`
+now additionally checks `is_open()` and sets `startup_failed_` on failure, matching the ladder's
+uniform wiring pattern, but the store's own internal posture is unchanged.
 
-**This section will be rewritten, not merely appended to, once commit 2 lands** — verify against
-the actual diff before trusting anything above as fact.
+**Schema** (Postgres schema `approval_manager`, one table, folding the SQLite-era v1..v7 ladder
+into one PG v1 DDL — every column the ladder ever added is present from creation, and all six
+indexes the ladder accumulated are included; v7's `origin='legacy'` back-fill has no fresh-start
+equivalent — see "Considered and rejected"):
+
+```sql
+CREATE TABLE approvals (
+    id                TEXT    PRIMARY KEY,
+    definition_id     TEXT    NOT NULL,
+    status            TEXT    NOT NULL DEFAULT 'pending',
+    submitted_by      TEXT    NOT NULL DEFAULT '',
+    submitted_at      BIGINT  NOT NULL DEFAULT 0,
+    reviewed_by       TEXT    NOT NULL DEFAULT '',
+    reviewed_at       BIGINT  NOT NULL DEFAULT 0,
+    review_comment    TEXT    NOT NULL DEFAULT '',
+    scope_expression  TEXT    NOT NULL DEFAULT '',
+    consumed_at       BIGINT  NOT NULL DEFAULT 0,
+    consumed_by       TEXT    NOT NULL DEFAULT '',
+    schedule_id       TEXT    NOT NULL DEFAULT '',
+    origin            TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX idx_approvals_status ON approvals(status);
+CREATE INDEX idx_approvals_submitted_at ON approvals(submitted_at);
+CREATE INDEX idx_approvals_definition ON approvals(definition_id);
+CREATE INDEX idx_approvals_schedule_id ON approvals(schedule_id);
+CREATE INDEX idx_approvals_status_submitted ON approvals(status, submitted_at);
+CREATE INDEX idx_approvals_status_consumed_reviewed ON approvals(status, consumed_at, reviewed_at);
+```
+
+**`consume_ticket`'s one-time CAS ports shape-for-shape** — `UPDATE approval_manager.approvals SET
+consumed_at=$1, consumed_by=$2 WHERE id=$3 AND status='approved' AND consumed_at=0 RETURNING 1`,
+row-count-checked via `PQntuples` instead of a bare affected-row count — a security control
+preserved exactly, not a mechanical schema translation. The `#2442` cross-surface/cross-submitter
+binding check (a `get_checked` read ahead of the CAS) is unchanged; it deliberately stays
+non-locking (`FOR UPDATE` was considered and rejected — the origin/submitter fields are immutable
+after insert, and the CAS itself re-checks `status`/`consumed_at`, so there is no TOCTOU window a
+row lock would close).
+
+**The one genuinely non-mechanical consumer seam in the whole cluster: the SQLite-error
+discriminator.** `StoreReadError`/`ConsumeError`'s `int extended_errcode` (a raw
+`sqlite3_extended_errcode()`) — consumed by `mcp_approval_error.hpp::approval_store_error_body` to
+pick the MCP A4 permanent-vs-transient error arm — is replaced by a `std::string sqlstate` field.
+New `server/core/src/pg_error_class.hpp::is_permanent_pg_error(std::string_view)` replaces
+`sqlite_error_class.hpp::is_permanent_sqlite_error` (deleted — verified single includer). Permanent
+= class `42` prefix (schema drift — the closest Postgres analogue of `SQLITE_NOTADB`, and the same
+family `engine_principal_store.cpp`'s own file-local `is_permanent_sqlstate` classifier matches,
+#2456 UP-17), `XX001`/`XX002` (corruption, analogue of `SQLITE_CORRUPT`), `53100` (disk_full,
+analogue of `SQLITE_FULL`), `25006` (read_only_sql_transaction, analogue of `SQLITE_READONLY`);
+everything else — `08*` connection, `40001`/`40P01` serialization/deadlock, `55P03` lock timeout,
+`57014` query canceled, `P0001` a plpgsql `RAISE EXCEPTION` — stays transient, matching this
+repo's existing narrow-classifier precedent. An empty `sqlstate` (no Postgres origin — store not
+open, missing argument, a pool-acquire timeout) classifies transient on its own, exactly as `0`
+did for the SQLite field; the `!mgr.is_open()` disjunct in `approval_store_error_body` is what
+forces the permanent arm for the store-never-opened case regardless.
+
+**Deliberate template divergence, not an oversight:** `ApprovalManager`'s reads do NOT
+degrade-to-empty the way `ScheduleEngine`/`PatchManager` do — a pool-acquire timeout on a read
+surfaces as `StoreReadError{sqlstate=""}` (transient) rather than a silent empty result. This seam
+exists specifically to carry fidelity into the MCP A4 error envelope; collapsing it to
+degrade-to-empty would make a transient pool blip on the recall path indistinguishable from "no
+such ticket."
+
+**Contention tests ported to a Postgres-native technique.** The two SQLite `BEGIN EXCLUSIVE`
+tests pinning the masked-denial classification (`test_approval_manager.cpp`) port to
+`test_engine_principal_store.cpp`'s `.lock_timeout_ms` technique (#2456 precedent): a second raw
+connection holds `LOCK TABLE approval_manager.approvals IN ACCESS EXCLUSIVE MODE`, and the store's
+own pool is built with a short `lock_timeout_ms` so its blocked read fails deterministically with
+SQLSTATE `55P03` — no sleep/retry loop needed, same determinism guarantee the SQLite
+rollback-journal trick gave. A third test (the CAS-step-only fault, negative control for
+`binding_check_unevaluated`) ports its SQLite `BEFORE UPDATE ... RAISE(ABORT)` trigger to a
+Postgres `BEFORE UPDATE` trigger function raising a plpgsql exception (`P0001`, correctly transient
+by the classifier above).
+
+**One MCP-level integration test has NO Postgres equivalent and is deleted, not ported** (see
+"Considered and rejected") — the identical mechanism it tested is pinned precisely at the store
+level by the ported chaos test above.
+
+**Expiry-sweep clock-guard adjudication (routed-concerns row 38, recorded per its part 6):** the
+lazy 7-day expiry sweep inside `submit()` is a wall-clock-cutoff bulk `UPDATE` (two statements —
+stale-pending and approved-unconsumed), never a `DELETE`. The clock-guard seven-part apparatus's
+own trigger condition (bulk *deletes* driven by a wall clock) is not met by this store — rows are
+state-transitioned to `'expired'`, never removed, and remain queryable/auditable indefinitely. This
+is a deliberate reading, not a silent skip: the sweep ports shape-preserved (same two statements,
+same 7-day window, same RETURNING-based counting), and `mtx_` narrows to guard only this
+compound cap-check + sweep + insert sequence — `consume_ticket`'s CAS and every read method no
+longer take it at all, since a single Postgres statement is already atomic under the target row's
+own lock.
 
 ### Component 3/3: ExecutionTracker + `InstructionDbPool` deletion — TODO, lands with commit 3
 
@@ -181,6 +256,25 @@ Per claim-discipline, same caveat as above. Planned shape:
   replay-fingerprint guard would reject a subset-setup sharing that key from a different call site.
   Per-store templates plus one composite template (for the handful of call sites needing 2-3 stores
   together) instead.
+- **Porting v7's `origin='legacy'` back-fill as a Postgres migration step.** Rejected — on a fresh
+  PG v1 schema there are no pre-existing `''`-origin rows for it to rewrite (the population it
+  targeted was specifically pre-v5-column and pre-v7-migration SQLite rows), so the migration would
+  be dead code from creation. The DECODE-side property it protected — an unrecognised stored
+  `origin` value refuses redemption, never grants it — is unaffected and still pinned directly by
+  `approval_origin_from_string`'s own tests.
+- **Isolating the origin-check-specific chaos fault through the full MCP handler** (mirroring the
+  SQLite-era countdown-authorizer test that faulted rung 2 only, letting rung 1's identical-SQL
+  lookup through first). Rejected as infeasible under Postgres's pooled-connection model: a
+  table-level lock (the technique that replaces it for the lookup-rung-only case) blocks the FIRST
+  read to reach the table, which is rung 1's own lookup — it cannot selectively let one read
+  through and fault only the next, the way SQLite's per-connection authorizer callback could.
+  Faithfully isolating rung 2 alone (not rung 1) is preserved instead at the store level, directly
+  against `consume_ticket`, where the origin-check read genuinely is the first and only read for
+  that call.
+- **`FOR UPDATE` on the `#2442` binding-check read.** Rejected — the fields it would protect
+  (origin, submitted_by) are immutable after insert, and the CAS UPDATE already re-checks
+  `status`/`consumed_at` atomically; a row lock would tax every consume call for a race that does
+  not exist.
 
 ## Consequences
 
@@ -191,7 +285,14 @@ Per claim-discipline, same caveat as above. Planned shape:
   invisible (the SQLite era had no availability flag for this store at all) — a monitoring-
   visibility improvement, not a new failure mode: a broken schedule store previously failed silently
   (the poller simply never fired anything), it now fails loudly at boot.
-- Consequences for ApprovalManager/ExecutionTracker: TODO, commits 2/3.
+- **Any pending/approved/consumed approval-ticket evidence from a pre-Postgres build is lost on
+  upgrade** (component 2 of 3). A pending MCP recall or REST instruction-approval outstanding at
+  upgrade must be re-requested; consumed-ticket audit history (the `submitted_by → reviewed_by →
+  consumed_by` evidence chain) does not carry forward. Documented in `docs/user-manual/upgrading.md`.
+- **The MCP A4 error envelope's permanent-vs-transient discriminator is now a Postgres SQLSTATE
+  string, not a SQLite extended errcode** — an internal type change with no client-visible
+  behavior change (the same two response bodies, chosen by the same two-discriminator rule).
+- Consequences for ExecutionTracker: TODO, commit 3.
 
 ## Follow-ups
 

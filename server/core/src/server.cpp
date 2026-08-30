@@ -5090,11 +5090,11 @@ public:
         }
 
         // InstructionDbPool — a SEPARATE SQLite pool onto the SAME instructions.db file,
-        // backing the still-unmigrated ExecutionTracker/ApprovalManager (ADR-0065
-        // migration-programme PR 5 moves these two in a later commit; ScheduleEngine
-        // is already off this pool as of PR 5 commit 1 — see its own wiring block
-        // below). (ADR-0058: only instruction_definitions/instruction_sets moved to
-        // Postgres; these two siblings are unaffected and keep reading/writing the
+        // backing the still-unmigrated ExecutionTracker (ADR-0065 migration-programme
+        // PR 5 moves it in the next commit; ScheduleEngine/ApprovalManager are already
+        // off this pool as of PR 5 commits 1-2 — see their own wiring blocks below).
+        // (ADR-0058: only instruction_definitions/instruction_sets moved to
+        // Postgres; ExecutionTracker is unaffected and keeps reading/writing the
         // physical file directly — it is not retired by this migration). Deliberately
         // NOT gated on instruction_store_'s
         // (now Postgres) is_open() — the two are independent post-migration, unlike
@@ -5118,9 +5118,6 @@ public:
                 // table populates and SSE agent-transition fires
                 // for live drawer updates.
                 agent_service_.set_execution_tracker(execution_tracker_.get());
-
-                approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
-                approval_manager_->create_tables();
             }
         }
 
@@ -5130,7 +5127,7 @@ public:
         // where migration failure was log-only and no caller ever checked an
         // availability flag. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-
         // default amendment): the legacy instructions.db (shared with the still-
-        // SQLite ExecutionTracker/ApprovalManager siblings) is never copied; the
+        // SQLite ExecutionTracker sibling) is never copied; the
         // detect-and-warn obligation still applies, so legacy_sqlite_probe::
         // warn_if_legacy_rows() opens the legacy file read-only and warns (with
         // a row count) only if the `schedules` table actually holds rows.
@@ -5144,6 +5141,26 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
                                                          "ScheduleEngine", {"schedules"});
+            }
+        }
+
+        // ApprovalManager — migrated Postgres store (ADR-0009/0065, schema
+        // `approval_manager`; migration-programme PR 5, 2/3). Construction was
+        // ALREADY fail-closed in the SQLite era (a failed migration nulled
+        // db_) — this is a shape preservation, not a posture upgrade like its
+        // ScheduleEngine sibling. NO backfill, same rationale as ScheduleEngine
+        // above; the legacy `approvals` table is covered by the same
+        // legacy_sqlite_probe call.
+        if (pg_pool_ && !startup_failed_) {
+            approval_manager_ = std::make_unique<ApprovalManager>(*pg_pool_);
+            if (!approval_manager_->is_open()) {
+                spdlog::error("[PG] Refusing to start: approval manager migration/open failed "
+                              "(database reachable but the approval_manager schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
+                                                         "ApprovalManager", {"approvals"});
             }
         }
 

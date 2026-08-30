@@ -4440,7 +4440,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                       " (lookup)");
                         res.set_content(approval_store_error_body(
                                             *approval_manager, a4_error,
-                                            appr_read.error().extended_errcode),
+                                            appr_read.error().sqlstate),
                                         "application/json");
                         return;
                     }
@@ -4739,14 +4739,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         // stops THIS site becoming the fail-open one if rung 1's
                         // lookup ever changes.
                         //
-                        // An OPEN handle whose reads fail permanently — CORRUPT,
-                        // NOTADB, READONLY, FULL — is classified by the shared
-                        // body via `extended_errcode` (#2786 "PR 1c") rather
-                        // than taking the transient "retry forever" arm.
+                        // An OPEN store whose reads fail permanently — schema
+                        // drift, corruption, disk-full, read-only — is
+                        // classified by the shared body via `sqlstate`
+                        // (ADR-0065 port of #2786 "PR 1c") rather than taking
+                        // the transient "retry forever" arm.
                         if (kind == ConsumeFailure::kStoreError) {
                             res.set_content(approval_store_error_body(
                                                 *approval_manager, a4_error,
-                                                consumed.error().extended_errcode),
+                                                consumed.error().sqlstate),
                                             "application/json");
                             return;
                         }

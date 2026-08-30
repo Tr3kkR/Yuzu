@@ -1,17 +1,29 @@
 #include "approval_manager.hpp"
 
-#include "sqlite_raii.hpp"
-#include "migration_runner.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "secure_random.hpp"
 
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <random>
 
 namespace yuzu::server {
 
 namespace {
+
+constexpr const char* kStoreName = "approval_manager";
+
+// Bounded acquires (ADR-0012 §2). No hot-path caller here — every runtime
+// acquire uses the ordinary CRUD budget (matches PatchManager/
+// ScheduleEngine).
+constexpr std::chrono::milliseconds kReadTimeout{1500};
+constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
 // Approval ids are BEARER CAPABILITIES: an MCP approval-ticket recall (#289) is
 // authorized by presenting the id, and the bound args are not secret. A
@@ -41,9 +53,25 @@ int64_t now_epoch() {
         .count();
 }
 
-std::string col_text(sqlite3_stmt* stmt, int col) {
-    auto p = sqlite3_column_text(stmt, col);
-    return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
+const char* col(PGresult* res, int row, int c) {
+    return PQgetisnull(res, row, c) ? "" : PQgetvalue(res, row, c);
+}
+std::string col_str(PGresult* res, int row, int c) { return std::string(col(res, row, c)); }
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+
+// Best-effort SQLSTATE extraction (mirrors engine_principal_store.cpp's
+// file-local helper of the same shape, #2456). Never throws, never
+// null-derefs — `PQresultErrorField` returns nullptr both for "no such
+// field" and "PGresult itself is null". Empty string, not "<none>" — this
+// is a data field (StoreReadError::sqlstate/ConsumeError::sqlstate), not a
+// log-line rendering.
+std::string result_sqlstate(const pg::PgResult& res) {
+    const char* p = res.get() ? PQresultErrorField(res.get(), PG_DIAG_SQLSTATE) : nullptr;
+    return p ? std::string(p) : std::string();
 }
 
 } // namespace
@@ -171,169 +199,101 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
 
 namespace {
 
-Approval row_to_approval(sqlite3_stmt* stmt) {
+Approval row_to_approval(PGresult* r, int i) {
     Approval a;
-    a.id = col_text(stmt, 0);
-    a.definition_id = col_text(stmt, 1);
-    a.status = col_text(stmt, 2);
-    a.submitted_by = col_text(stmt, 3);
-    a.submitted_at = sqlite3_column_int64(stmt, 4);
-    a.reviewed_by = col_text(stmt, 5);
-    a.reviewed_at = sqlite3_column_int64(stmt, 6);
-    a.review_comment = col_text(stmt, 7);
-    a.scope_expression = col_text(stmt, 8);
-    a.consumed_at = sqlite3_column_int64(stmt, 9);
-    a.consumed_by = col_text(stmt, 10);
-    a.schedule_id = col_text(stmt, 11);
-    a.origin = approval_origin_from_string(col_text(stmt, 12));
+    a.id = col_str(r, i, 0);
+    a.definition_id = col_str(r, i, 1);
+    a.status = col_str(r, i, 2);
+    a.submitted_by = col_str(r, i, 3);
+    a.submitted_at = to_i64(col(r, i, 4));
+    a.reviewed_by = col_str(r, i, 5);
+    a.reviewed_at = to_i64(col(r, i, 6));
+    a.review_comment = col_str(r, i, 7);
+    a.scope_expression = col_str(r, i, 8);
+    a.consumed_at = to_i64(col(r, i, 9));
+    a.consumed_by = col_str(r, i, 10);
+    a.schedule_id = col_str(r, i, 11);
+    a.origin = approval_origin_from_string(col_str(r, i, 12));
     return a;
 }
 
 // THE canonical column list — every SELECT that feeds row_to_approval uses
 // this constant so the column order can never drift between call sites.
-const char* kSelectAllCols = "id, definition_id, status, submitted_by, submitted_at, "
-                             "reviewed_by, reviewed_at, review_comment, scope_expression, "
-                             "consumed_at, consumed_by, schedule_id, origin";
+constexpr const char* kSelectAllCols =
+    "id, definition_id, status, submitted_by, submitted_at, "
+    "reviewed_by, reviewed_at, review_comment, scope_expression, "
+    "consumed_at, consumed_by, schedule_id, origin";
+
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets search_path to the store schema for
+    // the migration txn. Runtime statements below schema-qualify explicitly.
+    //
+    // Folds the SQLite-era v1..v7 ladder into a single v1 DDL — every column
+    // the ladder added (consumed_at/consumed_by/schedule_id/origin) and all
+    // six indexes are present from creation on a fresh Postgres schema
+    // (ADR-0009 fresh-start-by-default); there is no pre-existing population
+    // to back-fill, so v7's `origin = 'legacy'` rewrite (the SQLite ladder's
+    // only DML migration) has nothing to run against and is dropped — see
+    // approval_manager.hpp's `to_string()` comment for why the DECODE side
+    // of that distinction (an unrecognised stored value still refuses) stays
+    // live regardless.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE approvals ("
+         "  id                TEXT    PRIMARY KEY,"
+         "  definition_id     TEXT    NOT NULL,"
+         "  status            TEXT    NOT NULL DEFAULT 'pending',"
+         "  submitted_by      TEXT    NOT NULL DEFAULT '',"
+         "  submitted_at      BIGINT  NOT NULL DEFAULT 0,"
+         "  reviewed_by       TEXT    NOT NULL DEFAULT '',"
+         "  reviewed_at       BIGINT  NOT NULL DEFAULT 0,"
+         "  review_comment    TEXT    NOT NULL DEFAULT '',"
+         "  scope_expression  TEXT    NOT NULL DEFAULT '',"
+         "  consumed_at       BIGINT  NOT NULL DEFAULT 0,"
+         "  consumed_by       TEXT    NOT NULL DEFAULT '',"
+         "  schedule_id       TEXT    NOT NULL DEFAULT '',"
+         "  origin            TEXT    NOT NULL DEFAULT ''"
+         ");"
+         "CREATE INDEX idx_approvals_status ON approvals(status);"
+         "CREATE INDEX idx_approvals_submitted_at ON approvals(submitted_at);"
+         "CREATE INDEX idx_approvals_definition ON approvals(definition_id);"
+         "CREATE INDEX idx_approvals_schedule_id ON approvals(schedule_id);"
+         // v6 (SQLite era): make the two status-scoped access patterns
+         // index-covered. MEASURED on a synthetic SQLite table at 1M rows:
+         // query() 112ms -> 0.34ms, the approved-unconsumed sweep 100ms ->
+         // 0.01ms. Postgres's own planner benefits identically from these.
+         "CREATE INDEX idx_approvals_status_submitted ON approvals(status, submitted_at);"
+         "CREATE INDEX idx_approvals_status_consumed_reviewed "
+         "  ON approvals(status, consumed_at, reviewed_at);"},
+    };
+    return kMigrations;
+}
 
 } // namespace
 
-ApprovalManager::ApprovalManager(sqlite3* db) : db_(db) {}
-
-void ApprovalManager::create_tables() {
-    if (!db_)
+ApprovalManager::ApprovalManager(pg::PgPool& pool) : pool_(pool) {
+    // Construction-only unbounded acquire (ADR-0012 §2) — every runtime
+    // acquire elsewhere in this file is bounded.
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error(
+            "ApprovalManager: no database connection at construction ({}) — approval "
+            "manager disabled",
+            pool_.last_error());
         return;
-
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS approvals (
-                id TEXT PRIMARY KEY,
-                definition_id TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                submitted_by TEXT NOT NULL DEFAULT '',
-                submitted_at INTEGER NOT NULL DEFAULT 0,
-                reviewed_by TEXT NOT NULL DEFAULT '',
-                reviewed_at INTEGER NOT NULL DEFAULT 0,
-                review_comment TEXT NOT NULL DEFAULT '',
-                scope_expression TEXT NOT NULL DEFAULT ''
-            );
-            CREATE INDEX IF NOT EXISTS idx_approvals_status
-                ON approvals(status);
-            CREATE INDEX IF NOT EXISTS idx_approvals_submitted_at
-                ON approvals(submitted_at);
-            CREATE INDEX IF NOT EXISTS idx_approvals_definition
-                ON approvals(definition_id);
-        )"},
-        // v2 (#289 / Issue 13.5): one-time-consumption stamp for the MCP
-        // approval-ticket flow. Additive column, NOT NULL DEFAULT 0 (0 =
-        // unconsumed) so it also back-fills every pre-existing row — keeps the
-        // eventual Postgres port a trivial ADD COLUMN.
-        {2, R"(
-            ALTER TABLE approvals ADD COLUMN consumed_at INTEGER NOT NULL DEFAULT 0;
-        )"},
-        // v3 (PR #1796 review H3/N2, SOC-2 CC7.2): WHO consumed the ticket.
-        // consume_ticket() stamps the recalling principal in the same CAS
-        // UPDATE that sets consumed_at, completing the evidence chain
-        // submitted_by → reviewed_by → consumed_by. Additive, '' = unconsumed
-        // (back-fills pre-existing rows; consistent with the v2 pattern).
-        {3, R"(
-            ALTER TABLE approvals ADD COLUMN consumed_by TEXT NOT NULL DEFAULT '';
-        )"},
-        // v4 (M-02, #1806): discriminates a scheduled-fire submission by the
-        // owning schedule so one approval no longer matches every schedule
-        // sharing (submitted_by, definition_id, scope_expression). Empty for
-        // interactive (workflow_routes.cpp) and MCP-minted (mcp_server.cpp)
-        // submissions, which never match a real schedule id.
-        {4, R"(
-            ALTER TABLE approvals ADD COLUMN schedule_id TEXT NOT NULL DEFAULT '';
-            CREATE INDEX IF NOT EXISTS idx_approvals_schedule_id
-                ON approvals(schedule_id);
-        )"},
-        // v5 (#2442): WHICH surface minted the ticket. Additive, '' = no
-        // declared origin — the honest reading for both a pre-v5 row and the
-        // MCP mint that cannot yet declare itself. Deliberately NOT back-filled
-        // to 'instruction': every pre-v5 row would then claim a surface it may
-        // not have come from, and these rows are approval evidence.
-        //
-        // Unchanged from the form that shipped to origin/dev. An earlier cut of
-        // this branch added `UPDATE approvals SET origin = 'legacy'` here as
-        // well as in v7. That edit changed no outcome: v5 runs only on a store
-        // below v5 and v7 runs immediately after it with no write in between
-        // (`migration_runner.cpp`, `if (m.version <= current) continue;` inside
-        // the apply loop), and `DEFAULT ''` leaves exactly the rows v7's
-        // `WHERE origin = ''` already matches. What it cost was real — a
-        // numbered migration is the definition of a data state, so editing one
-        // in place means two stores both stamped 5 can differ. The back-fill
-        // lives in v7 alone.
-        {5, R"(
-            ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT '';
-        )"},
-        // v6: make the two status-scoped access patterns index-covered. Neither
-        // is new, but both became load-bearing when mtx_ started covering the
-        // readers: a consumed ticket keeps status='approved' (consume stamps
-        // consumed_at, it does not restatus the row) and nothing prunes, so the
-        // 'approved' bucket only grows, and idx_approvals_status alone left both
-        // the ORDER BY in query() and the expiry sweep walking it. MEASURED on a
-        // synthetic table: at 1M rows query() 112 ms -> 0.34 ms and the
-        // approved-unconsumed sweep 100 ms -> 0.01 ms, temp B-tree gone. That
-        // matters beyond latency because ScheduleRunner issues three query()
-        // calls per tick on the same mutex an MCP approval recall needs.
-        {6, R"(
-            CREATE INDEX IF NOT EXISTS idx_approvals_status_submitted
-                ON approvals(status, submitted_at);
-            CREATE INDEX IF NOT EXISTS idx_approvals_status_consumed_reviewed
-                ON approvals(status, consumed_at, reviewed_at);
-        )"},
-        // v7 (#2442): the ONLY back-fill. '' is the GRANTING case at redemption,
-        // so every row carrying it — whether it predates the column or predates
-        // this migration — has to be moved off it. This reaches both populations
-        // in one step: a store below v5 gets the column from v5 (all rows '')
-        // and is rewritten here in the same loop, and a store already at >= 5,
-        // which never re-runs v5, is rewritten here too. No release carries the
-        // column, but every dev/CI/UAT database tracking origin/dev since
-        // 2026-08-02 does.
-        //
-        // Rewrites EVERY remaining '' row, not just the pre-column ones. A
-        // discriminator was attempted and does not exist: the obvious one is
-        // `submitted_at < schema_meta.upgraded_at`, but the runner re-stamps
-        // `upgraded_at` after EVERY migration, so by the time v7 runs the value
-        // names when v6 finished — seconds ago — not when the column appeared.
-        // A test caught this by asserting a post-column undeclared mint SURVIVES;
-        // it did not. v6 COULD have observed v5's stamp — `set_version` fires
-        // after each migration's SQL, so during v6 the value still named v5's
-        // completion. But v6 has already shipped to exactly the databases this
-        // needs to reach, so the window closed before it was noticed. No
-        // migration addable NOW can see it: every later one overwrites the
-        // stamp. Stated precisely because "impossible" would send the next
-        // author looking for a different mechanism that does not exist, when
-        // the real lesson is that a migration carrying a back-fill must be
-        // written in the same step as the column.
-        //
-        // So this is deliberately blunt: an undeclared MCP ticket outstanding at
-        // upgrade stops redeeming and must be re-requested. That is fail-closed,
-        // bounded by the 7-day approval window, and identical whether the
-        // database arrives via a release or via origin/dev.
-        //
-        // Surgical about everything else, though: `WHERE origin = ''` is what
-        // keeps a DECLARED surface intact. Drop the predicate and every row from
-        // every surface is clobbered to the sentinel and refused. Pinned.
-        //
-        // Matches nothing on a fresh install: v1..v6 run first and the table is
-        // empty. Idempotent: `origin = ''` is false once rewritten.
-        {7, R"(
-            UPDATE approvals SET origin = 'legacy' WHERE origin = '';
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
-        // Fail closed (governance sre-BLOCKING-1 / HC-1): a failed v2 migration
-        // means the `consumed_at` column is absent, so every get/find_pending/
-        // consume_ticket/query SELECT would fail — the whole MCP write + approval
-        // surface would be silently dead behind a green readyz. NULL db_ so
-        // is_open() reports false and /readyz goes red. Do NOT close: the handle
-        // is BORROWED (shared with ExecutionTracker/ScheduleEngine on the
-        // instruction pool); the pool owner closes it.
-        spdlog::error("ApprovalManager: schema migration failed — marking store unavailable");
-        db_ = nullptr;
     }
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("ApprovalManager: schema migration failed — approval manager disabled");
+        return;
+    }
+    open_ = true;
+    // ADR-0009's 2026-08-25 fresh-start-by-default amendment: no
+    // migrate_from_sqlite here, unconditionally, no flag. The caller
+    // (server.cpp) separately runs legacy_sqlite_probe::warn_if_legacy_rows()
+    // over the legacy instructions.db so a locally-wrong "no production
+    // fleet" premise still gets a loud signal.
+    spdlog::info("ApprovalManager initialized (schema {}) — fresh start, no legacy backfill",
+                 kStoreName);
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +304,7 @@ std::expected<std::string, std::string>
 ApprovalManager::submit(const std::string& definition_id, const std::string& submitted_by,
                         const std::string& scope_expression, const std::string& schedule_id,
                         ApprovalOrigin origin) {
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (definition_id.empty())
         return std::unexpected("definition_id is required");
@@ -372,26 +332,20 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 
     std::lock_guard lock(mtx_);
 
-    // Queue size limit: prevent unbounded growth (G4-UHP-MCP-004)
+    auto id_r = generate_id();
+    if (!id_r)
+        return std::unexpected(id_r.error());
+    auto id = *id_r;
+    auto ts = now_epoch();
     constexpr int kMaxPendingApprovals = 1000;
-    {
-        sqlite3_stmt* cnt = nullptr;
-        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'",
-                               -1, &cnt, nullptr) == SQLITE_OK) {
-            if (sqlite3_step(cnt) == SQLITE_ROW) {
-                int pending = sqlite3_column_int(cnt, 0);
-                if (pending >= kMaxPendingApprovals) {
-                    sqlite3_finalize(cnt);
-                    return std::unexpected("approval queue is full (" +
-                                           std::to_string(kMaxPendingApprovals) + " pending)");
-                }
-            }
-            sqlite3_finalize(cnt);
-        }
-    }
+    constexpr int64_t k7Days = 7 * 24 * 3600;
+    auto cutoff = std::to_string(ts - k7Days);
 
-    // Lazy expiry sweep (runs on every mint, under mtx_). One shared 7-day
-    // window, deliberately simple:
+    // Queue cap + lazy expiry sweep + insert as one bounded transaction
+    // (runs on every mint, still serialized process-locally by mtx_ above —
+    // multi-replica coordination of this check-then-act is an ADR-2002 (HA)
+    // concern, not addressed here). One shared 7-day expiry window,
+    // deliberately simple:
     //   * PENDING tickets nobody reviewed within 7 days of submission expire.
     //   * APPROVED-but-unconsumed tickets expire 7 days after their review
     //     (PR #1796 review N3): an approved ticket is a live one-time
@@ -401,73 +355,60 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     //     path treats an expired ticket exactly like a rejected one (submit a
     //     fresh request); consumed tickets (consumed_at != 0) are history, not
     //     capabilities, and are never touched.
-    // Counts come from stepping RETURNING rows on the statement itself —
-    // NEVER sqlite3_changes() after step on this shared FULLMUTEX connection
-    // (#1033; the L2 convention finding on PR #1796).
-    constexpr int64_t k7Days = 7 * 24 * 3600;
-    {
-        auto cutoff = now_epoch() - k7Days;
-        sqlite3_stmt* exp = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "UPDATE approvals SET status = 'expired' "
-                               "WHERE status = 'pending' AND submitted_at < ? "
-                               "RETURNING 1",
-                               -1, &exp, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(exp, 1, cutoff);
-            int expired = 0;
-            while (sqlite3_step(exp) == SQLITE_ROW)
-                ++expired;
-            sqlite3_finalize(exp);
-            if (expired > 0)
-                spdlog::info("ApprovalManager: expired {} stale pending approvals", expired);
+    // Counts come from PQntuples on the RETURNING result — never a bare
+    // affected-row count (#1033's SQLite shared-connection race has no
+    // Postgres analogue on a per-lease connection, but RETURNING is kept as
+    // the uniform idiom across every store in this ladder).
+    std::string queue_full_error;
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult cnt = pg::exec_params(
+            conn, "SELECT COUNT(*) FROM approval_manager.approvals WHERE status = 'pending'",
+            std::vector<std::string>{});
+        if (cnt.status() != PGRES_TUPLES_OK)
+            return false;
+        int pending = static_cast<int>(to_i64(col(cnt.get(), 0, 0)));
+        if (pending >= kMaxPendingApprovals) {
+            queue_full_error = "approval queue is full (" +
+                               std::to_string(kMaxPendingApprovals) + " pending)";
+            return false;
         }
-        sqlite3_stmt* expa = nullptr;
-        if (sqlite3_prepare_v2(db_,
-                               "UPDATE approvals SET status = 'expired' "
-                               "WHERE status = 'approved' AND consumed_at = 0 "
-                               "AND reviewed_at < ? RETURNING 1",
-                               -1, &expa, nullptr) == SQLITE_OK) {
-            sqlite3_bind_int64(expa, 1, cutoff);
-            int expired = 0;
-            while (sqlite3_step(expa) == SQLITE_ROW)
-                ++expired;
-            sqlite3_finalize(expa);
-            if (expired > 0)
-                spdlog::info("ApprovalManager: expired {} approved-but-unconsumed approval tickets",
-                             expired);
-        }
+
+        pg::PgResult exp = pg::exec_params(
+            conn,
+            "UPDATE approval_manager.approvals SET status = 'expired' "
+            "WHERE status = 'pending' AND submitted_at < $1 RETURNING 1",
+            std::vector<std::string>{cutoff});
+        if (exp.status() != PGRES_TUPLES_OK)
+            return false;
+        if (int n = PQntuples(exp.get()); n > 0)
+            spdlog::info("ApprovalManager: expired {} stale pending approvals", n);
+
+        pg::PgResult expa = pg::exec_params(
+            conn,
+            "UPDATE approval_manager.approvals SET status = 'expired' "
+            "WHERE status = 'approved' AND consumed_at = 0 AND reviewed_at < $1 RETURNING 1",
+            std::vector<std::string>{cutoff});
+        if (expa.status() != PGRES_TUPLES_OK)
+            return false;
+        if (int n = PQntuples(expa.get()); n > 0)
+            spdlog::info("ApprovalManager: expired {} approved-but-unconsumed approval tickets", n);
+
+        pg::PgResult ins = pg::exec_params(
+            conn,
+            "INSERT INTO approval_manager.approvals "
+            "(id, definition_id, status, submitted_by, submitted_at, "
+            " reviewed_by, reviewed_at, review_comment, scope_expression, schedule_id, origin) "
+            "VALUES ($1,$2,'pending',$3,$4,'',0,'',$5,$6,$7)",
+            std::vector<std::string>{id, definition_id, submitted_by, std::to_string(ts),
+                                     scope_expression, schedule_id, to_string(origin)});
+        return ins.status() == PGRES_COMMAND_OK;
+    });
+
+    if (!ok) {
+        if (!queue_full_error.empty())
+            return std::unexpected(queue_full_error);
+        return std::unexpected("insert failed (pool degraded or transaction failed)");
     }
-
-    auto id_r = generate_id();
-    if (!id_r)
-        return std::unexpected(id_r.error());
-    auto id = *id_r;
-    auto ts = now_epoch();
-
-    const char* sql = R"(
-        INSERT INTO approvals (id, definition_id, status, submitted_by, submitted_at,
-                               reviewed_by, reviewed_at, review_comment, scope_expression,
-                               schedule_id, origin)
-        VALUES (?, ?, 'pending', ?, ?, '', 0, '', ?, ?, ?)
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, definition_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 4, ts);
-    sqlite3_bind_text(stmt, 5, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 6, schedule_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 7, to_string(origin), -1, SQLITE_TRANSIENT);
-
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
-        sqlite3_finalize(stmt);
-        return std::unexpected("insert failed: " + err);
-    }
-    sqlite3_finalize(stmt);
 
     spdlog::info("ApprovalManager: submitted approval {} for definition {} by {}", redact_id(id),
                  definition_id, submitted_by);
@@ -480,35 +421,35 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
 
 std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
     std::vector<Approval> results;
-    if (!db_)
+    if (!open_)
+        return results;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return results;
 
-    std::lock_guard lock(mtx_);
-
-    std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE 1=1";
-    std::vector<std::string> binds;
+    std::string sql =
+        std::string("SELECT ") + kSelectAllCols + " FROM approval_manager.approvals WHERE 1=1";
+    std::vector<std::string> params;
+    int idx = 1;
 
     if (!q.status.empty()) {
-        sql += " AND status = ?";
-        binds.push_back(q.status);
+        sql += " AND status = $" + std::to_string(idx++);
+        params.push_back(q.status);
     }
     if (!q.submitted_by.empty()) {
-        sql += " AND submitted_by = ?";
-        binds.push_back(q.submitted_by);
+        sql += " AND submitted_by = $" + std::to_string(idx++);
+        params.push_back(q.submitted_by);
     }
     sql += " ORDER BY submitted_at DESC LIMIT 100";
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK)
         return results;
 
-    for (int i = 0; i < static_cast<int>(binds.size()); ++i)
-        sqlite3_bind_text(stmt, i + 1, binds[i].c_str(), -1, SQLITE_TRANSIENT);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW)
-        results.push_back(row_to_approval(stmt));
-
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(row_to_approval(res.get(), i));
     return results;
 }
 
@@ -517,44 +458,35 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
 // ---------------------------------------------------------------------------
 
 int ApprovalManager::pending_count() const {
-    if (!db_)
+    if (!open_)
+        return 0;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return 0;
 
-    std::lock_guard lock(mtx_);
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending'", -1,
-                           &stmt, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM approval_manager.approvals WHERE status = 'pending'",
+        std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK)
         return 0;
-
-    int count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        count = sqlite3_column_int(stmt, 0);
-
-    sqlite3_finalize(stmt);
-    return count;
+    return static_cast<int>(to_i64(col(res.get(), 0, 0)));
 }
 
 int ApprovalManager::pending_count_for(const std::string& submitted_by) const {
-    if (!db_ || submitted_by.empty())
+    if (!open_ || submitted_by.empty())
+        return 0;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return 0;
 
-    std::lock_guard lock(mtx_);
-
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(
-            db_, "SELECT COUNT(*) FROM approvals WHERE status = 'pending' AND submitted_by = ?", -1,
-            &stmt, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT COUNT(*) FROM approval_manager.approvals "
+        "WHERE status = 'pending' AND submitted_by = $1",
+        std::vector<std::string>{submitted_by});
+    if (res.status() != PGRES_TUPLES_OK)
         return 0;
-
-    sqlite3_bind_text(stmt, 1, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
-
-    int count = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        count = sqlite3_column_int(stmt, 0);
-
-    sqlite3_finalize(stmt);
-    return count;
+    return static_cast<int>(to_i64(col(res.get(), 0, 0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -568,41 +500,30 @@ std::optional<Approval> ApprovalManager::get(const std::string& id) const {
 
 std::expected<std::optional<Approval>, StoreReadError>
 ApprovalManager::get_checked(const std::string& id) const {
-    if (!db_)
+    if (!open_)
         return std::unexpected(StoreReadError{"database not open"});
     if (id.empty())
         return std::unexpected(StoreReadError{"approval id is required"});
 
-    std::lock_guard lock(mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(StoreReadError{"approval store temporarily unavailable "
+                                              "(pool exhausted)"});
 
-    std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE id = ?";
-    // SqliteStmt, not a raw sqlite3_stmt*: row_to_approval() below builds
-    // several std::strings from column data, which is throw-capable, and
-    // that call sits BETWEEN step and any manual finalize — an owner is what
-    // closes that leak window, not call-site ordering (Sol/gpt-5.6-sol
-    // opine review, 2026-08-10: this file's own reordering fix for the
-    // FAILURE branch's std::string build left the SUCCESS branch's
-    // row_to_approval() with the identical exposure).
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
-        return std::unexpected(StoreReadError{std::string("prepare failed: ") + sqlite3_errmsg(db_),
-                                              sqlite3_extended_errcode(db_)});
-
-    sqlite3_bind_text(stmt.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
-
-    std::optional<Approval> out;
-    const auto rc = sqlite3_step(stmt.get());
-    if (rc == SQLITE_ROW)
-        out = row_to_approval(stmt.get());
+    std::string sql = std::string("SELECT ") + kSelectAllCols +
+                      " FROM approval_manager.approvals WHERE id = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
 
     // A read that FAILED is not a read that found nothing. Collapsing the two
     // is what let a store error be reported to the operator as "this one-time
     // capability is spent" — see the pre-consume path in consume_ticket.
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
-        const int extended = sqlite3_extended_errcode(db_);
-        return std::unexpected(
-            StoreReadError{std::string("read failed: ") + sqlite3_errmsg(db_), extended});
-    }
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(StoreReadError{
+            std::string("read failed: ") + PQresultErrorMessage(res.get()), result_sqlstate(res)});
+
+    std::optional<Approval> out;
+    if (PQntuples(res.get()) > 0)
+        out = row_to_approval(res.get(), 0);
     return out;
 }
 
@@ -618,10 +539,11 @@ ApprovalManager::get_checked(const std::string& id) const {
 std::optional<Approval> ApprovalManager::find_pending(const std::string& definition_id,
                                                       const std::string& submitted_by,
                                                       const std::string& scope_expression) const {
-    if (!db_ || definition_id.empty() || submitted_by.empty())
+    if (!open_ || definition_id.empty() || submitted_by.empty())
         return std::nullopt;
-
-    std::lock_guard lock(mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
 
     // NO `LIMIT 1`. The newest match is not necessarily a usable one: since the
     // mint-time namespace refusal was removed, a ticket carrying a declared
@@ -640,19 +562,18 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
     // same key is a perfectly good dedup hit, and skipping it would mint a
     // duplicate.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
-                      " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
-                      "AND scope_expression = ? AND status = 'pending' "
+                      " FROM approval_manager.approvals WHERE definition_id = $1 "
+                      "AND submitted_by = $2 AND scope_expression = $3 AND status = 'pending' "
                       "ORDER BY submitted_at DESC";
-    SqliteStmt stmt;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{definition_id, submitted_by, scope_expression});
+    if (res.status() != PGRES_TUPLES_OK)
         return std::nullopt;
 
-    sqlite3_bind_text(stmt.get(), 1, definition_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
-
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        Approval a = row_to_approval(stmt.get());
+    const int rows = PQntuples(res.get());
+    for (int i = 0; i < rows; ++i) {
+        Approval a = row_to_approval(res.get(), i);
         if (!declares_non_mcp_surface(a.origin))
             return a;
     }
@@ -666,22 +587,22 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
                                 const ConsumePrecondition& precondition) {
-    // These three guards are NOT store faults — `extended_errcode` stays at
-    // its default 0. For `!db_`, that default is harmless: `!mgr.is_open()`
+    // These three guards are NOT store faults — `sqlstate` stays at its
+    // default empty. For `!open_`, that default is harmless: `!mgr.is_open()`
     // independently forces `approval_store_error_body`'s PERMANENT arm
-    // regardless of `extended_errcode`, so this guard never reaches the
-    // TRANSIENT wording. For the other two (empty id/consumed_by), `db_` IS
-    // open, so `extended_errcode=0` alone (not one of the four permanent
-    // codes) DOES take the transient arm ("retry this call unchanged") if
-    // this `kStoreError` ever reaches `approval_store_error_body` — and
-    // that's misleading, since these are caller/argument errors, not
-    // conditions that clear on their own. Harmless today: the MCP recall
-    // (the sole production caller) pre-validates a non-empty `supplied_id`
-    // before calling, and `consumed_by` is the session's own username, never
-    // empty for an authenticated caller. A future caller that reaches this
+    // regardless of `sqlstate`, so this guard never reaches the TRANSIENT
+    // wording. For the other two (empty id/consumed_by), the store IS
+    // open, so an empty `sqlstate` alone (not one of the permanent classes)
+    // DOES take the transient arm ("retry this call unchanged") if this
+    // `kStoreError` ever reaches `approval_store_error_body` — and that's
+    // misleading, since these are caller/argument errors, not conditions
+    // that clear on their own. Harmless today: the MCP recall (the sole
+    // production caller) pre-validates a non-empty `supplied_id` before
+    // calling, and `consumed_by` is the session's own username, never empty
+    // for an authenticated caller. A future caller that reaches this
     // function without that pre-validation should not trust the transient
     // wording for these two cases.
-    if (!db_)
+    if (!open_)
         return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, "database not open"});
     if (id.empty())
         return std::unexpected(
@@ -732,7 +653,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // submitter check below extends this SAME read rather than adding a 3rd
     // SELECT, for exactly that reason.
     {
-        auto row = get_checked(id); // takes mtx_ itself — must be outside any lock
+        auto row = get_checked(id); // takes its own bounded lease
         if (!row) {
             // #2786 arm 1: this read failing means neither the origin nor the
             // submitter comparison below runs, so a foreign-origin OR
@@ -745,7 +666,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
                         "(store fault: {}); refusing closed",
                         redact_id(id), row.error().message);
             return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
-                                                row.error().extended_errcode,
+                                                row.error().sqlstate,
                                                 /*binding_check_unevaluated=*/true});
         }
         if (*row && declares_non_mcp_surface((*row)->origin))
@@ -773,10 +694,10 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         // is not there. Telling the operator a live human-approved ticket is
         // spent, because SQLite was busy for a moment, is the burn class #2443
         // exists to close, re-entered through the taxonomy.
-        auto row = get_checked(id); // takes mtx_ itself — must be outside the lock below
+        auto row = get_checked(id); // takes its own bounded lease
         if (!row)
             return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
-                                                row.error().extended_errcode});
+                                                row.error().sqlstate});
         // A row that cannot transition is reported WITHOUT running the
         // precondition: the callback may be costly or emit audit, and the CAS
         // below would decline this row anyway. Same message as the CAS decline,
@@ -818,43 +739,39 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         }
     }
 
-    std::lock_guard lock(mtx_);
+    // Atomic CAS: only an approved, not-yet-consumed ticket transitions. A
+    // single Postgres statement is already atomic under the target row's
+    // own lock — no app-level mutex needed (mtx_ is scoped to submit()'s
+    // compound cap-check + sweep + insert only; see the header). RETURNING
+    // carries the "row matched" signal in the result's row count, the same
+    // uniform idiom every store in this ladder uses instead of a bare
+    // affected-row count. consumed_by rides the same UPDATE so who/when can
+    // never disagree.
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected(
+            ConsumeError{ConsumeFailure::kStoreError, "approval store temporarily unavailable "
+                                                       "(pool exhausted)"});
 
-    // Atomic CAS: only an approved, not-yet-consumed ticket transitions.
-    // RETURNING carries the "row matched" signal in the step return code, so we
-    // never call sqlite3_changes() on the shared FULLMUTEX connection (#1033).
-    // SQLITE_ROW == this call consumed it; SQLITE_DONE == already used / not
-    // approved / absent (replay-safe: a second concurrent recall loses here).
-    // consumed_by rides the same UPDATE so who/when can never disagree.
-    const char* sql = R"(
-        UPDATE approvals SET consumed_at = ?, consumed_by = ?
-        WHERE id = ? AND status = 'approved' AND consumed_at = 0
-        RETURNING 1
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
-                                            std::string("prepare failed: ") + sqlite3_errmsg(db_),
-                                            sqlite3_extended_errcode(db_)});
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE approval_manager.approvals SET consumed_at = $1, consumed_by = $2 "
+        "WHERE id = $3 AND status = 'approved' AND consumed_at = 0 RETURNING 1",
+        std::vector<std::string>{std::to_string(now_epoch()), consumed_by, id});
 
-    sqlite3_bind_int64(stmt, 1, now_epoch());
-    sqlite3_bind_text(stmt, 2, consumed_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, id.c_str(), -1, SQLITE_TRANSIENT);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(ConsumeError{
+            ConsumeFailure::kStoreError,
+            std::string("consume failed: ") + PQresultErrorMessage(res.get()),
+            result_sqlstate(res)});
 
-    auto rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-
-    if (rc == SQLITE_ROW) {
+    if (PQntuples(res.get()) > 0) {
         spdlog::info("ApprovalManager: consumed approval ticket {} by {}", redact_id(id), consumed_by);
         return {};
     }
-    if (rc == SQLITE_DONE)
-        return std::unexpected(
-            ConsumeError{ConsumeFailure::kNotConsumable,
-                         kNotConsumableMessage});
-    return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
-                                        std::string("consume failed: ") + sqlite3_errmsg(db_),
-                                        sqlite3_extended_errcode(db_)});
+    // Zero rows matched — already used / not approved / absent (replay-safe:
+    // a second concurrent recall loses here).
+    return std::unexpected(ConsumeError{ConsumeFailure::kNotConsumable, kNotConsumableMessage});
 }
 
 // ---------------------------------------------------------------------------
@@ -877,73 +794,68 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
                                                                     const std::string& status,
                                                                     const std::string& reviewer,
                                                                     const std::string& comment) {
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (id.empty())
         return std::unexpected("approval id is required");
     if (reviewer.empty())
         return std::unexpected("reviewer is required");
 
-    std::lock_guard lock(mtx_);
+    // Fetch the current approval to validate state (a friendly error
+    // message only — the real TOCTOU guard is the UPDATE's own
+    // WHERE status='pending' below, not this read).
+    {
+        auto lease = pool_.try_acquire_for(kReadTimeout);
+        if (!lease)
+            return std::unexpected("approval store temporarily unavailable (pool exhausted)");
+        pg::PgResult sel = pg::exec_params(
+            lease.get(),
+            "SELECT status, submitted_by FROM approval_manager.approvals WHERE id = $1",
+            std::vector<std::string>{id});
+        if (sel.status() != PGRES_TUPLES_OK)
+            return std::unexpected(std::string("read failed: ") + PQresultErrorMessage(sel.get()));
+        if (PQntuples(sel.get()) == 0)
+            return std::unexpected("approval not found: " + id);
 
-    // Fetch the current approval to validate state
-    sqlite3_stmt* sel = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT status, submitted_by FROM approvals WHERE id = ?", -1, &sel,
-                           nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+        auto current_status = col_str(sel.get(), 0, 0);
+        auto submitted_by = col_str(sel.get(), 0, 1);
 
-    sqlite3_bind_text(sel, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        // Cannot review an already-reviewed approval
+        if (current_status != "pending")
+            return std::unexpected("approval already reviewed (status: " + current_status + ")");
 
-    if (sqlite3_step(sel) != SQLITE_ROW) {
-        sqlite3_finalize(sel);
-        return std::unexpected("approval not found: " + id);
+        // Ownership rule: reviewer must not be the submitter
+        if (reviewer == submitted_by)
+            return std::unexpected("reviewer cannot be the same as the submitter");
     }
 
-    auto current_status = col_text(sel, 0);
-    auto submitted_by = col_text(sel, 1);
-    sqlite3_finalize(sel);
-
-    // Cannot review an already-reviewed approval
-    if (current_status != "pending")
-        return std::unexpected("approval already reviewed (status: " + current_status + ")");
-
-    // Ownership rule: reviewer must not be the submitter
-    if (reviewer == submitted_by)
-        return std::unexpected("reviewer cannot be the same as the submitter");
-
     // Atomic update; WHERE status = 'pending' prevents TOCTOU double-approve
-    // (G4-UHP-MCP-005). RETURNING carries the "row matched" signal in the step
-    // return code (SQLITE_ROW = this call transitioned it; SQLITE_DONE = already
-    // reviewed / not pending), so we never call sqlite3_changes() on the shared
-    // FULLMUTEX connection — approve/reject is now reachable via MCP, and the
-    // changes()-race would mis-report a security decision (#1033 / governance UP-2).
-    const char* sql = R"(
-        UPDATE approvals SET status = ?, reviewed_by = ?, reviewed_at = ?, review_comment = ?
-        WHERE id = ? AND status = 'pending' RETURNING 1
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    // (G4-UHP-MCP-005). RETURNING carries the "row matched" signal in the
+    // result's row count — approve/reject is reachable via MCP, and a security
+    // decision must not be mis-reported by a racy affected-row count
+    // (#1033 / governance UP-2 — the Postgres port keeps the same idiom
+    // every store in this ladder uses, though the SQLite-era shared-
+    // connection race this specifically defended against has no direct
+    // Postgres analogue on a per-lease connection).
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("approval store temporarily unavailable (pool exhausted)");
 
-    sqlite3_bind_text(stmt, 1, status.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, reviewer.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 3, now_epoch());
-    sqlite3_bind_text(stmt, 4, comment.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 5, id.c_str(), -1, SQLITE_TRANSIENT);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE approval_manager.approvals SET status = $1, reviewed_by = $2, "
+        "reviewed_at = $3, review_comment = $4 WHERE id = $5 AND status = 'pending' "
+        "RETURNING 1",
+        std::vector<std::string>{status, reviewer, std::to_string(now_epoch()), comment, id});
 
-    auto rc = sqlite3_step(stmt);
-    if (rc == SQLITE_ROW) {
-        sqlite3_finalize(stmt);
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("update failed: ") + PQresultErrorMessage(res.get()));
+
+    if (PQntuples(res.get()) > 0) {
         spdlog::info("ApprovalManager: {} approval {} by {}", status, redact_id(id), reviewer);
         return {};
     }
-    if (rc == SQLITE_DONE) {
-        sqlite3_finalize(stmt);
-        return std::unexpected("approval already reviewed by another user");
-    }
-    auto err = std::string(sqlite3_errmsg(db_));
-    sqlite3_finalize(stmt);
-    return std::unexpected("update failed: " + err);
+    return std::unexpected("approval already reviewed by another user");
 }
 
 } // namespace yuzu::server

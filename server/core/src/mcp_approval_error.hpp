@@ -6,7 +6,7 @@
 
 #include "approval_manager.hpp"
 #include "mcp_jsonrpc.hpp"
-#include "sqlite_error_class.hpp"
+#include "pg_error_class.hpp"
 
 namespace yuzu::server::mcp {
 
@@ -23,12 +23,13 @@ namespace yuzu::server::mcp {
 /// on the substrate already failing to serve it.
 ///
 /// Permanent has TWO independent discriminators — either alone classifies the
-/// failure permanent: `!mgr.is_open()` (a null handle does not recover
-/// without an operator restarting the server), or
-/// `is_permanent_sqlite_error(extended_errcode)` (an OPEN handle whose reads
-/// fail permanently — CORRUPT, NOTADB, READONLY, FULL; #2786 "PR 1c"). The
-/// caller passes `extended_errcode` rather than this function defaulting it,
-/// so a call site cannot silently omit the discriminator and reintroduce the
+/// failure permanent: `!mgr.is_open()` (a store that never opened does not
+/// recover without an operator restarting the server), or
+/// `is_permanent_pg_error(sqlstate)` (an OPEN store whose reads fail
+/// permanently — schema drift, corruption, disk-full, read-only; ADR-0065
+/// port of #2786 "PR 1c", was `is_permanent_sqlite_error(extended_errcode)`).
+/// The caller passes `sqlstate` rather than this function defaulting it, so
+/// a call site cannot silently omit the discriminator and reintroduce the
 /// gap the second arm closes.
 ///
 /// The transient arm carries a concrete `retry_after_ms` because invariant A5
@@ -60,8 +61,8 @@ concept ApprovalA4Error =
 template <ApprovalA4Error A4Error>
 [[nodiscard]] std::string approval_store_error_body(const ApprovalManager& mgr,
                                                      const A4Error& a4_error,
-                                                     int extended_errcode) {
-    if (!mgr.is_open() || is_permanent_sqlite_error(extended_errcode))
+                                                     std::string_view sqlstate) {
+    if (!mgr.is_open() || is_permanent_pg_error(sqlstate))
         return a4_error(kInternalError, "approval store unavailable",
                         "this will NOT clear on retry, the approval was not consumed and does "
                         "not need re-requesting while the 7-day window holds. Escalate to an "
