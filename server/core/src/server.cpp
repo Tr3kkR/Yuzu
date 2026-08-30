@@ -2528,8 +2528,8 @@ public:
         // YuzuSessionReapClockAnomaly's `increase() > 0` alert is meaningful.
         metrics_.describe("yuzu_auth_session_reap_clock_anomaly_total",
                           "Session reap passes declined due to an implausible (forward or backward) "
-                          "wall-clock reading vs the persisted anchor — the DB-clock-integrity "
-                          "signal for durable sessions (ADR-2002 §4)",
+                          "wall-clock reading vs the persisted anchor - the DB-clock-integrity "
+                          "signal for durable sessions (ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
