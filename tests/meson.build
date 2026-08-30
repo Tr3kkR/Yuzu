@@ -1608,9 +1608,7 @@ if build_server
   # a bespoke list: [rest_api_t2] is a whole-file tag in test_rest_api_t2.cpp
   # also carried by 9 device_token/software_deployment cases already
   # claimed by shard K, and [events] is shared with 5 discovery-tagged
-  # cases already claimed by shard K's [pg][discovery] sibling branch (not
-  # itself a shard-K branch — discovery lives in the [pg] catch-all's own
-  # exclusion list, homed by whichever shard's positive filter names it) —
+  # cases already claimed by shard J's [pg][discovery] positive branch —
   # reusing the identical suffix here excludes exactly those already-homed
   # cases from shard L instead of duplicating them, which a naive
   # `[pg][tag]` OR-list without the suffix would have done (verified: the

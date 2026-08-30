@@ -988,9 +988,11 @@ have introduced (a transient Graph glitch wiping every synced group).
 `ScheduleEngine`, `ApprovalManager`, and `ExecutionTracker` move from the
 shared SQLite `instructions.db` file (via `InstructionDbPool`) to their own
 independent PostgreSQL schemas in this release (migration-programme PR 5,
-the last of the 7 components the postgres-migration ladder had never
-tracked — schemas `schedule_engine`, `approval_manager`, `execution_tracker`
-respectively). This is a **fresh-start cutover with no data migration**
+closing 3 of the last 4 components the postgres-migration ladder had never
+tracked — `WorkflowEngine`/ADR-0064 is the one still outstanding, staged
+separately — schemas `schedule_engine`, `approval_manager`,
+`execution_tracker` respectively). This is a **fresh-start cutover with no
+data migration**
 (ADR-0009) — the legacy `instructions.db` is **never read** for data on
 upgrade. `InstructionDbPool` itself is deleted; `instructions.db` is retired
 and no Yuzu store writes to it again.

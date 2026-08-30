@@ -7,8 +7,9 @@
   suite (2976 cases, 2895 passed, 81 pre-existing unrelated skips) pass with zero failures;
   `check-pg-shard-partition.py` confirms an exact 11-pg/4-non-pg partition.
 - **Date:** 2026-08-30
-- **Deciders:** pg workstream (migration-programme PR 5, the last of the 7-store SQLite→Postgres
-  ladder, #1328/#1325/#3653)
+- **Deciders:** pg workstream (migration-programme PR 5, closing 3 of the last 4 Wave 4 components
+  in the 7-store SQLite→Postgres ladder — `WorkflowEngine`/ADR-0064 is the one still outstanding,
+  staged separately, #1328/#1325/#3653)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009 (including its 2026-08-25
   fresh-start-by-default amendment), ADR-0012 (substrate/store contract); ADR-0063
   (`DirectorySync` → PostgreSQL — the freshest per-store template this ADR follows); ADR-0061/
