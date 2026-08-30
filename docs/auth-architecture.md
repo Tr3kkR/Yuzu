@@ -21,10 +21,104 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 - **Session revocation REST surface (CC6.3 revocation, CC6.7 disposition, CC6.8 termination).**
   - `DELETE /api/v1/sessions?username=<name>` — admin-only via `UserManagement:Write`. Cookie sessions only; API tokens deliberately not revoked.
   - `DELETE /api/v1/sessions/me` — any interactive authenticated principal. Wipes cookie sessions AND revokes the caller's API tokens (lost-laptop UX). MCP-tier and service-scoped tokens rejected with 403. Response sets `Set-Cookie: yuzu_session=; Max-Age=0` so the client side completes the disposition.
-  - Both wrap `AuthManager::invalidate_user_sessions`, which erases matching entries from the in-memory `sessions_` map under `mu_` and returns `RevokeResult { count, db_persisted }`. **Sessions have never had a durable row since the Postgres cutover** (ADR-0006 — the SQLite-era `sessions` table was dropped, not migrated; see "AuthDB — persistent authentication store" below), so `invalidate_user_sessions` no longer performs a companion AuthDB write — `db_persisted` is always `true` today. The field is kept on `RevokeResult` (rather than removed) so the REST handler's `result="partial"`/`db_error=true` audit path stays available without a wire-shape change, should a future durable session mirror return.
+  - Both wrap `AuthManager::invalidate_user_sessions`, which returns `RevokeResult { count, db_persisted }`. Since HA WS-1/1a (ADR-2002 §4) sessions ARE durable (`SessionStore`, see "Durable operator sessions" below): with a store wired it deletes every durable row for the user FIRST (bumping the write-generation so all replicas drop their cached copies), then wipes this replica's cache — `count` is the fleet-wide total killed and `db_persisted` reflects the durable-delete outcome (false on a store error, with the local wipe still done so the operator's "kill NOW" intent is honored — the REST handler's `result="partial"`/`db_error=true` audit path). On a legacy config-file-only deployment (no store) it stays an in-memory wipe with `db_persisted=true`.
   - Audit actions split for SIEM correlation: `session.revoke_all` (cross-user) vs `session.revoke_all.self` (self via either route, including admin self-target through the admin path). Both use `target_type=User` (project PascalCase convention). `result` ∈ {`success`, `partial`, `denied`}.
   - Prometheus counter `yuzu_auth_sessions_revoked_total{caller, result, scope}` for CC7.2 anomaly detection.
   - Self-target guard distinction (DO NOT CONFLATE WITH `#397/#403`): the existing `#397/#403` self-target guard on `DELETE /api/settings/users/<self>` and role demotion is a hard 403 to prevent admin-role self-lockout (an unrecoverable state). Session revocation self-target is recoverable (re-auth) and is permitted but audited as `.self`. Future refactors must not "fix" the session-revocation self-target into a hard 403.
+
+### Durable operator sessions (HA WS-1/1a, ADR-2002 §4)
+
+Operator sessions are durable Postgres rows so a session survives a core-replica
+restart/failover and (once the clock-authority item below lands) validates
+identically on any replica — a prerequisite of the HA "safe-to-scale" gate. The
+design:
+
+> **KNOWN GAP — cross-host clock authority (tracked, multi-replica prerequisite).**
+> As shipped in WS-1/1a, durable timestamps are authored and adjudicated with
+> the **core replica's** `system_clock`, NOT PostgreSQL `now()`. On a **single
+> replica** (the only supported topology until the safe-to-scale gate) this is
+> self-consistent and satisfies ADR-2002 §4's required mitigations — (a) the one
+> host's clock is the monitored security dependency (the reap clock-anomaly
+> signal + its alert), (b) both short windows carry a hard issue-time + max-delta
+> ceiling independent of their configured length: JIT elevation via
+> `elevation_issued_at` + `kMaxElevationWindow` (24 h), and MFA step-up via
+> `mfa_verified_at` + `kMaxMfaStepUpWindowSecs` (24 h) in `require_mfa_step_up`.
+> (Both ceilings, like JIT's, bound the authored/forward direction; the residual
+> smaller-backward-step is what mitigation (a)'s monitor covers.) But it
+> does NOT yet realize ADR-2002 §4's choice of Postgres `now()` as the shared
+> clock that *fixes cross-host skew*: with two replicas, a backward-skewed
+> replica could accept a session past its DB-authored absolute expiry (bounded by
+> the skew). Making the durable base-session lifetime DB-clock-authored (author
+> via `now()`; derive a local monotonic remaining-duration deadline at
+> cache-populate time) is a **required item before a second replica is enabled**,
+> tracked with the rest of the safe-to-scale gate. Until then "validates
+> identically on any replica" holds only under a common/synchronised clock.
+
+- **Store.** `SessionStore` (`server/core/src/session_store.{hpp,cpp}`, schema
+  `session_store`) is a born-on-PG, fail-closed store (ADR-0012). The row key is
+  the **SHA-256 of the bearer token**, never the raw token (secret-at-rest); the
+  raw token is hashed at every store boundary. Rows carry the authz-relevant
+  `Session` fields in wall-clock epoch-millis.
+- **Write-through + validate cache.** `AuthManager` write-throughs every session
+  op to the store and validates against it, with the in-memory `sessions_` map
+  as a **generation-gated process-local cache**: a durable `write_generation`
+  counter is bumped in the same txn as every authz-affecting mutation (create,
+  invalidate, elevate, revoke-elevation, mfa-verify — but **not**
+  `touch_activity`, a sliding idle update). `validate_session` polls the
+  generation on a ~1s interval (single-flight); when it advances (a mutation
+  landed, possibly on another replica) the whole cache is cleared and the next
+  lookup re-reads authoritative state. Operator sessions number in the tens, so a
+  global generation whose bump clears the whole cache is cheap. **Two distinct
+  staleness bounds:** in NORMAL operation a mutation propagates within the ~1s
+  refresh interval. During a refresh OUTAGE (PG brownout, failed
+  `read_generation`) the cache is served UNCHANGED only within a bounded
+  stale-serve budget — `kSessionGenStaleServeBoundMs` (30s) from the last
+  SUCCESSFUL refresh (the `rbac_store` pattern the ADR names). Past that budget
+  the generation view is "stale" and NO cache hit is trusted: every validate —
+  including a locally-minted session — falls through to the authoritative store
+  and **fails closed (401)** while the store stays degraded. So a
+  revoked/demoted/elevated session cannot ride the cache past ~30s of outage,
+  not to its 8h absolute expiry.
+- **Authoritative reads.** A `SessionStore::find` returns
+  `expected<optional<Row>>`: `nullopt` = definitively absent, `unexpected` = DB
+  degraded. `validate_session` never treats a degraded read as "no valid
+  session" in a way that grants — a degraded lookup **fails the request (401)**.
+  A locally-minted session is served from the cache during a brief blip (within
+  the stale-serve budget above); once the budget is exceeded even it falls to the
+  authoritative read and fails closed until PG recovers.
+- **Wall-clock (the reversal) + ceilings.** The `Session` lifetime fields
+  (`expires_at`, `mfa_verified_at`, `elevated_until`, `last_activity_at`) moved
+  from `steady_clock` (monotonic) to `system_clock` (wall-clock), because a
+  durable row is compared against absolute wall time on any replica. The
+  NTP-step resistance the monotonic clock gave is replaced by two
+  defense-in-depth wall-clock controls: (1) `is_elevated()` enforces a hard
+  `kMaxElevationWindow` (24 h) ceiling anchored by `Session::elevation_issued_at`
+  (stamped with `elevated_until` at every grant, cleared with it on revoke), so
+  a forward clock corruption or an anchor-less `elevated_until` cannot extend
+  admin past the ceiling; (2) the MFA step-up gate treats a **future-dated**
+  proof (`mfa_verified_at > now`, i.e. a backward step) as no proof — fail
+  closed. DB-primary clock integrity is a monitored security dependency (HA
+  WS-11).
+- **Retention.** `SessionStore::reap_expired` is a wall-clock bulk delete, so it
+  joins the clock-guarded-retention set (routed concern #2360/#2361): an
+  advisory lock taken as its own statement, a persisted `reap_anchor_ms`
+  sanitised against implausible forward *and* backward skew (declined, not acted
+  on), an unconditional per-pass cap, and a recorded missing-anchor decision
+  (proceed — sessions are re-mintable). It **deliberately carves out** two of the
+  seven parts, the `api_token_store` precedent (recorded here per the rule's
+  "record which way you went"): part (1) the would-wipe probe — sessions reach
+  100% expiry as routine drain, so it cannot separate a true from a false
+  positive; and part (4) fact-set anomaly dedup — a declined pass is logged and
+  surfaced as `yuzu_auth_session_reap_clock_anomaly_total` (the DB-clock-integrity
+  monitor) rather than deduped by fact identity. Single-writer today (one
+  server); it becomes PG-shared state under the ADR-0012 advisory lock when a
+  second replica lands.
+- **Legacy path.** Config-file-only deployments (no `--postgres-dsn`, so no
+  pool) leave `AuthManager::session_store_` null and keep the pre-HA in-memory
+  sessions unchanged. The store is wired at boot only when the PG substrate is
+  up; a wired store that fails to migrate/open is a **fail-closed boot error**
+  (ADR-0007) and is surfaced at `/readyz` + `/healthz` via
+  `AuthManager::is_session_store_ok()`.
 
 ## Account lockout (SOC 2 CC6.3)
 
@@ -117,16 +211,21 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   user mid-coffee-break is a behaviour change, so it is off unless an operator
   turns it on (recommended `900` = 15 min). Boot posture is logged for CC6.3
   evidence. Enabling it satisfies the CC6.3 inactivity-timeout control.
-- **In-memory is authoritative — and, since the Postgres cutover, the ONLY
-  copy.** Sessions are validated from the in-memory `AuthManager::sessions_`
-  map. The SQLite-era `sessions` table (whose rows were always v1
-  dead-writes — never read back) was **dropped, not migrated**, when `AuthDB`
-  moved to Postgres (ADR-0006) — there is no `auth.sessions` table at all
-  today, durable or otherwise. So the idle state lives *only* on the
-  in-memory `Session`:
-  `last_activity_at` (a monotonic `steady_clock` stamp — an NTP step can neither
-  extend nor collapse the window). `AuthManager::session_inactivity_` holds the
-  configured window (set once at startup via `set_session_inactivity`).
+- **Durable since HA WS-1/1a (ADR-2002 §4).** Operator sessions are durable
+  Postgres rows in `SessionStore` (schema `session_store`); `AuthManager`
+  write-throughs every session and validates against it, with the in-memory
+  `AuthManager::sessions_` map serving as a generation-gated process-local
+  cache (see "Durable operator sessions" below). The idle state
+  (`last_activity_at`) is now a **wall-clock** (`system_clock`) row column
+  advanced via `SessionStore::touch_activity`, which deliberately does NOT bump
+  the write-generation (a slide is not an authz change, so it never invalidates
+  any replica's cache), and mirrored into the cache. It survives a replica
+  restart/failover and validates identically on any replica under a common clock
+  (see the cross-host clock-authority gap above). (Before HA WS-1/1a
+  the idle state lived only in-memory on a monotonic `steady_clock`; the clock
+  is now wall-clock, with the JIT-elevation/MFA windows carrying hard wall-clock
+  ceilings — see below.) `AuthManager::session_inactivity_` holds the configured
+  window (set once at startup via `set_session_inactivity`).
 - **Enforcement is in `validate_session`** (the same place the absolute
   `expires_at` is checked, and which already conditionally upgrades its shared
   lock for the opportunistic reap). When the feature is on: a session idle
@@ -146,16 +245,15 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   `synthesize_token_session` (their own store), never `validate_session`, so a
   long-lived automation token is **never** idle-timed-out. OIDC sessions are
   subject to the same idle window but the user simply re-authenticates via SSO.
-- **No durable mirror since the Postgres cutover.** Before ADR-0006, a touch
-  best-effort-persisted the timestamp via `AuthDB::touch_session_activity`
-  (mirroring `mfa_mark_session_stepup`), throttled to at most once per session
-  per `kActivityPersistGranularity` (60 s). That method — and the `sessions`
-  table it wrote — was **removed**, not ported, when `AuthDB` moved to
-  Postgres: there is no session surface on the Postgres-backed `AuthDB` at all
-  (see "AuthDB — persistent authentication store" below), so `last_activity_at`
-  now lives purely in `AuthManager::sessions_` and does not survive a server
-  restart (idle-timeout state resets along with the rest of the in-memory
-  session table). Idle expiry is not separately audited (neither was absolute
+- **Durable mirror (HA WS-1/1a).** A throttled touch advances the durable
+  `last_activity_ms` column via `SessionStore::touch_activity`, at most once per
+  session per `kActivityPersistGranularity` (60 s), so the sliding update is not
+  a per-request SQL write and — because it does NOT bump the write-generation —
+  never invalidates any replica's validate cache. `last_activity_at` therefore
+  survives a restart (unlike the pre-HA in-memory state, which reset on
+  restart). The session surface lives on the dedicated `SessionStore`, never on
+  `AuthDB` (which has no session table — see "AuthDB — persistent authentication
+  store" below). Idle expiry is not separately audited (neither was absolute
   expiry) and emits **no Prometheus counter** — the observable signal is the
   `auth.login` audit row on re-authentication.
 
@@ -282,9 +380,10 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   separate branch needed. The response reports the TRUE remaining time as
   `expires_in` (seconds, computed after any clamp — always `<=` the
   requested/capped duration) alongside an absolute `expires_at` (RFC3339 UTC —
-  a `system_clock` projection of the `steady_clock`-tracked remaining
-  duration, since `elevated_until` itself has no wall-clock meaning
-  off-process). The justification is sanitised (control bytes incl. DEL →
+  read directly off the `system_clock` `elevated_until`, which since HA WS-1/1a
+  (ADR-2002 §4) is a durably-persisted wall-clock instant, so it carries the
+  same meaning across a restart and off-process). The justification is
+  sanitised (control bytes incl. DEL →
   space) and capped (1 KiB) into the audit detail. The `role.elevation.granted`
   audit is **fail-closed**: if it can't persist, the elevation is rolled back
   (compensating `revoke_elevation`) and the call 500s with `Sec-Audit-Failed`
@@ -294,12 +393,17 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   analytics event); `role.elevation.denied` for an ineligible /
   failed-eligibility / not-MFA-enrolled caller.
 - **Effective role** — `auth::effective_role(session)` returns `admin` while
-  `steady_clock::now() < elevated_until`, else the base `role`. THE authorization
+  `system_clock::now() < elevated_until`, else the base `role`. THE authorization
   functions gate on it: `require_admin` checks `effective_role`, and
   `require_permission`/`require_scoped_permission` **short-circuit to allow** an
-  elevated session (full admin for the window). `elevated_until` is monotonic
-  `steady_clock` (an NTP step can't extend it) and **per-session in-memory** — a
-  restart or logout drops the elevation (fail-safe).
+  elevated session (full admin for the window). Since HA WS-1/1a (ADR-2002 §4)
+  `elevated_until` (with its `elevation_issued_at` anchor) is a wall-clock
+  `system_clock` instant **durably persisted** to `SessionStore`, so the
+  elevation **survives a server restart** — it is bounded by a hard
+  `kMaxElevationWindow` (24 h) wall-clock ceiling and by the session's own
+  absolute expiry, and auto-reverts when the window lapses or on explicit
+  revoke/logout, but **not** on restart. See `docs/auth-architecture.md` →
+  "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
 - **Scope: interactive cookie sessions only.** `/api/v1/elevate` reads the
   session cookie and `elevate_session` keys on the cookie token; API and MCP
   tokens resolve through `synthesize_token_session` (no cookie, no
@@ -847,7 +951,9 @@ record.** Four fixes on top of the base restoration above:
   previously hit `InvalidUsername` at this inner call even though the REST
   layer had already accepted the principal — corrupting the audit trail with
   `result="partial"`/`db_error=true` for an action that fully succeeded (OIDC
-  sessions are never persisted to `sessions`, so 0 matched rows IS success).
+  sessions are never persisted to any AuthDB `sessions` table — durable sessions
+  live in the separate `SessionStore`, HA WS-1/1a — so 0 matched rows at this
+  AuthDB call IS success).
 - **Settings → Users "Revoke sessions" URL-encodes the principal.** The
   button previously built its `hx-delete` URL with `html_escape` alone, which
   does not touch `#` — a durable SSO principal's `#` was silently truncated
@@ -947,6 +1053,8 @@ mapping below).
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
 | `--saml-group-attribute` *(optional)* | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
 | `--saml-admin-group` *(optional)* | `YUZU_SAML_ADMIN_GROUP` | Group value (from `--saml-group-attribute`) that grants `role=admin` |
+| `--saml-name-attribute` *(optional)* | `YUZU_SAML_NAME_ATTRIBUTE` | `<Attribute Name="...">` whose first `<AttributeValue>` is the user's human display name (e.g. Entra's `http://schemas.microsoft.com/identity/claims/displayname`). Empty leaves the display as the raw NameID. See "Attribute-based display" below |
+| `--saml-email-attribute` *(optional)* | `YUZU_SAML_EMAIL_ATTRIBUTE` | `<Attribute Name="...">` whose first `<AttributeValue>` is the user's email (e.g. Entra's `http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress`). Used only as a display fallback and logged |
 | `--saml-sp-key` *(optional)* | `YUZU_SAML_SP_KEY` | Filesystem path to an SP AuthnRequest signing private key (PEM, **RSA only**); when set, AuthnRequests are signed (see AuthnRequest signing below) |
 
 Example startup:
@@ -1002,9 +1110,13 @@ Browser           Yuzu Server               IdP
 
 ### Session
 
-The minted session is **in-memory and ephemeral** (lost on server restart,
-identical lifetime to OIDC sessions — 8-hour absolute, subject to
-`--session-inactivity-secs`). Session fields:
+The minted session is **durable** — since HA WS-1/1a (ADR-2002 §4)
+`AuthManager::create_saml_session` write-throughs to `SessionStore` exactly as
+OIDC does, so it **survives a server restart** (for Postgres-backed
+deployments; config-file-only deployments keep the old in-memory-only
+behavior). It has the identical lifetime to OIDC sessions — 8-hour absolute,
+subject to `--session-inactivity-secs`. See `docs/auth-architecture.md` →
+"Durable operator sessions (HA WS-1/1a, ADR-2002 §4)". Session fields:
 
 - `auth_source = "saml"`
 - `role = admin` when `--saml-admin-group` is configured and the assertion's
@@ -1041,6 +1153,42 @@ groups the IdP didn't attest to. Parsing is capped at 64 `<AttributeValue>`
 entries (across however many `<Attribute>` elements carry the configured
 Name) as a DoS guard; values beyond the cap are silently ignored rather than
 rejecting the assertion.
+
+### Attribute-based display (name / email)
+
+By default a SAML session's `display_name` is the raw `NameID` — often an
+opaque `persistent` identifier. `--saml-name-attribute` and
+`--saml-email-attribute` let the operator name the `<Attribute>` elements that
+carry the user's display name and email, so the dashboard and audit rows show
+a human name instead. The session display is derived exactly like OIDC's
+(`create_oidc_session`): **name attribute → email attribute → raw NameID**.
+
+- Both values are read from the **same XSW-verified assertion node** as the
+  `NameID` and groups (never a second document-wide search), via the same
+  namespace-checked walk — a signature-wrapping attack cannot inject a display
+  name or email the IdP didn't attest to. The first non-empty `<AttributeValue>`
+  wins; empty values are skipped.
+- They are **session-enrichment only**. Email is used as a display fallback and
+  logged; it is **not** stored as a durable session field (mirroring OIDC,
+  which has no session email field either). Neither value is ever an identity,
+  authz, or SCIM-linkage input — the SAML identity key stays `NameID`-only
+  (`saml_principal_id`), and admin is still granted **only** from the group
+  attribute, never from the name/email attributes (the security note above
+  continues to hold — these attributes are attacker-controlled labels).
+- Both flags empty (the default) reproduces the raw-`NameID` display exactly —
+  a fully backward-compatible addition.
+
+> **PII in operational logs (data-handling note, CC6.7).** When configured, the
+> parsed display name and email appear in the **operational** log (`spdlog`) at
+> `info` on session creation — the same posture OIDC already has (its
+> `create_oidc_session` logs the resolved display + email identically). These
+> are IdP-attested values, are **not** written to the audit store (the SAML
+> audit row keys on the stable NameID-derived principal only), and are not
+> otherwise persisted. Operational logs inherit the deployment's general
+> log-access and retention controls; a first-customer questionnaire asking
+> "where does user PII appear in logs" is answered here for both SSO paths.
+> Tightening this to a hashed/omitted form across OIDC and SAML consistently is
+> tracked as a follow-up.
 
 Because role is computed fresh at every session mint (no persisted mapping),
 there is no schema or migration involved, and changing `--saml-admin-group`
@@ -1160,9 +1308,11 @@ key. Design:
 - **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
   local-password login. Compliance impact: CC6.3 (local-password fallback
   remains active). OIDC is the path to `sso-only`.
-- **AttributeStatement parsing beyond the group attribute.** Only the single
-  configured `--saml-group-attribute` is read for group→role mapping; no other
-  assertion attributes are stored or surfaced.
+- **AttributeStatement parsing beyond group/name/email.** Group→role mapping
+  (`--saml-group-attribute`) plus the display-name/email session-enrichment
+  attributes (`--saml-name-attribute`/`--saml-email-attribute`, see
+  "Attribute-based display" above) are read; no *other* assertion attributes
+  (department, title, custom claims, …) are stored or surfaced.
 - **SP metadata endpoint.** No `GET /saml/metadata` endpoint is provided; IdP
   registration uses the manual flag values.
 - **Windows server support — out of scope, not deferred.** Running the Yuzu
@@ -2472,13 +2622,17 @@ A **service-scoped API token** is bound to one IT service's agents (`session->to
 
 **Two deliberately separate route classes (closes #3218 — do not merge these gates):** `require_list_read` is the sole gate on fleet-wide rollup routes and refuses a service-scoped session outright (no per-service slice to narrow a rollup to). `require_fleet_read` **REPLACES** `require_permission` (never pairs with it — see its own doc comment's BLOCKING falsifier) on routes migrating toward real per-request confinement (Phase 2 — see below); its own doc comment and `require_list_read`'s cross-reference each other's route class so a future reader doesn't reach for the wrong one. `require_fleet_read` never consults `kServiceScopeGlobalSafe` — a migrated route serves confined service-scoped tokens directly through the gate's own `meet(management-group, service-scope)` composition, instead of the flip's allow-list route.
 
-**MCP's mirror: the C8 `ServiceScopeClass` chokepoint (§3c).** Every `tools/call` dispatch consults a third field on the tool's `kToolSecurity` row — `denied` (the default), `confined` (a real downstream confinement mechanism exists — `deny_fleet_wide_service_scoped`, a `scoped_perm_fn` check, a fail-closed `exec_visible` derivation, or (as of #3290) `fleet_read_fn_`/`require_fleet_read`'s `meet(management-group, service-scope)` composition), or `global_safe` (boot-validated against the same `kServiceScopeGlobalSafe` table `require_permission` reads). `confined` is **not** a claim that the tool is actually usable by a service-scoped caller — most `confined` tools still deny downstream via their own `perm_fn`/`scoped_perm_fn` under the seeded-empty allow-list; it only means the C8 layer itself doesn't short-circuit before the tool's own (pre-existing) confinement runs. `query_installed_software` is the first tool where `confined` means real usability, not just a non-short-circuiting label — see the Phase 2 progress note below. `resources/read` bypasses C8 structurally but calls `perm_fn` directly, so it is covered by the flip the same way any REST route is.
+**MCP's mirror: the C8 `ServiceScopeClass` chokepoint (§3c).** Every `tools/call` dispatch consults a third field on the tool's `kToolSecurity` row — `denied` (the default), `confined` (a real downstream confinement mechanism exists — `deny_fleet_wide_service_scoped`, a `scoped_perm_fn` check, a fail-closed `exec_visible` derivation, or (as of #3290) `fleet_read_fn_`/`require_fleet_read`'s `meet(management-group, service-scope)` composition), or `global_safe` (boot-validated against the same `kServiceScopeGlobalSafe` table `require_permission` reads). `confined` is **not** a claim that the tool is actually usable by a service-scoped caller — most `confined` tools still deny downstream via their own `perm_fn`/`scoped_perm_fn` under the seeded-empty allow-list; it only means the C8 layer itself doesn't short-circuit before the tool's own (pre-existing) confinement runs. `query_installed_software` and, as of #1700, `get_agent_details` are the tools so far where `confined` means real usability, not just a non-short-circuiting label — see the Phase 2 progress note below. `resources/read` bypasses C8 structurally but calls `perm_fn` directly, so it is covered by the flip the same way any REST route is.
 
 **Explicit denies for gate-less routes (§3e).** A route that never calls `require_permission`/`require_scoped_permission`/C8 at all is untouched by the flip regardless of how the flip itself is tuned — these needed their own deny. `AuthRoutes::deny_service_scoped_session` is `server.cpp`'s shared gate for this shape (health-summary fragment, the legacy `/events` SSE stream, the instructions-list fragment, and the six result-set HTMX fragments); `ComplianceRoutes` and `WorkflowRoutes` carry their own file-local equivalents for the same reason every other route-owner class in this list does (below). A residual grep sweep of every `auth_fn`/`perm_fn` call site in `rest_api_v1.cpp` (74 sites) and `mcp_server.cpp` (3 sites) found four more real instances — three sharing one shape (`management-groups/{id}/roles` GET/POST/DELETE, plus the `POST /api/v1/tokens` service-scope minting check, all bypassing `require_permission` via a **direct** `rbac_store->check_permission` call) and the eight-route `/api/v1/result-sets*` REST family (the twin of the HTMX fragments above) — plus one **distinct, more severe, not service-scope-specific** bug in the same pass: `POST /api/v1/result-sets/from-inventory-query` had no authorization check of any kind (CWE-862), missed by an earlier fix that gated its three dispatch siblings. Full inventory, including document-only dispositions and the sweep's own accounting: `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
 **The per-file `deny_service_scoped_*`/`deny_fleet_wide_service_scoped` helpers are now a SECOND, largely-redundant layer, not the primary defense.** For any route that also calls `require_permission`/`require_scoped_permission` (the vast majority), the flip above already denies a service-scoped token structurally — five of the seven original in-handler deny sites (`list_schedules`, `get_dex_signal_detail`, `list_dex_perf_devices`, `compare_app_perf_versions`, `list_network_devices`) are still double-denies, kept for now and scheduled for Phase 2 retirement. Two are retired: `query_installed_software`'s in the first Phase 2 migration (below), and `get_dex_group_app_perf`'s in #3290 Phase 2 bucket 1a — both were provably dead (fired after their route's own `perm_fn`), unlike the five that remain, which are live-but-redundant (their deny fires BEFORE `perm_fn`, so retiring them changes the observable response, not just deletes unreachable code — a different, more cautious backlog item). Same bucket-1a pass also retired `deny_service_scoped_schedule` (`schedule_routes.{hpp,cpp}`) entirely — its four call sites (`schedule.create`/`.list`/`.delete`/`.enable`) all fired after their route's own `require_permission`. The remaining per-file helpers (below) stay in place; they remain load-bearing **only** for routes with no other RBAC gate call at all (the §3e class above) — `EXTEND the pattern, do not fork a new copy` still applies to *that* subset. Current call sites, including this PR's additions: `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.{hpp,cpp}`), `deny_service_scoped_` (`dex_routes.{hpp,cpp}`, `deployment_routes.{hpp,cpp}`, `preflight_routes.{hpp,cpp}`, and the new `compliance_routes.{hpp,cpp}`), `deny_service_scoped_schedule_list` + the new `deny_service_scoped_scope_estimate` (both local lambdas in `workflow_routes.cpp`), the shared `deny_fleet_wide_service_scoped` lambda in `rest_api_v1.cpp` (now covering the result-set REST family too) and `mcp_server.cpp`, the new `AuthRoutes::deny_service_scoped_session` (`server.cpp`'s shared gate for its own gate-less routes), plus inline checks in `device_routes.cpp` / `network_routes.cpp` / `inventory_routes.cpp` / `tar_tree_routes.cpp`.
 
 **Phase 2 progress (#3290).** The first migration landed: `GET /api/v1/inventory/software` + its MCP twin `query_installed_software` are now on `require_fleet_read` — both surfaces' `deny_fleet_wide_service_scoped`/blanket-deny call sites are retired for this tool pair (the REST call was already provably dead, firing after `perm_fn`; the MCP call was live and is now gone). `require_fleet_read` itself gained the elevated/engine/mcp_tier caller-class branches it was missing at Phase 0 (mirroring `require_list_read`'s ladder — see its own doc comment). Prioritization for this and future migrations is **documented reasoning, not the metric** — no production fleet exists yet, so `yuzu_auth_service_scope_default_denied_total` has no real traffic to rank by; the criterion-1 substitute and the ranked backlog live in `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`. The §3d `authorize_list_read` supersede→intersect migration (below) is a separate, not-yet-started stream.
+
+**Second migration (#1712/#1700, this ADR-0017 continuation).** Closes the "World A" gap this ADR flagged (`Fail-closed list-read gate (HIGH)` finding) for three readers that previously had NO per-agent filter at all: dashboard `/fragments/results`, the workflow executions-drawer detail route (its responses section AND its per-agent status grid/table — both read per-agent data, from `ResponseStore` and `ExecutionTracker` respectively, and the route's gate migration admits the same newly-in-scope caller to both), and MCP `get_agent_details` — all three routes migrated onto `require_fleet_read` as their sole gate, replacing `perm_fn`/`perm_fn_`/`tier_allows`+`perm_fn` outright. `get_agent_details` is reclassified from `ServiceScopeClass::denied` to `confined` (`kToolSecurityRows`, `mcp_server.cpp`) since it now has this same real confinement mechanism; a correctly-confined service-scoped token gets a real filtered/404-collapsed answer instead of a blanket 403.
+
+Out of scope for this migration, flagged not fixed (none newly reachable by this migration's admission change — unlike the status grid above, these were already reachable by their current caller class before #1712, so leaving them unmigrated does not widen anything): MCP `list_agents` (same unscoped-fleet-read shape `get_agent_details` had), `/sse/executions/{id}` and REST `/api/v1/events` (both still gated by plain `perm_fn`/`require_permission`, both backed by `ExecutionEventBus` and publishing the identical per-agent `agent-transition`/unfiltered `agents_targeted` `execution-progress` events the now-migrated drawer route withholds — tracked #3699), the dashboard results workflow's sidecar routes — `/fragments/results/filter-bar`, `/fragments/create-group-form`, and `POST /api/dashboard/group-from-results` (all still on flat `perm_fn_`, reading unscoped `ResponseStore` facet queries — tracked as #3489, #3525 tracked the same finding and was closed as its duplicate; see ADR-0017's "In scope" Responses bullet for the detailed reachability analysis distinguishing `filter-bar`'s latent-only exposure from `group-from-results`' real, pre-existing `ManagementGroup:Write`-vs-`Response:Read` privilege-crossing risk — this same risk is why the dashboard's "Create Group from N Agents" button is now withheld from a confined caller entirely, #1712 hardening round), REST `GET /api/v1/execution-statistics/agents` (same flat `perm_fn(Execution,Read)` gate, returns per-agent execution stats with no confinement — found by Gate 4 consistency-auditor's re-derivation of the sibling-handler check on this PR's exact `(securable, operation)` pairs, tracked as #3526; the workflow executions LIST fragment `/fragments/executions` carries the same data class at lower severity, noted in the same issue), and `GET`/`PUT`/`DELETE /api/agents/:id/properties[/:key]` (bare `require_permission(Infrastructure,Read/Write)`, no per-agent scope filter, including a WRITE path — tracked #3700).
 
 **Consequences accepted for v1 (recorded, not oversights):** fleet-wide aggregates with no per-agent identity (e.g. `get_dex_perf_fleet`, `get_network_fleet`) stay `denied` at C8 — a `confined` label with no real downstream mechanism would be an unenforced claim; re-admission is a Phase 2 `kServiceScopeGlobalSafe` entry with security-guardian sign-off, not an inferred-safe classification during a routine change. Service-tag writes (whoever sets an agent's `service` tag moves scope) are hardened as of #3289 — a service-scoped session is denied, value-blind, before writing/deleting the `service` key at every REST/legacy-dashboard/MCP tag-mutation site, and the agent's own gRPC `Register` sync path no longer accepts an agent-claimed `service` value at all; plain `Tag:Write`/`Tag:Delete` remains sufficient for non-service-scoped (already fleet-scoped) holders. A related but distinct gap — a live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation — was tracked separately as #3295 and is now closed: `evaluate_scope`'s `tag:<key>` resolver is store-first (a TagStore row of any source wins over a connected agent's live claim; the session value answers only when the store has no row at all), and `register_agent` drops an agent-claimed `service` key from the session at ingest. No cached derived confinement sets. Dispatch's supersede→intersect migration (§3d, four `authorize_list_read` callers) is deferred, not part of this PR. **Bootstrap note:** an empty-cohort service token cannot bootstrap its own scope via any route — and since #3289, neither can an agent via its own Register sync; onboarding a brand-new service still needs an interactive/unscoped path; see `docs/user-manual/authentication.md`.
 
@@ -3251,8 +3405,11 @@ the replacement for the original in-memory + on-config-flush model that lost
 users on every restart, #618/#388/#527) in the ADR-0006 Wave 3 substrate
 migration. Tables: `users`, `enrollment_tokens`, `pending_agents`,
 `mfa_recovery_codes`. **Dropped, not migrated:** the SQLite-era `sessions`
-table (sessions are in-memory-authoritative in `AuthManager::sessions_` —
-the DB mirror was a permanent v1 dead-write, never read back) and `auth_kv`
+table (at the time of this cutover sessions were in-memory-authoritative in
+`AuthManager::sessions_`, and that SQLite `sessions` mirror had been a permanent
+v1 dead-write, never read back — since HA WS-1/1a (ADR-2002 §4) `sessions_` is a
+validate cache in front of the durable Postgres `SessionStore`; see "Durable
+operator sessions (HA WS-1/1a, ADR-2002 §4)") and `auth_kv`
 (unused scaffolding, superseded outright by `pg::SecretCodec`, ADR-0010).
 `ScimStore` migrated in lockstep to its own `scim_store` Postgres schema —
 see "Storage" under SCIM v2 provisioning above.

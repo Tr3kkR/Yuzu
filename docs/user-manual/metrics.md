@@ -305,7 +305,17 @@ Two more, added with the ADR-0059 Postgres migration (also pre-seeded to `0` at 
 | `yuzu_server_offload_delivery_credential_unavailable_total` | counter | Offload-target deliveries skipped because the target's credential (ADR-0010) failed to decrypt — the delivery is never fired unsigned. A nonzero rate points at KEK/keys-directory health, not the target's own configuration; cross-check against `yuzu_server_secret_decrypt_failures_total{store="offload_target_store"}` for the specific failure class. |
 | `yuzu_server_offload_fire_event_degraded_total` | counter | `fire_event`'s enabled-target scan could not acquire a database connection within its 300ms bound, or the query itself failed — that tick's events were not delivered to any target. A rising rate under normal load indicates pool exhaustion on the hot dispatch path. |
 
-## Fleet visualization metrics
+## Patch-manager write-outcome metrics (ADR-0062)
+
+`PatchManager` (see [REST API §Patch Management](rest-api.md)) records one outcome per write call.
+Pre-seeded to `0` at boot for every `op`×`result` combination, so `absent()`-based alerting stays
+meaningful before the first call ever fires.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_patch_manager_writes_total{op,result}` | counter | Outcome of each `PatchManager` write, `op` ∈ `{record_patches, deploy_patch, cancel_deployment}`, `result` ∈ `{success, failed, rejected_oversized}`. A `failed` result means the Postgres transaction backing that call didn't commit (pool exhaustion, a query error) — the caller sees the store's existing not-available/failure error either way; this counter is the only cross-request signal. `rejected_oversized` (currently only on `op="deploy_patch"`) increments when the request's `agent_ids` list exceeds `kMaxDeployTargets` (5000, post-de-duplication), before the write is attempted — distinct from `failed`, which means a write was attempted and the transaction didn't commit. Note: `record_patches()` has no production caller today (ADR-0062, #3676), so this series' `op="record_patches"` values stay at their pre-seeded `0` until that gap is closed. |
+
+
 
 The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST API §Fleet Visualization](rest-api.md)) exposes the following metrics. Routes share one `FleetTopologyStore` cache; all metrics are process-global.
 

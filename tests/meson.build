@@ -652,6 +652,7 @@ if build_server
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
       'unit/server/test_update_registry.cpp',
+      'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',
       'unit/server/test_response_store.cpp',
       'unit/server/test_preflight_parse.cpp',
@@ -710,6 +711,7 @@ if build_server
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_dashboard_tar_fragments.cpp',
       'unit/server/test_dashboard_results_columns.cpp', # PR1.7 remediation: resolve_render_columns/render_results
+      'unit/server/test_dashboard_results_fragment.cpp', # #1712 / #3290 Phase 2: /fragments/results fleet-read gate
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
@@ -733,6 +735,9 @@ if build_server
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
+      'unit/server/test_session_store.cpp',
+      'unit/server/test_auth_session_store.cpp',
+      'unit/server/test_clock_drift_monitor.cpp',
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_operator_surface_twins.cpp',
@@ -869,6 +874,7 @@ if build_server
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
+      'unit/server/test_directory_sync.cpp', # ADR-0063: directory_sync Postgres migration
       'unit/server/test_fleet_topology_store.cpp',
       'unit/server/test_viz_routes.cpp',
       'unit/server/test_product_pack_store.cpp',

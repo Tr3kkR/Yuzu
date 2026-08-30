@@ -39,6 +39,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
@@ -106,6 +107,13 @@ struct ExecHarness {
     std::unique_ptr<ExecutionEventBus> event_bus;
 
     bool perm_grant{true};
+    /// #1712 / #3290 Phase 2 — the executions-drawer detail route's fake
+    /// twin of require_fleet_read. Defaults to admit-unfiltered (nullopt
+    /// scope) so every pre-existing detail test keeps the full-fleet path;
+    /// a confinement test sets fleet_read_grant=false (403) or
+    /// fleet_read_scope to a specific set.
+    bool fleet_read_grant{true};
+    yuzu::server::authz::VisibleSet fleet_read_scope{std::nullopt};
     /// guardian-confinement-2298: empty by default (an ordinary session);
     /// a test sets this to prove the /fragments/schedules service-scoped
     /// deny fires independently of perm_grant.
@@ -177,14 +185,24 @@ struct ExecHarness {
     /// empty deny-all) is exercised (K-R7-02).
     bool wire_exec_visible{true};
 
+    /// #3565: `fleet_read_fn` is captured BY VALUE into the detail route's
+    /// lambda at `register_routes` time (unlike DashboardRoutes' live
+    /// per-request member read), so a test wanting the genuinely-unwired
+    /// (empty std::function) contract must opt out HERE, at construction --
+    /// setting `fleet_read_grant`/`fleet_read_scope` after the fact can't
+    /// reach it, the closure is already captured.
+    bool wire_fleet_read_fn{true};
+
     explicit ExecHarness(pg::PgPool& pool, bool with_bus = true,
                          yuzu::server::detail::StreamBudget* budget = nullptr,
                          bool wire_exec_visible_arg = true,
-                         bool with_workflow_engine = false)
+                         bool with_workflow_engine = false,
+                         bool wire_fleet_read_fn_arg = true)
         : stream_budget(budget),
           tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
         wire_exec_visible = wire_exec_visible_arg;
+        wire_fleet_read_fn = wire_fleet_read_fn_arg;
         for (auto& p : {tracker_db, instr_db, wf_db})
             fs::remove(p);
 
@@ -238,6 +256,19 @@ struct ExecHarness {
             }
             return true;
         };
+        // #1712 / #3290 Phase 2 — the executions-drawer detail route's SOLE
+        // gate. Fails 403 when fleet_read_grant is false (mirrors perm_fn's
+        // deny shape); admits with fleet_read_scope otherwise (nullopt =
+        // unfiltered, the default).
+        auto fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                    const std::string&,
+                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
+            if (!fleet_read_grant) {
+                res.status = 403;
+                return {false, yuzu::server::authz::deny_all()};
+            }
+            return {true, fleet_read_scope};
+        };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -281,6 +312,10 @@ struct ExecHarness {
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        if (wire_fleet_read_fn)
+            wf_deps.fleet_read_fn = fleet_read_fn;
+        // else: leave genuinely default-constructed (empty std::function) --
+        // production's own unwired-misconfiguration contract (#3565).
         wf_deps.audit_fn = audit_fn;
         wf_deps.emit_fn = emit_fn;
         wf_deps.scope_fn = scope_fn;
@@ -573,16 +608,91 @@ TEST_CASE("executions detail: 404 on unknown id", "[pg][workflow][executions][de
     CHECK(res->status == 404);
 }
 
-TEST_CASE("executions detail: 403 when perm_fn denies", "[pg][workflow][executions][detail][rbac]") {
+// #1712 / #3290 Phase 2: this route migrated from perm_fn onto
+// require_fleet_read (fleet_read_fn) as its SOLE gate — perm_grant no
+// longer has any effect here (it still gates the LIST route above and the
+// SSE route below, both unmigrated); fleet_read_grant is the deny knob now.
+TEST_CASE("executions detail: 403 when fleet_read_fn denies",
+          "[pg][workflow][executions][detail][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool);
     h.make_def("def-X", "X");
     auto eid = h.make_exec("def-X", "completed", 1, 1, 0);
-    h.perm_grant = false;
+    h.fleet_read_grant = false;
     auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// #3565: the dashboard (/fragments/results) and MCP (get_agent_details)
+// siblings both have an unwired-fleet_read_fn -> 503 fail-closed test; this
+// route's own equivalent contract (workflow_routes.cpp's own
+// `if (!fleet_read_fn) {...503...}` branch) had no test at all.
+TEST_CASE("executions detail: unwired fleet_read_fn -> 503, fail closed",
+          "[pg][workflow][executions][detail][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                 /*with_workflow_engine=*/false, /*wire_fleet_read_fn=*/false);
+    h.make_def("def-U", "U");
+    auto eid = h.make_exec("def-U", "completed", 1, 1, 0);
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    // Gate 8 re-review (this round), quality-engineer finding: this route has
+    // TWO distinct 503 branches -- unwired fleet_read_fn ("Service
+    // unavailable") and a null execution_tracker ("Tracker not available").
+    // Asserting only the status lets a harness defect that leaves the
+    // tracker null (instead of, or in addition to, the gate) false-green on
+    // the wrong branch. Match the dashboard sibling's body-substring check
+    // (test_dashboard_results_fragment.cpp) to pin the actual branch.
+    CHECK(res->body.find("Service unavailable") != std::string::npos);
+}
+
+// #3565: this codebase has a documented prior incident (authz_model.hpp's
+// own doc comment on VisibleSet{}) of an engaged-empty scope (deny_all())
+// being mishandled as unfiltered/nullopt, serving the whole fleet to a
+// caller with no grants at all. Pin the distinction directly for this route.
+TEST_CASE("executions detail: admitted-but-deny_all() scope shows nothing",
+          "[pg][workflow][executions][detail][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-Y2", "Y2");
+    auto eid = h.make_exec("def-Y2", "completed", 1, 1, 0);
+    h.agent_status(eid, "agent-should-not-appear", "success", 0, "", 1735689601);
+    h.store_response("def-Y2", "agent-should-not-appear", "should never render", eid);
+
+    h.fleet_read_scope = yuzu::server::authz::deny_all();
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("agent-should-not-appear") == std::string::npos);
+    CHECK(res->body.find("should never render") == std::string::npos);
+}
+
+// #1712 / #3290 Phase 2: the "Responses" section must drop rows for agents
+// outside the caller's scope (both the primary execution_id-correlated fetch
+// and the legacy timestamp-window fallback merge into `filtered` before this
+// filter runs, so one assertion covers both paths).
+TEST_CASE("executions detail: responses section drops out-of-scope agents",
+          "[pg][workflow][executions][detail][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-Y", "Y");
+    auto eid = h.make_exec("def-Y", "completed", 2, 2, 0);
+    h.store_response("def-Y", "agent-in", "in-scope output", eid);
+    h.store_response("def-Y", "agent-out", "out-of-scope output", eid);
+
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{
+        std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("in-scope output") != std::string::npos);
+    CHECK(res->body.find("out-of-scope output") == std::string::npos);
 }
 
 TEST_CASE("executions detail: KPI strip shows counts + p50/p95", "[pg][workflow][executions][detail]") {
@@ -627,6 +737,49 @@ TEST_CASE("executions detail: p50/p95 fall back to dash when any agent is runnin
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("exec-kpi-value\">—") != std::string::npos);
+}
+
+// Adversarial-review blocker (#1712): migrating this route's gate onto
+// require_fleet_read admits a caller class the OLD flat perm_fn gate denied
+// outright (confined-only via the #1715(a) additive grant) -- so the status
+// grid/table must be scoped too, not just the Responses section, or the gate
+// migration itself widens disclosure for a newly-admitted caller instead of
+// narrowing it.
+TEST_CASE("executions detail: status grid + per-agent table drop out-of-scope "
+          "agents, and counts reflect only in-scope agents",
+          "[pg][workflow][executions][detail][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-Z", "Z");
+    auto eid = h.make_exec("def-Z", "completed", 2, 2, 0);
+    h.agent_status(eid, "agent-in", "success", 0, "", 1735689601);
+    h.agent_status(eid, "agent-out", "failure", 1, "boom", 1735689602);
+
+    h.fleet_read_scope =
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // Out-of-scope agent id must not appear anywhere in the response --
+    // not the status grid cell, not the per-agent table row, not its error
+    // detail (a distinct, more sensitive string than the bare id).
+    CHECK(res->body.find("agent-out") == std::string::npos);
+    CHECK(res->body.find("boom") == std::string::npos);
+    CHECK(res->body.find("agent-in") != std::string::npos);
+    // "Succeeded" KPI is derived from the (now-filtered) agents vector, so it
+    // must count only the in-scope agent, not both.
+    CHECK(res->body.find("exec-kpi-value exec-kpi-value--ok\">1<") != std::string::npos);
+    CHECK(res->body.find("exec-kpi-value exec-kpi-value--ok\">2<") == std::string::npos);
+    // Gate 4 unhappy-path finding UP-1: the "Total" KPI must ALSO recompute
+    // from the filtered set for a scoped caller -- exec.agents_targeted is 2
+    // (dispatch-time), but only 1 agent is in scope. Total staying at 2 while
+    // the grid/table show only 1 agent would disclose that an out-of-scope
+    // agent exists by simple subtraction, even with its identity hidden.
+    // (exact match: the Total cell's class is plain "exec-kpi-value" with no
+    // --ok/--err modifier, so this substring is unique to it.)
+    CHECK(res->body.find("exec-kpi-value\">1<") != std::string::npos);
+    CHECK(res->body.find("exec-kpi-value\">2<") == std::string::npos);
 }
 
 TEST_CASE("executions detail: per-agent table sorts failed first",

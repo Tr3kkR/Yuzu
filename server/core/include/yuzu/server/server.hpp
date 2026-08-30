@@ -215,6 +215,8 @@ struct Config {
                                      // empty means AuthnRequests are unsigned (backward-compatible)
     std::string saml_group_attribute; // <Attribute Name="..."> carrying group values
     std::string saml_admin_group;     // Group value (from saml_group_attribute) that maps to admin
+    std::string saml_name_attribute;  // <Attribute Name="..."> carrying the display name (else NameID)
+    std::string saml_email_attribute; // <Attribute Name="..."> carrying the email (display fallback)
 
     // Response persistence
     int response_retention_days{90};
