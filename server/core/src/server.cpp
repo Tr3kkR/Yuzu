@@ -151,6 +151,7 @@
 #include "preflight_run_store.hpp"
 #include "vuln_finding_store.hpp"
 #include "access_review_store.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — campaign persistence
+#include "clock_drift_monitor.hpp" // HA WS-1/1a — backward wall-clock drift detector (ADR-2002 §4)
 #include "session_store.hpp"       // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
@@ -18393,8 +18394,11 @@ private:
                 // extends JIT/MFA windows, so it increments the clock-anomaly
                 // counter the YuzuSessionReapClockAnomaly alert fires on. Only
                 // armed with a durable session store (the clock that matters here).
-                constexpr int64_t kClockBackwardToleranceMs = 3000; // ignore sub-3s jitter
-                int64_t last_wall_ms = 0, last_steady_ms = 0;
+                // Cumulative-offset detector (NOT a per-tick delta — a per-tick
+                // tolerance that re-baselines each tick is blind to a stopped
+                // clock, adversarial-round C1). Tolerance ignores sub-3s jitter;
+                // a stopped/slewed-back wall clock accumulates until it crosses it.
+                ClockDriftMonitor session_clock_monitor{/*tolerance_ms=*/3000};
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -18415,11 +18419,13 @@ private:
                         const bool rs_ok = result_set_store_ && result_set_store_->is_open();
                         ++tick;
 
-                        // DB-clock-integrity monitor: detect a backward wall-clock
-                        // step by comparing wall vs monotonic advance since the last
-                        // tick (C1). Fine-grained (~2s), independent of the reap
-                        // anchor, so a small backward step between reap samples is
-                        // still caught. First tick only seeds the baselines.
+                        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
+                        // C1): compare the wall clock against a monotonic reference
+                        // via ClockDriftMonitor, which ACCUMULATES sub-threshold
+                        // backward drift — so a stopped / slowly-slewed-back wall
+                        // clock (each ~2s sample diverging by less than the
+                        // tolerance) is still caught, unlike a per-sample delta.
+                        // Runs every ~2s tick, independent of the 15m reap anchor.
                         if (session_store_ && session_store_->is_open()) {
                             const int64_t wall_ms =
                                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -18429,24 +18435,13 @@ private:
                                 std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count();
-                            if (last_steady_ms != 0) {
-                                const int64_t steady_delta = steady_ms - last_steady_ms;
-                                const int64_t wall_delta = wall_ms - last_wall_ms;
-                                // Wall advanced materially less than monotonic ⇒ the
-                                // wall clock was stepped backward (or stalled).
-                                if (steady_delta - wall_delta > kClockBackwardToleranceMs) {
-                                    spdlog::warn("session clock monitor: wall clock advanced {}ms "
-                                                 "vs {}ms monotonic since last tick — backward "
-                                                 "step/stall of ~{}ms (un-expires sessions / extends "
-                                                 "JIT+MFA windows)",
-                                                 wall_delta, steady_delta,
-                                                 steady_delta - wall_delta);
-                                    metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
-                                        .increment();
-                                }
+                            if (session_clock_monitor.observe(wall_ms, steady_ms)) {
+                                spdlog::warn("session clock monitor: wall clock has fallen behind "
+                                             "monotonic time (backward step / stall / slow negative "
+                                             "slew) — un-expires sessions / extends JIT+MFA windows");
+                                metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
+                                    .increment();
                             }
-                            last_wall_ms = wall_ms;
-                            last_steady_ms = steady_ms;
                         }
 
                         // 1) Materialise terminal pending sets (result-set store
