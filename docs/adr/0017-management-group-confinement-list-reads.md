@@ -365,15 +365,19 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   list-read site in the shape the sweep was designed to find. Not introduced or worsened by #1712;
   tracked as a follow-up — see #3699.
 
-  **Also NOT covered by #1712, found during this PR's own governance re-review — a WRITE-path
-  sibling of the same shape, undisclosed in this coverage map until now:** `GET`/`PUT`/
-  `DELETE /api/agents/:id/properties[/:key]` (`server.cpp`) reads and writes per-agent
+  **A WRITE-path sibling of the same shape, found during #1712's own governance re-review and
+  undisclosed in this coverage map until then — now CLOSED (#3700):** `GET`/`PUT`/
+  `DELETE /api/agents/:id/properties[/:key]` (`server.cpp`) read and wrote per-agent
   custom-properties data behind bare `require_permission("Infrastructure","Read"/"Write")` with no
   per-agent scope filter at all. Not introduced or worsened by #1712 — pre-existing, and absent from
-  every prior enumeration of this ADR's surface list. The WRITE path is a stronger risk class than
-  the read-only surfaces #1712 addressed: a caller holding global `Infrastructure:Write` can mutate
-  custom-properties data for any agent regardless of their otherwise-confined visibility elsewhere.
-  Tracked as a follow-up — see #3700.
+  every prior enumeration of this ADR's surface list. The WRITE path was a stronger risk class than
+  the read-only surfaces #1712 addressed: a caller holding global `Infrastructure:Write` could
+  mutate custom-properties data for any agent regardless of their otherwise-confined visibility
+  elsewhere. Fixed by migrating all three routes to `require_scoped_permission("Infrastructure",
+  "Read"/"Write", agent_id)`, the same per-target gate the Tag routes in `server.cpp` use — RBAC-off
+  behavior is unchanged (`Infrastructure` is not in `kTopologyFloor`, so the legacy fallback branch
+  is identical to `require_permission`'s). Coverage: `tests/unit/server/
+  test_agent_properties_scope_authz.cpp`.
 
 ## Consequences
 
