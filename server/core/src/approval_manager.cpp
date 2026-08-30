@@ -214,6 +214,8 @@ Approval row_to_approval(PGresult* r, int i) {
     a.consumed_by = col_str(r, i, 10);
     a.schedule_id = col_str(r, i, 11);
     a.origin = approval_origin_from_string(col_str(r, i, 12));
+    a.target_plugin = col_str(r, i, 13);
+    a.target_action = col_str(r, i, 14);
     return a;
 }
 
@@ -222,21 +224,26 @@ Approval row_to_approval(PGresult* r, int i) {
 constexpr const char* kSelectAllCols =
     "id, definition_id, status, submitted_by, submitted_at, "
     "reviewed_by, reviewed_at, review_comment, scope_expression, "
-    "consumed_at, consumed_by, schedule_id, origin";
+    "consumed_at, consumed_by, schedule_id, origin, target_plugin, target_action";
 
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for
     // the migration txn. Runtime statements below schema-qualify explicitly.
     //
-    // Folds the SQLite-era v1..v7 ladder into a single v1 DDL — every column
-    // the ladder added (consumed_at/consumed_by/schedule_id/origin) and all
-    // six indexes are present from creation on a fresh Postgres schema
-    // (ADR-0009 fresh-start-by-default); there is no pre-existing population
-    // to back-fill, so v7's `origin = 'legacy'` rewrite (the SQLite ladder's
-    // only DML migration) has nothing to run against and is dropped — see
-    // approval_manager.hpp's `to_string()` comment for why the DECODE side
-    // of that distinction (an unrecognised stored value still refuses) stays
-    // live regardless.
+    // Folds the SQLite-era v1..v8 ladder into a single v1 DDL — every column
+    // the ladder added (consumed_at/consumed_by/schedule_id/origin/
+    // target_plugin/target_action) and all six indexes are present from
+    // creation on a fresh Postgres schema (ADR-0009 fresh-start-by-default);
+    // there is no pre-existing population to back-fill, so v7's
+    // `origin = 'legacy'` rewrite (the SQLite ladder's only DML migration)
+    // has nothing to run against and is dropped — see approval_manager.hpp's
+    // `to_string()` comment for why the DECODE side of that distinction (an
+    // unrecognised stored value still refuses) stays live regardless. v8
+    // (#1398 dispatch-approval-gate hardening) adds target_plugin/
+    // target_action, both '' by default — a mint that leaves either empty
+    // (every non-schedule submit path) simply never matches
+    // `fire_with_approval`'s equality check, the correct fail-closed outcome
+    // (ADR-0033 §1), not a state requiring back-fill.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE approvals ("
@@ -252,7 +259,9 @@ const std::vector<pg::PgMigration>& migrations() {
          "  consumed_at       BIGINT  NOT NULL DEFAULT 0,"
          "  consumed_by       TEXT    NOT NULL DEFAULT '',"
          "  schedule_id       TEXT    NOT NULL DEFAULT '',"
-         "  origin            TEXT    NOT NULL DEFAULT ''"
+         "  origin            TEXT    NOT NULL DEFAULT '',"
+         "  target_plugin     TEXT    NOT NULL DEFAULT '',"
+         "  target_action     TEXT    NOT NULL DEFAULT ''"
          ");"
          "CREATE INDEX idx_approvals_status ON approvals(status);"
          "CREATE INDEX idx_approvals_submitted_at ON approvals(submitted_at);"
@@ -303,7 +312,8 @@ ApprovalManager::ApprovalManager(pg::PgPool& pool) : pool_(pool) {
 std::expected<std::string, std::string>
 ApprovalManager::submit(const std::string& definition_id, const std::string& submitted_by,
                         const std::string& scope_expression, const std::string& schedule_id,
-                        ApprovalOrigin origin) {
+                        ApprovalOrigin origin, std::string target_plugin,
+                        std::string target_action) {
     if (!open_)
         return std::unexpected("database not open");
     if (definition_id.empty())
@@ -397,10 +407,12 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             conn,
             "INSERT INTO approval_manager.approvals "
             "(id, definition_id, status, submitted_by, submitted_at, "
-            " reviewed_by, reviewed_at, review_comment, scope_expression, schedule_id, origin) "
-            "VALUES ($1,$2,'pending',$3,$4,'',0,'',$5,$6,$7)",
+            " reviewed_by, reviewed_at, review_comment, scope_expression, schedule_id, origin, "
+            " target_plugin, target_action) "
+            "VALUES ($1,$2,'pending',$3,$4,'',0,'',$5,$6,$7,$8,$9)",
             std::vector<std::string>{id, definition_id, submitted_by, std::to_string(ts),
-                                     scope_expression, schedule_id, to_string(origin)});
+                                     scope_expression, schedule_id, to_string(origin),
+                                     target_plugin, target_action});
         return ins.status() == PGRES_COMMAND_OK;
     });
 

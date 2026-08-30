@@ -6,6 +6,7 @@
 #include "audit_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
 
@@ -121,7 +122,19 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
     // cannot be bypassed and fails closed to require-approval.
     const bool needs_approval = s.requires_approval || def.approval_mode != "auto";
     if (needs_approval) {
-        if (!d_.approval_manager) {
+        // #1398 (Gate 5 chaos-injector finding, LOW): checks is_open(), not
+        // pointer-nullness. `d_.approval_manager` is a non-owning pointer set
+        // once at server construction and stays non-null for the process
+        // lifetime regardless of whether its internal migration later fails
+        // (ApprovalManager::create_tables() sets its OWN db_ to nullptr on a
+        // failed migration, never this pointer) — so the old `!d_.
+        // approval_manager` check could never fire on a migration-closed
+        // store, and this diagnostic branch's more specific audit/log
+        // message never ran for that case. Net security effect was
+        // unchanged either way (fire_with_approval's own query()/submit()
+        // calls already fail closed on a closed store), but this is the
+        // actually-reachable check for it.
+        if (!d_.approval_manager || !d_.approval_manager->is_open()) {
             // Fail closed: never dispatch an approval-gated instruction
             // without the gate. Advance so the schedule doesn't spin.
             count("yuzu_schedule_fire_failures_total");
@@ -144,18 +157,69 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
 
 bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std::string& plugin,
                                         const std::string& action) {
-    // 1) An APPROVED ticket for THIS schedule's occurrence → fire. The caller
-    //    advances the schedule on our true return, which retires the ticket
-    //    via the occurrence anchor (see ticket_is_current) — approve == at
-    //    most one scheduled run. Single tick thread, so no concurrent-fire
-    //    race. Matching on a.schedule_id == s.id (M-02, #1806) is required,
-    //    not just belt-and-suspenders: without it, two schedules sharing
-    //    (creator, definition, scope) would both fire off ONE approval.
+    // #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding,
+    // then re-hardened by security-guardian's re-review): the definition
+    // this schedule fires can be MUTATED (PUT /api/instructions/{id}, gated
+    // only on InstructionDefinition:Write) between a ticket's approval and
+    // this schedule's next tick — `fire()` re-fetches `def` fresh every
+    // time, so `plugin`/`action` here may be DIFFERENT from what was
+    // actually reviewed when the ticket below was approved. Comparing
+    // against `a.target_plugin`/`a.target_action` (see their doc comment,
+    // approval_manager.hpp) closes that: a mismatch on EITHER field —
+    // including a pre-migration empty value — simply fails the equality
+    // check below and falls through to submitting a fresh ticket for the
+    // NEW content, never redeeming stale review for unreviewed content.
+    // TWO separate comparisons, not a concatenated string: `plugin`/`action`
+    // are free text with no charset restriction, so a single `plugin+"."
+    // +action` string would be collision-prone (28 shipped actions already
+    // contain a literal `.`) — matching `CommandCapabilityRegistry::
+    // classify`'s own independent-field shape eliminates that class.
+
+    // 1) An APPROVED ticket for THIS schedule's occurrence, for THIS exact
+    //    target → fire. The caller advances the schedule on our true return,
+    //    which retires the ticket via the occurrence anchor (see
+    //    ticket_is_current) — approve == at most one scheduled run. Single
+    //    tick thread, so no concurrent-fire race. Matching on
+    //    a.schedule_id == s.id (M-02, #1806) is required, not just
+    //    belt-and-suspenders: without it, two schedules sharing (creator,
+    //    definition, scope) would both fire off ONE approval.
+    // #1398 (security-guardian re-review, MEDIUM): a ticket that matches
+    // this occurrence's identity but NOT its current content is exactly the
+    // attack this hardening defends against (get benign content approved,
+    // then swap the definition before the next tick) — worth its own
+    // detectable audit signal, distinct from "no ticket found at all"
+    // (step 4's ordinary first-ask path below). Captured here, AUDITED
+    // BELOW (only if this tick actually reaches step 4) rather than
+    // immediately: the stale mismatched ticket stays in `approved` status
+    // forever (nothing re-statuses it), so auditing on every detection
+    // would re-fire this event every tick for as long as the resulting
+    // fresh ticket (step 4) stays pending — sre governance finding, audit
+    // volume, not correctness. Firing it once, on the tick that actually
+    // acts on the mismatch by requesting fresh review, is the meaningful
+    // event; every subsequent tick's re-detection of the SAME stale ticket
+    // is not new information (step 2 below already suppresses the
+    // resubmission that would otherwise duplicate-ask).
+    std::string mismatch_audit_detail;
     auto approved = d_.approval_manager->query({.status = "approved", .submitted_by = s.created_by});
     for (const auto& a : approved) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
             a.schedule_id != s.id || !ticket_is_current(a, s))
             continue;
+        if (a.target_plugin != plugin || a.target_action != action) {
+            spdlog::warn("schedule_runner: schedule '{}' (id={}) approval {} no longer matches "
+                         "the definition's CURRENT target ({}.{} != approved {}.{}) — refusing "
+                         "to redeem stale review; a fresh ticket will be requested",
+                         s.name, s.id, a.id, plugin, action, a.target_plugin, a.target_action);
+            if (mismatch_audit_detail.empty()) {
+                mismatch_audit_detail =
+                    "approval_content_mismatch approval_id=" + a.id + " schedule_id=" + s.id +
+                    " approved_target=" + onbehalf::sanitize_for_log(a.target_plugin, 128) + "." +
+                    onbehalf::sanitize_for_log(a.target_action, 128) +
+                    " current_target=" + onbehalf::sanitize_for_log(plugin, 128) + "." +
+                    onbehalf::sanitize_for_log(action, 128);
+            }
+            continue;
+        }
         dispatch_tracked(s, plugin, action, a.id);
         return true;
     }
@@ -177,7 +241,8 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
     auto rejected = d_.approval_manager->query({.status = "rejected", .submitted_by = s.created_by});
     for (const auto& a : rejected) {
         if (a.definition_id != s.definition_id || a.scope_expression != s.scope_expression ||
-            a.schedule_id != s.id || !ticket_is_current(a, s))
+            a.schedule_id != s.id || a.target_plugin != plugin || a.target_action != action ||
+            !ticket_is_current(a, s))
             continue;
         spdlog::info("schedule_runner: schedule '{}' (id={}) occurrence skipped — approval {} "
                      "rejected by {}",
@@ -187,10 +252,16 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
         return true;
     }
 
-    // 4) No ticket yet → submit one (tagged with this schedule's id, M-02)
-    //    and hold the occurrence at its due time.
+    // 4) No ticket yet → submit one (tagged with this schedule's id, M-02,
+    //    and this exact target plugin/action, #1398 hardening) and hold the
+    //    occurrence at its due time. This is where a step-1 content mismatch
+    //    (if any was found above) gets its one-shot audit row: reaching
+    //    here means neither step 2 nor step 3 short-circuited, so this tick
+    //    is genuinely the one requesting fresh review for the mismatch.
+    if (!mismatch_audit_detail.empty())
+        audit(s, "instruction.schedule_fired", "denied", mismatch_audit_detail);
     auto submitted = d_.approval_manager->submit(s.definition_id, s.created_by, s.scope_expression,
-                                                 s.id, ApprovalOrigin::kSchedule);
+                                                 s.id, ApprovalOrigin::kSchedule, plugin, action);
     if (!submitted) {
         // Submit failure (pending cap, store error): drop THIS occurrence
         // (advance) rather than re-submitting every tick against a full cap.
@@ -271,7 +342,14 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
         // dispatch goes through, not silently bypass it. `parameters` is
         // this package's typed-schedule-params payload — the two are
         // independent: WHAT is dispatched vs WHO it is dispatched as.
-        const auto caller = d_.resolve_caller(s.created_by);
+        auto caller = d_.resolve_caller(s.created_by);
+        // #1398: `approval_id` is empty on a direct auto-mode fire and a
+        // real ApprovalManager ticket id on the approved-ticket branch
+        // (fire_with_approval, above) — the same signal dispatch_tracked's
+        // own audit detail already keys on (see `detail += " approval_id="`
+        // below), reused here rather than re-derived.
+        caller.approval_provenance =
+            approval_id.empty() ? ApprovalProvenance::None : ApprovalProvenance::Ticket;
         std::tie(command_id, sent) = d_.dispatch_fn(plugin, action, /*agent_ids=*/{},
                                                     dispatch_scope, parameters, exec_id, caller);
     } catch (const std::exception& e) {

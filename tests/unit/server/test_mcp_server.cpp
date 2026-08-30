@@ -67,6 +67,7 @@
 
 #include <libpq-fe.h> // direct-SQL secret-row verification (M5 remediation)
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -74,6 +75,7 @@
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -6547,6 +6549,84 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     CHECK(sc.contains("message"));
 }
 
+// #1398 (quality-engineer, Gate 3): no prior test wired a fake dispatch_fn
+// that consults the REAL chokepoint (classify_and_authorize_dispatch) rather
+// than fabricating a bare {command_id, 0} directly — so nothing pinned what
+// an MCP caller ACTUALLY experiences today when a gated pair denies at the
+// chokepoint, as opposed to when an agent is genuinely offline. Production's
+// dispatch_confined (server.cpp) does exactly this: `if (!classified) return
+// {command_id, 0};` — a chokepoint denial and an unreachable agent are
+// indistinguishable at this boundary. This test locks that collapse in
+// explicitly, as a known-imperfect but INTENTIONAL regression guard: #1398
+// Rung 4 (tracked, not yet shipped) is the closure that gives a gate denial
+// its own discriminated JSON-RPC error instead of this shared envelope. If
+// this test starts failing because the envelope changed shape WITHOUT Rung 4
+// having shipped a real discriminator, that is a regression, not progress.
+TEST_CASE("MCP execute_instruction: a real chokepoint ApprovalRequired denial "
+          "collapses into the same no_agents_reached envelope as an offline agent (#1398)",
+          "[mcp][integration][execute][1398]") {
+    using yuzu::server::CommandCapability;
+    using yuzu::server::CommandCapabilityRegistry;
+    using yuzu::server::ExecuteGate;
+    using yuzu::server::detail::DispatchDenialReason;
+
+    static constexpr std::array<CommandCapability, 1> kGatedFixture{{
+        {
+            .plugin = "registry",
+            .action = "set_value",
+            .dispatch_class = yuzu::server::DispatchClass::Mutating,
+            .mutability = yuzu::server::Mutability::Reversible,
+            .securable = "Infrastructure",
+            .operation = yuzu::server::authz::Operation::Write,
+            .risk_tier = yuzu::server::authz::RiskTier::Medium,
+            .system_reserved = false,
+            .execute_gate = ExecuteGate::AdminOrApproval,
+        },
+    }};
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kGatedFixture)};
+    const auto always_allow = [](std::string_view, std::string_view,
+                                 yuzu::server::authz::Operation) { return true; };
+
+    McpTestServer ts;
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
+        // Non-admin, no approval provenance, RBAC-allowed — the exact caller
+        // shape `ExecuteGate::AdminOrApproval` is designed to deny.
+        return yuzu::server::DispatchCaller{.principal = "alice", .principal_role = "operator"};
+    };
+    bool chokepoint_denied = false;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+        auto classified =
+            yuzu::server::detail::classify_and_authorize_dispatch(registry, caller, plugin, action,
+                                                                  always_allow);
+        if (!classified) {
+            chokepoint_denied =
+                classified.error().reason == DispatchDenialReason::ApprovalRequired;
+            return {"cmd-registry-set_value", 0}; // mirrors dispatch_confined's real shape
+        }
+        return {"cmd-registry-set_value", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1398,"params":{"name":"execute_instruction","arguments":{"plugin":"registry","action":"set_value"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(chokepoint_denied); // the fixture registry actually denied, not skipped
+
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    // Rung-4-pending: today this is IDENTICAL to the offline-agent envelope
+    // asserted in "MCP Integration: execute_instruction zero agents reached"
+    // above — no `approval_required`/`ApprovalRequired` discriminator exists
+    // in this response yet.
+    CHECK(sc["status"] == "no_agents_reached");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK_FALSE(sc.contains("approval_required"));
+}
+
 // ── 28. Default scope to __all__ ─────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction default scope __all__",
@@ -6798,6 +6878,33 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier mints approval t
     // A ticket was minted, NOT executed.
     CHECK_FALSE(dispatched);
     CHECK(appr.pending_count() == 1);
+}
+
+// #1398: an operator-tier execute_instruction is auto-approved by MCP's own
+// tier gate (mcp_policy.hpp requires_approval returns false for
+// Execution:Execute at operator tier) — no ticket is ever minted, so the
+// caller reaching dispatch must carry NO approval provenance. For a
+// gate=None pair (os_info.version here) that is moot; the assertion matters
+// for the ~42 role-gated pairs, where an operator-tier caller relies solely
+// on principal_is_admin at the chokepoint, never a fabricated provenance.
+TEST_CASE("MCP Integration: execute_instruction operator tier carries no approval provenance "
+          "(auto-approved, no ticket ever minted)",
+          "[mcp][integration][execute][1398]") {
+    McpTestServer ts;
+    yuzu::server::ApprovalProvenance captured = yuzu::server::ApprovalProvenance::Ticket;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+        captured = caller.approval_provenance;
+        return {"cmd-op", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1398,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(captured == yuzu::server::ApprovalProvenance::None);
 }
 
 // ── 36. Audit on success ─────────────────────────────────────────────────
@@ -8941,6 +9048,43 @@ TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an
         R"({"jsonrpc":"2.0","method":"tools/call","id":89,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
     REQUIRE(ok);
     CHECK(dispatched);
+}
+
+// #1398 (adversarial-review finding, Kimi + Codex 2026-08-28): before this
+// fix, MCP's execute_bundle handler derived a fully-stamped caller (via the
+// SAME caller_fn every other surface uses) but passed only
+// session->username + caller.exec_visible into bundle_orch->dispatch() —
+// principal_is_admin and approval_provenance never crossed that boundary, so
+// an admin's bundle step on an AdminOrApproval-gated pair was refused
+// ApprovalRequired unconditionally. This is the full-stack version of the
+// orchestrator-level falsifier in test_bundle_orchestrator.cpp.
+TEST_CASE("MCP execute_bundle threads the caller's principal_is_admin into DispatchFn (#1398)",
+          "[pg][mcp][bundle][1398]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    bool captured_admin = false;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
+        std::unordered_set<std::string> s{"agent-A"};
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{s},
+                                            .principal_is_admin = true};
+    };
+    ts.start_with_dispatch([&captured_admin](const std::string&, const std::string&,
+                                             const std::vector<std::string>&, const std::string&,
+                                             const std::unordered_map<std::string, std::string>&,
+                                             const std::string&,
+                                             const yuzu::server::DispatchCaller& caller)
+                               -> std::pair<std::string, int> {
+        captured_admin = caller.principal_is_admin;
+        return {"cmd", 1};
+    });
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1398,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    REQUIRE(res);
+    CHECK(captured_admin);
 }
 
 TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is unwired (CDX-R6-02)",
@@ -11211,11 +11355,17 @@ TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declar
         McpTestServer ts;
         ts.approval_manager_for_test = &appr;
         bool dispatched = false;
+        // #1398: captured to prove the recall stamps Ticket provenance —
+        // the ~42 role-gated pairs' chokepoint gate needs this independent
+        // of MCP's own tier/ticket machinery above.
+        yuzu::server::ApprovalProvenance captured_provenance =
+            yuzu::server::ApprovalProvenance::None;
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
             dispatched = true;
+            captured_provenance = caller.approval_provenance;
             return {"cmd-ok", 1};
         };
         ts.start_with_dispatch(dispatch, "supervised");
@@ -11234,6 +11384,7 @@ TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declar
         auto body = nlohmann::json::parse(ts.call(recall)->body);
         REQUIRE(body.contains("result"));
         CHECK(dispatched);
+        CHECK(captured_provenance == yuzu::server::ApprovalProvenance::Ticket);
     }
 }
 
@@ -12323,6 +12474,10 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&,
                                     const std::string&) -> bool { return true; };
+    // #1398: quarantine.quarantine is role-gated content (ExecuteGate::
+    // AdminOrApproval). Captured locally rather than added to the shared
+    // McpTestServer harness — this test is the one place that needs it.
+    yuzu::server::ApprovalProvenance captured_provenance = yuzu::server::ApprovalProvenance::None;
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
@@ -12332,6 +12487,7 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_params = params;
         ts.last_dispatch_exec_visible = caller.exec_visible;
+        captured_provenance = caller.approval_provenance;
         return {"cmd-quar", 1};
     };
     ts.start_with_dispatch(dispatch, "supervised"); // Security:Execute requires approval (C2)
@@ -12393,6 +12549,11 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     CHECK(ts.last_dispatch_exec_visible->count("agent-q") == 1);
     // #2712: structuredContent mirrors content[0].text exactly.
     CHECK(write_tool_structured(res2) == payload2);
+    // #1398: the recall reached dispatch only after C8 consumed a real
+    // ticket for this exact request — the caller must carry that
+    // provenance, since quarantine.quarantine's compiled dispatch-chokepoint
+    // gate (AdminOrApproval) checks it independently of MCP's own tier gate.
+    CHECK(captured_provenance == yuzu::server::ApprovalProvenance::Ticket);
 }
 
 TEST_CASE("MCP quarantine_device records-only (agents_reached=0) returns a RETRYABLE "

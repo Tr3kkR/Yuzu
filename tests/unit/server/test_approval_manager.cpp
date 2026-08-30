@@ -817,7 +817,9 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
 // v1 DDL has no v5/v6 intermediate state, and both indexes it pinned are
 // simply part of that one DDL now (verified by inspection of
 // approval_manager.cpp's migrations(), and exercised incidentally by every
-// other test in this file that hits an indexed query path).
+// other test in this file that hits an indexed query path). The origin/dev
+// SQLite-era counterpart also asserted `current_version(...) == 8` for the
+// #1398 target_plugin/target_action columns — moot for the same reason.
 
 TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
           "[pg][approval_manager][approval]") {
