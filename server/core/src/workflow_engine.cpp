@@ -765,19 +765,35 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
         // finalize's is guarded (governance finding, security-guardian + docs-writer,
         // independently): without it, a concurrent cancel_execution() landing between the
         // cancellation check above and this write could flip status back to 'running', making
-        // the loop (and finalize afterwards) forget the cancellation ever happened. Currently
-        // unreachable in production (cancel_execution has no caller), closed as the same
-        // defense-in-depth as the finalize fix.
+        // the loop (and finalize afterwards) forget the cancellation ever happened. `RETURNING id`
+        // makes the CAS observable (governance finding, security-guardian): a CONFIRMED zero-row
+        // result means the guard didn't match — status was no longer 'running', i.e. a cancel landed
+        // in the window between the check above and this write — so the loop stops immediately
+        // instead of dispatching one more step past the cancel. A lease timeout or query failure is
+        // NOT treated as a mismatch (that would break the ADR-0064 degrade-and-continue posture for
+        // an ordinary transient failure) — only a definite, executed CAS that matched zero rows
+        // stops the loop. Currently unreachable in production (cancel_execution has no caller),
+        // closed as the same defense-in-depth as the finalize fix.
+        bool cas_ran = false;
+        bool cas_matched = false;
         with_write_lease([&](PGconn* c) {
             pg::PgResult res = pg::exec_params(
                 c,
                 "UPDATE workflow_engine.workflow_executions SET status = 'running', "
-                "current_step = $1::int WHERE id = $2 AND status = 'running'",
+                "current_step = $1::int WHERE id = $2 AND status = 'running' RETURNING id",
                 std::vector<std::string>{std::to_string(step.index), exec_id});
-            if (res.status() != PGRES_COMMAND_OK)
+            if (res.status() != PGRES_TUPLES_OK) {
                 spdlog::warn("WorkflowEngine: current-step update failed for {}: {}", exec_id,
                             PQresultErrorMessage(res.get()));
+                return;
+            }
+            cas_ran = true;
+            cas_matched = PQntuples(res.get()) > 0;
         });
+        if (cas_ran && !cas_matched) {
+            execution_failed = true;
+            break;
+        }
 
         // Evaluate condition if present
         if (!step.condition.empty() && condition_fn) {
@@ -944,11 +960,13 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             finalize_status = col_str(res.get(), 0, 0); // "failed" or "completed" — confirmed written
     });
 
-    // Determine the real outcome for metrics/logging. If our own write landed, trust it. If not
-    // (lease timeout, or the guard matched zero rows), read back what's actually there rather
-    // than guessing — a concurrent cancel_execution() is the only thing that can move status off
-    // 'running' before finalize, so "cancelled" gets its own bucket; anything else stays "failed"
-    // so an unexpected value can never leak into a metric label.
+    // Determine the real outcome for the log line (and, via the completed/not-completed split
+    // below, the metric). If our own write landed, trust it. If not (lease timeout, or the guard
+    // matched zero rows), read back what's actually there rather than guessing — a concurrent
+    // cancel_execution() is the only thing that can move status off 'running' before finalize, so
+    // the LOG distinguishes "cancelled" from "failed"; the metric still buckets both under
+    // result="failed" (unchanged two-value cardinality) so an unexpected value can never leak
+    // into a metric label.
     std::string outcome = finalize_status.value_or("");
     if (outcome.empty()) {
         auto exec_check = get_execution(exec_id);

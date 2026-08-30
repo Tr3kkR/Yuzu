@@ -4168,8 +4168,12 @@ Workflows define multi-step instruction sequences that execute in order against 
 
 #### `GET /api/workflows`
 
-List all workflows. Supports `?q=<search>` query parameter for name filtering. A soft-deleted
-workflow (see `DELETE` below) never appears in this list.
+List all workflows. Supports `?name=<search>` for a substring name filter and `?limit=<n>` to cap
+the number of rows returned (default 100; `limit` must be a positive integer — `0` or negative is a
+`400`, matching the existing non-numeric-`limit` `400`). A soft-deleted workflow (see `DELETE`
+below) never appears in this list.
+
+**Response (400):** `{"error":{"code":400,"message":"limit must be a positive integer"},"meta":{"api_version":"v1"}}` — non-numeric `limit` returns the sibling `"invalid numeric query parameter"` `400` instead.
 
 **Response (503, degraded read):** `{"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}}` — `workflow_engine` is a migrated Postgres store (ADR-0064); a genuine pool/query failure surfaces as `503`, never a silently-empty list.
 

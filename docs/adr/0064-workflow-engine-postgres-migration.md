@@ -299,9 +299,22 @@ their own inline guard — nothing else called it). Finalize additionally uses `
 confirm what was actually written: if the guard matched zero rows (a concurrent cancel already claimed
 it) or a lease timeout dropped the write, `execute()` reads back the execution's real status via
 `get_execution()` before reporting the write-outcome metric and log line, rather than trusting the
-in-process `execution_failed` bool — which would otherwise misreport a dropped write as success or a
-cancellation as a plain failure. Currently unreachable in production — `cancel_execution()` has no
-REST/MCP caller today (verified: grepped the whole tree) — but closes the gap correctly ahead of that
+in-process `execution_failed` bool — which would otherwise misreport a dropped write as success. The
+LOG line distinguishes a genuine cancellation from an ordinary failure this way; the metric still
+buckets both under `result="failed"` (unchanged two-value cardinality — see "Write-outcome metrics"
+above).
+
+The mid-loop write goes one step further than finalize's: it also uses `RETURNING id` to make its own
+CAS **observable to the loop itself**, not just to a post-hoc metric. A confirmed zero-row result (the
+guard ran and matched nothing — status was no longer `'running'`) stops the loop immediately, so a
+cancel landing between the top-of-iteration cancellation check and this write can't let one extra step
+dispatch to the fleet before the loop notices. This is deliberately narrower than the write-degradation
+posture above: a **lease timeout or query failure** on this write is NOT treated as a CAS mismatch —
+only a write that actually ran and matched zero rows is definite evidence of a concurrent cancel;
+degrading an ambiguous transient failure into "stop the whole execution" would trade one missed edge
+case for a strictly worse one (aborting an in-flight fleet operation on a passing connection-pool
+hiccup). Currently unreachable in production — `cancel_execution()` has no REST/MCP caller today
+(verified: grepped the whole tree) — but closes the gap correctly ahead of that
 route eventually being wired, rather than leaving a latent trap.
 
 ### Lease discipline — the retry-loop hazard

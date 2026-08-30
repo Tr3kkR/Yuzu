@@ -2256,7 +2256,7 @@ TEST_CASE("GET /api/workflows rejects a negative limit with 400", "[pg][workflow
     CHECK(res->status == 400);
 }
 
-TEST_CASE("GET /api/workflows accepts a positive limit", "[pg][workflow][list]") {
+TEST_CASE("GET /api/workflows accepts a positive limit and returns the workflow", "[pg][workflow][list]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
@@ -2267,6 +2267,26 @@ TEST_CASE("GET /api/workflows accepts a positive limit", "[pg][workflow][list]")
     auto res = h.sink.Get("/api/workflows?limit=5");
     REQUIRE(res);
     CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["count"] == 1);
+    CHECK(body["workflows"][0]["name"] == "wf-lim1");
+}
+
+TEST_CASE("GET /api/workflows applies limit to the returned row count", "[pg][workflow][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-lim2", "lim2");
+    h.make_workflow("wf-lim2-a", "def-lim2");
+    h.make_workflow("wf-lim2-b", "def-lim2");
+
+    auto res = h.sink.Get("/api/workflows?limit=1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["count"] == 1);
+    CHECK(body["workflows"].size() == 1);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
