@@ -13,7 +13,16 @@ but have not been exercised, arm64 is unverified, and the container checks run u
 bash scripts/setup-rhel9.sh --with-postgres          # provision
 source ~/.config/yuzu/toolchain-env.sh               # activate (also hooked into ~/.bashrc)
 ./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini
+yz_pkgconfig && meson configure build-linux -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig
 meson compile -C build-linux
+```
+
+The fourth line matters: `scripts/setup.sh` passes only `-Dcmake_prefix_path`, while `CLAUDE.md`'s
+manual-configure marks `-Dpkg_config_path` load-bearing too - spdlog/fmt resolve via pkg-config
+first, and relying on the cmake fallback to chain fmt is at the mercy of the port version.
+`yz_pkgconfig` (defined in the generated env file) puts the checkout's vcpkg `.pc` directory on
+`PKG_CONFIG_PATH` for tools run by hand; the `meson configure` line pins the same path into the
+build directory so later reconfigures keep it. (Aligning `setup.sh` itself is tracked separately.)
 ```
 
 The script is idempotent — re-running it on a provisioned box changes nothing. Verify a machine at
