@@ -312,7 +312,7 @@ meaningful before the first call ever fires.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_server_patch_manager_writes_total{op,result}` | counter | Outcome of each `PatchManager` write, `op` ∈ `{record_patches, deploy_patch, cancel_deployment}`, `result` ∈ `{success, failed}`. A `failed` result means the Postgres transaction backing that call didn't commit (pool exhaustion, a query error) — the caller sees the store's existing not-available/failure error either way; this counter is the only cross-request signal. Note: `record_patches()` has no production caller today (ADR-0062, #3676), so this series' `op="record_patches"` values stay at their pre-seeded `0` until that gap is closed. |
+| `yuzu_server_patch_manager_writes_total{op,result}` | counter | Outcome of each `PatchManager` write, `op` ∈ `{record_patches, deploy_patch, cancel_deployment}`, `result` ∈ `{success, failed, rejected_oversized}`. A `failed` result means the Postgres transaction backing that call didn't commit (pool exhaustion, a query error) — the caller sees the store's existing not-available/failure error either way; this counter is the only cross-request signal. `rejected_oversized` (currently only on `op="deploy_patch"`) increments when the request's `agent_ids` list exceeds `kMaxDeployTargets` (5000, post-de-duplication), before the write is attempted — distinct from `failed`, which means a write was attempted and the transaction didn't commit. Note: `record_patches()` has no production caller today (ADR-0062, #3676), so this series' `op="record_patches"` values stay at their pre-seeded `0` until that gap is closed. |
 
 
 
