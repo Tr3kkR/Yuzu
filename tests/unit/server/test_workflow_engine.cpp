@@ -550,7 +550,9 @@ TEST_CASE("WorkflowEngine: a concurrent cancel_execution races execute()'s guard
     // guard defends against is between the top-of-loop get_execution() cancellation check and
     // that same iteration's guarded UPDATE, with no I/O in between — and a cancel landing during
     // a step's dispatch is ALREADY caught by the next iteration's top-of-loop check regardless of
-    // whether the mid-loop guard exists. With the mid-loop guard's WHERE clause and RETURNING
+    // whether the mid-loop guard exists (or, for the LAST step, by finalize's own separate
+    // `WHERE status = 'running'` guard — there is no next iteration for that one). With the
+    // mid-loop guard's WHERE clause and RETURNING
     // temporarily removed (simulating the pre-fix code) this test was run 20 times across two
     // harness shapes — a slow single-canceller version (5 steps, 5ms dispatch delay, one
     // 1ms-interval canceller thread) and this denser one (60 steps, no dispatch delay, 4
@@ -563,7 +565,16 @@ TEST_CASE("WorkflowEngine: a concurrent cancel_execution races execute()'s guard
     // cancellation from separate threads/connections is safe end-to-end (never leaves the row in
     // 'running', and any cancel that succeeds is permanent), exercising the top-of-loop check,
     // cancel_execution()'s own CAS, and the finalize guard together under real interleaving.
-    WORKFLOW_ENGINE(engine);
+    //
+    // Uses its own larger pool instead of WORKFLOW_ENGINE's fixed size=4 (governance finding,
+    // cpp-expert): 4 canceller threads plus execute()'s own leases share one pool here, and under
+    // CI-runner contention a starved try_acquire_for could time out the "genuinely raced" proof
+    // below — the same shared-box contention class as #473/#482.
+    YUZU_REQUIRE_PG_DB_TPL(wf_db_fx_, workflow_engine_tpl);
+    PgPool wf_pool_fx_{{.conninfo = wf_db_fx_.dsn(), .size = 12}};
+    REQUIRE(wf_pool_fx_.valid());
+    WorkflowEngine engine{wf_pool_fx_};
+    REQUIRE(engine.is_open());
     std::string yaml = "kind: Workflow\nmetadata:\n  displayName: many-step\nspec:\n  steps:\n";
     constexpr int kSteps = 60;
     for (int i = 0; i < kSteps; ++i)
@@ -617,6 +628,23 @@ TEST_CASE("WorkflowEngine: a concurrent cancel_execution races execute()'s guard
     std::vector<std::thread> cancellers;
     for (int i = 0; i < kCancellers; ++i)
         cancellers.emplace_back(canceller_body);
+
+    // RAII join (governance finding, cpp-safety — CLAUDE.md's non-RAII-cleanup policy floor):
+    // if execute() below throws, a bare `stop_canceller = true; for (...) t.join();` placed AFTER
+    // it would never run, and `cancellers`' destructor would then call std::terminate() on every
+    // still-joinable thread. This guard's destructor runs on the unwind path too, so every
+    // canceller is always signalled to stop and joined before either `cancellers` or the
+    // by-reference-captured locals it points at (engine, the atomics, exec_id) go out of scope.
+    struct CancellerJoiner {
+        std::atomic<bool>& stop;
+        std::vector<std::thread>& threads;
+        ~CancellerJoiner() {
+            stop.store(true, std::memory_order_relaxed);
+            for (auto& t : threads)
+                if (t.joinable())
+                    t.join();
+        }
+    } joiner{stop_canceller, cancellers};
 
     auto exec_result = engine.execute(
         wf_id, {"agent-1"},
