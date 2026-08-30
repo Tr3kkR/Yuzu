@@ -49,10 +49,10 @@
     "note": "Hand-recorded from the provisioning session that produced this file. Everything above this key is collected by scripts/setup-rhel9.sh --manifest; this block is not.",
     "date": "2026-08-31",
     "repo_branch": "docs/rhel9-toolchain-setup",
-    "repo_commit": "45fdd3556",
+    "repo_commit": "5bc96ea73",
     "environment": "KVM guest (12 vCPU / 23 GB), Rocky 9.8 GenericCloud, SELinux enforcing, real systemd (postgresql-setup --initdb + systemctl path exercised end to end)",
     "predecessor": "the 2026-08-15 bare-metal run (dev @ c01493d3, also main @ 88f9397d) recorded in this file's git history",
-    "configure_command": "./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini && yz_pkgconfig && meson configure build-linux -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig (the documented sequence, verbatim)",
+    "configure_command": "./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini && yz_pkgconfig && meson configure build-linux --clearcache -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig (the documented sequence, verbatim)",
     "recipe": "bash scripts/setup-rhel9.sh --with-postgres --manifest: zero failed steps on re-run over the existing cluster; --check --with-postgres: all checks pass",
     "tests": {
       "meson_test_targets": 39,
@@ -65,6 +65,6 @@
       },
       "pg_shards": "all 11 [pg] shards pass against the recipe-provisioned cluster"
     },
-    "dependency_resolution_note": "spdlog resolved 1.17.0; with PKG_CONFIG_PATH initially unset the build also links via meson's cmake fallback at this baseline (checked with meson 1.11.2 and 1.12.0) - the documented pkg-config pin makes it deterministic rather than port-dependent"
+    "dependency_resolution_note": "the recorded configure log shows spdlog resolved via pkg-config with the pinned path in env (not the cmake fallback, not cached) - the --clearcache pin is demonstrably in force; at this baseline the cmake fallback also links (spdlog 1.17.0 chains fmt), which is why the pin exists: determinism over port courtesy"
   }
 }
