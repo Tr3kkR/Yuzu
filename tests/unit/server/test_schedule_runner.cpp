@@ -2,12 +2,12 @@
  * test_schedule_runner.cpp — Unit tests for the recurring-schedule poller
  * (ScheduleRunner, #1191).
  *
- * Strategy: real ScheduleEngine (Postgres, ADR-0065 migration-programme PR 5
- * commit 1/3) + real ExecutionTracker/ApprovalManager on one shared :memory:
- * SQLite handle (still the production shape for those two — they share
- * instructions.db until PR 5's later commits move them too), a real
- * InstructionStore on a temp DB, and a FAKE dispatch_fn that records calls
- * and returns a configurable reach count.
+ * Strategy: real ScheduleEngine/ExecutionTracker/ApprovalManager (Postgres,
+ * ADR-0065, schema-per-store on one shared ephemeral database — the
+ * production shape now that InstructionDbPool is deleted and all three
+ * are independent Postgres stores), a real InstructionStore on the same
+ * database, and a FAKE dispatch_fn that records calls and returns a
+ * configurable reach count.
  * Due-ness is driven by creating schedules with next_execution_at in the
  * past (create_schedule honors an explicit value), so no clock injection is
  * needed.
@@ -29,7 +29,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 #include <chrono>
 #include <stdexcept>
@@ -41,15 +40,6 @@ using namespace yuzu::server;
 
 namespace {
 
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 struct DispatchCall {
     std::string plugin;
     std::string action;
@@ -60,13 +50,12 @@ struct DispatchCall {
 };
 
 // InstructionStore is now a migrated Postgres store (ADR-0058). ADR-0065
-// migration-programme PR 5 commit 1/3 added ScheduleEngine and commit 2/3
-// adds ApprovalManager to this same template/database (ADR-0008
-// schema-per-store-on-one-connection) — this key has exactly one caller in
-// the whole test tree (this file), so growing its setup function across PR
-// 5's three commits is safe under the PgTestTemplate replay-fingerprint rule
+// migration-programme PR 5 grew this same template/database (ADR-0008
+// schema-per-store-on-one-connection) across all 3 commits — this key has
+// exactly one caller in the whole test tree (this file), so growing its
+// setup function was safe under the PgTestTemplate replay-fingerprint rule
 // (no other TU shares this key, so there's no divergent setup to conflict
-// with). Commit 3/3 will extend this further to also cover ExecutionTracker.
+// with). Now covers all 4 stores.
 yuzu::test::PgTestTemplate schedrunner_instr_tpl{
     "schedrunnerinstr", [](const std::string& dsn) {
         yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -79,6 +68,9 @@ yuzu::test::PgTestTemplate schedrunner_instr_tpl{
         ApprovalManager approvals{pool};
         if (!approvals.is_open())
             throw std::runtime_error("schedrunner approval manager template: store failed to migrate");
+        ExecutionTracker tracker{pool};
+        if (!tracker.is_open())
+            throw std::runtime_error("schedrunner execution tracker template: store failed to migrate");
     }};
 
 // A trivial first-declared Harness member whose sole purpose is running the
@@ -104,15 +96,11 @@ struct Harness {
     yuzu::test::PostgresTestDb instr_db{schedrunner_instr_tpl};
     yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
 
-    TestDb db; // shared by tracker (production shape; SQLite until PR 5
-               // commit 3/3 moves it too)
-
-    // ADR-0065 (migration-programme PR 5, 1-2/3): ScheduleEngine and
-    // ApprovalManager now built on instr_pool (same ephemeral Postgres
-    // database as InstructionStore below, schema-per-store) instead of the
-    // shared SQLite `db` handle.
+    // ADR-0065 (migration-programme PR 5): all four stores built on
+    // instr_pool (one ephemeral Postgres database, schema-per-store) — the
+    // production shape now that InstructionDbPool is deleted.
     ScheduleEngine engine{instr_pool};
-    ExecutionTracker tracker{db.db};
+    ExecutionTracker tracker{instr_pool};
     ApprovalManager approvals{instr_pool};
     InstructionStore is{instr_pool};
 

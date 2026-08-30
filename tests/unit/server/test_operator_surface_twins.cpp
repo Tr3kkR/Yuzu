@@ -62,7 +62,6 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <string>
@@ -106,11 +105,11 @@ yuzu::test::PgTestTemplate twins_rbac_tpl{"optwinsrbac", [](const std::string& d
         throw std::runtime_error("optwins rbac template: store failed to migrate");
 }};
 // InstructionStore is now a migrated Postgres store (ADR-0058). ADR-0065
-// migration-programme PR 5 commit 1/3 added ScheduleEngine and commit 2/3
-// adds ApprovalManager to this same template/database (ADR-0008
-// schema-per-store-on-one-connection) — this key has exactly one caller in
-// the whole test tree (this file), so growing its setup function across PR
-// 5's three commits is safe under the PgTestTemplate replay-fingerprint rule.
+// migration-programme PR 5 grew this same template/database (ADR-0008
+// schema-per-store-on-one-connection) across all 3 commits — this key has
+// exactly one caller in the whole test tree (this file), so growing its
+// setup function was safe under the PgTestTemplate replay-fingerprint rule.
+// Now covers all 4 stores.
 yuzu::test::PgTestTemplate twins_instr_tpl{"optwinsinstr", [](const std::string& dsn) {
     yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
     InstructionStore store{pool};
@@ -122,6 +121,9 @@ yuzu::test::PgTestTemplate twins_instr_tpl{"optwinsinstr", [](const std::string&
     ApprovalManager approvals{pool};
     if (!approvals.is_open())
         throw std::runtime_error("optwins approval manager template: store failed to migrate");
+    ExecutionTracker tracker{pool};
+    if (!tracker.is_open())
+        throw std::runtime_error("optwins execution tracker template: store failed to migrate");
 }};
 } // namespace
 
@@ -237,29 +239,18 @@ TEST_CASE("arming_check composition: RBAC enabled + ungranted principal denies",
 
 namespace {
 
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 // Minimal harness — the D7 unset/canned-arming_check ScheduleRunner
 // contract itself is p4's test_schedule_runner.cpp's job; this harness
 // exists only to wire compose_arming_check (a REAL registry + REAL
 // RbacStore) through a real ScheduleRunner end to end.
 struct Harness {
-    TestDb db;
     yuzu::server::pg::PgPool& instr_pool;
 
-    // ADR-0065 (migration-programme PR 5, 1-2/3): ScheduleEngine and
-    // ApprovalManager now built on instr_pool (same ephemeral Postgres
-    // database as InstructionStore below, schema-per-store) instead of the
-    // shared SQLite `db` handle.
+    // ADR-0065 (migration-programme PR 5): all stores built on instr_pool
+    // (one ephemeral Postgres database, schema-per-store) — the production
+    // shape now that InstructionDbPool is deleted.
     ScheduleEngine engine{instr_pool};
-    ExecutionTracker tracker{db.db};
+    ExecutionTracker tracker{instr_pool};
     ApprovalManager approvals{instr_pool};
     InstructionStore is;
 

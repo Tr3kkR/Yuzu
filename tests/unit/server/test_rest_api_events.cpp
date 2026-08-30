@@ -37,6 +37,7 @@
 #include "rest_a4_envelope.hpp"
 #include "rest_api_v1.hpp"
 #include "test_approval_manager_pg_helper.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -44,7 +45,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
-#include <sqlite3.h>
 
 #include <atomic>
 #include <chrono>
@@ -62,38 +62,24 @@ using namespace yuzu::server;
 
 namespace {
 
-fs::path uniq(const std::string& prefix) {
-    return yuzu::test::unique_temp_path(prefix + "-");
-}
-
-// RAII closer for the raw sqlite3* the ExecutionTracker borrows. Declared
-// FIRST in RestEventsHarness so it destructs LAST — matches the
-// SqliteHandleGuard pattern from test_workflow_routes.cpp (qa-B2).
-struct SqliteHandleGuard {
-    sqlite3* db{nullptr};
-    ~SqliteHandleGuard() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 struct AuditCall {
     std::string action, result, target_type, target_id, detail;
 };
 
 struct RestEventsHarness {
-    SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
     /// Optional shared admission budget (ADR-0034). nullptr keeps every pre-existing
     /// test on the unmetered path; the admission tests pass one in.
     yuzu::server::detail::StreamBudget* stream_budget{nullptr};
 
-    fs::path tracker_db;
-    std::unique_ptr<ExecutionTracker> tracker;
     // Bus outlives tracker — same invariant as production server.cpp
-    // (execution_event_bus_ declared before execution_tracker_).
+    // (execution_event_bus_ declared before execution_tracker_; members
+    // destruct in reverse declaration order, so declaring the bus FIRST
+    // makes it destruct LAST).
     std::unique_ptr<ExecutionEventBus> event_bus;
+    std::optional<yuzu::test::ExecutionTrackerPg> tracker_bundle;
+    ExecutionTracker* tracker{nullptr};
 
     // Auth/perm/audit toggles for negative cases.
     bool session_present{true};
@@ -115,17 +101,12 @@ struct RestEventsHarness {
     /// 503 path).
     explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true,
                                yuzu::server::detail::StreamBudget* budget = nullptr)
-        : stream_budget(budget), tracker_db(uniq("rest-events-tracker")) {
-        fs::remove(tracker_db);
-
+        : stream_budget(budget) {
         if (with_tracker) {
-            REQUIRE(sqlite3_open(tracker_db.string().c_str(), &tracker_guard.db) == SQLITE_OK);
+            tracker_bundle.emplace();
+            tracker = tracker_bundle->get();
             if (with_bus) {
                 event_bus = std::make_unique<ExecutionEventBus>();
-            }
-            tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
-            tracker->create_tables();
-            if (event_bus) {
                 tracker->set_event_bus(event_bus.get());
             }
         } else if (with_bus) {
@@ -172,7 +153,7 @@ struct RestEventsHarness {
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr,
-                            /*instruction_store=*/nullptr, tracker.get(),
+                            /*instruction_store=*/nullptr, tracker,
                             /*schedule_engine=*/nullptr,
                             /*approval_manager=*/nullptr,
                             /*tag_store=*/nullptr,
@@ -207,22 +188,6 @@ struct RestEventsHarness {
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
                             /*directory_sync=*/nullptr, stream_budget);
-    }
-
-    ~RestEventsHarness() {
-        // Drop tracker BEFORE bus — tracker borrows event_bus_ via
-        // set_event_bus, must reset first. Same invariant as
-        // ExecHarness in test_workflow_routes.cpp.
-        tracker.reset();
-        event_bus.reset();
-        if (tracker_guard.db) {
-            sqlite3_close(tracker_guard.db);
-            tracker_guard.db = nullptr;
-        }
-        std::error_code ec;
-        fs::remove(tracker_db, ec);
-        fs::remove(tracker_db.string() + "-wal", ec);
-        fs::remove(tracker_db.string() + "-shm", ec);
     }
 
     std::string make_exec(const std::string& status) {
@@ -314,7 +279,7 @@ TEST_CASE("make_event_envelope: empty payload becomes JSON null", "[events][enve
 
 // ── Auth + permission preflight ─────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: unauthenticated request → 401 from auth_fn", "[events][auth]") {
+TEST_CASE("GET /api/v1/events: unauthenticated request → 401 from auth_fn", "[pg][events][auth]") {
     RestEventsHarness h;
     h.session_present = false;
     auto res = h.sink.Get("/api/v1/events?execution_id=anything");
@@ -325,7 +290,7 @@ TEST_CASE("GET /api/v1/events: unauthenticated request → 401 from auth_fn", "[
     REQUIRE(h.audit_log.empty());
 }
 
-TEST_CASE("GET /api/v1/events: permission denied → 403 from perm_fn", "[events][perm]") {
+TEST_CASE("GET /api/v1/events: permission denied → 403 from perm_fn", "[pg][events][perm]") {
     RestEventsHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-X");
@@ -346,7 +311,7 @@ TEST_CASE("GET /api/v1/events: permission denied → 403 from perm_fn", "[events
 // tests make it falsifiable.
 
 TEST_CASE("GET /api/v1/events: 429 A4 envelope once the shared budget is exhausted",
-          "[events][admission][sse]") {
+          "[pg][events][admission][sse]") {
     yuzu::server::detail::StreamBudget budget{
         yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
     auto held = budget.try_acquire(yuzu::server::detail::SseSurface::kApiEvents, "someone-else",
@@ -373,7 +338,7 @@ TEST_CASE("GET /api/v1/events: 429 A4 envelope once the shared budget is exhaust
 }
 
 TEST_CASE("GET /api/v1/events: a budget rejection leaves no subscriber and no gauge drift",
-          "[events][admission][sse]") {
+          "[pg][events][admission][sse]") {
     // The lease is taken before BOTH the bus subscription and the active-gauge bump.
     // Getting either order wrong is silent: a leaked listener is only visible in
     // memory, and a leaked gauge increment only shows up as a slowly-rising number
@@ -396,7 +361,7 @@ TEST_CASE("GET /api/v1/events: a budget rejection leaves no subscriber and no ga
 }
 
 TEST_CASE("GET /api/v1/events: the PER-PRINCIPAL cap is keyed on the authenticated identity",
-          "[events][admission][sse]") {
+          "[pg][events][admission][sse]") {
     // Falsification guard the global-cap tests above cannot provide: they force a reject
     // by pre-seeding a DIFFERENT principal, so they would still pass if the handler keyed
     // its lease on a hardcoded literal instead of `session->username`. Here the reject can
@@ -434,7 +399,7 @@ TEST_CASE("GET /api/v1/events: the PER-PRINCIPAL cap is keyed on the authenticat
 }
 
 TEST_CASE("GET /api/v1/events: an unmetered route still serves (nullptr budget is a seam)",
-          "[events][admission][sse]") {
+          "[pg][events][admission][sse]") {
     // Guards against the admission tests above passing for the wrong reason.
     RestEventsHarness h; // no budget
     const auto exec_id = h.make_exec("running");
@@ -445,7 +410,7 @@ TEST_CASE("GET /api/v1/events: an unmetered route still serves (nullptr budget i
 
 // ── Input validation ────────────────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: missing execution_id → 400 A4 envelope", "[events][input]") {
+TEST_CASE("GET /api/v1/events: missing execution_id → 400 A4 envelope", "[pg][events][input]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/events");
     REQUIRE(res);
@@ -459,7 +424,7 @@ TEST_CASE("GET /api/v1/events: missing execution_id → 400 A4 envelope", "[even
     REQUIRE(h.audit_log.empty());
 }
 
-TEST_CASE("GET /api/v1/events: malformed execution_id → 400 A4 envelope", "[events][input]") {
+TEST_CASE("GET /api/v1/events: malformed execution_id → 400 A4 envelope", "[pg][events][input]") {
     RestEventsHarness h;
     // Path-traversal-style payload exercises the char-class regex; the
     // 128-char cap is also implicit (rejects 200+-char IDs).
@@ -482,7 +447,7 @@ TEST_CASE("GET /api/v1/events: tracker unavailable → 503 A4", "[events][noreso
     REQUIRE(h.audit_log.empty());
 }
 
-TEST_CASE("GET /api/v1/events: event bus unavailable → 503 A4", "[events][noresources]") {
+TEST_CASE("GET /api/v1/events: event bus unavailable → 503 A4", "[pg][events][noresources]") {
     RestEventsHarness h(/*with_bus=*/false, /*with_tracker=*/true);
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-x");
     REQUIRE(res);
@@ -493,7 +458,7 @@ TEST_CASE("GET /api/v1/events: event bus unavailable → 503 A4", "[events][nore
 
 // ── Execution-state preflight ───────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[events][notfound]") {
+TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[pg][events][notfound]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-does-not-exist");
     REQUIRE(res);
@@ -505,7 +470,7 @@ TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[events][notfound
     REQUIRE(h.audit_log.empty());
 }
 
-TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[events][terminal]") {
+TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[pg][events][terminal]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("completed");
     auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
@@ -520,7 +485,7 @@ TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[events][termina
 
 // ── Happy path ──────────────────────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: running execution → 200 + subscribed", "[events][happy]") {
+TEST_CASE("GET /api/v1/events: running execution → 200 + subscribed", "[pg][events][happy]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
 
@@ -552,7 +517,7 @@ TEST_CASE("GET /api/v1/events: running execution → 200 + subscribed", "[events
     REQUIRE(h.audit_log[0].detail.starts_with("correlation_id=req-"));
 }
 
-TEST_CASE("GET /api/v1/events: audit failure → Sec-Audit-Failed header", "[events][happy][audit]") {
+TEST_CASE("GET /api/v1/events: audit failure → Sec-Audit-Failed header", "[pg][events][happy][audit]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.audit_should_fail = true;
@@ -570,7 +535,7 @@ TEST_CASE("GET /api/v1/events: audit failure → Sec-Audit-Failed header", "[eve
 }
 
 TEST_CASE("GET /api/v1/events: audit exception → Sec-Audit-Failed header",
-          "[events][happy][audit]") {
+          "[pg][events][happy][audit]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.audit_should_throw = true;
@@ -586,7 +551,7 @@ TEST_CASE("GET /api/v1/events: audit exception → Sec-Audit-Failed header",
 
 // ── Replay window ───────────────────────────────────────────────────────────
 
-TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[events][replay]") {
+TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
 
@@ -618,7 +583,7 @@ TEST_CASE("GET /api/v1/events: ?since param replays buffered events", "[events][
     REQUIRE(h.event_bus->subscriber_count(exec_id) == 1);
 }
 
-TEST_CASE("GET /api/v1/events: invalid ?since parses to no-replay (0)", "[events][replay]") {
+TEST_CASE("GET /api/v1/events: invalid ?since parses to no-replay (0)", "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.event_bus->publish(exec_id, "execution-progress", R"({"pending":1})", false);
@@ -633,7 +598,7 @@ TEST_CASE("GET /api/v1/events: invalid ?since parses to no-replay (0)", "[events
 
 // ── OpenAPI discovery (A2) ──────────────────────────────────────────────────
 
-TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[events][discovery][a2]") {
+TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[pg][events][discovery][a2]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -647,7 +612,7 @@ TEST_CASE("OpenAPI spec lists /events under the agentic-first surface", "[events
 }
 
 TEST_CASE("OpenAPI spec lists /audit/auth-sample (CC7.2 evidence export)",
-          "[events][discovery][a2]") {
+          "[pg][events][discovery][a2]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -658,7 +623,7 @@ TEST_CASE("OpenAPI spec lists /audit/auth-sample (CC7.2 evidence export)",
 }
 
 TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
-          "[events][discovery][a2][lockout]") {
+          "[pg][events][discovery][a2][lockout]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -672,7 +637,7 @@ TEST_CASE("OpenAPI spec lists the account-unlock route (A2 discovery)",
 }
 
 TEST_CASE("OpenAPI spec lists the JIT admin-elevation routes (A2 discovery)",
-          "[events][discovery][a2][jit]") {
+          "[pg][events][discovery][a2][jit]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -686,7 +651,7 @@ TEST_CASE("OpenAPI spec lists the JIT admin-elevation routes (A2 discovery)",
 }
 
 TEST_CASE("OpenAPI spec declares ExecutionSseEvent and A4ErrorEnvelope schemas",
-          "[events][discovery][a2]") {
+          "[pg][events][discovery][a2]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/openapi.json");
     REQUIRE(res);
@@ -737,7 +702,7 @@ TEST_CASE("error_json_a4 no-retry overload emits retry_after_ms:null (A4 field s
 }
 
 TEST_CASE("GET /api/v1/events: 503 (no bus) envelope includes retry_after_ms",
-          "[events][noresources][a4]") {
+          "[pg][events][noresources][a4]") {
     RestEventsHarness h(/*with_bus=*/false, /*with_tracker=*/true);
     auto res = h.sink.Get("/api/v1/events?execution_id=exec-x");
     REQUIRE(res);
@@ -769,7 +734,7 @@ TEST_CASE("make_event_envelope: malformed payload becomes JSON null", "[events][
 // ── X-Content-Type-Options nosniff (security-LOW-2) ─────────────────────────
 
 TEST_CASE("GET /api/v1/events: response sets X-Content-Type-Options: nosniff",
-          "[events][happy][security]") {
+          "[pg][events][happy][security]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     auto res = h.sink.Get("/api/v1/events?execution_id=" + exec_id);
@@ -781,7 +746,7 @@ TEST_CASE("GET /api/v1/events: response sets X-Content-Type-Options: nosniff",
 // ── Last-Event-ID header as replay source ───────────────────────────────────
 
 TEST_CASE("GET /api/v1/events: Last-Event-ID header drives replay when ?since absent",
-          "[events][replay]") {
+          "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     h.event_bus->publish(exec_id, "agent-transition", R"({"agent_id":"a1"})", false);
@@ -807,7 +772,7 @@ TEST_CASE("GET /api/v1/events: Last-Event-ID header drives replay when ?since ab
 
 TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header (with "
           "header injected)",
-          "[events][replay]") {
+          "[pg][events][replay]") {
     // Paired with the existing `?since` precedence test — that one
     // proves `?since` alone works; this one proves `?since` WINS when
     // a conflicting Last-Event-ID is present in the request. G1
@@ -829,7 +794,7 @@ TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID 
 }
 
 TEST_CASE("GET /api/v1/events: ?since query takes precedence over Last-Event-ID header",
-          "[events][replay]") {
+          "[pg][events][replay]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     // Both signals coexist; the handler MUST honour the query param
@@ -946,7 +911,7 @@ TEST_CASE("detail::enqueue_capped: drops oldest on cap overflow + bumps dropped_
 // ── Replay-gap detection ────────────────────────────────────────────────────
 
 TEST_CASE("GET /api/v1/events: replay-gap envelope condition is detectable from bus snapshot",
-          "[events][replay][gap]") {
+          "[pg][events][replay][gap]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
     // Simulate a buffer that has already evicted the early events:
@@ -999,7 +964,7 @@ TEST_CASE("GET /api/v1/events: replay-gap envelope condition is detectable from 
 // ── Endpoint-scoped metrics ─────────────────────────────────────────────────
 
 TEST_CASE("GET /api/v1/events: subscribe increments yuzu_server_sse_api_* metrics",
-          "[events][metrics][observability]") {
+          "[pg][events][metrics][observability]") {
     RestEventsHarness h;
     auto exec_id = h.make_exec("running");
 
@@ -1030,7 +995,7 @@ TEST_CASE("GET /api/v1/events: subscribe increments yuzu_server_sse_api_* metric
 // ── GET /api/v1/executions/{id} (#1088 R2 — UAT-found contract gap) ─────────
 
 TEST_CASE("GET /api/v1/executions/{id}: returns final state JSON for known execution",
-          "[events][executions][issue-1088]") {
+          "[pg][events][executions][issue-1088]") {
     // The W5.1 /api/v1/events 410 envelope remediation hint points at
     // this endpoint. UAT smoke on #1088 caught that the endpoint did
     // not exist (only /sse/executions/{id} HTML+SSE and the dashboard
@@ -1053,7 +1018,7 @@ TEST_CASE("GET /api/v1/executions/{id}: returns final state JSON for known execu
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: unknown id → 404 A4 envelope",
-          "[events][executions][issue-1088][notfound]") {
+          "[pg][events][executions][issue-1088][notfound]") {
     RestEventsHarness h;
     auto res = h.sink.Get("/api/v1/executions/exec-does-not-exist");
     REQUIRE(res);
@@ -1077,7 +1042,7 @@ TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retr
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: auth denied → 401 (no body leak)",
-          "[events][executions][issue-1088][auth]") {
+          "[pg][events][executions][issue-1088][auth]") {
     RestEventsHarness h;
     h.session_present = false;
     auto res = h.sink.Get("/api/v1/executions/exec-1");
@@ -1086,7 +1051,7 @@ TEST_CASE("GET /api/v1/executions/{id}: auth denied → 401 (no body leak)",
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: permission denied → 403",
-          "[events][executions][issue-1088][perm]") {
+          "[pg][events][executions][issue-1088][perm]") {
     RestEventsHarness h;
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/executions/exec-1");

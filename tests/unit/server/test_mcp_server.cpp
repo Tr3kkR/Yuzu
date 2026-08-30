@@ -26,6 +26,7 @@
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
+#include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
@@ -65,7 +66,6 @@
 #include "agent.pb.h" // yuzu::agent::v1::AgentInfo (discover_plugins test)
 
 #include <libpq-fe.h> // direct-SQL secret-row verification (M5 remediation)
-#include <sqlite3.h>
 
 #include <atomic>
 #include <chrono>
@@ -5198,25 +5198,9 @@ TEST_CASE("MCP Agentic demo: summarize_working_set agent kind enforces group sco
 }
 
 TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execution:Read (G-S2)",
-          "[mcp][integration][agentic-demo][scope][review-1653]") {
-    auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-scope-");
-    std::filesystem::remove(db_path);
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        std::filesystem::path p;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-            std::error_code ec;
-            std::filesystem::remove(p, ec);
-            std::filesystem::remove(p.string() + "-wal", ec);
-            std::filesystem::remove(p.string() + "-shm", ec);
-        }
-    } guard{db, db_path};
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+          "[pg][mcp][integration][agentic-demo][scope][review-1653]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
 
     McpTestServer ts;
     ts.execution_tracker_for_test = &tracker;
@@ -5235,25 +5219,9 @@ TEST_CASE("MCP Agentic demo: summarize_working_set execution kind requires Execu
 
 // #3344: get_execution_status had zero prior unit coverage.
 TEST_CASE("MCP get_execution_status: #3344 retry_after_ms present only while non-terminal",
-          "[mcp][integration][execution]") {
-    auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-status-poll-");
-    std::filesystem::remove(db_path);
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        std::filesystem::path p;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-            std::error_code ec;
-            std::filesystem::remove(p, ec);
-            std::filesystem::remove(p.string() + "-wal", ec);
-            std::filesystem::remove(p.string() + "-shm", ec);
-        }
-    } guard{db, db_path};
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+          "[pg][mcp][integration][execution]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
 
     yuzu::server::Execution exec;
     exec.definition_id = "def-poll-status";
@@ -5994,7 +5962,7 @@ TEST_CASE("MCP execute_instruction hands dispatch an EMPTY principal when the Ca
 
 TEST_CASE("MCP Integration: execute_instruction populates execution_id and threads it through "
           "dispatch (#1088)",
-          "[mcp][integration][execute][issue-1088]") {
+          "[pg][mcp][integration][execute][issue-1088]") {
     // governance R1 closure for QE SHOULD-1 + SHOULD-2 / happy-LOW-2 /
     // consistency SHOULD-1: with a real ExecutionTracker wired in, the
     // MCP `execute_instruction` lifecycle (create_execution → dispatch
@@ -6003,29 +5971,8 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     // execution_id the handler reports back in the JSON-RPC result —
     // mirroring the REST sibling test at
     // `test_workflow_routes.cpp:#1088 — POST /api/instructions/.../execute`.
-    auto db_path = yuzu::test::unique_temp_path("test-mcp-exec-tracker-");
-    std::filesystem::remove(db_path);
-
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
-    // RAII: close + delete on scope exit so a REQUIRE failure mid-test
-    // doesn't leak the temp DB. Matches the SqliteHandleGuard pattern
-    // from test_workflow_routes.cpp.
-    struct Guard {
-        sqlite3* h;
-        std::filesystem::path p;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-            std::error_code ec;
-            std::filesystem::remove(p, ec);
-            std::filesystem::remove(p.string() + "-wal", ec);
-            std::filesystem::remove(p.string() + "-shm", ec);
-        }
-    } guard{db, db_path};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
 
     McpTestServer ts;
     ts.execution_tracker_for_test = &tracker;
@@ -7107,27 +7054,10 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
     // the execution_id), stamp a response row with the returned id, then collect
     // it back via query_responses{execution_id}. This is the loop an agentic
     // worker runs at fleet scale.
-    auto db_path = yuzu::test::unique_temp_path("test-mcp-fanout-loop-");
-    std::filesystem::remove(db_path);
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        std::filesystem::path p;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-            std::error_code ec;
-            std::filesystem::remove(p, ec);
-            std::filesystem::remove(p.string() + "-wal", ec);
-            std::filesystem::remove(p.string() + "-shm", ec);
-        }
-    } guard{db, db_path};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
     YUZU_REQUIRE_PG_DB_TPL(pgdb, responsestore_tpl);
     pg::PgPool pool{{.conninfo = pgdb.dsn(), .size = 4}};
+    yuzu::server::ExecutionTracker tracker(pool);
+    REQUIRE(tracker.is_open());
     yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
@@ -7172,27 +7102,10 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
 
 TEST_CASE("MCP query_responses: #3344 retry_after_ms confirms in-flight, absent once terminal",
           "[pg][mcp][integration][response][fanout][execute]") {
-    auto db_path = yuzu::test::unique_temp_path("test-mcp-query-poll-hint-");
-    std::filesystem::remove(db_path);
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        std::filesystem::path p;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-            std::error_code ec;
-            std::filesystem::remove(p, ec);
-            std::filesystem::remove(p.string() + "-wal", ec);
-            std::filesystem::remove(p.string() + "-shm", ec);
-        }
-    } guard{db, db_path};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
     YUZU_REQUIRE_PG_DB_TPL(pgdb, responsestore_tpl);
     pg::PgPool pool{{.conninfo = pgdb.dsn(), .size = 4}};
+    yuzu::server::ExecutionTracker tracker(pool);
+    REQUIRE(tracker.is_open());
     yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
@@ -13822,27 +13735,12 @@ bridge_ring(yuzu::server::mcp::McpStreamState& st, const std::string& principal)
 } // namespace
 
 TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode (2f PR 3a)",
-          "[mcp][integration][execute][bridge][2f]") {
+          "[pg][mcp][integration][execute][bridge][2f]") {
     namespace smcp = yuzu::server::mcp;
 
     // Real tracker + bus + session registry + bridge, mock everything else.
-    // :memory: (not a temp FILE) on purpose: this TEST_CASE re-runs its fixture
-    // per SECTION, and file-SQLite create_tables is serialized by Defender on the
-    // Windows CI runner (flake #473 class) - the dominant per-section cost that
-    // pushed the server suite over its 600s meson cap (#2092/#2093). The tracker
-    // uses this single connection, so an in-memory DB is fully equivalent here.
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{db};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     yuzu::server::ExecutionEventBus bus;
     tracker.set_event_bus(&bus);
     yuzu::MetricsRegistry metrics;
@@ -14172,11 +14070,18 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
     }
 
     SECTION("create_execution failure degrades to the plain path, dispatch still runs, counted") {
-        // #2413: a real ExecutionTracker bound to no database. create_execution
-        // returns std::unexpected("database not open") deterministically, with
-        // no I/O and no fault-injection seam needed on the bridge side - this is
-        // the same failure class CLAUDE.md calls "a failed sqlite3_prepare".
-        yuzu::server::ExecutionTracker broken(nullptr);
+        // #2413: a real ExecutionTracker bound to an unreachable pool
+        // (ADR-0065: an unreachable port fails construction's own connect
+        // attempt deterministically, test_engine_principal_store.cpp's #2456
+        // precedent — no live database needed). create_execution returns
+        // std::unexpected("database not open") deterministically, with no I/O
+        // and no fault-injection seam needed on the bridge side.
+        pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                                .size = 1,
+                                .connect_timeout_s = 1}};
+        REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+        yuzu::server::ExecutionTracker broken(unreachable);
+        REQUIRE(!broken.is_open());
         ts.execution_tracker_for_test = &broken;
 
         auto dispatch = [&](const std::string&, const std::string&,
@@ -14261,7 +14166,7 @@ TEST_CASE("Harness default for streamed_post_enabled_ tracks Config's own defaul
 }
 
 TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain response",
-          "[mcp][integration][execute][bridge][2f][3b]") {
+          "[pg][mcp][integration][execute][bridge][2f][3b]") {
     // The shipped default is now ON (see "Config's shipped default for streamed POST is
     // ON" above). This test covers the operator opt-out instead: with the flag off, the
     // operator surfaces that document the plain-path bounds still hold - a client asking
@@ -14273,18 +14178,8 @@ TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain r
     // fallback breaking.
     namespace smcp = yuzu::server::mcp;
 
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{db};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     yuzu::server::ExecutionEventBus bus;
     tracker.set_event_bus(&bus);
     yuzu::MetricsRegistry metrics;
@@ -14337,21 +14232,11 @@ TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain r
 }
 
 TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
-          "[mcp][integration][execute][bridge][2f][3b]") {
+          "[pg][mcp][integration][execute][bridge][2f][3b]") {
     namespace smcp = yuzu::server::mcp;
 
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{db};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     yuzu::server::ExecutionEventBus bus;
     tracker.set_event_bus(&bus);
     yuzu::MetricsRegistry metrics;
@@ -14779,21 +14664,11 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
 
 // ── 2f PR 3b (C9): notifications/cancelled intercept ─────────────────────────
 TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR 3b C9)",
-          "[mcp][integration][bridge][2f][3b][cancel]") {
+          "[pg][mcp][integration][bridge][2f][3b][cancel]") {
     namespace smcp = yuzu::server::mcp;
 
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{db};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     yuzu::server::ExecutionEventBus bus;
     tracker.set_event_bus(&bus);
     yuzu::MetricsRegistry metrics;
@@ -14987,21 +14862,11 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
 
 // ── C10: chaos P0 endpoint reproductions, handler half ───────────────────────
 TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain path alone",
-          "[mcp][integration][bridge][2f][chaos][ch5][ch6]") {
+          "[pg][mcp][integration][bridge][2f][chaos][ch5][ch6]") {
     namespace smcp = yuzu::server::mcp;
 
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{db};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
     yuzu::server::ExecutionEventBus bus;
     tracker.set_event_bus(&bus);
     yuzu::MetricsRegistry metrics;

@@ -60,23 +60,7 @@ fs::path uniq(const std::string& prefix) {
     return yuzu::test::unique_temp_path(prefix + "-");
 }
 
-// RAII holder for the raw sqlite3* that ExecutionTracker takes by handle.
-// Declared as the FIRST member of ExecHarness so its destructor runs LAST
-// in member-destruction order — guarantees the handle closes even if a
-// later REQUIRE in the constructor throws (qa-B2 fixture leak fix).
-struct SqliteHandleGuard {
-    sqlite3* db{nullptr};
-    ~SqliteHandleGuard() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 struct ExecHarness {
-    // Order matters: tracker_guard outlives `tracker` so the handle is still
-    // alive while ~ExecutionTracker runs (it doesn't close, only finalizes
-    // statements), then SqliteHandleGuard closes the handle on destruction.
-    SqliteHandleGuard tracker_guard;
     /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
     /// owns the route lambdas that capture `&metrics`, so this ordering is what
     /// keeps the borrowed pointer valid for as long as a handler could run. An
@@ -89,7 +73,7 @@ struct ExecHarness {
     /// pre-existing test on the unmetered path; the admission tests pass one in.
     yuzu::server::detail::StreamBudget* stream_budget{nullptr};
 
-    fs::path tracker_db, instr_db, wf_db;
+    fs::path instr_db, wf_db;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
     std::unique_ptr<ResponseStore> responses;
@@ -199,16 +183,13 @@ struct ExecHarness {
                          bool with_workflow_engine = false,
                          bool wire_fleet_read_fn_arg = true)
         : stream_budget(budget),
-          tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
+          instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
         wire_exec_visible = wire_exec_visible_arg;
         wire_fleet_read_fn = wire_fleet_read_fn_arg;
-        for (auto& p : {tracker_db, instr_db, wf_db})
+        for (auto& p : {instr_db, wf_db})
             fs::remove(p);
 
-        // ExecutionTracker takes a raw sqlite3* — open it via the guard so a
-        // throwing REQUIRE in any later constructor step still closes it.
-        REQUIRE(sqlite3_open(tracker_db.string().c_str(), &tracker_guard.db) == SQLITE_OK);
         // PR 3: bus must outlive the tracker (the tracker borrows the
         // bus pointer). Build the bus first when wanted; the no-bus
         // harness leaves event_bus as nullptr so the route registration
@@ -216,8 +197,8 @@ struct ExecHarness {
         if (with_bus) {
             event_bus = std::make_unique<ExecutionEventBus>();
         }
-        tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
-        tracker->create_tables();
+        tracker = std::make_unique<ExecutionTracker>(pool);
+        REQUIRE(tracker->is_open());
         if (event_bus) {
             tracker->set_event_bus(event_bus.get());
         }
@@ -352,24 +333,11 @@ struct ExecHarness {
         // so the bus must outlive the tracker through its destructor.
         tracker.reset();
         event_bus.reset();
-        // Close the raw SQLite handle BEFORE attempting to remove the
-        // tracker_db file. On Windows, fs::remove() fails with
-        // ERROR_SHARING_VIOLATION if any process holds the file open;
-        // tracker_guard.~SqliteHandleGuard() would close it, but only
-        // AFTER this destructor body returns — by which point fs::remove
-        // on the still-open tracker_db has already thrown
-        // filesystem_error, escaping the destructor and terminating the
-        // process. Linux is permissive (unlink succeeds with open fds)
-        // so the bug only manifests on Windows MSVC.
-        if (tracker_guard.db) {
-            sqlite3_close(tracker_guard.db);
-            tracker_guard.db = nullptr;
-        }
         // Use the noexcept overload — destructors must not throw even if
         // a separate remove failure (e.g. file already gone, parent dir
         // missing) happens.
         std::error_code ec;
-        for (auto& p : {tracker_db, instr_db, wf_db}) {
+        for (auto& p : {instr_db, wf_db}) {
             fs::remove(p, ec);
             fs::remove(p.string() + "-wal", ec);
             fs::remove(p.string() + "-shm", ec);

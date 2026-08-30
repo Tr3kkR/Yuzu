@@ -1,9 +1,11 @@
 # ADR-0065: Instruction Cluster (ScheduleEngine / ApprovalManager / ExecutionTracker) → PostgreSQL
 
-- **Status:** Proposed (this ADR lands with commit 1/3 of the PR, and now covers commit 2/3;
-  ExecutionTracker's section is a placeholder until commit 3 lands — see its TODO marker below.
-  Flip to Accepted once all three components are ported and the sections below are verified.)
-- **Date:** 2026-08-30 (commits 1-2/3); TBD (final)
+- **Status:** Accepted — all three components ported, the whole binary compiles and links, and
+  both the full `[pg]`-tagged suite (2888 cases, 2885 passed, 3 pre-existing unrelated skips —
+  see "Considered and rejected") and the full non-pg suite (2976 cases, 2895 passed, 81
+  pre-existing unrelated skips) pass with zero failures; `check-pg-shard-partition.py` confirms
+  an exact 11-pg/4-non-pg partition.
+- **Date:** 2026-08-30
 - **Deciders:** pg workstream (migration-programme PR 5, the last of the 7-store SQLite→Postgres
   ladder, #1328/#1325/#3653)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009 (including its 2026-08-25
@@ -32,7 +34,7 @@ extended (per the ladder's Wave 4 note) to non-`Store`-suffix class names.
 
 ## Decision
 
-### Component 1/3: ScheduleEngine (this commit)
+### Component 1/3: ScheduleEngine (commit 1)
 
 `ScheduleEngine` (`schedule_engine.{hpp,cpp}`) stores recurring instruction schedules
 (`schedules`, one table, 17 columns) and is polled by `ScheduleRunner`'s background tick thread
@@ -110,14 +112,18 @@ availability flag to key either probe on, so neither existed. `/readyz`'s `Store
 exact pattern `patch_manager_ok`/`directory_sync_ok` already established.
 
 **No backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment):** no
-`migrate_from_sqlite`, unconditionally. The legacy `instructions.db` (shared with the still-SQLite
-ExecutionTracker/ApprovalManager siblings until commits 2/3 of this PR) is never read for data.
-Construction logs a one-time `ScheduleEngine initialized (schema schedule_engine) — fresh start, no
-legacy backfill` line; `server.cpp` calls the shared `legacy_sqlite_probe::warn_if_legacy_rows()`
-helper (already established by the earlier Wave 4 PRs) over `instructions.db`, naming the
-`schedules` table, to warn (never fail, never block boot) if the legacy file still holds rows.
+`migrate_from_sqlite`, unconditionally. The legacy `instructions.db` (at this point in the PR's
+staged commits, still shared with the not-yet-ported ExecutionTracker/ApprovalManager siblings) is
+never read for data. Construction logs a one-time `ScheduleEngine initialized (schema
+schedule_engine) — fresh start, no legacy backfill` line; `server.cpp` calls the shared
+`legacy_sqlite_probe::warn_if_legacy_rows()` helper (already established by the earlier Wave 4
+PRs) over `instructions.db`, naming only the `schedules` table this component owns, to warn
+(never fail, never block boot) if the legacy file still holds rows. Each of the three components
+in this cluster makes its own separate probe call over its own tables — landing with its own
+commit — rather than one combined call; `server.cpp`'s per-store construction blocks were already
+independent before this migration, and a probe call belongs next to the construction it guards.
 
-### Component 2/3: ApprovalManager (this commit)
+### Component 2/3: ApprovalManager (commit 2)
 
 `ApprovalManager` (`approval_manager.{hpp,cpp}`) stores one-time MCP approval tickets and REST
 instruction-approval requests (`approvals`, one table, 13 columns) — a security control, not
@@ -218,29 +224,125 @@ compound cap-check + sweep + insert sequence — `consume_ticket`'s CAS and ever
 longer take it at all, since a single Postgres statement is already atomic under the target row's
 own lock.
 
-### Component 3/3: ExecutionTracker + `InstructionDbPool` deletion — TODO, lands with commit 3
+### Component 3/3: ExecutionTracker + `InstructionDbPool` deletion (commit 3)
 
-Per claim-discipline, same caveat as above. Planned shape:
+`ExecutionTracker` (`execution_tracker.{hpp,cpp}`) stores execution history and per-agent
+outcomes (`executions` + `agent_exec_status`, two tables) and is the write path for every
+gRPC `CommandResponse`, all REST v1/legacy execution routes, five MCP tools, the dashboard, and
+`ScheduleRunner`. It is the last of the three to move and the one whose deletion of
+`InstructionDbPool` retires `instructions.db` entirely.
 
-- Schema `execution_tracker`, folding the SQLite-era v1+v2 ladder (the `plugin_result_status`
-  column) into one PG v1 DDL.
-- The one `sqlite3_changes()` call in the whole cluster (`refresh_counts`, gating the terminal-
-  transition SSE publish) becomes `UPDATE ... RETURNING` — closing the #1033-class shared-connection
-  race this store carried.
-- The `recursive_mutex` (needed because `refresh_counts` re-enters `get_execution` on the same
-  thread) is restructured away in favor of a lease-free private helper, or replaced with a plain
-  mutex if re-entrancy is removed instead.
-- The two-publish SSE ordering invariant (progress-flagged-terminal event precedes the real
-  terminal event — `docs/executions-history-ladder.md`'s `first_terminal_id` contract) is preserved
-  exactly; this is a routed concern and re-verified at governance time regardless of what this ADR
-  claims.
-- `InstructionDbPool` (`instruction_db_pool.{hpp,cpp}`) is deleted, along with its `server.cpp`
-  member, construction block, and teardown line — this is the point at which the legacy
-  `instructions.db` file stops being written to by any Yuzu store.
-- `/readyz`'s existing `execution_tracker` row re-keys from `instr_db_pool_->is_open() &&
-  execution_tracker_->schema_ok()` to the store's own new `is_open()`.
+**Not a posture upgrade at the store level — but a probe-visibility fix.** The SQLite era kept a
+`migration_ok_`/`schema_ok()` pair only because a borrowed `sqlite3*` couldn't be nulled on
+failure; `/readyz` keyed on `instr_db_pool_->is_open() && execution_tracker_->schema_ok()` —
+i.e. availability was reported through the POOL, not the store. Construction is now
+fail-**closed** on its own new `open_`/`is_open()` (`schema_ok()` kept as an alias, unchanged
+call sites); `/readyz`'s `execution_tracker` row re-keys directly to
+`execution_tracker_ && execution_tracker_->is_open()` (`server.cpp:13070`), and `/healthz` gains
+a net-new `execution_tracker_ok` conjunct + stores-map entry (`server.cpp:12851-12912`) — the
+SQLite era had no such row in `/healthz` at all.
 
-**This section will be rewritten, not merely appended to, once commit 3 lands.**
+**Schema** (Postgres schema `execution_tracker`, two tables, folding the SQLite-era v1+v2 ladder
+— v2 added `plugin_result_status` — into one PG v1 DDL, four indexes):
+
+```sql
+CREATE TABLE executions (
+    id                 TEXT    PRIMARY KEY,
+    definition_id      TEXT    NOT NULL,
+    status             TEXT    NOT NULL DEFAULT 'pending',
+    scope_expression   TEXT    NOT NULL DEFAULT '',
+    parameter_values   TEXT    NOT NULL DEFAULT '',
+    dispatched_by      TEXT    NOT NULL DEFAULT '',
+    dispatched_at      BIGINT  NOT NULL DEFAULT 0,
+    agents_targeted    INTEGER NOT NULL DEFAULT 0,
+    agents_responded   INTEGER NOT NULL DEFAULT 0,
+    agents_success     INTEGER NOT NULL DEFAULT 0,
+    agents_failure     INTEGER NOT NULL DEFAULT 0,
+    completed_at       BIGINT  NOT NULL DEFAULT 0,
+    parent_id          TEXT    NOT NULL DEFAULT '',
+    rerun_of           TEXT    NOT NULL DEFAULT ''
+);
+CREATE TABLE agent_exec_status (
+    execution_id       TEXT    NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+    agent_id           TEXT    NOT NULL,
+    status             TEXT    NOT NULL DEFAULT 'dispatched',
+    first_response_at  BIGINT  NOT NULL DEFAULT 0,
+    completed_at       BIGINT  NOT NULL DEFAULT 0,
+    exit_code          INTEGER NOT NULL DEFAULT 0,
+    error_detail       TEXT    NOT NULL DEFAULT '',
+    plugin_result_status TEXT  NOT NULL DEFAULT '',
+    PRIMARY KEY (execution_id, agent_id)
+);
+CREATE INDEX idx_exec_definition ON executions(definition_id);
+CREATE INDEX idx_exec_parent ON executions(parent_id);
+CREATE INDEX idx_exec_dispatched_at ON executions(dispatched_at);
+CREATE INDEX idx_agent_exec_status_execution ON agent_exec_status(execution_id);
+```
+
+**`refresh_counts` closes the #1033-class race and gains the same one-transaction consistency
+`advance_schedule` gained.** The SQLite era read `sqlite3_changes(db_)` immediately after a
+terminal-transition `UPDATE` on the shared FULLMUTEX connection — a read that is not atomic with
+the `step()` that produced it under concurrent callers on one connection (the exact hazard issue
+#1033 tracks generally). The port (`execution_tracker.cpp:448-543`) wraps the aggregate recompute,
+the conditional terminal-transition `UPDATE ... WHERE status='running' RETURNING 1`, and the SSE
+payload snapshot in one `pool_.with_txn_for`; the terminal transition is detected via
+`PQntuples(term.get()) > 0` on the `RETURNING` result instead of a separate changes-count call —
+a per-lease Postgres connection with `RETURNING` has no such race to begin with. Both SSE
+publishes (`execution-progress`, then `execution-completed` when terminal) run lease-free, after
+the transaction commits and the connection is released — preserving
+`docs/executions-history-ladder.md`'s `first_terminal_id` contract (the terminal-flagged progress
+event precedes the real terminal event) exactly, which governance re-verifies independently of
+this ADR's claim.
+
+**The `recursive_mutex` is deleted, not narrowed or replaced.** It existed only because
+`refresh_counts` re-entered the public `get_execution()` on the same thread while holding the
+lock. The port instead introduces a lease-free private helper, `exec_by_id_at(PGconn*, const
+std::string&)` (`execution_tracker.cpp:189`), that `get_execution`/`get_summary` call after
+acquiring their own lease, and that `refresh_counts` calls directly with the transaction's
+already-held connection — avoiding the documented `pg_pool.hpp` nesting-deadlock hazard of
+acquiring a second lease from inside an already-held `with_txn_for` callback. With no method
+calling another store method while holding a lock, no mutex of any kind is needed; `open_` is a
+plain `bool`, not atomic (construction-then-read-only, matching every other store in this
+ladder).
+
+**`InstructionDbPool` deletion.** `instruction_db_pool.{hpp,cpp}` is deleted along with its
+`server.cpp` member (`instr_db_pool_`), its dedicated construction block, and its teardown line
+— verified beforehand by a repo-wide grep that `server.cpp` was its only consumer. The
+`execution_event_bus_` construction, previously gated inside the pool's own `is_open()` check,
+relocates into the new `if (pg_pool_ && !startup_failed_)` gate, still constructed before the
+tracker (`server.cpp:5114`) — the `[BUS-BEFORE-TRACKER]` destruction-order invariant
+(`server.cpp`) is preserved unchanged because `pg_pool_` already precedes the trio in member
+declaration order, so no member reordering was needed to keep it correct.
+
+**Consumers (unchanged public API, no signature churn):** gRPC `AgentServiceImpl` (every
+`CommandResponse`), REST v1 (8 routes) + legacy REST, 5 MCP tools, the dashboard, `ScheduleRunner`
+(borrowed pointer). Verified: no consumer constructs `ExecutionTracker` itself outside test code —
+`server.cpp` is the sole production construction site.
+
+**No backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment):** no
+`migrate_from_sqlite`, unconditionally. This is the point at which `instructions.db` stops being
+written to by any Yuzu store. `ExecutionTracker`'s own `legacy_sqlite_probe::warn_if_legacy_rows()`
+call (naming `executions`, `agent_exec_status`) lands in this commit, alongside the
+already-landed ScheduleEngine (`schedules`) and ApprovalManager (`approvals`) calls from commits
+1 and 2 — an operator upgrading straight from a pre-PR build to the finished PR sees up to three
+separate warnings, one per component that still held rows, not one combined line.
+
+**Test blast radius (15 files, ~380 cases) converted using two shapes, chosen per call site.**
+Most sites hold a raw `sqlite3*` alone and convert to the self-contained
+`yuzu::test::ExecutionTrackerPg` RAII bundle (`test_execution_tracker_pg_helper.hpp`, its own
+`PgTestTemplate` key `exectracker`, its own `SKIP` guard). Sites that already share a `pg::PgPool`
+with another store in the same fixture (e.g. `ResponseStore` in `test_mcp_server.cpp`'s
+query-responses fanout tests) construct `ExecutionTracker` directly against that same pool
+instead (schema-per-store on one database) rather than opening a second ephemeral database. The
+one closed-store test (`ExecutionTracker(nullptr)` in the SQLite era) ports to the
+`test_engine_principal_store.cpp` #2456 precedent: a `pg::PgPool` built against an unreachable
+host (`connect_timeout_s=1`) fails the store's own connect attempt deterministically, no live
+database required — the same technique already used for `ApprovalManager`'s closed-store test in
+commit 2.
+
+**One MCP-level SQLite technique ($2506 F2 real-tracker payload-contract test) had no schema
+change to make** — it already drove `ExecutionTracker` as a black box through its public API, so
+only its construction converts (to `ExecutionTrackerPg`); the payload assertions are unchanged.
 
 ## Considered and rejected
 
@@ -292,17 +394,37 @@ Per claim-discipline, same caveat as above. Planned shape:
 - **The MCP A4 error envelope's permanent-vs-transient discriminator is now a Postgres SQLSTATE
   string, not a SQLite extended errcode** — an internal type change with no client-visible
   behavior change (the same two response bodies, chosen by the same two-discriminator rule).
-- Consequences for ExecutionTracker: TODO, commit 3.
+- **Any execution history and per-agent status from a pre-Postgres build is lost on upgrade**
+  (component 3 of 3). The executions drawer, REST execution routes, and MCP execution-status
+  tools start from empty; no gRPC `CommandResponse` in flight at the moment of upgrade has
+  anywhere to land until the operator's next dispatch. Documented in
+  `docs/user-manual/upgrading.md`.
+- **`instructions.db` is retired.** This is the point at which no Yuzu store — server or agent —
+  writes to it; `InstructionDbPool` (its sole reader/writer abstraction) is deleted along with the
+  file's last three consumers. The file itself is left on disk (never deleted) so the legacy-probe
+  warning can still fire on an upgrade.
+- **The #1033-class `sqlite3_changes()`-after-`step()` race is closed for this store** (tracked
+  generally at issue #1033; this store's specific instance, in `refresh_counts`, is the ONLY
+  `sqlite3_changes()` call site the whole three-store cluster carried). The sibling stores this
+  ADR ports (`ScheduleEngine`, `ApprovalManager`) never had one.
+- **`/healthz` gains an `execution_tracker` row it never had under the SQLite era** (availability
+  was previously only visible through `/readyz`, itself keyed on the pool rather than the store) —
+  a monitoring-visibility improvement, not a new failure mode.
 
 ## Follow-ups
 
-- `execution_tracker.cpp`'s `#1033`-class shared-connection race: tracked to be closed by commit 3
-  of this PR, not a separate follow-up.
-- ADR-2002 (High Availability) forward-pointers, one per component, to be added as each commit
-  lands: ExecutionTracker's `ExecutionEventBus` stays process-local (cross-replica SSE delivery is
-  ADR-2002's concern); ApprovalManager's queue-cap/expiry-sweep check-then-act is process-local
-  (multi-replica coordination is ADR-2002's concern); ScheduleEngine's `SELECT ... FOR UPDATE`
-  (now a single atomic UPDATE, so this specific hazard is closed) still leaves concurrent
-  *dispatch* of the same due schedule across replicas unaddressed — ADR-2002 already commits to a
-  fenced-leader + transactional-outbox model for exactly this class of problem. All three are
-  irrelevant on today's single-server design (`docs/adr/2002-high-availability-architecture.md`).
+- `execution_tracker.cpp`'s `#1033`-class shared-connection race is CLOSED by this PR (see
+  component 3's `refresh_counts` section above) — recorded here, not as an open item.
+- ADR-2002 (High Availability) forward-pointers, one per component: ExecutionTracker's
+  `ExecutionEventBus` stays process-local (cross-replica SSE delivery is ADR-2002's concern);
+  ApprovalManager's queue-cap/expiry-sweep check-then-act is process-local (multi-replica
+  coordination is ADR-2002's concern); ScheduleEngine's `SELECT ... FOR UPDATE` (now a single
+  atomic UPDATE, so this specific hazard is closed) still leaves concurrent *dispatch* of the same
+  due schedule across replicas unaddressed — ADR-2002 already commits to a fenced-leader +
+  transactional-outbox model for exactly this class of problem. All three are irrelevant on
+  today's single-server design (`docs/adr/2002-high-availability-architecture.md`).
+- **Not fixed here, filed separately:** unbounded growth of `executions`/`agent_exec_status`
+  (`execution_tracker` schema) and `approvals` (`approval_manager` schema) — a retention pass is
+  its own clock-guarded change (routed-concerns row 38's seven-part apparatus), out of scope for a
+  storage-backend migration. `ConcurrencyManager` (test-only dead code, no `server.cpp`
+  construction site) — noted, not deleted in this PR (scope discipline).

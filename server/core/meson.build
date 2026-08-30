@@ -401,7 +401,6 @@ yuzu_server_core_lib = static_library(
     'src/analytics_event_store.cpp',
     'src/analytics_sinks.cpp',
     'src/data_export.cpp',
-    'src/instruction_db_pool.cpp',
     'src/instruction_store.cpp',
     'src/instruction_yaml.cpp',
     'src/execution_tracker.cpp',

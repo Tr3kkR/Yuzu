@@ -30,12 +30,13 @@ Take the next free number in your block. Filename is `<number>-<kebab-slug>.md`.
 
 The `ls docs/adr/` grep above only sees numbers with a file on disk — it cannot see a number
 a doc has claimed in prose. `docs/postgres-migration-ladder.md`'s `## Wave 4` section (added
-2026-08-27) reserves **0061–0065** for its 5 in-flight migration PRs (`UpdateRegistry`,
-`PatchManager`, `DirectorySync`, `WorkflowEngine`, and a shared cluster ADR for
-`ExecutionTracker`/`ApprovalManager`/`ScheduleEngine`) before any of those files exist. If
+2026-08-27) originally reserved **0061–0065** for its 5 in-flight migration PRs. As of the
+instruction-cluster PR (ADR-0065, `ExecutionTracker`/`ApprovalManager`/`ScheduleEngine`), 4 of
+the 5 files exist on disk (0061 `UpdateRegistry`, 0062 `PatchManager`, 0063 `DirectorySync`,
+0065 this one) — only **0064 (`WorkflowEngine`)** remains reserved-but-not-yet-on-disk. If
 you're picking a number in the `0xxx` block, check that doc's Wave 4 table too, not just this
 grep — otherwise this becomes a third entry in "Known number collisions" below. Drop this note
-once all 5 files exist on disk (at which point the grep sees them directly).
+once 0064 also exists on disk (at which point the grep sees all 5 directly).
 
 ## The convention binds prospectively
 
