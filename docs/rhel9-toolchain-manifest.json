@@ -11,7 +11,7 @@
   "compiler": "g++ (GCC) 14.2.1 20250110 (Red Hat 14.2.1-13)",
   "cmake": "3.31.8",
   "ninja": "1.10.2",
-  "meson": "1.11.2",
+  "meson": "1.12.0",
   "python": "3.9.25",
   "pyyaml": "6.0.3",
   "postgresql": "18.4",
@@ -40,17 +40,20 @@
     "unzip": {"version": "6.0-60.el9_8", "repo": "baseos"},
     "tar": {"version": "1.34-11.el9", "repo": "base-os-install"},
     "git": {"version": "2.52.0-1.el9", "repo": "appstream"},
-    "curl": {"version": "7.76.1-40.el9", "repo": "base-os-install"}
+    "curl": {"version": "7.76.1-40.el9", "repo": "base-os-install"},
+    "postgresql-server": {"version": "18.4-2.module+el9.8.0+40213+f1e225a4", "repo": "appstream"},
+    "postgresql-contrib": {"version": "18.4-2.module+el9.8.0+40213+f1e225a4", "repo": "appstream"},
+    "postgresql": {"version": "18.4-2.module+el9.8.0+40213+f1e225a4", "repo": "appstream"}
   },
   "verified_run": {
     "note": "Hand-recorded from the provisioning session that produced this file. Everything above this key is collected by scripts/setup-rhel9.sh --manifest; this block is not.",
-    "date": "2026-08-30",
+    "date": "2026-08-31",
     "repo_branch": "docs/rhel9-toolchain-setup",
-    "repo_commit": "85fac0969",
+    "repo_commit": "45fdd3556",
     "environment": "KVM guest (12 vCPU / 23 GB), Rocky 9.8 GenericCloud, SELinux enforcing, real systemd (postgresql-setup --initdb + systemctl path exercised end to end)",
     "predecessor": "the 2026-08-15 bare-metal run (dev @ c01493d3, also main @ 88f9397d) recorded in this file's git history",
-    "configure_command": "./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini",
-    "recipe": "bash scripts/setup-rhel9.sh --with-postgres --manifest: zero failed steps; --check --with-postgres: all 22 checks pass",
+    "configure_command": "./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini && yz_pkgconfig && meson configure build-linux -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig (the documented sequence, verbatim)",
+    "recipe": "bash scripts/setup-rhel9.sh --with-postgres --manifest: zero failed steps on re-run over the existing cluster; --check --with-postgres: all checks pass",
     "tests": {
       "meson_test_targets": 39,
       "ok": 35,
@@ -60,7 +63,8 @@
         "docs telemetry selftest": "system SQLite 3.34.1 lacks RETURNING (documented platform limitation)",
         "server unit tests shard A": "test_mcp_server.cpp classify-schema case, known Linux-only failure (#2610 family); this branch contains no C++ changes"
       },
-      "pg_shards": "all 11 [pg] shards pass against the recipe-provisioned cluster; shard B 87 s"
-    }
+      "pg_shards": "all 11 [pg] shards pass against the recipe-provisioned cluster"
+    },
+    "dependency_resolution_note": "spdlog resolved 1.17.0; with PKG_CONFIG_PATH initially unset the build also links via meson's cmake fallback at this baseline (checked with meson 1.11.2 and 1.12.0) - the documented pkg-config pin makes it deterministic rather than port-dependent"
   }
 }
