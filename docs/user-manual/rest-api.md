@@ -4168,7 +4168,14 @@ Workflows define multi-step instruction sequences that execute in order against 
 
 #### `GET /api/workflows`
 
-List all workflows. Supports `?q=<search>` query parameter for name filtering.
+List all workflows. Supports `?name=<search>` for a substring name filter and `?limit=<n>` to cap
+the number of rows returned (default 100; `limit` must be a positive integer — `0` or negative is a
+`400`, matching the existing non-numeric-`limit` `400`). A soft-deleted workflow (see `DELETE`
+below) never appears in this list.
+
+**Response (400):** `{"error":{"code":400,"message":"limit must be a positive integer"},"meta":{"api_version":"v1"}}` — non-numeric `limit` returns the sibling `"invalid numeric query parameter"` `400` instead.
+
+**Response (503, degraded read):** `{"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}}` — `workflow_engine` is a migrated Postgres store (ADR-0064); a genuine pool/query failure surfaces as `503`, never a silently-empty list.
 
 **Response:**
 
@@ -4195,15 +4202,23 @@ Create a workflow from YAML. The request body is the raw YAML text with `Content
 
 #### `GET /api/workflows/{id}`
 
-Get a single workflow by ID, including its full step definitions.
+Get a single workflow by ID, including its full step definitions. `404` for an unknown or
+soft-deleted id; `503` on a genuine store degrade (ADR-0064).
 
 #### `DELETE /api/workflows/{id}`
 
-Delete a workflow by ID.
+Delete a workflow by ID. **Soft-delete (ADR-0064):** the workflow is retired, not physically
+removed — its execution history stays intact and remains readable via `GET
+/api/workflow-executions/{id}` indefinitely, and a deleted workflow's id can never be
+re-used. Response body is unchanged: `{"deleted": true}` on the first delete of an existing
+workflow, `{"deleted": false}` (still `200`) for an unknown id or a repeat delete of an
+already-deleted one. A genuine store-unavailable condition now returns `503` instead of the
+pre-migration `{"deleted": false}`.
 
 #### `POST /api/workflows/{id}/execute`
 
-Execute a workflow against targeted agents.
+Execute a workflow against targeted agents. Fails (workflow-not-found, `400`) if the workflow
+does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064).
 
 **Request body:**
 
@@ -4221,7 +4236,10 @@ Execute a workflow against targeted agents.
 
 #### `GET /api/workflow-executions/{id}`
 
-Get the status of a running or completed workflow execution, including per-step and per-agent results.
+Get the status of a running or completed workflow execution, including per-step and per-agent
+results. `404` for an unknown execution id; `503` on a genuine store degrade (ADR-0064).
+Execution history survives its workflow being deleted — this route stays readable for an
+execution whose workflow was later soft-deleted.
 
 **Usage guide:**
 
