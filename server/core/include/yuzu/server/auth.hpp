@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -16,7 +17,9 @@ class MetricsRegistry;
 }
 namespace yuzu::server {
 class AuthDB;
-}
+class SessionStore;  // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
+struct SessionRow;   // session_store.hpp — the durable row shape
+} // namespace yuzu::server
 
 namespace yuzu::server::auth {
 
@@ -104,7 +107,14 @@ struct Session {
     /// display-name changes without perturbing the stable `username` above.
     std::string display_name;
     Role role;
-    std::chrono::steady_clock::time_point expires_at;
+    /// Absolute session-lifetime ceiling. WALL-CLOCK (`system_clock`) since
+    /// HA WS-1/1a (ADR-2002 §4): sessions are durable Postgres rows, so their
+    /// lifetime is an absolute wall-clock instant that any replica compares
+    /// against, not a per-process monotonic point. The NTP-step resistance the
+    /// former `steady_clock` gave is replaced by (a) the DB-primary clock being
+    /// a monitored security dependency (WS-11) and (b) the hard wall-clock
+    /// ceilings on the elevation/MFA windows below.
+    std::chrono::system_clock::time_point expires_at;
     // "local", "oidc", "saml", "api_token", "mcp_token", or "engine_token" (six values —
     // docs/auth-engine-principals-design.md §6; the sixth is minted only by
     // AuthRoutes::synthesize_token_session for a principal_kind="engine" ApiToken).
@@ -131,48 +141,91 @@ struct Session {
 
     /// Timestamp of the most recent successful MFA proof on this session
     /// (login completion or step-up). Default-constructed sentinel means
-    /// "no MFA proof yet". Compared against
-    /// `steady_clock::now() - cfg.mfa_step_up_window_secs` by high-risk
-    /// route handlers. SOC 2 CC6.6 — see docs/auth-mfa-design.md.
-    std::chrono::steady_clock::time_point mfa_verified_at{};
+    /// "no MFA proof yet". WALL-CLOCK (`system_clock`) since HA WS-1/1a
+    /// (durable rows). Compared against
+    /// `system_clock::now() - cfg.mfa_step_up_window_secs` by high-risk route
+    /// handlers, which fail CLOSED on a backward step (a proof timestamped
+    /// AFTER `now` is treated as no proof — see mfa_step_up.cpp). SOC 2 CC6.6 —
+    /// see docs/auth-mfa-design.md.
+    std::chrono::system_clock::time_point mfa_verified_at{};
 
-    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `steady_clock::now() <
-    /// elevated_until`, this session's EFFECTIVE role is `admin` regardless of
-    /// the base `role` — a time-boxed, justified, MFA-gated activation set by
-    /// `POST /api/v1/elevate` (eligibility = `users.elevation_eligible`). The
-    /// default-constructed sentinel (epoch) means "not elevated" — fail-closed,
-    /// monotonic (an NTP step can't extend it). Per-session + in-memory: a
-    /// restart or logout drops the elevation. See `effective_role()` and
-    /// docs/auth-architecture.md "JIT admin elevation".
-    std::chrono::steady_clock::time_point elevated_until{};
+    /// JIT admin elevation (SOC 2 CC6.3/CC6.6). When `system_clock::now() <
+    /// elevated_until` (AND the window is within the `kMaxElevationWindow` hard
+    /// ceiling — see `is_elevated()`), this session's EFFECTIVE role is `admin`
+    /// regardless of the base `role` — a time-boxed, justified, MFA-gated
+    /// activation set by `POST /api/v1/elevate` (eligibility =
+    /// `users.elevation_eligible`). The default-constructed sentinel (epoch)
+    /// means "not elevated". WALL-CLOCK since HA WS-1/1a (durable rows); the
+    /// former monotonic NTP-step resistance is replaced by the paired
+    /// `elevation_issued_at` anchor + `kMaxElevationWindow` ceiling below. See
+    /// `effective_role()` and docs/auth-architecture.md "JIT admin elevation".
+    std::chrono::system_clock::time_point elevated_until{};
+
+    /// Wall-clock instant the current elevation was GRANTED (the max-delta
+    /// anchor, ADR-2002 §4). Paired with `elevated_until`: `is_elevated()`
+    /// rejects any elevation whose granted window `elevated_until -
+    /// elevation_issued_at` exceeds `kMaxElevationWindow`, so a forward clock
+    /// corruption (at grant, or a tampered durable row) cannot push admin
+    /// beyond the hard ceiling independent of what `elevated_until` holds. Epoch
+    /// sentinel when not elevated; set together with `elevated_until` at every
+    /// grant site and cleared together on revoke.
+    std::chrono::system_clock::time_point elevation_issued_at{};
 
     /// Inactivity (idle) timeout support (SOC 2 CC6.3). `last_activity_at` is
-    /// bumped toward `steady_clock::now()` on authenticated requests when the
+    /// bumped toward `system_clock::now()` on authenticated requests when the
     /// idle timeout is enabled (`AuthManager::session_inactivity_ > 0`),
     /// throttled to once per touch-granularity; `validate_session` rejects the
     /// session once `now - last_activity_at` exceeds the window — a sliding
-    /// window UNDER the absolute `expires_at`. steady_clock (monotonic) so an
-    /// NTP step can neither extend nor collapse it. `last_activity_persisted_at`
-    /// throttles the best-effort AuthDB mirror (`touch_session_activity`) to at
-    /// most one write per session per kActivityPersistGranularity, keeping the
-    /// hot path off a per-request SQL write.
+    /// window UNDER the absolute `expires_at`. WALL-CLOCK (`system_clock`) since
+    /// HA WS-1/1a: the sliding anchor is a durable row column advanced via
+    /// `SessionStore::touch_activity` (which deliberately does NOT bump the
+    /// write-generation), so any replica ages the session from the same
+    /// absolute instant. `last_activity_persisted_at` throttles the durable
+    /// mirror to at most one write per session per kActivityPersistGranularity,
+    /// keeping the hot path off a per-request SQL write.
     ///
-    /// Both are STAMPED at each of the three session-creation sites
-    /// (authenticate / create_local_session / create_oidc_session). The `{}`
-    /// member-init is the steady_clock EPOCH, which is fail-closed: an unstamped
-    /// session reads as instantly-idle (rejected), never a spurious keep-alive.
-    /// **Invariant:** any future path that inserts a Session into
-    /// `AuthManager::sessions_` (e.g. the v2 session-rehydration-from-auth.db
-    /// work) MUST stamp `last_activity_at`, or the restored session is
-    /// idle-evicted on its first validate when the feature is on.
-    std::chrono::steady_clock::time_point last_activity_at{};
-    std::chrono::steady_clock::time_point last_activity_persisted_at{};
+    /// Both are STAMPED at every session-creation and rehydration site. The `{}`
+    /// member-init is the EPOCH, which is fail-closed: an unstamped session
+    /// reads as instantly-idle (rejected), never a spurious keep-alive.
+    /// **Invariant:** any path that inserts a Session into the validate-cache
+    /// (creation OR rehydration from a `SessionRow`) MUST stamp
+    /// `last_activity_at`, or the restored session is idle-evicted on its first
+    /// validate when the feature is on.
+    std::chrono::system_clock::time_point last_activity_at{};
+    std::chrono::system_clock::time_point last_activity_persisted_at{};
 };
 
-/// True iff `s` currently holds an unexpired JIT admin elevation.
+/// Defense-in-depth hard ceiling on any JIT elevation window (ADR-2002 §4).
+/// With sessions on wall-clock (durable rows), `is_elevated()` additionally
+/// rejects any elevation whose granted window (`elevated_until -
+/// elevation_issued_at`) exceeds this bound — so a forward clock corruption at
+/// grant time, or a tampered durable row, cannot extend admin beyond it,
+/// INDEPENDENT of the per-deployment `--jit-max-elevation-secs` clamp the caller
+/// applies at grant. Chosen generously so every legitimate grant (default 1h,
+/// config-capped) passes while an implausible far-future value is refused.
+inline constexpr auto kMaxElevationWindow = std::chrono::hours(24);
+
+/// True iff `s` currently holds an unexpired, in-ceiling JIT admin elevation.
+/// Wall-clock (`system_clock`) since HA WS-1/1a; the ceiling below is the
+/// defense-in-depth replacement for the former monotonic NTP-step resistance.
 inline bool is_elevated(const Session& s) {
-    return s.elevated_until.time_since_epoch().count() != 0 &&
-           std::chrono::steady_clock::now() < s.elevated_until;
+    if (s.elevated_until.time_since_epoch().count() == 0)
+        return false;
+    const auto now = std::chrono::system_clock::now();
+    if (now >= s.elevated_until)
+        return false;
+    // Backward-step guard, symmetric with mfa_step_up's future-dated-proof
+    // rejection: an issued-at in the future relative to `now` means the wall
+    // clock stepped backward below the grant instant — fail closed rather than
+    // honor a window a rewind would stretch. (A smaller rewind that stays above
+    // issued_at can still extend the live window; that residual is the
+    // WS-11-monitored DB-primary-clock dependency, ADR-2002 §4.)
+    if (now < s.elevation_issued_at)
+        return false;
+    // Reject a granted window wider than the hard ceiling (a forward-corrupted
+    // `elevated_until`, or an elevated_until set without its issued-at anchor —
+    // which reads as an epoch-anchored, thus enormous, window and is refused).
+    return (s.elevated_until - s.elevation_issued_at) <= kMaxElevationWindow;
 }
 
 /// The session's EFFECTIVE legacy role: `admin` while a JIT elevation is active,
@@ -314,11 +367,11 @@ public:
     /// Create a session for a user who has already cleared the password
     /// and any required MFA checks. Mirrors create_oidc_session but with
     /// `auth_source="local"`. If `mfa_verified` is true, stamps
-    /// `mfa_verified_at = steady_clock::now()` so the step-up window
+    /// `mfa_verified_at = system_clock::now()` so the step-up window
     /// covers immediate high-risk actions taken right after login.
     std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
 
-    /// Stamp `mfa_verified_at = steady_clock::now()` on the named session.
+    /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
     /// Returns true if the session existed and was updated. Used by the
     /// /login/mfa/stepup route (PR 2) to mark an already-issued session
     /// as freshly MFA-verified.
@@ -331,7 +384,7 @@ public:
     /// cookie session that carries it (residual-risk follow-up B, security
     /// review 2026-06-30). The CALLER is responsible for the eligibility +
     /// MFA-step-up gates; this only mutates the in-memory session. Returns the
-    /// absolute (possibly-clamped) expiry `steady_clock::time_point` on success
+    /// absolute (possibly-clamped) expiry `system_clock::time_point` on success
     /// (so the route can report it), nullopt if the session does not exist OR
     /// is already at/past its own `expires_at` (a dead-window guard, governance
     /// hardening round UP-1/UP-4: a session that crosses its absolute lifetime
@@ -340,21 +393,30 @@ public:
     /// spurious `role.elevation.granted`/`role.elevation.expired` pair). The
     /// caller's nullopt→401 path already covers this. `duration` is assumed
     /// already clamped to the configured `--jit-max-elevation-secs` cap by the
-    /// caller.
-    std::optional<std::chrono::steady_clock::time_point>
+    /// caller; the durable grant additionally stamps `elevation_issued_at` so
+    /// the `kMaxElevationWindow` ceiling (auth.hpp) can bound it wall-clock.
+    std::optional<std::chrono::system_clock::time_point>
     elevate_session(const std::string& token, std::chrono::seconds duration);
 
     /// Revoke an active JIT elevation (manual step-down): clear `elevated_until`
-    /// on the named session. Returns true if the session existed and was
-    /// elevated (so the route can distinguish a real revoke from a no-op).
-    bool revoke_elevation(const std::string& token);
+    /// on the named session. On success the value is whether the session existed
+    /// AND was elevated (so the route can distinguish a real revoke from a
+    /// no-op). Returns `unexpected` ONLY when a durable `SessionStore` clear
+    /// FAILED — the route MUST fail closed there (the elevation is still live
+    /// durably; reporting success would falsely tell an incident responder the
+    /// admin was revoked, governance-missed / adversarial C2). Store-less
+    /// (legacy) mode never errors.
+    [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
 
     /// Clear any active JIT elevation on EVERY session of `username` (all
     /// devices). Called when an admin removes a user's elevation eligibility so
     /// an in-flight elevation is terminated immediately — symmetric with the
-    /// session wipe on demote/delete (governance UP-1). Returns the number of
-    /// sessions whose elevation was cleared.
-    int revoke_user_elevations(const std::string& username);
+    /// session wipe on demote/delete (governance UP-1). On success the value is
+    /// the number of sessions whose elevation was cleared. Returns `unexpected`
+    /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
+    /// closed (an in-flight elevation may still be live durably; the eligibility
+    /// flip alone does not drop it). Store-less (legacy) mode never errors.
+    [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
 
     /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
     /// security review 2026-06-30): if `token`'s session holds an elevation
@@ -385,8 +447,26 @@ public:
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
 
+private:
+    /// Store-backed validate path (HA WS-1/1a): cache-first, then authoritative
+    /// `SessionStore::find`, with the same absolute-expiry + idle-timeout gates
+    /// as the legacy in-memory path. Only reached when `session_store_` is set;
+    /// the store-less deployment keeps the legacy body unchanged. A degraded
+    /// authoritative read for an uncached token fails the request (401), never a
+    /// silent grant.
+    std::optional<Session> validate_session_durable(const std::string& token,
+                                                    bool idle_enabled) const;
+
+public:
+
     /// Destroy a session (logout).
-    void invalidate_session(const std::string& token);
+    /// Destroy a session (logout). Returns whether the durable delete
+    /// persisted: true when no store is configured OR the durable row was
+    /// deleted; FALSE on a durable-delete store error (the local cache is still
+    /// erased, but the durable row survives and can rehydrate a valid session on
+    /// another replica / from a copied cookie, so the caller MUST NOT report a
+    /// clean logout — adversarial-round blocker #3).
+    [[nodiscard]] bool invalidate_session(const std::string& token);
 
     /// Outcome of `invalidate_user_sessions`. The in-memory `count` is the
     /// number of session cookies erased; `db_persisted` is true iff the
@@ -452,6 +532,25 @@ public:
     /// If not set, falls back to config file I/O (backwards compatible).
     void set_auth_db(yuzu::server::AuthDB* db) { auth_db_ = db; }
 
+    /// Set the durable session store (HA WS-1/1a, ADR-2002 §4). When set,
+    /// operator sessions are written-through to Postgres and validated
+    /// against it, with the in-memory `sessions_` map serving as a
+    /// generation-gated process-local cache; a session then survives a
+    /// core-replica restart/failover and validates on any replica. When
+    /// NULL (config-file-only deployments, and unit tests that do not wire
+    /// a pool) the legacy in-memory-only behavior is preserved unchanged —
+    /// the same optional-backing pattern as `set_auth_db`. Wired at startup
+    /// before any request is served.
+    void set_session_store(yuzu::server::SessionStore* s) { session_store_ = s; }
+
+    /// True iff a durable SessionStore is set AND reports open. Wired into
+    /// /readyz alongside `is_auth_db_ok()`: with sessions durable, a
+    /// half-open/failed session store is a readiness failure (the node cannot
+    /// mint or validate durable sessions). Returns true in the legacy
+    /// in-memory path (no store configured) so the signal only fires on an
+    /// actual store failure. Fail-closed like `is_auth_db_ok`.
+    bool is_session_store_ok() const noexcept;
+
     /// Configure the idle (inactivity) session timeout (SOC 2 CC6.3). When > 0,
     /// `validate_session` rejects a cookie session idle longer than `window` and
     /// bumps `last_activity_at` on each authenticated touch. 0 (default)
@@ -488,13 +587,13 @@ public:
     /// Role: admin if user is in the admin group, or email/name matches a local admin.
     ///
     /// `mfa_verified_at` seeds the new session's MFA-proof timestamp. The
-    /// caller passes a non-default `steady_clock` value only when the IdP
+    /// caller passes a non-default `system_clock` value only when the IdP
     /// attested a multi-factor login via the `amr` claim (PR3 / SOC 2
     /// CC6.6). A default-constructed value leaves the session un-stepped-up,
     /// so the local step-up gate prompts for a TOTP code on the first
-    /// high-risk action. Must be `steady_clock` (not the wall-clock `iat`)
-    /// so an NTP step cannot extend the step-up window — see
-    /// docs/auth-mfa-design.md hard invariant #5.
+    /// high-risk action. Wall-clock (`system_clock`) since HA WS-1/1a (durable
+    /// rows); the step-up window is short and fails CLOSED on a backward clock
+    /// step (see mfa_step_up.cpp) — docs/auth-mfa-design.md hard invariant #5.
     ///
     /// #1837 — the session's STABLE `username` (authorization principal) is
     /// derived from `"oidc:" + iss + "#" + oidc_sub`, NOT `display_name`: a
@@ -513,7 +612,7 @@ public:
                                     const std::string& oidc_sub, const std::string& iss,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group_id = {},
-                                    std::chrono::steady_clock::time_point mfa_verified_at = {});
+                                    std::chrono::system_clock::time_point mfa_verified_at = {});
 
     /// Create an ephemeral session for a verified SAML assertion's NameID.
     /// Role: admin if `groups` contains `admin_group` (exact match), user
@@ -707,6 +806,79 @@ public:
 private:
     static std::string generate_session_token();
 
+    // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
+    // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.
+
+    /// SHA-256 (hex) of a raw session token — the SessionStore row key. Secrets
+    /// at rest: the store never sees the raw bearer token (session_store.hpp).
+    static std::string hash_token(const std::string& raw_token);
+
+    /// Count a degraded durable-session operation on the auth hot path
+    /// (yuzu_auth_session_store_degrade_total{op}) so a PG blip/failover is
+    /// observable without log-grepping (mirrors the rbac/login degrade
+    /// counters). No-op when no MetricsRegistry is wired (tests/CLI).
+    void note_session_store_degrade(const char* op) const;
+
+    /// Reconstruct a cache `Session` from a durable `SessionRow` (wall-clock).
+    /// Stamps last_activity and both elevation fields so the ceiling and idle
+    /// gates read a fully-formed session (auth.hpp Session invariant).
+    static Session session_from_row(const yuzu::server::SessionRow& row);
+
+    /// Serialize a cache `Session` (+ its raw token) into a durable `SessionRow`.
+    yuzu::server::SessionRow row_from_session(const std::string& raw_token,
+                                              const Session& s) const;
+
+    /// Write-through a newly-created session: when a durable store is
+    /// configured, INSERT the row FIRST (outside `mu_`) and FAIL CLOSED on a
+    /// store error — a login whose session cannot be made durable is not
+    /// honored (ADR-0007 fail-closed; the server already refuses to run without
+    /// Postgres). Then cache it under `mu_`. Returns false on durable-write
+    /// failure; always true in the legacy in-memory path. Caller must NOT hold
+    /// `mu_`.
+    [[nodiscard]] bool persist_new_session(const std::string& raw_token, const Session& s);
+
+    /// Durably delete every session for a username (bumps the generation so all
+    /// replicas drop the cached copies). Called from the role-change / demote /
+    /// delete paths ALONGSIDE the local-cache wipe, so a stale-role session
+    /// cannot survive on another replica or across a restart.
+    ///
+    /// Returns true when there is nothing durable to fail (no store configured)
+    /// OR the durable delete succeeded; FALSE on a durable-delete error. A false
+    /// return MUST fail the enclosing role-change/remove operation closed: in
+    /// store mode the local `sessions_` erase is only cache eviction — a
+    /// cache-missed token is re-served from the authoritative row — so if the
+    /// durable delete did not land, the stale-(higher-)role session survives and
+    /// the generation was NOT bumped (other replicas keep serving it). Reporting
+    /// success there would grant a demoted/removed operator their old privilege
+    /// past the change (governance authdb-BLOCKING). `invalidate_user` is
+    /// idempotent, so an operator retry after a false return is safe. No-op
+    /// (true) without a store. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool wipe_user_sessions_durable(const std::string& username);
+
+    /// Poll the durable write-generation on an interval; when it has advanced
+    /// (a create/invalidate/elevate/mfa mutation landed, possibly on another
+    /// replica), clear the process-local `sessions_` cache so the next lookup
+    /// re-reads authoritative state. Interval-gated + single-flight (mirrors
+    /// RbacStore::maybe_refresh_generation); a refresh FAILURE keeps serving the
+    /// existing cache (the absolute `expires_at` on every session is the
+    /// backstop). No-op without a store. Caller must NOT hold `mu_`.
+    ///
+    /// Coherence does NOT depend on anchoring a locally-committed write: a
+    /// mutation bumps the durable generation, so within one refresh interval
+    /// this same poll observes the advance and clears the cache, re-reading
+    /// authoritative state — write-through to the local cache only covers the
+    /// sub-interval window until then.
+    void maybe_refresh_session_generation() const;
+
+    /// True when the validate-cache's generation view is too stale to trust — the
+    /// generation was never confirmed, OR the last SUCCESSFUL refresh is older
+    /// than kSessionGenStaleServeBoundMs (a sustained refresh outage). A cache
+    /// hit is served only when this is false; past the bound, validate falls to
+    /// the authoritative store and fails closed if it too is degraded (the
+    /// rbac_store bounded-stale-serve pattern, ADR-2002 §4). No-op-false without
+    /// a store. Takes `session_gen_mtx_`; caller must NOT hold it.
+    [[nodiscard]] bool session_generation_view_stale() const;
+
     /// Persist enrollment tokens to disk.
     bool save_tokens() const;
     /// Load enrollment tokens from disk.
@@ -726,10 +898,33 @@ private:
     std::filesystem::path cfg_path_;
     std::filesystem::path data_dir_;
     std::unordered_map<std::string, UserEntry> users_;
+    // Keyed by the token HASH when a durable store is configured (it is the
+    // store row key too), by the raw token in the legacy in-memory-only mode.
+    // Serves as the generation-gated validate cache when `session_store_` is set.
     mutable std::unordered_map<std::string, Session> sessions_;
 
     // Non-owning pointer to AuthDB; if set, persistence goes through DB.
     yuzu::server::AuthDB* auth_db_ = nullptr;
+
+    // Non-owning pointer to the durable SessionStore (HA WS-1/1a). Null =
+    // legacy in-memory-only sessions. Set once at startup before serving.
+    yuzu::server::SessionStore* session_store_ = nullptr;
+
+    // Validate-cache generation state (guarded by `session_gen_mtx_`, a
+    // dedicated mutex so a generation poll never contends on the session-map
+    // `mu_`). `cached_session_gen_` is the durable write-generation this
+    // replica's `sessions_` cache is coherent with; `session_gen_valid_` is
+    // false until the first successful anchor. `last_session_gen_refresh_ms_`
+    // interval-gates the poll (single-flight claim, like RbacStore).
+    mutable std::mutex session_gen_mtx_;
+    mutable std::uint64_t cached_session_gen_ = 0;
+    mutable bool session_gen_valid_ = false;
+    mutable std::int64_t last_session_gen_refresh_ms_ = 0;
+    // steady-ms of the last SUCCESSFUL generation read (bounded stale-serve, the
+    // rbac_store pattern). 0 = never succeeded. Read by
+    // session_generation_view_stale() to decide when a cache hit is too stale to
+    // trust during a refresh outage.
+    mutable std::int64_t last_successful_session_gen_refresh_ms_ = 0;
 
     /// Idle-timeout window (SOC 2 CC6.3). 0 = disabled (absolute expiry only).
     /// Read on the validate_session hot path; set once at startup before any
