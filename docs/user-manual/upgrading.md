@@ -1169,10 +1169,10 @@ server `PgPool`).
   the policy-evaluation thread's join can also stall on its own Postgres
   claim call (`PolicyStore::claim_due_policies`), which isn't a gRPC
   operation and isn't bounded by `Shutdown(deadline)` — tracked separately
-  (#3706), not fixed here; the shipped 210 s grace period below already
-  comfortably covers its ordinary-contention case. The shipped
+  (#3706), not fixed here. The shipped
   docker-compose/systemd units already set a 210 s grace period
-  (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this —
+  (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this
+  residual's ordinary-contention case —
   but if you deploy under Kubernetes or another orchestrator, its default is
   frequently far shorter (Kubernetes' own default
   `terminationGracePeriodSeconds` is **30**), and a pod with slow-draining
