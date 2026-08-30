@@ -1766,6 +1766,18 @@ test('capability catalogue completeness',
   timeout: 30,
 )
 
+# #1398 data-gate: every capability-catalogue row's authored ExecuteGate
+# matches the strictest approval.mode any shipped InstructionDefinition
+# declares for that plugin.action pair, and a content-declared pair with no
+# catalogue row is exempt from gating only when it is server-side (never
+# agent-dispatched). Hermetic — parses sources, builds nothing.
+test('capability gate consistency',
+  _python3_test,
+  args: [files('test_capability_gate_consistency.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
 # workflow runs, so self-hosted legs and /test exercise the same code path CI
 # does -- WHEREVER A USABLE PROMTOOL IS PRESENT. No CI leg sets the opt-in below

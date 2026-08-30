@@ -2528,6 +2528,90 @@ for it to re-drive. The `400`-vs-`503` split is otherwise unchanged.
 Rollback is data-safe. A mixed fleet is safe: the dispatch gate is server-side and applies
 regardless of agent version.
 
+## ⚠️ Behaviour change: raw dispatch now enforces InstructionDefinition approval governance (#1398)
+
+An `InstructionDefinition`'s declared `approval.mode` (`role-gated`/`always`) was previously
+enforced only on the governed `POST /api/instructions/:id/execute` path — raw dispatch
+(`POST /api/command`, MCP `execute_instruction`/`execute_bundle`/`quarantine_device`, the
+dashboard, workflow, schedules, and `/auto` Deploy) never resolved a definition, so a caller who
+held plain RBAC permission on an action could bypass its declared review requirement entirely by
+dispatching directly instead of through the governed path. This release closes that at the single
+shared dispatch chokepoint. **Read this before upgrading if any automation, integration, or
+scripted workflow dispatches commands as a non-admin principal** — an operation that previously
+succeeded may now be refused.
+
+### What changed
+
+Every dispatchable `plugin.action` pair now carries a compiled `ExecuteGate`
+(`None`/`AdminOrApproval`/`AlwaysApproval`), derived strictest-wins from every shipped
+`InstructionDefinition` targeting that pair. **42 pairs are gated** as of this release —
+including every `script_exec.*` action, `filesystem.delete_lines`/`.write_content`/`.replace`,
+`registry.set_value`/`.delete_key`/`.delete_value`, `interaction.*`, `network_actions.*`,
+`wol.*`, `quarantine.quarantine`/`.unquarantine`/`.whitelist`, `rdp_control.set_state`,
+`certificates.delete`, `storage.*`, `tags.clear`, `discovery.scan_subnet`, `chargen.chargen_start`,
+`http_client.download`, `installed_apps.list_per_user`, `services.set_start_mode`,
+`tar.configure`, and `content_dist.*` — the complete, authoritative list is
+`tests/fixtures/1398_pair_gate_table.json` (search for `"AdminOrApproval"`/`"AlwaysApproval"`,
+excluding the `server`/`server_internal`/`_server`-prefixed rows, which are server-internal and
+never agent-dispatched).
+
+A gated pair now denies a non-admin caller with no covering approval, **regardless of which
+surface dispatched it**:
+
+- **REST** (`/api/command`, and the legacy `chargen`/`procfetch` routes): `403`, naming the gate
+  and pointing at the governed alternative (`{"error":{"code":403,"message":"approval required
+  for <plugin>.<action> — ... dispatch it via POST /api/instructions/{id}/execute instead,
+  which supports the approval workflow"}}`). Denials are audited (`command.dispatch`,
+  `result=denied`, `detail=reason=approval_required`) and counted
+  (`yuzu_server_dispatch_denied_total{reason="approval_required"}`).
+- **MCP** (`execute_instruction` at `operator` tier — `supervised` tier already goes through the
+  approval workflow): the denial collapses into the SAME `no_agents_reached` tool result an
+  offline/unreachable agent gets, not a discriminated error — the JSON-RPC error-shaping closure
+  for this specific case is tracked separately (not yet shipped). If an MCP-driven automation
+  starts reporting "no agents reached" for a target you know is online, check whether the pair
+  it's calling is now gated before assuming a connectivity problem.
+- **Schedules**: a schedule dispatching a gated pair now requires an approval ticket exactly like
+  the interactive governed path (`ScheduleRunner` mints one and holds the occurrence until an
+  admin approves it via the existing `/api/approvals` workflow) — this was already the behavior
+  for schedules with their own `requires_approval` flag set; it now ALSO applies whenever the
+  target pair itself is gated, independent of that flag.
+- **`/auto` Deploy**: content_dist dispatches are unaffected — the deployment pipeline's own
+  re-authorization, guarded state transitions, and audit trail are accepted as the equivalent
+  control (`ApprovalProvenance::GovernedPipeline`), so no new ticket is required there.
+
+### How to check your exposure before upgrading
+
+Query the audit log for `command.dispatch` rows (or your own automation's recent activity) whose
+`plugin`/`action` appears in the gated list above, dispatched by a non-admin principal. If you
+find any, either grant the dispatching principal an admin role, or migrate that automation to
+dispatch through the governed path (`POST /api/instructions/:id/execute`, or an MCP
+`supervised`-tier token) so it goes through the approval workflow instead of raw dispatch.
+
+### Schedule approval tickets are now bound to their reviewed content
+
+A separate hardening in this same release: a schedule's approval ticket is now bound to the
+specific `plugin`/`action` it was approved for, not just the definition's id. If a definition's
+`plugin`/`action` is edited (`PUT /api/instructions/{id}`) after a schedule's ticket for it was
+approved but before the schedule's next fire, the stale ticket no longer redeems — the schedule
+correctly requests a fresh ticket for the new content instead of firing under review that was
+never given for it. This is self-healing (no manual database intervention needed): approve the
+new ticket the same way you approved the original. You would only notice this if you edit a
+scheduled definition's target action between approval and fire, which is unusual but not
+unsupported.
+
+### Migration
+
+`ApprovalManager`'s SQLite schema gains two additive columns (`target_plugin`, `target_action`,
+migration v8) — no backfill, no data loss, safe on a large existing `approvals` table (constant
+default, metadata-only `ALTER TABLE`). Rollback is safe: an older binary ignores the two new
+columns on read and simply doesn't populate them on write, which the new binary's fail-closed
+matching correctly treats as "must re-request" rather than a corruption state.
+
+### No config flag, no override
+
+There is no flag to disable the new gate. An admin caller, or a caller dispatching via the
+governed path with a redeemed approval ticket, is not subject to it.
+
 ## Upgrade Order
 
 Always upgrade in this order:
