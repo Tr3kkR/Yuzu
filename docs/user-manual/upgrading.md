@@ -983,6 +983,60 @@ API response is now a hard sync failure (surfaced in
 group sync — this closes a gap the deletion behavior above would otherwise
 have introduced (a transient Graph glitch wiping every synced group).
 
+## ⚠️ Behaviour change: schedules, approvals, and execution history reset on Postgres cutover (ADR-0065)
+
+`ScheduleEngine`, `ApprovalManager`, and `ExecutionTracker` move from the
+shared SQLite `instructions.db` file (via `InstructionDbPool`) to their own
+independent PostgreSQL schemas in this release (migration-programme PR 5,
+the last of the 7 components the postgres-migration ladder had never
+tracked — schemas `schedule_engine`, `approval_manager`, `execution_tracker`
+respectively). This is a **fresh-start cutover with no data migration**
+(ADR-0009) — the legacy `instructions.db` is **never read** for data on
+upgrade. `InstructionDbPool` itself is deleted; `instructions.db` is retired
+and no Yuzu store writes to it again.
+
+**What happens on first PG boot:**
+- The server logs three one-time lines — `ScheduleEngine initialized (schema
+  schedule_engine) — fresh start, no legacy backfill`, similarly for
+  `ApprovalManager`/`approval_manager`, and `ExecutionTracker`/
+  `execution_tracker` — plus a separate warning naming a row count for any
+  of `schedules`/`approvals`/`executions`/`agent_exec_status` still present
+  in the legacy `instructions.db`.
+- `GET /api/schedules` starts empty. **Operator action required:** re-create
+  any recurring schedules via `POST /api/schedules`.
+- Any MCP or REST instruction-approval ticket pending, approved-but-unconsumed,
+  or already consumed at the moment of cutover is gone. **Operator action
+  required:** a pending approval must be re-requested by whatever flow
+  originally submitted it (MCP `execute_instruction`'s approval gate, a
+  scheduled run requiring approval, or a direct REST submission) — there is
+  no way to recover an in-flight ticket across the cutover. Consumed-ticket
+  audit history (the `submitted_by → reviewed_by → consumed_by` evidence
+  chain) does not carry forward either.
+- The executions drawer, REST execution routes (`GET /api/v1/executions/*`,
+  `/agents`, `/definitions`), and MCP execution-status tools
+  (`get_execution_status`, `query_responses`'s execution-id join) all start
+  empty. No gRPC `CommandResponse` in flight at the exact moment of upgrade
+  has anywhere to land until the next dispatch. No operator action required
+  — new executions populate normally from first boot.
+- `/readyz` now lists all three stores (`ExecutionTracker` was already
+  present, re-keyed off its own `is_open()` instead of the shared pool's);
+  `/healthz` gains net-new `schedule_engine` and `execution_tracker` rows —
+  neither was ever reported there before this release (`ApprovalManager` was
+  already in both, unchanged).
+
+**Also in this release:** `advance_schedule`'s locked select-then-compute-
+then-update collapses into one atomic `UPDATE ... RETURNING`, closing a
+two-statement race an app-level lock previously covered — no operator-visible
+behavior change. `ExecutionTracker`'s one `sqlite3_changes()` call (gating
+the terminal-transition SSE event on the shared SQLite connection) is closed
+via `UPDATE ... RETURNING`, fixing a latent race under concurrent callers —
+also no operator-visible change; the executions-history SSE contract
+(progress-before-terminal event ordering) is unchanged. The MCP approval
+error envelope's permanent-vs-transient discriminator changes internally
+from a raw SQLite extended error code to a Postgres SQLSTATE string — the
+same two response shapes are still chosen by the same rule, so no client
+migration is needed.
+
 ## ⚠️ Behaviour change: buffered analytics events reset on Postgres cutover (ADR-0049)
 
 `AnalyticsEventStore` (the outbox spool behind `/api/analytics/status` and
