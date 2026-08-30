@@ -67,16 +67,25 @@ design:
   `touch_activity`, a sliding idle update). `validate_session` polls the
   generation on a ~1s interval (single-flight); when it advances (a mutation
   landed, possibly on another replica) the whole cache is cleared and the next
-  lookup re-reads authoritative state. A refresh failure keeps serving the cache
-  (every session's absolute `expires_at` is the backstop). Operator sessions
-  number in the tens, so a global generation whose bump clears the whole cache
-  is cheap. Cross-replica staleness is bounded by the refresh interval (~1s).
+  lookup re-reads authoritative state. Operator sessions number in the tens, so a
+  global generation whose bump clears the whole cache is cheap. **Two distinct
+  staleness bounds:** in NORMAL operation a mutation propagates within the ~1s
+  refresh interval. During a refresh OUTAGE (PG brownout, failed
+  `read_generation`) the cache is served UNCHANGED only within a bounded
+  stale-serve budget — `kSessionGenStaleServeBoundMs` (30s) from the last
+  SUCCESSFUL refresh (the `rbac_store` pattern the ADR names). Past that budget
+  the generation view is "stale" and NO cache hit is trusted: every validate —
+  including a locally-minted session — falls through to the authoritative store
+  and **fails closed (401)** while the store stays degraded. So a
+  revoked/demoted/elevated session cannot ride the cache past ~30s of outage,
+  not to its 8h absolute expiry.
 - **Authoritative reads.** A `SessionStore::find` returns
   `expected<optional<Row>>`: `nullopt` = definitively absent, `unexpected` = DB
   degraded. `validate_session` never treats a degraded read as "no valid
-  session" in a way that grants — an uncached token whose lookup is degraded
-  **fails the request (401)**; a session minted on this replica is in the cache
-  and does not reach that path during a blip.
+  session" in a way that grants — a degraded lookup **fails the request (401)**.
+  A locally-minted session is served from the cache during a brief blip (within
+  the stale-serve budget above); once the budget is exceeded even it falls to the
+  authoritative read and fails closed until PG recovers.
 - **Wall-clock (the reversal) + ceilings.** The `Session` lifetime fields
   (`expires_at`, `mfa_verified_at`, `elevated_until`, `last_activity_at`) moved
   from `steady_clock` (monotonic) to `system_clock` (wall-clock), because a

@@ -270,6 +270,36 @@ TEST_CASE_METHOD(StepUpFixture, "require_mfa_step_up: stale proof beyond window 
 }
 
 TEST_CASE_METHOD(StepUpFixture,
+                 "require_mfa_step_up: a proof older than the 24h hard ceiling fails CLOSED even "
+                 "under an oversized configured window",
+                 "[pg][mfa][stepup]") {
+    // Adversarial-round #2 C3 / PR #3702 blocker #1: the effective freshness
+    // window is min(window_secs, kMaxMfaStepUpWindowSecs=24h). A misconfigured or
+    // over-large window_secs cannot extend the step-up window past the hard
+    // ceiling (parity with JIT's kMaxElevationWindow).
+    httplib::Request req;
+    httplib::Response res;
+    res.status = 200;
+    // Proof aged 25h; configured window a (misconfigured) 30h. Without the
+    // ceiling, age(25h) <= window(30h) would PASS; the 24h ceiling rejects it.
+    auto session = make_session("alice", "local",
+                                std::chrono::system_clock::now() - std::chrono::hours(25));
+    CHECK_FALSE(require_mfa_step_up(req, res, session, *db, /*window_secs=*/30 * 3600, audit_fn,
+                                    "POST /api/v1/tokens"));
+    CHECK(res.status == 401);
+
+    // A proof just INSIDE the ceiling (23h) with the same oversized window passes
+    // — proving the ceiling is what rejects above, not the configured window.
+    httplib::Response res2;
+    res2.status = 200;
+    auto fresh = make_session("alice", "local",
+                              std::chrono::system_clock::now() - std::chrono::hours(23));
+    CHECK(require_mfa_step_up(req, res2, fresh, *db, /*window_secs=*/30 * 3600, audit_fn,
+                             "POST /api/v1/tokens"));
+    CHECK(res2.status == 200);
+}
+
+TEST_CASE_METHOD(StepUpFixture,
                  "require_mfa_step_up: a future-dated proof (backward clock step) fails CLOSED",
                  "[pg][mfa][stepup]") {
     // HA WS-1/1a wall-clock reversal: mfa_verified_at is now system_clock. A

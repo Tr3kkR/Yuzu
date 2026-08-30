@@ -18384,6 +18384,17 @@ private:
                 // display_name / oidc_sub (identity/PII), so age them out on a
                 // ~15m cadence. reap_expired is clock-guarded + capped (5000/pass).
                 constexpr int kSessionReapEveryNTicks = 450; // ~15 minutes at 2s/tick
+                // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
+                // adversarial-round #2 C1): each ~2s tick compares wall-clock
+                // advance against MONOTONIC (steady_clock) elapsed. A backward
+                // wall-clock step — even a small one BETWEEN reap samples that the
+                // reap anchor check cannot see — shows up here as wall advancing
+                // materially LESS than monotonic; that un-expires sessions and
+                // extends JIT/MFA windows, so it increments the clock-anomaly
+                // counter the YuzuSessionReapClockAnomaly alert fires on. Only
+                // armed with a durable session store (the clock that matters here).
+                constexpr int64_t kClockBackwardToleranceMs = 3000; // ignore sub-3s jitter
+                int64_t last_wall_ms = 0, last_steady_ms = 0;
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -18403,6 +18414,40 @@ private:
                         // never starves the response/Guardian reap cadences.
                         const bool rs_ok = result_set_store_ && result_set_store_->is_open();
                         ++tick;
+
+                        // DB-clock-integrity monitor: detect a backward wall-clock
+                        // step by comparing wall vs monotonic advance since the last
+                        // tick (C1). Fine-grained (~2s), independent of the reap
+                        // anchor, so a small backward step between reap samples is
+                        // still caught. First tick only seeds the baselines.
+                        if (session_store_ && session_store_->is_open()) {
+                            const int64_t wall_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            const int64_t steady_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+                            if (last_steady_ms != 0) {
+                                const int64_t steady_delta = steady_ms - last_steady_ms;
+                                const int64_t wall_delta = wall_ms - last_wall_ms;
+                                // Wall advanced materially less than monotonic ⇒ the
+                                // wall clock was stepped backward (or stalled).
+                                if (steady_delta - wall_delta > kClockBackwardToleranceMs) {
+                                    spdlog::warn("session clock monitor: wall clock advanced {}ms "
+                                                 "vs {}ms monotonic since last tick — backward "
+                                                 "step/stall of ~{}ms (un-expires sessions / extends "
+                                                 "JIT+MFA windows)",
+                                                 wall_delta, steady_delta,
+                                                 steady_delta - wall_delta);
+                                    metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
+                                        .increment();
+                                }
+                            }
+                            last_wall_ms = wall_ms;
+                            last_steady_ms = steady_ms;
+                        }
 
                         // 1) Materialise terminal pending sets (result-set store
                         // only; the thread may be running solely for the response

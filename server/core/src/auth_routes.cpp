@@ -2829,18 +2829,33 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         audit_log(req, "auth.logout", db_persisted ? "success" : "partial", /*target_type=*/{},
                   /*target_id=*/{}, db_persisted ? "" : "db_error=true");
         emit_event("auth.logout", req);
+        const bool is_htmx = !req.get_header_value("HX-Request").empty();
+        if (!db_persisted) {
+            // FAIL CLOSED (adversarial-round #2, C2): the durable row was NOT
+            // deleted, so the session is still valid (it rehydrates on any cache
+            // miss / on another replica / from a copied cookie). Do NOT clear the
+            // cookie — that would look like a clean logout AND destroy the only
+            // credential a retry needs — and do NOT redirect an HTMX client to
+            // /login. Return a visible error on BOTH surfaces so the human/API
+            // caller knows logout is incomplete and retries (the durable delete
+            // is idempotent). The degrade metric already fired in
+            // invalidate_session; ops sees the `partial` audit row.
+            res.status = 503;
+            if (is_htmx)
+                res.set_content("<div class=\"error\">Logout could not be completed (the session "
+                                "store is unavailable). You are still signed in — please retry.</div>",
+                                "text/html");
+            else
+                res.set_content(
+                    R"({"status":"partial","detail":"the durable session could not be deleted; you are still signed in, retry to complete logout"})",
+                    "application/json");
+            return;
+        }
+        // Success — the durable row is gone; clear the cookie and finish.
         res.set_header("Set-Cookie", "yuzu_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
-        // HTMX clients (a human browser) get a redirect header either way — this
-        // browser IS logged out. Non-HTMX (API/automation) get an honest 503 on a
-        // partial logout so a caller can retry the durable delete.
-        if (!req.get_header_value("HX-Request").empty()) {
+        if (is_htmx) {
             res.set_header("HX-Redirect", "/login");
             res.set_content("", "text/plain");
-        } else if (!db_persisted) {
-            res.status = 503;
-            res.set_content(
-                R"({"status":"partial","detail":"session cookie cleared but the durable session could not be deleted; retry to complete logout"})",
-                "application/json");
         } else {
             res.set_content(R"({"status":"ok"})", "application/json");
         }

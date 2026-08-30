@@ -253,3 +253,28 @@ TEST_CASE("AuthManager+SessionStore: a durable-clear failure fails revoke CLOSED
     auto rvu = a->revoke_user_elevations("jack");
     CHECK_FALSE(rvu.has_value());
 }
+
+TEST_CASE("AuthManager+SessionStore: a failed single-session invalidate reports db_persisted=false",
+          "[auth][session_store][pg]") {
+    // Adversarial-round #2 C2/C3 / PR #3702 blocker #3: a logout whose durable
+    // delete fails must NOT report a clean logout — invalidate_session returns
+    // false so /logout can fail closed (keep the cookie, 503) rather than clear
+    // the cookie over a still-valid durable session.
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto a = make_mgr(store);
+    auto token = a->create_local_session("kate", Role::user, /*mfa_verified=*/false);
+    REQUIRE(a->validate_session(token).has_value());
+
+    // Fault-inject: drop the schema so the durable DELETE fails.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        yuzu::server::pg::exec_params(lease.get(), "DROP SCHEMA session_store CASCADE",
+                                      std::vector<std::string>{});
+    }
+    CHECK_FALSE(a->invalidate_session(token)); // db_persisted=false — logout must fail closed
+}
