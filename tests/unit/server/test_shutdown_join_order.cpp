@@ -51,10 +51,10 @@
 
 #include <filesystem>
 #include <fstream>
-#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') -- see the server_test_exe cpp_args block."
@@ -84,15 +84,23 @@ std::string strip_line_comments(const std::string& text) {
     return std::regex_replace(text, re, "");
 }
 
-// Returns the line number of the FIRST match, failing loudly (rather than
-// returning an empty optional silently) if the pattern isn't found -- a
-// vacuous pass here would be worse than a hard failure, since it would mean
-// the scan itself broke, not that the ordering is fine.
+// Returns the line number of the SOLE match, failing loudly (rather than
+// returning an empty optional, or silently picking the first of several) if
+// the pattern is found zero or more-than-one times -- a vacuous pass here
+// would be worse than a hard failure, since it would mean the scan itself
+// broke, not that the ordering is fine. Uniqueness matters as much as
+// presence (governance Gate 2, security-guardian): a future second call site
+// matching the same pattern earlier in the file (e.g. a hoisted helper)
+// would otherwise satisfy every ordering check below while the real
+// `stop()` order silently regressed.
 int require_one_line(const std::string& text, const std::regex& re, const char* label) {
-    std::smatch m;
     INFO("looking for: " << label);
-    REQUIRE(std::regex_search(text, m, re));
-    return line_of(text, static_cast<std::size_t>(m.position(0)));
+    std::vector<int> lines;
+    for (auto it = std::sregex_iterator(text.begin(), text.end(), re); it != std::sregex_iterator();
+         ++it)
+        lines.push_back(line_of(text, static_cast<std::size_t>(it->position(0))));
+    REQUIRE(lines.size() == 1);
+    return lines[0];
 }
 
 } // namespace

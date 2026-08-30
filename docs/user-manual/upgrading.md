@@ -1141,15 +1141,17 @@ server `PgPool`).
   on it post-upgrade.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period, but understand what that does and does not buy you.** A
-  graceful `SIGTERM` walks several independently-bounded waits in sequence —
-  up to 30 s draining in-flight executions, up to 5 s waiting on the
-  NVD-sync background thread, up to 15 s waiting on the HTTP listener thread
-  (#2703 Gate 7 item 2), up to 5 s on the gRPC shutdown deadline, and (#3261
-  governance hardening) up to 60 s waiting for WebhookStore and
-  OffloadTargetStore to drain their delivery queues — the last of which runs
-  the two stores CONCURRENTLY, not sequentially, so it adds 60 s to the
-  total rather than 120 s. Stacked, this can reach **~115 s** in the worst
-  case if more than one stage is genuinely wedged. **(#3495) The pre-flight
+  graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
+  draining in-flight executions, up to 5 s on the gRPC shutdown deadline
+  (moved up by #3495 to run right after the execution drain — see below),
+  up to 5 s waiting on the NVD-sync background thread, up to 15 s waiting on
+  the HTTP listener thread (#2703 Gate 7 item 2), and (#3261 governance
+  hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to
+  drain their delivery queues — the last of which runs the two stores
+  CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
+  120 s. Stacked, this can reach **~115 s** in the worst case if more than
+  one stage is genuinely wedged; the total and each stage's own bound are
+  unchanged by the reorder, only their relative sequence is. **(#3495) The pre-flight
   runner, quarantine containment reconciler, and schedule tick background
   thread joins ride on the same 5 s gRPC shutdown deadline bucket above, not
   a separate stage** — `ServerImpl::stop()` now cancels in-flight gRPC RPCs
