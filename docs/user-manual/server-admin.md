@@ -2075,6 +2075,8 @@ membership — mirroring the OIDC `--oidc-admin-group` mechanism:
 |---|---|---|
 | `--saml-group-attribute` | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers. |
 | `--saml-admin-group` | `YUZU_SAML_ADMIN_GROUP` | The group value (from `--saml-group-attribute`) that grants `role=admin`. |
+| `--saml-name-attribute` | `YUZU_SAML_NAME_ATTRIBUTE` | Optional. `<Attribute Name="...">` whose first value is the user's display name (e.g. Entra's `displayname` claim URI). Empty (default) leaves the session display as the raw NameID. **Display/audit only — never an identity or authz input.** |
+| `--saml-email-attribute` | `YUZU_SAML_EMAIL_ATTRIBUTE` | Optional. `<Attribute Name="...">` whose first value is the user's email (e.g. Entra's `emailaddress` claim URI). Used only as a display fallback and logged — **never stored durably or used for identity.** |
 
 A session is `role=admin` only when both flags are set and the assertion's
 group list contains an **exact match** for `--saml-admin-group`; otherwise

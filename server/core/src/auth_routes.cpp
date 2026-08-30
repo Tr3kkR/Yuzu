@@ -3778,8 +3778,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 break; // existing behaviour — no new login-time audit row
             }
 
-            session_token = auth_mgr_.create_saml_session(saml_name_id, saml_entity_id,
-                                                           result.value().groups, saml_admin_gid);
+            session_token = auth_mgr_.create_saml_session(
+                saml_name_id, saml_entity_id, result.value().groups, saml_admin_gid,
+                result.value().display_name, result.value().email);
 
             // ADR-2001 §4 (PR4b) — deny-at-login backstop, POST-MINT
             // RE-CHECK (the codex-caught check-then-mint race, mirrors the

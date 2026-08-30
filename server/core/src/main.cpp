@@ -861,6 +861,16 @@ int main(int argc, char* argv[]) {
     app.add_option("--saml-admin-group", cfg.saml_admin_group,
                    "SAML group value (from --saml-group-attribute) that maps to admin role")
         ->envname("YUZU_SAML_ADMIN_GROUP");
+    app.add_option("--saml-name-attribute", cfg.saml_name_attribute,
+                   "SAML <Attribute Name=\"...\"> whose first value is the user's display name "
+                   "(e.g. the Entra displayname claim URI); empty leaves the display as the raw "
+                   "NameID. Display/audit only, never an identity or authz input")
+        ->envname("YUZU_SAML_NAME_ATTRIBUTE");
+    app.add_option("--saml-email-attribute", cfg.saml_email_attribute,
+                   "SAML <Attribute Name=\"...\"> whose first value is the user's email "
+                   "(e.g. the Entra emailaddress claim URI); empty disables email parsing. "
+                   "Used only as a display fallback and logged, never stored or used for identity")
+        ->envname("YUZU_SAML_EMAIL_ATTRIBUTE");
 
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,
