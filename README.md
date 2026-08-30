@@ -177,6 +177,9 @@ Open `http://localhost:8080` and sign in with the credentials set during first-r
 - **macOS:** `autoconf`, `automake`, `libtool`
   (`brew install autoconf automake libtool`) — same libpq port runs
   autoreconf. Windows needs nothing extra (vcpkg auto-acquires winflexbison).
+- **RHEL / Rocky / AlmaLinux 9:** the system GCC (11) cannot build C++23 — see
+  [`docs/rhel9-build-setup.md`](docs/rhel9-build-setup.md) for the verified
+  recipe, or run `bash scripts/setup-rhel9.sh`.
 
 ### Quick Start
 
