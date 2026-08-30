@@ -179,10 +179,11 @@ pg_answers() { psql "${PG_DSN}" -v ON_ERROR_STOP=1 -tAc 'SELECT 1' 2>/dev/null |
 # The durable identity of the cluster at PGDATA: survives restarts, changes on
 # re-initdb. pg_controldata reads it from disk, so it works with the server
 # stopped.
-# LC_ALL=C pins the label this parses: Rocky 9's PG 18 module ships no
-# pg_controldata translations today (verified: de/fr langpacks leave the output
-# English), but sudoers env_keep passes LANG/LC_* through, so a future package
-# adding them would otherwise break the match on a non-English box.
+# LC_ALL=C pins the label this parses. In a rockylinux:9 container de/fr
+# langpacks leave the output English, but container images may strip %lang
+# catalogs via _install_langs, so a real host can carry translations - and
+# sudoers env_keep passes LANG/LC_* through. Either way the pin makes the
+# match immune.
 pg_sysid() { sudo -u postgres env LC_ALL=C pg_controldata "${PGDATA}" 2>/dev/null | awk '/^Database system identifier:/ {print $NF}'; }
 # Reachability is not identity: something else could be listening on
 # 127.0.0.1:5432. Returns 0 when the DSN's listener is the cluster at PGDATA
