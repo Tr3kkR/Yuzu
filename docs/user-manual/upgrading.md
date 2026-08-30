@@ -925,6 +925,64 @@ dropped (governance #1593). Retention moved from an hourly background thread
 to a clock-guarded, capped reap on the maintenance tick (no operator-visible
 behaviour change beyond the same 90-day default).
 
+## ⚠️ Behaviour change: directory sync state resets on Postgres cutover (ADR-0063)
+
+`DirectorySync` (AD/Entra ID integration — synced users/groups, group
+memberships, and group→role mappings) moves from the SQLite
+`directory-sync.db` file to the server's PostgreSQL substrate in this release
+(migration-programme PR 3, schema `directory_sync`). This is a **fresh-start
+cutover with no data migration** (ADR-0009) — the legacy `directory-sync.db`
+is **never read** on upgrade.
+
+**What happens on first PG boot:**
+- The server logs a one-time `DirectorySync initialized (schema
+  directory_sync) — fresh start, no legacy backfill` line, and a separate
+  warning naming a row count if the legacy `directory-sync.db` still holds
+  synced users/groups/mappings.
+- `GET /api/directory/users`, `GET /api/directory/status`, and the group→role
+  mapping list all start empty.
+- **Before upgrading, capture your current group→role mappings** (they will
+  NOT survive the cutover): `PUT /api/directory/group-mappings` with an empty
+  `{"mappings": []}` body is a safe, non-mutating read — an empty input array
+  is a no-op, and the response always echoes the store's full current
+  mapping list regardless. There is no dedicated read-only endpoint for this
+  today; save the response's `mappings` array (each entry
+  `{"group_id": "...", "role_name": "..."}`) somewhere durable before you
+  upgrade.
+- **Operator action required, after upgrading:** re-run `POST /api/directory/sync` with the
+  same `tenant_id`/`client_id`/`client_secret` you already supply on every
+  sync call — this store never persisted the credential, so this migration
+  adds no new credential-gathering step, but you still need it in hand to
+  re-populate synced users and groups. Then re-apply every mapping you saved
+  above via one `PUT /api/directory/group-mappings` call with body
+  `{"mappings": [{"group_id": "...", "role_name": "..."}, ...]}` — those
+  mappings ARE lost by the cutover and must be recreated from your saved copy.
+  **Verify the re-sync captured everything**: compare `GET
+  /api/directory/status`'s `user_count`/`group_count` against your Entra
+  tenant's own user/group counts before considering the upgrade complete.
+- The MCP `export_access_review`/REST access-review export's optional email
+  enrichment (matched off synced users' UPN) is unaffected in shape — it
+  degrades to "no enrichment" until the first post-upgrade sync completes,
+  exactly as it already did whenever directory sync was never configured.
+
+**Also in this release:** `directory_memberships` gained a real foreign key
+(`ON DELETE CASCADE` on both `user_id` and `group_id`) — the SQLite era had
+none. `/readyz` and `/healthz` now report `directory_sync` — the SQLite-era
+store was never checked at boot or reflected in either probe.
+
+**Behaviour change beyond the storage cutover itself:** a user or group
+deleted from Entra now actually disappears from `DirectorySync` on the next
+successful sync — the SQLite era kept every previously-synced user/group
+around forever, upserting but never removing one Entra had deleted. If your
+integration (or a saved report) relied on a removed identity remaining
+visible via `GET /api/directory/users`/`GET /api/directory/status` after
+leaving Entra, it will stop being visible starting with the first
+post-upgrade sync. Relatedly, a malformed/unexpected Microsoft Graph groups
+API response is now a hard sync failure (surfaced in
+`GET /api/directory/status`'s `last_error`) rather than a silently-empty
+group sync — this closes a gap the deletion behavior above would otherwise
+have introduced (a transient Graph glitch wiping every synced group).
+
 ## ⚠️ Behaviour change: buffered analytics events reset on Postgres cutover (ADR-0049)
 
 `AnalyticsEventStore` (the outbox spool behind `/api/analytics/status` and

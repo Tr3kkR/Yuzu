@@ -826,7 +826,7 @@ Session-cookie auth with PBKDF2-hashed passwords.
 
 ### 18.6 Active Directory / Entra Integration :white_check_mark: `T2`
 
-`DirectorySync` (1013 LOC). Entra ID sync via Microsoft Graph API (OAuth2 client credentials flow). Fetches `/users` and `/groups`, stores in SQLite. Group-to-role mapping (`configure_group_role_mapping`) maps directory groups to RBAC roles. LDAP sync stub for on-prem AD (full LDAP support planned). REST API endpoints for sync trigger, status, and mapping CRUD. Settings UI section active.
+`DirectorySync` (ADR-0063: migrated to PostgreSQL, schema `directory_sync`). Entra ID sync via Microsoft Graph API (OAuth2 client credentials flow). Fetches `/users` and `/groups`, stores in Postgres (fail-closed construction; FK + `ON DELETE CASCADE` on memberships, new in this migration). Group-to-role mapping (`configure_group_role_mapping`) maps directory groups to RBAC roles. LDAP sync stub for on-prem AD (full LDAP support planned). REST API endpoints for sync trigger, status, and mapping CRUD. Settings UI section active.
 
 ### 18.7 Token-Based API Authentication :white_check_mark: `T2`
 
