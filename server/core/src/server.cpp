@@ -528,7 +528,7 @@ public:
                           "Total number of commands dispatched to agents", "counter");
         metrics_.describe(
             "yuzu_server_shutdown_dispatch_reach_zero_total",
-            "#3495: dispatches that reached zero agents while a shutdown was in progress — a "
+            "#3495: dispatches that reached zero agents while a shutdown was in progress - a "
             "correlated signal (may reflect Shutdown(deadline) forcibly cancelling a stream "
             "write mid-dispatch, or an ordinary zero-reach dispatch that happened to land "
             "during the shutdown window; this metric cannot distinguish the two)",
