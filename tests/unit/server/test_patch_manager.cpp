@@ -19,6 +19,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <stdexcept>
 #include <string>
@@ -248,6 +249,8 @@ TEST_CASE("PatchManager: deploy_patch de-duplicates agent_ids", "[patch_manager]
 TEST_CASE("PatchManager: deploy_patch rejects an oversized agent_ids list",
           "[patch_manager][pg][deploy][validation]") {
     PATCH_MANAGER(mgr);
+    yuzu::MetricsRegistry metrics;
+    mgr.set_metrics(&metrics);
 
     std::vector<std::string> agent_ids;
     agent_ids.reserve(5001);
@@ -257,6 +260,9 @@ TEST_CASE("PatchManager: deploy_patch rejects an oversized agent_ids list",
     auto result = mgr.deploy_patch("KB1234567", agent_ids, false, "admin");
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().find("too many target agents") != std::string::npos);
+    CHECK(metrics.serialize().find(
+              "yuzu_server_patch_manager_writes_total{op=\"deploy_patch\","
+              "result=\"rejected_oversized\"} 1") != std::string::npos);
 }
 
 // ── Test: record_patches upserts inventory ──────────────────────────────────

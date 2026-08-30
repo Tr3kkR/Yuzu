@@ -403,9 +403,14 @@ PatchManager::deploy_patch(const DeploymentRequest& req) {
             agent_ids.push_back(id);
     }
 
-    if (agent_ids.size() > kMaxDeployTargets)
+    if (agent_ids.size() > kMaxDeployTargets) {
+        if (metrics_)
+            metrics_->counter("yuzu_server_patch_manager_writes_total",
+                              {{"op", "deploy_patch"}, {"result", "rejected_oversized"}})
+                .increment();
         return std::unexpected("too many target agents (max " +
                                std::to_string(kMaxDeployTargets) + ")");
+    }
 
     if (!open_)
         return std::unexpected("patch manager not available");

@@ -6348,6 +6348,10 @@ public:
                     for (const auto result : {"success", "failed"})
                         metrics_.counter("yuzu_server_patch_manager_writes_total",
                                          {{"op", op}, {"result", result}});
+                // deploy_patch's own cap-rejection path (kMaxDeployTargets) never
+                // reaches the success/failed branch above — zero-seed separately.
+                metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                 {{"op", "deploy_patch"}, {"result", "rejected_oversized"}});
                 legacy_sqlite_probe::warn_if_legacy_rows(
                     cfg_.db_dir() / "patches.db", "PatchManager",
                     {"patch_inventory", "patch_deployments", "patch_deployment_targets"});
