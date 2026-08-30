@@ -27,8 +27,12 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 
+#include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgConn;
@@ -532,6 +536,120 @@ TEST_CASE("WorkflowEngine: cancel_execution mid-run stops subsequent steps",
     // 'running'`), so it no longer clobbers the "cancelled" status cancel_execution() already
     // committed — status stays "cancelled", not overwritten to "failed".
     CHECK((*exec)->status == "cancelled");
+}
+
+TEST_CASE("WorkflowEngine: a concurrent cancel_execution races execute()'s guarded writes over "
+          "real connections and the execution never ends up back in 'running'",
+          "[workflow_engine][pg][cancel][race]") {
+    // #3722 follow-up, done directly rather than deferred: genuine multi-threaded race over
+    // separate PgPool leases (not the same-thread simulation the sequential cancel tests above
+    // use, where cancel_execution() is called from inside the dispatch_fn callback on execute()'s
+    // own thread/call-stack).
+    //
+    // HONEST LIMIT, checked empirically rather than assumed: the specific window the mid-loop
+    // guard defends against is between the top-of-loop get_execution() cancellation check and
+    // that same iteration's guarded UPDATE, with no I/O in between — and a cancel landing during
+    // a step's dispatch is ALREADY caught by the next iteration's top-of-loop check regardless of
+    // whether the mid-loop guard exists. With the mid-loop guard's WHERE clause and RETURNING
+    // temporarily removed (simulating the pre-fix code) this test was run 20 times across two
+    // harness shapes — a slow single-canceller version (5 steps, 5ms dispatch delay, one
+    // 1ms-interval canceller thread) and this denser one (60 steps, no dispatch delay, 4
+    // no-delay canceller threads) — and BOTH passed every single run: the top-of-loop check won
+    // the race before the (disabled) mid-loop guard's window was ever reached. This test therefore
+    // does NOT prove the mid-loop guard's specific TOCTOU window is closed — that window appears
+    // to be sub-microsecond-adjacent to the top-of-loop check with no I/O in between, and this
+    // black-box harness could not land inside it even under maximized contention. What it DOES
+    // prove, and is real coverage the prior same-thread sequential test lacked: genuine concurrent
+    // cancellation from separate threads/connections is safe end-to-end (never leaves the row in
+    // 'running', and any cancel that succeeds is permanent), exercising the top-of-loop check,
+    // cancel_execution()'s own CAS, and the finalize guard together under real interleaving.
+    WORKFLOW_ENGINE(engine);
+    std::string yaml = "kind: Workflow\nmetadata:\n  displayName: many-step\nspec:\n  steps:\n";
+    constexpr int kSteps = 60;
+    for (int i = 0; i < kSteps; ++i)
+        yaml += "    - instruction: inst-" + std::to_string(i) + "\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    std::atomic<int> dispatched_count{0};
+    std::atomic<bool> raced_while_running{false}; // proof the canceller genuinely observed
+                                                   // 'running' concurrently with execute(), not
+                                                   // just after it had already finished
+    std::atomic<bool> cancel_succeeded{false}; // true iff some cancel_execution() call itself
+                                                // reported success — i.e. the DB confirmed the
+                                                // pending/running -> cancelled transition at that
+                                                // instant (cancel_execution's own CAS matched)
+    std::atomic<bool> stop_canceller{false};
+    std::atomic<bool> exec_id_claimed{false}; // CAS-guards which single thread may write exec_id
+    std::atomic<bool> exec_id_ready{false};   // release-stored only after that write completes
+    std::string exec_id;                      // single-writer (the CAS winner) / multi-reader,
+                                               // readers gated on exec_id_ready's acquire load
+
+    auto canceller_body = [&] {
+        // Each thread independently polls for the execution row to appear (execute() creates it
+        // before the first dispatch), then hammers cancel_execution() with no delay of its own.
+        // Only the thread that wins the exec_id_claimed CAS writes `exec_id`, so concurrent
+        // discovery by multiple threads can't race the same plain std::string write; the
+        // acquire/release pair on exec_id_ready makes that write visible before any reader uses it.
+        while (!exec_id_ready.load(std::memory_order_acquire) &&
+               !stop_canceller.load(std::memory_order_relaxed)) {
+            auto execs = engine.list_executions(wf_id, 1);
+            if (execs.has_value() && !execs->empty()) {
+                bool expected = false;
+                if (exec_id_claimed.compare_exchange_strong(expected, true,
+                                                             std::memory_order_acq_rel)) {
+                    exec_id = (*execs)[0].id;
+                    exec_id_ready.store(true, std::memory_order_release);
+                }
+            }
+        }
+        while (!stop_canceller.load(std::memory_order_relaxed)) {
+            auto exec = engine.get_execution(exec_id);
+            if (exec.has_value() && exec->has_value() && (*exec)->status == "running")
+                raced_while_running.store(true, std::memory_order_relaxed);
+
+            if (engine.cancel_execution(exec_id).has_value())
+                cancel_succeeded.store(true, std::memory_order_relaxed); // not_found/
+                    // already-terminal are losing-race outcomes, not errors — only a genuine
+                    // success sets this
+        }
+    };
+    constexpr int kCancellers = 4;
+    std::vector<std::thread> cancellers;
+    for (int i = 0; i < kCancellers; ++i)
+        cancellers.emplace_back(canceller_body);
+
+    auto exec_result = engine.execute(
+        wf_id, {"agent-1"},
+        [&](const std::string&, const std::string&,
+            const std::string&) -> std::expected<std::string, std::string> {
+            ++dispatched_count;
+            return std::string(R"({"status":"ok"})");
+        });
+
+    stop_canceller = true;
+    for (auto& t : cancellers)
+        t.join();
+
+    REQUIRE(exec_result.has_value());
+    REQUIRE(raced_while_running.load()); // the harness must have genuinely raced, not run serially
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+
+    CHECK((*exec)->status != "running"); // never left mid-transition
+    CHECK((*exec)->status != "failed");  // ok_dispatch never errors, so this is unreachable here
+
+    // The sharp invariant a broken guard would actually violate: once cancel_execution() itself
+    // reports success, the DB has already committed 'cancelled' — that transition must be
+    // PERMANENT. A clobbering mid-loop or finalize write (the exact bug the guards close) would
+    // silently overwrite it back to 'running' and let the loop run to completion, landing here as
+    // "completed" instead. If no cancel attempt ever won the race, execute() must have run to a
+    // normal completion instead.
+    if (cancel_succeeded.load())
+        CHECK((*exec)->status == "cancelled");
+    else
+        CHECK((*exec)->status == "completed");
 }
 
 // ── Degrade path ──────────────────────────────────────────────────────────
