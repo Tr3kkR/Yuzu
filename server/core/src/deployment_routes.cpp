@@ -97,7 +97,10 @@ DeploymentRoutes::caller_from_session(const auth::Session& session) const {
         .principal = session.username,
         .principal_role = auth::role_to_string(session.role),
         .exec_visible = exec_visible_fn_ ? exec_visible_fn_(session)
-                                         : yuzu::server::authz::deny_all()};
+                                         : yuzu::server::authz::deny_all(),
+        // #1398: JIT-elevation-aware, matching every other session-derived
+        // caller (server.cpp's derive_dispatch_caller).
+        .principal_is_admin = auth::effective_role(session) == auth::Role::admin};
 }
 
 std::string DeploymentRoutes::advance_and_render(const std::string& deployment_id,

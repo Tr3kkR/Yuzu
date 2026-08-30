@@ -1160,6 +1160,17 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
             item.yaml_source = documents[i];
             items_to_store.push_back(std::move(item));
             ++installed_count;
+        } else if (is_generic_db_error(result.error())) {
+            // Governance finding: a genuine origin-store DB/lease failure must abort the whole
+            // install immediately, not fall into `errors` — the aggregation below prepends
+            // "<kind>: "/"no items installed: " text ahead of the error, which strips the
+            // kDbErrorPrefix byte-0 marker the REST layer's is_generic_db_error()/
+            // product_pack_error_status() rely on (turning a 503 into a misclassified 400), and
+            // in a multi-document bundle where an earlier item already installed, continuing the
+            // loop would let the pack persist with this item silently missing. Mirrors
+            // uninstall()'s identical origin-store-DB-error-aborts-immediately shape below.
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) + "failed to install " +
+                                   kind + " item: " + result.error());
         } else {
             errors.push_back(kind + ": " + result.error());
         }
