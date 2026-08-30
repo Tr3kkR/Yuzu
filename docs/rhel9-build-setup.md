@@ -264,7 +264,9 @@ reference box.
 ## Environment
 
 `setup-rhel9.sh` writes a sourceable `~/.config/yuzu/toolchain-env.sh` and hooks it into `~/.bashrc`
-behind a guard block, so it is safe on re-run:
+behind a guard block, so it is safe on re-run. (To undo, delete the block between
+`# >>> yuzu toolchain >>>` and `# <<< yuzu toolchain <<<` in `~/.bashrc`, then
+`rm ~/.config/yuzu/toolchain-env.sh`; the cluster, role and `~/vcpkg` are left to you.)
 
 ```bash
 source /opt/rh/gcc-toolset-14/enable   # guarded: no stacked PATH entries
@@ -431,7 +433,6 @@ today this is a documented limitation rather than something the setup script can
 | `near "RETURNING": syntax error` from a Python script | System SQLite is 3.34.1; `RETURNING` needs 3.35+. Known limitation, see above. |
 | pip: `Could not find a version that satisfies the requirement meson==1.12.0` (the listed versions stop at 1.11.2) | You asked the 3.9 `python3` for the CI pin. This recipe installs `meson==1.11.2`; the python3.12 route is #3696. |
 | `[fail] sudo is required` | Stock container images and minimal installs have no `sudo`. As root: `dnf install -y sudo`. |
-| Undoing the shell hook | Delete the block between `# >>> yuzu toolchain >>>` and `# <<< yuzu toolchain <<<` in `~/.bashrc`, then `rm ~/.config/yuzu/toolchain-env.sh`. The cluster, role and `~/vcpkg` are left to you. |
 | vcpkg `openssl` port fails in `Configure` | Missing perl modules. Install `perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html`. |
 | vcpkg `libpq` port fails looking for `bison`/`flex` | Those two packages are not installed. |
 
