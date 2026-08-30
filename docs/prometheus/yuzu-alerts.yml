@@ -3724,3 +3724,46 @@ groups:
   # labels are counted in the current agent process while evictions cover batches
   # written up to 7 days earlier across a churning fleet, so after a restart the
   # numerator can exceed it.
+
+  - name: yuzu-auth-sessions
+    # HA WS-1/1a (ADR-2002 §4) — durable operator sessions. The clock-anomaly
+    # alert is the DB-clock-integrity monitor ADR-2002 §4 mitigation (a) requires
+    # ("monitor for backward movement; alert"): a session reap pass declines when
+    # its wall-clock read is implausibly ahead of, or behind, the persisted
+    # anchor — exactly a backward/forward DB-host clock step, which would
+    # un-expire sessions and extend live JIT-elevation / MFA windows. Both
+    # counters are zero-seeded at boot, so increase() > 0 is meaningful.
+    rules:
+      - alert: YuzuSessionReapClockAnomaly
+        expr: |
+          increase(yuzu_auth_session_reap_clock_anomaly_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable-session reap declined on a wall-clock anomaly (DB/host clock integrity)"
+          description: >-
+            A durable-session reap pass was declined because the server's
+            wall-clock reading was implausibly ahead of or behind the persisted
+            reap anchor — the DB-clock-integrity signal ADR-2002 §4 requires be
+            monitored. A backward clock step un-expires sessions and extends live
+            JIT-elevation / MFA step-up windows beyond their authored maximums
+            (the residual the per-window ceilings deliberately do not resist).
+            Investigate NTP / DB-host / server-host clock health; correlate with
+            yuzu_auth_session_store_degrade_total.
+      - alert: YuzuSessionStoreDegraded
+        expr: |
+          increase(yuzu_auth_session_store_degrade_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable session store degraded on the auth hot path (op={{ $labels.op }})"
+          description: >-
+            A durable session-store operation ({{ $labels.op }}) hit a degraded
+            PostgreSQL read/write for 10m. A `validate` degrade fails requests
+            closed (401); `create`/`elevate`/`mark_mfa`/`invalidate`/
+            `invalidate_user` degrades fail the privileged op closed; a sustained
+            `generation_refresh` degrade drops the validate cache past the
+            stale-serve bound. Usually PostgreSQL pool saturation / failover —
+            correlate with the pool metrics.

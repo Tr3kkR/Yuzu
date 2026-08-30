@@ -1267,7 +1267,7 @@ curl -s -X DELETE \
 }
 ```
 
-`revoked` is the number of in-memory session cookies wiped. `db_persisted` reports whether the AuthDB DELETE for persisted session rows succeeded; when `false`, the audit row is recorded with `result="partial"` and `detail` carries `db_error=true`. A `false` value indicates the operator should retry or restart the server — server restart will otherwise resurrect any persisted rows that were not deleted.
+`revoked` is the number of sessions wiped (the fleet-wide durable count on a Postgres-backed deployment, or the local cookie count in the config-file-only fallback). `db_persisted` reports whether the durable session delete succeeded — since HA WS-1/1a this goes through the durable `SessionStore` (`invalidate_user`), never AuthDB. When `false`, the audit row is recorded with `result="partial"` and `detail` carries `db_error=true`. **Remediation: retry** — the durable delete is idempotent, so re-issuing the request converges. **A server restart does NOT revoke the sessions:** durable sessions survive a restart by design (ADR-2002 §4), so a session that failed to be revoked stays valid until its absolute 8-hour expiry, not "resurrected" by restart. The local cache is wiped on this replica regardless (the operator's "stop NOW" intent is honoured there immediately), but the durable rows — and any other replica's cache — are only cleared once the delete actually lands.
 
 `audit_emitted` reports whether the SOC 2 CC6.6 audit row landed in the audit store. When `false` the response also sets the `Sec-Audit-Failed: true` header — SREs scraping for evidence-integrity gaps should alert on either signal. The revoke side-effect still completes when `audit_emitted=false` (operator's "stop NOW" intent is honoured); only the SOC 2 evidence chain is degraded for that request. This split was introduced in PR #883 (HIGH-2) to close a silent-failure window where a locked audit DB or disk-full condition produced a 200 OK that masqueraded as full evidence.
 
@@ -6223,6 +6223,10 @@ The one device list behind every network-quality drill: worst devices by a metri
 - **Permission:** `Patch:Read`
 - **Query params:** `agent_id`, `severity`, `status`, `limit` (default 100)
 
+> **Note:** patch inventory is populated only by `PatchManager::record_patches()`, which has no
+> production caller today — this endpoint returns an empty result in every real deployment, not
+> because the fleet has no missing patches. See `docs/capability-map.md` §8.5/§8.7 and #3676.
+
 **`POST /api/patches/deploy`** — Create a patch deployment targeting specific agents.
 
 - **Permission:** `Patch:Write`
@@ -6231,19 +6235,33 @@ The one device list behind every network-quality drill: worst devices by a metri
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `kb_id` | string | Yes | — | KB identifier (format: `KBnnnnnnn`) |
-| `agent_ids` | string[] | Yes | — | Target agent IDs |
+| `agent_ids` | string[] | Yes | — | Target agent IDs (max 5000 after de-duplication; a longer list is rejected with `too many target agents`) |
 | `reboot_if_needed` | bool | No | `false` | Reboot agents after patching |
 | `reboot_delay_seconds` | int | No | `300` | Seconds to wait before reboot (clamped to 60–86400). A desktop notification warns the user before reboot. |
 | `reboot_at` | int64 | No | `0` | Optional epoch timestamp for scheduled reboot. Must be in the future. `0` = use delay instead. |
 
 - **Response (201):** `{"deployment_id": "...", "kb_id": "...", "target_count": N, "status": "pending"}`
 
-> **Note:** Reboot orchestration requires the Yuzu agent to run with root (Linux/macOS) or Administrator (Windows) privileges. If the agent lacks these privileges, the reboot command will fail silently; the patch installation itself will still succeed.
+> **Note:** this creates a deployment record + a `pending` row per target — there is no server-side
+> scan/install/verify/reboot orchestration (`PatchManager::execute_deployment()` was removed;
+> ADR-0062, `docs/capability-map.md` §8.3/§8.4/§8.6, tracking issue #3669). Nothing advances a
+> target past `pending` except `POST /api/patches/deployments/:id/cancel` (→ `cancelled`).
+> `reboot_if_needed`/`reboot_delay_seconds`/`reboot_at` are accepted, clamped, and stored, but
+> nothing acts on them.
+
+Successful deploys are recorded in the audit log with `action=patch.deploy`, `result=success`.
+A validation rejection (invalid KB format, an oversized `agent_ids` list, or a failed
+transaction) is recorded with `result=denied` and `detail` carrying the error message — see
+`docs/user-manual/audit-log.md`'s `patch.deploy` row for the known gaps (#3705) in this
+outcome's granularity.
 
 **`GET /api/patches/deployments/:id`** — Deployment details with per-target status.
 
 - **Permission:** `Patch:Read`
-- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` (pending, scanning, downloading, installing, verifying, rebooting, completed, failed, skipped, cancelled).
+- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` — always `pending`
+  or `cancelled` today (the fuller `scanning`/`downloading`/`installing`/`verifying`/`rebooting`/
+  `completed`/`failed`/`skipped` vocabulary is reserved by the schema but nothing currently sets
+  it). `completed_targets`/`failed_targets` are set once at creation and never recalculated.
 
 **`GET /api/patches/deployments`** — List deployments (paginated, default limit 50).
 
