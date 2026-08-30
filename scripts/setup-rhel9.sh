@@ -590,7 +590,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
     if [ "$DRY_RUN" = 1 ]; then
       printf "  (dry-run) record the new cluster's identity in %s\n" "${PG_MARK}"
     else
-      pg_sysid | sudo -u postgres tee "${PG_MARK}" >/dev/null
+      pg_sysid | sudo -u postgres tee "${PG_MARK}" >/dev/null || true
       sudo test -s "${PG_MARK}" || die "could not record the cluster identity in ${PG_MARK}"
     fi
     PG_OWNED=1
@@ -600,7 +600,7 @@ if [ "$WITH_POSTGRES" = 1 ]; then
   if [ "$PG_OWNED" = 1 ] || [ "$DRY_RUN" = 1 ]; then
     PG_OWNED=1   # dry-run narrates the fresh-box arm declared above
   else
-    CUR_SYSID="$(pg_sysid)"
+    CUR_SYSID="$(pg_sysid)" || CUR_SYSID=""
     MARK_SYSID="$(sudo cat "${PG_MARK}" 2>/dev/null | tr -d '[:space:]')" || MARK_SYSID=""
     if [ -z "${CUR_SYSID}" ]; then
       warn "cannot read the cluster identity at ${PGDATA} (sudo or pg_controldata unavailable); treating it as not managed by this script"
