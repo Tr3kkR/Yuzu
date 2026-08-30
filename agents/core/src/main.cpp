@@ -219,8 +219,8 @@ static void on_signal(int sig) {
         // the watchdog above for the SAME wedge, and whichever one's exit call the kernel
         // schedules first wins — governance Gate 5 chaos-injector reproduced this empirically
         // across many repeated trials: always exactly one of the two codes, never a third
-        // value or a crash, but genuinely nondeterministic which one (exact trial counts in
-        // the governance.d/2233-shutdown-deadline-guard.*.jsonl ledger for this PR). Treat the
+        // value or a crash, but genuinely nondeterministic which one — see this PR's
+        // governance record for the exact trial counts. Treat the
         // exit code as a useful hint, not a certain diagnosis, when both paths could plausibly
         // have fired.
         // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7, chaos-injector; this PR.)
