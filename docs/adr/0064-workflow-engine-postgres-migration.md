@@ -82,9 +82,12 @@ CREATE TABLE workflow_step_results (
     PRIMARY KEY (execution_id, step_index)
 );
 CREATE INDEX idx_wf_exec_workflow ON workflow_executions(workflow_id);
-CREATE INDEX idx_wf_step_results_exec ON workflow_step_results(execution_id);
 CREATE INDEX idx_workflows_deleted ON workflows(deleted_at) WHERE deleted_at = 0;
 ```
+
+No separate index on `workflow_step_results(execution_id)` (governance finding, architect): the
+`PRIMARY KEY (execution_id, step_index)` btree already serves an `execution_id`-only equality
+lookup on its leading column — a dedicated index would be pure redundant write/storage cost.
 
 One v1 migration, flattened from the SQLite-era single `IF NOT EXISTS` ladder. `completed_at` was
 nullable `INTEGER` in SQLite (unset until terminal); it becomes `BIGINT NOT NULL DEFAULT 0` here,
@@ -272,6 +275,26 @@ an in-flight, already-dispatched fleet operation — aborting a workflow whose s
 run on real agents would be strictly worse than a gap in the recorded history of it. This mirrors
 `execute()`'s own pre-migration failure posture (dispatch failures are recorded, not fatal to the
 method) and is unchanged by this migration.
+
+**The per-step cancellation-check read shares this posture too** (governance finding,
+security-guardian + cpp-expert, independently): `execute()`'s loop calls `get_execution(exec_id)`
+at the top of each iteration to detect a concurrent `cancel_execution()`; a lease timeout on that
+read is treated identically to "not cancelled" and the loop keeps dispatching. This is the same
+degrade-and-continue posture as the write helpers above, for the same reason — aborting an
+in-flight fleet operation over a transient read failure would be strictly worse than one missed
+cancellation check (the loop re-checks on the very next step).
+
+**Finalize's own status write is guarded, unlike the mid-loop "running" update** (governance
+finding, cpp-expert): the terminal `UPDATE ... SET status = 'failed'/'completed'` at the end of
+`execute()` carries `WHERE status = 'running'`, so it cannot clobber a status a concurrent
+`cancel_execution()` already moved to `'cancelled'` — mirroring `cancel_execution()`'s own atomic
+transition from the other direction. Pre-migration, the `std::unique_lock mtx_` serialized cancel
+against finalize, so whichever ran last silently won; that "last writer wins" characteristic was
+already present, just achieved by serialization rather than a missing guard. The Postgres port
+removes the serialization, so finalize needs its own compare-and-guard to keep the same
+never-overwrite-a-terminal-cancel property. Currently unreachable in production —
+`cancel_execution()` has no REST/MCP caller today (verified: grepped the whole tree) — but closes
+the gap correctly ahead of that route eventually being wired, rather than leaving a latent trap.
 
 ### Lease discipline — the retry-loop hazard
 

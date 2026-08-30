@@ -358,6 +358,132 @@ TEST_CASE("WorkflowEngine: execute on_failure=abort (default) skips remaining st
     CHECK((*exec)->step_results[1].status == "skipped");
 }
 
+TEST_CASE("WorkflowEngine: execute on_failure=continue proceeds past a failed step",
+          "[workflow_engine][pg][execute]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: continue-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      onFailure: continue\n"
+                             "    - instruction: inst-2\n";
+
+    auto wf_id = *engine.create_workflow(yaml);
+
+    StepDispatchFn fail_first =
+        [](const std::string& instruction_id, const std::string&,
+           const std::string&) -> std::expected<std::string, std::string> {
+        if (instruction_id == "inst-1")
+            return std::unexpected("boom");
+        return std::string(R"({"status":"ok"})");
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, fail_first);
+    REQUIRE(exec_result.has_value());
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    // The second step still ran (not skipped) despite the first failing, so the overall
+    // execution completes rather than failing.
+    CHECK((*exec)->status == "completed");
+    REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[0].status == "failed");
+    CHECK((*exec)->step_results[1].status == "success");
+}
+
+TEST_CASE("WorkflowEngine: execute retries exhaust and the step is recorded failed",
+          "[workflow_engine][pg][execute][retry]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: retry-exhaust-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      retryCount: 2\n"
+                             "      retryDelay: 0\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    int attempts = 0;
+    StepDispatchFn always_fail =
+        [&attempts](const std::string&, const std::string&,
+                   const std::string&) -> std::expected<std::string, std::string> {
+        ++attempts;
+        return std::unexpected("boom");
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, always_fail);
+    REQUIRE(exec_result.has_value());
+    CHECK(attempts == 3); // 1 initial + 2 retries, all exhausted
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "failed");
+    REQUIRE((*exec)->step_results.size() == 1);
+    CHECK((*exec)->step_results[0].status == "failed");
+    CHECK((*exec)->step_results[0].attempt == 3); // the last (also failed) attempt number
+}
+
+TEST_CASE("WorkflowEngine: execute skips a step whose condition evaluates false",
+          "[workflow_engine][pg][execute]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: cond-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "    - instruction: inst-2\n"
+                             "      condition: skip-me\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    bool condition_called = false;
+    ConditionEvalFn deny_all = [&condition_called](const std::string& expr,
+                                                   const std::map<std::string, std::string>&) {
+        condition_called = true;
+        CHECK(expr == "skip-me");
+        return false;
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn(), deny_all);
+    REQUIRE(exec_result.has_value());
+    CHECK(condition_called);
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "completed");
+    REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[0].status == "success");
+    CHECK((*exec)->step_results[1].status == "skipped");
+}
+
+TEST_CASE("WorkflowEngine: execute expands a foreach step and aggregates per-item results",
+          "[workflow_engine][pg][execute]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: foreach-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "    - instruction: inst-2\n"
+                             "      foreach: items\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    std::vector<std::string> foreach_params_seen;
+    StepDispatchFn dispatch = [&foreach_params_seen](
+                                  const std::string& instruction_id, const std::string&,
+                                  const std::string& params) -> std::expected<std::string, std::string> {
+        if (instruction_id == "inst-1")
+            return std::string(R"({"items":["a","b"]})");
+        foreach_params_seen.push_back(params);
+        return std::string(R"({"status":"ok"})");
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, dispatch);
+    REQUIRE(exec_result.has_value());
+    // The "items" array from step 1's result drove two separate dispatch calls for step 2.
+    REQUIRE(foreach_params_seen.size() == 2);
+    CHECK(foreach_params_seen[0] == "\"a\"");
+    CHECK(foreach_params_seen[1] == "\"b\"");
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "completed");
+    REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[1].status == "success");
+}
+
 // ── Cancel ────────────────────────────────────────────────────────────────
 
 TEST_CASE("WorkflowEngine: cancel_execution rejects an unknown id",
@@ -402,7 +528,10 @@ TEST_CASE("WorkflowEngine: cancel_execution mid-run stops subsequent steps",
     auto exec = engine.get_execution(*exec_result);
     REQUIRE(exec.has_value());
     REQUIRE(exec->has_value());
-    CHECK((*exec)->status == "failed"); // cancellation surfaces as execution_failed=true
+    // Governance finding (cpp-expert): the finalize UPDATE is now guarded (`WHERE status =
+    // 'running'`), so it no longer clobbers the "cancelled" status cancel_execution() already
+    // committed — status stays "cancelled", not overwritten to "failed".
+    CHECK((*exec)->status == "cancelled");
 }
 
 // ── Degrade path ──────────────────────────────────────────────────────────
@@ -526,14 +655,28 @@ TEST_CASE("WorkflowEngine: get_execution surfaces a genuine workflow_step_result
 }
 
 // ── cancel_execution atomicity (adversarial-review CDX-P1-003/WF-2/WF-5) ─────
+//
+// Governance finding (quality-engineer, Gate 3): a genuine concurrent race between
+// cancel_execution()'s SELECT-then-UPDATE and a racing execute() finalize cannot be reproduced
+// deterministically at the API level — no thread interleaves inside one SQL statement, and a
+// probabilistic thread/sleep-based stress test would violate this repo's test-determinism
+// convention. The single-statement `UPDATE ... WHERE status IN ('pending','running') RETURNING
+// id` shape (workflow_engine.cpp) is the actual closure evidence for the race — it is atomic by
+// construction and reviewable directly in the diff, not something this test proves. What the
+// case below DOES prove, and is exactly what it is named for: cancelling an execution that is
+// ALREADY terminal (the common non-concurrent case, and the only shape reachable at the API
+// today) reports the already-terminal message and never overwrites the row — a real, useful
+// assertion, but not a race/atomicity proof. Do not re-add an "atomicity" framing here without a
+// genuine concurrent reproduction.
 
-TEST_CASE("WorkflowEngine: cancel_execution's transition is one atomic statement",
+TEST_CASE("WorkflowEngine: cancel_execution on an already-terminal execution reports "
+          "already-terminal and never overwrites its status",
           "[workflow_engine][pg][cancel]") {
     WORKFLOW_ENGINE(engine);
     auto wf_id = *engine.create_workflow(kOneStepYaml);
     auto exec_id = *engine.execute(wf_id, {"agent-1"}, ok_dispatch_fn());
 
-    // Already terminal ("completed") — the atomic UPDATE...WHERE status IN (...) matches zero
+    // Already terminal ("completed") — the guarded UPDATE...WHERE status IN (...) matches zero
     // rows, so cancel must report the already-terminal message, never silently overwrite it.
     auto cancel = engine.cancel_execution(exec_id);
     REQUIRE_FALSE(cancel.has_value());

@@ -2480,5 +2480,7 @@ TEST_CASE("POST /api/scope/estimate: an ordinary session reaches the estimator",
 
 // #3503 review finding: WorkflowEngine::create_workflow()'s wrong-kind path routes through the
 // shared kind_mismatch_error() helper — pinned in test_workflow_engine.cpp (ADR-0064: moved
-// there since it's a store-behaviour test, and YUZU_REQUIRE_PG_DB_TPL is reserved for
-// migration/fresh-DB tests, not ordinary store CRUD).
+// there since it's a store-behaviour test, and the plain YUZU_REQUIRE_PG_DB (no _TPL) this test
+// used to use is reserved for migration/fresh-DB tests; ordinary store CRUD belongs on the
+// PgTestTemplate-backed YUZU_REQUIRE_PG_DB_TPL, per-test migration DDL being exactly what drove
+// the 2026-07-12 Windows server-suite timeout).

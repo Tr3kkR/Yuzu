@@ -81,7 +81,10 @@ const std::vector<pg::PgMigration>& migrations() {
          "  PRIMARY KEY (execution_id, step_index)"
          ");"
          "CREATE INDEX idx_wf_exec_workflow ON workflow_executions(workflow_id);"
-         "CREATE INDEX idx_wf_step_results_exec ON workflow_step_results(execution_id);"
+         // No separate index on workflow_step_results(execution_id) — governance finding
+         // (architect): the PK (execution_id, step_index) btree already serves an
+         // execution_id-only equality lookup on its leading column; a dedicated index would be
+         // pure redundant write/storage cost.
          "CREATE INDEX idx_workflows_deleted ON workflows(deleted_at) WHERE deleted_at = 0;"},
     };
     return kMigrations;
@@ -702,8 +705,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
 
     auto exec_id = generate_id();
     auto now = std::to_string(now_epoch());
-    nlohmann::json agent_ids_arr = agent_ids;
-    auto agent_str = agent_ids_arr.dump();
+    const std::string agent_str = nlohmann::json(agent_ids).dump();
 
     // New atomicity (ADR-0064): execution-row creation + every step-result pre-creation are one
     // transaction. The execution insert is an INSERT...SELECT...WHERE deleted_at = 0, which
@@ -842,8 +844,7 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             bool foreach_failed = false;
 
             for (const auto& params : dispatch_params) {
-                auto dispatch_result = dispatch_fn(step.instruction_id,
-                                                    agent_ids_arr.dump(), params);
+                auto dispatch_result = dispatch_fn(step.instruction_id, agent_str, params);
                 if (dispatch_result) {
                     foreach_results.push_back(
                         nlohmann::json::parse(*dispatch_result, nullptr, false));
@@ -921,9 +922,25 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
         }
     }
 
-    // Finalize execution
+    // Finalize execution — `WHERE status = 'running'` guards against clobbering a status a
+    // concurrent cancel_execution() already moved to 'cancelled' (governance finding,
+    // cpp-expert): the pre-migration mutex serialized cancel vs. finalize, so whichever ran last
+    // silently won — a pre-existing "last writer wins" characteristic, not something this port
+    // introduced. Postgres removes that serialization, so finalize needs its own guard to keep
+    // the same "never overwrite a terminal cancel" property cancel_execution()'s own atomic
+    // UPDATE already enforces from the other direction. Currently unreachable in production
+    // (cancel_execution has no REST/MCP caller today), but this closes the gap correctly ahead
+    // of that route being wired.
     with_write_lease([&](PGconn* c) {
-        wf_update_execution_status(c, exec_id, execution_failed ? "failed" : "completed");
+        pg::PgResult res = pg::exec_params(
+            c,
+            "UPDATE workflow_engine.workflow_executions SET status = $1, completed_at = $2::bigint "
+            "WHERE id = $3 AND status = 'running'",
+            std::vector<std::string>{execution_failed ? "failed" : "completed",
+                                     std::to_string(now_epoch()), exec_id});
+        if (res.status() != PGRES_COMMAND_OK)
+            spdlog::warn("WorkflowEngine: finalize status update failed for {}: {}", exec_id,
+                        PQresultErrorMessage(res.get()));
     });
 
     if (metrics_)
