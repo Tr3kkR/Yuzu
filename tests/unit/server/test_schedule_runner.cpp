@@ -686,3 +686,55 @@ TEST_CASE("ScheduleRunner: tick() stops firing further schedules once should_sto
     const bool b_fired = sb.next_execution_at != 1;
     CHECK(a_fired != b_fired);
 }
+
+// #3495 companion (governance happy-path, 2026-08-30): Harness::runner always
+// wires a non-empty `.should_stop` lambda (`[this]{ return should_stop_hook &&
+// should_stop_hook(); }`, itself false unless a test sets should_stop_hook) —
+// so no existing ScheduleRunner test ever exercises `d_.should_stop` as a
+// literal default-constructed empty std::function, the exact production
+// shape every unwired Deps carries. PreflightRunner and PolicyEvaluator each
+// got a dedicated unset-should_stop control test at Gate 3; this is
+// ScheduleRunner's. Constructs a second, raw ScheduleRunner sharing the
+// Harness's already-built engine/tracker/approvals/instruction-store rather
+// than going through Harness's own runner (which cannot leave should_stop
+// unset).
+TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
+          "not just the first",
+          "[schedule][runner]") {
+    Harness h;
+    auto id_a = h.make_due("test.def", "interval");
+    auto id_b = h.make_due("test.def", "daily");
+
+    std::vector<DispatchCall> calls;
+    ScheduleRunner raw_runner(ScheduleRunner::Deps{
+        .schedule_engine = &h.engine,
+        .instruction_store = &h.is,
+        .execution_tracker = &h.tracker,
+        .approval_manager = &h.approvals,
+        .dispatch_fn =
+            [&](const std::string& plugin, const std::string& action,
+                const std::vector<std::string>&, const std::string& scope,
+                const std::unordered_map<std::string, std::string>& params,
+                const std::string& execution_id,
+                const DispatchCaller& caller) -> std::pair<std::string, int> {
+            calls.push_back({plugin, action, scope, execution_id, caller, params});
+            return {"cmd-" + std::to_string(calls.size()), 1};
+        },
+        .resolve_caller =
+            [](const std::string& username) {
+            return DispatchCaller{.principal = username, .system = false};
+        },
+        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+            return true;
+        },
+        // .should_stop left unset (default std::function<bool()>{}).
+    });
+
+    raw_runner.tick();
+
+    CHECK(calls.size() == 2); // both fired — an unset should_stop never breaks the loop
+    const auto sa = h.get(id_a);
+    const auto sb = h.get(id_b);
+    CHECK(sa.next_execution_at != 1);
+    CHECK(sb.next_execution_at != 1);
+}

@@ -8438,9 +8438,9 @@ public:
         }
 
         // agent_server_/mgmt_server_->Shutdown(deadline) already ran above
-        // (#3495), immediately before the pre-flight/quarantine/schedule
-        // joins — moved there so its forced-cancellation reaches those
-        // threads' in-flight dispatch writes too, not just the direct
+        // (#3495), immediately before the policy-eval/pre-flight/quarantine/
+        // schedule joins — moved there so its forced-cancellation reaches
+        // those threads' in-flight dispatch writes too, not just the direct
         // Subscribe/ManagementService streams. In-flight Subscribe and
         // ManagementService streams have therefore already drained or been
         // forcibly cancelled by this point, same as before the move — only
@@ -8454,7 +8454,7 @@ public:
         // gRPC drain race-windowed a use-after-free during graceful
         // shutdown. Drain producers first, null the borrowed pointer
         // explicitly, then release the tracker — still true here: the drain
-        // (and now the three joins too) both precede this section.
+        // (and now the four joins too) both precede this section.
 
         // Now safe: gRPC streams have either completed or been cancelled,
         // so no thread is inside notify_exec_tracker holding the borrowed
@@ -8545,7 +8545,7 @@ public:
         // exclusive lock, heartbeat_ingestion.hpp) stays sequenced AFTER
         // agent_server_->Shutdown(deadline) even though that call moved
         // earlier in this function — it did not move past this point, only
-        // to before the three joins above it. So this wait's bound is
+        // to before the four joins above it. So this wait's bound is
         // unchanged (still Shutdown's 5s deadline plus whatever store-call
         // timeout was already in flight when forced cancellation landed),
         // not regressed to unbounded by the reorder above (#3495 acceptance

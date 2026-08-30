@@ -1143,7 +1143,9 @@ server `PgPool`).
   grace period, but understand what that does and does not buy you.** A
   graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
   draining in-flight executions, up to 5 s on the gRPC shutdown deadline
-  (moved up by #3495 to run right after the execution drain — see below),
+  (moved up by #3495 to run earlier in the sequence, ahead of the four
+  joins below and several other quick housekeeping joins not separately
+  listed here, though still after the execution drain — see below),
   up to 5 s waiting on the NVD-sync background thread, up to 15 s waiting on
   the HTTP listener thread (#2703 Gate 7 item 2), and (#3261 governance
   hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to

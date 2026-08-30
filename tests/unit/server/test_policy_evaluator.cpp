@@ -603,17 +603,28 @@ TEST_CASE("policy evaluator: two instances sharing one store dispatch a policy e
 
 // #3495 governance Gate 3 re-review (architect, 2026-08-30): PolicyEvaluator
 // was the fourth production consumer of the shared command_dispatch_fn
-// closure and was missed by the original #3495 fix — dispatch_due()'s
-// per-policy loop had no interior cancellation check, exactly the same gap
-// QuarantineContainmentReconciler/PreflightRunner/ScheduleRunner already
-// closed. Deps::should_stop ports the same field: checked once per claimed
-// policy, before that policy's kickoff_check (and its blocking dispatch_fn
-// call) begins, so a policy already dispatching still completes cleanly —
-// this only stops the NEXT policy from starting. Safe to defer: the durable
-// claim (claim_due_policies, above) is recovered by the staleness sweep the
-// same way an ordinary dispatch failure already is.
-TEST_CASE("policy evaluator: dispatch_due() stops claiming further policies once "
-          "should_stop() reports true, deferring the rest to the next tick",
+// closure and was missed by the original #3495 fix — policy_eval_thread_
+// still joined before agent_server_->Shutdown(deadline). That join-ordering
+// half of the fix is real and stays (see test_shutdown_join_order.cpp).
+//
+// An EARLIER version of this Gate 3 round also added a should_stop check
+// inside dispatch_due()'s per-claimed-policy loop, mirroring the other three
+// engines. Gate 4 unhappy-path (2026-08-30, UP-1/UP-2) caught that this was
+// itself a NEW BLOCKING bug: claim_due_policies durably stamps
+// `last_dispatched_at` for EVERY due policy in ONE transaction BEFORE the
+// loop starts — a should_stop break partway through the loop leaves the
+// un-processed tail claimed but never actually checked, silently skipping
+// them for up to a full `default_interval_seconds` (not "the next tick" as
+// an earlier version of the removed check's comment incorrectly claimed —
+// the staleness sweep it cited only resets 'fixing' status rows, never this
+// claim). That should_stop check was REMOVED (see dispatch_due()'s own
+// comment for the full reasoning); this test now proves the corrected
+// behavior — should_stop does NOT stop dispatch_due() from processing every
+// claimed policy — so a future regression re-adding that check fails here,
+// not silently in production.
+TEST_CASE("policy evaluator: dispatch_due() processes every claimed policy "
+          "regardless of should_stop, since claim_due_policies already "
+          "durably committed all of them",
           "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -651,21 +662,85 @@ TEST_CASE("policy evaluator: dispatch_due() stops claiming further policies once
     REQUIRE(h.ps.create_policy(pol_b).has_value()); // check: test.check2 -> checkp2
 
     auto deps = h.deps();
-    // Stop signals true once the first policy has dispatched — proving the
-    // loop actually checks should_stop() before the SECOND policy and exits
-    // early rather than pushing through both.
-    deps.should_stop = [&h] { return h.dispatch_calls >= 1; };
+    // Stop signals true from the very first check — the strongest possible
+    // adversarial case. If dispatch_due() honored this (like its Gate 3
+    // round briefly did), NEITHER policy would be checked despite BOTH
+    // already being durably claimed above.
+    deps.should_stop = [] { return true; };
     PolicyEvaluator ev(deps);
 
-    ev.tick(); // collect_ready() is a no-op (nothing in flight yet); dispatch_due() claims both, dispatches one
+    ev.tick(); // collect_ready() is a no-op (nothing in flight yet); dispatch_due() claims both, must dispatch both
 
-    REQUIRE(h.dispatch_calls == 1); // NOT 2 — the loop stopped before the second policy
-    REQUIRE(h.dispatched_plugins.size() == 1);
-    // Exactly one plugin fired — proves ONE policy's kickoff_check ran and
-    // the other's never started (a clean defer, not a partial dispatch).
-    const bool checkp_fired = h.dispatched_plugins[0] == "checkp";
-    const bool checkp2_fired = h.dispatched_plugins[0] == "checkp2";
-    CHECK(checkp_fired != checkp2_fired);
+    REQUIRE(h.dispatch_calls == 2); // NOT 0, NOT 1 — should_stop=true never gates this loop
+    REQUIRE(h.dispatched_plugins.size() == 2);
+    // Both plugins fired — proves BOTH policies' kickoff_check ran despite
+    // should_stop reporting true throughout.
+    const bool checkp_fired =
+        h.dispatched_plugins[0] == "checkp" || h.dispatched_plugins[1] == "checkp";
+    const bool checkp2_fired =
+        h.dispatched_plugins[0] == "checkp2" || h.dispatched_plugins[1] == "checkp2";
+    CHECK(checkp_fired);
+    CHECK(checkp2_fired);
+}
+
+// #3495 (governance consistency-auditor, 2026-08-30): collect_ready() is now
+// the ONLY should_stop site left in PolicyEvaluator (dispatch_due()'s was
+// removed above) — this proves it actually works, not just that it exists.
+// Unlike dispatch_due()'s claim, collect_ready()'s `ready` items carry no
+// durable pre-commit, so deferring them to the next tick is genuinely safe
+// here (see collect_ready()'s own comment). should_stop is checked once per
+// item, at the TOP of the loop before that item's own work begins (same
+// semantics as every other engine) — so should_stop already true when
+// tick() is called defers EVERY ready item, not just the ones after the
+// first; there is no partial-processing case to observe here the way there
+// is for a dispatch-bearing loop (dispatch_due()'s own test covers that
+// shape instead, where each iteration's own work is a blocking call).
+TEST_CASE("policy evaluator: collect_ready() defers every ready item when "
+          "should_stop() already reports true",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
+    auto pid_a = h.author("result.hostname != ''");
+    auto pid_b = h.author("result.hostname != ''");
+
+    // A mutable flag rather than a fixed lambda: should_stop must read false
+    // while seeding two in-flight checks (evaluate_now doesn't consult it —
+    // it's a manual, operator-triggered dispatch, not a tick loop), then
+    // true once collect_ready() itself is under test.
+    bool stop = false;
+    auto deps = h.deps();
+    deps.should_stop = [&stop] { return stop; };
+    PolicyEvaluator ev(deps);
+
+    REQUIRE_FALSE(ev.evaluate_now(pid_a).value_or("").empty());
+    REQUIRE_FALSE(ev.evaluate_now(pid_b).value_or("").empty());
+    h.fake_now += 20; // past grace_seconds (15) — both now "ready" for collect_ready()
+
+    stop = true;
+    ev.tick(); // collect_ready() must process NEITHER ready item
+
+    // Neither policy got an agent_status write. (Both policies' next
+    // interval due-time was already pushed out by evaluate_now's own
+    // durable stamp, so dispatch_due() finds nothing due in this same
+    // tick() and cannot interfere with this assertion.)
+    CHECK(h.status_of(pid_a, "agentA") == "<none>");
+    CHECK(h.status_of(pid_b, "agentA") == "<none>");
+
+    // NOT a temporary defer: collect_ready() dequeues every past-grace item
+    // from in_flight_ into `ready` UNCONDITIONALLY, before the should_stop
+    // loop even runs (see collect_ready()'s own comment) — so both entries
+    // are already gone from in_flight_ by this point, regardless of
+    // should_stop's value. A second tick(), even with should_stop now
+    // false, has nothing left to collect for either policy; both stay
+    // "<none>" until the next interval's fresh Check dispatch (UP-3, Gate 4
+    // unhappy-path) — proving the bounded-but-real loss this component's
+    // design accepts, not a false "it recovers on retry" claim.
+    stop = false;
+    ev.tick();
+    CHECK(h.status_of(pid_a, "agentA") == "<none>");
+    CHECK(h.status_of(pid_b, "agentA") == "<none>");
 }
 
 // #3495 companion (mirrors the PreflightRunner/ScheduleRunner control cases,

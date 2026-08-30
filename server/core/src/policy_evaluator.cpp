@@ -370,16 +370,33 @@ void PolicyEvaluator::dispatch_due() {
                 .increment();
         return;
     }
+    // #3495 (governance Gate 4 unhappy-path, 2026-08-30, UP-1/UP-2):
+    // Deps::should_stop is DELIBERATELY NOT checked in this loop, unlike its
+    // siblings in collect_ready() (above) and every other engine's tick
+    // loop. claim_due_policies just durably stamped `last_dispatched_at` for
+    // EVERY policy in `claimed`, in ONE transaction, unconditionally — a
+    // should_stop break here would leave the un-processed tail claimed but
+    // never actually checked. An earlier version of this comment claimed
+    // that was "recovered by the staleness sweep (fixing_stale_seconds)" —
+    // that claim was FALSE: the sweep only resets `status='fixing'` rows
+    // (mid-remediation), never `policy_dispatch_state.last_dispatched_at`.
+    // The real consequence of breaking here is every claimed-but-skipped
+    // policy silently reading as "already checked this interval" and not
+    // being reconsidered until `default_interval_seconds` (3600s default)
+    // elapses — a fleet-wide, counter-less, log-less compliance-check gap on
+    // the single most common shutdown trigger (a rolling deploy), not a
+    // bounded one-tick defer. DO NOT reintroduce a should_stop check here
+    // without first giving claim_due_policies a way to release an unclaimed
+    // tail back to "due" (a new PolicyStore method — out of scope for a
+    // should_stop check). The primary #3495 fix (agent_server_->
+    // Shutdown(deadline) now running before policy_eval_thread_'s join)
+    // still bounds this loop's total wall time on its own: only the FIRST
+    // kickoff_check() call can genuinely block on a stalled stream write —
+    // once Shutdown's deadline elapses and forcibly cancels it, every
+    // dispatch_fn call attempted afterward against the now-shut-down gRPC
+    // server fails fast, so an un-gated loop over N claimed policies does
+    // not multiply the shutdown-time cost by N.
     for (const auto& p : *claimed) {
-        // #3495: bounds how many MORE policies a single tick() call starts
-        // once shutdown begins — a policy already being kicked off below
-        // still completes cleanly, this only stops the next one from
-        // starting. Safe to defer: this policy's durable claim (recorded by
-        // claim_due_policies, above) is recovered by the staleness sweep
-        // (fixing_stale_seconds) the same way an ordinary dispatch failure
-        // already is — see the comment on that failure path below.
-        if (d_.should_stop && d_.should_stop())
-            break;
         auto k = kickoff_check(p); // does its own brief locking; dispatch runs without mu_
         if (!k) {
             // Governance UP-2 (2026-08-24): this policy's durable dispatch
@@ -641,12 +658,22 @@ void PolicyEvaluator::collect_ready() {
     for (auto& f : ready) {
         // #3495: bounds how many MORE ready items this call processes once
         // shutdown begins — an item already being processed below still
-        // finishes cleanly. Safe to defer the rest: `ready` is already
-        // per-replica, in-memory-only state (see this file's header doc) —
-        // an entry dropped here by a deferred break is lost the same way
-        // EVERY entry in `in_flight_` already is on an ordinary process
-        // restart; this does not add a new class of loss, only moves an
-        // already-accepted one slightly earlier during a graceful shutdown.
+        // finishes cleanly. Unlike dispatch_due()'s loop (below — see its
+        // comment for why THAT one does NOT get a should_stop check), this
+        // is safe to defer: `ready` is already per-replica, in-memory-only
+        // state (see this file's header doc), with no durable claim behind
+        // it. Governance Gate 4 unhappy-path (2026-08-30, UP-3) sharpened
+        // the consequence: this is a REAL loss on the routine graceful-
+        // shutdown path (not merely a restatement of ordinary restart loss —
+        // a graceful shutdown happens far more often than a crash), but it
+        // is a BOUNDED one: a dropped Check-phase item's stale verdict is
+        // superseded the next time this same policy comes due (at most
+        // `default_interval_seconds`); a dropped FixWait-phase item's
+        // verify-dispatch is skipped, leaving `status='fixing'` until the
+        // `fixing_stale_seconds` sweep resets it, then the next interval's
+        // Check re-establishes the true state. Neither case silently
+        // fleet-wide-skips checking the way an equivalent break in
+        // dispatch_due() would.
         if (d_.should_stop && d_.should_stop())
             break;
         // Degrade → empty (ADR-0039 deny-or-benign): a transient read failure
