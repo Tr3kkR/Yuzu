@@ -5090,10 +5090,13 @@ public:
         }
 
         // InstructionDbPool — a SEPARATE SQLite pool onto the SAME instructions.db file,
-        // backing the still-unmigrated ExecutionTracker/ApprovalManager/ScheduleEngine
-        // (ADR-0058: only instruction_definitions/instruction_sets moved to Postgres; these
-        // three siblings are unaffected and keep reading/writing the physical file directly —
-        // it is not retired by this migration). Deliberately NOT gated on instruction_store_'s
+        // backing the still-unmigrated ExecutionTracker/ApprovalManager (ADR-0065
+        // migration-programme PR 5 moves these two in a later commit; ScheduleEngine
+        // is already off this pool as of PR 5 commit 1 — see its own wiring block
+        // below). (ADR-0058: only instruction_definitions/instruction_sets moved to
+        // Postgres; these two siblings are unaffected and keep reading/writing the
+        // physical file directly — it is not retired by this migration). Deliberately
+        // NOT gated on instruction_store_'s
         // (now Postgres) is_open() — the two are independent post-migration, unlike
         // pre-migration where they happened to share one SQLite-open check. RAII pool owns the
         // shared connection (fixes G3-ARCH-T2-002); declared before the consumers in the member
@@ -5118,9 +5121,29 @@ public:
 
                 approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
                 approval_manager_->create_tables();
+            }
+        }
 
-                schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
-                schedule_engine_->create_tables();
+        // Phase 2b: ScheduleEngine — migrated Postgres store (ADR-0009/0065,
+        // schema `schedule_engine`; migration-programme PR 5, 1/3). Construction
+        // fail-CLOSED per ADR-0012 §1 — a posture UPGRADE from the SQLite era,
+        // where migration failure was log-only and no caller ever checked an
+        // availability flag. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-
+        // default amendment): the legacy instructions.db (shared with the still-
+        // SQLite ExecutionTracker/ApprovalManager siblings) is never copied; the
+        // detect-and-warn obligation still applies, so legacy_sqlite_probe::
+        // warn_if_legacy_rows() opens the legacy file read-only and warns (with
+        // a row count) only if the `schedules` table actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            schedule_engine_ = std::make_unique<ScheduleEngine>(*pg_pool_);
+            if (!schedule_engine_->is_open()) {
+                spdlog::error("[PG] Refusing to start: schedule engine migration/open failed "
+                              "(database reachable but the schedule_engine schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
+                                                         "ScheduleEngine", {"schedules"});
             }
         }
 
@@ -12789,6 +12812,11 @@ private:
             // start rather than shipping the gap. Construction is fail-closed,
             // so this is belt-and-braces against a runtime is_open() flip.
             bool directory_sync_ok = directory_sync_ && directory_sync_->is_open();
+            // ADR-0065 (migration-programme PR 5, 1/3) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Net-new: the SQLite era had
+            // no is_open()/availability flag for this store at all.
+            bool schedule_engine_ok = schedule_engine_ && schedule_engine_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12799,7 +12827,7 @@ private:
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
                 notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-                patch_manager_ok && session_store_ok && directory_sync_ok;
+                patch_manager_ok && session_store_ok && directory_sync_ok && schedule_engine_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12846,7 +12874,8 @@ private:
                   {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
                   {"patch_manager", patch_manager_ok ? "ok" : "error"},
                   {"session_store", session_store_ok ? "ok" : "error"},
-                  {"directory_sync", directory_sync_ok ? "ok" : "error"}}},
+                  {"directory_sync", directory_sync_ok ? "ok" : "error"},
+                  {"schedule_engine", schedule_engine_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -13008,6 +13037,12 @@ private:
                 {"execution_tracker", execution_tracker_ != nullptr && instr_db_pool_ &&
                                           instr_db_pool_->is_open() &&
                                           execution_tracker_->schema_ok()},
+                // ADR-0065 (migration-programme PR 5, 1/3): ScheduleEngine became
+                // a fail-closed Postgres store (was fail-open SQLite with no
+                // is_open() of its own — migration failure was log-only and no
+                // caller ever checked availability). Net-new row: the SQLite era
+                // had no equivalent probe at all.
+                {"schedule_engine", schedule_engine_ && schedule_engine_->is_open()},
                 // gov R3 HC-1: FleetTopologyStore became load-bearing for
                 // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
                 // Pure in-memory store with no is_open(); pointer-not-null is

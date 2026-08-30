@@ -1,17 +1,30 @@
 #include "schedule_engine.hpp"
-#include "migration_runner.hpp"
+
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "schedule_params_parsers.hpp"
 #include "sensitive_instruction_params.hpp" // schedule_params_contain_sensitive_key (#3136 blocker)
 
+#include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <random>
 
 namespace yuzu::server {
 
 namespace {
+
+constexpr const char* kStoreName = "schedule_engine";
+
+// Bounded acquires (ADR-0012 §2). No hot-path caller here — every runtime
+// acquire uses the ordinary CRUD budget (matches PatchManager/DirectorySync).
+constexpr std::chrono::milliseconds kReadTimeout{1500};
+constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
 std::string generate_id() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
@@ -30,37 +43,44 @@ int64_t now_epoch() {
         .count();
 }
 
-std::string col_text(sqlite3_stmt* stmt, int col) {
-    auto p = sqlite3_column_text(stmt, col);
-    return p ? std::string(reinterpret_cast<const char*>(p)) : std::string{};
+const char* col(PGresult* res, int row, int c) {
+    return PQgetisnull(res, row, c) ? "" : PQgetvalue(res, row, c);
 }
+std::string col_str(PGresult* res, int row, int c) { return std::string(col(res, row, c)); }
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+bool to_bool(const char* s) { return s != nullptr && (s[0] == 't' || s[0] == 'T' || s[0] == '1'); }
 
-InstructionSchedule row_to_schedule(sqlite3_stmt* stmt) {
+InstructionSchedule row_to_schedule(PGresult* r, int i) {
     InstructionSchedule s;
-    s.id = col_text(stmt, 0);
-    s.name = col_text(stmt, 1);
-    s.definition_id = col_text(stmt, 2);
-    s.frequency_type = col_text(stmt, 3);
-    s.interval_minutes = sqlite3_column_int(stmt, 4);
-    s.time_of_day = col_text(stmt, 5);
-    s.day_of_week = sqlite3_column_int(stmt, 6);
-    s.day_of_month = sqlite3_column_int(stmt, 7);
-    s.scope_expression = col_text(stmt, 8);
-    s.requires_approval = sqlite3_column_int(stmt, 9) != 0;
-    s.enabled = sqlite3_column_int(stmt, 10) != 0;
-    s.next_execution_at = sqlite3_column_int64(stmt, 11);
-    s.last_executed_at = sqlite3_column_int64(stmt, 12);
-    s.execution_count = sqlite3_column_int(stmt, 13);
-    s.created_by = col_text(stmt, 14);
-    s.created_at = sqlite3_column_int64(stmt, 15);
-    s.parameter_values = col_text(stmt, 16);
+    s.id = col_str(r, i, 0);
+    s.name = col_str(r, i, 1);
+    s.definition_id = col_str(r, i, 2);
+    s.frequency_type = col_str(r, i, 3);
+    s.interval_minutes = static_cast<int>(to_i64(col(r, i, 4)));
+    s.time_of_day = col_str(r, i, 5);
+    s.day_of_week = static_cast<int>(to_i64(col(r, i, 6)));
+    s.day_of_month = static_cast<int>(to_i64(col(r, i, 7)));
+    s.scope_expression = col_str(r, i, 8);
+    s.requires_approval = to_bool(col(r, i, 9));
+    s.enabled = to_bool(col(r, i, 10));
+    s.next_execution_at = to_i64(col(r, i, 11));
+    s.last_executed_at = to_i64(col(r, i, 12));
+    s.execution_count = static_cast<int>(to_i64(col(r, i, 13)));
+    s.created_by = col_str(r, i, 14);
+    s.created_at = to_i64(col(r, i, 15));
+    s.parameter_values = col_str(r, i, 16);
     return s;
 }
 
-const char* kSelectAllCols = "id, name, definition_id, frequency_type, interval_minutes, "
-                             "time_of_day, day_of_week, day_of_month, scope_expression, "
-                             "requires_approval, enabled, next_execution_at, last_executed_at, "
-                             "execution_count, created_by, created_at, parameter_values";
+constexpr const char* kSelectAllCols =
+    "id, name, definition_id, frequency_type, interval_minutes, "
+    "time_of_day, day_of_week, day_of_month, scope_expression, "
+    "requires_approval, enabled, next_execution_at, last_executed_at, "
+    "execution_count, created_by, created_at, parameter_values";
 
 bool is_valid_frequency(const std::string& freq) {
     return freq == "once" || freq == "interval" || freq == "daily" || freq == "weekly" ||
@@ -89,51 +109,72 @@ int64_t compute_initial_next_execution(const std::string& frequency_type, int in
     return now;
 }
 
+const std::vector<pg::PgMigration>& migrations() {
+    // Unqualified DDL: the runner sets search_path to the store schema for
+    // the migration txn. Runtime statements below schema-qualify explicitly.
+    //
+    // Folds the SQLite-era v1+v2 ladder (v2 added parameter_values, PR1.5a)
+    // into a single v1 DDL — no separate migration step on a fresh Postgres
+    // schema (ADR-0009 fresh-start-by-default). Adds a partial index on
+    // (next_execution_at) that the SQLite era never had — evaluate_due()'s
+    // WHERE clause (enabled=1 AND next_execution_at>0 AND
+    // next_execution_at<=now) and its ORDER BY next_execution_at both match
+    // this index's predicate/column exactly.
+    static const std::vector<pg::PgMigration> kMigrations = {
+        {1,
+         "CREATE TABLE schedules ("
+         "  id                 TEXT    PRIMARY KEY,"
+         "  name               TEXT    NOT NULL,"
+         "  definition_id      TEXT    NOT NULL,"
+         "  frequency_type     TEXT    NOT NULL DEFAULT 'once',"
+         "  interval_minutes   INTEGER NOT NULL DEFAULT 60,"
+         "  time_of_day        TEXT    NOT NULL DEFAULT '00:00',"
+         "  day_of_week        INTEGER NOT NULL DEFAULT 0,"
+         "  day_of_month       INTEGER NOT NULL DEFAULT 1,"
+         "  scope_expression   TEXT    NOT NULL DEFAULT '',"
+         "  requires_approval  BOOLEAN NOT NULL DEFAULT FALSE,"
+         "  enabled            BOOLEAN NOT NULL DEFAULT TRUE,"
+         "  next_execution_at  BIGINT  NOT NULL DEFAULT 0,"
+         "  last_executed_at   BIGINT  NOT NULL DEFAULT 0,"
+         "  execution_count    INTEGER NOT NULL DEFAULT 0,"
+         "  created_by         TEXT    NOT NULL DEFAULT '',"
+         "  created_at         BIGINT  NOT NULL DEFAULT 0,"
+         "  parameter_values   TEXT    NOT NULL DEFAULT '{}'"
+         ");"
+         "CREATE INDEX idx_schedules_due ON schedules(next_execution_at) "
+         "  WHERE enabled AND next_execution_at > 0;"},
+    };
+    return kMigrations;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-ScheduleEngine::ScheduleEngine(sqlite3* db) : db_(db) {}
-
-void ScheduleEngine::create_tables() {
-    if (!db_)
+ScheduleEngine::ScheduleEngine(pg::PgPool& pool) : pool_(pool) {
+    // Construction-only unbounded acquire (ADR-0012 §2) — every runtime
+    // acquire elsewhere in this file is bounded.
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("ScheduleEngine: no database connection at construction ({}) — schedule "
+                      "engine disabled",
+                      pool_.last_error());
         return;
-
-    static const std::vector<Migration> kMigrations = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS schedules (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                definition_id TEXT NOT NULL,
-                frequency_type TEXT NOT NULL DEFAULT 'once',
-                interval_minutes INTEGER NOT NULL DEFAULT 60,
-                time_of_day TEXT NOT NULL DEFAULT '00:00',
-                day_of_week INTEGER NOT NULL DEFAULT 0,
-                day_of_month INTEGER NOT NULL DEFAULT 1,
-                scope_expression TEXT NOT NULL DEFAULT '',
-                requires_approval INTEGER NOT NULL DEFAULT 0,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                next_execution_at INTEGER NOT NULL DEFAULT 0,
-                last_executed_at INTEGER NOT NULL DEFAULT 0,
-                execution_count INTEGER NOT NULL DEFAULT 0,
-                created_by TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL DEFAULT 0
-            );
-        )"},
-        // PR1.5a: typed schedule parameters (schedule_params_parsers.hpp).
-        // ADD COLUMN with a DEFAULT back-fills every pre-existing row with
-        // the canonical "no parameters" object in place — no separate
-        // UPDATE pass, and no row is ever NULL here for row_to_schedule to
-        // mis-decode as an empty std::string that then fails validation.
-        {2, R"(
-            ALTER TABLE schedules ADD COLUMN parameter_values TEXT NOT NULL DEFAULT '{}';
-        )"},
-    };
-    if (!MigrationRunner::run(db_, "schedule_engine", kMigrations)) {
-        spdlog::error("ScheduleEngine: schema migration failed");
     }
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("ScheduleEngine: schema migration failed — schedule engine disabled");
+        return;
+    }
+    open_ = true;
+    // ADR-0009's 2026-08-25 fresh-start-by-default amendment: no
+    // migrate_from_sqlite here, unconditionally, no flag. The caller
+    // (server.cpp) separately runs legacy_sqlite_probe::warn_if_legacy_rows()
+    // over the legacy instructions.db so a locally-wrong "no production
+    // fleet" premise still gets a loud signal.
+    spdlog::info("ScheduleEngine initialized (schema {}) — fresh start, no legacy backfill",
+                 kStoreName);
 }
 
 void ScheduleEngine::stop() {
@@ -149,34 +190,37 @@ void ScheduleEngine::stop() {
 
 std::vector<InstructionSchedule> ScheduleEngine::query_schedules(const ScheduleQuery& q) const {
     std::vector<InstructionSchedule> results;
-    if (!db_)
+    if (!open_)
+        return results;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return results;
 
-    std::shared_lock lock(mtx_);
-
-    std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM schedules WHERE 1=1";
-    std::vector<std::string> binds;
+    std::string sql =
+        std::string("SELECT ") + kSelectAllCols + " FROM schedule_engine.schedules WHERE 1=1";
+    std::vector<std::string> params;
+    int idx = 1;
 
     if (!q.definition_id.empty()) {
-        sql += " AND definition_id = ?";
-        binds.push_back(q.definition_id);
+        sql += " AND definition_id = $" + std::to_string(idx++);
+        params.push_back(q.definition_id);
     }
     if (q.enabled_only) {
-        sql += " AND enabled = 1";
+        sql += " AND enabled = TRUE";
     }
     sql += " ORDER BY name ASC LIMIT 100";
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ScheduleEngine::query_schedules: query failed: {}",
+                      PQresultErrorMessage(res.get()));
         return results;
+    }
 
-    for (int i = 0; i < static_cast<int>(binds.size()); ++i)
-        sqlite3_bind_text(stmt, i + 1, binds[i].c_str(), -1, SQLITE_TRANSIENT);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW)
-        results.push_back(row_to_schedule(stmt));
-
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(row_to_schedule(res.get(), i));
     return results;
 }
 
@@ -186,7 +230,7 @@ std::vector<InstructionSchedule> ScheduleEngine::query_schedules(const ScheduleQ
 
 std::expected<std::string, std::string>
 ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (sched.name.empty())
         return std::unexpected("name is required");
@@ -227,51 +271,41 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
             "parameters contain a one-time credential (grant_secret/grant_id) that cannot be "
             "scheduled — mint a fresh grant and dispatch it directly instead");
 
-    std::unique_lock lock(mtx_);
-
     auto id = sched.id.empty() ? generate_id() : sched.id;
     auto now = now_epoch();
     auto next = sched.next_execution_at > 0
                     ? sched.next_execution_at
                     : compute_initial_next_execution(sched.frequency_type, sched.interval_minutes);
 
-    const char* sql = R"(
-        INSERT INTO schedules
-        (id, name, definition_id, frequency_type, interval_minutes,
-         time_of_day, day_of_week, day_of_month, scope_expression,
-         requires_approval, enabled, next_execution_at, last_executed_at,
-         execution_count, created_by, created_at, parameter_values)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    )";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "INSERT INTO schedule_engine.schedules "
+            "(id, name, definition_id, frequency_type, interval_minutes, "
+            " time_of_day, day_of_week, day_of_month, scope_expression, "
+            " requires_approval, enabled, next_execution_at, last_executed_at, "
+            " execution_count, created_by, created_at, parameter_values) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+            std::vector<std::string>{
+                id, sched.name, sched.definition_id, sched.frequency_type,
+                std::to_string(sched.interval_minutes), sched.time_of_day,
+                std::to_string(sched.day_of_week), std::to_string(sched.day_of_month),
+                sched.scope_expression, sched.requires_approval ? "true" : "false",
+                sched.enabled ? "true" : "false", std::to_string(next),
+                std::to_string(sched.last_executed_at), std::to_string(sched.execution_count),
+                sched.created_by, std::to_string(sched.created_at > 0 ? sched.created_at : now),
+                *canon_params});
+        if (res.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ScheduleEngine::create_schedule: insert failed: {}",
+                          PQresultErrorMessage(res.get()));
+            return false;
+        }
+        return true;
+    });
 
-    int i = 1;
-    sqlite3_bind_text(stmt, i++, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, i++, sched.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, i++, sched.definition_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, i++, sched.frequency_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, i++, sched.interval_minutes);
-    sqlite3_bind_text(stmt, i++, sched.time_of_day.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, i++, sched.day_of_week);
-    sqlite3_bind_int(stmt, i++, sched.day_of_month);
-    sqlite3_bind_text(stmt, i++, sched.scope_expression.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, i++, sched.requires_approval ? 1 : 0);
-    sqlite3_bind_int(stmt, i++, sched.enabled ? 1 : 0);
-    sqlite3_bind_int64(stmt, i++, next);
-    sqlite3_bind_int64(stmt, i++, sched.last_executed_at);
-    sqlite3_bind_int(stmt, i++, sched.execution_count);
-    sqlite3_bind_text(stmt, i++, sched.created_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, i++, sched.created_at > 0 ? sched.created_at : now);
-    sqlite3_bind_text(stmt, i++, canon_params->c_str(), -1, SQLITE_TRANSIENT);
+    if (!ok)
+        return std::unexpected("insert failed (pool degraded or transaction failed)");
 
-    if (sqlite3_step(stmt) != SQLITE_DONE) {
-        auto err = std::string(sqlite3_errmsg(db_));
-        sqlite3_finalize(stmt);
-        return std::unexpected("insert failed: " + err);
-    }
-    sqlite3_finalize(stmt);
     spdlog::info("ScheduleEngine: created schedule '{}' (id={}, freq={})", sched.name, id,
                  sched.frequency_type);
     return id;
@@ -282,28 +316,21 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
 // ---------------------------------------------------------------------------
 
 bool ScheduleEngine::delete_schedule(const std::string& id, const std::string& created_by) {
-    if (!db_)
+    if (!open_)
         return false;
-
-    std::unique_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
 
     // M-01/L-01 (#1806): owner-scoped RETURNING delete — created_by is
     // enforced at the SQL WHERE clause (the sole seam, matching
     // deployment_run_store's owner-scope pattern) instead of a separate
     // pre-check, so there is no TOCTOU window between "is this mine" and
-    // "delete it". RETURNING replaces the sqlite3_changes() anti-pattern
-    // (#1033) — the row count comes from the statement itself, not a second
-    // unsynchronized read of db_->nChange on this shared connection.
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, "DELETE FROM schedules WHERE id=? AND created_by=? RETURNING id",
-                          -1, &stmt, nullptr) != SQLITE_OK)
-        return false;
-
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, created_by.c_str(), -1, SQLITE_TRANSIENT);
-    bool deleted = sqlite3_step(stmt) == SQLITE_ROW;
-    sqlite3_finalize(stmt);
-    return deleted;
+    // "delete it".
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM schedule_engine.schedules WHERE id=$1 AND created_by=$2 RETURNING id",
+        std::vector<std::string>{id, created_by});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -312,25 +339,19 @@ bool ScheduleEngine::delete_schedule(const std::string& id, const std::string& c
 
 bool ScheduleEngine::set_enabled(const std::string& id, bool enabled,
                                  const std::string& created_by) {
-    if (!db_)
+    if (!open_)
         return false;
-
-    std::unique_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
 
     // M-01 (#1806): same owner-scoped RETURNING pattern as delete_schedule.
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                          "UPDATE schedules SET enabled=? WHERE id=? AND created_by=? "
-                          "RETURNING id",
-                          -1, &stmt, nullptr) != SQLITE_OK)
-        return false;
-
-    sqlite3_bind_int(stmt, 1, enabled ? 1 : 0);
-    sqlite3_bind_text(stmt, 2, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, created_by.c_str(), -1, SQLITE_TRANSIENT);
-    bool changed = sqlite3_step(stmt) == SQLITE_ROW;
-    sqlite3_finalize(stmt);
-    return changed;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE schedule_engine.schedules SET enabled=$1 WHERE id=$2 AND created_by=$3 "
+        "RETURNING id",
+        std::vector<std::string>{enabled ? "true" : "false", id, created_by});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,29 +360,32 @@ bool ScheduleEngine::set_enabled(const std::string& id, bool enabled,
 
 std::vector<InstructionSchedule> ScheduleEngine::evaluate_due() const {
     std::vector<InstructionSchedule> results;
-    if (!db_)
+    if (!open_)
         return results;
-
-    std::shared_lock lock(mtx_);
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return results;
 
     auto now = now_epoch();
 
     std::string sql = std::string("SELECT ") + kSelectAllCols +
-                      " FROM schedules WHERE enabled = 1"
+                      " FROM schedule_engine.schedules WHERE enabled = TRUE"
                       " AND next_execution_at > 0"
-                      " AND next_execution_at <= ?"
+                      " AND next_execution_at <= $1"
                       " ORDER BY next_execution_at ASC";
 
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(now)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ScheduleEngine::evaluate_due: query failed: {}",
+                      PQresultErrorMessage(res.get()));
         return results;
+    }
 
-    sqlite3_bind_int64(stmt, 1, now);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW)
-        results.push_back(row_to_schedule(stmt));
-
-    sqlite3_finalize(stmt);
+    const int rows = PQntuples(res.get());
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(row_to_schedule(res.get(), i));
     return results;
 }
 
@@ -370,77 +394,57 @@ std::vector<InstructionSchedule> ScheduleEngine::evaluate_due() const {
 // ---------------------------------------------------------------------------
 
 void ScheduleEngine::advance_schedule(const std::string& id) {
-    if (!db_)
+    if (!open_)
         return;
 
-    // M-03 (#1806): the SELECT-then-UPDATE below is a read-modify-write
-    // spanning two prepared statements — the actual race FULLMUTEX does not
-    // cover (it only serializes each individual sqlite3 call, not the pair).
-    // One unique_lock for the whole sequence so a concurrent
-    // create/delete/set_enabled/query on another thread cannot interleave
-    // between the read and the write.
-    std::unique_lock lock(mtx_);
+    // Collapses the SQLite-era locked SELECT-then-C++-arithmetic-then-UPDATE
+    // (a read-modify-write spanning two statements — the actual race the
+    // app-level shared_mutex existed to cover, since SQLITE_OPEN_FULLMUTEX
+    // only serialized each individual call, not the pair) into ONE atomic
+    // statement. The frequency arithmetic moves into a SQL CASE so the whole
+    // read-compute-write happens inside a single round trip under
+    // Postgres's own row-level locking — no app-level lock needed.
+    auto now = std::to_string(now_epoch());
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "UPDATE schedule_engine.schedules SET "
+            "  next_execution_at = CASE frequency_type "
+            "    WHEN 'once' THEN 0 "
+            "    WHEN 'interval' THEN $1::bigint + GREATEST(interval_minutes, 1) * 60 "
+            "    WHEN 'daily' THEN $1::bigint + 86400 "
+            "    WHEN 'weekly' THEN $1::bigint + 604800 "
+            "    WHEN 'monthly' THEN $1::bigint + 2592000 "
+            "    ELSE next_execution_at "
+            "  END, "
+            "  last_executed_at = $1::bigint, "
+            "  execution_count = execution_count + 1 "
+            "WHERE id = $2 "
+            "RETURNING next_execution_at, frequency_type",
+            std::vector<std::string>{now, id});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ScheduleEngine::advance_schedule: update failed for id={}: {}", id,
+                          PQresultErrorMessage(res.get()));
+            return false;
+        }
+        // Zero rows affected = today's silent no-op shape (id does not
+        // exist) — not a failure.
+        if (PQntuples(res.get()) > 0) {
+            spdlog::debug("ScheduleEngine: advanced schedule id={} (freq={}, next_at={})", id,
+                          col_str(res.get(), 0, 1), col_str(res.get(), 0, 0));
+        }
+        return true;
+    });
 
-    // Read current schedule state
-    std::string select_sql =
-        std::string("SELECT ") + kSelectAllCols + " FROM schedules WHERE id = ?";
-    sqlite3_stmt* sel = nullptr;
-    if (sqlite3_prepare_v2(db_, select_sql.c_str(), -1, &sel, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_text(sel, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(sel) != SQLITE_ROW) {
-        sqlite3_finalize(sel);
-        return;
+    // L-02 (#1806) parity: a discarded failure left a failed advance silent
+    // — the schedule would stay at its old next_execution_at and re-fire on
+    // every subsequent poller tick instead of just this one. with_txn_for
+    // itself logs nothing on a lease/BEGIN failure, so log here too.
+    if (!ok) {
+        spdlog::error("ScheduleEngine::advance_schedule: failed for id={} (pool degraded or "
+                      "transaction failed)",
+                      id);
     }
-
-    auto sched = row_to_schedule(sel);
-    sqlite3_finalize(sel);
-
-    auto now = now_epoch();
-    int64_t next = 0;
-
-    if (sched.frequency_type == "once") {
-        next = 0; // disable after single execution
-    } else if (sched.frequency_type == "interval") {
-        // Clamp legacy rows that predate the create-time floor: 0/negative
-        // would land next_execution_at <= now and re-fire every poller tick.
-        next = now + static_cast<int64_t>(std::max(sched.interval_minutes, 1)) * 60;
-    } else if (sched.frequency_type == "daily") {
-        next = now + 86400;
-    } else if (sched.frequency_type == "weekly") {
-        next = now + 7 * 86400;
-    } else if (sched.frequency_type == "monthly") {
-        next = now + 30 * 86400; // approximate
-    }
-
-    const char* update_sql = R"(
-        UPDATE schedules
-        SET next_execution_at = ?,
-            last_executed_at = ?,
-            execution_count = execution_count + 1
-        WHERE id = ?
-    )";
-    sqlite3_stmt* upd = nullptr;
-    if (sqlite3_prepare_v2(db_, update_sql, -1, &upd, nullptr) != SQLITE_OK)
-        return;
-
-    sqlite3_bind_int64(upd, 1, next);
-    sqlite3_bind_int64(upd, 2, now);
-    sqlite3_bind_text(upd, 3, id.c_str(), -1, SQLITE_TRANSIENT);
-    // L-02 (#1806): a discarded non-SQLITE_DONE step left a failed advance
-    // silent — the schedule would stay at its old next_execution_at and
-    // re-fire on every subsequent poller tick instead of just this one.
-    if (sqlite3_step(upd) != SQLITE_DONE) {
-        spdlog::error("ScheduleEngine: advance_schedule failed for id={}: {}", id,
-                      sqlite3_errmsg(db_));
-        sqlite3_finalize(upd);
-        return;
-    }
-    sqlite3_finalize(upd);
-
-    spdlog::debug("ScheduleEngine: advanced schedule id={} (freq={}, next_at={})", id,
-                  sched.frequency_type, next);
 }
 
 } // namespace yuzu::server

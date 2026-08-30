@@ -52,6 +52,7 @@
 #include "instruction_store.hpp"
 #include "mcp_server_testonly.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
 #include "schedule_arming_check.hpp"
 #include "schedule_engine.hpp"
@@ -60,6 +61,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <sqlite3.h>
 
 #include <algorithm>
@@ -103,12 +105,20 @@ yuzu::test::PgTestTemplate twins_rbac_tpl{"optwinsrbac", [](const std::string& d
     if (!store.is_open())
         throw std::runtime_error("optwins rbac template: store failed to migrate");
 }};
-// InstructionStore is now a migrated Postgres store (ADR-0058).
+// InstructionStore is now a migrated Postgres store (ADR-0058). ADR-0065
+// migration-programme PR 5 commit 1/3 adds ScheduleEngine to this same
+// template/database (ADR-0008 schema-per-store-on-one-connection) — this
+// key has exactly one caller in the whole test tree (this file), so growing
+// its setup function across PR 5's three commits is safe under the
+// PgTestTemplate replay-fingerprint rule.
 yuzu::test::PgTestTemplate twins_instr_tpl{"optwinsinstr", [](const std::string& dsn) {
     yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
     InstructionStore store{pool};
     if (!store.is_open())
         throw std::runtime_error("optwins instruction template: store failed to migrate");
+    ScheduleEngine engine{pool};
+    if (!engine.is_open())
+        throw std::runtime_error("optwins schedule engine template: store failed to migrate");
 }};
 } // namespace
 
@@ -241,7 +251,10 @@ struct Harness {
     TestDb db;
     yuzu::server::pg::PgPool& instr_pool;
 
-    ScheduleEngine engine{db.db};
+    // ADR-0065 (migration-programme PR 5, 1/3): ScheduleEngine now built on
+    // instr_pool (same ephemeral Postgres database as InstructionStore
+    // below, schema-per-store) instead of the shared SQLite `db` handle.
+    ScheduleEngine engine{instr_pool};
     ExecutionTracker tracker{db.db};
     ApprovalManager approvals{db.db};
     InstructionStore is;
@@ -285,7 +298,6 @@ struct Harness {
                       return compose_arming_check(registry, &rbac, principal, plugin, action);
                   },
           }) {
-        engine.create_tables();
         tracker.create_tables();
         approvals.create_tables();
         rbac.set_rbac_enabled(true);
@@ -318,10 +330,18 @@ struct Harness {
         return *id;
     }
 
+    // ScheduleEngine now lives in Postgres (instr_pool) — poke it via a
+    // pool lease (mirrors test_schedule_runner.cpp's identical helper,
+    // which has direct access to the DSN and uses a second raw connection
+    // instead; this Harness only receives the pool, not the DSN, so a
+    // lease is the available seam).
     void force_due(const std::string& id) {
-        char* err = nullptr;
-        auto sql = "UPDATE schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
-        REQUIRE(sqlite3_exec(db.db, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK);
+        auto lease = instr_pool.acquire();
+        REQUIRE(lease);
+        auto sql =
+            "UPDATE schedule_engine.schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
+        yuzu::server::pg::PgResult res{PQexec(lease.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 };
 

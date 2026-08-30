@@ -2,10 +2,12 @@
  * test_schedule_runner.cpp — Unit tests for the recurring-schedule poller
  * (ScheduleRunner, #1191).
  *
- * Strategy: real ScheduleEngine / ExecutionTracker / ApprovalManager on one
- * shared :memory: SQLite handle (the production shape — they share
- * instructions.db), a real InstructionStore on a temp DB, and a FAKE
- * dispatch_fn that records calls and returns a configurable reach count.
+ * Strategy: real ScheduleEngine (Postgres, ADR-0065 migration-programme PR 5
+ * commit 1/3) + real ExecutionTracker/ApprovalManager on one shared :memory:
+ * SQLite handle (still the production shape for those two — they share
+ * instructions.db until PR 5's later commits move them too), a real
+ * InstructionStore on a temp DB, and a FAKE dispatch_fn that records calls
+ * and returns a configurable reach count.
  * Due-ness is driven by creating schedules with next_execution_at in the
  * past (create_schedule honors an explicit value), so no clock injection is
  * needed.
@@ -21,10 +23,12 @@
 
 #include "../test_helpers.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <sqlite3.h>
 
 #include <chrono>
@@ -55,13 +59,23 @@ struct DispatchCall {
     std::unordered_map<std::string, std::string> params;
 };
 
-// InstructionStore is now a migrated Postgres store (ADR-0058).
+// InstructionStore is now a migrated Postgres store (ADR-0058). ADR-0065
+// migration-programme PR 5 commit 1/3 adds ScheduleEngine to this same
+// template/database (ADR-0008 schema-per-store-on-one-connection) — this
+// key has exactly one caller in the whole test tree (this file), so growing
+// its setup function across PR 5's three commits is safe under the
+// PgTestTemplate replay-fingerprint rule (no other TU shares this key, so
+// there's no divergent setup to conflict with). Commit 2/3 will extend this
+// further to also cover ApprovalManager/ExecutionTracker.
 yuzu::test::PgTestTemplate schedrunner_instr_tpl{
     "schedrunnerinstr", [](const std::string& dsn) {
         yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
         InstructionStore store{pool};
         if (!store.is_open())
             throw std::runtime_error("schedrunner instruction template: store failed to migrate");
+        ScheduleEngine engine{pool};
+        if (!engine.is_open())
+            throw std::runtime_error("schedrunner schedule engine template: store failed to migrate");
     }};
 
 // A trivial first-declared Harness member whose sole purpose is running the
@@ -87,9 +101,13 @@ struct Harness {
     yuzu::test::PostgresTestDb instr_db{schedrunner_instr_tpl};
     yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
 
-    TestDb db; // shared by engine + tracker + approvals (production shape)
+    TestDb db; // shared by tracker + approvals (production shape; SQLite until
+               // PR 5 commits 2/3 move them too)
 
-    ScheduleEngine engine{db.db};
+    // ADR-0065 (migration-programme PR 5, 1/3): ScheduleEngine now built on
+    // instr_pool (same ephemeral Postgres database as InstructionStore
+    // below, schema-per-store) instead of the shared SQLite `db` handle.
+    ScheduleEngine engine{instr_pool};
     ExecutionTracker tracker{db.db};
     ApprovalManager approvals{db.db};
     InstructionStore is{instr_pool};
@@ -142,7 +160,6 @@ struct Harness {
         INFO("[schedrunner instr] fixture status (blank == database came up OK): "
              << instr_db.error());
         REQUIRE(instr_db.available());
-        engine.create_tables();
         tracker.create_tables();
         approvals.create_tables();
 
@@ -192,16 +209,21 @@ struct Harness {
     }
 
     // Force an already-advanced schedule due again (a "next occurrence").
+    // ScheduleEngine now lives in Postgres (instr_pool) — poke it via a
+    // second raw connection, same as the interval-floor test below.
     void force_due(const std::string& id) {
-        char* err = nullptr;
-        auto sql = "UPDATE schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
-        REQUIRE(sqlite3_exec(db.db, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK);
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql =
+            "UPDATE schedule_engine.schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 };
 
 } // namespace
 
-TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[schedule][runner]") {
+TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[schedule][runner][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval");
 
@@ -246,7 +268,7 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
 }
 
 TEST_CASE("ScheduleRunner: 'once' schedule fires exactly once then disables",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "once");
 
@@ -258,7 +280,7 @@ TEST_CASE("ScheduleRunner: 'once' schedule fires exactly once then disables",
 }
 
 TEST_CASE("ScheduleRunner: unknown definition skips the occurrence but advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     auto id = h.make_due("no.such.def", "interval");
 
@@ -271,7 +293,7 @@ TEST_CASE("ScheduleRunner: unknown definition skips the occurrence but advances"
 
 TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOUT advancing "
           "(retries next tick)",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     // Regression pin (gov Gate 3/6 sibling finding): a genuine InstructionStore DB error used
     // to advance_schedule() unconditionally, permanently consuming that occurrence on a
     // transient Postgres blip — the same class of bug PolicyEvaluator::dispatch_due's
@@ -294,7 +316,7 @@ TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOU
 }
 
 TEST_CASE("ScheduleRunner: disabled definition skips the occurrence but advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     InstructionDefinition d;
     d.id = "test.off";
@@ -314,7 +336,7 @@ TEST_CASE("ScheduleRunner: disabled definition skips the occurrence but advances
 }
 
 TEST_CASE("ScheduleRunner: zero agents reached cancels the execution and advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     h.reach = 0;
     auto id = h.make_due("test.def", "interval");
@@ -329,7 +351,7 @@ TEST_CASE("ScheduleRunner: zero agents reached cancels the execution and advance
 }
 
 TEST_CASE("ScheduleRunner: dispatch throw cancels the execution and advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     h.throw_on_dispatch = true;
     auto id = h.make_due("test.def", "interval");
@@ -345,7 +367,7 @@ TEST_CASE("ScheduleRunner: dispatch throw cancels the execution and advances",
 }
 
 TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the occurrence",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -365,7 +387,7 @@ TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the oc
 }
 
 TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactly once",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -390,7 +412,7 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 }
 
 TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks next time",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -412,7 +434,7 @@ TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks
 }
 
 TEST_CASE("ScheduleRunner: definition approval_mode gates even without the schedule flag",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     h.make_due("test.gated", "interval", /*requires_approval=*/false);
 
@@ -425,7 +447,7 @@ TEST_CASE("ScheduleRunner: definition approval_mode gates even without the sched
 
 TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get independent "
           "approval tickets — one approval fires only its own schedule (M-02, #1806)",
-          "[schedule][runner][approval][m02]") {
+          "[schedule][runner][approval][m02][pg]") {
     Harness h;
     // Both due, both reference the same gated definition, both default to
     // the same scope_expression ("") and created_by ("admin") — exactly the
@@ -471,7 +493,7 @@ TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get 
 }
 
 TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy advance",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
 
     // Create-time floor.
@@ -484,11 +506,17 @@ TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy 
     REQUIRE_FALSE(rejected.has_value());
 
     // Legacy row (predates the floor): clamp on advance so it cannot land
-    // next_execution_at <= now and re-fire every tick.
+    // next_execution_at <= now and re-fire every tick. ScheduleEngine now
+    // lives in Postgres (instr_pool) — poke it via a second raw connection.
     auto id = h.make_due("test.def", "interval");
-    char* err = nullptr;
-    auto sql = "UPDATE schedules SET interval_minutes = 0 WHERE id = '" + id + "'";
-    REQUIRE(sqlite3_exec(h.db.db, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql = "UPDATE schedule_engine.schedules SET interval_minutes = 0 WHERE id = '" +
+                  id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
 
     h.runner.tick();
 
@@ -504,7 +532,7 @@ TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy 
 
 TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the dispatch fn and "
           "exec.parameter_values",
-          "[schedule][runner][params]") {
+          "[schedule][runner][params][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/false,
                          R"({"target":"prod","retries":3})");
@@ -527,7 +555,7 @@ TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the dispatch fn
 
 TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the canonical "
           "empty object and dispatches an empty parameter map",
-          "[schedule][runner][params]") {
+          "[schedule][runner][params][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval");
 
@@ -542,7 +570,7 @@ TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the
 // ── D7 (PLAN-003): arming re-check on EVERY fire path ───────────────────────
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval) fire path",
-          "[schedule][runner][d7]") {
+          "[schedule][runner][d7][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
     auto id = h.make_due("test.def", "interval");
 
@@ -553,7 +581,7 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval)
 }
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
-          "[schedule][runner][d7][approval]") {
+          "[schedule][runner][d7][approval][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -569,7 +597,7 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fir
 
 TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and approval-gated "
           "paths",
-          "[schedule][runner][d7]") {
+          "[schedule][runner][d7][pg]") {
     Harness h(ScheduleRunner::ArmingCheckFn{}); // deliberately empty — p14 not wired
     auto auto_id = h.make_due("test.def", "interval");
     auto gated_id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -584,7 +612,7 @@ TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and app
 
 TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved-ticket paths "
           "fire (existing approval behaviour unchanged)",
-          "[schedule][runner][d7][approval]") {
+          "[schedule][runner][d7][approval][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return true; });
 
     auto auto_id = h.make_due("test.def", "interval");
