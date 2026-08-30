@@ -357,30 +357,6 @@ void wf_update_attempt(PGconn* conn, const std::string& execution_id, int step_i
                     step_index, PQresultErrorMessage(res.get()));
 }
 
-/// Parameterized (not string-concatenated — governance finding on the pre-migration code's
-/// ints-into-SQL-text shape).
-void wf_update_execution_status(PGconn* conn, const std::string& id, const std::string& status,
-                                 int current_step = -1) {
-    std::string sql = "UPDATE workflow_engine.workflow_executions SET status = $1";
-    std::vector<std::string> params{status};
-    int idx = 2;
-    if (status == "completed" || status == "failed" || status == "cancelled") {
-        sql += ", completed_at = $" + std::to_string(idx++) + "::bigint";
-        params.push_back(std::to_string(now_epoch()));
-    }
-    if (current_step >= 0) {
-        sql += ", current_step = $" + std::to_string(idx++) + "::int";
-        params.push_back(std::to_string(current_step));
-    }
-    sql += " WHERE id = $" + std::to_string(idx);
-    params.push_back(id);
-
-    pg::PgResult res = pg::exec_params(conn, sql.c_str(), params);
-    if (res.status() != PGRES_COMMAND_OK)
-        spdlog::warn("WorkflowEngine: update_execution_status failed for {}: {}", id,
-                    PQresultErrorMessage(res.get()));
-}
-
 } // namespace
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -785,9 +761,22 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
             }
         }
 
-        // Update current step
+        // Update current step — `WHERE status = 'running'` guards this write the same way
+        // finalize's is guarded (governance finding, security-guardian + docs-writer,
+        // independently): without it, a concurrent cancel_execution() landing between the
+        // cancellation check above and this write could flip status back to 'running', making
+        // the loop (and finalize afterwards) forget the cancellation ever happened. Currently
+        // unreachable in production (cancel_execution has no caller), closed as the same
+        // defense-in-depth as the finalize fix.
         with_write_lease([&](PGconn* c) {
-            wf_update_execution_status(c, exec_id, "running", step.index);
+            pg::PgResult res = pg::exec_params(
+                c,
+                "UPDATE workflow_engine.workflow_executions SET status = 'running', "
+                "current_step = $1::int WHERE id = $2 AND status = 'running'",
+                std::vector<std::string>{std::to_string(step.index), exec_id});
+            if (res.status() != PGRES_COMMAND_OK)
+                spdlog::warn("WorkflowEngine: current-step update failed for {}: {}", exec_id,
+                            PQresultErrorMessage(res.get()));
         });
 
         // Evaluate condition if present
@@ -931,25 +920,48 @@ std::expected<std::string, std::string> WorkflowEngine::execute(
     // UPDATE already enforces from the other direction. Currently unreachable in production
     // (cancel_execution has no REST/MCP caller today), but this closes the gap correctly ahead
     // of that route being wired.
+    // `finalize_status` is what we PROVE landed in the database — never assumed from the
+    // in-process `execution_failed` bool alone (governance finding, sre + cpp-expert +
+    // happy-path, independently convergent): a lease-acquire timeout drops the write entirely
+    // (logged, no exception), and the WHERE-guard can legitimately match zero rows if a
+    // concurrent cancel_execution() already moved the row to 'cancelled'. Reporting "success" in
+    // either case — as an unconditional metric/log keyed only on `execution_failed` would —
+    // would claim a write that didn't happen, or misreport a cancellation as a step failure.
+    std::optional<std::string> finalize_status;
     with_write_lease([&](PGconn* c) {
         pg::PgResult res = pg::exec_params(
             c,
             "UPDATE workflow_engine.workflow_executions SET status = $1, completed_at = $2::bigint "
-            "WHERE id = $3 AND status = 'running'",
+            "WHERE id = $3 AND status = 'running' RETURNING status",
             std::vector<std::string>{execution_failed ? "failed" : "completed",
                                      std::to_string(now_epoch()), exec_id});
-        if (res.status() != PGRES_COMMAND_OK)
+        if (res.status() != PGRES_TUPLES_OK) {
             spdlog::warn("WorkflowEngine: finalize status update failed for {}: {}", exec_id,
                         PQresultErrorMessage(res.get()));
+            return;
+        }
+        if (PQntuples(res.get()) > 0)
+            finalize_status = col_str(res.get(), 0, 0); // "failed" or "completed" — confirmed written
     });
+
+    // Determine the real outcome for metrics/logging. If our own write landed, trust it. If not
+    // (lease timeout, or the guard matched zero rows), read back what's actually there rather
+    // than guessing — a concurrent cancel_execution() is the only thing that can move status off
+    // 'running' before finalize, so "cancelled" gets its own bucket; anything else stays "failed"
+    // so an unexpected value can never leak into a metric label.
+    std::string outcome = finalize_status.value_or("");
+    if (outcome.empty()) {
+        auto exec_check = get_execution(exec_id);
+        outcome = (exec_check && *exec_check && (*exec_check)->status == "cancelled")
+            ? "cancelled" : "failed";
+    }
 
     if (metrics_)
         metrics_->counter("yuzu_server_workflow_engine_writes_total",
                           {{"op", "execute"},
-                           {"result", execution_failed ? "failed" : "success"}})
+                           {"result", outcome == "completed" ? "success" : "failed"}})
             .increment();
-    spdlog::info("WorkflowEngine: execution {} {}", exec_id,
-                 execution_failed ? "failed" : "completed");
+    spdlog::info("WorkflowEngine: execution {} {}", exec_id, outcome);
     return exec_id;
 }
 

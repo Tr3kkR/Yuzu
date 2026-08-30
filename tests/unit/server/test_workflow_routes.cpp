@@ -2224,6 +2224,52 @@ TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible der
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// GET /api/workflows?limit= — reject non-positive limit rather than silently
+// clamping to 1 row (WorkflowQuery's std::max(limit, 1) floor would otherwise
+// turn `limit=0` into "1 row", a behavior delta from the pre-migration SQLite
+// `LIMIT 0` semantics of "0 rows").
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GET /api/workflows rejects limit=0 with 400", "[pg][workflow][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-lim0", "lim0");
+    h.make_workflow("wf-lim0", "def-lim0");
+
+    auto res = h.sink.Get("/api/workflows?limit=0");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 400);
+}
+
+TEST_CASE("GET /api/workflows rejects a negative limit with 400", "[pg][workflow][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+
+    auto res = h.sink.Get("/api/workflows?limit=-1");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
+
+TEST_CASE("GET /api/workflows accepts a positive limit", "[pg][workflow][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-lim1", "lim1");
+    h.make_workflow("wf-lim1", "def-lim1");
+
+    auto res = h.sink.Get("/api/workflows?limit=5");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ADR-0064 — ProductPackStore install/uninstall fan-out into WorkflowEngine,
 // exercised through the REAL production install_fn/uninstall_fn (workflow_routes.cpp),
 // not a hand-rolled stub. No prior test anywhere covered the Workflow arm of either
@@ -2235,7 +2281,8 @@ TEST_CASE("ADR-0064: POST/DELETE /api/product-packs installs and uninstalls a Wo
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
-                  /*with_workflow_engine=*/true, /*with_product_pack_store=*/true);
+                  /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/true);
 
     const std::string bundle = "apiVersion: yuzu.io/v1alpha1\n"
                                "kind: ProductPack\n"
@@ -2284,7 +2331,8 @@ TEST_CASE("ADR-0064: uninstalling a pack whose Workflow item was already deleted
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
-                  /*with_workflow_engine=*/true, /*with_product_pack_store=*/true);
+                  /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/true);
 
     const std::string bundle = "apiVersion: yuzu.io/v1alpha1\n"
                                "kind: ProductPack\n"
@@ -2331,7 +2379,8 @@ TEST_CASE("ADR-0064: a genuine WorkflowEngine DB failure during pack install 503
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
-                  /*with_workflow_engine=*/true, /*with_product_pack_store=*/true);
+                  /*with_workflow_engine=*/true, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/true);
 
     PgConn conn{PQconnectdb(db.dsn().c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

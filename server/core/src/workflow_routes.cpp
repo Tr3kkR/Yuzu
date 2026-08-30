@@ -1233,6 +1233,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 "application/json");
             return;
         }
+        if (q.limit <= 0) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"limit must be a positive integer"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
 
         auto workflows_result = workflow_engine->list_workflows(q);
         if (!workflows_result) {
