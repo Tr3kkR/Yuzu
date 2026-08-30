@@ -336,6 +336,19 @@ tests-build-server-linux_x64/yuzu_server_tests "[pg]"
 
 ## Verified reference run
 
+**Re-verified 2026-08-30 at this branch's head (`85fac0969`)** in a Rocky 9.8 KVM guest (12 vCPU /
+23 GB) with SELinux **enforcing** and real systemd - the `postgresql-setup --initdb` + `systemctl`
+path ran genuinely, not shimmed. The recipe (`--with-postgres --manifest`) completed with zero
+failed steps, `--check --with-postgres` passed all 22 checks, and the full
+`setup.sh --tests` -> `meson compile` -> `meson test` sequence gave 35 OK / 2 skipped / 2 failed -
+the same two pre-existing failures as the original run below (the SQLite `RETURNING` telemetry
+limitation, and the known Linux-only MCP case, #2610 family). All 11 `[pg]` shards passed against
+the recipe-provisioned cluster. `docs/rhel9-toolchain-manifest.json` now records this run; the
+original bare-metal record remains in that file's git history. Still unexercised: the RHEL
+`subscription-manager` and EPEL-on-RHEL branches, and arm64.
+
+### Original reference run (2026-08-15)
+
 Rocky Linux 9.8, 16 cores / 23 GB RAM, `dev` at `c01493d3`, 2026-08-15. The same recipe was also run
 end-to-end on `main` at `88f9397d` (the 0.13.0 cut, meson 1.11.1) with the same outcome. Full
 provenance — every package version with the repo it came from — is in
