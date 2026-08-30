@@ -13,10 +13,13 @@
  */
 
 #include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp> // Config (for the /logout route-sink harness)
 
+#include "auth_routes.hpp"    // AuthRoutes — the /logout route under test (#3716)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "session_store.hpp"
+#include "test_route_sink.hpp" // in-process HttpRouteSink (no socket — TSan-safe, #438)
 
 #include "../test_helpers.hpp"
 
@@ -24,8 +27,13 @@
 
 #include <filesystem>
 #include <memory>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
+using yuzu::server::AuthRoutes;
+using yuzu::server::Config;
 using yuzu::server::SessionStore;
 using yuzu::server::auth::AuthManager;
 using yuzu::server::auth::effective_role;
@@ -62,6 +70,49 @@ std::unique_ptr<AuthManager> make_mgr_with_config(SessionStore& store) {
     mgr->load_config(cfg);
     mgr->set_session_store(&store);
     return mgr;
+}
+
+// A minimal AuthRoutes wired against a store-backed AuthManager and an
+// in-process TestRouteSink, for the /logout route-sink test (#3716). Only the
+// session store is real (so a fault-inject can force invalidate_session to
+// fail); every other store is null — audit_log and emit_event both null-guard
+// their store, and /logout dereferences nothing else. Member order is
+// load-bearing: `routes` is declared BEFORE `sink` so the handlers the sink
+// captures (which hold `routes`' `this`) outlive the sink on teardown
+// (test_route_sink.hpp invariant #1).
+struct LogoutHarness {
+    Config cfg{};
+    std::unique_ptr<AuthManager> mgr;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<yuzu::server::oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<AuthRoutes> routes;
+    yuzu::server::test::TestRouteSink sink;
+
+    explicit LogoutHarness(SessionStore& store) : mgr(make_mgr(store)) {
+        cfg.https_enabled = false; // no `Secure` cookie suffix to reason about
+        routes = std::make_unique<AuthRoutes>(cfg, *mgr, /*rbac=*/nullptr,
+                                              /*api_token=*/nullptr, /*audit=*/nullptr,
+                                              /*mgmt_group=*/nullptr, /*tag=*/nullptr,
+                                              /*analytics=*/nullptr, oidc_mu, oidc_provider);
+        routes->register_routes(sink);
+    }
+};
+
+// A Cookie header carrying the session token; add HX-Request for the HTMX arm.
+std::unordered_map<std::string, std::string> cookie_hdrs(const std::string& token, bool htmx) {
+    std::unordered_map<std::string, std::string> h{{"Cookie", "yuzu_session=" + token}};
+    if (htmx)
+        h["HX-Request"] = "true";
+    return h;
+}
+
+// Fault-inject: drop the durable schema so the next store op (DELETE / find /
+// read_generation) fails — the standing pattern in this file's revoke tests.
+void drop_session_schema(PgPool& pool) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    yuzu::server::pg::exec_params(lease.get(), "DROP SCHEMA session_store CASCADE",
+                                  std::vector<std::string>{});
 }
 
 } // namespace
@@ -277,4 +328,132 @@ TEST_CASE("AuthManager+SessionStore: a failed single-session invalidate reports 
                                       std::vector<std::string>{});
     }
     CHECK_FALSE(a->invalidate_session(token)); // db_persisted=false — logout must fail closed
+}
+
+// ── #3716 deferred coverage ───────────────────────────────────────────────────
+
+TEST_CASE("AuthRoutes /logout: success clears the cookie; a durable-delete failure fails CLOSED "
+          "on BOTH HTMX and non-HTMX (#3716)",
+          "[auth][session_store][pg][logout]") {
+    // The route wrapper for the invalidate_session()==false fail-closed fix
+    // (adversarial-round #2, C2): on a durable-delete failure /logout must keep
+    // the cookie (still signed in), NOT emit an HX-Redirect, and return 503 on
+    // BOTH surfaces — never a clean 200 that clears the cookie over a session
+    // that still rehydrates on another replica. test_auth_session_store's
+    // db_persisted=false case covers the AuthManager return; this covers the
+    // HTTP handler that consumes it.
+    //
+    // Content-type is irrelevant here (the handler reads the Cookie + HX-Request
+    // headers, not a form body), so the #1786 urlencoded-vs-json trap does not
+    // arise; the branch is selected by the HX-Request header alone.
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    LogoutHarness h{store};
+
+    SECTION("success — HTMX: cookie cleared + HX-Redirect to /login") {
+        auto tok = h.mgr->create_local_session("htmx-ok", Role::user, /*mfa=*/false);
+        auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, true));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->get_header_value("HX-Redirect") == "/login");
+        CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
+        CHECK_FALSE(h.mgr->validate_session(tok).has_value()); // durable row gone
+    }
+
+    SECTION("success — non-HTMX: cookie cleared + {\"status\":\"ok\"}") {
+        auto tok = h.mgr->create_local_session("json-ok", Role::user, /*mfa=*/false);
+        auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, false));
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body.find("\"status\":\"ok\"") != std::string::npos);
+        CHECK(res->get_header_value("Set-Cookie").find("Max-Age=0") != std::string::npos);
+        CHECK_FALSE(h.mgr->validate_session(tok).has_value());
+    }
+
+    SECTION("durable-delete failure — HTMX fails CLOSED (503, cookie kept, no redirect)") {
+        auto tok = h.mgr->create_local_session("htmx-degrade", Role::user, /*mfa=*/false);
+        REQUIRE(h.mgr->validate_session(tok).has_value());
+        drop_session_schema(pool); // the DELETE inside invalidate_session now fails
+        auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, true));
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("HX-Redirect").empty());  // no false clean-logout redirect
+        CHECK(res->get_header_value("Set-Cookie").empty());   // cookie KEPT — still signed in
+        CHECK(res->body.find("still signed in") != std::string::npos);
+    }
+
+    SECTION("durable-delete failure — non-HTMX fails CLOSED (503, cookie kept, partial)") {
+        auto tok = h.mgr->create_local_session("json-degrade", Role::user, /*mfa=*/false);
+        REQUIRE(h.mgr->validate_session(tok).has_value());
+        drop_session_schema(pool);
+        auto res = h.sink.dispatch("POST", "/logout", "", "application/json", cookie_hdrs(tok, false));
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Set-Cookie").empty()); // cookie KEPT
+        CHECK(res->body.find("\"status\":\"partial\"") != std::string::npos);
+    }
+}
+
+TEST_CASE("AuthManager+SessionStore: the validate cache is trusted only after the generation view "
+          "is confirmed — unconfirmed fails CLOSED; confirmed rides a brownout (#3716)",
+          "[auth][session_store][pg]") {
+    // The generation-gated validate cache (mirrors rbac_store). Two halves of
+    // the stale-serve trust gate, both deterministic without a wall-clock sleep:
+    //   * a CONFIRMED generation view keeps serving the cached session through a
+    //     PG brownout (up to kSessionGenStaleServeBoundMs) — the whole point of
+    //     the bounded cache;
+    //   * an UNCONFIRMED view (no successful read_generation yet) is NEVER
+    //     trusted, so a cached session is withheld and validate fails closed on
+    //     the authoritative path.
+    // The numeric 30s ELAPSED bound (a confirmed view going stale purely by time
+    // passing) needs an injectable clock to test without a real sleep; that leg
+    // is deferred (see #3716 / #3715) — the security-relevant trust gate is the
+    // pair below.
+    YUZU_REQUIRE_PG_DB_TPL(db, authsess_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("confirmed view rides a PG brownout within the stale-serve bound") {
+        auto a = make_mgr(store);
+        auto tok = a->create_local_session("kate", Role::user, /*mfa=*/false);
+        // First validate on a healthy store CONFIRMS the generation view and
+        // re-caches the row (session_gen_valid_ = true, anchor = now).
+        REQUIRE(a->validate_session(tok).has_value());
+        // Brownout: the durable store vanishes. Well within the stale-serve
+        // bound the confirmed view is still trusted, so the cached session is
+        // served WITHOUT the store — a cache hit, not an authoritative read.
+        drop_session_schema(pool);
+        // Self-verify the fault-inject actually took effect. This is the ONE
+        // section a silently no-op DROP (schema rename, permission drift) would
+        // false-green: with the store still healthy the second validate would
+        // succeed via an AUTHORITATIVE read rather than the cache, so without
+        // this the section could pass without exercising stale-serve at all (the
+        // degrade/unconfirmed sections instead go RED on a no-op DROP, so they
+        // self-report). Timing note: a >30s STEADY-clock stall between the two
+        // validates (an oversubscribed shared runner, a sanitizer pause) can
+        // legitimately age the confirmed view past kSessionGenStaleServeBoundMs
+        // and turn this into the authoritative path — a bounded, low-probability
+        // false-red inherent to testing a 30s bound without an injectable clock
+        // (that numeric leg is deferred with #3716 / #3715).
+        REQUIRE_FALSE(store.read_generation().has_value()); // schema is really gone
+        CHECK(a->validate_session(tok).has_value());
+    }
+
+    SECTION("unconfirmed view is never trusted — a cached session fails closed") {
+        auto a = make_mgr(store);
+        // create_local_session caches the row but does NOT confirm the
+        // generation view (no read_generation), so session_gen_valid_ stays
+        // false. The row sits in this manager's cache.
+        auto tok = a->create_local_session("nick", Role::user, /*mfa=*/false);
+        // Degrade before any validate confirms the view. An unconfirmed view is
+        // distrusted, so validate bypasses the (populated) cache, goes
+        // authoritative, and fails closed on the degraded store — proving the
+        // cache is not served under an unconfirmed generation view (a trusted
+        // cache would have returned the session without touching the store).
+        drop_session_schema(pool);
+        CHECK_FALSE(a->validate_session(tok).has_value());
+    }
 }
