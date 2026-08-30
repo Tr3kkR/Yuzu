@@ -48,6 +48,11 @@ void ScheduleRunner::tick() {
         return;
 
     for (const auto& s : d_.schedule_engine->evaluate_due()) {
+        // #3495: bounds how many MORE schedules a single tick() call fires
+        // once shutdown begins — a schedule already firing below still
+        // completes cleanly, this only stops the next one from starting.
+        if (d_.should_stop && d_.should_stop())
+            break;
         // Contain per-schedule failures: one malformed schedule/definition
         // must not stop the remaining due schedules from firing this tick.
         try {

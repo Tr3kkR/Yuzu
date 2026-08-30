@@ -1149,7 +1149,18 @@ server `PgPool`).
   OffloadTargetStore to drain their delivery queues — the last of which runs
   the two stores CONCURRENTLY, not sequentially, so it adds 60 s to the
   total rather than 120 s. Stacked, this can reach **~115 s** in the worst
-  case if more than one stage is genuinely wedged. The shipped
+  case if more than one stage is genuinely wedged. **(#3495) The pre-flight
+  runner, quarantine containment reconciler, and schedule tick background
+  thread joins ride on the same 5 s gRPC shutdown deadline bucket above, not
+  a separate stage** — `ServerImpl::stop()` now cancels in-flight gRPC RPCs
+  before joining those three threads (previously it cancelled them after,
+  so a thread genuinely blocked inside a gRPC stream write had no bound at
+  all — not covered by the ~115 s figure, and not fixable by raising the
+  grace period, since nothing in `stop()` would ever reach the cancellation
+  that unblocks it). If you sized a grace period around the pre-#3495
+  figure and never hit that gap in practice, no action is needed; it was a
+  real but narrow window (a stalled agent stream during shutdown), not a
+  routine occurrence. The shipped
   docker-compose/systemd units already set a 210 s grace period
   (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this —
   but if you deploy under Kubernetes or another orchestrator, its default is

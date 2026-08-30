@@ -8244,6 +8244,36 @@ public:
         if (app_perf_rollup_thread_.joinable()) {
             app_perf_rollup_thread_.join();
         }
+        // #3495: Shutdown gRPC with a deadline BEFORE joining the three
+        // background threads below (pre-flight runner, quarantine
+        // containment reconciler, schedule tick) — all three synchronously
+        // call into AgentRegistry::send_to() -> stream->Write(), which can
+        // block indefinitely on an HTTP/2 flow-control window with no bound
+        // of its own. Previously this call ran AFTER these joins (see the
+        // "now safe" block further down, where the drain-then-null sequence
+        // for execution_tracker_ etc. still lives): a thread blocked inside
+        // such a write had no path to unblock, because stop_requested_ (and
+        // each Deps::should_stop it's wired into, where these threads are
+        // started) only stops the NEXT dispatch from starting, not one
+        // already in flight — and Shutdown(deadline), the
+        // one thing that forcibly cancels an in-flight RPC, hadn't run yet.
+        // Calling it here first means a blocked write is forcibly cancelled
+        // within `deadline`, so every join below is now bounded by this same
+        // window instead of unbounded (governance #3495: chaos-injector HIGH
+        // + codex external tie-break, 2026-08-24; found on this exact three-
+        // thread shape while reviewing #3425's addition of the third one).
+        //
+        // Safe against #1867's lesson (drain producers before nulling the
+        // borrowed pointers they use — see the "now safe" block below,
+        // unchanged): every pointer that drain protects is still nulled
+        // AFTER both this call and the three joins below. Moving this call
+        // earlier only widens that margin; it does not narrow it.
+        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+        if (agent_server_)
+            agent_server_->Shutdown(deadline);
+        if (mgmt_server_)
+            mgmt_server_->Shutdown(deadline);
+
         // Join the pre-flight runner thread (uses preflight_run_store_ +
         // response_store_ + the dispatch path — stop before teardown), then drop
         // the runner so its borrowed pointers can't be ticked again.
@@ -8382,12 +8412,14 @@ public:
             }
         }
 
-        // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
-        // ManagementService streams drain before we drop the stores they
-        // reference. Without a deadline, Shutdown() waits indefinitely for
-        // all RPCs to finish, and the Subscribe RPC is a long-lived
-        // bidirectional stream that never completes on its own. With a
-        // deadline, RPCs are forcibly cancelled at expiry.
+        // agent_server_/mgmt_server_->Shutdown(deadline) already ran above
+        // (#3495), immediately before the pre-flight/quarantine/schedule
+        // joins — moved there so its forced-cancellation reaches those
+        // threads' in-flight dispatch writes too, not just the direct
+        // Subscribe/ManagementService streams. In-flight Subscribe and
+        // ManagementService streams have therefore already drained or been
+        // forcibly cancelled by this point, same as before the move — only
+        // WHEN that happens changed, not the deadline or its 5s bound.
         //
         // Governance round (UAT 2026-05-06 architect Gate 3 B-1):
         // AgentServiceImpl borrows execution_tracker_ via a raw pointer
@@ -8396,12 +8428,8 @@ public:
         // CommandResponse frame. Resetting execution_tracker_ before the
         // gRPC drain race-windowed a use-after-free during graceful
         // shutdown. Drain producers first, null the borrowed pointer
-        // explicitly, then release the tracker.
-        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
-        if (agent_server_)
-            agent_server_->Shutdown(deadline);
-        if (mgmt_server_)
-            mgmt_server_->Shutdown(deadline);
+        // explicitly, then release the tracker — still true here: the drain
+        // (and now the three joins too) both precede this section.
 
         // Now safe: gRPC streams have either completed or been cancelled,
         // so no thread is inside notify_exec_tracker holding the borrowed
@@ -8487,6 +8515,17 @@ public:
         // The reconciler's own background thread is already joined above;
         // this closes the OTHER caller (the heartbeat fast path, driven by
         // gRPC handler threads already quiesced by the drains above).
+        //
+        // #3495 re-verification: this wait (quarantine_reconcile_mu_'s
+        // exclusive lock, heartbeat_ingestion.hpp) stays sequenced AFTER
+        // agent_server_->Shutdown(deadline) even though that call moved
+        // earlier in this function — it did not move past this point, only
+        // to before the three joins above it. So this wait's bound is
+        // unchanged (still Shutdown's 5s deadline plus whatever store-call
+        // timeout was already in flight when forced cancellation landed),
+        // not regressed to unbounded by the reorder above (#3495 acceptance
+        // criterion: this bound must be re-verified, not assumed, against any
+        // new ordering).
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr);
         quarantine_reconciler_.reset();
@@ -18005,6 +18044,10 @@ private:
             .dispatch_fn = command_dispatch_fn,
             .now_ms_fn = {},
             .retention_days = 14,
+            // #3495: lets a shutdown request stop tick() from starting
+            // further runs once stop_requested_ flips — same field and
+            // wiring as QuarantineContainmentReconciler::Deps below.
+            .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         preflight_runner_thread_ = std::thread([this]() {
             spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
@@ -18202,6 +18245,10 @@ private:
                                                                rbac_store_.get(), principal,
                                                                plugin, action);
             },
+            // #3495: lets a shutdown request stop tick() from firing further
+            // due schedules once stop_requested_ flips — same field and
+            // wiring as QuarantineContainmentReconciler::Deps above.
+            .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         schedule_tick_thread_ = std::thread([this]() {
             spdlog::info("Schedule runner thread started (cadence=30s)");

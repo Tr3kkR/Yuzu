@@ -28,6 +28,7 @@
 #include <sqlite3.h>
 
 #include <chrono>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -97,6 +98,12 @@ struct Harness {
     std::vector<DispatchCall> calls;
     int reach{1};        // agents "reached" by the fake dispatch
     bool throw_on_dispatch{false};
+    // #3495: settable AFTER construction (mirrors throw_on_dispatch above) so
+    // existing call sites are unaffected — Deps::should_stop wraps a lambda
+    // that reads this field live rather than the field's value at
+    // construction time, since Deps is copied into the runner once and
+    // there's no other way to change should_stop's behavior per-test.
+    std::function<bool()> should_stop_hook;
 
     ScheduleRunner runner;
 
@@ -138,6 +145,7 @@ struct Harness {
                   return DispatchCaller{.principal = username, .system = false};
               },
               .arming_check = std::move(arming),
+              .should_stop = [this] { return should_stop_hook && should_stop_hook(); },
           }) {
         INFO("[schedrunner instr] fixture status (blank == database came up OK): "
              << instr_db.error());
@@ -643,4 +651,38 @@ TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + targe
         }
     }
     CHECK(found);
+}
+
+// #3495 governance (chaos-injector HIGH + codex external tie-break,
+// 2026-08-24): tick()'s per-schedule loop had NO interior cancellation
+// check — once started, a single tick() call could fire every due schedule
+// with no way to interrupt it, compounding with ServerImpl::stop()'s
+// schedule_tick_thread_.join() ahead of it. Deps::should_stop closes this,
+// ported from QuarantineContainmentReconciler::Deps: checked once per
+// schedule, before fire() runs, so a schedule already firing still
+// completes cleanly — this only stops the NEXT one from starting.
+TEST_CASE("ScheduleRunner: tick() stops firing further schedules once should_stop() "
+          "reports true, deferring the rest to the next tick",
+          "[schedule][runner]") {
+    Harness h;
+    auto id_a = h.make_due("test.def", "interval");
+    auto id_b = h.make_due("test.def", "daily");
+
+    // Stop signals true once the first schedule has fired — proving the
+    // loop actually checks should_stop() before the SECOND schedule and
+    // exits early rather than pushing through both.
+    h.should_stop_hook = [&h] { return h.calls.size() >= 1; };
+
+    h.runner.tick();
+
+    REQUIRE(h.calls.size() == 1); // NOT 2 — the loop stopped before the second schedule
+
+    const auto sa = h.get(id_a);
+    const auto sb = h.get(id_b);
+    // Exactly one of the two fired (advanced past next_execution_at == 1);
+    // the other is untouched and stays due for the next tick — a clean
+    // defer, not a partial or lost fire.
+    const bool a_fired = sa.next_execution_at != 1;
+    const bool b_fired = sb.next_execution_at != 1;
+    CHECK(a_fired != b_fired);
 }

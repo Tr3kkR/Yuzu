@@ -32,6 +32,11 @@ void PreflightRunner::tick() {
     d_.run_store->prune_older_than(cutoff);
 
     for (auto& run : d_.run_store->list_running()) {
+        // #3495: bounds how many MORE runs a single tick() call starts once
+        // shutdown begins — a run already in progress still finishes its own
+        // dispatch + persist below cleanly, this only stops the next one.
+        if (d_.should_stop && d_.should_stop())
+            break;
         const auto cfg = preflight::config_from_json(run.config_json);
         auto targets = d_.run_store->get_targets(run.run_id);
         if (targets.empty()) {
