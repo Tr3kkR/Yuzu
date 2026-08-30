@@ -1110,7 +1110,9 @@ void AuthManager::provision_sso_identity(const std::string& principal, const std
 std::string AuthManager::create_saml_session(const std::string& name_id,
                                              const std::string& entity_id,
                                              const std::vector<std::string>& groups,
-                                             const std::string& admin_group) {
+                                             const std::string& admin_group,
+                                             const std::string& saml_display_name,
+                                             const std::string& saml_email) {
     std::unique_lock lock(mu_);
 
     // ADR-2001 PR4a — the STABLE authorization principal is
@@ -1131,10 +1133,21 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
 
     const std::string stable_username = yuzu::server::saml::saml_principal_id(entity_id, name_id);
 
+    // Display-name derivation mirrors OIDC's `create_oidc_session` exactly:
+    // prefer the parsed name attribute, else the parsed email, else the raw
+    // NameID (the pre-attributes behaviour, so a SAML deployment that never
+    // configures --saml-name-attribute/--saml-email-attribute renders exactly
+    // as before). `display_name` is UI/audit-detail only, NEVER authz
+    // (auth.hpp Session contract), and `saml_email` — like OIDC — is used only
+    // as a display fallback + logged, never stored as a durable session field.
+    const std::string resolved_display =
+        !saml_display_name.empty() ? saml_display_name
+                                   : (!saml_email.empty() ? saml_email : name_id);
+
     auto token = generate_session_token();
     Session s;
     s.username                   = stable_username;
-    s.display_name               = name_id;
+    s.display_name               = resolved_display;
     s.role                       = role;
     s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
     s.auth_source                = "saml";
@@ -1142,8 +1155,8 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
     s.last_activity_persisted_at = s.last_activity_at;
     sessions_[token]             = std::move(s);
 
-    spdlog::info("SAML session created for '{}' (display={}, role={})", stable_username, name_id,
-                role_to_string(role));
+    spdlog::info("SAML session created for '{}' (display={}, email={}, role={})", stable_username,
+                 resolved_display, saml_email, role_to_string(role));
     return token;
 }
 
