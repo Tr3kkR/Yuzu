@@ -175,13 +175,20 @@ public:
     /// handler which now creates the execution row BEFORE dispatch (to thread
     /// execution_id into cmd_dispatch and close the FAST-agent race UP2-4),
     /// then updates `agents_targeted` once dispatch confirms how many agents
-    /// the command actually reached.
-    void set_agents_targeted(const std::string& execution_id, int agents_targeted);
+    /// the command actually reached. Returns false on a pool/query failure
+    /// (governance PR review, 2026-08-31) — the row never learns its real
+    /// agent count and can never reach refresh_counts's all-responded
+    /// threshold, wedging it at "running"; callers should log/surface this.
+    bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
 
-    void mark_cancelled(const std::string& id, const std::string& user);
+    /// Returns false on a pool/query failure (governance PR review,
+    /// 2026-08-31) — the execution was NOT actually cancelled; callers must
+    /// not report success (an audit "success" row or an HTTP 200) on a
+    /// false return.
+    bool mark_cancelled(const std::string& id, const std::string& user);
 
     // Statistics (capability 1.9)
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
@@ -209,6 +216,11 @@ private:
     /// otherwise, including the ordinary "nothing changed" case. See
     /// `refresh_counts`'s retry-and-log wrapper for why this is split out.
     bool refresh_counts_once(const std::string& execution_id);
+
+    /// One attempt at `update_agent_status`'s upsert + agent-transition SSE
+    /// publish. Returns false on a lease-acquire failure or a query failure;
+    /// `true` otherwise. See `update_agent_status`'s retry-and-log wrapper.
+    bool upsert_agent_status_once(const std::string& execution_id, const AgentExecStatus& s);
 
     pg::PgPool& pool_;
     bool open_{false};

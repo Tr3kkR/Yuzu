@@ -364,11 +364,8 @@ std::expected<std::string, std::string> ExecutionTracker::create_execution(const
     return id;
 }
 
-void ExecutionTracker::update_agent_status(const std::string& execution_id,
-                                           const AgentExecStatus& s) {
-    if (!open_)
-        return;
-
+bool ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
+                                                const AgentExecStatus& s) {
     // Snapshot-and-release (governance round perf-B1 / UP-A9), preserved
     // under the pool model: build the SSE payload, release the lease
     // (scope exit), THEN publish. Holding a lease across publish would
@@ -382,7 +379,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     {
         auto lease = pool_.try_acquire_for(kWriteTimeout);
         if (!lease)
-            return;
+            return false;
 
         auto now = now_epoch();
         pg::PgResult res = pg::exec_params(
@@ -407,7 +404,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
                 std::to_string(s.completed_at), std::to_string(s.exit_code), s.error_detail,
                 std::to_string(s.plugin_result_status)});
         if (res.status() != PGRES_COMMAND_OK)
-            return;
+            return false;
 
         if (event_bus_) {
             should_publish = true;
@@ -424,6 +421,32 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
 
     if (should_publish) {
         event_bus_->publish(execution_id, "agent-transition", payload.dump());
+    }
+    return true;
+}
+
+void ExecutionTracker::update_agent_status(const std::string& execution_id,
+                                           const AgentExecStatus& s) {
+    if (!open_)
+        return;
+
+    // Retry once on failure, same rationale and shape as refresh_counts's
+    // own retry (governance adversarial review, PR review 2026-08-31,
+    // Doomgoose): a lease-acquire timeout or a cancelled statement under
+    // row-lock contention here is silent by default and, unlike
+    // refresh_counts's failure mode, unrecoverable by #3729's reconciler —
+    // the reconciler recomputes FROM agent_exec_status rows, so a row that
+    // was never inserted has nothing to reconcile from (the agent does not
+    // re-send). Loud logging on final failure at least surfaces the loss.
+    bool ok = false;
+    for (int attempt = 0; attempt < 2 && !ok; ++attempt)
+        ok = upsert_agent_status_once(execution_id, s);
+    if (!ok) {
+        spdlog::error("ExecutionTracker::update_agent_status: upsert failed twice for "
+                      "execution_id={} agent_id={} — this agent's status is NOT recorded and "
+                      "will not be reconciled (agents do not re-send)",
+                      execution_id, s.agent_id);
+        return;
     }
 
     // UAT 2026-05-06: chain refresh_counts so the parent executions row's
@@ -442,14 +465,27 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     refresh_counts(execution_id);
 }
 
-void ExecutionTracker::set_agents_targeted(const std::string& execution_id, int agents_targeted) {
+bool ExecutionTracker::set_agents_targeted(const std::string& execution_id, int agents_targeted) {
     if (!open_)
-        return;
+        return false;
     auto lease = pool_.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return;
-    pg::exec_params(lease.get(), "UPDATE execution_tracker.executions SET agents_targeted=$1 WHERE id=$2",
-                    std::vector<std::string>{std::to_string(agents_targeted), execution_id});
+    if (!lease) {
+        spdlog::error("ExecutionTracker::set_agents_targeted: pool exhausted for execution_id={}",
+                      execution_id);
+        return false;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "UPDATE execution_tracker.executions SET agents_targeted=$1 WHERE id=$2",
+        std::vector<std::string>{std::to_string(agents_targeted), execution_id});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error(
+            "ExecutionTracker::set_agents_targeted: update failed for execution_id={} — the "
+            "row never learns its real agent count and can never reach the all-responded "
+            "threshold refresh_counts checks, wedging it at 'running' with no automatic recovery",
+            execution_id);
+        return false;
+    }
+    return true;
 }
 
 void ExecutionTracker::refresh_counts(const std::string& execution_id) {
@@ -613,9 +649,9 @@ ExecutionTracker::create_rerun(const std::string& original_id, const std::string
     return create_execution(rerun);
 }
 
-void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& /*user*/) {
+bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& /*user*/) {
     if (!open_)
-        return;
+        return false;
 
     // Snapshot-and-release (perf-B1 / UP-A9). See update_agent_status for
     // the full rationale.
@@ -623,15 +659,22 @@ void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
 
     {
         auto lease = pool_.try_acquire_for(kWriteTimeout);
-        if (!lease)
-            return;
+        if (!lease) {
+            spdlog::error("ExecutionTracker::mark_cancelled: pool exhausted for execution id={}",
+                          id);
+            return false;
+        }
 
         pg::PgResult res = pg::exec_params(
             lease.get(),
             "UPDATE execution_tracker.executions SET status='cancelled', completed_at=$1 WHERE id=$2",
             std::vector<std::string>{std::to_string(now_epoch()), id});
-        if (res.status() != PGRES_COMMAND_OK)
-            return;
+        if (res.status() != PGRES_COMMAND_OK) {
+            spdlog::error("ExecutionTracker::mark_cancelled: update failed for execution id={} — "
+                          "the execution was NOT actually cancelled",
+                          id);
+            return false;
+        }
 
         if (event_bus_) {
             should_publish = true;
@@ -643,6 +686,7 @@ void ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
         payload["status"] = "cancelled";
         event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
     }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -1492,7 +1492,7 @@ TEST_CASE("SSE handler: refresh_counts on terminal threshold publishes "
     ExecHarness h(pool);
     h.make_def("def-TERM", "Terminal");
     auto exec_id = h.make_exec("def-TERM", "running", 2, 0, 0);
-    h.tracker->set_agents_targeted(exec_id, 2);
+    REQUIRE(h.tracker->set_agents_targeted(exec_id, 2));
 
     std::vector<ExecutionEvent> seen;
     h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) { seen.push_back(ev); });

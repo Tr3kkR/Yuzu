@@ -415,6 +415,19 @@ void ScheduleEngine::advance_schedule(const std::string& id) {
             "    WHEN 'daily' THEN $1::bigint + 86400 "
             "    WHEN 'weekly' THEN $1::bigint + 604800 "
             "    WHEN 'monthly' THEN $1::bigint + 2592000 "
+            // Deliberate divergence from the old C++ arithmetic this
+            // replaces, which defaulted an unrecognized frequency_type to 0
+            // (disabling the schedule). This CASE's ELSE instead leaves
+            // next_execution_at unchanged (governance PR review, 2026-08-31,
+            // Doomgoose: on a row that was just found due, that means it
+            // stays due and re-fires every subsequent poller tick). Confirmed
+            // unreachable on every current write path: create_schedule
+            // validates via is_valid_frequency, no UPDATE ... SET
+            // frequency_type exists anywhere, and ADR-0009's fresh-start
+            // cutover means no legacy row can carry a stale value either. Not
+            // fixed to match the old default because doing so silently
+            // (re-adding a fourth WHEN-less branch) would be just as easy to
+            // miss again — pinned here instead so a future editor sees it.
             "    ELSE next_execution_at "
             "  END, "
             "  last_executed_at = $1::bigint, "

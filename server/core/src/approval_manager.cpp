@@ -369,6 +369,14 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     // Postgres analogue on a per-lease connection, but RETURNING is kept as
     // the uniform idiom across every store in this ladder).
     std::string queue_full_error;
+    // Sweep counts, logged AFTER the transaction commits (governance PR
+    // review, 2026-08-31, Doomgoose) — logging inside the lambda claims an
+    // action happened before it is known to have survived; a later
+    // statement in the SAME transaction (the cap check, the insert) can
+    // still roll the whole thing back, which would make an "expired N"
+    // info line false.
+    int expired_pending_committed = 0;
+    int expired_approved_committed = 0;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         // Expiry sweep runs BEFORE the pending-count cap check, not after: the
         // cap is exactly the state the sweep exists to relieve, and a stale
@@ -384,8 +392,6 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         if (exp.status() != PGRES_TUPLES_OK)
             return false;
         int expired_pending = PQntuples(exp.get());
-        if (expired_pending > 0)
-            spdlog::info("ApprovalManager: expired {} stale pending approvals", expired_pending);
 
         pg::PgResult expa = pg::exec_params(
             conn,
@@ -394,8 +400,7 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             std::vector<std::string>{cutoff});
         if (expa.status() != PGRES_TUPLES_OK)
             return false;
-        if (int n = PQntuples(expa.get()); n > 0)
-            spdlog::info("ApprovalManager: expired {} approved-but-unconsumed approval tickets", n);
+        int expired_approved = PQntuples(expa.get());
 
         pg::PgResult cnt = pg::exec_params(
             conn, "SELECT COUNT(*) FROM approval_manager.approvals WHERE status = 'pending'",
@@ -437,7 +442,11 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             std::vector<std::string>{id, definition_id, submitted_by, std::to_string(ts),
                                      scope_expression, schedule_id, to_string(origin),
                                      target_plugin, target_action});
-        return ins.status() == PGRES_COMMAND_OK;
+        if (ins.status() != PGRES_COMMAND_OK)
+            return false;
+        expired_pending_committed = expired_pending;
+        expired_approved_committed = expired_approved;
+        return true;
     });
 
     if (!ok) {
@@ -445,6 +454,12 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             return std::unexpected(queue_full_error);
         return std::unexpected("insert failed (pool degraded or transaction failed)");
     }
+    if (expired_pending_committed > 0)
+        spdlog::info("ApprovalManager: expired {} stale pending approvals",
+                     expired_pending_committed);
+    if (expired_approved_committed > 0)
+        spdlog::info("ApprovalManager: expired {} approved-but-unconsumed approval tickets",
+                     expired_approved_committed);
 
     spdlog::info("ApprovalManager: submitted approval {} for definition {} by {}", redact_id(id),
                  definition_id, submitted_by);
@@ -851,8 +866,17 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
             lease.get(),
             "SELECT status, submitted_by FROM approval_manager.approvals WHERE id = $1",
             std::vector<std::string>{id});
-        if (sel.status() != PGRES_TUPLES_OK)
-            return std::unexpected(std::string("read failed: ") + PQresultErrorMessage(sel.get()));
+        if (sel.status() != PGRES_TUPLES_OK) {
+            // Scrubbed generic string reaching the REST/MCP caller (this
+            // reaches the HX-Trigger toast and the MCP error body) — matches
+            // the shape create_execution/submit already use in this ladder
+            // (governance PR review, 2026-08-31, Doomgoose: this site leaked
+            // the raw Postgres diagnostic while the same-PR fix scrubbed the
+            // identical shape elsewhere). Diagnostic logged server-side only.
+            spdlog::error("ApprovalManager::set_review_status: read failed for id={}: {}", id,
+                          PQresultErrorMessage(sel.get()));
+            return std::unexpected("approval store temporarily unavailable (read failed)");
+        }
         if (PQntuples(sel.get()) == 0)
             return std::unexpected("approval not found: " + id);
 

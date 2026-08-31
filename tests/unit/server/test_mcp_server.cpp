@@ -2762,7 +2762,7 @@ TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WI
 TEST_CASE("MCP confirm_engine_rotation: a closed/unwired engine-credential store "
           "denies WITHOUT consuming, not a pass-through that burns the ticket "
           "at the handler's own guard (#2443, fjarvis Gate-8-followup review)",
-          "[mcp][engine_principal][confirm][approval]") {
+          "[pg][mcp][engine_principal][confirm][approval]") {
     // The precondition's own closed-store check used to `return {}`
     // (pass-through), reasoning that "the handler's own store-open guard
     // reports this" - but the handler's guard runs AFTER consume_ticket, not
@@ -6849,7 +6849,7 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier, no approval man
 // approval_id + status_url, NOT a hard deny.
 
 TEST_CASE("MCP Integration: execute_instruction supervised tier mints approval ticket",
-          "[mcp][integration][execute][approval]") {
+          "[pg][mcp][integration][execute][approval]") {
         yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
 
@@ -8191,7 +8191,7 @@ TEST_CASE("MCP KEK: rotate_kek supervised, no approval manager, degraded deny",
 }
 
 TEST_CASE("MCP KEK: rotate_kek and rewrap_secrets supervised + approval manager mint a ticket",
-          "[mcp][integration][kek][security][approval]") {
+          "[pg][mcp][integration][kek][security][approval]") {
     for (const char* tool_name : {"rotate_kek", "rewrap_secrets"}) {
         INFO("tool=" << tool_name);
                 yuzu::test::ApprovalManagerPg appr_bundle;
@@ -8235,7 +8235,7 @@ TEST_CASE("MCP KEK: rotate_kek and rewrap_secrets supervised + approval manager 
 
 TEST_CASE("MCP KEK: the full approval round-trip executes rotate_kek/rewrap_secrets and "
           "audits kek.rotate/kek.rewrap against Secret/kek",
-          "[mcp][integration][kek][security][approval]") {
+          "[pg][mcp][integration][kek][security][approval]") {
     // Mirrors "MCP delete_tag full approval-ticket round-trip" above: mint,
     // approve out-of-band, recall with approval_id -> the seam actually runs.
     for (const char* tool_name : {"rotate_kek", "rewrap_secrets"}) {
@@ -8302,7 +8302,7 @@ TEST_CASE("MCP KEK: the full approval round-trip executes rotate_kek/rewrap_secr
 }
 
 TEST_CASE("MCP KEK: REST/MCP parity on the HalfCommitted remediation string",
-          "[mcp][integration][kek][security][approval]") {
+          "[pg][mcp][integration][kek][security][approval]") {
     // #2395 rule A: both surfaces share the SAME KekOps seam, so a
     // HalfCommitted result must produce the SAME remediation wording on
     // both — the caller must be told to call rewrap_secrets/`/rewrap` to
@@ -10566,7 +10566,7 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
 // adding a check at the handler and forgetting the gate; this test is what
 // makes the third time fail loudly.
 TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticket",
-          "[mcp][integration][approval][bounds]") {
+          "[pg][mcp][integration][approval][bounds]") {
         yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
 
@@ -11425,7 +11425,7 @@ TEST_CASE("MCP 2405: execute_bundle step items are validated recursively",
 
 TEST_CASE("MCP 2444: execute_bundle empty step plugin/action is rejected pre-mint, not "
           "burned post-consume (adversarial review)",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     McpTestServer ts;
@@ -12134,7 +12134,7 @@ TEST_CASE("MCP 2444: item 2 minLength:1 sweep — one field per tool family reje
 }
 
 TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at the gate",
-          "[mcp][integration][approval][schema]") {
+          "[pg][mcp][integration][approval][schema]") {
     // The pure-compiler test proves the keyword LOGIC on synthetic schemas;
     // this proves the real served tables carry those keywords through the
     // live dispatch path — an out-of-range value on a real gated tool is
@@ -12406,7 +12406,7 @@ TEST_CASE("MCP 2405: concurrent validate() on one compiled schema is race-free",
 }
 
 TEST_CASE("MCP approve_request approves a pending request as a second principal",
-          "[mcp][integration][approval]") {
+          "[pg][mcp][integration][approval]") {
         yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     auto submitted =
@@ -12431,7 +12431,7 @@ TEST_CASE("MCP approve_request approves a pending request as a second principal"
     CHECK(write_tool_structured(res) == payload);
 }
 
-TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][approval]") {
+TEST_CASE("MCP reject_request rejects a pending request", "[pg][mcp][integration][approval]") {
         yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
     auto submitted =

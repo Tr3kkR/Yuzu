@@ -8138,8 +8138,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         bridge->abandon(bridge_sid, id);
                         bridge_active = false;
                     }
-                    if (execution_tracker && !execution_id.empty()) {
-                        execution_tracker->mark_cancelled(execution_id, session->username);
+                    if (execution_tracker && !execution_id.empty() &&
+                        !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                        spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
+                                      execution_id);
                     }
                     mcp_audit("failure",
                               std::string("dispatch_exception execution_id=") + execution_id);
@@ -8165,8 +8167,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (`session->username`, not literal `"mcp"`) so any
                     // future change to ExecutionTracker that persists the
                     // user field records the authenticated principal.
-                    if (execution_tracker && !execution_id.empty()) {
-                        execution_tracker->mark_cancelled(execution_id, session->username);
+                    if (execution_tracker && !execution_id.empty() &&
+                        !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                        spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
+                                      execution_id);
                     }
                     // governance R1 unhappy-UP-7: structured signal so
                     // the agentic worker can branch on `status` without
@@ -8246,7 +8250,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // dispatch confirmed how many agents the command went to.
                 // Mirrors workflow_routes.cpp:1461-1463.
                 if (execution_tracker && !execution_id.empty()) {
-                    execution_tracker->set_agents_targeted(execution_id, agents_reached);
+                    if (!execution_tracker->set_agents_targeted(execution_id, agents_reached)) {
+                        spdlog::error("mcp_server: set_agents_targeted failed for execution_id={}",
+                                      execution_id);
+                    }
                     // S4.5 (2f PR 3a) - terminal-starvation fix: responses that
                     // arrived BEFORE set_agents_targeted saw agents_targeted==0
                     // and could not transition the row to terminal

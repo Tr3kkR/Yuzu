@@ -17022,7 +17022,18 @@ private:
             auto session = auth_routes_->resolve_session(req);
             auto user = session ? session->username : "unknown";
 
-            execution_tracker_->mark_cancelled(id, user);
+            // governance PR review (2026-08-31): mark_cancelled now reports
+            // whether the update actually happened — do not tell the
+            // operator "cancelled" (HTTP 200 + a "success" audit row) when
+            // it didn't.
+            if (!execution_tracker_->mark_cancelled(id, user)) {
+                (void)audit_log(req, "execution.cancel", "failure", "execution", id);
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"cancel failed - execution store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             (void)audit_log(req, "execution.cancel", "success", "execution", id);
             emit_event("execution.completed", req, {{"status", "cancelled"}},
                        {{"execution_id", id}});

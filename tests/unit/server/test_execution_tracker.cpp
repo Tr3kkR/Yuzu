@@ -375,10 +375,18 @@ TEST_CASE("ExecutionTracker: refresh_counts retries and recovers from transient 
     // which it reliably does well inside a real lock_timeout window.
     YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::execution_tracker_pg_template);
 
-    // A short lock_timeout makes the injected contention resolve in
-    // milliseconds instead of the production 10s default (PgPool::Options).
+    // lock_timeout wide enough to be robust to CI scheduling jitter
+    // (governance PR review, 2026-08-31, Doomgoose: the original 100ms/150ms
+    // pair left only a ~50ms margin on each side, and a mutant that broke the
+    // retry was observed to false-green under a loaded run). Attempt 2 gets
+    // its OWN fresh lock_timeout window starting when attempt 1 fails
+    // (~kLockTimeout after t=0), so the safe range for the release delay is
+    // strictly between kLockTimeout and 2*kLockTimeout — kReleaseDelay sits
+    // centered in that range with a wide (150ms) margin on both sides.
+    constexpr auto kLockTimeout = std::chrono::milliseconds{300};
+    constexpr auto kReleaseDelay = std::chrono::milliseconds{450};
     yuzu::server::pg::PgPool store_pool{
-        {.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+        {.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = static_cast<int>(kLockTimeout.count())}};
     REQUIRE(store_pool.valid());
     ExecutionTracker tracker{store_pool};
     REQUIRE(tracker.is_open());
@@ -390,9 +398,9 @@ TEST_CASE("ExecutionTracker: refresh_counts retries and recovers from transient 
     const std::string execution_id = *id_result;
 
     // A second, independent connection holds an exclusive row lock on the
-    // execution for longer than store_pool's 100ms lock_timeout, so the
-    // FIRST refresh_counts attempt (chained inside update_agent_status)
-    // is guaranteed to be cancelled and abandoned.
+    // execution for longer than store_pool's lock_timeout, so the FIRST
+    // refresh_counts attempt (chained inside update_agent_status) is
+    // guaranteed to be cancelled and abandoned.
     yuzu::server::pg::PgPool locker_pool{{.conninfo = db.dsn(), .size = 1}};
     REQUIRE(locker_pool.valid());
     auto locker_lease = locker_pool.try_acquire_for(std::chrono::milliseconds{2000});
@@ -405,10 +413,10 @@ TEST_CASE("ExecutionTracker: refresh_counts retries and recovers from transient 
     REQUIRE(lock.status() == PGRES_TUPLES_OK);
 
     // Releases the lock partway through the store's retry window — well
-    // after the 100ms lock_timeout has already cancelled attempt 1, well
-    // before a human would notice anything.
+    // after kLockTimeout has already cancelled attempt 1, well before a
+    // human would notice anything.
     std::thread releaser([&] {
-        std::this_thread::sleep_for(std::chrono::milliseconds{150});
+        std::this_thread::sleep_for(kReleaseDelay);
         auto rollback =
             pg::exec_params(locker_lease.get(), "ROLLBACK", std::vector<std::string>{});
         CHECK(rollback.status() == PGRES_COMMAND_OK);
@@ -420,9 +428,20 @@ TEST_CASE("ExecutionTracker: refresh_counts retries and recovers from transient 
     as.dispatched_at = 1000;
     as.completed_at = 1005;
     as.exit_code = 0;
+    auto before = std::chrono::steady_clock::now();
     tracker.update_agent_status(execution_id, as);
+    auto elapsed = std::chrono::steady_clock::now() - before;
 
     releaser.join();
+
+    // Proves attempt 1 actually got cancelled rather than the test passing
+    // by luck (e.g. the lock happening to already be free) — the call must
+    // have blocked for at least one full lock_timeout window before the
+    // retry could succeed. No log-capture seam exists in this file, so a
+    // coarse wall-clock floor is the cheapest reliable proof (governance PR
+    // review, 2026-08-31, Doomgoose: "never asserts attempt 1 was
+    // cancelled").
+    CHECK(elapsed >= kLockTimeout);
 
     // Pre-fix: this would be stuck at "running" with stale (zero) aggregate
     // counts — attempt 1 was cancelled and nothing ever retried it.
@@ -561,7 +580,7 @@ TEST_CASE("ExecutionTracker: mark_cancelled", "[pg][execution_tracker]") {
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
 
-    tracker.mark_cancelled(*id_result, "admin");
+    CHECK(tracker.mark_cancelled(*id_result, "admin"));
 
     auto exec = tracker.get_execution(*id_result);
     REQUIRE(exec.has_value());
@@ -580,7 +599,7 @@ TEST_CASE("ExecutionTracker: mark_cancelled sets completed_at", "[pg][execution_
     REQUIRE(before.has_value());
     CHECK(before->completed_at == 0);
 
-    tracker.mark_cancelled(*id_result, "operator1");
+    CHECK(tracker.mark_cancelled(*id_result, "operator1"));
 
     auto after = tracker.get_execution(*id_result);
     REQUIRE(after.has_value());
@@ -684,13 +703,16 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     REQUIRE_FALSE(created.has_value());
     CHECK(created.error() == "database not open");
 
-    // Mutations on a closed store are silent no-ops, not crashes.
+    // Mutations on a closed store are no-ops, not crashes — and the two
+    // that report success/failure (governance PR review, 2026-08-31) must
+    // honestly report failure rather than silently claiming success.
     AgentExecStatus status;
     status.agent_id = "agent-1";
     status.status = "running";
     closed.update_agent_status("exec-1", status);
     closed.refresh_counts("exec-1");
-    closed.mark_cancelled("exec-1", "tester");
+    CHECK_FALSE(closed.mark_cancelled("exec-1", "tester"));
+    CHECK_FALSE(closed.set_agents_targeted("exec-1", 1));
 }
 
 // "v2 probe stamps straight through..."/"v2 probe does not silently skip

@@ -7482,7 +7482,9 @@ void RestApiV1::register_routes(
             if (result_set_store->count_for_owner(owner) >= ResultSetStore::kMaxPerOwner) {
                 if (metrics_registry)
                     metrics_registry->counter("yuzu_result_set_quota_rejected").increment();
-                execution_tracker->mark_cancelled(exec_id, owner);
+                if (!execution_tracker->mark_cancelled(exec_id, owner)) {
+                    spdlog::error("result-set: mark_cancelled failed for exec_id={}", exec_id);
+                }
                 rs_err(res, 429, std::string(to_string(ResultSetError::QuotaExceeded)) +
                                      " execution_id=" + exec_id);
                 return;
@@ -7509,7 +7511,9 @@ void RestApiV1::register_routes(
                                                                  params, exec_id, caller);
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
-                execution_tracker->mark_cancelled(exec_id, owner);
+                if (!execution_tracker->mark_cancelled(exec_id, owner)) {
+                    spdlog::error("result-set: mark_cancelled also failed for exec_id={}", exec_id);
+                }
                 rs_err(res, 500, "RESULT_SET_DISPATCH_FAILED: dispatch raised");
                 return;
             }
@@ -7532,14 +7536,18 @@ void RestApiV1::register_routes(
                 // quarantine state is already readable at GET
                 // /api/v1/quarantine — so naming them does not weaken the
                 // confinement rationale above.
-                execution_tracker->mark_cancelled(exec_id, owner);
+                if (!execution_tracker->mark_cancelled(exec_id, owner)) {
+                    spdlog::error("result-set: mark_cancelled also failed for exec_id={}", exec_id);
+                }
                 rs_err(res, 503,
                        "RESULT_SET_NO_AGENTS: no agents reached in the target scope — targets may "
                        "be unreachable, quarantined, or withheld because containment state could "
                        "not be read");
                 return;
             }
-            execution_tracker->set_agents_targeted(exec_id, sent);
+            if (!execution_tracker->set_agents_targeted(exec_id, sent)) {
+                spdlog::error("result-set: set_agents_targeted failed for exec_id={}", exec_id);
+            }
 
             CreateRequest cr;
             cr.owner_principal = owner;
@@ -7556,7 +7564,9 @@ void RestApiV1::register_routes(
                 // materialise into — cancel the execution so it doesn't idle in
                 // 'running', and surface exec_id so the operator can trace what
                 // was sent (review B5; mirrors the throw / no-agents paths).
-                execution_tracker->mark_cancelled(exec_id, owner);
+                if (!execution_tracker->mark_cancelled(exec_id, owner)) {
+                    spdlog::error("result-set: mark_cancelled failed for exec_id={}", exec_id);
+                }
                 int status = created.error() == ResultSetError::QuotaExceeded ? 429 : 400;
                 rs_err(res, status,
                        std::string(to_string(created.error())) + " execution_id=" + exec_id);

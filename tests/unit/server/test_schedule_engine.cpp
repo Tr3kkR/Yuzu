@@ -496,7 +496,12 @@ TEST_CASE("ScheduleEngine: create_schedule rejects invalid parameters and create
 // never crash.
 TEST_CASE("ScheduleEngine reports !is_open on a migration failure and degrades every method",
           "[schedule_engine][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    // governance PR review (2026-08-31, Doomgoose): this is exactly the
+    // migration-in-substance shape docs/postgres-store-playbook.md routes to
+    // YUZU_REQUIRE_PG_MIGRATION_DB (not plain YUZU_REQUIRE_PG_DB) — the
+    // wrong macro re-adds the per-test Windows EXEC_BACKEND DDL cost the
+    // migration-macro exists to remove.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};

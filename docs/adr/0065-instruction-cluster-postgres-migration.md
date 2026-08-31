@@ -11,6 +11,7 @@
   numbers up from this ADR's original 2888/11-shard figures; see the "Correction" sections below
   for what changed.)
 - **Date:** 2026-08-30
+- **Authors:** Dave Rae
 - **Deciders:** pg workstream (migration-programme PR 5, the last of the 7-store SQLite→Postgres
   ladder — `WorkflowEngine`/ADR-0064 merged separately as PR 4, #1328/#1325/#3653)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009 (including its 2026-08-25
@@ -117,7 +118,12 @@ availability flag to key either probe on, so neither existed. `/readyz`'s `Store
 exact pattern `patch_manager_ok`/`directory_sync_ok` already established.
 
 **No backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment):** no
-`migrate_from_sqlite`, unconditionally. The legacy `instructions.db` (at this point in the PR's
+`migrate_from_sqlite`, unconditionally — re-derived for this store, not merely cited (PR review,
+2026-08-31, Doomgoose, per #1325): the amendment applies here specifically because there is no
+production fleet running this store today (pre-release), so there is no live `schedules` table
+whose loss would be an operational incident rather than a documented, disclosed cutover; the
+`legacy_sqlite_probe::warn_if_legacy_rows()` check below is the mechanism that would catch the
+premise being locally wrong. The legacy `instructions.db` (at this point in the PR's
 staged commits, still shared with the not-yet-ported ExecutionTracker/ApprovalManager siblings) is
 never read for data. Construction logs a one-time `ScheduleEngine initialized (schema
 schedule_engine) — fresh start, no legacy backfill` line; `server.cpp` calls the shared
@@ -289,21 +295,35 @@ CREATE TABLE executions (
     rerun_of           TEXT    NOT NULL DEFAULT ''
 );
 CREATE TABLE agent_exec_status (
-    execution_id       TEXT    NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
-    agent_id           TEXT    NOT NULL,
-    status             TEXT    NOT NULL DEFAULT 'dispatched',
-    first_response_at  BIGINT  NOT NULL DEFAULT 0,
-    completed_at       BIGINT  NOT NULL DEFAULT 0,
-    exit_code          INTEGER NOT NULL DEFAULT 0,
-    error_detail       TEXT    NOT NULL DEFAULT '',
-    plugin_result_status TEXT  NOT NULL DEFAULT '',
+    execution_id          TEXT    NOT NULL,
+    agent_id              TEXT    NOT NULL,
+    status                TEXT    NOT NULL DEFAULT 'pending',
+    dispatched_at         BIGINT  NOT NULL DEFAULT 0,
+    first_response_at     BIGINT  NOT NULL DEFAULT 0,
+    completed_at          BIGINT  NOT NULL DEFAULT 0,
+    exit_code             INTEGER NOT NULL DEFAULT 0,
+    error_detail          TEXT    NOT NULL DEFAULT '',
+    plugin_result_status   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (execution_id, agent_id)
 );
-CREATE INDEX idx_exec_definition ON executions(definition_id);
-CREATE INDEX idx_exec_parent ON executions(parent_id);
-CREATE INDEX idx_exec_dispatched_at ON executions(dispatched_at);
-CREATE INDEX idx_agent_exec_status_execution ON agent_exec_status(execution_id);
+CREATE INDEX idx_executions_status ON executions(status);
+CREATE INDEX idx_agent_exec_agent ON agent_exec_status(agent_id);
+CREATE INDEX idx_executions_dispatched ON executions(dispatched_at);
+CREATE INDEX idx_executions_definition ON executions(definition_id);
 ```
+
+**Correction (PR review, 2026-08-31, Doomgoose):** the block above was rewritten to match the
+actually-shipped DDL byte-for-byte (`execution_tracker.cpp`'s `migrations()`) — the version
+originally committed here misstated it five ways: (1) **no FK exists** —
+`agent_exec_status.execution_id` carries no `REFERENCES executions(id) ON DELETE CASCADE`; a
+deleted parent orphans its child rows, tolerated by design (this store never deletes executions,
+and #3728's future retention pass must not silently assume cascade cleanup it does not have —
+see that issue); (2) `agent_exec_status.status` defaults to `'pending'`, not `'dispatched'`; (3)
+`agent_exec_status.dispatched_at BIGINT NOT NULL DEFAULT 0` exists and was omitted entirely; (4)
+`plugin_result_status` is `INTEGER`, not `TEXT` — it stores the typed CC-07 plugin-result-status
+enum value, never free text; (5) the four index names and their target columns were disjoint from
+the real ones — no index on `parent_id` exists (`get_children`'s query is unindexed today), and
+the real DDL indexes `status` and `agent_id` instead, which the original block omitted.
 
 **`refresh_counts` closes the #1033-class race and gains the same one-transaction consistency
 `advance_schedule` gained.** The SQLite era read `sqlite3_changes(db_)` immediately after a
@@ -463,8 +483,13 @@ only its construction converts (to `ExecutionTrackerPg`); the payload assertions
   upgrade must be re-requested; consumed-ticket audit history (the `submitted_by → reviewed_by →
   consumed_by` evidence chain) does not carry forward. Documented in `docs/user-manual/upgrading.md`.
 - **The MCP A4 error envelope's permanent-vs-transient discriminator is now a Postgres SQLSTATE
-  string, not a SQLite extended errcode** — an internal type change with no client-visible
-  behavior change (the same two response bodies, chosen by the same two-discriminator rule).
+  string, not a SQLite extended errcode** — mostly an internal type change (the same two response
+  bodies, chosen by the same two-discriminator rule), with one deliberate exception (PR review,
+  2026-08-31, Doomgoose): the old classifier (`sqlite_error_class.hpp`, deleted) had no permanent
+  case for schema drift — a dropped/altered `approvals` table surfaced as a generic SQLite error
+  and was classified transient ("retry unchanged"). The new classifier's class-`42` case makes
+  that same fault permanent, so it now fails fast with an escalate-to-operator response instead
+  of an endless retry loop — an improvement, but a real client-visible change for that edge case.
 - **Any execution history and per-agent status from a pre-Postgres build is lost on upgrade**
   (component 3 of 3). The executions drawer, REST execution routes, and MCP execution-status
   tools start from empty; no gRPC `CommandResponse` in flight at the moment of upgrade has
