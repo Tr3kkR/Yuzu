@@ -6633,6 +6633,38 @@ Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",r
 write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body
 must be a JSON object; anything else is `400`.
 
+**Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
+fan-out are refused (#3685).** The command catalogue currently classifies 17 `plugin.action` pairs
+`Destructive` (e.g. `tar.purge_source`, `filesystem.delete`, `registry.delete_key`); dispatching
+any of them with `agent_ids` omitted or empty, or with `scope` (including `"__all__"`) instead of
+`agent_ids`, is refused **before** the command reaches an agent:
+
+```json
+{"error": {"code": 400, "message": "destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}}
+```
+
+The elevated securable/operation this row's catalogue entry names (per-row, e.g.
+`Infrastructure:Delete` for `tar.purge_source`) is checked via `require_permission` **before**
+this refusal — a caller lacking the grant gets the ordinary `403` first, never a `400` that would
+leak whether the row is Destructive. A caller who *is* authorized but named explicit `agent_ids`
+is then confined to their currently visible agents (management-group scope); an id list that
+confines to nothing returns:
+
+```json
+{"error": {"code": 404, "message": "no reachable in-scope agent"}, "meta": {"api_version": "v1"}}
+```
+
+A `plugin.action` pair the registry cannot classify (`Unclassified`/`Ambiguous`) is **not**
+independently denied by this gate — it falls through to the same dispatch chokepoint that denies
+every other unclassified pair, so a classify miss never silently reaches an agent through this
+path. Refusals are counted the same way as every other targeting refusal on this route
+(`yuzu_server_dispatch_target_rejected_total{route="command",reason="destructive_untargeted"}`)
+and audited (`command.dispatch`, `result=denied`).
+
+MCP `execute_instruction` enforces the identical rule (same refusal message, same
+`agent_ids`-only requirement) — see `docs/mcp-server.md`. `POST /api/instructions/{id}/execute`,
+the dashboard execute surface, and MCP `execute_bundle` do not yet enforce this gate.
+
 **Response (403): unauthorized dispatch.** Two distinct causes share the `403` status but carry
 different messages (#1398) — an incident review can tell them apart from the audit trail's
 `detail=reason=<reason>` field alone (`forbidden` vs `approval_required`), even without the
