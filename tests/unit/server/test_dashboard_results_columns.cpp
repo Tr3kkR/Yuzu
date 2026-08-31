@@ -692,7 +692,11 @@ TEST_CASE("create-group-form route: a JIT-elevated session sees the "
         auth::Session s;
         s.username = "elevated-admin";
         s.role = auth::Role::user;
-        s.elevated_until = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+        {
+            const auto now = std::chrono::system_clock::now();
+            s.elevated_until = now + std::chrono::minutes(5);
+            s.elevation_issued_at = now;
+        }
         return s;
     };
     DashboardRoutes::PermFn perm_fn =
@@ -750,7 +754,11 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
         auth::Session s;
         s.username = "elevated-admin";
         s.role = auth::Role::user; // base role holds nothing; elevation carries it
-        s.elevated_until = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+        {
+            const auto now = std::chrono::system_clock::now();
+            s.elevated_until = now + std::chrono::minutes(5);
+            s.elevation_issued_at = now;
+        }
         return s;
     };
     DashboardRoutes::PermFn perm_fn =

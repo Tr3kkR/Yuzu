@@ -210,8 +210,11 @@ struct GroupFromResultsHarness {
             auth::Session s;
             s.username = kUser;
             s.role = auth::Role::admin;
-            if (elevated_session)
-                s.elevated_until = std::chrono::steady_clock::now() + std::chrono::minutes(5);
+            if (elevated_session) {
+                const auto now = std::chrono::system_clock::now();
+                s.elevated_until = now + std::chrono::minutes(5);
+                s.elevation_issued_at = now;
+            }
             return s;
         };
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
