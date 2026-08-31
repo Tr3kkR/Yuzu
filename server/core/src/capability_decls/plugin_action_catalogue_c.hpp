@@ -53,6 +53,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "network_config",
@@ -62,6 +63,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "network_config",
@@ -71,6 +73,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "network_config",
@@ -80,6 +83,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "network_config",
@@ -89,6 +93,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "network_config",
@@ -98,6 +103,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── netprobe (agents/plugins/netprobe/src/netprobe_plugin.cpp) ──
@@ -111,6 +117,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "netprobe",
@@ -120,6 +127,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "netprobe",
@@ -129,6 +137,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── netstat (agents/plugins/netstat/src/netstat_plugin.cpp) ──
@@ -143,6 +152,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "netstat",
@@ -152,6 +162,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── network_diag (agents/plugins/network_diag/src/network_diag_plugin.cpp) ──
@@ -163,6 +174,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "network_diag",
@@ -172,6 +184,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── network_actions (agents/plugins/network_actions/src/network_actions_plugin.cpp) ──
@@ -185,6 +198,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::Medium,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "network_actions",
@@ -194,6 +208,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── discovery (agents/plugins/discovery/src/discovery_plugin.cpp) ──
@@ -207,6 +222,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── wifi (agents/plugins/wifi/src/wifi_plugin.cpp) ──
@@ -218,6 +234,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "wifi",
@@ -227,6 +244,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── wol (agents/plugins/wol/src/wol_plugin.cpp) ──
@@ -243,6 +261,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::Medium,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "wol",
@@ -252,6 +271,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── http_client (agents/plugins/http_client/src/http_client_plugin.cpp) ──
@@ -270,6 +290,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "FileRetrieval",
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "http_client",
@@ -279,6 +300,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "http_client",
@@ -288,6 +310,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Infrastructure",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── certificates (agents/plugins/certificates/src/certificates_plugin.cpp) ──
@@ -299,6 +322,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "certificates",
@@ -308,6 +332,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "certificates",
@@ -320,6 +345,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Delete,
         .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── firewall (agents/plugins/firewall/src/firewall_plugin.cpp) ──
@@ -334,6 +360,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "firewall",
@@ -343,6 +370,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── quarantine (agents/plugins/quarantine/src/quarantine_plugin.cpp) ──
@@ -369,6 +397,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Execute,
         .risk_tier = authz::RiskTier::Critical,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "quarantine",
@@ -383,6 +412,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Execute,
         .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "quarantine",
@@ -392,6 +422,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "quarantine",
@@ -403,6 +434,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Execute,
         .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── rdp_control (agents/plugins/rdp_control/src/rdp_control_plugin.cpp) ──
@@ -422,6 +454,7 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::High,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "rdp_control",
@@ -431,8 +464,17 @@ inline constexpr std::array<CommandCapability, 34> kPluginActionCatalogueC{{
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
     },
 }};
+
+// #1398: every row in kPluginActionCatalogueC must author .execute_gate — an
+// omission would value-initialize to ExecuteGate::Unspecified (the zero
+// enumerator), which is a genuine compile failure here rather than a
+// silent runtime gap. See ExecuteGate's doc comment in
+// command_capability.hpp.
+static_assert(::yuzu::server::detail::all_gates_specified(kPluginActionCatalogueC),
+              "every row in kPluginActionCatalogueC must author .execute_gate");
 
 } // namespace detail
 

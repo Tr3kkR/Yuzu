@@ -2,10 +2,12 @@
  * test_schedule_runner.cpp — Unit tests for the recurring-schedule poller
  * (ScheduleRunner, #1191).
  *
- * Strategy: real ScheduleEngine / ExecutionTracker / ApprovalManager on one
- * shared :memory: SQLite handle (the production shape — they share
- * instructions.db), a real InstructionStore on a temp DB, and a FAKE
- * dispatch_fn that records calls and returns a configurable reach count.
+ * Strategy: real ScheduleEngine/ExecutionTracker/ApprovalManager (Postgres,
+ * ADR-0065, schema-per-store on one shared ephemeral database — the
+ * production shape now that InstructionDbPool is deleted and all three
+ * are independent Postgres stores), a real InstructionStore on the same
+ * database, and a FAKE dispatch_fn that records calls and returns a
+ * configurable reach count.
  * Due-ness is driven by creating schedules with next_execution_at in the
  * past (create_schedule honors an explicit value), so no clock injection is
  * needed.
@@ -21,11 +23,12 @@
 
 #include "../test_helpers.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <stdexcept>
@@ -37,15 +40,6 @@ using namespace yuzu::server;
 
 namespace {
 
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 struct DispatchCall {
     std::string plugin;
     std::string action;
@@ -55,13 +49,28 @@ struct DispatchCall {
     std::unordered_map<std::string, std::string> params;
 };
 
-// InstructionStore is now a migrated Postgres store (ADR-0058).
+// InstructionStore is now a migrated Postgres store (ADR-0058). ADR-0065
+// migration-programme PR 5 grew this same template/database (ADR-0008
+// schema-per-store-on-one-connection) across all 3 commits — this key has
+// exactly one caller in the whole test tree (this file), so growing its
+// setup function was safe under the PgTestTemplate replay-fingerprint rule
+// (no other TU shares this key, so there's no divergent setup to conflict
+// with). Now covers all 4 stores.
 yuzu::test::PgTestTemplate schedrunner_instr_tpl{
     "schedrunnerinstr", [](const std::string& dsn) {
         yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
         InstructionStore store{pool};
         if (!store.is_open())
             throw std::runtime_error("schedrunner instruction template: store failed to migrate");
+        ScheduleEngine engine{pool};
+        if (!engine.is_open())
+            throw std::runtime_error("schedrunner schedule engine template: store failed to migrate");
+        ApprovalManager approvals{pool};
+        if (!approvals.is_open())
+            throw std::runtime_error("schedrunner approval manager template: store failed to migrate");
+        ExecutionTracker tracker{pool};
+        if (!tracker.is_open())
+            throw std::runtime_error("schedrunner execution tracker template: store failed to migrate");
     }};
 
 // A trivial first-declared Harness member whose sole purpose is running the
@@ -87,11 +96,12 @@ struct Harness {
     yuzu::test::PostgresTestDb instr_db{schedrunner_instr_tpl};
     yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
 
-    TestDb db; // shared by engine + tracker + approvals (production shape)
-
-    ScheduleEngine engine{db.db};
-    ExecutionTracker tracker{db.db};
-    ApprovalManager approvals{db.db};
+    // ADR-0065 (migration-programme PR 5): all four stores built on
+    // instr_pool (one ephemeral Postgres database, schema-per-store) — the
+    // production shape now that InstructionDbPool is deleted.
+    ScheduleEngine engine{instr_pool};
+    ExecutionTracker tracker{instr_pool};
+    ApprovalManager approvals{instr_pool};
     InstructionStore is{instr_pool};
 
     std::vector<DispatchCall> calls;
@@ -142,7 +152,6 @@ struct Harness {
         INFO("[schedrunner instr] fixture status (blank == database came up OK): "
              << instr_db.error());
         REQUIRE(instr_db.available());
-        engine.create_tables();
         tracker.create_tables();
         approvals.create_tables();
 
@@ -192,16 +201,21 @@ struct Harness {
     }
 
     // Force an already-advanced schedule due again (a "next occurrence").
+    // ScheduleEngine now lives in Postgres (instr_pool) — poke it via a
+    // second raw connection, same as the interval-floor test below.
     void force_due(const std::string& id) {
-        char* err = nullptr;
-        auto sql = "UPDATE schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
-        REQUIRE(sqlite3_exec(db.db, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK);
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql =
+            "UPDATE schedule_engine.schedules SET next_execution_at = 1 WHERE id = '" + id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
     }
 };
 
 } // namespace
 
-TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[schedule][runner]") {
+TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[schedule][runner][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval");
 
@@ -226,6 +240,10 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
     // silently, since none of them inspect the caller at all.
     CHECK_FALSE(h.calls[0].caller.system);
     CHECK(h.calls[0].caller.principal == "admin");
+    // #1398: a direct auto-mode fire carries no approval provenance — the
+    // gate at the dispatch chokepoint relies on principal_is_admin alone
+    // for a role-gated pair reached this way, never a fabricated ticket.
+    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::None);
 
     // Tracked execution row, targeted count recorded.
     auto exec = h.tracker.get_execution(h.calls[0].execution_id);
@@ -246,7 +264,7 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
 }
 
 TEST_CASE("ScheduleRunner: 'once' schedule fires exactly once then disables",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "once");
 
@@ -258,7 +276,7 @@ TEST_CASE("ScheduleRunner: 'once' schedule fires exactly once then disables",
 }
 
 TEST_CASE("ScheduleRunner: unknown definition skips the occurrence but advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     auto id = h.make_due("no.such.def", "interval");
 
@@ -271,7 +289,7 @@ TEST_CASE("ScheduleRunner: unknown definition skips the occurrence but advances"
 
 TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOUT advancing "
           "(retries next tick)",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     // Regression pin (gov Gate 3/6 sibling finding): a genuine InstructionStore DB error used
     // to advance_schedule() unconditionally, permanently consuming that occurrence on a
     // transient Postgres blip — the same class of bug PolicyEvaluator::dispatch_due's
@@ -294,7 +312,7 @@ TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOU
 }
 
 TEST_CASE("ScheduleRunner: disabled definition skips the occurrence but advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     InstructionDefinition d;
     d.id = "test.off";
@@ -314,7 +332,7 @@ TEST_CASE("ScheduleRunner: disabled definition skips the occurrence but advances
 }
 
 TEST_CASE("ScheduleRunner: zero agents reached cancels the execution and advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     h.reach = 0;
     auto id = h.make_due("test.def", "interval");
@@ -329,7 +347,7 @@ TEST_CASE("ScheduleRunner: zero agents reached cancels the execution and advance
 }
 
 TEST_CASE("ScheduleRunner: dispatch throw cancels the execution and advances",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
     h.throw_on_dispatch = true;
     auto id = h.make_due("test.def", "interval");
@@ -345,7 +363,7 @@ TEST_CASE("ScheduleRunner: dispatch throw cancels the execution and advances",
 }
 
 TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the occurrence",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -365,7 +383,7 @@ TEST_CASE("ScheduleRunner: requires_approval submits one ticket and holds the oc
 }
 
 TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactly once",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -378,6 +396,11 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 
     REQUIRE(h.calls.size() == 1);
     CHECK(h.get(id).execution_count == 1);
+    // #1398: firing on an approved ticket stamps Ticket provenance — the
+    // ONE non-MCP redemption loop this ladder's gate relies on for a
+    // role-gated/always-gated definition's schedule to ever fire for a
+    // non-admin creator.
+    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::Ticket);
 
     // One-approval == one-run: force the next occurrence due — the spent
     // (still 'approved') ticket must be stale under the occurrence anchor,
@@ -389,8 +412,62 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
 }
 
+// #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding): a
+// ticket is minted for the definition's CONTENT at submit time, but
+// `fire()` re-fetches the definition fresh every tick and previously
+// matched a ticket by `(definition_id, scope_expression, schedule_id)`
+// alone — so a definition mutated between ticket-approval and the next
+// tick would fire under review that was never given for the NEW content.
+// Concrete exploit this closes: a seeded non-admin role (e.g. Operator,
+// which holds InstructionDefinition:Write + Schedule:Write + Execution:
+// Execute) gets a benign action approved, then mutates the SAME
+// definition to point at `script_exec.bash` (also `Execution:Execute`,
+// also gated) before the next tick — without this fix, the stale ticket
+// would silently cover the swapped, unreviewed action.
+TEST_CASE("ScheduleRunner: a definition mutated AFTER ticket approval does not fire under "
+          "the stale ticket (#1398 content-swap hardening)",
+          "[schedule][runner][approval][1398]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits a ticket for procs.list (test.def's content)
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+
+    // Mutate the definition's plugin/action AFTER approval, BEFORE the next
+    // tick — exactly the PUT /api/instructions/{id} write an operator with
+    // only InstructionDefinition:Write can perform.
+    auto def_result = h.is.get_definition("test.def");
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    InstructionDefinition mutated = **def_result;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+
+    h.runner.tick(); // must NOT fire the swapped action under the old ticket
+
+    CHECK(h.calls.empty()); // no dispatch happened at all — the swap was refused
+    // A fresh ticket for the NEW content is submitted and held, distinct
+    // from the original (now permanently stale — target mismatched) approved
+    // one. Two separate fields (not a concatenated string, #1398
+    // security-guardian re-review) so a definition whose plugin/action
+    // happen to concatenate to the same string as another pair still can't
+    // collide here — asserted independently.
+    auto still_pending = h.approvals.query({.status = "pending"});
+    REQUIRE(still_pending.size() == 1);
+    CHECK(still_pending[0].target_plugin == "script_exec");
+    CHECK(still_pending[0].target_action == "bash");
+    auto approved_now = h.approvals.query({.status = "approved"});
+    REQUIRE(approved_now.size() == 1);
+    CHECK(approved_now[0].target_plugin == "procs"); // the stale, never-consumed ticket
+    CHECK(approved_now[0].target_action == "list");
+    CHECK(approved_now[0].consumed_at == 0); // never redeemed
+}
+
 TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks next time",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -412,7 +489,7 @@ TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks
 }
 
 TEST_CASE("ScheduleRunner: definition approval_mode gates even without the schedule flag",
-          "[schedule][runner][approval]") {
+          "[schedule][runner][approval][pg]") {
     Harness h;
     h.make_due("test.gated", "interval", /*requires_approval=*/false);
 
@@ -425,7 +502,7 @@ TEST_CASE("ScheduleRunner: definition approval_mode gates even without the sched
 
 TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get independent "
           "approval tickets — one approval fires only its own schedule (M-02, #1806)",
-          "[schedule][runner][approval][m02]") {
+          "[schedule][runner][approval][m02][pg]") {
     Harness h;
     // Both due, both reference the same gated definition, both default to
     // the same scope_expression ("") and created_by ("admin") — exactly the
@@ -471,7 +548,7 @@ TEST_CASE("ScheduleRunner: two schedules sharing (creator,definition,scope) get 
 }
 
 TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy advance",
-          "[schedule][runner]") {
+          "[schedule][runner][pg]") {
     Harness h;
 
     // Create-time floor.
@@ -484,11 +561,17 @@ TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy 
     REQUIRE_FALSE(rejected.has_value());
 
     // Legacy row (predates the floor): clamp on advance so it cannot land
-    // next_execution_at <= now and re-fire every tick.
+    // next_execution_at <= now and re-fire every tick. ScheduleEngine now
+    // lives in Postgres (instr_pool) — poke it via a second raw connection.
     auto id = h.make_due("test.def", "interval");
-    char* err = nullptr;
-    auto sql = "UPDATE schedules SET interval_minutes = 0 WHERE id = '" + id + "'";
-    REQUIRE(sqlite3_exec(h.db.db, sql.c_str(), nullptr, nullptr, &err) == SQLITE_OK);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        auto sql = "UPDATE schedule_engine.schedules SET interval_minutes = 0 WHERE id = '" +
+                  id + "'";
+        yuzu::server::pg::PgResult res{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
 
     h.runner.tick();
 
@@ -504,7 +587,7 @@ TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy 
 
 TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the dispatch fn and "
           "exec.parameter_values",
-          "[schedule][runner][params]") {
+          "[schedule][runner][params][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/false,
                          R"({"target":"prod","retries":3})");
@@ -527,7 +610,7 @@ TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the dispatch fn
 
 TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the canonical "
           "empty object and dispatches an empty parameter map",
-          "[schedule][runner][params]") {
+          "[schedule][runner][params][pg]") {
     Harness h;
     auto id = h.make_due("test.def", "interval");
 
@@ -542,7 +625,7 @@ TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the
 // ── D7 (PLAN-003): arming re-check on EVERY fire path ───────────────────────
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval) fire path",
-          "[schedule][runner][d7]") {
+          "[schedule][runner][d7][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
     auto id = h.make_due("test.def", "interval");
 
@@ -553,7 +636,7 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval)
 }
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
-          "[schedule][runner][d7][approval]") {
+          "[schedule][runner][d7][approval][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
@@ -569,7 +652,7 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fir
 
 TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and approval-gated "
           "paths",
-          "[schedule][runner][d7]") {
+          "[schedule][runner][d7][pg]") {
     Harness h(ScheduleRunner::ArmingCheckFn{}); // deliberately empty — p14 not wired
     auto auto_id = h.make_due("test.def", "interval");
     auto gated_id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -584,7 +667,7 @@ TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and app
 
 TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved-ticket paths "
           "fire (existing approval behaviour unchanged)",
-          "[schedule][runner][d7][approval]") {
+          "[schedule][runner][d7][approval][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return true; });
 
     auto auto_id = h.make_due("test.def", "interval");
@@ -643,4 +726,59 @@ TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + targe
         }
     }
     CHECK(found);
+}
+
+// #1398 (compliance-officer + sre governance findings): the
+// approval_content_mismatch audit event added alongside the content-swap
+// hardening test (above, in the SQLite-only harness section) had no test
+// verifying the audit row is actually written (compliance-officer) — a
+// future refactor of fire_with_approval could silently drop the audit()
+// call and nothing would catch it. This test wires a real AuditStore
+// (mirroring the D7 audit test just above) and checks two things: (1) the
+// row exists with the expected detail fields, and (2) it fires exactly
+// ONCE across two ticks that both re-detect the same stale mismatch — not
+// once per tick (sre finding: the stale approved ticket never changes
+// status, so an un-deduplicated audit call would re-fire on every tick for
+// as long as the fresh replacement ticket stays pending).
+TEST_CASE("ScheduleRunner: a content mismatch audits once, with the approved vs. current "
+          "target in the detail, not once per tick (#1398)",
+          "[schedule][runner][approval][1398][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, schedrunner_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    Harness h(
+        [](const std::string&, const std::string&, const std::string&) { return true; }, &audit);
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits a ticket for procs.list
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+
+    auto def_result = h.is.get_definition("test.def");
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    InstructionDefinition mutated = **def_result;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+
+    h.runner.tick(); // detects the mismatch, audits once, submits a fresh ticket
+    h.runner.tick(); // re-detects the SAME stale mismatch — must NOT audit again
+
+    auto mismatch_rows_res = audit.query({.action = "instruction.schedule_fired"});
+    REQUIRE(mismatch_rows_res.has_value());
+    int mismatch_rows = 0;
+    for (const auto& e : *mismatch_rows_res) {
+        if (e.result == "denied" &&
+            e.detail.find("approval_content_mismatch") != std::string::npos) {
+            ++mismatch_rows;
+            CHECK(e.detail.find("approved_target=procs.list") != std::string::npos);
+            CHECK(e.detail.find("current_target=script_exec.bash") != std::string::npos);
+            CHECK(e.detail.find("schedule_id=" + id) != std::string::npos);
+        }
+    }
+    CHECK(mismatch_rows == 1);
 }

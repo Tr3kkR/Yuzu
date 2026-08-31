@@ -4,8 +4,9 @@
 ##
 ## Sources by platform:
 ##   Windows: IP Helper API (GetAdaptersAddresses), WinHTTP proxy API, dnsapi.dll
-##   Linux:   ip(8), /etc/resolv.conf, resolvectl, sysfs, environment variables
-##   macOS:   ifconfig, scutil, networksetup, dscacheutil
+##   Linux:   rtnetlink (RTM_GETLINK/RTM_GETADDR/RTM_GETROUTE), /proc/net/arp,
+##            /etc/resolv.conf, sysfs, environment variables, resolvectl (dns_cache only)
+##   macOS:   getifaddrs, SIOCGIFMEDIA, PF_ROUTE sysctl, SCDynamicStore
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -16,9 +17,15 @@ metadata:
   version: 1.0.0
   description: >
     Lists network adapters with MAC address, link speed, and
-    operational status. Skips loopback and tunnel interfaces.
-    On Windows uses GetAdaptersAddresses, on Linux reads ip-link
-    and sysfs speed, on macOS parses ifconfig output.
+    operational status. On Windows uses GetAdaptersAddresses and skips
+    loopback and tunnel interfaces; on Linux reads rtnetlink
+    (RTM_GETLINK) plus sysfs speed and skips loopback; on macOS reads
+    getifaddrs and SIOCGIFMEDIA and reports loopback (lo0) as a real
+    adapter. The loopback difference between Linux and macOS is
+    long-standing behaviour, not an oversight. On Linux the adapter name is
+    the kernel interface name, so devices with a parent link (veth, VLAN,
+    tunnel) are reported as eth0 rather than iproute2's display form
+    eth0@if74.
   tags: [network, inventory, hardware]
 
 spec:
@@ -80,8 +87,11 @@ metadata:
     Lists assigned IP addresses per adapter with subnet prefix length
     and default gateway. Returns both IPv4 and IPv6 unicast addresses.
     On Windows uses GetAdaptersAddresses with GAA_FLAG_INCLUDE_GATEWAYS,
-    on Linux parses ip-addr and ip-route, on macOS parses ifconfig and
-    route output.
+    on Linux reads rtnetlink (RTM_GETADDR/RTM_GETROUTE), on macOS reads
+    getifaddrs plus a PF_ROUTE sysctl for the default route. Loopback is
+    excluded on Linux and macOS. The Linux default gateway is taken from the
+    main routing table only, matching ip route show default; policy-routing
+    tables installed by VPNs are ignored.
   tags: [network, inventory, addressing]
 
 spec:
@@ -143,8 +153,10 @@ metadata:
     Lists configured DNS servers per adapter, including address
     family (IPv4/IPv6). On Windows enumerates per-adapter DNS
     server addresses via GetAdaptersAddresses. On Linux reads
-    /etc/resolv.conf nameserver entries. On macOS parses scutil
-    --dns output.
+    /etc/resolv.conf nameserver entries. On macOS reads SCDynamicStore,
+    unioning the global resolver key with every per-service resolver key
+    so supplemental (VPN split-DNS, secondary-interface) resolvers are
+    included, de-duplicated in first-seen order.
   tags: [network, inventory, dns]
 
 spec:
@@ -205,7 +217,12 @@ metadata:
     (none, http, pac, auto_detect), proxy address, and bypass list.
     On Windows reads WinHTTP IE proxy config. On Linux checks
     http_proxy/https_proxy/all_proxy/no_proxy environment variables.
-    On macOS queries networksetup for web proxy and auto-proxy URL.
+    On macOS reads SCDynamicStoreCopyProxies, checking the primary network
+    service first and then each scoped per-interface service, so a proxy
+    configured on a service that is not currently active is still reported.
+    Only the HTTP proxy and PAC URL are reported: a host configured with
+    only an HTTPS, SOCKS or FTP proxy reads as none. macOS results also
+    include a bypass row listing the proxy exception list.
   tags: [network, inventory, proxy, compliance]
 
 spec:
@@ -303,6 +320,75 @@ spec:
 
   gather:
     ttlSeconds: 30
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [network_config]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: device.network_config.arp
+  displayName: ARP / Neighbour Table
+  version: 1.0.0
+  description: >
+    Returns the host ARP / neighbour table (interface, IP, MAC address,
+    static/dynamic type). On Windows reads GetIpNetTable2 — IPv4 ARP and
+    IPv6 neighbours, including incomplete entries, capped at 20000 rows.
+    On Linux reads /proc/net/arp: IPv4 ARP only — IPv6 neighbours live in
+    a separate kernel table and are not reported, and non-Ethernet or
+    incomplete (non-ATF_COM) entries are skipped. On macOS reads a
+    PF_ROUTE RTF_LLINFO sysctl and de-duplicates; the dump carries no
+    interface name or static/dynamic type, so both fields are reported
+    as "-". Linux and macOS share Windows' 20000-row cap. This collects
+    the host's known neighbour identities (IP + MAC address) and is
+    tagged for compliance/inventory review on that basis.
+  tags: [network, inventory, arp, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: network_config
+    action: arp
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: interface
+        type: string
+      - name: ip_address
+        type: string
+      - name: mac_address
+        type: string
+      - name: entry_type
+        type: string
+    aggregation:
+      groupBy:
+        - entry_type
+      operations:
+        - count
+
+  readablePayload: "Get ARP / neighbour table"
+
+  gather:
+    ttlSeconds: 120
 
   approval:
     mode: auto

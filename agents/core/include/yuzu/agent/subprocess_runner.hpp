@@ -44,6 +44,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::agent {
@@ -150,6 +151,178 @@ struct SubprocessOptions {
     // agent -- a failed delivery escalates straight to the hard kill rather
     // than waiting out the grace for a signal that can never arrive.
     std::chrono::milliseconds soft_terminate_grace{0};
+
+    // Caller-supplied environment allow-list additions (Alex plan-gate
+    // ruling, PLAN-04 option b: the runner freeze is lifted for exactly this
+    // one narrowly-scoped extension). This is a DELIBERATE, BOUNDED widening
+    // of ADR-3002 A5's clear-slate env policy -- the child still never
+    // inherits the parent process' environment wholesale; the caller must
+    // name each variable it wants forwarded explicitly, one entry at a time.
+    // An entry whose name matches an existing A5 allow-list entry REPLACES
+    // it in place (never appended as a second, ambiguous same-named entry);
+    // an entry with a new name is appended in caller order. Empty (the
+    // default) leaves every existing caller's LaunchSpec byte-identical to
+    // today's -- this field changes nothing unless a caller opts in.
+    //
+    // FAILS CLOSED: if any entry's name is denylisted (the LD_*/DYLD_*
+    // prefixes, or the exact names IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/
+    // LOCPATH) or malformed (empty name, a name containing '=' or a NUL, a
+    // value containing a NUL, OR a name containing any non-ASCII byte --
+    // BR-010 whole-branch review: is_malformed_env_entry rejects this on
+    // EVERY platform, POSIX included, not just Windows), the ENTIRE launch
+    // is refused
+    // (termination_reason == spawn_error, tool_ran == false, no OS call
+    // attempted) rather than proceeding with that one entry silently
+    // dropped -- a silently-ignored LD_PRELOAD request would hide a caller
+    // bug. See merge_launch_env() in subprocess_launch_spec.hpp for the pure
+    // merge/validation logic and LaunchSpecError::denied_env_var for the
+    // specific rejection reason.
+    std::vector<std::pair<std::string, std::string>> extra_env;
+
+    // A2-002 (Alex plan-gate ruling, script_exec Windows-parity escalation):
+    // a SECOND, narrower widening of A5's clear-slate env policy, additive
+    // to (never a replacement for) extra_env above. BR4-006 (whole-branch
+    // review round 4): this point previously called the widening
+    // "Windows-ONLY" -- true when this flag was introduced, but point (c)
+    // below records that content_dist's migration exposed a real POSIX gap
+    // and Alex extended the SAME flag to the POSIX backend rather than
+    // inventing a second mechanism; the flag itself is cross-platform as of
+    // that ruling, even though script_exec (the caller this paragraph is
+    // about) only ever sets it on its own Windows leg -- see (c) and
+    // script_exec_plugin.cpp's file-header comment for why that ONE
+    // caller's POSIX leg has no gap to fill. Default
+    // false, so every existing caller's launch is bit-for-bit unchanged --
+    // this is covered by test_subprocess_launch_spec.cpp's default-value
+    // assertion and by test_subprocess_runner.cpp's "extra_env-only, flag
+    // unset" launch-spec test.
+    //
+    // WHY THIS EXISTS: script_exec's Windows leg (deleted CreateProcessA
+    // call, pre-runner-migration) passed a null lpEnvironment, so its
+    // children inherited the FULL parent environment unfiltered -- unlike
+    // the POSIX leg, which always kept an explicit seven-name safe_vars
+    // allow-list (PATH/HOME/USER/LANG/LC_ALL/TERM/TZ). Alex ruled AGAINST
+    // narrowing that pre-existing Windows behaviour to match POSIX's seven
+    // names when this runner replaced script_exec's private spawn paths.
+    // extra_env alone cannot express "forward everything the parent has" --
+    // it is an explicit, individually-validated, additive allow-list, by
+    // design (ADR-3002 A5) -- so this flag is the one narrowly-scoped
+    // exception PLAN-04/A2-002 authorizes: it exists ONLY to reproduce
+    // script_exec's pre-existing Windows behaviour, not as a general-purpose
+    // "give me the parent's environment" facility for any other caller.
+    //
+    // (a) INTERACTION WITH extra_env: when true, extra_env entries are still
+    // applied ON TOP of the inherited parent-environment block, using the
+    // SAME replace-in-place-never-duplicate semantics merge_launch_env()
+    // always uses (subprocess_launch_spec.hpp) -- extra_env is the base
+    // that's swapped from the A5 default to the live parent snapshot, not a
+    // rule that stops applying. A caller combining both (as script_exec
+    // does, forwarding its own seven-name allow-list on top of the full
+    // inherited block) gets: full parent env, with any of those seven names
+    // set to exactly the value extra_env specified, even if that differs
+    // from what the live parent process itself currently holds.
+    //
+    // (b) SECURITY: this deliberately bypasses ADR-3002 A5's clear-slate
+    // policy -- gated tightly: opt-in, default-off, cross-platform but
+    // per-caller (see (c) below for the POSIX backend's own gating), and
+    // every extra_env entry is STILL run through the existing
+    // denylist/malformed-entry checks
+    // (is_denied_env_name/is_malformed_env_entry) exactly as when this flag
+    // is false -- LD_*/DYLD_*/IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/LOCPATH
+    // remain refused (the whole launch fails closed) regardless of this
+    // flag's value; it only changes what UNNAMED variables the child also
+    // receives, never what extra_env itself is allowed to name. This exists
+    // to preserve pre-existing script_exec behaviour that PREDATES the
+    // runner -- it is not, and must never become, a general-purpose "inherit
+    // everything" facility for a caller with no equivalent legacy
+    // requirement.
+    //
+    // (c) POSIX: HONOURED, as of BR-001 (whole-branch review round 2, Alex
+    // ruling) -- this point previously said POSIX intentionally ignored the
+    // flag; that was true only until content_dist's migration exposed a
+    // real gap the reasoning below explains.
+    //
+    // content_dist's deleted POSIX launcher called execvp() WITHOUT ever
+    // replacing `environ`, so a staged installer inherited this agent's
+    // FULL live environment (HTTPS_PROXY, a licence variable, HOME,
+    // whatever the deployment set) -- unlike script_exec's deleted POSIX
+    // path, which already used an explicit seven-name safe_vars allow-list
+    // (extra_env alone reproduces THAT one exactly, no widening needed,
+    // which is why script_exec's POSIX leg still never sets this flag --
+    // see script_exec_plugin.cpp). The migrated runner's A5 clear-slate
+    // silently narrowed content_dist's staged installers to
+    // PATH/LC_ALL(/TZ) only: an undisclosed regression, not a deliberate
+    // hardening decision, and Alex ruled it must be fixed by extending this
+    // flag to POSIX rather than inventing a second mechanism.
+    //
+    // The POSIX backend in subprocess_runner.cpp now branches on this flag
+    // exactly as the Windows backend already did: reads its own live
+    // environment (POSIX `environ`), strips the ADR-3002 A5 injection class
+    // (LD_*/DYLD_*/IFS/BASH_ENV/ENV/GCONV_PATH/NLSPATH/LOCPATH) via
+    // subprocess_launch_spec.hpp's filter_inherited_env() -- SILENTLY
+    // (dropped, not fatal; see that function's own comment for why an
+    // inherited variable's failure mode must differ from extra_env's
+    // fail-closed one) -- then layers extra_env on top with the SAME
+    // replace-never-duplicate merge_launch_env() semantics point (a)
+    // above already describes for Windows. extra_env's own denylist/
+    // malformed-entry checks are UNCHANGED: a denied or malformed extra_env
+    // entry still fails the whole launch closed, on POSIX exactly as on
+    // Windows, regardless of this flag.
+    //
+    // content_dist now sets this flag on EVERY platform (its pre-migration
+    // behaviour was full inheritance everywhere, POSIX included -- there
+    // was never a Windows-only asymmetry in what it actually did, only in
+    // what this runner initially reproduced). script_exec's POSIX leg is
+    // UNCHANGED and must stay that way: it already has its own curated
+    // seven-name allow-list with no gap to fill, and widening it to full
+    // inheritance would be an unrelated, undiscussed behaviour change this
+    // flag's contract does not authorize for that caller.
+    bool inherit_parent_env = false;
+
+    // BR4-007 (whole-branch review round 4): Windows-only, no POSIX
+    // equivalent (there is no console concept to suppress there, so this
+    // field is simply ignored on the POSIX backend). Both script_exec's and
+    // content_dist's deleted private Windows launchers passed
+    // CREATE_NO_WINDOW to CreateProcessA -- migrating them onto this
+    // runner's shared Windows backend (whose own create_flags never set
+    // that bit, for callers with no equivalent pre-migration behaviour to
+    // preserve) silently dropped it, so an interactively-run agent
+    // launching either action could flash a console window a pre-migration
+    // caller never saw. Default false so every existing caller's launch is
+    // bit-for-bit unchanged -- opt in per call site, exactly the
+    // inherit_parent_env precedent above. Session-0 SERVICE deployments are
+    // unaffected either way (no console to flash); this exists for the
+    // interactive/diagnostic run case. Does not disable
+    // CREATE_NEW_PROCESS_GROUP or this call's soft_terminate_grace
+    // CTRL_BREAK delivery -- CREATE_NO_WINDOW only suppresses the new
+    // console WINDOW's visibility, it does not remove the process group or
+    // its console, and xplat-A2's existing caveat (GenerateConsoleCtrlEvent
+    // is already unreliable for a console-less agent SERVICE) is unchanged
+    // by this flag either way.
+    // BR-006 (adversarial review, HIGH -- corrects the paragraph above,
+    // which is WRONG about the Win32 contract and must not be re-derived
+    // from): CREATE_NO_WINDOW does not merely hide the new console WINDOW's
+    // visibility -- per Microsoft's own documented contract, a process
+    // created with this flag gets NO CONSOLE AT ALL (it is not attached to
+    // any console, new or inherited). GenerateConsoleCtrlEvent's contract
+    // requires the target process group to SHARE a console with the
+    // caller; a no_window=true child has none, so CTRL_BREAK_EVENT can
+    // never reach it. Concretely: for any caller that sets BOTH
+    // no_window=true AND a nonzero soft_terminate_grace, the "soft"
+    // termination step is a guaranteed no-op on Windows -- every
+    // deadline/cancel goes straight to TerminateJobObject, silently
+    // skipping the configured grace. A genuinely separate soft-IPC channel
+    // compatible with a no-console child would be a new, separately-
+    // designed mechanism, not an extension of CTRL_BREAK delivery, and
+    // stays out of scope here. What IS in scope, and now done: a caller
+    // must not CONFIGURE a grace it cannot deliver -- content_dist_exec_
+    // parsers.hpp and script_exec_plugin.cpp, the two callers that set
+    // no_window=true, both zero soft_terminate_grace on that path so the
+    // options struct honestly reflects what Windows actually delivers.
+    // This doc comment is the standing warning for any FUTURE
+    // no_window=true caller: zero soft_terminate_grace alongside it, or
+    // the two fields silently lie about each other. See the call-site
+    // comments in content_dist_exec_parsers.hpp and script_exec_plugin.cpp.
+    bool no_window = false;
 
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --
     // RLIMIT_AS in particular breaks mmap-heavy tools like `log show`, so
@@ -340,5 +513,24 @@ YUZU_EXPORT bool subprocess_cancel_requested();
  * path with SubprocessOptions::exec_verify (B6).
  */
 YUZU_EXPORT std::string probe_tool_path(const std::vector<std::string>& candidates);
+
+#ifdef _WIN32
+/**
+ * Whole-branch review round 3 (BR3-001): the Windows system directory,
+ * resolved via GetSystemDirectoryW and cached for the process's lifetime --
+ * same rationale, and the same pattern, as quarantine_plugin.cpp's
+ * netsh_path(). Both this runner's own Windows default working_dir (A6,
+ * below) and any caller that needs an absolute path to a well-known
+ * System32 tool (e.g. script_exec's PowerShell launch) must resolve
+ * through here rather than trusting a hard-coded "C:\Windows\System32"
+ * literal, which is wrong on any install where Windows lives on a non-C:
+ * volume -- an attacker-writable "C:\Windows\System32" tree on such a host
+ * would otherwise be treated as trusted.
+ *
+ * Returns an EMPTY string if GetSystemDirectoryW fails. Callers MUST fail
+ * closed on that (refuse the spawn), never fall back to a guessed literal.
+ */
+YUZU_EXPORT const std::string& windows_system_directory();
+#endif
 
 } // namespace yuzu::agent

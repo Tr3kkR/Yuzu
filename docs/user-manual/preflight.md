@@ -156,6 +156,15 @@ Two safety properties matter because executing an installer changes the endpoint
   device that has dropped out of your scope since the pre-flight run is **skipped**,
   not executed.
 
+**Approval governance (#1398).** The stage/execute dispatches this pipeline makes are
+`content_dist` actions — some of which a compiled per-pair gate marks as requiring an
+admin caller or a redeemed approval ticket on every OTHER dispatch surface (raw
+`/api/command`, MCP, schedules). Deploy is exempt from minting its own ticket: this
+pipeline's own re-authorization (above), run-once claim, and full audit trail are
+accepted as the equivalent control, so a non-admin operator with `SoftwareDeployment:Execute`
+can deploy without a separate approval step. This is a deliberate design choice, not a
+gap — see `docs/security-reviews/1398-dispatch-approval-gate-design.md`, Decision 5.
+
 **Deploying mid-run, and covering later devices.** Because you can deploy before
 the run finishes, a deployment only covers the devices that had cleared when you
 clicked. Devices that clear **afterward** are not added to the running deployment —

@@ -120,7 +120,7 @@ Session ID returned on registration. `WatchEvents` tracks connect/disconnect eve
 
 ### 1.9 Instruction Execution Statistics :white_check_mark: `T2`
 
-`ExecutionTracker` aggregation methods: per-agent stats, per-definition stats, fleet summary. REST endpoints: `GET /api/v1/execution-statistics`, `/agents`, `/definitions`. HTMX fragment for dashboard card.
+`ExecutionTracker` (ADR-0065: migrated to PostgreSQL, schema `execution_tracker`) aggregation methods: per-agent stats, per-definition stats, fleet summary. REST endpoints: `GET /api/v1/execution-statistics`, `/agents`, `/definitions`. HTMX fragment for dashboard card.
 
 ---
 
@@ -164,11 +164,11 @@ Session ID returned on registration. `WatchEvents` tracks connect/disconnect eve
 
 ### 2.9 Instruction Scheduling :white_check_mark: `T2`
 
-`ScheduleEngine` with frequency types (daily, weekly, monthly, sub-day), scope expressions evaluated dynamically at dispatch, enable/disable toggle, execution history tracking. REST CRUD via `/api/schedules`.
+`ScheduleEngine` (ADR-0065: migrated to PostgreSQL, schema `schedule_engine`) with frequency types (daily, weekly, monthly, sub-day), scope expressions evaluated dynamically at dispatch, enable/disable toggle, execution history tracking. REST CRUD via `/api/schedules`.
 
 ### 2.10 Instruction Approval Workflows :white_check_mark: `T2`
 
-`ApprovalManager` with submit/approve/reject, ownership validation (reviewer != submitter), pending count, scope expression, and full audit trail. Per-definition approval mode (auto/role-gated/always).
+`ApprovalManager` (ADR-0065: migrated to PostgreSQL, schema `approval_manager`) with submit/approve/reject, ownership validation (reviewer != submitter), pending count, scope expression, and full audit trail. Per-definition approval mode (auto/role-gated/always).
 
 ### 2.11 Target Estimation :white_check_mark: `T2`
 

@@ -37,6 +37,7 @@
 #include <barrier>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib> // ::setenv/::unsetenv (BR-001 POSIX inherit_parent_env tests below)
 #include <cstring> // std::strerror (B6 spawn_errno diagnostic)
 #include <filesystem>
 #include <memory>
@@ -864,6 +865,62 @@ TEST_CASE("run_bounded_subprocess: on_line delivers every produced line, uncappe
     CHECK(streamed[4] == "e");
 }
 
+TEST_CASE("run_bounded_subprocess: store_line delivers a blank completed line to on_line, matching "
+          "both deleted script_exec spawn paths' wire behaviour (A2-006)",
+          "[subprocess][streaming]") {
+    std::vector<std::string> streamed;
+    SubprocessResult r = run_bounded_subprocess(
+        {"/bin/sh", "-c", "printf 'row1\\n\\nrow2\\n'"},
+        SubprocessOptions{.deadline = 5000ms,
+                           .on_line = [&](const std::string& line) { streamed.push_back(line); }});
+    CHECK_FALSE(r.timed_out);
+    // The callback sees the blank line too -- three deliveries (row1, "",
+    // row2), not two. Before this fix, store_line's early `if (line.empty())
+    // return;` sat BEFORE the on_line call, so the middle blank line never
+    // reached the callback at all.
+    REQUIRE(streamed.size() == 3);
+    CHECK(streamed[0] == "row1");
+    CHECK(streamed[1].empty());
+    CHECK(streamed[2] == "row2");
+    // The stored collect-at-end snapshot still excludes the blank line --
+    // ONLY callback delivery changed; result.lines' contract is untouched.
+    REQUIRE(r.lines.size() == 2);
+    CHECK(r.lines[0] == "row1");
+    CHECK(r.lines[1] == "row2");
+}
+
+TEST_CASE("run_bounded_subprocess: a blank line contributes nothing to the stored-line byte budget "
+          "(A2-006)",
+          "[subprocess][streaming][output_cap]") {
+    // Four blank lines ahead of "hi": if a blank line consumed even one byte
+    // of the stored_line_bytes budget (as it would if store_line's early
+    // return ran before, rather than after, its budget bookkeeping), a
+    // 5-byte cap would be exhausted before "hi" is ever stored. Since blank
+    // lines are excluded from that accounting entirely, the full budget
+    // remains available for "hi" (2 bytes + 1 accounting byte).
+    SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "printf '\\n\\n\\n\\nhi\\n'"},
+                                                 SubprocessOptions{.deadline = 5000ms, .output_cap_bytes = 5});
+    CHECK(r.tool_ran);
+    REQUIRE(r.lines.size() == 1);
+    CHECK(r.lines[0] == "hi");
+}
+
+TEST_CASE("run_bounded_subprocess: result.lines never overshoots output_cap_bytes even when a "
+          "one-byte remainder would previously have admitted a whole second line (BR-008)",
+          "[subprocess][streaming][output_cap]") {
+    // output_cap_bytes = 5: "ab" consumes 3 stored bytes (2 + 1 accounting
+    // byte), leaving a budget of 2. "cd" needs 3 -- it must NOT fit. Before
+    // this fix, the gate only checked `stored_line_bytes < output_cap`
+    // (3 < 5, true) without ever checking whether THIS line's own bytes fit
+    // the remainder, so "cd" was admitted anyway and stored_line_bytes grew
+    // to 6 -- past the documented cap.
+    SubprocessResult r = run_bounded_subprocess({"/bin/sh", "-c", "printf 'ab\\ncd\\n'"},
+                                                 SubprocessOptions{.deadline = 5000ms, .output_cap_bytes = 5});
+    CHECK(r.tool_ran);
+    REQUIRE(r.lines.size() == 1); // "cd" correctly rejected, not overshot in
+    CHECK(r.lines[0] == "ab");
+}
+
 TEST_CASE("run_bounded_subprocess: A6 chdir's the child into working_dir",
           "[subprocess][working_dir]") {
     std::filesystem::path dir = yuzu::test::unique_temp_path("yuzu_test_cwd_");
@@ -914,6 +971,69 @@ TEST_CASE("run_bounded_subprocess: A5 env is a clear-and-allow-list, not the dae
         CHECK(line.substr(0, 9) != "BASH_ENV=");
         CHECK(line.substr(0, 11) != "GCONV_PATH=");
     }
+}
+
+// ── BR-001 (whole-branch review round 2): POSIX inherit_parent_env ─────────
+// content_dist's deleted POSIX launcher inherited the agent's full parent
+// environment via execvp() (no environ replacement); the migrated runner's
+// A5 clear-slate silently narrowed that. These are the real-child twin of
+// test_subprocess_launch_spec.cpp's pure filter_inherited_env/
+// merge_launch_env fixtures -- proving the actual POSIX fork/exec path (not
+// just the pure decision core) observes the contract.
+
+TEST_CASE("run_bounded_subprocess: POSIX inherit_parent_env defaults to false, leaving an "
+          "existing caller's child environment exactly as before (BR-001, no-regression guard)",
+          "[subprocess][env][inherit_parent_env]") {
+    ::setenv("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value", 1);
+    SubprocessResult r = run_bounded_subprocess({"/usr/bin/env"}, SubprocessOptions{.deadline = 5000ms});
+    ::unsetenv("YUZU_TEST_INHERIT_ENV_MARKER");
+
+    CHECK(r.tool_ran);
+    CHECK_FALSE(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=parent_value"));
+}
+
+TEST_CASE("run_bounded_subprocess: POSIX inherit_parent_env=true forwards the real parent "
+          "environment, minus the ADR-3002 A5 injection class (BR-001)",
+          "[subprocess][env][inherit_parent_env]") {
+    ::setenv("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value", 1);
+    // Injection-class names -- must be withheld from the child even though
+    // they ARE genuinely present in the real parent environment being
+    // inherited (silent strip, not a launch failure -- see
+    // filter_inherited_env's own contract comment).
+    ::setenv("LD_PRELOAD", "/evil.so", 1);
+    ::setenv("IFS", "$'\\n'", 1);
+    SubprocessResult r = run_bounded_subprocess(
+        {"/usr/bin/env"}, SubprocessOptions{.deadline = 5000ms, .inherit_parent_env = true});
+    ::unsetenv("YUZU_TEST_INHERIT_ENV_MARKER");
+    ::unsetenv("LD_PRELOAD");
+    ::unsetenv("IFS");
+
+    CHECK(r.tool_ran);
+    // The real parent value survives via full-environment inheritance --
+    // this name is never in the runner's own A5 allow-list at all.
+    CHECK(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=parent_value"));
+    for (const auto& line : r.lines) {
+        CHECK(line.substr(0, 3) != "LD_");
+        CHECK(line.substr(0, 5) != "DYLD_");
+        CHECK(line.substr(0, 4) != "IFS=");
+    }
+}
+
+TEST_CASE("run_bounded_subprocess: POSIX inherit_parent_env=true still applies extra_env on top, "
+          "replace-never-duplicate (BR-001, design point (a))",
+          "[subprocess][env][inherit_parent_env]") {
+    ::setenv("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value", 1);
+    SubprocessResult r = run_bounded_subprocess(
+        {"/usr/bin/env"},
+        SubprocessOptions{.deadline = 5000ms,
+                           .extra_env = {{"YUZU_TEST_INHERIT_ENV_MARKER", "override"}},
+                           .inherit_parent_env = true});
+    ::unsetenv("YUZU_TEST_INHERIT_ENV_MARKER");
+
+    CHECK(r.tool_ran);
+    // extra_env REPLACES the inherited value in place -- one entry, not two.
+    CHECK(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=override"));
+    CHECK_FALSE(contains_line(r.lines, "YUZU_TEST_INHERIT_ENV_MARKER=parent_value"));
 }
 
 TEST_CASE("run_bounded_subprocess: B3 an opt-in RLIMIT_CPU cap is applied to the child, off by default "
@@ -1176,6 +1296,7 @@ TEST_CASE("the Spawner interface is independently injectable/testable without sp
 #include <yuzu/agent/subprocess_runner.hpp>
 
 #include <chrono>
+#include <cstdlib> // _putenv_s (A2-002 inherit_parent_env tests below)
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -1189,11 +1310,18 @@ namespace {
 
 // argv[0] MUST be absolute -- run_bounded_subprocess never PATH-searches
 // (subprocess_runner.hpp) -- and neither of these carries a banned
-// .bat/.cmd/.com extension. These are the same canonical system paths the
-// runner's own Windows backend already assumes for the child's working
-// directory ("C:\\Windows\\System32", subprocess_runner.cpp) and its A5
-// environment allow-list (SystemRoot/windir = "C:\\Windows",
-// subprocess_launch_spec.hpp default_launch_env).
+// .bat/.cmd/.com extension. These are resolved at RUNTIME via
+// windows_system_directory() (GetSystemDirectoryW, cached) rather than the
+// hard-coded "C:\\Windows\\System32" literal this used to be (BR4-005,
+// whole-branch review round 4): a hard-coded literal makes this whole suite
+// fail before ever exercising anything -- including BR3-001's runtime
+// system-directory fix itself -- on the relocated-system (non-`C:`)
+// configuration this branch's own security fix (subprocess_runner.cpp's
+// `windows_system_directory()` call, changelog.d's
+// 5.1-windows-system-directory-resolution fragment) exists to protect. On a
+// standard `C:` install the resolved value is byte-identical to the old
+// literal, so this is a strict improvement with no behaviour change on the
+// common case.
 //
 // Every argv token below is passed as its OWN element, so the Colascione
 // quoter never has to quote anything: the child sees a bare
@@ -1202,13 +1330,13 @@ namespace {
 // AutoRun hook, so a machine-local `Command Processor\AutoRun` value on a CI
 // image can neither inject output into the captured stream nor change the
 // child's exit code -- these assertions describe the runner, not the host.
-constexpr const char* kCmdExe = "C:\\Windows\\System32\\cmd.exe";
+const std::string kCmdExe = windows_system_directory() + "\\cmd.exe";
 
 // `ping -n 30 127.0.0.1` is the portable Windows sleep: ~29s of one-second
 // intervals, far longer than any deadline asserted below, with no PowerShell
 // and no real network dependency (loopback ICMP is serviced locally, and even
 // a blocked ICMP path only makes it take LONGER, never shorter).
-constexpr const char* kPingExe = "C:\\Windows\\System32\\ping.exe";
+const std::string kPingExe = windows_system_directory() + "\\ping.exe";
 
 } // namespace
 
@@ -1307,6 +1435,114 @@ TEST_CASE("run_bounded_subprocess (Windows) honours a pre-armed per-invocation C
     CHECK(elapsed < 15s);
 }
 
+TEST_CASE("run_bounded_subprocess (Windows) store_line delivers a blank completed line to on_line "
+          "(A2-006)",
+          "[subprocess][windows][streaming]") {
+    std::vector<std::string> streamed;
+    SubprocessResult result = run_bounded_subprocess(
+        // NOTE: no space directly before `&` -- cmd.exe's echo prints its
+        // entire argument LITERALLY, trailing whitespace included, up to the
+        // (unescaped) command separator, so "echo row1 &" would actually
+        // print "row1 " (trailing space) rather than "row1". Caught live on
+        // Windows CI (2026-08-31): the first CI run of this test to ever
+        // actually execute past compile time failed on exactly this.
+        {kCmdExe, "/d", "/c", "echo row1& echo.& echo row2"},
+        SubprocessOptions{.deadline = 10000ms,
+                           .on_line = [&](const std::string& line) { streamed.push_back(line); }});
+
+    CHECK_FALSE(result.timed_out);
+    CHECK(result.tool_ran);
+    // "echo." emits a bare CRLF -- a completed BLANK line -- between the two
+    // named lines; the callback must see all three, not two. Before this fix,
+    // store_line's early `if (line.empty()) return;` sat BEFORE the on_line
+    // call, so this middle line never reached the callback at all.
+    REQUIRE(streamed.size() == 3);
+    CHECK(streamed[0] == "row1");
+    CHECK(streamed[1].empty());
+    CHECK(streamed[2] == "row2");
+    // The stored collect-at-end snapshot still excludes the blank line --
+    // ONLY callback delivery changed.
+    REQUIRE(result.lines.size() == 2);
+    CHECK(result.lines[0] == "row1");
+    CHECK(result.lines[1] == "row2");
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env defaults to false, leaving an "
+          "existing caller's child environment exactly as before (A2-002)",
+          "[subprocess][windows][env]") {
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value");
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c", "echo %YUZU_TEST_INHERIT_ENV_MARKER%"},
+        SubprocessOptions{.deadline = 10000ms}); // inherit_parent_env left at its default
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", ""); // best-effort cleanup
+
+    CHECK(result.tool_ran);
+    REQUIRE(result.lines.size() == 1);
+    // cmd.exe echoes an unexpanded "%VAR%" literal when the name is unset in
+    // ITS OWN environment -- proving the A5 allow-list child never saw this
+    // process' marker, exactly as every existing caller already gets today.
+    CHECK(result.lines[0] == "%YUZU_TEST_INHERIT_ENV_MARKER%");
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true forwards the full parent "
+          "environment, with extra_env still applied on top (A2-002, design point (a))",
+          "[subprocess][windows][env]") {
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value");
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c",
+         // No space directly before `&` -- see the A2-006 test's comment above.
+         "echo %YUZU_TEST_INHERIT_ENV_MARKER%& echo %YUZU_TEST_OVERRIDE_MARKER%"},
+        SubprocessOptions{.deadline = 10000ms,
+                           .extra_env = {{"YUZU_TEST_OVERRIDE_MARKER", "extra_value"}},
+                           .inherit_parent_env = true});
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", ""); // best-effort cleanup
+
+    CHECK(result.tool_ran);
+    REQUIRE(result.lines.size() == 2);
+    // The real parent value survives via full-environment inheritance -- this
+    // name was never in extra_env at all.
+    CHECK(result.lines[0] == "parent_value");
+    // extra_env is still applied ON TOP of the inherited block: this name was
+    // never set in the real parent environment, so its only possible source
+    // is extra_env's replace-never-duplicate merge over the inherited base.
+    CHECK(result.lines[1] == "extra_value");
+}
+
+TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true withholds the ADR-3002 A5 "
+          "injection class from the child, matching the POSIX backend (BR-005)",
+          "[subprocess][windows][env][inherit_parent_env]") {
+    // Present in the raw GetEnvironmentStringsW() snapshot (proven by the
+    // no-regression test above establishing the harness can see a marker
+    // set via _putenv_s), but must never reach the child once
+    // inherit_parent_env=true routes it through filter_inherited_env --
+    // Windows matching is case-insensitive, so an uppercased "LD_PRELOAD"
+    // and "IFS" both exercise the same detail::is_denied_env_name() path
+    // the POSIX test above exercises.
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value");
+    (void)_putenv_s("LD_PRELOAD", "evil.dll");
+    (void)_putenv_s("IFS", "broken");
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c",
+         // No space directly before `&` -- see the A2-006 test's comment above.
+         "echo %YUZU_TEST_INHERIT_ENV_MARKER%& echo [%LD_PRELOAD%]& echo [%IFS%]"},
+        SubprocessOptions{.deadline = 10000ms, .inherit_parent_env = true});
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", ""); // best-effort cleanup
+    (void)_putenv_s("LD_PRELOAD", "");
+    (void)_putenv_s("IFS", "");
+
+    CHECK(result.tool_ran);
+    REQUIRE(result.lines.size() == 3);
+    // The real parent value survives -- this name is not in the A5 injection
+    // class, so ordinary full-environment inheritance still applies.
+    CHECK(result.lines[0] == "parent_value");
+    // cmd.exe echoes the literal "%VAR%" placeholder when the child's OWN
+    // environment has no such name -- proving filter_inherited_env withheld
+    // both, exactly as the POSIX backend's twin test proves for LD_PRELOAD
+    // and IFS.
+    CHECK(result.lines[1] == "[%LD_PRELOAD%]");
+    CHECK(result.lines[2] == "[%IFS%]");
+}
+
 // K2/CDX-P2-003: the Windows "is executable" half of probe_tool_path's
 // header contract -- previously the backend only checked exists-and-not-a-
 // directory, so an existing .txt, a directory sibling, or a spawn-banned
@@ -1314,9 +1550,12 @@ TEST_CASE("run_bounded_subprocess (Windows) honours a pre-armed per-invocation C
 // then refuse (or worse, be unable) to exec.
 TEST_CASE("probe_tool_path (Windows) honours the executable half of its contract",
           "[subprocess][probe][windows]") {
-    // A real PE binary is returned; a directory is not executable.
+    // A real PE binary is returned; a directory is not executable. (BR4-005:
+    // the system directory itself, runtime-resolved like kCmdExe above,
+    // rather than a hard-coded "C:\\Windows" literal -- any real directory
+    // proves the same "not executable" contract.)
     CHECK(probe_tool_path({kCmdExe}) == kCmdExe);
-    CHECK(probe_tool_path({"C:\\Windows"}).empty());
+    CHECK(probe_tool_path({windows_system_directory()}).empty());
 
     yuzu::test::TempDir dir("yuzu_test_probe_");
     std::filesystem::create_directories(dir.path);
