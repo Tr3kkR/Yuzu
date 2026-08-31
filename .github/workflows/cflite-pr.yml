@@ -22,9 +22,12 @@ on:
     # closure is the six parser families below plus tests/fuzz/ itself -
     # nothing in agents/, sdk/, proto/, or the rest of server/ reaches
     # them. Family globs (not exact files) so a sibling header/impl added
-    # to a family stays covered. KEEP IN SYNC with .clusterfuzzlite/build.sh
-    # inputs; the scheduled batch leg (cflite-batch.yml) backstops any PR
-    # this filter misses. Narrowing matters because affected-target pruning
+    # to a family stays covered. KEEP IN SYNC with BOTH
+    # .clusterfuzzlite/build.sh's inputs AND cflite-batch.yml's identical
+    # paths list - the batch leg uses the SAME filter, so a PR this list
+    # misses is missed by both legs; when a fuzzed file grows an
+    # out-of-family include, add the new family glob to both workflows in
+    # the same change. Narrowing matters because affected-target pruning
     # fails OPEN (an empty affected set keeps ALL targets), so this filter
     # is the only mechanism that makes an unrelated PR free.
     paths:
@@ -42,7 +45,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions: read-all
+# Job blocks below declare their own scopes; keep the workflow default
+# minimal so a future job cannot silently inherit a broad grant.
+permissions:
+  contents: read
 
 jobs:
   fuzz:

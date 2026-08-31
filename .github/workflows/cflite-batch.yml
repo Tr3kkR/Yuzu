@@ -10,22 +10,28 @@
 #   coverage - replays that corpus under a coverage build and publishes
 #              cifuzz-coverage-latest, which cflite-pr.yml's build step uses
 #              for affected-target pruning.
-#   prune    - minimizes the stored corpus (replaces it wholesale); run
-#              sparingly, and never concurrently with batch.
+#   prune    - minimizes the stored corpus (replaces it wholesale); manual
+#              dispatch only, run sparingly.
 #
 # Triggers: push to dev, gated on the same fuzzed-closure paths as
-# cflite-pr.yml. Deliberate: cron and workflow_dispatch only fire from the
-# DEFAULT branch (main), which lags dev by months - a cron-only version of
-# this workflow would stay dormant until the next dev->main merge and would
-# then fuzz main's stale tree. A push trigger runs the pushed ref's own
-# workflow file, so this leg is live as soon as it lands on dev. The weekly
-# cron below is the eventual steady state for when main catches up.
+# cflite-pr.yml (KEEP the two lists identical), plus workflow_dispatch.
+# Deliberate: a push trigger runs the pushed ref's own workflow file, so
+# this leg is live as soon as it lands on dev. There is deliberately NO
+# cron: schedule only fires from the DEFAULT branch (main), which lags dev
+# by months - a cron run would build main's stale tree, its coverage
+# upload would then be the freshest cifuzz-coverage-latest most weeks and
+# would drive the PR job's affected-target pruning from a months-old line
+# map, and a cron prune would shed dev-corpus inputs that main's binaries
+# reject. Revisit a cron once main tracks dev closely.
 #
-# Corpus durability = artifact retention (default 90 days). Acceptable while
-# batch runs at least that often. A dedicated storage repo was considered
-# and rejected: it needs admin (new repo + PAT + secret), and the cifuzz git
-# filestore full-clones the storage repo in both action containers on every
-# PR run.
+# Corpus durability = artifact retention (default 90 days). The only cadence
+# is dev pushes touching the paths below (measured ~1 per 10 days over the
+# last 60); if 90 quiet days ever pass, the corpus and coverage report
+# expire and the system degrades to seeds + keep-all pruning until the next
+# batch run - visible only as the download-miss warnings in the job logs.
+# A dedicated storage repo was considered and rejected: it needs admin
+# (new repo + PAT + secret), and the cifuzz git filestore full-clones the
+# storage repo in both action containers on every PR run.
 #
 # upload-build is deliberately NOT set on the batch job: with prior builds
 # available, PR runs switch to reporting only crashes they judge NEW, and
@@ -55,11 +61,12 @@ on:
         description: 'Also run corpus prune after batch'
         type: boolean
         default: false
-  schedule:
-    - cron: '30 2 * * 1'   # weekly; dormant until this file is on main
 
-# Never cancel a batch mid-corpus-upload, and never let two writers race
-# on the corpus artifacts: queue instead.
+# Never cancel a RUNNING batch mid-corpus-upload, and never let two runs'
+# writers race on the corpus artifacts. Note GitHub keeps at most one
+# PENDING run per group: a newer pending run replaces an older pending one
+# (including a pending dispatch-with-prune - re-dispatch if that happens);
+# the running run always completes.
 concurrency:
   group: cflite-batch
   cancel-in-progress: false
@@ -123,10 +130,11 @@ jobs:
 
   prune:
     name: Corpus prune
-    # Weekly (once live on main) or explicit dispatch only - prune REPLACES
-    # the stored corpus, so it runs less often than batch and only after a
-    # fresh batch upload.
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.prune)
+    # Explicit dispatch only - prune REPLACES the stored corpus wholesale
+    # (a prune against a broken/flaky target sheds corpus permanently once
+    # prior artifact versions expire), so it never runs unattended and only
+    # after a fresh batch upload.
+    if: github.event_name == 'workflow_dispatch' && inputs.prune
     needs: batch
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -149,3 +157,76 @@ jobs:
           mode: prune
           sanitizer: address
           fuzz-seconds: 600
+
+  # A red batch/coverage/prune has no other consumer: the workflow is not a
+  # required check and nobody watches push-triggered runs, so a persistent
+  # failure would silently stop corpus/coverage growth (the PR job then
+  # degrades to seeds + keep-all pruning with no signal). Mirror
+  # nightly.yml's nightly-broken pattern: open or comment on a
+  # cflite-batch-broken issue. Unlike nightly-broken there is NO merge
+  # discipline attached - the issue is a repair prompt, not a gate.
+  alert:
+    name: "Open cflite-batch-broken on failure"
+    needs: [batch, coverage, prune]
+    # `always()` alone also runs after cancellation, which is routine here
+    # (superseded pending runs); only real failures should file.
+    if: ${{ !cancelled() && failure() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update cflite-batch-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        with:
+          script: |
+            const label = 'cflite-batch-broken';
+            const failedJobs = [];
+            const ctx = JSON.parse(process.env.NEEDS_JSON);
+            for (const [name, job] of Object.entries(ctx)) {
+              if (job.result === 'failure') failedJobs.push(name);
+            }
+            const summary = failedJobs.length
+              ? failedJobs.join(', ')
+              : 'unknown (alert fired without specific job failures)';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const sha = '${{ github.sha }}';
+            const body = [
+              `ClusterFuzzLite batch run failed @ \`${sha.substring(0, 7)}\`.`,
+              ``,
+              `**Failed jobs:** ${summary}`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `While this is open, corpus/coverage artifacts stop updating and`,
+              `PR-side fuzzing silently degrades to seed corpora + keep-all`,
+              `pruning. Not a merge gate.`,
+              ``,
+              `(auto-posted by .github/workflows/cflite-batch.yml — close after a green run.)`,
+            ].join('\n');
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 5,
+            });
+            if (existing.data.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: 'ClusterFuzzLite batch pipeline is broken',
+                labels: [label],
+                body,
+              });
+            }
