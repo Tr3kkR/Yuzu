@@ -47,6 +47,7 @@
  * in test_web_utils.cpp is TSan-safe and keeps the decision logic checked.
  */
 
+#include "test_loopback_http.hpp"
 #include "web_utils.hpp"
 
 #include <httplib.h>
@@ -93,6 +94,11 @@ struct BodyCapTestServer {
     int port{0};
     std::atomic<int> mcp_handler_calls{0};
     std::atomic<int> other_handler_calls{0};
+    // Rejection witness (#2757): incremented exactly where the pre-routing
+    // handler below decides to reject, so a Windows connection-reset
+    // fallback (test_loopback_http.hpp) can prove the rejection actually
+    // ran for a given request rather than accepting any lost response.
+    std::atomic<int> rejections{0};
 
     void start() {
         svr.Post("/mcp/v1/", [this](const httplib::Request&, httplib::Response& res) {
@@ -115,7 +121,7 @@ struct BodyCapTestServer {
         // try/catch, and distinguishes 411 from 413/415; none of that is
         // replicated here, so this fixture proves the decision reaches the
         // wire, not the response taxonomy.
-        svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res)
+        svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {
             if (mcp_body_exceeds_cap(req.path, req.get_header_value_u64("Content-Length", 0),
                                      kTestCap) ||
@@ -125,6 +131,7 @@ struct BodyCapTestServer {
                 res.status = 413;
                 res.set_content(R"({"error":{"code":413,"message":"too large"}})",
                                 "application/json");
+                rejections.fetch_add(1);
                 return httplib::Server::HandlerResponse::Handled;
             }
             return httplib::Server::HandlerResponse::Unhandled;
@@ -176,9 +183,12 @@ TEST_CASE("MCP body cap: an oversized POST is 413'd and never reaches the handle
     cli.set_connection_timeout(5);
     cli.set_read_timeout(5);
 
-    auto r = cli.Post("/mcp/v1/", std::string(kTestCap + 1, 'x'), "application/json");
-    REQUIRE(r);
-    CHECK(r->status == 413);
+    // 1025 B crosses CPPHTTPLIB_EXPECT_100_THRESHOLD (1024), so this request
+    // also exercises the Expect: 100-continue path - see
+    // test_loopback_http.hpp for why that matters on Windows.
+    yuzu::test::expect_pre_routing_rejection(
+        [&] { return cli.Post("/mcp/v1/", std::string(kTestCap + 1, 'x'), "application/json"); },
+        413, ts.rejections);
     CHECK(ts.mcp_handler_calls.load() == 0);
 }
 

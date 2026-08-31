@@ -84,7 +84,7 @@ spec:
     ttlSeconds: 600
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]

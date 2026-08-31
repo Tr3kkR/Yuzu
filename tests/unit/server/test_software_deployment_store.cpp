@@ -92,7 +92,7 @@ SoftwareDeployment make_deployment(const std::string& package_id,
 
 TEST_CASE("SoftwareDeploymentStore reports !is_open on a migration failure",
           "[software_deployment][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

@@ -66,6 +66,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "hardware",
@@ -76,6 +77,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "hardware",
@@ -86,6 +88,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "hardware",
@@ -96,6 +99,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "hardware",
@@ -106,6 +110,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "hardware",
@@ -116,6 +121,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "hardware",
@@ -126,6 +132,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "hardware",
@@ -136,6 +143,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── users (agents/plugins/users/src/users_plugin.cpp) ─────────────────
@@ -150,6 +158,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "users",
@@ -160,6 +169,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "users",
@@ -170,6 +180,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "users",
@@ -180,6 +191,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "users",
@@ -190,6 +202,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "users",
@@ -200,6 +213,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "users",
@@ -210,6 +224,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── status (agents/plugins/status/src/status_plugin.cpp) ──────────────
@@ -224,6 +239,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "status",
@@ -234,6 +250,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "status",
@@ -244,6 +261,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "status",
@@ -254,6 +272,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "status",
@@ -264,6 +283,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "status",
@@ -274,6 +294,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     // `switch` emits the live agent session credential alongside connection
     // state (status_plugin.cpp:381, `session_id|{}` via `cfg("agent.session_id")`)
@@ -289,6 +310,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "status",
@@ -299,6 +321,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── os_info (agents/plugins/os_info/src/os_info_plugin.cpp) ───────────
@@ -312,6 +335,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "os_info",
@@ -322,6 +346,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "os_info",
@@ -332,6 +357,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "os_info",
@@ -342,6 +368,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "os_info",
@@ -352,6 +379,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── storage (agents/plugins/storage/src/storage_plugin.cpp) ───────────
@@ -374,6 +402,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "storage",
@@ -384,6 +413,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "storage",
@@ -394,6 +424,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Delete,
         .risk_tier = authz::RiskTier::High,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "storage",
@@ -404,6 +435,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "storage",
@@ -414,6 +446,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Delete,
         .risk_tier = authz::RiskTier::High,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 
     // ── installed_apps (agents/plugins/installed_apps/src/installed_apps_plugin.cpp) ──
@@ -429,6 +462,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "installed_apps",
@@ -439,6 +473,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "installed_apps",
@@ -449,6 +484,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "installed_apps",
@@ -459,6 +495,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── processes (agents/plugins/processes/src/processes_plugin.cpp) ─────
@@ -473,6 +510,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "processes",
@@ -483,6 +521,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "processes",
@@ -493,6 +532,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "processes",
@@ -503,6 +543,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── procfetch (agents/plugins/procfetch/src/procfetch_plugin.cpp) ─────
@@ -516,6 +557,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── disk_space (agents/plugins/disk_space/src/disk_space_plugin.cpp) ──
@@ -529,6 +571,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── device_identity (agents/plugins/device_identity/src/device_identity_plugin.cpp) ──
@@ -546,6 +589,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "device_identity",
@@ -556,6 +600,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "device_identity",
@@ -566,6 +611,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── agent_logging (agents/plugins/agent_logging/src/agent_logging_plugin.cpp) ──
@@ -593,6 +639,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "agent_logging",
@@ -603,6 +650,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── diagnostics (agents/plugins/diagnostics/src/diagnostics_plugin.cpp) ──
@@ -620,6 +668,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "diagnostics",
@@ -630,6 +679,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     // `connection_info` emits the live agent session credential alongside
     // connection state (diagnostics_plugin.cpp:171, `session_id|{}` via
@@ -644,6 +694,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── example (agents/plugins/example/src/example_plugin.cpp) ───────────
@@ -658,6 +709,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "example",
@@ -668,6 +720,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 
     // ── chargen (agents/plugins/chargen/src/chargen_plugin.cpp) ───────────
@@ -690,6 +743,7 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Execute,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
     {
         .plugin = "chargen",
@@ -700,8 +754,17 @@ inline constexpr std::array<CommandCapability, 55> kPluginActionCatalogueB{{
         .operation = authz::Operation::Execute,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 }};
+
+// #1398: every row in kPluginActionCatalogueB must author .execute_gate — an
+// omission would value-initialize to ExecuteGate::Unspecified (the zero
+// enumerator), which is a genuine compile failure here rather than a
+// silent runtime gap. See ExecuteGate's doc comment in
+// command_capability.hpp.
+static_assert(::yuzu::server::detail::all_gates_specified(kPluginActionCatalogueB),
+              "every row in kPluginActionCatalogueB must author .execute_gate");
 
 } // namespace detail
 

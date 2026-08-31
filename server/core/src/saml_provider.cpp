@@ -481,6 +481,83 @@ static std::vector<std::string> extract_group_values(xmlNodePtr assertion,
     return groups;
 }
 
+/// Max stored length of an IdP-attested display/email attribute value, and a
+/// sanitiser applied at the parse boundary. These values are semi-trusted (a
+/// compromised IdP, or an Entra/AD tenant where `displayName` is user-settable,
+/// controls them) and flow to the operational log (spdlog), the dashboard, and
+/// `/whoami`. An internal newline would let a value forge a second log record
+/// (Gate 4 UP-1/2), and an unbounded value would be retained in the session and
+/// logged in full (UP-3). So strip C0 controls (incl. `\n`/`\r`/`\t`) and DEL,
+/// then clamp — WITHOUT splitting a UTF-8 multibyte sequence (a split byte would
+/// be invalid UTF-8 and could break JSON serialisation of `/whoami`). Sanitise
+/// ONCE here so every downstream sink is safe. Group values need no such
+/// treatment: `extract_group_values` matches them by exact equality and only
+/// ever counts them — they are never displayed or logged verbatim.
+constexpr std::size_t kMaxAttributeValueLen = 256;
+
+static std::string sanitize_attribute_value(std::string s) {
+    std::erase_if(s, [](unsigned char c) { return c < 0x20 || c == 0x7F; });
+    if (s.size() > kMaxAttributeValueLen) {
+        std::size_t cut = kMaxAttributeValueLen;
+        // Back up over UTF-8 continuation bytes (0b10xxxxxx) so the clamp lands
+        // on a codepoint boundary, never mid-sequence.
+        while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80) --cut;
+        s.resize(cut);
+    }
+    return s;
+}
+
+/// Extract the FIRST non-empty `<AttributeValue>` text of the verified
+/// assertion's `<AttributeStatement>/<Attribute Name="attr_name">`.
+///
+/// SECURITY (N2 parity): reads ONLY from `assertion` — the SAME XSW-verified
+/// node `name_id` and the groups are read from — never a second XPath/search
+/// over the document. Callers MUST pass the single verified assertion node,
+/// never `root`. It reuses `extract_group_values`'s exact three-level,
+/// namespace-checked descent so a new attribute cannot drift off the verified
+/// subtree. Returns "" when `attr_name` is empty (feature off), the attribute
+/// is absent, or it carries no non-empty value. Bounded by construction: it
+/// stops at the first match, so there is no DoS-cap concern (a single scalar,
+/// not an unbounded multi-value list like groups).
+static std::string extract_first_attribute_value(xmlNodePtr assertion,
+                                                  const std::string& attr_name) {
+    if (attr_name.empty()) return {};
+
+    for (xmlNodePtr stmt = xmlFirstElementChild(assertion); stmt;
+         stmt = xmlNextElementSibling(stmt)) {
+        if (stmt->type != XML_ELEMENT_NODE || !stmt->name ||
+            !xmlStrEqual(stmt->name, BAD_CAST "AttributeStatement") || !stmt->ns ||
+            !stmt->ns->href || !xmlStrEqual(stmt->ns->href, BAD_CAST kSamlAssertionNs)) {
+            continue;
+        }
+        for (xmlNodePtr attr = xmlFirstElementChild(stmt); attr;
+             attr = xmlNextElementSibling(attr)) {
+            if (attr->type != XML_ELEMENT_NODE || !attr->name ||
+                !xmlStrEqual(attr->name, BAD_CAST "Attribute") || !attr->ns || !attr->ns->href ||
+                !xmlStrEqual(attr->ns->href, BAD_CAST kSamlAssertionNs)) {
+                continue;
+            }
+            if (get_attr(attr, "Name") != attr_name) continue;
+            for (xmlNodePtr val = xmlFirstElementChild(attr); val;
+                 val = xmlNextElementSibling(val)) {
+                if (val->type != XML_ELEMENT_NODE || !val->name ||
+                    !xmlStrEqual(val->name, BAD_CAST "AttributeValue") || !val->ns ||
+                    !val->ns->href || !xmlStrEqual(val->ns->href, BAD_CAST kSamlAssertionNs)) {
+                    continue;
+                }
+                // Sanitise at the parse boundary (control chars stripped,
+                // length clamped) so a newline can't forge a log record and a
+                // huge value can't be retained/logged (Gate 4 UP-1/2/3). A
+                // value that is empty AFTER sanitising (e.g. all control chars)
+                // is skipped, exactly like an empty raw value.
+                std::string text = sanitize_attribute_value(get_text(val));
+                if (!text.empty()) return text; // first non-empty (sanitised) value wins
+            }
+        }
+    }
+    return {};
+}
+
 /// Maximum element-nesting depth we will traverse in the XSW walks. libxml2
 /// already caps parse depth (XML_PARSE_HUGE is off → default 256), but we bound
 /// our own recursion explicitly so these walks are provably stack-safe
@@ -1290,10 +1367,18 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     std::vector<std::string> groups =
         extract_group_values(assertion, config_.group_attribute, &group_cap_truncated);
 
-    spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={})", name_id,
-                 groups.size());
-    return SamlAssertion{std::move(name_id), std::move(name_id_format), std::move(groups),
-                         group_cap_truncated};
+    // Session-enrichment attributes (display name, email) — read from the SAME
+    // verified 'assertion' node (N2 parity). Empty config (default) yields
+    // empty strings, preserving the raw-NameID display fallback. These NEVER
+    // feed identity/authz/SCIM-linkage — only Session::display_name rendering.
+    std::string display_name = extract_first_attribute_value(assertion, config_.name_attribute);
+    std::string email        = extract_first_attribute_value(assertion, config_.email_attribute);
+
+    spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={}, has_display={}, "
+                 "has_email={})",
+                 name_id, groups.size(), !display_name.empty(), !email.empty());
+    return SamlAssertion{std::move(name_id),   std::move(name_id_format), std::move(groups),
+                         group_cap_truncated,  std::move(display_name),   std::move(email)};
 }
 
 // ── cleanup ───────────────────────────────────────────────────────────────────

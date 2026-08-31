@@ -170,6 +170,22 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    fresh authorization decision from cache, and bound every map on its own insert path.
    `EnginePrincipalStore`'s liveness cache (#2367) is the worked example.
 
+   *Degrade log level* (gov consistency-auditor, adversarial review 2026-08-28): a lease-timeout/
+   query-failure log line's level follows the SAME path-hotness judgment as the acquire deadline
+   above, not a per-store arbitrary pick — `spdlog::debug` for a heartbeat-adjacent best-effort path
+   the caller retries every cycle regardless (`OfflineEndpointStore`'s upsert), `spdlog::error` where
+   the caller has no retry of its own and an operator needs to know (`UpdateRegistry`'s admin-driven
+   writes). State the choice's rationale in the store's own file, since the two shapes read
+   identically from the log line alone. **Judge per METHOD, not per store** — `UpdateRegistry` itself
+   keeps all four methods at `error` uniformly (a coarser split than ideal: `latest_for` feeds the
+   agent-driven, heartbeat-retried `CheckForUpdate`/`DownloadUpdate` path and could plausibly justify
+   `debug` by this same rationale, while `list_packages` is genuinely admin-driven like the writes) —
+   don't cite `UpdateRegistry` as a worked example of the per-method split, only of the store-vs-store
+   one (docs-writer finding, adversarial review 2026-08-28). Pair every degrade log with a
+   `yuzu_server_<store>_{read,write}_degrade_total{reason}` counter (`InstructionStore`'s #1675
+   convention) — the log level decides operator noise, the counter is what an alert keys on, and a
+   store needs the counter regardless of which log level it picks.
+
 6. **Wire into `server.cpp`** via the construction helper, after the `PgPool` probe and inside
    the `if (pg_pool_ && !startup_failed_)` guard. A Postgres store that cannot open is a **fatal
    startup error** — the helper flips `startup_failed_` on `!is_open()`. Member-declare the
@@ -191,10 +207,23 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    (`CREATE DATABASE … TEMPLATE`) with every migration already applied, instead of re-running
    the store's migration DDL per test — per-test migrations were the dominant, worst-scaling
    cost of the `[pg]` set on the contended Windows runners (2026-07-12 server-suite timeout).
-   Keep plain `YUZU_REQUIRE_PG_DB` only for tests that exercise migration, fresh/empty-
-   database, or pg-substrate behaviour itself (pg_pool/pg_raii/pg_hardening need no
-   migrations, so a template buys them nothing). Full contract: the `PgTestTemplate` doc
-   comment in `tests/unit/test_helpers.hpp`.
+   Keep plain `YUZU_REQUIRE_PG_DB` only for tests that exercise fresh/empty-database or
+   pg-substrate behaviour itself (pg_pool/pg_raii/pg_hardening need no migrations, so a
+   template buys them nothing). Full contract: the `PgTestTemplate` doc comment in
+   `tests/unit/test_helpers.hpp`.
+
+   **Migration-in-substance tests use `YUZU_REQUIRE_PG_MIGRATION_DB(var)` instead**
+   (#2354, #3443) — a real from-scratch migrate, `!is_open()`-on-migration-failure,
+   backfill/upgrade, or drift-detection test genuinely needs to run the migration DDL
+   itself (a `PgTestTemplate` clone would hide the exact behaviour under test), but paying
+   that cost is Windows-specific EXEC_BACKEND overhead the same coverage on Linux already
+   proves. The macro is a drop-in `YUZU_REQUIRE_PG_DB` replacement — SKIPs on Windows by
+   default (fail-closed; `YUZU_TEST_PG_MIGRATION_DDL=1` forces it back on locally), runs
+   unconditionally everywhere else. A new store's own migration test belongs on this macro,
+   not plain `YUZU_REQUIRE_PG_DB` — using the plain macro re-adds the per-test Windows DDL
+   cost this mechanism exists to remove, one store at a time. Contract: the doc comment
+   immediately above `YUZU_REQUIRE_PG_MIGRATION_DB`'s definition in
+   `tests/unit/test_helpers.hpp`.
 
    High-volume store-behaviour files may instead keep one template clone and pool for the
    file, then completely reset its rows with `TRUNCATE … RESTART IDENTITY CASCADE` before
@@ -231,7 +260,13 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   whether the legacy file exists and is non-empty, and if so `spdlog::warn` a row/key count
   before proceeding fresh-started, so an environment where the "no production fleet" premise
   turns out to be locally wrong gets a loud signal instead of the silent loss `ResponseStore`'s
-  actual (undetected) behavior would otherwise reproduce for stateful config. This default
+  actual (undetected) behavior would otherwise reproduce for stateful config. **For a store with
+  no secret columns, prefer the shared `legacy_sqlite_probe::warn_if_legacy_rows`
+  (`server/core/src/legacy_sqlite_probe.hpp`, introduced by ADR-0061) over hand-rolling this
+  check** — it generalizes `RuntimeConfigStore::warn_if_legacy_data_present`'s single-table logic
+  to an arbitrary table list; a secret-bearing store still needs the 0600/sidecar hardening this
+  shared helper deliberately omits (see its own header comment) and should follow
+  `RuntimeConfigStore`'s hand-rolled variant instead. This default
   holds only while "no production fleet" stays true — if a real external deployment exists or
   is committed to before your store migrates, re-derive whether backfill is actually needed for
   THIS store in its own per-store ADR; don't cite this bullet as blanket cover once the premise

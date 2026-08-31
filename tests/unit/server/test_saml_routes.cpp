@@ -1396,6 +1396,100 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
 #endif
 }
 
+TEST_CASE("SAML ACS — display-name/email attributes set the session display (name->email->NameID)",
+          "[pg][saml][auth_routes]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    // Gate 3/4 (quality-engineer + happy-path): the session-level derivation
+    // (create_saml_session: display = name -> email -> raw NameID) was untested
+    // end-to-end — provider tests cover parsing, route tests only pinned the
+    // default (attributes-unset) path. This drives the full /auth/saml/start ->
+    // /saml/acs round-trip with the flags configured and asserts the minted
+    // session's display_name for name, email-only, and backward-compat cases.
+    const auto& f = saml_test_fixture();
+
+    auto saml_cfg           = f.make_config();
+    saml_cfg.name_attribute  = "displayName";
+    saml_cfg.email_attribute = "email";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    const std::string name_id = "opaque-persistent-id"; // deliberately NOT a human name
+
+    // Construct the PG-backed fixture at TEST-BODY scope, NOT inside the
+    // value-returning lambda below. Its YUZU_REQUIRE_PG_DB skip must fire at
+    // test/section level; a SKIP() thrown from inside a CHECK(mint_display(...))
+    // expression instead surfaces as a FAILED "{ nested SKIP() called }" and
+    // breaks the no-Postgres Linux SAML test leg (adversarial-review CDX-C1).
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id;
+
+    auto mint_display = [&](const std::string& attr_stmt) -> std::string {
+        auto start_res = fix.sink.Get("/auth/saml/start");
+        REQUIRE(start_res != nullptr);
+        REQUIRE(start_res->status == 302);
+        std::string binding_secret;
+        {
+            const auto sc        = start_res->get_header_value("Set-Cookie");
+            const std::string px = "__Host-yuzu_saml_bind=";
+            const auto vs        = sc.find(px) + px.size();
+            const auto ve        = sc.find(';', vs);
+            binding_secret = sc.substr(vs, ve == std::string::npos ? std::string::npos : ve - vs);
+        }
+        const auto request_id = extract_authn_request_id(start_res->get_header_value("Location"));
+        REQUIRE_FALSE(request_id.empty());
+        const auto response_b64 =
+            f.make_response(request_id, name_id, 3600, {}, {}, false, nullptr, attr_stmt);
+        std::string encoded;
+        encoded.reserve(response_b64.size() + 16);
+        for (unsigned char c : response_b64) {
+            if (c == '+')
+                encoded += "%2B";
+            else
+                encoded += static_cast<char>(c);
+        }
+        const auto form_body = "SAMLResponse=" + encoded + "&RelayState=%2F";
+        auto acs_res         = fix.sink.dispatch("POST", "/saml/acs", form_body,
+                                         "application/x-www-form-urlencoded",
+                                         {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+        REQUIRE(acs_res != nullptr);
+        REQUIRE(acs_res->status == 302);
+        std::string token;
+        for (std::size_t i = 0;; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            const auto pos = sc.find("yuzu_session=");
+            if (pos == std::string::npos) continue;
+            const auto vs = pos + std::string("yuzu_session=").size();
+            const auto ve = sc.find(';', vs);
+            token         = sc.substr(vs, ve == std::string::npos ? std::string::npos : ve - vs);
+            break;
+        }
+        REQUIRE_FALSE(token.empty());
+        auto sess = fix.auth_mgr.validate_session(token);
+        REQUIRE(sess.has_value());
+        // Identity is ALWAYS the stable principal, never the display attribute.
+        CHECK(sess->username == saml::saml_principal_id(f.idp_entity_id, name_id));
+        return sess->display_name;
+    };
+
+    SECTION("name attribute -> display is the human name, not the raw NameID") {
+        const auto stmt =
+            SamlTestFixture::make_attribute_statement("displayName", {"Ada Lovelace"}) +
+            SamlTestFixture::make_attribute_statement("email", {"ada@example.com"});
+        CHECK(mint_display(stmt) == "Ada Lovelace");
+    }
+    SECTION("email only -> display falls back to the email") {
+        const auto stmt = SamlTestFixture::make_attribute_statement("email", {"grace@example.com"});
+        CHECK(mint_display(stmt) == "grace@example.com");
+    }
+    SECTION("no enrichment attributes -> display stays the raw NameID (backward-compat)") {
+        CHECK(mint_display("") == name_id);
+    }
+#endif
+}
+
 TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint a user session",
           "[pg][saml][auth_routes]") {
 #if defined(_WIN32)

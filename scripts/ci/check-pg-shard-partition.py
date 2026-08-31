@@ -7,6 +7,12 @@ genuine, bounded, correctly-flagged subset of ``[pg]`` — one entry, the
 expected name, the expected exact case count, tagged ``--allow-running-
 no-tests``, and every matched case also carries ``[pg]``.
 
+Windows CI test-phase restructuring (#3443, 2026-08-28): the same check_partition()
+set-math also proves the ``server-nonpg``-suite entries partition ``~[pg]`` —
+the non-pg shards the Windows job's own non-pg Test step selects by suite,
+same discovery-by-suite-membership property, same failure shape, reusing
+the one chokepoint rather than a second hand-rolled copy.
+
 Replaces flake-retry.py's old verbatim positional-filter pin (a hardcoded
 copy of every shard's tag-filter string, hand-updated on every split/
 rebalance — missed 3 times in the same number of weeks, each time reddening
@@ -16,11 +22,13 @@ person to update it looked. This proves the actual property that matters —
 exact partitioning of the real case population — against the compiled
 binary, not against a remembered snapshot.
 
-Runs as its own meson test() entry (suite: 'server'), NOT inside the cheap
-flake-retry selftest (suite: 'docs'): it needs the real yuzu_server_tests
-binary built, which the docs suite deliberately does not depend on. No
-Postgres connection needed — --list-tests only enumerates registered
-TEST_CASE macros, it never executes a test body.
+Runs as its own meson test() entry (suite: ['server', 'server-checks'] —
+the second label is what lets the Windows non-pg Test step's
+assert-suite-cover.py select it), NOT inside the cheap flake-retry selftest
+(suite: 'docs'): it needs the real yuzu_server_tests binary built, which
+the docs suite deliberately does not depend on. No Postgres connection
+needed — --list-tests only enumerates registered TEST_CASE macros, it
+never executes a test body.
 
 Discovery is via `meson introspect <builddir> --tests`, keyed on suite
 membership (yuzu:server-pg), not a hardcoded shard-name list — so a shard
@@ -66,6 +74,13 @@ import xml.etree.ElementTree as ET  # stdlib, not defusedxml: this parses our
 
 SERVER_PG_SUITE = "yuzu:server-pg"
 SERVER_PG_SMOKE_SUITE = "yuzu:server-pg-smoke"
+# Windows CI test-phase restructuring (#3443, 2026-08-28): the non-pg server
+# shards (A/B/C) partition '~[pg]' the same way the pg shards partition
+# '[pg]' — same discovery-by-suite-membership property, same failure shape,
+# reusing check_partition below with a different suite/ref_spec/label rather
+# than a second hand-rolled copy of the same set-math.
+SERVER_NONPG_SUITE = "yuzu:server-nonpg"
+NONPG_REF_SPEC = "~[pg]"
 SMOKE_SPEC = "[pg-smoke]"
 SMOKE_ENTRY_NAME = "server pg smoke"
 # Measured against the real binary once the [pg-smoke] tags landed (#3443
@@ -166,6 +181,15 @@ def parse_shard_entries(tests):
     return [(name, exe, spec) for name, exe, spec, _opts in entries], errors
 
 
+def parse_nonpg_entries(tests):
+    """Return (entries, errors) for every server-nonpg-suite entry in `tests`
+    (Windows CI test-phase restructuring, #3443). Same 3-tuple shape as
+    parse_shard_entries — see _parse_suite_entries for the shared rules.
+    """
+    entries, errors = _parse_suite_entries(tests, SERVER_NONPG_SUITE)
+    return [(name, exe, spec) for name, exe, spec, _opts in entries], errors
+
+
 def parse_smoke_entries(tests):
     """Return (entries, errors) for every server-pg-smoke-suite entry in
     `tests` (#3443 Phase 2). entries: [(name, exe, tag_filter_spec, opts),
@@ -217,11 +241,18 @@ def _fmt_case(c):
     return f"{c[0]!r} ({c[1]}:{c[2]})"
 
 
-def check_partition(entries, list_cases_fn):
+def check_partition(entries, list_cases_fn, ref_spec="[pg]", label="server-pg"):
     """Given well-shaped shard entries and a case-lookup callable
     (filter_spec -> set of (name, file, line)), prove: (a) every case the
-    reference `[pg]` filter matches lands in exactly one shard's matched
-    set, (b) no shard's filter matches a case outside that reference set.
+    `ref_spec` filter matches lands in exactly one shard's matched set,
+    (b) no shard's filter matches a case outside that reference set.
+
+    `ref_spec`/`label` default to the original pg-shard check ('[pg]' /
+    'server-pg'); the Windows restructuring's non-pg partition (#3443) calls
+    this with ref_spec='~[pg]', label='server-nonpg' — same set-math, a
+    different reference filter and wording so a non-pg failure never
+    misleadingly reports '[pg]'/'server-pg' in its own diagnostic (Sol
+    review). `label` is used only in messages — it does not gate behavior.
 
     Pure with respect to I/O — `list_cases_fn` is injected so this can run
     against a real compiled binary (main(), below) or against a synthetic
@@ -230,14 +261,14 @@ def check_partition(entries, list_cases_fn):
     """
     exes = {e for _, e, _ in entries}
     if len(exes) != 1:
-        return False, [f"server-pg shards use {len(exes)} different binaries "
+        return False, [f"{label} shards use {len(exes)} different binaries "
                         f"({sorted(exes)!r}) — expected exactly one"], {}
     exe = exes.pop()
 
-    full_ref = list_cases_fn(exe, "[pg]")
+    full_ref = list_cases_fn(exe, ref_spec)
     if not full_ref:
-        return False, ["'[pg]' matched zero cases on this binary — the "
-                        "reference set itself is empty"], {}
+        return False, [f"{ref_spec!r} matched zero cases on this binary — "
+                        f"the {label} reference set itself is empty"], {}
 
     seen = {}
     union = set()
@@ -245,7 +276,7 @@ def check_partition(entries, list_cases_fn):
     for name, _exe, spec in entries:
         cases = list_cases_fn(exe, spec)
         if not cases:
-            failures.append(f"shard {name!r} (spec {spec!r}) matched ZERO cases")
+            failures.append(f"{label} shard {name!r} (spec {spec!r}) matched ZERO cases")
         for c in cases:
             if c in seen:
                 failures.append(f"case {_fmt_case(c)} appears in BOTH "
@@ -258,12 +289,12 @@ def check_partition(entries, list_cases_fn):
     extra = union - full_ref
     if missing:
         sample = ", ".join(_fmt_case(c) for c in sorted(missing)[:5])
-        failures.append(f"{len(missing)} case(s) tagged [pg] are in NO shard: "
-                         f"{sample}" + (" ..." if len(missing) > 5 else ""))
+        failures.append(f"{len(missing)} case(s) matched by {ref_spec!r} are in "
+                         f"NO {label} shard: {sample}" + (" ..." if len(missing) > 5 else ""))
     if extra:
         sample = ", ".join(_fmt_case(c) for c in sorted(extra)[:5])
-        failures.append(f"{len(extra)} case(s) matched by a shard filter but "
-                         f"not in the [pg] reference set: {sample}"
+        failures.append(f"{len(extra)} case(s) matched by a {label} shard filter "
+                         f"but not in the {ref_spec!r} reference set: {sample}"
                          + (" ..." if len(extra) > 5 else ""))
 
     stats = {"shard_count": len(entries), "case_count": len(full_ref)}
@@ -346,7 +377,8 @@ def main(argv=None):
     tests = introspect_tests(args.builddir)
     entries, shape_errors = parse_shard_entries(tests)
     smoke_entries, smoke_shape_errors = parse_smoke_entries(tests)
-    all_shape_errors = shape_errors + smoke_shape_errors
+    nonpg_entries, nonpg_shape_errors = parse_nonpg_entries(tests)
+    all_shape_errors = shape_errors + smoke_shape_errors + nonpg_shape_errors
     if all_shape_errors:
         for e in all_shape_errors:
             gh("error", f"check-pg-shard-partition: {e}")
@@ -357,11 +389,26 @@ def main(argv=None):
                      f"entries in suite {SERVER_PG_SUITE!r} — hollow "
                      f"discovery (expected the full set of pg shards)")
         return 1
+    # Non-pg hollow-discovery floor is 2 (today: shards A, B, C), same
+    # reasoning as the pg floor above — a suite label typo or a dropped
+    # test() entry must fail loud here, not silently check zero/one shard.
+    if len(nonpg_entries) < 2:
+        gh("error", f"check-pg-shard-partition: found only {len(nonpg_entries)} "
+                     f"entries in suite {SERVER_NONPG_SUITE!r} — hollow "
+                     f"discovery (expected the full set of non-pg shards)")
+        return 1
 
     ok, failures, stats = check_partition(entries, list_cases)
     if not ok:
         for f in failures:
             gh("error", f"check-pg-shard-partition: {f}")
+        return 1
+
+    nonpg_ok, nonpg_failures, nonpg_stats = check_partition(
+        nonpg_entries, list_cases, ref_spec=NONPG_REF_SPEC, label="server-nonpg")
+    if not nonpg_ok:
+        for f in nonpg_failures:
+            gh("error", f"check-pg-shard-partition (non-pg): {f}")
         return 1
 
     shard_exe = entries[0][1]  # check_partition already proved one exe across all entries
@@ -371,10 +418,11 @@ def main(argv=None):
             gh("error", f"check-pg-shard-partition (smoke): {f}")
         return 1
 
-    print(f"check-pg-shard-partition: OK — {stats['shard_count']} shards, "
-          f"{stats['case_count']} cases, exact partition (no loss, no "
-          f"duplication); smoke: {smoke_stats['smoke_case_count']} cases "
-          f"matched (not executed — see ci.yml's DSN assert + the live "
+    print(f"check-pg-shard-partition: OK — {stats['shard_count']} pg shards, "
+          f"{stats['case_count']} cases; {nonpg_stats['shard_count']} non-pg "
+          f"shards, {nonpg_stats['case_count']} cases; both exact partitions "
+          f"(no loss, no duplication); smoke: {smoke_stats['smoke_case_count']} "
+          f"cases matched (not executed — see ci.yml's DSN assert + the live "
           f"test run for execution proof)")
     return 0
 

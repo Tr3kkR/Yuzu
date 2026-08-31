@@ -146,8 +146,9 @@ groups:
       - alert: YuzuRbacReadDegraded
         # An authorization read against the PostgreSQL rbac_store (ADR-0041)
         # could not resolve and therefore DENIED (reads fail closed —
-        # deny-on-degrade). Because require_permission / authorize_list_read all
-        # route through this store, a degrade denies authorization FLEET-WIDE —
+        # deny-on-degrade). Because require_permission / authorize_list_read /
+        # require_fleet_read all route through this store, a degrade denies
+        # authorization FLEET-WIDE —
         # it is an availability event, not a silent partial outage. /readyz stays
         # green under pure pool saturation (it trips only on connection failure,
         # to avoid false LB evictions), so this is otherwise dashboard-invisible.
@@ -183,8 +184,8 @@ groups:
             non-zero: authorization reads against the PostgreSQL rbac_store are
             failing and therefore DENYING (fail-closed / deny-on-degrade,
             ADR-0041). Because require_permission / require_scoped_permission /
-            authorize_list_read all resolve through this store, operators and
-            agentic callers are being denied fleet-wide. pool_acquire_timeout /
+            authorize_list_read / require_fleet_read all resolve through this
+            store, operators and agentic callers are being denied fleet-wide. pool_acquire_timeout /
             query_error correlate with yuzu_pg_* saturation or outage;
             generation_refresh_failed means the cross-replica cache-coherence
             token could not be re-read PAST the bounded ~5s stale-serve window
@@ -869,6 +870,52 @@ groups:
             read_concurrency_cap does NOT appear under this alert - a slot
             timeout fails the dispatch closed, so it shows up on
             YuzuQuarantineGateFailClosed instead.
+
+      - alert: YuzuQuarantineEndpointUnconfirmed
+        expr: |
+          yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A connected, quarantined device has not confirmed its own firewall is active"
+          description: >-
+            A device has an active QuarantineStore record, is currently
+            REACHABLE (a live AgentSession — the reconciler could dispatch to
+            it right now), and QuarantineContainmentReconciler (#3425) has
+            not been able to confirm its endpoint firewall via a follow-up
+            `quarantine.status` read returning state|active. The #881
+            dispatch gate still refuses operator commands to this device —
+            containment holds at the control plane — but the OTHER half,
+            the device's own firewall stopping it reaching anything else,
+            is unconfirmed. reachability="offline" is DELIBERATELY EXCLUDED:
+            a device quarantined while off is legitimately unconfirmed for
+            its entire offline duration, and paging on that would be paging
+            on correct behaviour (the #2553/observability-conventions.md
+            lesson already applied to reason="quarantined" dispatch
+            denials) - that population is dashboard material, not an
+            alert. Check yuzu_server_quarantine_reconciler_tick_healthy first
+            - if 0, the reconciler's own reads are currently failing and this
+            alert's source gauge is frozen at a stale value, not necessarily
+            an accurate one; triage the reconciler itself before this alert's
+            population. If tick_healthy=1, correlate with
+            yuzu_server_quarantine_reapply_total{result} for WHY:
+            "validation_failed" means the stored whitelist itself is
+            undispatchable - as of #3425 (d1f71c58f) POST /api/v1/quarantine
+            validates whitelist at write time, so this now points at a record
+            migrated from the legacy quarantine.db (ADR-0047 backfill, no
+            validation) or one written before d1f71c58f shipped, not a fresh
+            REST write; "busy"/"unconfirmed" mean a dispatch landed but did
+            not (yet) confirm; "degraded" means either a per-agent
+            apply/confirm/status call is failing, OR the tick itself is
+            failing (check tick_healthy above first to tell which) - NOT
+            reliably correlated against yuzu_server_quarantine_read_degrade_total
+            (see that counter's row in metrics.md) - check the Postgres
+            pool, same triage as
+            YuzuQuarantineGateFailClosed. The audited evidence trail is the
+            quarantine.reapply verb (system principal, detail carries
+            record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
+            record_id=... command_id=..." on success).
 
       - alert: YuzuDispatchTargetRejected
         expr: |
@@ -3677,3 +3724,46 @@ groups:
   # labels are counted in the current agent process while evictions cover batches
   # written up to 7 days earlier across a churning fleet, so after a restart the
   # numerator can exceed it.
+
+  - name: yuzu-auth-sessions
+    # HA WS-1/1a (ADR-2002 §4) — durable operator sessions. The clock-anomaly
+    # alert is the DB-clock-integrity monitor ADR-2002 §4 mitigation (a) requires
+    # ("monitor for backward movement; alert"): a session reap pass declines when
+    # its wall-clock read is implausibly ahead of, or behind, the persisted
+    # anchor — exactly a backward/forward DB-host clock step, which would
+    # un-expire sessions and extend live JIT-elevation / MFA windows. Both
+    # counters are zero-seeded at boot, so increase() > 0 is meaningful.
+    rules:
+      - alert: YuzuSessionReapClockAnomaly
+        expr: |
+          increase(yuzu_auth_session_reap_clock_anomaly_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable-session reap declined on a wall-clock anomaly (DB/host clock integrity)"
+          description: >-
+            A durable-session reap pass was declined because the server's
+            wall-clock reading was implausibly ahead of or behind the persisted
+            reap anchor — the DB-clock-integrity signal ADR-2002 §4 requires be
+            monitored. A backward clock step un-expires sessions and extends live
+            JIT-elevation / MFA step-up windows beyond their authored maximums
+            (the residual the per-window ceilings deliberately do not resist).
+            Investigate NTP / DB-host / server-host clock health; correlate with
+            yuzu_auth_session_store_degrade_total.
+      - alert: YuzuSessionStoreDegraded
+        expr: |
+          increase(yuzu_auth_session_store_degrade_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Durable session store degraded on the auth hot path (op={{ $labels.op }})"
+          description: >-
+            A durable session-store operation ({{ $labels.op }}) hit a degraded
+            PostgreSQL read/write for 10m. A `validate` degrade fails requests
+            closed (401); `create`/`elevate`/`mark_mfa`/`invalidate`/
+            `invalidate_user` degrades fail the privileged op closed; a sustained
+            `generation_refresh` degrade drops the validate cache past the
+            stale-serve bound. Usually PostgreSQL pool saturation / failover —
+            correlate with the pool metrics.

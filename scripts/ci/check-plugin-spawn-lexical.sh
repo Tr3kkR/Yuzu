@@ -489,6 +489,8 @@ GRANDFATHERED = {
     # license_scan (Linux leg) removed here too (Wave 4 PR4.3b): same reasoning
     # -- licensing_linux.cpp is now clean of raw spawn tokens outside the runner.
     "agents/plugins/network_config/src/network_config_plugin.cpp",
+    # network_config's own entry is removed the same way by PR4.1, the
+    # remaining half of #3405 -- see that commit's message for why.
     "agents/plugins/script_exec/src/script_exec_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",
     "agents/plugins/tar/src/tar_service_collector.cpp",

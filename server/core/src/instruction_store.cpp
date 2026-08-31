@@ -431,6 +431,18 @@ InstructionStore::validate_and_prepare(InstructionDefinition& def) const {
         return std::unexpected("type must be 'question' or 'action'");
     if (def.plugin.empty())
         return std::unexpected("plugin is required");
+    // #1398: reject an approval_mode outside the vocabulary the governed
+    // execute path (workflow_routes.cpp) and the dispatch-chokepoint
+    // ExecuteGate derivation both understand. An unvalidated value here
+    // reached the runtime import path (import_definition_json_impl, the
+    // ONLY caller besides create_definition) with zero enforcement — every
+    // other create/update surface already checks this inline at the route
+    // layer, but the store itself, which both the trusted boot-content
+    // reseed loop and any future JSON-import caller go through, did not.
+    if (def.approval_mode != "auto" && def.approval_mode != "role-gated" &&
+        def.approval_mode != "always" && !def.approval_mode.empty())
+        return std::unexpected("invalid approval_mode: " + def.approval_mode +
+                               " (must be auto, role-gated, or always)");
 
     if (auto err = validate_definition_scope(def.yaml_source))
         return std::unexpected(*err);
@@ -602,6 +614,15 @@ std::expected<void, std::string> InstructionStore::update_definition(const Instr
     // be a bypass for the fromResultSet rules.
     if (auto err = validate_definition_scope(def.yaml_source))
         return std::unexpected(*err);
+
+    // #1398: mirror validate_and_prepare's approval_mode check — this function
+    // does not call validate_and_prepare (unlike create_definition), and one
+    // of its two REST callers (the YAML-paste dashboard editor route) sets
+    // approval_mode from parsed content with no inline validation of its own.
+    if (def.approval_mode != "auto" && def.approval_mode != "role-gated" &&
+        def.approval_mode != "always" && !def.approval_mode.empty())
+        return std::unexpected("invalid approval_mode: " + def.approval_mode +
+                               " (must be auto, role-gated, or always)");
 
     const char* sql = R"(
         UPDATE instruction_store.instruction_definitions SET

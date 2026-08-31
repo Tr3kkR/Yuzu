@@ -105,6 +105,7 @@
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
 #include "quarantine_store.hpp"
+#include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "result_set_matcher.hpp"
 #include "result_set_store.hpp"
 #include "result_sets_ui.hpp"
@@ -150,6 +151,8 @@
 #include "preflight_run_store.hpp"
 #include "vuln_finding_store.hpp"
 #include "access_review_store.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — campaign persistence
+#include "clock_drift_monitor.hpp" // HA WS-1/1a — backward wall-clock drift detector (ADR-2002 §4)
+#include "session_store.hpp"       // HA WS-1/1a — durable operator sessions (ADR-2002 §4)
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
@@ -181,6 +184,7 @@
 #include "tag_store.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
+#include "legacy_sqlite_probe.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
 #include "workflow_engine.hpp"
@@ -1236,6 +1240,28 @@ public:
             metrics_.counter("yuzu_server_quarantine_gate_total",
                              {{"outcome", std::string(outcome)}});
 
+        // #3425: QuarantineContainmentReconciler's outcome series, seeded
+        // across its whole closed label set for the same "absent must not
+        // be confused with never ran" reason as the gate outcomes above.
+        for (const auto result : yuzu::server::kQuarantineReapplyResults)
+            metrics_.counter("yuzu_server_quarantine_reapply_total",
+                             {{"result", std::string(result)}});
+        // Per-replica gauge (never sum() across instances — each replica
+        // only sees the sessions its own gRPC listener holds). Seeded at 0
+        // for both label values so a healthy fleet with nothing unconfirmed
+        // renders as an explicit 0, not an absent series.
+        for (const char* reachability : {"connected", "offline"})
+            metrics_.gauge("yuzu_server_quarantine_endpoint_unconfirmed",
+                           {{"reachability", reachability}})
+                .set(0);
+        // Freshness signal for the gauge above (#3425 review, Doomgoose
+        // #3567): pre-seeded optimistic (1) since the reconciler's tick
+        // thread starts within a boot-time window measured in seconds, not
+        // minutes — a brief false-healthy read before the first real tick
+        // is a negligible tradeoff against the alternative of a 0 (falsely
+        // degraded) or absent (loses absent()-alertability) default.
+        metrics_.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
+
         // The quarantine read-degrade family was never pre-seeded, unlike its
         // mgmt-group and discovery siblings above, so every reason read as
         // absent on a healthy server and `absent()` could not be used on any of
@@ -1285,7 +1311,7 @@ public:
                           "distinct from the `forbidden` authorization verdict.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
-                            "kill_switched"}) {
+                            "approval_required", "kill_switched"}) {
             metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", reason}});
         }
         metrics_.describe("yuzu_server_dispatch_tag_invalid_total",
@@ -2473,6 +2499,39 @@ public:
             metrics_.counter("yuzu_auth_read_degrade_total",
                              {{"route", "login"}, {"reason", reason}});
         }
+        // HA WS-1/1a: durable SessionStore degradation on the auth hot path
+        // (validate/create/touch/generation-refresh/reap). Mirrors the
+        // yuzu_auth_read_degrade_total / yuzu_server_rbac_read_degrade_total
+        // pattern so an operator can see a PG blip/failover degrade session
+        // handling (stale-cache-or-401) without grepping logs. `op` labels the
+        // degrading operation. Wired from AuthManager (validate/create/touch/
+        // generation) + the maintenance-thread reap above.
+        metrics_.describe("yuzu_auth_session_store_degrade_total",
+                          "Durable session-store operations that hit a degraded PostgreSQL read/"
+                          "write on the auth hot path (labelled by op: validate / create / touch / "
+                          "generation_refresh / reap / invalidate_user / invalidate / mark_mfa / "
+                          "elevate); a validate degrade fails the request closed, and elevate / "
+                          "revoke (via invalidate_user) degrades fail the privileged op closed",
+                          "counter");
+        for (auto op : {"validate", "create", "touch", "generation_refresh", "reap",
+                        "invalidate_user", "invalidate", "mark_mfa", "elevate"})
+            metrics_.counter("yuzu_auth_session_store_degrade_total", {{"op", op}});
+        metrics_.describe("yuzu_auth_session_reap_total",
+                          "Expired durable operator-session rows deleted by the clock-guarded "
+                          "retention sweep",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_reap_total");
+        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a)): incremented
+        // when a session reap pass is DECLINED because the wall clock read is
+        // implausibly ahead of, or behind, the persisted anchor — i.e. a DB/host
+        // clock anomaly (a backward step un-expires sessions). Pre-seeded to 0 so
+        // YuzuSessionReapClockAnomaly's `increase() > 0` alert is meaningful.
+        metrics_.describe("yuzu_auth_session_reap_clock_anomaly_total",
+                          "Session reap passes declined due to an implausible (forward or backward) "
+                          "wall-clock reading vs the persisted anchor - the DB-clock-integrity "
+                          "signal for durable sessions (ADR-2002 section 4)",
+                          "counter");
+        metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -3345,7 +3404,8 @@ public:
 #ifdef _WIN32
         if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
             !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
-            !cfg_.saml_sp_key.empty()) {
+            !cfg_.saml_sp_key.empty() || !cfg_.saml_name_attribute.empty() ||
+            !cfg_.saml_email_attribute.empty()) {
             spdlog::error("SAML is not supported on Windows builds; SAML login disabled"
                           " — fail-closed");
         }
@@ -3472,6 +3532,8 @@ public:
                         saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
                         saml_cfg.idp_cert_pem   = std::move(cert_pem);
                         saml_cfg.group_attribute = cfg_.saml_group_attribute;
+                        saml_cfg.name_attribute  = cfg_.saml_name_attribute;
+                        saml_cfg.email_attribute = cfg_.saml_email_attribute;
                         saml_cfg.sp_signing_key_pem = std::move(sp_signing_key_pem);
                         saml_cfg.enabled        = true;
                         // Construct in the single-threaded startup phase — xmlsec global init
@@ -3584,16 +3646,11 @@ public:
             // only after every fail-closed check and the listeners are up.
         }
 
-        // Initialize OTA update registry
-        if (cfg_.ota_enabled) {
-            auto update_db_path = cfg_.db_dir() / "update_packages.db";
-            auto update_dir =
-                cfg_.update_dir.empty() ? cfg_.db_dir() / "agent-updates" : cfg_.update_dir;
-            std::error_code ec;
-            std::filesystem::create_directories(update_dir, ec);
-            update_registry_ = std::make_unique<UpdateRegistry>(update_db_path, update_dir);
-            agent_service_.set_update_registry(update_registry_.get());
-        }
+        // OTA update registry (ADR-0061): moved below, after the PostgreSQL
+        // substrate is constructed — UpdateRegistry is now a Postgres-backed
+        // store and needs pg_pool_ to exist first. See the
+        // "if (cfg_.ota_enabled && pg_pool_ && !startup_failed_)" block
+        // following the offline-endpoint store below.
 
         // Wire up cross-references for AgentServiceImpl
         // (done after stores are created below)
@@ -3666,6 +3723,55 @@ public:
                               "failed (database reachable but the endpoint_state schema could "
                               "not be created/opened)");
                 startup_failed_ = true;
+            }
+        }
+
+        // OTA update registry — Postgres store (ADR-0061, Wave 4 ladder blind
+        // spot). Only constructed when cfg_.ota_enabled is true (default —
+        // opt-out via --no-ota, not an opt-in flag), same gate as
+        // pre-migration; with --no-ota, update_registry_ stays null, unchanged
+        // behaviour. Otherwise, construction is now FAIL-CLOSED per ADR-0012 §1
+        // — a posture upgrade: the pre-migration constructor had NO is_open()
+        // check at this call site at all (silently served with a null db_ on
+        // open failure). A reachable database whose update_registry schema
+        // can't be created/opened is now a fatal startup error.
+        if (cfg_.ota_enabled && pg_pool_ && !startup_failed_) {
+            auto update_dir =
+                cfg_.update_dir.empty() ? cfg_.db_dir() / "agent-updates" : cfg_.update_dir;
+            std::error_code ec;
+            std::filesystem::create_directories(update_dir, ec);
+            update_registry_ = std::make_unique<UpdateRegistry>(*pg_pool_, update_dir);
+            if (!update_registry_->is_open()) {
+                spdlog::error("[PG] Refusing to start: update registry migration/open failed "
+                              "(database reachable but the update_registry schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                agent_service_.set_update_registry(update_registry_.get());
+                // Detect-and-warn (docs/postgres-store-playbook.md's Backfill
+                // bullet): silent unless the legacy file actually holds real
+                // package rows this fresh-start cutover will not carry over.
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "update_packages.db",
+                                                         "UpdateRegistry", {"update_packages"});
+                // Read/write degrade-total counters (gov sre finding, adversarial
+                // review 2026-08-28) — mirrors InstructionStore's #1675 convention:
+                // pre-seed every {reason} series so a dashboard/alert never reads
+                // "no data" for a reason that simply hasn't fired yet.
+                update_registry_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_update_registry_read_degrade_total",
+                                  "UpdateRegistry reads that degraded instead of answering, "
+                                  "by reason",
+                                  "counter");
+                metrics_.describe("yuzu_server_update_registry_write_degrade_total",
+                                  "UpdateRegistry writes that degraded instead of succeeding, "
+                                  "by reason",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_update_registry_read_degrade_total",
+                                     {{"reason", reason}});
+                    metrics_.counter("yuzu_server_update_registry_write_degrade_total",
+                                     {{"reason", reason}});
+                }
             }
         }
 
@@ -3845,6 +3951,26 @@ public:
                         auth_mgr_.set_auth_db(auth_db_.get());
                     }
                 }
+            }
+        }
+
+        // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
+        // ADR-2002 §4). Same fail-CLOSED construction posture as the other
+        // born-on-PG stores (ADR-0012 §1): a reachable database whose schema
+        // can't migrate/open is a deploy error, not a serve-degraded state.
+        // Wired into AuthManager so sessions write-through to Postgres and
+        // survive a replica restart/failover; without it (config-file-only
+        // deployments never reach this block — pg_pool_ is null) AuthManager
+        // keeps its legacy in-memory sessions.
+        if (pg_pool_ && !startup_failed_) {
+            session_store_ = std::make_unique<SessionStore>(*pg_pool_);
+            if (!session_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: session store migration/open failed "
+                              "(database reachable but the session_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auth_mgr_.set_session_store(session_store_.get());
             }
         }
 
@@ -5746,12 +5872,36 @@ public:
             }
         }
 
-        // Phase 7: Workflow Engine
-        {
-            auto wf_db = cfg_.db_dir() / "workflows.db";
-            workflow_engine_ = std::make_unique<WorkflowEngine>(wf_db);
-            if (workflow_engine_ && workflow_engine_->is_open()) {
-                spdlog::info("WorkflowEngine initialized at {}", wf_db.string());
+        // Phase 7: Workflow Engine — Migrated Postgres store (ADR-0006/0009/0064, schema
+        // `workflow_engine`). Construction fail-CLOSED per ADR-0012 §1 — a posture UPGRADE from
+        // the SQLite era, where construction was unconditional/best-effort and is_open() was
+        // never checked by any caller. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment): the legacy workflows.db is never copied; the detect-and-warn obligation
+        // still applies (this store holds real operator-authored workflow definitions + their
+        // execution history), so legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            workflow_engine_ = std::make_unique<WorkflowEngine>(*pg_pool_);
+            if (!workflow_engine_->is_open()) {
+                spdlog::error("[PG] Refusing to start: workflow engine migration/open failed "
+                              "(database reachable but the workflow_engine schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                workflow_engine_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_workflow_engine_writes_total",
+                                  "WorkflowEngine create_workflow/delete_workflow/execute/"
+                                  "cancel_execution outcomes, by op and result. ADR-0064.",
+                                  "counter");
+                for (const auto op :
+                    {"create_workflow", "delete_workflow", "execute", "cancel_execution"})
+                    for (const auto result : {"success", "failed"})
+                        metrics_.counter("yuzu_server_workflow_engine_writes_total",
+                                         {{"op", op}, {"result", result}});
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "workflows.db", "WorkflowEngine",
+                    {"workflows", "workflow_steps", "workflow_executions",
+                     "workflow_step_results"});
             }
         }
 
@@ -6243,21 +6393,64 @@ public:
             }
         }
 
-        // Phase 7: Directory Sync (AD/Entra integration)
-        {
-            auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
-            directory_sync_ = std::make_unique<DirectorySync>(dirsync_db);
-            if (directory_sync_ && directory_sync_->is_open()) {
-                spdlog::info("DirectorySync initialized at {}", dirsync_db.string());
+        // Phase 7: Directory Sync (AD/Entra integration) — migrated to
+        // Postgres (ADR-0063, migration-programme PR 3, schema
+        // `directory_sync`). Fail-CLOSED per ADR-0012 §1 (posture upgrade —
+        // the SQLite era was fail-OPEN here, never checking is_open()).
+        if (pg_pool_ && !startup_failed_) {
+            directory_sync_ = std::make_unique<DirectorySync>(*pg_pool_);
+            if (!directory_sync_->is_open()) {
+                spdlog::error("[PG] Refusing to start: directory sync store migration/open "
+                              "failed (database reachable but the directory_sync schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                // Detect-and-warn (docs/postgres-store-playbook.md's Backfill
+                // bullet): silent unless the legacy file actually holds real
+                // rows this cutover will not carry over — see the store's
+                // own doc comment. Never read for data, never blocks boot.
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "directory-sync.db", "DirectorySync",
+                    {"directory_users", "directory_groups", "directory_memberships",
+                     "directory_group_role_mappings", "directory_sync_status"});
             }
         }
 
-        // Phase 7: Patch Manager
-        {
-            auto patch_db = cfg_.db_dir() / "patches.db";
-            patch_manager_ = std::make_unique<PatchManager>(patch_db);
-            if (patch_manager_ && patch_manager_->is_open()) {
-                spdlog::info("PatchManager initialized at {}", patch_db.string());
+        // Phase 7: Patch Manager — Migrated Postgres store (ADR-0006/0009/
+        // 0062, schema `patch_manager`). Construction fail-CLOSED per
+        // ADR-0012 §1 — a posture UPGRADE from the SQLite era, where
+        // construction was unconditional/best-effort and is_open() was
+        // never even checked by any caller. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // patches.db is never copied; the detect-and-warn obligation still
+        // applies (this store holds real operator-initiated
+        // deployment/inventory state), so legacy_sqlite_probe::
+        // warn_if_legacy_rows() opens the legacy file read-only and warns
+        // (with a row count) only if it actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            patch_manager_ = std::make_unique<PatchManager>(*pg_pool_);
+            if (!patch_manager_->is_open()) {
+                spdlog::error("[PG] Refusing to start: patch manager migration/open failed "
+                              "(database reachable but the patch_manager schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                patch_manager_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_patch_manager_writes_total",
+                                  "PatchManager record_patches/deploy_patch/cancel_deployment "
+                                  "outcomes, by op and result. ADR-0062.",
+                                  "counter");
+                for (const auto op : {"record_patches", "deploy_patch", "cancel_deployment"})
+                    for (const auto result : {"success", "failed"})
+                        metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                         {{"op", op}, {"result", result}});
+                // deploy_patch's own cap-rejection path (kMaxDeployTargets) never
+                // reaches the success/failed branch above — zero-seed separately.
+                metrics_.counter("yuzu_server_patch_manager_writes_total",
+                                 {{"op", "deploy_patch"}, {"result", "rejected_oversized"}});
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "patches.db", "PatchManager",
+                    {"patch_inventory", "patch_deployments", "patch_deployment_targets"});
             }
         }
 
@@ -8184,6 +8377,16 @@ public:
         }
         preflight_runner_.reset();
 
+        // Join the quarantine containment reconciler thread (#3425; uses
+        // quarantine_store_ + response_store_ + the dispatch path — stop
+        // before teardown). The object itself is NOT reset here: the
+        // heartbeat-triggered fast path (a separate, gRPC-thread-driven
+        // caller) can still invoke it until the fn is cleared below, well
+        // after this join — see the "after gRPC drain" block.
+        if (quarantine_reconcile_thread_.joinable()) {
+            quarantine_reconcile_thread_.join();
+        }
+
         // Join the schedule tick thread (borrows schedule_engine_ + the
         // instruction/execution/approval/audit stores via schedule_runner_ —
         // must stop before any of them are torn down), then drop the runner
@@ -8381,6 +8584,11 @@ public:
         // TrackerScope contract, auth_db_'s destruct-before-drop still holds
         // regardless — this only protects the OUTSIDE-owned raw pointer).
         auth_mgr_.set_auth_db(nullptr);
+        // Same contract for the durable SessionStore raw pointer (HA WS-1/1a):
+        // auth_mgr_ (main.cpp-owned) borrows session_store_ via
+        // set_session_store; null it before session_store_ destructs with the
+        // rest of this object's members.
+        auth_mgr_.set_session_store(nullptr);
 
         // Release Phase 2 components (RAII handles close).
         execution_tracker_.reset();
@@ -8404,6 +8612,23 @@ public:
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_offline_endpoint_store(nullptr);
         offline_endpoint_store_.reset();
+        // #3425: same discipline — null the heartbeat-side caller of
+        // quarantine_reconciler_ before dropping the object it calls into.
+        // The reconciler's own background thread is already joined above;
+        // this closes the OTHER caller (the heartbeat fast path, driven by
+        // gRPC handler threads already quiesced by the drains above).
+        if (heartbeat_ingestion_)
+            heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr);
+        quarantine_reconciler_.reset();
+        // UpdateRegistry (ADR-0061) borrows pg_pool_ — same discipline: null the
+        // borrowed raw pointer in agent_service_'s OTA gRPC handlers
+        // (CheckForUpdate/DownloadUpdate) before dropping it, then drop before
+        // the pool. settings_routes_ also holds a raw pointer, wired once at
+        // route-registration time rather than through a live setter — every
+        // HTTP handler thread that could reach it is already quiesced by the
+        // drains above (same as runtime_config_store_'s identical shape).
+        agent_service_.set_update_registry(nullptr);
+        update_registry_.reset();
         // Generic InventoryStore (ADR-0037): same discipline as the typed PG
         // stores below — null the borrowed pointer in the ingest service
         // that actually borrows it (the gateway ProxyInventory path; the
@@ -10053,6 +10278,10 @@ private:
             .principal_role = auth::role_to_string(sess.role),
             .exec_visible = derive_exec_visible(sess),
             .system = false,
+            // #1398: JIT-elevation-aware, matching the governed
+            // POST /api/instructions/:id/execute path's own role-gated
+            // bypass (workflow_routes.cpp).
+            .principal_is_admin = auth::effective_role(sess) == auth::Role::admin,
         };
     }
 
@@ -10087,10 +10316,16 @@ private:
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
         bool principal_resolves = false;
         std::string role_label;
+        // #1398: resolved from the SAME auth-store read as role_label, at
+        // fire time — never cached from schedule-creation time — and fails
+        // closed (stays false) on any resolution failure below, matching
+        // principal_resolves's own fail-closed contract.
+        bool principal_is_admin = false;
         if (auth_db_ && !username.empty()) {
             if (auto user = auth_db_->get_user(username)) {
                 principal_resolves = true;
                 role_label = auth::role_to_string(user->role);
+                principal_is_admin = user->role == auth::Role::admin;
             } else {
                 spdlog::warn("schedule fire: creator '{}' no longer resolves ({}); denying "
                              "fail-closed rather than firing on a stale identity",
@@ -10119,7 +10354,7 @@ private:
         }
         return yuzu::server::caller_for_stored_username(
             username, true, std::move(role_label),
-            yuzu::server::authz::compose_exec_visible(facts));
+            yuzu::server::authz::compose_exec_visible(facts), principal_is_admin);
     }
 
     /// PR1.9c: a stable string label for `DispatchArm`, fed into
@@ -10221,24 +10456,10 @@ private:
 
         if (!decision) {
             const auto& denial = decision.error();
-            std::string_view reason_label;
-            switch (denial.reason) {
-            case yuzu::server::detail::DispatchDenialReason::Unclassified:
-                reason_label = "unclassified";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::Ambiguous:
-                reason_label = "ambiguous";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::AnonymousOperator:
-                reason_label = "anonymous_operator";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::Forbidden:
-                reason_label = "forbidden";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::KillSwitched:
-                reason_label = "kill_switched";
-                break;
-            }
+            // #1398: the ONE label mapping — see to_string(DispatchDenialReason)'s
+            // doc comment (agent_registry.hpp) for why this is no longer a
+            // hand-duplicated switch here.
+            const std::string_view reason_label = yuzu::server::detail::to_string(denial.reason);
             metrics_
                 .counter("yuzu_server_dispatch_denied_total",
                          {{"reason", std::string(reason_label)}})
@@ -10289,8 +10510,13 @@ private:
         if (!finalized) {
             // The only denial `finalize_classified_command` can produce is
             // KillSwitched — classification/authorization already succeeded
-            // above.
-            metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
+            // above. #1398 hardening (Gate 4 consistency-auditor, INFO): route
+            // through the shared to_string() rather than a hand-duplicated
+            // literal — the exact drift this helper exists to prevent.
+            metrics_
+                .counter("yuzu_server_dispatch_denied_total",
+                         {{"reason", std::string(yuzu::server::detail::to_string(
+                                        yuzu::server::detail::DispatchDenialReason::KillSwitched))}})
                 .increment();
             spdlog::warn("dispatch denied: {}:{} reason=kill_switched caller={}", plugin, action,
                          caller.system ? std::string("system")
@@ -10494,14 +10720,18 @@ private:
     /// WorkflowRoutes::CommandDispatchFn); every fake dispatch lambda in
     /// test_mcp_server.cpp / test_dashboard_tar_fragments.cpp /
     /// test_workflow_routes.cpp was updated for the signature-only change.
-    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is left as the
-    /// original CDX-P1-03/K-3 comment found it — a SEPARATE, REST-shared
-    /// typedef with no role concept on its REST side; mcp_server.cpp now
-    /// adapts the widened DispatchFn down to it at construction rather than
-    /// touch that shared type. `principal`/`principal_role` are empty for a
-    /// caller not yet wired to identify itself (present-empty `exec_visible`
-    /// still denies); `DispatchCaller::system` marks a genuine
-    /// background/system dispatcher (no Session at all) explicitly.
+    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is signature-identical
+    /// to `McpServer::DispatchFn` — PR1.9c removed the old adapter, and its
+    /// `dispatch()` (bundle_orchestrator.hpp/.cpp) accepts and threads the
+    /// caller's `principal_is_admin`/`approval_provenance` too (#1398,
+    /// adversarial-review finding: those two fields used to be dropped
+    /// between the wrapper's already-correct caller derivation and the
+    /// per-step `DispatchCaller` this orchestrator reconstructs — fixed by
+    /// widening `dispatch()`'s own signature, not by touching this shared
+    /// typedef). `principal`/`principal_role` are empty for a caller not yet
+    /// wired to identify itself (present-empty `exec_visible` still denies);
+    /// `DispatchCaller::system` marks a genuine background/system dispatcher
+    /// (no Session at all) explicitly.
     ///
     /// Original CDX-P1-03/K-3 (adv-fix11) rationale, preserved for context: a
     /// prior wave attempted widening McpServer::DispatchFn by one param for
@@ -12491,6 +12721,13 @@ private:
             // the /readyz conjunction; trivially true when not on default certs
             // (the operator brought their own, so ca_store isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
+            // ADR-0061: UpdateRegistry — only load-bearing when cfg_.ota_enabled
+            // is true (default ON, opt-out via --no-ota). Mirrors /readyz's own
+            // entry; NOT analogous to ca_ok just above (using_default_certs is
+            // itself true for the ordinary out-of-box self-signed deployment,
+            // not an "off by default" gate).
+            bool update_registry_ok =
+                !cfg_.ota_enabled || (update_registry_ && update_registry_->is_open());
             // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
             // not here, so /healthz could report "healthy" with a degraded store —
             // the same gap the Guardian/CA rows above closed. The server fails
@@ -12565,16 +12802,37 @@ private:
             // gap, not an availability one, but the two probes should agree on which
             // stores exist.
             bool runtime_config_ok = runtime_config_store_ && runtime_config_store_->is_open();
+            // ADR-0062 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Construction is fail-closed,
+            // so this is belt-and-braces against a runtime is_open() flip.
+            bool patch_manager_ok = patch_manager_ && patch_manager_->is_open();
+            // HA WS-1/1a: durable operator sessions. /readyz's StoreCheck vector
+            // names this store; mirror it here so the two probes agree (same
+            // anti-drift rule as runtime_config above) and match the documented
+            // "reported at /readyz and /healthz" contract. is_session_store_ok()
+            // is true on legacy config-file-only deployments (no store wired).
+            bool session_store_ok = auth_mgr_.is_session_store_ok();
+            // ADR-0063 (migration-programme PR 3) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Construction is fail-closed,
+            // so this is belt-and-braces against a runtime is_open() flip.
+            bool directory_sync_ok = directory_sync_ && directory_sync_->is_open();
+            // ADR-0064 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz drift class:
+            // workflow_engine was already in /readyz's StoreCheck vector (below) but absent
+            // here in the SQLite era.
+            bool workflow_engine_ok = workflow_engine_ && workflow_engine_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
                 pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
                 guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok && ca_ok &&
-                offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
-                app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok && tag_ok &&
-                runtime_config_ok;
+                update_registry_ok && offline_endpoint_ok && software_inventory_ok &&
+                vuln_finding_ok && app_perf_daily_ok && app_perf_fleet_ok &&
+                device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
+                mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
+                notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
+                patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12601,6 +12859,7 @@ private:
                   // StoreCheck vector); matching that name here.
                   {"approval_manager", approval_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
+                  {"update_registry", update_registry_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
                   {"vuln_finding_store", vuln_finding_ok ? "ok" : "error"},
@@ -12617,7 +12876,11 @@ private:
                   {"notification_store", notification_ok ? "ok" : "error"},
                   {"upload_grant_store", upload_grant_ok ? "ok" : "error"},
                   {"tag_store", tag_ok ? "ok" : "error"},
-                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"}}},
+                  {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
+                  {"patch_manager", patch_manager_ok ? "ok" : "error"},
+                  {"session_store", session_store_ok ? "ok" : "error"},
+                  {"directory_sync", directory_sync_ok ? "ok" : "error"},
+                  {"workflow_engine", workflow_engine_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -12727,6 +12990,11 @@ private:
                 {"runtime_config_store", runtime_config_store_ && runtime_config_store_->is_open()},
                 {"inventory_store", inventory_store_ && inventory_store_->is_open()},
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
+                // ADR-0063 (migration-programme PR 3): DirectorySync became a
+                // fail-closed Postgres store (was fail-open SQLite, never
+                // checked here before) — load-bearing for /api/directory/*
+                // and the access-review export's optional email enrichment.
+                {"directory_sync", directory_sync_ && directory_sync_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
                 {"guaranteed_state_store",
@@ -12739,6 +13007,13 @@ private:
                 // an operator can detect a corrupt auth.db without scraping
                 // spdlog; pairs with docs/ops-runbooks/auth-db-recovery.md.
                 {"auth_db", auth_mgr_.is_auth_db_ok()},
+                // HA WS-1/1a (ADR-2002 §4): durable operator sessions. Reports
+                // "ok" on legacy config-file-only deployments (no store wired in
+                // AuthManager) and false only when a wired SessionStore failed
+                // to migrate/open — a half-open store cannot mint or validate
+                // durable sessions, so the node is not ready to front the LB.
+                // Same is_*_ok() fail-closed shape as auth_db above.
+                {"session_store", auth_mgr_.is_session_store_ok()},
                 // Phase 8.3 #255 — load-bearing for /api/v1/offload-targets
                 // and the AgentService fan-out path. A migration failure
                 // would silently no-op all offload deliveries while the
@@ -12871,6 +13146,18 @@ private:
                 {"scim_store", !cfg_.scim_enable ||
                                    (scim_store_ && scim_store_->is_open() &&
                                     scim_store_->has_token())},
+                // ADR-0061: UpdateRegistry is only constructed when
+                // cfg_.ota_enabled is true, which defaults ON (opt-out via
+                // --no-ota) — unlike ca_store/scim_store's construction
+                // (unconditional whenever pg_pool_ is up; only their /readyz
+                // CHECK above is flag-gated), this store's CONSTRUCTION itself
+                // has the opt-out. So the check below
+                // covers the ordinary default deployment, not an opt-in
+                // minority. A failed migration/open would otherwise silently
+                // disable OTA (CheckForUpdate/DownloadUpdate always answering
+                // "no update") while /readyz reported "ready".
+                {"update_registry", !cfg_.ota_enabled ||
+                                        (update_registry_ && update_registry_->is_open())},
                 // Wave 2 migrated Postgres store (ADR-0006/0009/0044, schema
                 // `discovery_store`). AUTHORITATIVE per ADR-0012 §1 — the
                 // operator-set `managed` flag is real state. Construction
@@ -12902,6 +13189,11 @@ private:
                 // /readyz still reported "ready".
                 {"upload_grant_store",
                  upload_grant_store_ && upload_grant_store_->is_open()},
+                // ADR-0062 (Wave 4 non-`*Store` migration) — was in neither
+                // /readyz nor /healthz in the SQLite era (no caller ever
+                // checked is_open() at all). Load-bearing for every
+                // /api/patches/* route now that construction is fail-closed.
+                {"patch_manager", patch_manager_ && patch_manager_->is_open()},
             };
 
             // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
@@ -14302,17 +14594,37 @@ private:
                 const bool is_classification_error =
                     denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
                     denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+                // #1398: a gated-but-unapproved pair gets its own message,
+                // naming the gate and pointing at the governed alternative —
+                // distinct from a bare RBAC "permission denied" (Decision 7,
+                // deny+redirect, no new ticket-mint surface on this route).
+                const bool is_approval_required =
+                    denial.reason ==
+                    yuzu::server::detail::DispatchDenialReason::ApprovalRequired;
                 const int status = is_classification_error ? 400 : 403;
                 const std::string message =
                     is_classification_error
                         ? std::string{"unknown or ambiguous plugin.action"}
-                        : "permission denied: " + denial.securable + ":" +
-                              std::string(yuzu::server::authz::to_string(denial.operation));
-                const bool audit_ok =
-                    audit_log(req, "command.dispatch", "denied", "command", "",
-                             std::string("reason=dispatch_denied ") +
-                                 onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                 onbehalf::sanitize_for_log(action, 128));
+                        : is_approval_required
+                              ? "approval required for " + plugin + "." + action +
+                                    " — this action requires either an admin caller or an "
+                                    "approved request; dispatch it via "
+                                    "POST /api/instructions/{id}/execute instead, which "
+                                    "supports the approval workflow"
+                              : "permission denied: " + denial.securable + ":" +
+                                    std::string(yuzu::server::authz::to_string(denial.operation));
+                // #1398 (governance security-guardian F3): the SPECIFIC denial
+                // reason, not a flat "dispatch_denied" — an incident review
+                // needs to tell `forbidden` apart from `approval_required`
+                // from the audit trail alone, the same way the metric label
+                // already does (yuzu::server::detail::to_string, shared with
+                // build_classified_command's metric emission above).
+                const bool audit_ok = audit_log(
+                    req, "command.dispatch", "denied", "command", "",
+                    std::string("reason=") +
+                        std::string(yuzu::server::detail::to_string(denial.reason)) + " " +
+                        onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                        onbehalf::sanitize_for_log(action, 128));
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = status;
@@ -17935,6 +18247,77 @@ private:
             }
         });
 
+        // QuarantineContainmentReconciler (#3425) — re-applies endpoint
+        // containment for an active quarantine record whose device has
+        // reconnected. Same shared dispatch lambda as every other
+        // background engine; the #881 gate's is_quarantine_control_plugin
+        // exemption already lets the quarantine plugin's own actions
+        // through unmodified. Joined BEFORE the stores in stop().
+        quarantine_reconciler_ =
+            std::make_unique<QuarantineContainmentReconciler>(QuarantineContainmentReconciler::Deps{
+                .quarantine_store = quarantine_store_.get(),
+                .response_store = response_store_.get(),
+                .registry = &registry_,
+                .metrics = &metrics_,
+                .audit_store = audit_store_.get(),
+                .dispatch_fn = command_dispatch_fn,
+                .now_fn = {},
+                // governance Gate 5 (chaos-injector, Finding 4b): lets a
+                // shutdown request stop tick()'s reconcile loop from
+                // starting further agents once stop_requested_ flips.
+                .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
+            });
+        // Heartbeat-triggered fast path (the ONLY event-driven trigger that
+        // is dispatch-safe — Register returns before Subscribe establishes
+        // the stream, so a hook fired from there would have `send_to`
+        // silently drop it). The tick below is the periodic backstop:
+        // AgentRegistry::send_to drops offline agents silently, so a tick
+        // against a still-offline device costs one cheap skip and catches a
+        // device that reconnected between heartbeats (same shape as
+        // PreflightRunner's re-dispatch-on-reconnect loop).
+        if (heartbeat_ingestion_) {
+            heartbeat_ingestion_->set_quarantine_reconcile_fn(
+                [this](std::string_view agent_id) {
+                    if (quarantine_reconciler_)
+                        quarantine_reconciler_->notify_agent_heartbeat(agent_id);
+                });
+        }
+        quarantine_reconcile_thread_ = std::thread([this]() {
+            spdlog::info("Quarantine containment reconciler thread started (cadence=20s)");
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                for (int i = 0; i < 4 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (quarantine_reconciler_) {
+                    // tick() touches PG and gRPC dispatch — either can throw;
+                    // an escaping exception would std::terminate the whole
+                    // process over a best-effort reconcile pass. Catch, log,
+                    // keep ticking (five other background loops in this file
+                    // already carry this shape).
+                    try {
+                        quarantine_reconciler_->tick();
+                    } catch (const std::exception& e) {
+                        spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
+                                      e.what());
+                        // #3425 governance correction round (cpp-safety
+                        // SHOULD + unhappy-path UP-1): an exception here
+                        // means this tick did not reach ITS OWN successful
+                        // completion (whether it never reached the read, or
+                        // threw later during dispatch) — without this, the
+                        // freshness gauge freezes at its last value instead
+                        // of exposing the outage.
+                        quarantine_reconciler_->on_tick_exception();
+                    } catch (...) {
+                        spdlog::error(
+                            "quarantine_reconciler: tick threw unknown exception — continuing");
+                        quarantine_reconciler_->on_tick_exception();
+                    }
+                }
+            }
+            spdlog::info("Quarantine containment reconciler thread stopped");
+        });
+
         // ScheduleRunner (#1191) — drives recurring-instruction schedules.
         // ScheduleEngine::evaluate_due/advance_schedule had no production
         // caller: schedules persisted and listed but never fired. Fires travel
@@ -18076,6 +18459,25 @@ private:
                 // is_open-gated (JC-6 decoupling — a response-store outage must
                 // not wedge the result-set GC/materialize work above).
                 constexpr int kResponseReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // HA WS-1/1a: durable session retention sweep. Tighter than the
+                // 60m stores above — expired session rows carry username /
+                // display_name / oidc_sub (identity/PII), so age them out on a
+                // ~15m cadence. reap_expired is clock-guarded + capped (5000/pass).
+                constexpr int kSessionReapEveryNTicks = 450; // ~15 minutes at 2s/tick
+                // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
+                // adversarial-round #2 C1): each ~2s tick compares wall-clock
+                // advance against MONOTONIC (steady_clock) elapsed. A backward
+                // wall-clock step — even a small one BETWEEN reap samples that the
+                // reap anchor check cannot see — shows up here as wall advancing
+                // materially LESS than monotonic; that un-expires sessions and
+                // extends JIT/MFA windows, so it increments the clock-anomaly
+                // counter the YuzuSessionReapClockAnomaly alert fires on. Only
+                // armed with a durable session store (the clock that matters here).
+                // Cumulative-offset detector (NOT a per-tick delta — a per-tick
+                // tolerance that re-baselines each tick is blind to a stopped
+                // clock, adversarial-round C1). Tolerance ignores sub-3s jitter;
+                // a stopped/slewed-back wall clock accumulates until it crosses it.
+                ClockDriftMonitor session_clock_monitor{/*tolerance_ms=*/3000};
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
@@ -18095,6 +18497,31 @@ private:
                         // never starves the response/Guardian reap cadences.
                         const bool rs_ok = result_set_store_ && result_set_store_->is_open();
                         ++tick;
+
+                        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
+                        // C1): compare the wall clock against a monotonic reference
+                        // via ClockDriftMonitor, which ACCUMULATES sub-threshold
+                        // backward drift — so a stopped / slowly-slewed-back wall
+                        // clock (each ~2s sample diverging by less than the
+                        // tolerance) is still caught, unlike a per-sample delta.
+                        // Runs every ~2s tick, independent of the 15m reap anchor.
+                        if (session_store_ && session_store_->is_open()) {
+                            const int64_t wall_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            const int64_t steady_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count();
+                            if (session_clock_monitor.observe(wall_ms, steady_ms)) {
+                                spdlog::warn("session clock monitor: wall clock has fallen behind "
+                                             "monotonic time (backward step / stall / slow negative "
+                                             "slew) — un-expires sessions / extends JIT+MFA windows");
+                                metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
+                                    .increment();
+                            }
+                        }
 
                         // 1) Materialise terminal pending sets (result-set store
                         // only; the thread may be running solely for the response
@@ -18177,6 +18604,39 @@ private:
                         if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                             tick % kGuardianReapEveryNTicks == 0) {
                             guaranteed_state_store_->reap_expired();
+                        }
+
+                        // 2d) Durable session retention reap (HA WS-1/1a, ADR-2002 §4).
+                        // Expired session rows carry identity/PII (username /
+                        // display_name / oidc_sub) and accrue one-per-login, so age
+                        // them out on a ~15m cadence. reap_expired is clock-guarded
+                        // (advisory-lock own-statement + persisted anchor +
+                        // implausible-skew decline + 5000/pass cap) and single-writer-
+                        // safe. now_ms is this server's wall clock; the guard sanitises
+                        // it. A returned count>0 is counted for retention auditability.
+                        if (session_store_ && session_store_->is_open() &&
+                            tick % kSessionReapEveryNTicks == 0) {
+                            const std::int64_t now_ms =
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::system_clock::now().time_since_epoch())
+                                    .count();
+                            if (auto reaped = session_store_->reap_expired(now_ms)) {
+                                if (reaped->deleted > 0)
+                                    metrics_.counter("yuzu_auth_session_reap_total")
+                                        .increment(static_cast<double>(reaped->deleted));
+                                // DB-clock-integrity monitor (ADR-2002 §4 mitigation
+                                // (a)): a declined pass due to a forward/backward
+                                // clock anomaly is the "monitor for backward
+                                // movement; alert" signal. Surfaced as a counter so
+                                // YuzuSessionReapClockAnomaly can fire on it.
+                                if (reaped->clock_anomaly)
+                                    metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
+                                        .increment();
+                            } else {
+                                metrics_.counter("yuzu_auth_session_store_degrade_total",
+                                                 {{"op", "reap"}})
+                                    .increment();
+                            }
                         }
 
                         // 3) Refresh alive gauges.
@@ -19215,6 +19675,11 @@ private:
         // handlers capture `this` at registration and read the member per
         // request, so setting it afterwards would never reach a live route.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // #1712 / #3290 Phase 2 — same conversion lambda already wired into
+        // McpServer's query_installed_software (fleet_read_fn, defined
+        // above); wiring it here too so /fragments/results migrates onto
+        // require_fleet_read as its sole gate.
+        dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         dashboard_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
@@ -19318,6 +19783,10 @@ private:
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        // #1712 / #3290 Phase 2 — same conversion lambda already wired into
+        // McpServer's query_installed_software and DashboardRoutes above;
+        // used only by the executions-drawer detail route.
+        wf_deps.fleet_read_fn = fleet_read_fn;
         wf_deps.audit_fn = audit_fn;
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);
@@ -20941,10 +21410,50 @@ private:
         // build_classified_command.
         auto classified = build_classified_command(caller, plugin, action, command_id);
         if (!classified) {
-            res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"command denied"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // #1398 (governance Gate 6 sre finding, HIGH/BLOCKING): mirror
+            // the /api/command denial block exactly (server.cpp, ~line
+            // 14343) — this route was named explicitly in-scope by the
+            // design doc's Decision 7 ("REST (/api/command,
+            // forward_legacy_command): 403 ... with the specific denial
+            // reason in the audit detail") but was never actually touched
+            // by the diff. `chargen.chargen_start` (this route's live,
+            // dispatchable pair) is compiled ExecuteGate::AdminOrApproval,
+            // so an unaudited ApprovalRequired denial here was a real,
+            // reachable SOC 2 CC7.2 evidence-chain gap
+            // (docs/observability-conventions.md: "Denied operations MUST
+            // emit an audit event"), not a hypothetical one.
+            const auto& denial = classified.error();
+            const bool is_classification_error =
+                denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
+                denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+            const bool is_approval_required =
+                denial.reason == yuzu::server::detail::DispatchDenialReason::ApprovalRequired;
+            const int status = is_classification_error ? 400 : 403;
+            const std::string message =
+                is_classification_error
+                    ? std::string{"unknown or ambiguous plugin.action"}
+                    : is_approval_required
+                          ? "approval required for " + plugin + "." + action +
+                                " — this action requires either an admin caller or an "
+                                "approved request; dispatch it via "
+                                "POST /api/instructions/{id}/execute instead, which "
+                                "supports the approval workflow"
+                          : "permission denied: " + denial.securable + ":" +
+                                std::string(yuzu::server::authz::to_string(denial.operation));
+            const bool audit_ok = audit_log(
+                req, "command.dispatch", "denied", "command", "",
+                std::string("reason=") +
+                    std::string(yuzu::server::detail::to_string(denial.reason)) + " " +
+                    onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                    onbehalf::sanitize_for_log(action, 128));
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = status;
+            nlohmann::json err{{"error", {{"code", status}, {"message", message}}},
+                               {"meta", {{"api_version", "v1"}}}};
+            if (audit_store_)
+                err["audit_emitted"] = audit_ok;
+            res.set_content(err.dump(), "application/json");
             return;
         }
 
@@ -21193,7 +21702,11 @@ private:
     // can't double-apply the same per-reason delta (#1912 review).
     mutable std::mutex nvd_metrics_scrape_mu_;
 
-    // OTA agent updates
+    // OTA agent updates — born-on-PG store (ADR-0061). Borrows pg_pool_
+    // (declared earlier, destructs later) and is borrowed by agent_service_'s
+    // OTA gRPC handlers + settings_routes_'s Updates admin surface; declared
+    // here so it destructs AFTER those consumers' own quiesce/drain and
+    // BEFORE the pool. explicit reset() in stop() before pg_pool_.reset().
     std::unique_ptr<UpdateRegistry> update_registry_;
 
     // Analytics
@@ -21293,6 +21806,16 @@ private:
     /// for the policy this snapshot serves.
     yuzu::server::QuarantineSnapshot quarantine_snapshot_;
     std::mutex quarantine_snapshot_mtx_;
+    /// #3425: re-applies endpoint containment for an active quarantine
+    /// record whose device has reconnected. Borrows quarantine_store_ +
+    /// response_store_ + registry_ — declared here (near quarantine_store_)
+    /// but joined/cleared/reset explicitly in stop(), same discipline as
+    /// preflight_runner_/policy_evaluator_, not relied on via declaration
+    /// order alone (this member's own thread is a background ticker, not a
+    /// per-request borrower, so the explicit stop() sequence is what makes
+    /// teardown safe).
+    std::unique_ptr<QuarantineContainmentReconciler> quarantine_reconciler_;
+    std::thread quarantine_reconcile_thread_; // #3425; joined before stores
     /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so
     /// it destructs after the ingest/HTTP paths that hold its raw pointer and
@@ -21535,6 +22058,12 @@ private:
     std::unique_ptr<FileKeyProvider> auth_key_provider_;
     std::unique_ptr<pg::SecretCodec> auth_secret_codec_;
     std::unique_ptr<AuthDB> auth_db_;
+    // SessionStore — born-on-PG durable operator sessions (HA WS-1/1a,
+    // ADR-2002 §4). Borrows pg_pool_ by reference, so (like every member here)
+    // it destructs before pg_pool_. auth_mgr_ holds a raw pointer to it via
+    // set_session_store; that pointer is nulled at teardown before this
+    // destructs (see set_session_store(nullptr) beside set_auth_db(nullptr)).
+    std::unique_ptr<SessionStore> session_store_;
     // SCIM v2 provisioning (/scim/v2/*) — the store is constructed
     // unconditionally alongside AuthDB (born-on-PG, cheap to open); only
     // route registration + the configured bearer token are gated on

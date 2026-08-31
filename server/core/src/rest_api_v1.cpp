@@ -22,6 +22,7 @@
 #include "inventory_eval.hpp"
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
@@ -886,7 +887,7 @@ const std::string& openapi_spec() {
         R"json(,
     "/quarantine": {
       "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list. Two distinct causes, distinguished by message: store/pool/query failure only increments yuzu_server_quarantine_read_degrade_total; a per-record admit-then-filter anomaly (e.g. transient engine-principal-store outage) does not"}}},
-      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, or the device is already quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, the device is already quarantined, or whitelist fails server-edge validation (>512 chars, or a token outside [0-9A-Fa-f.:], <=45 chars/token)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
       "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
@@ -1595,6 +1596,9 @@ void RestApiV1::register_routes(
         if (sess) {
             caller.principal = sess->username;
             caller.principal_role = auth::role_to_string(sess->role);
+            // #1398: JIT-elevation-aware, matching every other session-derived
+            // caller.
+            caller.principal_is_admin = auth::effective_role(*sess) == auth::Role::admin;
         }
         caller.exec_visible = (exec_visible_fn && sess) ? exec_visible_fn(*sess)
                                                         : yuzu::server::authz::deny_all();
@@ -1749,6 +1753,13 @@ void RestApiV1::register_routes(
                   }
                   auto session = auth_fn(req, res);
                   const std::string principal = session ? session->username : std::string{};
+                  // #1398: JIT-elevation-aware, matching every other session-derived
+                  // caller — threaded into bundle_orch->dispatch() below so an
+                  // admin's bundle step on an AdminOrApproval-gated pair is not
+                  // unconditionally denied (adversarial-review finding: this value
+                  // used to be dropped entirely between here and the orchestrator).
+                  const bool principal_is_admin =
+                      session && auth::effective_role(*session) == auth::Role::admin;
                   // A bundle is owned by its dispatcher (collate gates on it). An
                   // empty principal would be un-attributable and collatable by any
                   // other empty-principal caller — refuse it, matching the
@@ -1808,7 +1819,15 @@ void RestApiV1::register_routes(
                           exec_visible_fn && session
                               ? exec_visible_fn(*session)
                               : yuzu::server::authz::deny_all();
-                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible);
+                      // #1398: thread principal_is_admin (derived above) so an
+                      // admin's bundle step on a gated pair is not unconditionally
+                      // denied. approval_provenance stays the default None — REST
+                      // execute_bundle has no ticket-consumption flow (that is an
+                      // MCP-tier-specific mechanism); a non-admin REST caller
+                      // reaches a gated pair only via the governed instruction-
+                      // execute path, same as before this diff.
+                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible,
+                                                principal_is_admin);
                   } catch (const std::exception& e) {
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
                                std::string("agent=") + agent_id + " error=" + e.what());
@@ -4574,7 +4593,17 @@ void RestApiV1::register_routes(
                             .add("quarantined_by", r.quarantined_by)
                             .add("quarantined_at", r.quarantined_at)
                             .add("whitelist", r.whitelist)
-                            .add("reason", r.reason));
+                            .add("reason", r.reason)
+                            // #3425: endpoint-containment confirmation state
+                            // (schema v2) — 0 = never, matching
+                            // quarantined_at's own never-happened shape.
+                            // last_applied_at: a system re-dispatch of the
+                            // stored whitelist was accepted (agents_reached
+                            // > 0), NOT proof of containment.
+                            // last_confirmed_at: a follow-up quarantine.status
+                            // read reported state|active.
+                            .add("last_applied_at", r.last_applied_at)
+                            .add("last_confirmed_at", r.last_confirmed_at));
                 ++visible;
             }
             res.set_content(list_json(arr.str(), visible), "application/json");
@@ -4631,6 +4660,30 @@ void RestApiV1::register_routes(
         }
         if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
             return;
+
+        // #3425 gate3-rest-whitelist-validation-gap: this write is the ONLY
+        // creation path that skipped the charset/length check the reconciler
+        // and MCP's already_active retry both apply before ever dispatching
+        // a stored whitelist (quarantine_reapply.hpp — the single validator
+        // chokepoint, reused here rather than forked). Before #3425's
+        // reconciler shipped, a record written with an unsafe whitelist was
+        // merely permanently undispatchable; now it also fails validation on
+        // every tick/heartbeat, forever, until replaced — reject it at write
+        // time instead so the operator finds out immediately, not via a
+        // repeating background counter.
+        if (whitelist.size() > kQuarantineWhitelistMaxLen ||
+            !quarantine_whitelist_tokens_safe(whitelist)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "whitelist rejected: total exceeds " +
+                                                 std::to_string(kQuarantineWhitelistMaxLen) +
+                                                 " characters, a token exceeds 45 characters, "
+                                                 "or a token contains a character outside "
+                                                 "[0-9A-Fa-f.:]"),
+                            "application/json");
+            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
+                     "whitelist rejected by server-edge validation");
+            return;
+        }
 
         auto session = auth_fn(req, res);
         std::string by = session ? session->username : "system";

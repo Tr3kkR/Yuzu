@@ -92,7 +92,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mfa-reset <username>` | *(none)* | **Break-glass.** Clears the named user's MFA enrollment and exits **without starting the server** — the recovery path from MFA-enforcement lockout. Writes an `mfa.reset.breakglass` audit row (principal = the OS account that ran the CLI). Requires `--config` + `--data-dir`; no TLS flags needed. See `docs/ops-runbooks/auth-db-recovery.md` § Emergency MFA disable. |
 | `--auth-lockout-threshold` | `5` | Consecutive failed **local-password** login attempts before an account is temporarily locked (SOC 2 CC6.3). A locked account returns the **same generic 401** as a bad password — no enumeration/lock-state oracle. Counter resets on a successful login or an admin unlock (`POST /api/v1/users/{name}/unlock`). Scope is local-password only — OIDC/SSO sessions and API tokens are unaffected. Setting `0` **disables** lockout (startup `WARN`) and constitutes a deviation from the CC6.3 hardened baseline — record it as a documented exception on your risk register, do not just flip it. NIST 800-63B §5.2.2 suggests allowing ≥10 attempts where network-layer rate-limiting is also present; raise the threshold accordingly if you front Yuzu with an IP throttle. Env: `YUZU_AUTH_LOCKOUT_THRESHOLD`. |
 | `--auth-lockout-window-secs` | `900` | How long an account stays locked after the threshold is crossed. The lock **auto-expires** after this window — it is never permanent, so it cannot be weaponised to permanently deny a legitimate principal; a waited-out user regains a full attempt budget. Env: `YUZU_AUTH_LOCKOUT_WINDOW_SECS`. |
-| `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and the grant is in-memory per cookie session (auto-reverts on lapse; a restart drops it). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
+| `--jit-max-elevation-secs` | `3600` | **JIT admin elevation** maximum window (SOC 2 CC6.3/CC6.6). Caps the lifetime of a time-boxed admin elevation activated via `POST /api/v1/elevate`; a request asking for longer is clamped. Range 1–86400 (24h). Eligibility is the per-user `users.elevation_eligible` flag (admin-set via `POST /api/v1/users/<name>/elevation-eligibility`), elevation requires a fresh MFA step-up, and for Postgres-backed deployments the grant is **durably persisted** to the cookie session's `SessionStore` row (HA WS-1/1a, ADR-2002 §4), so it **survives a restart** — bounded by this 24h ceiling and the session's own absolute expiry, and auto-reverting on lapse, logout, or explicit revoke (config-file-only deployments keep the old in-memory-per-session behavior a restart drops). API/MCP tokens can never be elevated. Env: `YUZU_JIT_MAX_ELEVATION_SECS`. |
 | `--jit-oidc-amr-elevation` / `--no-jit-oidc-amr-elevation` | `true` (enabled) | Whether an OIDC session whose IdP login attested MFA (the `amr` claim, seeding `Session::mfa_verified_at` at `/auth/callback`) can satisfy `POST /api/v1/elevate`'s mandatory second-factor requirement **without** local TOTP enrollment. An OIDC session never consults a local namesake account's TOTP enrollment — a single-factor (no-`amr`) OIDC session is **always** denied regardless of this flag. Pass `--no-jit-oidc-amr-elevation` to disable JIT elevation for OIDC sessions **entirely** — an OIDC session cannot present a local TOTP step-up (its step-up challenge is re-authenticating via SSO, not a TOTP code), so with the flag off an operator must switch to a local-authenticated session with local TOTP to elevate. A one-time INFO log line is emitted at boot when OIDC is configured and this flag is on. ⚠️ **This flag currently has no observable effect** — since the #1837/#1857 identity re-key, an OIDC session is denied JIT elevation at the eligibility gate (its `oidc:<iss>#<sub>` principal has no local `users` row), before the `amr` branch this flag controls is reached; OIDC elevation is restored by #1852. Env: `YUZU_JIT_OIDC_AMR_ELEVATION`. |
 | `--session-inactivity-secs` | `0` | **Idle (inactivity) session timeout** (SOC 2 CC6.3). Seconds of inactivity after which an operator **dashboard cookie session** is invalidated server-side — a **sliding** window that resets on each authenticated request, *under* the absolute 8-hour session lifetime. `0` (default) **disables** it (only the absolute lifetime applies — existing deployments are unaffected); a recommended hardened value is `900` (15 min). Scope is cookie sessions only: **API tokens and MCP tokens are never idle-timed-out** (long-lived automation is unaffected); OIDC users simply re-authenticate via SSO. The active window is logged once at boot for evidence; a value ≥ the absolute 8-hour session lifetime (28800s) is accepted but elicits a startup `WARN` (the idle window can never fire before absolute expiry). Env: `YUZU_SESSION_INACTIVITY_SECS`. |
 | `--auth-mode` | `standard` | Local-password login policy (SOC 2 CC6.3). `standard` = password login enabled. `sso-only` = **local-password login is disabled fleet-wide** — only OIDC SSO mints a session — so the server **refuses to start** unless OIDC is configured (`--oidc-issuer`). A rejected local login returns the **same generic 401** as a bad password (no oracle) and is counted via the metric `yuzu_auth_local_disabled_total` (metric, not a per-attempt audit row — avoids audit-flood under credential spray). A single `--break-glass-user` is exempt while armed. Env: `YUZU_AUTH_MODE`. |
@@ -1034,6 +1034,44 @@ you see this on a rolling upgrade, retry once traffic quiesces (a load
 balancer draining the outgoing replica is usually enough); it is not a data
 integrity concern either way.
 
+### vNEXT — a device quarantined while offline now re-contains itself automatically on reconnect (#3425) (breaking)
+
+`QuarantineStore` gains schema v2: two columns on `quarantine_records`
+(`last_applied_at`, `last_confirmed_at`, both `BIGINT NOT NULL DEFAULT 0`) tracking whether a new
+background component, `QuarantineContainmentReconciler`, has re-applied and confirmed a device's
+endpoint firewall since it last reconnected. Same `ACCESS EXCLUSIVE` migration-lock note as the
+API-token entry above applies here too — negligible in practice, since `quarantine_records` is a
+small, manually-curated security-event table, not a hot path.
+
+No operator action needed for the reconciler itself. Previously, a device quarantined while
+offline stayed contained at the control plane (the #881 dispatch gate) indefinitely, but its own
+firewall was never (re-)applied until someone noticed and manually re-issued the
+`quarantine_device` MCP call. On upgrade, every pre-existing active quarantine record starts
+unconfirmed, so expect one automatic re-application attempt per connected contained device shortly
+after the new binary starts serving — this is idempotent and is the correct, intended behaviour
+(those are exactly the devices whose endpoint containment was never independently confirmed). See
+`docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the mechanism and
+the new `yuzu_server_quarantine_endpoint_unconfirmed{reachability}` /
+`yuzu_server_quarantine_reapply_total{result}` / `yuzu_server_quarantine_reconciler_tick_healthy`
+metrics.
+
+**BREAKING for callers of `POST /api/v1/quarantine`.** This route now validates `whitelist` at
+write time (≤512 chars, `[0-9A-Fa-f.:]` tokens only) and rejects a malformed value with `400`
+instead of persisting it — a caller relying on the old permissiveness for a CIDR range or hostname
+entry now gets `400` where it previously got `201`. This route only ever creates a NEW record (it
+already refuses with `400` if the device is already quarantined), so no *existing* containment is
+ever lost by this change — but a caller that fires a quarantine request and ignores a `400`
+response now gets zero protection for that device, where before a malformed-but-persisted record
+still left it denied at the #881 control-plane dispatch gate (its endpoint firewall was never
+actually enforceable either way, since the same malformed value could never be dispatched). Check
+the response status; do not assume success.
+
+`QuarantineContainmentReconciler` is **always on, with no configuration surface** — no CLI flag or
+env var disables or tunes it (matching the #881 dispatch gate it complements, which is the same
+way). Its cadence (20s tick), per-agent timing (60s minimum reapply interval, 15-minute backoff
+cap), and per-tick dispatch cap (50 agents) are fixed `constexpr` constants in
+`quarantine_containment_reconciler.hpp`, not runtime-configurable.
+
 ### vNEXT — the rotation sweep now carries the full clock-guarded-retention shape (#2964)
 
 **What changed.** `ApiTokenStore::sweep_expired_rotations` — the 60-second
@@ -1366,6 +1404,14 @@ MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` 
 
 **What to do.** Nothing required for the common case. If your integration has error-handling logic keyed specifically on a `403` from these two surfaces, update it to handle the real filtered result instead.
 
+### vNEXT — dashboard `/fragments/results`, the workflow executions drawer, and MCP `get_agent_details` now confine to the caller's management group / service scope (#1712, ADR-0017)
+
+**What changed.** These three surfaces previously gated on a flat permission check with no per-agent filter: a management-group-confined operator holding `Response:Read`/`Execution:Read` saw the **whole fleet's** response data and agent statuses through the dashboard/workflow surfaces (not just their own group), and a service-scoped API token calling MCP `get_agent_details` was denied outright (`403`) rather than shown anything. All three now migrate onto `AuthRoutes::require_fleet_read`, the same admit-then-filter primitive `GET /api/v1/inventory/software`/`query_installed_software` already use (#3290 note above) — a management-group-confined operator now sees a genuinely narrowed, correct result on the two dashboard/workflow surfaces; a correctly-confined service-scoped token now gets a **filtered result** from `get_agent_details` instead of a `403`. `get_agent_details` on an out-of-scope agent returns the identical "not found" response a genuinely nonexistent agent would (closing a related existence-oracle, #3564) — the tool can no longer be used to discover which agents exist outside a caller's scope.
+
+**Who this affects.** Any management-group-confined operator using the dashboard results page or the workflow executions drawer will now see a **narrower** view than before — this is the intended fix, not a regression; an unconfined (global) operator's view is byte-identical to before. A confined operator who newly reaches `/fragments/results` will also not see the "Create Group from N Agents" button that an unconfined operator sees — its downstream flow (`/fragments/create-group-form`, `POST /api/dashboard/group-from-results`) is not yet scope-safe, so the button is withheld entirely for a confined caller rather than risk a confined-N-vs-unscoped-M mismatch (tracked #3489). Any integration authenticating with a service-scoped API token that calls MCP `get_agent_details`: code that specifically branched on a `403` from this tool to mean "not available to this token" should be updated to expect a real (filtered) result instead, mirroring the `query_installed_software` guidance above.
+
+**What to do.** Nothing required for the common case. If a confined operator reports dashboard/workflow results that look "smaller than before," that is the fix working as intended — confirm their management-group membership matches the agents they expect to see. If a service-scoped integration's error handling is keyed on a `403` from `get_agent_details` specifically, update it the same way as the `query_installed_software` note above.
+
 ### v0.10.0 — API token revocation is owner-scoped
 
 Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
@@ -1539,6 +1585,20 @@ detail: `docs/adr/0057-webhook-store-postgres-migration.md` and the
 ### vNEXT — `initialize` can answer `503` during a graceful shutdown (#3042)
 
 With MCP streaming on, `initialize` now returns `HTTP 503` / JSON-RPC `-32015` ("Server is shutting down") for a narrow, transient window (seconds, not the deploy's whole grace period) if it lands after `ServerImpl::stop()` has begun draining live sessions. **Affected:** any MCP client integration — the reference clients and most SDKs already treat a non-2xx `initialize` as a transient failure and retry/reconnect; a client that specifically asserted "initialize never 503s" needs updating. No `retry_after_ms` is given (this process has no visibility into when a replacement instance will be reachable); reconnect and re-`initialize` once it is. A session that was already live when shutdown began instead receives a clean `notifications/yuzu.stream_closed` close frame (`reason: session_terminated`) rather than a bare connection drop — see [MCP — Troubleshooting](mcp.md#-32015-server-is-shutting-down-http-503) for the full symptom/cause/fix.
+
+### vNEXT — Linux adapter names no longer carry the `@peer` suffix (breaking)
+
+**What changed.** The `network_config` agent plugin's `adapters` and `ip_addresses` actions were rewritten to read Linux interfaces via rtnetlink instead of parsing `ip -o link show` text. The previous parser copied iproute2's *display* form for any interface with a parent link — a veth pair, a VLAN sub-interface, a tunnel device — which renders as `<name>@<parent>`, for example `eth0@if74` or `eth0.100@eth0`. The new leg reads the kernel's own interface name directly (`IFLA_IFNAME`), which never carries that suffix: the same two interfaces now report as `eth0` and `eth0.100`. This is a deliberate choice, not an oversight — `eth0@if74` is iproute2 presentation syntax that no other data source on the host recognises, and it was also silently breaking the adapter's link-speed lookup (`/sys/class/net/eth0@if74/speed` never resolves; the un-suffixed path does), so restoring the old string would also restore that bug.
+
+**Who this affects.** Any deployment with a Linux fleet segment where at least one host has an interface with a parent link — containerised hosts (veth is the default Docker/Kubernetes networking model), VLAN-tagged interfaces, or tunnel devices (WireGuard, OpenVPN, GRE) — **and** has a saved dashboard filter, a report, an external inventory join, or automation keyed on the adapter-name string containing `@`. A plain bare-metal or VM fleet with no such interfaces is unaffected; the field's *value* changes only for interfaces that previously carried the suffix.
+
+**Before upgrading, check whether this affects you.** On a representative Linux host, compare:
+
+```bash
+ip -o link show | awk -F': ' '{print $2}' | grep '@'
+```
+
+If this returns any interface names, those hosts will report a different (shorter) adapter name for those interfaces after upgrade — update any saved filter, dashboard, or join key that references the old `@`-suffixed string. If it returns nothing, this note does not affect you.
 
 ---
 
@@ -2056,6 +2116,8 @@ membership — mirroring the OIDC `--oidc-admin-group` mechanism:
 |---|---|---|
 | `--saml-group-attribute` | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers. |
 | `--saml-admin-group` | `YUZU_SAML_ADMIN_GROUP` | The group value (from `--saml-group-attribute`) that grants `role=admin`. |
+| `--saml-name-attribute` | `YUZU_SAML_NAME_ATTRIBUTE` | Optional. `<Attribute Name="...">` whose first value is the user's display name (e.g. Entra's `displayname` claim URI). Empty (default) leaves the session display as the raw NameID. **Display/audit only — never an identity or authz input.** |
+| `--saml-email-attribute` | `YUZU_SAML_EMAIL_ATTRIBUTE` | Optional. `<Attribute Name="...">` whose first value is the user's email (e.g. Entra's `emailaddress` claim URI). Used only as a display fallback and logged — **never stored durably or used for identity.** |
 
 A session is `role=admin` only when both flags are set and the assertion's
 group list contains an **exact match** for `--saml-admin-group`; otherwise
