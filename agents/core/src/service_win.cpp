@@ -100,18 +100,44 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
         // (agents/core/src/shutdown_deadline_guard.hpp, kShutdownDeadlineGrace = 20s) as its
         // first statement. 20s leaves only a 10s margin under this 30s hint, not "well under"
         // it - a wedge diagnosed slowly by the guard's own worker dispatch could still cost
-        // the SCM's patience in a worst case. That reasoning is about SERVICE_CONTROL_STOP's
-        // own STOP_PENDING hint specifically; on SERVICE_CONTROL_SHUTDOWN the OS applies its
-        // own WaitToKillServiceTimeout instead, which can be shorter and is outside this
-        // process's control either way. No checkpoint-bumping thread added regardless: a wedge
-        // that outlives the 30s hint now hard_exit()s the whole process before the SCM's own
-        // timeout would matter, rather than needing a live checkpoint to survive it. --install-
-        // service's own SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 - SC_ACTION_RESTART
-        // x3, with SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it fires on a clean exit with
-        // no SERVICE_STOPPED report too, not just a crash) DOES auto-restart a watchdog-fired
-        // TerminateProcess, similar to the Linux systemd Restart=always path (an earlier
-        // revision of this comment claimed the opposite - governance Gate 6 sre finding,
-        // corrected at Gate 8 re-verify after direct code read).
+        // the SCM's patience in a worst case.
+        //
+        // That margin is for ONE watchdog. AgentImpl::stop() and run()'s teardown ScopeExit
+        // each arm their own, independently-budgeted 20s watchdog, and in the worst case the
+        // two compose SEQUENTIALLY in wall-clock time (agent.cpp's kShutdownDeadlineGrace
+        // comment has the exact call-graph reasoning) - up to ~40s total, past this 30s hint,
+        // with neither individual watchdog firing (external review, PR #3737). In that specific
+        // composed-but-neither-fires case the outcome is a CLEAN stop, not a crash: teardown
+        // eventually completes on its own and this handler reaches report_status(SERVICE_STOPPED)
+        // below (line ~260) with its default NO_ERROR exit code. Per SERVICE_FAILURE_ACTIONS_FLAG's
+        // documented semantics, --install-service's SC_ACTION_RESTART recovery actions (main.cpp,
+        // #1822) fire ONLY on a process that terminates WITHOUT reporting SERVICE_STOPPED, or one
+        // that reports it with a non-zero exit code - a slow-but-clean SERVICE_STOPPED/NO_ERROR
+        // report satisfies neither condition, so no restart fires here (an earlier revision of
+        // this comment claimed the opposite - corrected after direct verification against
+        // Microsoft's own documented flag semantics, not just re-derivation from this PR's code).
+        // The actual consequence of exceeding the 30s hint in this specific tail case is milder
+        // than a restart, not worse: the service simply reports STOPPED later than the SCM
+        // expected, with no automatic action taken either way.
+        //
+        // If EITHER watchdog instead genuinely FIRES (a real wedge, hard_exit(4)), the
+        // auto-restart claim below (main.cpp, #1822) is unaffected and remains correct: a
+        // TerminateProcess exit never reports SERVICE_STOPPED at all, which is exactly the
+        // first triggering condition above.
+        //
+        // That STOP_PENDING-margin reasoning is about SERVICE_CONTROL_STOP specifically; on
+        // SERVICE_CONTROL_SHUTDOWN the OS applies its own WaitToKillServiceTimeout instead,
+        // which can be shorter and is outside this process's control either way. No
+        // checkpoint-bumping thread added regardless: a wedge that outlives the 30s hint now
+        // hard_exit()s the whole process before the SCM's own timeout would matter, rather than
+        // needing a live checkpoint to survive it. --install-service's own
+        // SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 - SC_ACTION_RESTART x3, with
+        // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it fires on a clean exit with no
+        // SERVICE_STOPPED report too, not just a crash) DOES auto-restart a watchdog-fired TerminateProcess,
+        // similar to the Linux systemd Restart=always path (an earlier revision of this comment
+        // claimed NO auto-restart existed at all - governance Gate 6 sre finding, corrected at
+        // Gate 8 re-verify after direct code read; the SEPARATE correction above is about which
+        // specific SHUTDOWN OUTCOME triggers it, not whether the mechanism exists).
         report_status(SERVICE_STOP_PENDING, NO_ERROR, 0, 30000);
         {
             std::lock_guard<std::mutex> lock(g_agent_mu);

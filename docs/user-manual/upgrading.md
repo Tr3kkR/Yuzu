@@ -2796,8 +2796,14 @@ Before upgrading any component:
   by the same 20s watchdog; the agent's `--install-service` recovery-actions
   configuration (#1822) auto-restarts on a watchdog fire similarly to the
   Linux `Restart=always` unit, but the exit shows up as a generic unexpected
-  termination rather than one of the SCM's own "specific error" buckets. See
-  *Stopping a wedged agent* in [Server Administration](server-admin.md).
+  termination rather than one of the SCM's own "specific error" buckets.
+  `AgentImpl::stop()` and the run()-exit teardown each arm this deadline
+  separately, and in the worst case the two can compose sequentially to as
+  much as ~40s before either one fires, past the 30s SCM hint — but that
+  specific case is a slow clean stop, not a hang or a restart (a clean
+  `SERVICE_STOPPED` report doesn't trigger the recovery actions above
+  either). See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
