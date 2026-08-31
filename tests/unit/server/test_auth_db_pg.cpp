@@ -34,9 +34,11 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::AuthDB;
@@ -680,6 +682,68 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     auto after_disable = h.db.mfa_status("mfauser");
     REQUIRE(after_disable.has_value());
     CHECK_FALSE(after_disable->enrolled);
+}
+
+// ── #2399: a single valid TOTP code is consumed AT MOST ONCE, even under two
+//    concurrent submissions ─────────────────────────────────────────────────
+//
+// `mfa_verify_login_code` is a `SELECT ... FOR UPDATE` transaction whose
+// counter advance is additionally guarded by `WHERE mfa_last_counter < $matched
+// RETURNING`. Two mechanisms, one invariant: the same code cannot pass twice.
+// This exercises it end-to-end against live PG with the pool handing each
+// thread its own connection — the row lock serializes them, and the monotonic
+// WHERE is the belt to that lock's suspenders. Assert on the COUNT (exactly one
+// success), not on which thread wins, so the test is deterministic.
+TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly once",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()}; // pool size 4 — enough for two concurrent verifies
+    REQUIRE(h.db.upsert_user("racer", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto init = h.db.mfa_init_enrollment("racer", "Yuzu");
+    REQUIRE(init.has_value());
+    auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw_secret.has_value());
+    auto secret_view =
+        std::string_view(reinterpret_cast<const char*>(raw_secret->data()), raw_secret->size());
+    auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
+    // Complete enrollment at `counter`; the login code is the NEXT step so the
+    // enrollment counter's own replay protection does not reject it.
+    REQUIRE(h.db.mfa_verify_enrollment("racer", yuzu::server::mfa::generate(secret_view, counter))
+                .has_value());
+    auto login_code = yuzu::server::mfa::generate(secret_view, counter + 1);
+
+    std::atomic<int> ok{0};
+    std::atomic<int> rejected{0};
+    std::atomic<int> errored{0};
+    std::atomic<bool> go{false};
+    auto submit = [&] {
+        while (!go.load(std::memory_order_acquire)) {
+        } // spin so both threads reach the store as close together as possible
+        auto r = h.db.mfa_verify_login_code("racer", login_code);
+        if (!r.has_value())
+            errored.fetch_add(1, std::memory_order_relaxed);
+        else if (*r)
+            ok.fetch_add(1, std::memory_order_relaxed);
+        else
+            rejected.fetch_add(1, std::memory_order_relaxed);
+    };
+    std::thread t1(submit);
+    std::thread t2(submit);
+    go.store(true, std::memory_order_release);
+    t1.join();
+    t2.join();
+
+    // Exactly one submission burns the code; the other is a clean `false`
+    // (already-consumed), never a second success and never a store error.
+    CHECK(ok.load() == 1);
+    CHECK(rejected.load() == 1);
+    CHECK(errored.load() == 0);
+
+    // And the code stays burned for any later attempt.
+    auto replay = h.db.mfa_verify_login_code("racer", login_code);
+    REQUIRE(replay.has_value());
+    CHECK(*replay == false);
 }
 
 // ── ★ fail-closed: corrupted/undecryptable secret NEVER reads as "not
