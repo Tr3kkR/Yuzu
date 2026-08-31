@@ -58,6 +58,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -222,8 +223,10 @@ inline std::string format_mac(const unsigned char* addr, std::size_t len) {
 
 /**
  * Dedupe a vector of equality-comparable values, preserving first-seen
- * order. Pure — O(n^2) worst case, which is fine for the small lists
- * (a handful of DNS servers, a few dozen ARP entries) this exists for.
+ * order. O(n) via an unordered_set sidecar tracking what has already been
+ * emitted — both callers can see up to kArpEntryCap (20000) records before
+ * their own cap trims the output, and an O(n^2) `std::find` scan at that
+ * boundary is a worst-case ~200M comparisons for one dedupe call.
  *
  * Two production callers (PKG-NC fix round, live before/after parity diff):
  *   - macOS arp: the PF_ROUTE NET_RT_FLAGS/RTF_LLINFO sysctl dump can report
@@ -238,8 +241,10 @@ template <typename T>
 inline std::vector<T> dedupe_preserve_order(const std::vector<T>& items) {
     std::vector<T> out;
     out.reserve(items.size());
+    std::unordered_set<T> seen;
+    seen.reserve(items.size());
     for (const auto& item : items) {
-        if (std::find(out.begin(), out.end(), item) == out.end())
+        if (seen.insert(item).second)
             out.push_back(item);
     }
     return out;
