@@ -4539,9 +4539,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // working example ~5424) — a dropped row on this
                                 // P1 security refusal's evidence chain is the more
                                 // security-relevant gap, not less.
+                                // Gate 8 round 3 (consistency-auditor SHOULD item 2):
+                                // prefixed with "reason=" so this arm's audit detail
+                                // is byte-shape-identical to the adjacent ClassifyMiss
+                                // arm's above (`reason=<value> <plugin>:<action>
+                                // correlation_id=<cid>`) — genuine parity, not just a
+                                // shared mechanism, so audit-log tooling can rely on
+                                // one convention across both arms of this switch.
                                 const bool audit_ok = mcp_audit(
                                     "denied",
-                                    std::string("destructive_untargeted ") +
+                                    std::string("reason=destructive_untargeted ") +
                                         yuzu::server::detail::sanitize_detail_value(p) + ":" +
                                         yuzu::server::detail::sanitize_detail_value(a) +
                                         " correlation_id=" + cid);

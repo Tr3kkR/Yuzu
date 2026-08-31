@@ -1321,7 +1321,11 @@ public:
         // on today.
         metrics_.describe("yuzu_server_dispatch_denied_total",
                           "Dispatches refused by the classification/authorization chokepoint "
-                          "(`build_classified_command`), labelled by which gate refused. "
+                          "(`build_classified_command`) or, for `unclassified`/`ambiguous` on "
+                          "MCP's `execute_instruction` specifically, by the C8 pre-mint gate "
+                          "(`mcp_server.cpp`) denying a classify-miss locally before an "
+                          "approval ticket is minted (#3685) - a second, independent emitter "
+                          "on the same series, labelled by which gate refused. "
                           "`kill_switched` is an operator-thrown emergency stop, deliberately "
                           "distinct from the `forbidden` authorization verdict.",
                           "counter");

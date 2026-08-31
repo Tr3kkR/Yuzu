@@ -794,8 +794,8 @@ struct McpTestServer {
         [](std::string_view, std::string_view)
             -> std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError> {
             static constexpr yuzu::server::CommandCapability kBenignRow{
-                .plugin = "*",
-                .action = "*",
+                .plugin = "unused",
+                .action = "unused",
                 .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
                 .mutability = yuzu::server::Mutability::None,
                 .securable = "Execution",
@@ -7203,6 +7203,42 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
     CHECK_FALSE(dispatched);
 }
 
+namespace {
+// Gate 8 round 3 (quality-engineer + security-guardian SHOULD item 4):
+// `destructive_classify_stub` above always maps a miss to `Unclassified`, so
+// no existing test drives the `Ambiguous` branch of C8's `gate.miss ==
+// ClassificationError::Ambiguous ? Ambiguous : Unclassified` ternary — a
+// mutation swapping which miss maps to which reason string would pass every
+// prior test. A separate small stub (not a parameter on
+// `destructive_classify_stub` itself, which 8 existing call sites already
+// bind directly to `ClassifyFn` by name — adding a parameter would change
+// its signature and break every one of them) reusing the same
+// `kDestructiveRow`/miss-shape, differing only in which
+// `ClassificationError` a miss reports. Mirrors the real
+// `CommandCapabilityRegistry`-level technique
+// (`test_dispatch_destructive_gate.cpp`'s `kCollidingFragment`: two
+// independently-authored fragments redeclaring the same `plugin.action`)
+// without needing a real registry at the MCP-fixture level, where
+// `ClassifyFn` is injected directly.
+[[nodiscard]] std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError>
+destructive_classify_stub_ambiguous(std::string_view plugin, std::string_view action) {
+    static constexpr yuzu::server::CommandCapability kDestructiveRow{
+        .plugin = "tar",
+        .action = "purge_source",
+        .dispatch_class = yuzu::server::DispatchClass::Destructive,
+        .mutability = yuzu::server::Mutability::Irreversible,
+        .securable = "Infrastructure",
+        .operation = yuzu::server::authz::Operation::Delete,
+        .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = yuzu::server::ExecuteGate::None,
+    };
+    if (plugin == kDestructiveRow.plugin && action == kDestructiveRow.action)
+        return kDestructiveRow;
+    return std::unexpected(yuzu::server::ClassificationError::Ambiguous);
+}
+} // namespace
+
 TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3): a classify-miss at C8 denies "
           "immediately — NO approval ticket minted",
           "[mcp][pg][integration][execute][3685][approval]") {
@@ -7214,15 +7250,21 @@ TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3): a classify-miss at C
     // returns `ClassificationError::Unclassified` for every plugin.action
     // pair except `tar.purge_source` (its own doc comment above), so any
     // OTHER pair exercises exactly the ClassifyMiss verdict without a new
-    // stub. The `Ambiguous` sub-case shares the same code path (a ternary on
-    // `gate.miss`), so this one case exercises both mapped reasons'
-    // machinery.
+    // stub. Gate 8 round 3 item 4: this case also pins the actual `reason=`
+    // VALUE threaded into the metrics label and audit detail — not just that
+    // the same code path runs — so a mutation swapping which miss maps to
+    // which reason string fails this test. The `Ambiguous` sub-case
+    // (`destructive_classify_stub_ambiguous`, its own test below) shares the
+    // same ternary but must independently pin `reason="ambiguous"`; this
+    // test proves nothing about that other branch.
     yuzu::test::ApprovalManagerPg appr_bundle;
     yuzu::server::ApprovalManager& appr = *appr_bundle;
 
+    yuzu::MetricsRegistry reg;
     McpTestServer ts;
     ts.classify_fn_for_test = destructive_classify_stub;
     ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
@@ -7244,6 +7286,57 @@ TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3): a classify-miss at C
     CHECK(body["error"]["message"].get<std::string>() == "unknown or ambiguous plugin.action");
     CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
     CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "unclassified"}})
+              .value() == 1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=unclassified") != std::string::npos);
+}
+
+TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3 / Gate 8 round 3 item 4): an AMBIGUOUS "
+          "classify-miss at C8 also denies immediately, with reason=\"ambiguous\" threaded "
+          "correctly — NO approval ticket minted",
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // Same shape as the Unclassified case above, but drives
+    // `gate.miss == ClassificationError::Ambiguous` through C8's ternary via
+    // `destructive_classify_stub_ambiguous`. Without this test, a mutation
+    // that swapped the ternary's two branches (mapping `Ambiguous` to
+    // `DispatchDenialReason::Unclassified` and vice versa) would pass every
+    // other test in this file, since the Unclassified test above cannot
+    // distinguish "correctly maps Unclassified" from "always reports
+    // Unclassified regardless of gate.miss".
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub_ambiguous;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "unknown or ambiguous plugin.action");
+    CHECK(appr.pending_count() == 0); // no ticket minted, same as the Unclassified case
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "ambiguous"}})
+              .value() == 1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=ambiguous") != std::string::npos);
 }
 
 TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive ticket is refused on "
