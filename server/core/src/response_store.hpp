@@ -272,8 +272,17 @@ public:
     // -- Faceted queries (for dashboard filtering at scale) --------------------
 
     /// Distinct facet values for a column within an instruction's results.
+    /// `agent_scope`: `nullopt` = unfiltered (existing behaviour, byte-
+    /// identical SQL). Engaged and empty = success-empty (`{}`) WITHOUT
+    /// acquiring a connection or running a query — a degraded store still
+    /// answers success-empty under a zero-visibility scope, the fail-closed
+    /// caller posture ADR-0017 requires (#1712, #2691 degrade-vs-empty
+    /// distinguishability). Engaged and non-empty = the aggregate is
+    /// confined IN SQL (`agent_id = ANY(...)`) before it runs (ADR-0017
+    /// INV-3), never post-filtered in C++.
     [[nodiscard]] std::optional<std::vector<FacetValue>>
-    facet_values(const std::string& instruction_id, int col_idx) const;
+    facet_values(const std::string& instruction_id, int col_idx,
+                const std::optional<std::vector<std::string>>& agent_scope = std::nullopt) const;
 
     /// Distinct agent IDs that have a matching facet value.
     [[nodiscard]] std::optional<std::vector<std::string>>
@@ -287,9 +296,18 @@ public:
     /// to 0 for every one of those cases alike; the group-creation dashboard
     /// flow this feeds must not read a store outage as "0 agents match"
     /// (#2691, Doomgoose finding #7).
+    /// `agent_scope`: `nullopt` = unfiltered (existing behaviour, byte-
+    /// identical SQL). Engaged and empty = success-empty (`0`) WITHOUT
+    /// acquiring a connection or running a query — a degraded store still
+    /// answers success-empty under a zero-visibility scope, the fail-closed
+    /// caller posture ADR-0017 requires (#1712, #2691 degrade-vs-empty
+    /// distinguishability). Engaged and non-empty = the aggregate is
+    /// confined IN SQL (`agent_id = ANY(...)`) before it runs (ADR-0017
+    /// INV-3), never post-filtered in C++.
     [[nodiscard]] std::optional<int64_t>
     facet_agent_count(const std::string& instruction_id,
-                      const std::vector<FacetFilter>& filters) const;
+                      const std::vector<FacetFilter>& filters,
+                      const std::optional<std::vector<std::string>>& agent_scope = std::nullopt) const;
 
     /// Total result line count matching facet filters. Same
     /// degrade-distinguishable posture as facet_agent_count (#2691).
