@@ -384,10 +384,9 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   allow-list check (seeded empty — nothing clears it), and is now admitted on agents matching the
   token's own service tag via `require_scoped_permission`'s separate service-scoped branch, which
   checks `ITServiceOwner`'s role grant directly rather than that allow-list — Tag-route parity,
-  working as intended. Coverage: `tests/unit/server/
-  test_agent_properties_scope_authz.cpp`, including a source-text tripwire proving the route
-  handlers still call the scoped gate (a primitive-level test alone cannot detect a handler reverted
-  back to `require_permission`).
+  working as intended. Coverage: `tests/unit/server/test_agent_properties_scope_authz.cpp`,
+  including a source-text tripwire proving the route handlers still call the scoped gate (a
+  primitive-level test alone cannot detect a handler reverted back to `require_permission`).
 
 ## Consequences
 
