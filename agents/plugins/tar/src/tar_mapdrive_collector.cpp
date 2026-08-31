@@ -415,17 +415,28 @@ std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> ro
 
 // ── Pure parsers (compiled everywhere; unit-tested off-OS) ────────────────────
 
-std::vector<MapDriveEntry> parse_proc_mounts(const std::string& text) {
-    std::vector<MapDriveEntry> out;
+ProcMountsParse parse_proc_mounts(const std::string& text) {
+    ProcMountsParse out;
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
         auto tok = split_ws(line);
-        if (tok.size() < 3)
+        if (tok.size() < 3) {
+            // BUG 2 fix: a structurally short row (fewer than the
+            // device/mountpoint/fstype 3 fields every /proc/mounts row
+            // carries) is a malformed row, not a legitimate skip -- flag it
+            // so the caller (enumerate_mapdrive()) can tell "this row was
+            // dropped because it wasn't a network filesystem" (a normal,
+            // routine skip, never flagged) apart from "this row was dropped
+            // because it was truncated/corrupt" (BR-mapdrive-001; same
+            // policy as tar_arp_parsers.hpp's BR4-005 and
+            // tar_service_parsers.hpp's BR-service-001).
+            out.malformed = true;
             continue;
+        }
         std::string fstype = tok[2];
         if (!is_network_fstype(fstype))
-            continue;
+            continue; // legitimate skip: well-formed row, just not a network fs
         std::string device = decode_mount_escapes(tok[0]);
         std::string mountpoint = decode_mount_escapes(tok[1]);
         MapDriveEntry e;
@@ -434,7 +445,7 @@ std::vector<MapDriveEntry> parse_proc_mounts(const std::string& text) {
         e.remote_path = device;
         e.remote_host = remote_host_of(device);
         e.provider = fstype;
-        out.push_back(std::move(e));
+        out.entries.push_back(std::move(e));
     }
     return out;
 }
@@ -1133,7 +1144,21 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
 #elif defined(__linux__)
 
 std::vector<MapDriveEntry> enumerate_mapdrive() {
-    std::vector<MapDriveEntry> out = parse_proc_mounts(read_required_file("/proc/mounts"));
+    auto mounts = parse_proc_mounts(read_required_file("/proc/mounts"));
+    if (mounts.malformed) {
+        // BUG 2 fix: read_required_file() already guards acquisition
+        // failure (open/read errors on /proc/mounts itself); this is the
+        // layer below it -- a row that opened and read fine but didn't
+        // tokenize into the fields every /proc/mounts row carries. Without
+        // this throw the returned entry count could silently be LESS than
+        // the true outbound-mount count, with no signal reaching the
+        // caller that anything was dropped -- same completeness-contract
+        // gap BR-service-001 closes for the service parsers.
+        spdlog::error("TAR mapdrive: /proc/mounts produced a malformed row -- skipping diff, "
+                      "retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError("TAR: /proc/mounts produced a malformed row");
+    }
+    std::vector<MapDriveEntry> out = std::move(mounts.entries);
     // Inbound: current Samba sessions. Empty if Samba isn't installed / no perms
     // (unmodified degrade-to-empty contract — `timeout 10` becomes the
     // runner's own deadline, `2>/dev/null` becomes its default stderr discard).

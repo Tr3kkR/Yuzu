@@ -316,9 +316,25 @@ std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> ro
 // the raw text to these; keeping the parse pure makes every leg testable off its
 // native OS from captured sample output.
 
+/** Result of parsing /proc/mounts text: the decoded network-mount entries
+ *  plus whether at least one row was malformed (structurally short --
+ *  fewer than 3 whitespace-separated fields -- and so dropped rather than
+ *  silently included/omitted). Mirrors tar_arp_parsers.hpp's
+ *  ProcNetArpParse{entries, malformed} shape (BR4-005) and
+ *  tar_service_parsers.hpp's ServiceParseResult: a malformed row is a
+ *  missing binding relative to a genuinely complete mount table, and the
+ *  CALLER (enumerate_mapdrive(), tar_mapdrive_collector.cpp) is the one
+ *  that turns this flag into an IncompleteCaptureError throw. A row that is
+ *  well-formed but simply not a network filesystem (is_network_fstype()
+ *  returns false) is a LEGITIMATE skip and never sets `malformed`. */
+struct ProcMountsParse {
+    std::vector<MapDriveEntry> entries;
+    bool malformed{false};
+};
+
 /** Parse `/proc/mounts` (or /proc/self/mountinfo-style) text into current
  *  outbound network mappings. Honours the kernel `\040`/`\011` octal escaping. */
-std::vector<MapDriveEntry> parse_proc_mounts(const std::string& text);
+ProcMountsParse parse_proc_mounts(const std::string& text);
 
 /** Parse `/etc/fstab` text into historical outbound network mappings (ts=0). */
 std::vector<MapDriveHistoryRow> parse_fstab(const std::string& text);

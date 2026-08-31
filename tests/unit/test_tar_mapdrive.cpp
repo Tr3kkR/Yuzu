@@ -35,7 +35,7 @@ TEST_CASE("mapdrive parse_proc_mounts: keeps network fstypes, decodes escapes",
         "/dev/sda1 / ext4 rw,relatime 0 0\n"
         "tmpfs /tmp tmpfs rw 0 0\n"
         "//srv/with\\040space /mnt/s\\040p cifs rw 0 0\n";
-    auto out = parse_proc_mounts(text);
+    auto out = parse_proc_mounts(text).entries;
     REQUIRE(out.size() == 3); // ext4 + tmpfs are not network fstypes
 
     CHECK(out[0].direction == "outbound");
@@ -51,6 +51,40 @@ TEST_CASE("mapdrive parse_proc_mounts: keeps network fstypes, decodes escapes",
     CHECK(out[2].remote_path == "//srv/with space");
     CHECK(out[2].local_mount == "/mnt/s p");
     CHECK(out[2].remote_host == "srv");
+}
+
+TEST_CASE("mapdrive parse_proc_mounts: a well-formed table is never flagged malformed",
+          "[tar][mapdrive][parse]") {
+    // Regression guard for a false positive: a genuinely well-formed table
+    // (including a legitimate non-network-fstype skip) must never set
+    // `malformed` -- a non-network row is a routine skip, not a structural
+    // defect (BUG 2 fix).
+    const std::string text = "//fileserver/public /mnt/pub cifs rw,vers=3.0 0 0\n"
+                             "/dev/sda1 / ext4 rw,relatime 0 0\n";
+    auto result = parse_proc_mounts(text);
+    CHECK_FALSE(result.malformed);
+    CHECK(result.entries.size() == 1);
+}
+
+TEST_CASE("mapdrive parse_proc_mounts: a structurally short row is dropped and "
+          "flagged malformed, not silently omitted",
+          "[tar][mapdrive][parse]") {
+    // Synthetic edge case: a row with fewer than the 3 whitespace-separated
+    // fields every real /proc/mounts row carries (device, mountpoint,
+    // fstype at minimum) -- a truncated read or a corrupted line, not a
+    // real kernel-emitted row. BUG 2: this previously vanished via a bare
+    // `continue`, so the returned entry count could silently be LESS than
+    // the true outbound-mount count with no signal reaching the caller.
+    const std::string text = "//fileserver/public /mnt/pub cifs rw,vers=3.0 0 0\n"
+                             "truncated-row\n" // synthetic: only 1 field, no fstype column
+                             "nfshost:/export/home /home/nfs nfs4 rw 0 0\n";
+    auto result = parse_proc_mounts(text);
+    CHECK(result.malformed);
+    // The two well-formed rows around the malformed one still decode --
+    // same defensive-tolerance shape as tar_arp_parsers.hpp's BR4-005.
+    REQUIRE(result.entries.size() == 2);
+    CHECK(result.entries[0].remote_host == "fileserver");
+    CHECK(result.entries[1].remote_host == "nfshost");
 }
 
 // ── /etc/fstab (Linux outbound historic; ts=0) ────────────────────────────────
@@ -517,7 +551,7 @@ TEST_CASE("mapdrive parse_proc_mounts: IPv6 NFS hosts resolve in full, bracketed
     const std::string text = "2001:db8::1:/export /mnt/v6a nfs4 rw 0 0\n"
                              "[2001:db8::1]:/export /mnt/v6b nfs4 rw 0 0\n"
                              "alice@2001:db8::1:/export /mnt/v6c nfs4 rw 0 0\n";
-    auto out = parse_proc_mounts(text);
+    auto out = parse_proc_mounts(text).entries;
     REQUIRE(out.size() == 3);
     CHECK(out[0].remote_host == "2001:db8::1");
     CHECK(out[1].remote_host == "2001:db8::1"); // brackets stripped
