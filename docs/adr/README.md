@@ -26,17 +26,6 @@ ls docs/adr/ | grep -oE '^[0-9]{4}' | sort -n | tail -20   # what's taken
 
 Take the next free number in your block. Filename is `<number>-<kebab-slug>.md`. **Record the author** in the frontmatter (`owner:`) or a `**Authors:**` line — without it nobody can tell which block an ADR belongs to. Older ADRs are inconsistent about which of the two forms they use; either is fine, but one of them is required.
 
-### In-flight reservations (`0xxx` block)
-
-The `ls docs/adr/` grep above only sees numbers with a file on disk — it cannot see a number
-a doc has claimed in prose. `docs/postgres-migration-ladder.md`'s `## Wave 4` section (added
-2026-08-27) reserves **0061–0065** for its 5 in-flight migration PRs (`UpdateRegistry`,
-`PatchManager`, `DirectorySync`, `WorkflowEngine`, and a shared cluster ADR for
-`ExecutionTracker`/`ApprovalManager`/`ScheduleEngine`) before any of those files exist. If
-you're picking a number in the `0xxx` block, check that doc's Wave 4 table too, not just this
-grep — otherwise this becomes a third entry in "Known number collisions" below. Drop this note
-once all 5 files exist on disk (at which point the grep sees them directly).
-
 ## The convention binds prospectively
 
 It was adopted **after** most `0xxx` ADRs were written, so the low block is mixed: roughly 21 ADRs sit in `0xxx` that belong to a namespaced author (10 @lesault, 7 Dave Rae, 4 Alex Young).

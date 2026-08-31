@@ -63,13 +63,18 @@
 /// `docker stop` each send exactly ONE SIGTERM and then SIGKILL. No supervisor ever sends a
 /// second. The OTA self-stop path (the update thread calls Agent::stop() itself) gets no
 /// signal at all and no supervisor timeout, because nobody asked us to stop.
-/// SO THERE IS NO INTERNAL BOUND ON A WEDGED STOP, AND THIS PR DOES NOT ADD ONE. Say it plainly
-/// rather than gesture at machinery that is not here: stop() drains guardian_/dex_observer_ with
-/// an UNBOUNDED wait, and the only thing that ends a wedged teardown is the supervisor's SIGKILL
-/// (and on the OTA self-stop path, nothing at all). An internal deadline is the right answer and
-/// is being built separately — it failed review three times because it was designed against an
-/// IDLE agent, and a running command holds a worker that nothing can cancel across the plugin ABI.
-/// Do not write a comment here claiming a bound exists until one does.
+///
+/// #2233 item 3 ("S+", agents/core/src/shutdown_deadline_guard.hpp) IS that internal bound —
+/// this comment previously said "THIS PR DOES NOT ADD ONE... being built separately"; that is
+/// no longer true. AgentImpl::stop() and run()'s teardown ScopeExit each arm a
+/// ShutdownDeadlineGuard as their first statement and call hard_exit() if the wrapped call
+/// hasn't returned within the grace period — bounding exactly the "stop() drains guardian_/
+/// dex_observer_ with an unbounded wait" and "OTA self-stop path gets nothing at all" gaps this
+/// comment used to describe. It does not need the running-command-holds-an-uncancellable-
+/// plugin-ABI-worker caveat that sank three prior attempts: hard_exit()/TerminateProcess/_exit()
+/// skip ALL normal teardown rather than trying to wait for or cancel anything, so a legitimately
+/// in-flight worker being "still running" at the moment of hard_exit() is a non-issue by
+/// construction — see shutdown_deadline_guard.hpp's own header comment for the full argument.
 
 #ifndef _WIN32
 
