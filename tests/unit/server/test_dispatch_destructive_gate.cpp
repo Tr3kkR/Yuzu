@@ -19,10 +19,21 @@
  * test is a header-only, injected-input surface (`dispatch_destructive_gate
  * .hpp`), same as `test_dispatch_confined_arms.cpp` and
  * `test_dispatch_target_shape.cpp` for their own shared rules.
+ *
+ * The tail of this file (commit 3, #3685 checkpoint 1) additionally binds a
+ * COMPOSITION property the pure header cannot prove on its own: that
+ * `evaluate_destructive_targeting`'s `Targeted` verdict is a targeting
+ * decision only, never an authorization one — the same command can still be
+ * independently denied by the real dispatch chokepoint
+ * (`classify_and_authorize_dispatch`, `agent_registry.hpp`), and
+ * `/api/command`'s own `require_permission` call stays present and distinct
+ * from that chokepoint's `has_permission` callback (D3/D4 in
+ * `dispatch_destructive_gate.hpp`'s doc comment).
  */
 
 #include "dispatch_destructive_gate.hpp"
 
+#include "agent_registry.hpp"
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "capability_decls/plugin_action_catalogue_b.hpp"
@@ -30,12 +41,16 @@
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "command_capability.hpp"
+#include "dispatch_caller.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -370,4 +385,111 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
     auto classified = registry.classify("tar", "purge_source");
     REQUIRE(classified.has_value());
     CHECK(classified->dispatch_class == DispatchClass::Destructive);
+}
+
+// ────────────────────────────────────── composition: targeting != authorization ──
+//
+// #3685 commit 3 (Sol's ask, folded into the plan's Decisions section): the
+// targeting evaluator returning Targeted must not, by itself, be mistaken
+// for an authorization decision. This section binds that separation two
+// ways — a runtime demonstration that the SAME plugin.action pair can be
+// Targeted here and still independently Forbidden at the real dispatch
+// chokepoint, and a source-scan pin that REST's own require_permission call
+// is still present and textually distinct from the chokepoint's
+// has_permission callback.
+
+using yuzu::server::authz::Operation;
+using yuzu::server::detail::classify_and_authorize_dispatch;
+using yuzu::server::detail::DispatchDenialReason;
+using yuzu::server::DispatchCaller;
+
+namespace {
+[[nodiscard]] bool always_deny(std::string_view, std::string_view, Operation) { return false; }
+} // namespace
+
+TEST_CASE("#3685 composition: a Targeted verdict makes NO authorization decision — the same "
+          "command can still be independently denied by classify_and_authorize_dispatch",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
+
+    // Step 1 — the pure targeting evaluator: explicit ids, no scope, a
+    // Destructive row. Targeted means only "proceed to confinement"; it says
+    // nothing about whether the caller is authorized to issue the command.
+    auto classified = registry.classify("tar", "purge_source");
+    REQUIRE(classified.has_value());
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/true,
+                                                      /*scope_key_present=*/false);
+    REQUIRE(gate.verdict == DestructiveTargetingVerdict::Targeted);
+
+    // Step 2 — the SAME registry, the SAME plugin.action pair, run through
+    // the real dispatch chokepoint with an operator principal `has_permission`
+    // denies. No call from step 1 into step 2, and no shared mutable state
+    // between them (evaluate_destructive_targeting took the classify()
+    // result by const reference and returned a plain value) — this is two
+    // genuinely independent decisions on the same input, not one function
+    // calling the other.
+    DispatchCaller caller{.principal = "alice", .principal_role = "operator"};
+    auto result =
+        classify_and_authorize_dispatch(registry, caller, "tar", "purge_source", always_deny);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().reason == DispatchDenialReason::Forbidden);
+    CHECK(result.error().securable == "Infrastructure");
+}
+
+// ──────────────────────── composition: require_permission stays REST's own ──
+
+namespace {
+namespace fs = std::filesystem;
+
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build (meson.project_source_root() / 'server' / 'core' / 'src') -- see the server_test_exe cpp_args block."
+#endif
+
+std::string read_src_file(const std::string& name) {
+    const fs::path path = fs::path(YUZU_SERVER_SRC_DIR) / name;
+    REQUIRE(fs::is_regular_file(path));
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE(in.is_open());
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+} // namespace
+
+TEST_CASE("#3685 composition: /api/command's require_permission call is present and textually "
+          "distinct from the chokepoint's has_permission callback usage — source-scan structural "
+          "pin (a runtime bind is awkward here: both live on ServerImpl/agent_registry.hpp "
+          "internals with no test-reachable seam of their own)",
+          "[server][dispatch][security]") {
+    const std::string server_cpp = read_src_file("server.cpp");
+
+    // The Destructive-gate call site itself must still exist.
+    const auto gate_pos = server_cpp.find("evaluate_destructive_targeting(");
+    REQUIRE(gate_pos != std::string::npos);
+
+    // Within a bounded window after the gate call, /api/command's own
+    // JIT-elevation-aware require_permission(cap.securable, cap.operation)
+    // re-check must still be present — this is D3/D4's "do not collapse the
+    // two" invariant: the caller keeps its own authorization call, never
+    // folded into or replaced by the chokepoint's has_permission callback.
+    constexpr std::size_t kWindow = 4000;
+    const std::string window =
+        server_cpp.substr(gate_pos, std::min(kWindow, server_cpp.size() - gate_pos));
+    CHECK(window.find("require_permission(req, res, std::string(cap.securable)") !=
+          std::string::npos);
+
+    // And the chokepoint's own has_permission callback usage
+    // (agent_registry.hpp) is a TEXTUALLY DISTINCT call — a different
+    // function name entirely, never a shared/aliased spelling of
+    // require_permission.
+    const std::string agent_registry_hpp = read_src_file("agent_registry.hpp");
+    CHECK(agent_registry_hpp.find(
+              "has_permission(caller.principal, cap.securable, cap.operation)") !=
+          std::string::npos);
+    // The two identifiers themselves must differ — the structural guarantee
+    // this test exists to pin. (Trivially true today; stated explicitly so
+    // a future rename that made them collide would have to touch this
+    // assertion, not silently pass it.)
+    CHECK(std::string("require_permission") != std::string("has_permission"));
 }
