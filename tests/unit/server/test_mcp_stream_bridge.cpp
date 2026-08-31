@@ -17,8 +17,7 @@
 #include "../../../server/core/src/execution_tracker.hpp"
 #include "../../../server/core/src/mcp_stream_bridge.hpp"
 #include "../test_helpers.hpp"
-
-#include <sqlite3.h>
+#include "test_execution_tracker_pg_helper.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -3441,7 +3440,7 @@ TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below 
 
 TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL ExecutionTracker "
           "(#2506 F2)",
-          "[mcp][bridge][2f]") {
+          "[pg][mcp][bridge][2f]") {
     // The producer (ExecutionTracker::refresh_counts) and the consumer
     // (McpStreamBridge::build_real_final) agree on exactly three keys of the
     // execution-completed payload: status, agents_success, agents_failure. Nothing
@@ -3450,15 +3449,12 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
     // final to status:"unknown" with the counts silently missing, and the whole
     // suite would stay green. This drives a real tracker so the payload under test
     // is the one production emits.
-    // RAII: a fatal REQUIRE below must not skip the close (repo ownership rule).
-    yuzu::test::SqliteHandleOwner<sqlite3> handle;
-    REQUIRE(sqlite3_open(":memory:", &handle.db) == SQLITE_OK);
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
     Fx fx;
     {
         std::mutex seen_mu;
         std::vector<std::pair<std::string, std::string>> seen;
-        yuzu::server::ExecutionTracker tracker(handle.db);
-        tracker.create_tables();
+        yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
         tracker.set_event_bus(&fx.bus);
         auto s = fx.make_session();
 

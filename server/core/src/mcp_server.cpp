@@ -4440,7 +4440,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                       " (lookup)");
                         res.set_content(approval_store_error_body(
                                             *approval_manager, a4_error,
-                                            appr_read.error().extended_errcode),
+                                            appr_read.error().sqlstate),
                                         "application/json");
                         return;
                     }
@@ -4739,14 +4739,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         // stops THIS site becoming the fail-open one if rung 1's
                         // lookup ever changes.
                         //
-                        // An OPEN handle whose reads fail permanently — CORRUPT,
-                        // NOTADB, READONLY, FULL — is classified by the shared
-                        // body via `extended_errcode` (#2786 "PR 1c") rather
-                        // than taking the transient "retry forever" arm.
+                        // An OPEN store whose reads fail permanently — schema
+                        // drift, corruption, disk-full, read-only — is
+                        // classified by the shared body via `sqlstate`
+                        // (ADR-0065 port of #2786 "PR 1c") rather than taking
+                        // the transient "retry forever" arm.
                         if (kind == ConsumeFailure::kStoreError) {
                             res.set_content(approval_store_error_body(
                                                 *approval_manager, a4_error,
-                                                consumed.error().extended_errcode),
+                                                consumed.error().sqlstate),
                                             "application/json");
                             return;
                         }
@@ -8112,6 +8113,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                     // (server.cpp); a test wanting unfiltered wires a
                                     // callback whose exec_visible is nullopt.
                               : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                // #1398: a supervised-tier call reaches here only after C8
+                // consumed a real ticket for THIS request
+                // (approval_ticket_just_consumed); an operator-tier call
+                // (auto-approved, no ticket ever minted) or a non-MCP-tiered
+                // caller relies solely on caller.principal_is_admin (already
+                // stamped by caller_fn/derive_dispatch_caller above) at the
+                // chokepoint's ExecuteGate::AdminOrApproval arm.
+                caller.approval_provenance = approval_ticket_just_consumed
+                                                 ? yuzu::server::ApprovalProvenance::Ticket
+                                                 : yuzu::server::ApprovalProvenance::None;
                 std::string command_id;
                 int agents_reached = 0;
                 try {
@@ -8127,8 +8138,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         bridge->abandon(bridge_sid, id);
                         bridge_active = false;
                     }
-                    if (execution_tracker && !execution_id.empty()) {
-                        execution_tracker->mark_cancelled(execution_id, session->username);
+                    if (execution_tracker && !execution_id.empty() &&
+                        !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                        spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
+                                      execution_id);
                     }
                     mcp_audit("failure",
                               std::string("dispatch_exception execution_id=") + execution_id);
@@ -8154,8 +8167,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (`session->username`, not literal `"mcp"`) so any
                     // future change to ExecutionTracker that persists the
                     // user field records the authenticated principal.
-                    if (execution_tracker && !execution_id.empty()) {
-                        execution_tracker->mark_cancelled(execution_id, session->username);
+                    if (execution_tracker && !execution_id.empty() &&
+                        !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                        spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
+                                      execution_id);
                     }
                     // governance R1 unhappy-UP-7: structured signal so
                     // the agentic worker can branch on `status` without
@@ -8175,23 +8190,37 @@ McpServer::HandlerFn McpServer::build_handler(
                             // this can be zero — a target that is QUARANTINED
                             // is withheld by the containment gate before
                             // dispatch, which is a permanent policy denial,
-                            // not transient unreachability. The dispatch
-                            // closure's return carries only (command_id,
-                            // sent), so this handler cannot yet tell the two
-                            // apart; saying so is better than asserting the
-                            // wrong one, because an agentic caller that reads
-                            // "unreachable" retries a denial forever. The
-                            // authoritative answer is the
-                            // quarantine.dispatch_denied audit row and
+                            // not transient unreachability. #1398 (governance
+                            // Gate 6 enterprise-readiness finding): a THIRD
+                            // cause collapses into this same envelope —
+                            // ExecuteGate::AdminOrApproval/AlwaysApproval
+                            // denying a non-admin, non-ticketed caller at the
+                            // dispatch chokepoint reaches this exact code
+                            // path too (mcp_server.cpp has no
+                            // classify_and_authorize_dispatch call of its own;
+                            // the shared dispatch_fn's internal chokepoint
+                            // denial surfaces as command_id/sent=0, same as
+                            // offline or quarantined). The dispatch closure's
+                            // return carries only (command_id, sent), so this
+                            // handler cannot yet tell any of the three apart;
+                            // naming all three is better than asserting one,
+                            // because an agentic caller that reads only
+                            // "unreachable" retries a permanent denial
+                            // forever. The authoritative answer is the
+                            // quarantine.dispatch_denied audit row,
                             // yuzu_server_dispatch_target_rejected_total
-                            // {reason="quarantined"}. A programmatic
+                            // {reason="quarantined"}, or
+                            // yuzu_server_dispatch_denied_total
+                            // {reason="approval_required"}. A programmatic
                             // discriminator needs a wider DispatchFn return —
-                            // tracked as a follow-up.
+                            // tracked as a follow-up (#1398 Rung 4 / #3687).
                             .add("message",
-                                 "No agents reached: every target was either unreachable or "
-                                 "withheld by the quarantine containment gate. If the device is "
-                                 "quarantined this is a policy denial and retrying will not "
-                                 "help — check quarantine status before retrying.")
+                                 "No agents reached: every target was either unreachable, "
+                                 "withheld by the quarantine containment gate, or denied "
+                                 "approval-required by the dispatch gate. A quarantine or "
+                                 "approval denial is a permanent policy refusal and retrying "
+                                 "will not help — check quarantine status, or dispatch via "
+                                 "POST /api/instructions/{id}/execute, before retrying.")
                             .str();
                     mcp_audit("failure",
                               std::string("no_agents_reached execution_id=") + execution_id);
@@ -8221,7 +8250,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // dispatch confirmed how many agents the command went to.
                 // Mirrors workflow_routes.cpp:1461-1463.
                 if (execution_tracker && !execution_id.empty()) {
-                    execution_tracker->set_agents_targeted(execution_id, agents_reached);
+                    if (!execution_tracker->set_agents_targeted(execution_id, agents_reached)) {
+                        spdlog::error("mcp_server: set_agents_targeted failed for execution_id={}",
+                                      execution_id);
+                    }
                     // S4.5 (2f PR 3a) - terminal-starvation fix: responses that
                     // arrived BEFORE set_agents_targeted saw agents_targeted==0
                     // and could not transition the row to terminal
@@ -9109,7 +9141,34 @@ McpServer::HandlerFn McpServer::build_handler(
                     .principal = session->username,
                     .principal_role = auth::role_to_string(session->role),
                     .exec_visible =
-                        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}}};
+                        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}},
+                    // #1398: JIT-elevation-aware, matching every other
+                    // session-derived caller. Applies to BOTH branches below
+                    // (the already-existing-record reapply via
+                    // redispatch_stored_containment, and the newly-created
+                    // record) — this shared caller is exactly why a single
+                    // fix here covers both, where the pre-#3425-refactor code
+                    // this diff originally targeted only touched the
+                    // newly-created branch's own inline construction.
+                    .principal_is_admin =
+                        auth::effective_role(*session) == auth::Role::admin,
+                    // #1398: quarantine.quarantine is AdminOrApproval-gated.
+                    // A supervised-tier MCP token reaches here only after C8
+                    // consumed a real ticket for THIS request
+                    // (approval_ticket_just_consumed); a non-MCP-tiered
+                    // caller (requires_approval short-circuits false for an
+                    // empty tier, so no ticket is ever minted) relies solely
+                    // on principal_is_admin above. The background
+                    // QuarantineContainmentReconciler's OWN redispatch calls
+                    // through a SEPARATE `.system = true` closure
+                    // (CommandDispatchFn, quarantine_containment_reconciler.hpp)
+                    // and bypasses this gate entirely via the chokepoint's
+                    // system-caller early return — it is not this caller and
+                    // needs no equivalent stamp.
+                    .approval_provenance =
+                        approval_ticket_just_consumed
+                            ? yuzu::server::ApprovalProvenance::Ticket
+                            : yuzu::server::ApprovalProvenance::None};
                 if (record_pre_existing) {
                     // #3425: the shared recipe (quarantine_reapply.hpp) owns
                     // the read-stored-row + validate + dispatch sequence —
@@ -9174,6 +9233,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!effective_whitelist.empty())
                         qparams["whitelist_ips"] = effective_whitelist;
                     try {
+                        // governance UP-9: thread a set CONFINED to the single
+                        // scope-gate-checked target, not an unfiltered VisibleSet{} —
+                        // defense in depth matching the bundle/execute_instruction
+                        // dispatch arms (this was the last arm still passing
+                        // unfiltered on a single already-authorized target).
+                        // PLAN-006: `session` was authenticated at handler entry and
+                        // is already used for the store write above — identify the
+                        // caller to dispatch_confined too, not just its visible set.
+                        // #1398: quarantine_caller (defined above this if/else,
+                        // shared with the reapply branch) already carries
+                        // principal_is_admin/approval_provenance.
                         std::tie(command_id, agents_reached) =
                             dispatch_fn("quarantine", "quarantine", {agent_id}, /*scope=*/"",
                                         qparams, /*execution_id=*/"", quarantine_caller);
@@ -9416,8 +9486,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     // checked above through to the orchestrator, rather than let it
                     // default to unfiltered — defense in depth if a future dispatch_fn
                     // starts consulting it itself.
-                    r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit,
-                                              caller.exec_visible);
+                    //
+                    // #1398 (adversarial-review finding): thread caller.principal_is_admin
+                    // and this request's ticket-consumption state too — dropping them
+                    // (as this call used to) unconditionally denied every admin/
+                    // ticket-holding caller's bundle step on an AdminOrApproval/
+                    // AlwaysApproval pair, regardless of who was actually calling.
+                    // execute_bundle is in the same approval-gated tool set as
+                    // execute_instruction/quarantine_device (kToolSecurity), so a
+                    // supervised-tier caller can reach here only after C8 consumed a
+                    // real ticket for THIS request.
+                    r = bundle_orch->dispatch(
+                        agent_id, *specs, session->username, bundle_audit, caller.exec_visible,
+                        caller.principal_is_admin,
+                        approval_ticket_just_consumed ? yuzu::server::ApprovalProvenance::Ticket
+                                                       : yuzu::server::ApprovalProvenance::None);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_bundle: dispatch failed: {}", e.what());
                     mcp_audit("failure", std::string("dispatch_exception: ") + e.what());

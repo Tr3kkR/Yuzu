@@ -28,7 +28,10 @@ pre-staged/queryable-empty, not hard-unsupported).
 
 _Last re-verified against code: 2026-07-21 (all rows re-checked against the cited
 sources on the consolidated macOS-parity branch; see [Verification](#verification))._
-_Last hand-updated: 2026-07-21 (macOS-parity consolidation — see Verification)._
+_Last hand-updated: 2026-08-24 (network_config native-leg migration). Scope note:
+only the `network_config` rows were re-verified against source on that date — the
+full-matrix re-verification stamp above deliberately still reads 2026-07-21, because
+no other row was re-checked._
 
 ## Matrix
 
@@ -73,7 +76,7 @@ duplicates.
 | **Device-identity inventory** (serial, UUID, BIOS, CPU/RAM/disk, MAC, OS) | ✅ | ✅ | ✅ | `sync_source_device_ci.cpp` reuses `hardware`/`device_identity`/`os_info`/`network_config`. `hardware` `system`: Win WMI `Win32_BIOS`/`Win32_ComputerSystemProduct`; Linux `/sys/class/dmi/id/product_{serial,uuid}` (0400 → needs `cap_dac_read_search`; `unknown` without it); macOS native IOKit `IOPlatformExpertDevice` (`IOServiceGetMatchingService`/`IORegistryEntryCreateCFProperty`; `IOPlatformUUID` ≠ SMBIOS UUID). Machine-scope only. Server `DeviceInventoryStore` |
 | **━━ Live device snapshot ("Get live info") ━━** | | | | Device page dispatch-and-poll snapshot; each kind has its own `device.live.<kind>` audit verb. `docs/user-manual/device-management.md` |
 | **Live — process tree + per-process connections** | ✅ tree + conn join | 🟡 tree; conn join absent | 🟡 tree | `processes/list_tree` (`proc\|pid\|ppid\|name\|sha256\|path`, all OSes) joined by PID to `network_diag/connections` (owning PID via `GetExtendedTcpTable`, Windows). Linux `/proc/net/tcp` exposes inode not pid → no join |
-| **Live — ARP / neighbour table** | ✅ | 🔜 (`/proc/net/arp`) | 🔜 (route sysctl) | `network_config/arp` (`GetIpNetTable2`, Windows); macOS emits an honest `arp\|not_available` sentinel (real route-sysctl collector still 🔜); Linux `/proc/net/arp` 🔜 |
+| **Live — ARP / neighbour table** | ✅ | 🟡 | 🟡 | `network_config/arp`: Windows `GetIpNetTable2`; Linux `/proc/net/arp` — constrained: IPv4 ARP only, no IPv6 neighbours (those live in `RTM_GETNEIGH`), and non-Ethernet and incomplete (non-`ATF_COM`) entries are skipped; macOS PF_ROUTE `RTF_LLINFO` sysctl, de-duplicated — constrained because that dump carries no interface name or static/dynamic type, both emitted as `-` |
 | **Live — DNS resolver cache** | ✅ | ⛔ (no portable resolver cache) | ⛔ (OS exposes no resolver-cache contents; `dscacheutil -cachedump` defunct on macOS 26) | `network_config/dns_cache` (`DnsGetCacheDataTable` on Windows; macOS returns an honest `dns_cache\|unsupported` sentinel, no shell-out — see `darwin-compat.md`) |
 | **Live — disk space** | ✅ | ✅ | ✅ | `disk_space` plugin `free` action; `GetDiskFreeSpaceExW` on Windows, `statvfs` on POSIX |
 | **Live — Wi-Fi current connection** | ✅ | ✅ | 🟡 | `wifi/connected` — Win `WlanQueryInterface`, Linux `nmcli`/`iwconfig`, macOS `wifi_corewlan.mm` `corewlan_current_connection` (CoreWLAN `CWWiFiClient`/`CWInterface`, first `.mm` TU; pure `format_connected_record` in `wifi_corewlan.hpp`). macOS 🟡: association/RSSI/channel/security read, but SSID/BSSID are withheld from a background daemon by Location Services on 14+ (`<ssid-withheld>`) — replaces the dead `airport -I` path |
@@ -82,7 +85,7 @@ duplicates.
 | **Firewall posture** (`firewall` plugin: `state` + `rules`) | ✅ per-profile via `INetFwPolicy2` COM (rung 1, native — no `netsh` shell-out) | ✅ backend autodetect, firewalld (rung 1, bounded sd-bus) → nftables (rung 1, bounded `NETLINK_NETFILTER` — read-only table/chain/rule enumeration, no libnftnl/libmnl dependency) → ufw → iptables (rung 2, `run_bounded_subprocess` argv, structured per-backend rows) | 🟡 `state`: Application Firewall primary (`socketfilterfw --getglobalstate`, unprivileged; `mode\|block_all` when State = 2) + pf secondary (`pfctl -s info`, root — `unknown` without it); `rules`: pf only (`pfctl -s rules`, root; no Application Firewall per-app list yet) — both via `run_bounded_subprocess` (rung 2, no shell) | `agents/plugins/firewall/src/firewall_plugin.cpp` `state`/`rules` legs; pure parsers `firewall_parsers.hpp` (tested every host) |
 | **Digital-signature verification** (`filesystem.get_signature`) | ✅ | ⛔ | ✅ | Win: WinVerifyTrust (Authenticode: valid/invalid/unsigned/untrusted) in `filesystem_plugin.cpp`. macOS: `codesign --verify --deep --strict` mapped to valid/unsigned/invalid/unknown by `classify_codesign_result` in `agents/plugins/filesystem/src/filesystem_macos_sig.hpp` (macOS `valid` = seal integrity, not Gatekeeper/notarization trust). Linux emits platform-unsupported |
 | **File version info** (`filesystem.get_version_info`) | ✅ | ⛔ | ✅ | Win: `GetFileVersionInfoW`/`VerQueryValueW` (VS_FIXEDFILEINFO + string table) in `filesystem_plugin.cpp`. macOS: CFBundleShortVersionString/CFBundleVersion from the bundle Info.plist via `plutil -extract`, mapped by `classify_plutil_extract` in `filesystem_macos_sig.hpp` (binary + XML plists; `version_status\|not_available` when absent). Linux emits platform-unsupported |
-| **Certificate store — login-keychain read** (`certificates.list`/`details` `store=login`/`all`) | ⛔ | ⛔ | ✅ | macOS-specific: reads the console user's login keychain via `launchctl asuser <uid> sudo -n -u <user> security find-certificate` (root-only; see `docs/agent-privilege-model.md`), built by `build_login_keychain_read_command` in `agents/shared/macos_console_user.hpp`, invoked from `agents/plugins/certificates/src/certificates_plugin.cpp`. Windows machine stores (CryptoAPI) and Linux `/etc/ssl/certs` have no per-user login-keychain equivalent for this hop |
+| **Certificate store — login-keychain read** (`certificates.list`/`details` `store=login`/`all`) | ⛔ | ⛔ | ✅ | macOS-specific: reads the console user's login keychain via `launchctl asuser <uid> sudo -n -u <user> -- security find-certificate` (root-only; see `docs/agent-privilege-model.md`) as a pre-split argv through the bounded subprocess runner (rung 2, #3406 — no shell; the home directory is resolved in-process), built by `build_login_keychain_read_argv` in `agents/shared/macos_console_user.hpp`, invoked from `agents/plugins/certificates/src/certificates_plugin.cpp`. Windows machine stores (CryptoAPI) and Linux `/etc/ssl/certs` have no per-user login-keychain equivalent for this hop |
 | **Certificate delete — verified / SIP-aware** (`certificates.delete`) | ✅ | ✅ | ✅ | Win: CryptoAPI store delete; Linux: remove matching PEM under `/etc/ssl/certs`. macOS: `security delete-certificate` on `System.keychain` then a re-enumeration that reports `deleted` only on a positively-proven absence (`classify_delete_verdict` in `agents/shared/macos_console_user.hpp`); `store=root` rejected (SystemRootCertificates.keychain is SIP-sealed) in `certificates_plugin.cpp` |
 | **━━ Network quality (`/network`) ━━** | | | | Measurement-first device/local-link health lens. `net_quality_sampler.cpp`; `docs/user-manual/network.md` "Platform coverage" |
 | **Network quality** (throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | 🟡 throughput only | Win `GetIfTable2` throughput + `GetTcpStatisticsEx` system-wide interval retransmit (**measurement-first, not loss-validated** — withheld from the fleet retransmit aggregate); RTT needs ESTATS (admin+overhead) → 🔜. Linux has all three. macOS `NET_RT_IFLIST2` throughput only (`read_net_counters()` sums non-loopback `if_data64` rx/tx, differenced per heartbeat); retransmit + RTT deferred — global `net.inet.tcp.stats` reads all-zero on modern macOS → 🔜 |
@@ -92,9 +95,9 @@ duplicates.
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI (in-process, no more `powershell`) + exclusion-registry read · ClamAV+Falcon+Sophos with a real `status` leg · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
 | bitlocker | ✅ | ✅ | ✅ | BitLocker via in-process Win32_EncryptableVolume WMI (rung 1, no subprocess) · LUKS via in-process libblkid + `/sys/class/block/dm-*/dm/uuid` reads (rung 1, no subprocess) · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` via direct argv through the bounded runner (rung 2; encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
-| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain stays on its registered Decision-7 governed-shell path; macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
+| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain reads via a pre-split argv through the bounded runner (rung 2, #3406 — the former Decision-7 governed-shell path is retired); macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
-| content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
+| content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS. `execute_staged` on Linux is CONSTRAINED, not unconditional: shebang-interpreted (`#!`) staged payloads are rejected (B6 fd-exec is incompatible with the kernel's binfmt_script re-open) — native executables only. Per-action detail: the generated plugin-action table below |
 | device_identity | ✅ | ✅ | ✅ | all three branches implemented |
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
 | discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
@@ -113,7 +116,7 @@ duplicates.
 | netprobe | ✅ | ✅ | ✅ | `_WIN32` vs POSIX portable sockets |
 | netstat | ✅ | ✅ | ✅ | linux/apple/win branches. `attribution` action additionally resolves the owning process's name/path (folds the retired sockwho plugin in, #3403) |
 | network_actions | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `flush_dns` runs both `dscacheutil -flushcache` **and** `killall -HUP mDNSResponder` (the load-bearing reset), honest status from real exit codes (`network_actions_plugin.cpp`) |
-| network_config | ✅ | ✅ | ✅ | win/linux/apple throughout. macOS: real adapter link speed via `SIOCGIFMEDIA` (was hardcoded 0); `arp`/`dns_cache` return honest `not_available`/`unsupported` sentinels (`network_config_plugin.cpp`) |
+| network_config | ✅ | ✅ | ✅ | win/linux/apple throughout, no `/bin/sh` on any leg. Linux rtnetlink + `/proc/net/arp`; macOS getifaddrs + `SIOCGIFMEDIA` link speed + PF_ROUTE + SCDynamicStore. `arp` is now live on Linux and macOS; `dns_cache` stays an honest `unsupported` sentinel on macOS (`network_config_plugin.cpp`) |
 | network_diag | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
@@ -217,10 +220,10 @@ implementation is.
 | bitlocker | state | macos | supported | 2 | fdesetup+diskutil | - |
 | bitlocker | state | windows | supported | 1 | wmi_encryptable_volume | - |
 | certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
-| certificates | list | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
+| certificates | list | macos | supported | 2 | SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
 | certificates | details | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
-| certificates | details | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
+| certificates | details | macos | supported | 2 | SecItem (System/root, in-process) + security find-certificate argv via subprocess runner (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo session hop, run as a pre-split argv through the bounded subprocess runner |
 | certificates | details | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
 | certificates | delete | linux | supported | 1 | libcrypto X509 lookup + filesystem remove | - |
 | certificates | delete | macos | constrained | 2 | security delete-certificate via subprocess runner | SystemRootCertificates.keychain is sealed under SIP and rejected outright; only System/MY store deletes are supported |
@@ -234,9 +237,9 @@ implementation is.
 | content_dist | stage | linux | supported | 1 | httplib_tls | - |
 | content_dist | stage | macos | supported | 1 | httplib_tls | - |
 | content_dist | stage | windows | constrained | 1 | httplib_tls | requires OpenSSL to be found at build time; HTTPS unavailable if absent |
-| content_dist | execute_staged | linux | supported | 2 | fork_execvp | - |
-| content_dist | execute_staged | macos | supported | 2 | fork_execvp | - |
-| content_dist | execute_staged | windows | supported | 2 | createprocessw | - |
+| content_dist | execute_staged | linux | constrained | 2 | subprocess_runner:staged_payload | shebang-interpreted (#!) staged payloads are rejected -- B6 fd-exec (execveat O_CLOEXEC) is incompatible with the kernel's binfmt_script re-open; native executables only |
+| content_dist | execute_staged | macos | supported | 2 | subprocess_runner:staged_payload | - |
+| content_dist | execute_staged | windows | supported | 2 | subprocess_runner:staged_payload | - |
 | content_dist | list_staged | linux | supported | 1 | std_filesystem | - |
 | content_dist | list_staged | macos | supported | 1 | std_filesystem | - |
 | content_dist | list_staged | windows | supported | 1 | std_filesystem | - |
@@ -432,23 +435,23 @@ implementation is.
 | network_actions | ping | linux | supported | 2 | system ping via bounded argv runner | - |
 | network_actions | ping | macos | supported | 2 | system ping via bounded argv runner | - |
 | network_actions | ping | windows | supported | 2 | system ping.exe via bounded argv runner | - |
-| network_config | adapters | linux | supported | 3 | ip(8) via governed shell runner | - |
-| network_config | adapters | macos | supported | 3 | ifconfig via governed shell runner | - |
+| network_config | adapters | linux | supported | 1 | rtnetlink (RTM_GETLINK) | - |
+| network_config | adapters | macos | supported | 1 | getifaddrs + SIOCGIFMEDIA | - |
 | network_config | adapters | windows | supported | 1 | GetAdaptersAddresses | - |
-| network_config | ip_addresses | linux | supported | 3 | ip(8) via governed shell runner | - |
-| network_config | ip_addresses | macos | supported | 3 | ifconfig/route via governed shell runner | - |
+| network_config | ip_addresses | linux | supported | 1 | rtnetlink (RTM_GETADDR/RTM_GETROUTE) | - |
+| network_config | ip_addresses | macos | supported | 1 | getifaddrs + PF_ROUTE sysctl | - |
 | network_config | ip_addresses | windows | supported | 1 | GetAdaptersAddresses | - |
 | network_config | dns_servers | linux | supported | 1 | /etc/resolv.conf read | - |
-| network_config | dns_servers | macos | supported | 3 | scutil via governed shell runner | - |
+| network_config | dns_servers | macos | supported | 1 | SCDynamicStore | - |
 | network_config | dns_servers | windows | supported | 1 | GetAdaptersAddresses | - |
-| network_config | proxy | linux | supported | 1 | environment variables | - |
-| network_config | proxy | macos | constrained | 3 | networksetup via governed shell runner | only the Wi-Fi network service is queried; other interfaces are not checked |
+| network_config | proxy | linux | constrained | 1 | environment variables | reads the *_proxy variables from the agent process's own environment only; a system-wide, desktop-session or package-manager proxy the agent did not inherit is not reported |
+| network_config | proxy | macos | constrained | 1 | SCDynamicStoreCopyProxies | reports the HTTP proxy and PAC URL, checking the primary network service first and then each scoped per-interface service; HTTPS/SOCKS/FTP proxies are not reported, so a host configured with only those reads as none |
 | network_config | proxy | windows | supported | 1 | WinHttpGetIEProxyConfigForCurrentUser | - |
-| network_config | dns_cache | linux | constrained | 3 | resolvectl via governed shell runner | falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent |
+| network_config | dns_cache | linux | constrained | 2 | resolvectl via direct-argv runner | falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent |
 | network_config | dns_cache | macos | unsupported | - | - | - |
 | network_config | dns_cache | windows | supported | 1 | DnsGetCacheDataTable (dnsapi.dll) | - |
-| network_config | arp | linux | unsupported | - | - | - |
-| network_config | arp | macos | unsupported | - | - | - |
+| network_config | arp | linux | constrained | 1 | /proc/net/arp | IPv4 ARP entries only; /proc/net/arp carries no IPv6 neighbours (they live in the RTM_GETNEIGH table), and non-Ethernet or incomplete entries are not reported |
+| network_config | arp | macos | constrained | 1 | PF_ROUTE sysctl RTF_LLINFO | ip and mac only; the interface name and static/dynamic type are not carried by the RTF_LLINFO dump and are emitted as '-' |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
 | network_diag | listening | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
@@ -537,14 +540,14 @@ implementation is.
 | sccm | site | linux | unsupported | - | - | - |
 | sccm | site | macos | unsupported | - | - | - |
 | sccm | site | windows | supported | 1 | registry+com_dispatch | - |
-| script_exec | exec | linux | supported | 2 | fork_execvp | - |
-| script_exec | exec | macos | supported | 2 | fork_execvp | - |
-| script_exec | exec | windows | supported | 2 | create_process | - |
+| script_exec | exec | linux | supported | 2 | subprocess_runner:direct_argv | - |
+| script_exec | exec | macos | supported | 2 | subprocess_runner:direct_argv | - |
+| script_exec | exec | windows | supported | 2 | subprocess_runner:direct_argv | - |
 | script_exec | powershell | linux | unsupported | - | - | - |
 | script_exec | powershell | macos | unsupported | - | - | - |
-| script_exec | powershell | windows | supported | 3 | powershell_encodedcommand | - |
-| script_exec | bash | linux | supported | 3 | bash_c | - |
-| script_exec | bash | macos | supported | 3 | bash_c | - |
+| script_exec | powershell | windows | supported | 3 | subprocess_runner:powershell_encodedcommand | - |
+| script_exec | bash | linux | supported | 3 | subprocess_runner:bash_c | - |
+| script_exec | bash | macos | supported | 3 | subprocess_runner:bash_c | - |
 | script_exec | bash | windows | unsupported | - | - | - |
 | services | list | linux | supported | 2 | runner argv 'systemctl list-units' | - |
 | services | list | macos | supported | 2 | runner argv 'launchctl list' | - |

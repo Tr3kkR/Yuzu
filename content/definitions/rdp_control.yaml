@@ -9,19 +9,27 @@
 # succeeds with no extra grant. A non-elevated agent returns reg_status|error:5
 # on every set_state.
 #
-# ENFORCEMENT REALITY (read before relying on the gate below): the only control
-# enforced on EVERY dispatch path is the `Execution:Execute` RBAC permission.
-# `approval.mode: role-gated` is enforced ONLY on the governed
-# POST /api/instructions/{id}/execute path; the raw dispatch paths
-# (POST /api/command, MCP execute_instruction) do NOT load this definition, so
-# they apply neither the approval workflow nor `executeRoles`. `executeRoles`
-# is advisory (not consumed by the server today) and `endpoint-admin` is a
-# content-convention label, not a server RBAC role (those are
-# Administrator/PlatformEngineer/Operator). Net: anyone holding
-# `Execution:Execute` (incl. an MCP token defaulting scope to __all__) can run
-# this. Restrict `Execution:Execute` and MCP token scope accordingly, and keep
-# the Guardian fDenyTSConnections backstop deployed. Enforcing definition-level
-# governance on raw dispatch is tracked as a platform follow-up (issue #1401).
+# ENFORCEMENT REALITY (read before relying on the gate below, #1398): two
+# independent controls now cover EVERY dispatch path -- the governed
+# POST /api/instructions/{id}/execute path AND raw dispatch
+# (POST /api/command, MCP execute_instruction, dashboard, workflow, schedule).
+# (1) RBAC: rdp_control.set_state classifies as `Security:Write` in the
+# compiled capability catalogue (capability_decls/plugin_action_catalogue_c.hpp)
+# -- NOT the generic `Execution:Execute` -- so a caller needs the narrower
+# `Security:Write` grant, checked at the one dispatch chokepoint
+# (classify_and_authorize_dispatch) every surface funnels through.
+# (2) Approval: this pair's compiled ExecuteGate is `AdminOrApproval`, derived
+# strictest-wins from this definition's `approval.mode: role-gated` -- a
+# non-admin caller without a proven approval decision (a consumed ticket, or
+# an equivalent governed pipeline) is denied `ApprovalRequired` at that same
+# chokepoint, on raw dispatch exactly as on the governed path.
+# `executeRoles` below remains advisory only -- it is not consumed by the
+# server (embed_content.py drops the whole `permissions` block at build time)
+# and `endpoint-admin` is a content-convention label, not a server RBAC role
+# (those are Administrator/PlatformEngineer/Operator/ApiTokenManager/
+# ITServiceOwner/Viewer/Reviewer). Actual enforcement is entirely the two
+# controls above. Keep the Guardian fDenyTSConnections backstop deployed
+# regardless -- defense in depth, not a substitute for either control.
 
 ---
 apiVersion: yuzu.io/v1alpha1

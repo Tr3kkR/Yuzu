@@ -1586,6 +1586,20 @@ detail: `docs/adr/0057-webhook-store-postgres-migration.md` and the
 
 With MCP streaming on, `initialize` now returns `HTTP 503` / JSON-RPC `-32015` ("Server is shutting down") for a narrow, transient window (seconds, not the deploy's whole grace period) if it lands after `ServerImpl::stop()` has begun draining live sessions. **Affected:** any MCP client integration — the reference clients and most SDKs already treat a non-2xx `initialize` as a transient failure and retry/reconnect; a client that specifically asserted "initialize never 503s" needs updating. No `retry_after_ms` is given (this process has no visibility into when a replacement instance will be reachable); reconnect and re-`initialize` once it is. A session that was already live when shutdown began instead receives a clean `notifications/yuzu.stream_closed` close frame (`reason: session_terminated`) rather than a bare connection drop — see [MCP — Troubleshooting](mcp.md#-32015-server-is-shutting-down-http-503) for the full symptom/cause/fix.
 
+### vNEXT — Linux adapter names no longer carry the `@peer` suffix (breaking)
+
+**What changed.** The `network_config` agent plugin's `adapters` and `ip_addresses` actions were rewritten to read Linux interfaces via rtnetlink instead of parsing `ip -o link show` text. The previous parser copied iproute2's *display* form for any interface with a parent link — a veth pair, a VLAN sub-interface, a tunnel device — which renders as `<name>@<parent>`, for example `eth0@if74` or `eth0.100@eth0`. The new leg reads the kernel's own interface name directly (`IFLA_IFNAME`), which never carries that suffix: the same two interfaces now report as `eth0` and `eth0.100`. This is a deliberate choice, not an oversight — `eth0@if74` is iproute2 presentation syntax that no other data source on the host recognises, and it was also silently breaking the adapter's link-speed lookup (`/sys/class/net/eth0@if74/speed` never resolves; the un-suffixed path does), so restoring the old string would also restore that bug.
+
+**Who this affects.** Any deployment with a Linux fleet segment where at least one host has an interface with a parent link — containerised hosts (veth is the default Docker/Kubernetes networking model), VLAN-tagged interfaces, or tunnel devices (WireGuard, OpenVPN, GRE) — **and** has a saved dashboard filter, a report, an external inventory join, or automation keyed on the adapter-name string containing `@`. A plain bare-metal or VM fleet with no such interfaces is unaffected; the field's *value* changes only for interfaces that previously carried the suffix.
+
+**Before upgrading, check whether this affects you.** On a representative Linux host, compare:
+
+```bash
+ip -o link show | awk -F': ' '{print $2}' | grep '@'
+```
+
+If this returns any interface names, those hosts will report a different (shorter) adapter name for those interfaces after upgrade — update any saved filter, dashboard, or join key that references the old `@`-suffixed string. If it returns nothing, this note does not affect you.
+
 ---
 
 ## Settings Page
@@ -3136,9 +3150,27 @@ deliberate and has **no grace window** — the second signal always force-exits,
 even if the first stop was progressing normally — so double-signalling stop
 tooling will force-kill healthy agents; send one signal and wait. You no longer
 need `SIGKILL` to recover a stuck agent. SQLite state is WAL crash-safe across
-the hard exit. On Windows, a second Ctrl-C also terminates promptly (via the
+the hard exit. Separately (#2233 item 3), a stuck teardown is now also caught
+automatically: `AgentImpl::stop()` and the agent's own `run()`-exit teardown
+each arm a 20-second internal watchdog, and self hard-exit (**code 4** — new,
+distinct from this section's exit 1 and the crash-loop-backstop's exit 3
+below) if guardian/spark/DEX teardown or any other blocking step hasn't
+returned within it. You do not need to send a second signal to recover from
+this class of wedge — doing so just makes the exit happen sooner (code 1)
+instead of after the 20s deadline (code 4). If a wedge triggers both at once
+(an operator's second signal racing the watchdog for the same hang), which
+code is actually reported is a race — treat it as a hint, not a certain
+diagnosis. On Windows, a second Ctrl-C also terminates promptly (via the
 escalation or the CRT's default disposition); the service path (`sc stop`) is
-unchanged. If the agent logs `shutdown watcher unavailable` at boot (thread/fd
+now also bounded by the same 20s watchdog. The agent's own `--install-service`
+path (see below) does configure automatic service recovery — 3 restarts, 60s
+apart, resetting after 24h, firing on both a crash and a clean exit that never
+reported `SERVICE_STOPPED` (#1822) — so a watchdog fire there behaves similarly
+to the Linux `Restart=always` unit, not as a permanent stop. What it does
+change: `TerminateProcess` bypasses `report_status`, so a code-4 exit
+does not land in the `sc query`/Event Viewer "specific error" buckets
+described further down — it surfaces as a generic unexpected termination. If
+the agent logs `shutdown watcher unavailable` at boot (thread/fd
 exhaustion), a hard-exit handler is installed instead: the agent exits promptly
 on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
@@ -3175,8 +3207,10 @@ silently ignored).
 
 **Crash-loop backstop (systemd).** The `yuzu-agent` unit sets `Restart=always` +
 `RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021
-rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`;
-against a *permanently* wedged target (a dead NFS mount, a hung service query) that would
+rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`
+(exit 3); the shutdown-teardown watchdog above (#2233 item 3) triggers the same
+`hard_exit()` mechanism at exit 4. Either way, against
+a *permanently* wedged target (a dead NFS mount, a hung service query) that would
 otherwise restart-loop every 10s forever. Instead, after 5 restarts within 300s systemd
 puts the unit into `failed` and stops retrying (the device goes dark rather than looping
 silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent`
@@ -3263,7 +3297,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
 
-**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code — the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on — **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives.
+**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code — the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on — **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4) described under *Stopping a wedged agent* above — they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets — Event Viewer shows it as a generic unexpected termination, not "specific error N".
 
 ### Server: sc.exe (native wrapper not yet available)
 
