@@ -100,7 +100,14 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
         // (agents/core/src/shutdown_deadline_guard.hpp, kShutdownDeadlineGrace = 20s) as its
         // first statement. 20s leaves only a 10s margin under this 30s hint, not "well under"
         // it - a wedge diagnosed slowly by the guard's own worker dispatch could still cost
-        // the SCM's patience in a worst case. That reasoning is about SERVICE_CONTROL_STOP's
+        // the SCM's patience in a worst case. That margin is for ONE watchdog: AgentImpl::
+        // stop() and run()'s teardown ScopeExit each arm their own, independently-budgeted
+        // 20s watchdog, and in the worst case the two compose SEQUENTIALLY in wall-clock time
+        // (agent.cpp's kShutdownDeadlineGrace comment has the exact call-graph reasoning) -
+        // up to ~40s total, past this 30s hint, with neither individual watchdog firing.
+        // Accepted, not fixed here: --install-service's recovery-actions config below already
+        // auto-restarts on the SCM reporting a slow/failed stop, so this is a recoverable
+        // extra restart cycle, not a permanent failure (external review, PR #3737). That reasoning is about SERVICE_CONTROL_STOP's
         // own STOP_PENDING hint specifically; on SERVICE_CONTROL_SHUTDOWN the OS applies its
         // own WaitToKillServiceTimeout instead, which can be shorter and is outside this
         // process's control either way. No checkpoint-bumping thread added regardless: a wedge

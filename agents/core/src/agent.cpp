@@ -99,14 +99,34 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // blocking chain sum to roughly 15-20s (GuardianEngine's two persist_lifecycle_journal_
 // locked calls, each documented as "worst case one KvStore 5s busy timeout"; SparkEngine's
 // kConsumerJoinBudgetMs = 2'000) but dex_observer_'s drain wait and stop_all_guards_
-// locked()'s per-guard stops have NO named bound at all — so this sits comfortably above
-// the named floor without claiming to be a derived guarantee (matching spark_file.cpp's
-// arm_ancestor deadline comment: state plainly that it's not a wall-clock bound where it
-// isn't one). Also constrained from above: service_win.cpp reports a 30s STOP_PENDING
-// hint to the Windows SCM, so this must stay under that or the SCM could act on an
-// unresponsive service before this watchdog even fires — 20s leaves only a 10s margin,
-// not a comfortable one (matching service_win.cpp's own wording on the same relationship,
-// not "well under"). That margin matters on Windows: --install-service's own
+// locked()'s per-guard stops have NO named bound at all — so this sits AT that named floor,
+// not comfortably above it (corrected per external review, PR #3737 — the earlier wording
+// overstated the margin), without claiming to be a derived guarantee (matching
+// spark_file.cpp's arm_ancestor deadline comment: state plainly that it's not a wall-clock
+// bound where it isn't one). Also constrained from above: service_win.cpp reports a 30s
+// STOP_PENDING hint to the Windows SCM, so a SINGLE watchdog must stay under that — 20s
+// leaves only a 10s margin, not a comfortable one (matching service_win.cpp's own wording
+// on the same relationship, not "well under").
+//
+// TWO watchdogs on the external-trigger path, and their budgets are independent, not
+// shared: run()'s ScopeExit re-calls guardian_->stop() on EVERY exit (comment below),
+// unconditionally, even when AgentImpl::stop() already called it — and GuardianEngine::
+// stop() has no early-out (verified above), so a second call blocks on its own mtx_ then
+// RE-EXECUTES. In the worst case this composes SEQUENTIALLY in wall-clock time: stop()'s
+// own watchdog (W1) bounds its guardian_->stop() call to <20s without firing, then run()'s
+// thread notices stop_requested_ and the ScopeExit's watchdog (W2) separately bounds ITS
+// OWN guardian_->stop() re-run to <20s without firing — up to ~40s total elapsed before
+// either individually reaches its own floor, exceeding the 30s SCM hint with NEITHER
+// watchdog firing (external review, PR #3737, verified against this exact call graph).
+// Accepted, not fixed here: the process is never actually stuck (each watchdog still
+// bounds ITS OWN phase, and the SCM's own timeout, if it fires first, does not leave the
+// process running); the consequence is the SCM reporting a slow/failed stop, which the
+// agent's own --install-service recovery-actions config (below) already auto-restarts —
+// a Restart=always-equivalent, not a permanent failure. Making the two watchdogs
+// composition-aware (deriving W2's budget from elapsed-time-since-stop()-began) is
+// deliberately deferred — it needs a design and its own review, not a quick patch to an
+// externally-reviewed primitive — grouped with the other open #2233 watchdog-tuning items.
+// That margin matters on Windows regardless: --install-service's own
 // SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 — SC_ACTION_RESTART x3, and
 // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it also fires on a clean exit with no
 // SERVICE_STOPPED report, not just a crash) DOES auto-restart on a watchdog fire — an
