@@ -1518,7 +1518,7 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
         // strictly greater than the SELECTed `row.last_counter`, so on the
         // normal FOR-UPDATE-serialized path this guard always matches the one row.
         //
-        // LOAD-BEARING: `RETURNING id` is what makes this an `PGRES_TUPLES_OK`
+        // LOAD-BEARING: `RETURNING id` is what makes this a `PGRES_TUPLES_OK`
         // result, so the zero-rows check below can distinguish a guard rejection
         // from a genuine write. Dropping `RETURNING` (e.g. a "simplify" refactor)
         // WITHOUT also reverting the `!= PGRES_TUPLES_OK` check would grade every
