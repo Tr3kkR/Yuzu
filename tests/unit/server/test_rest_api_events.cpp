@@ -38,6 +38,7 @@
 #include "rest_api_v1.hpp"
 #include "test_approval_manager_pg_helper.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
+#include "test_response_execution_authz_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -53,6 +54,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "../test_helpers.hpp"
@@ -84,6 +86,7 @@ struct RestEventsHarness {
     // Auth/perm/audit toggles for negative cases.
     bool session_present{true};
     bool perm_grant{true};
+    authz::VisibleSet fleet_read_scope{std::nullopt};
     bool audit_should_fail{false};
     bool audit_should_throw{false};
 
@@ -100,7 +103,9 @@ struct RestEventsHarness {
     /// `with_tracker=false` opts out of the tracker entirely (separate
     /// 503 path).
     explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true,
-                               yuzu::server::detail::StreamBudget* budget = nullptr)
+                               yuzu::server::detail::StreamBudget* budget = nullptr,
+                               RestApiV1::AuthFn auth_override = {},
+                               RestApiV1::FleetReadFn fleet_read_override = {})
         : stream_budget(budget) {
         if (with_tracker) {
             tracker_bundle.emplace();
@@ -115,8 +120,8 @@ struct RestEventsHarness {
             event_bus = std::make_unique<ExecutionEventBus>();
         }
 
-        auto auth_fn = [this](const httplib::Request&,
-                              httplib::Response& res) -> std::optional<auth::Session> {
+        RestApiV1::AuthFn auth_fn = [this](const httplib::Request&,
+                                           httplib::Response& res) -> std::optional<auth::Session> {
             if (!session_present) {
                 // Mirror require_auth's 401 contract — set status +
                 // body so the handler short-circuits.
@@ -129,6 +134,8 @@ struct RestEventsHarness {
             s.role = auth::Role::admin;
             return s;
         };
+        if (auth_override)
+            auth_fn = std::move(auth_override);
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                               const std::string&) -> bool {
             if (!perm_grant) {
@@ -146,6 +153,23 @@ struct RestEventsHarness {
                 throw std::runtime_error("simulated audit pipeline failure");
             return !audit_should_fail;
         };
+        RestApiV1::FleetReadFn fleet_read_fn =
+            [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) -> authz::FleetReadGate {
+            if (!session_present) {
+                res.status = 401;
+                res.set_content(R"({"error":"unauthorized"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            if (!perm_grant) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            return {true, fleet_read_scope};
+        };
+        if (fleet_read_override)
+            fleet_read_fn = std::move(fleet_read_override);
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
@@ -187,15 +211,19 @@ struct RestEventsHarness {
                             /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
-                            /*directory_sync=*/nullptr, stream_budget);
+                            /*directory_sync=*/nullptr, stream_budget,
+                            /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, fleet_read_fn);
     }
 
-    std::string make_exec(const std::string& status) {
+    std::string make_exec(const std::string& status,
+                          const std::string& dispatched_by = "tester") {
         Execution e;
         e.id = "exec-events-" + std::to_string(exec_counter.fetch_add(1));
         e.definition_id = "def-events";
         e.status = status;
-        e.dispatched_by = "tester";
+        e.scope_expression = "agent:secret-target";
+        e.parameter_values = R"({"secret_agent":"agent-hidden"})";
+        e.dispatched_by = dispatched_by;
         e.dispatched_at = 1735689600;
         e.agents_targeted = 3;
         e.agents_success = (status == "completed") ? 3 : 0;
@@ -205,6 +233,19 @@ struct RestEventsHarness {
         auto id = tracker->create_execution(e);
         REQUIRE(id.has_value());
         return *id;
+    }
+
+    void agent_status(const std::string& exec_id, const std::string& agent_id,
+                      const std::string& status, const std::string& error_detail = {},
+                      int64_t completed_at = 1735689660) {
+        AgentExecStatus a;
+        a.agent_id = agent_id;
+        a.status = status;
+        a.dispatched_at = 1735689600;
+        a.first_response_at = 1735689601;
+        a.completed_at = completed_at;
+        a.error_detail = error_detail;
+        tracker->update_agent_status(exec_id, a);
     }
 };
 
@@ -1028,6 +1069,68 @@ TEST_CASE("GET /api/v1/executions/{id}: unknown id → 404 A4 envelope",
     REQUIRE(res->body.find(R"("correlation_id":"req-)") != std::string::npos);
     // A4 mandates an api_version meta block on every error envelope.
     REQUIRE(res->body.find(R"("api_version":"v1")") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: invisible and nonexistent ids share one 404 shape",
+          "[pg][events][executions][scope][notfound]") {
+    RestEventsHarness h;
+    auto invisible_id = h.make_exec("running", "alice");
+    h.agent_status(invisible_id, "alice-agent", "success");
+    h.fleet_read_scope = authz::deny_all();
+
+    auto invisible = h.sink.Get("/api/v1/executions/" + invisible_id);
+    auto missing = h.sink.Get("/api/v1/executions/exec-does-not-exist");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    REQUIRE(invisible->status == 404);
+    REQUIRE(missing->status == 404);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    invisible_json["error"].erase("correlation_id");
+    missing_json["error"].erase("correlation_id");
+    CHECK(invisible_json == missing_json);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: confined dispatcher sees own unredacted execution",
+          "[pg][events][executions][scope][owner]") {
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running", "tester");
+    h.fleet_read_scope = authz::deny_all();
+
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find("agent:secret-target") != std::string::npos);
+    CHECK(res->body.find("agent-hidden") != std::string::npos);
+    CHECK(res->body.find("redacted - confined view") == std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: confined non-owner gets visible-only projection",
+          "[pg][events][executions][scope][projection]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz_rig{authz_db.dsn()};
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, /*budget=*/nullptr,
+                        authz_rig.auth_fn(), authz_rig.fleet_read_fn()};
+    auto exec_id = h.make_exec("running", "alice");
+    h.agent_status(exec_id, "bob-agent", "success");
+    h.agent_status(exec_id, "alice-agent", "failure", "alice-only-error", 1735689661);
+
+    const auto token = authz_rig.mint_bob();
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id,
+                          yuzu::test::ResponseExecutionAuthzPgRig::bearer(token));
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    const auto& data = body.at("data");
+    CHECK(data.at("agents_targeted") == 1);
+    CHECK(data.at("agents_responded") == 1);
+    CHECK(data.at("agents_success") == 1);
+    CHECK(data.at("agents_failure") == 0);
+    CHECK(data.at("scope_expression") == "(redacted - confined view)");
+    CHECK(data.at("parameter_values") == "(redacted - confined view)");
+    CHECK(data.at("last_error_detail") == "");
+    CHECK(res->body.find("alice-only-error") == std::string::npos);
+    CHECK(res->body.find("agent-hidden") == std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retry_after_ms",

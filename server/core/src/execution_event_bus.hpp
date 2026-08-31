@@ -130,9 +130,8 @@ public:
     /// it, under a single hold of the channel mutex. Returns the subscription token, as
     /// `subscribe` does.
     ///
-    /// This closes the replay→subscribe race the `/api/v1/events` sibling documents and
-    /// lives with (a frame published between its separate `replay_since` and `subscribe`
-    /// calls reaches neither): here a publisher needs the same channel mutex, so nothing
+    /// Used by both execution SSE routes and the MCP progress bridge to close the
+    /// replay-then-subscribe race: a publisher needs the same channel mutex, so nothing
     /// can land in the gap. Each event reaches the listener EXACTLY once - buffered events
     /// came from publishes that completed before this lock was held (the listener missed
     /// their live fan-out) and are delivered by the replay; events published after this

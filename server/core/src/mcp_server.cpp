@@ -5371,14 +5371,15 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── query_responses ───────────────────────────────────────────
             if (tool_name == "query_responses") {
-                if (!tier_allows(tier, "Response", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("query_responses: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Response", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Response", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!response_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Response store unavailable"),
@@ -5482,46 +5483,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 // shrinks `responses`, so `responses.size()` post-filter can't tell us.
                 const bool hit_cap = responses.size() == static_cast<std::size_t>(rq.limit);
 
-                // #1550 HIGH-1 / #1634: management-group scope. The flat Response:Read
-                // gate above is NOT an ownership check (dispatched_by is display-only),
-                // so without this an operator could collect ANOTHER operator's execution
-                // rows by execution_id. Filter per-agent through the injected scope
-                // predicate (production: check_scoped_permission, the same chokepoint the
-                // per-device REST/dashboard routes use), passing the already-resolved
-                // principal so we don't re-resolve the session per call. Dedupe the
-                // check per distinct agent_id — an execution fans out to a bounded agent
-                // set even with many response rows. Unwired/RBAC-off → no filter
-                // (legacy-open), matching require_scoped_permission. NOTE: the filter
+                // #1550 / #1634: filter through the fleet-read gate's already-resolved
+                // VisibleSet. A null scope is unrestricted and remains byte-identical.
+                // NOTE: the filter
                 // runs AFTER the store LIMIT, so a fan-out wider than the cap that spans
                 // out-of-scope agents may truncate the in-scope view (keyset follow-up
                 // #1634); the isolation guarantee — never another operator's rows —
                 // holds regardless, and result_truncated_by_cap signals the gap.
-                // NOTE (ADR-0017): like the inventory sibling, this responses filter is
-                // INERT under the global Response:Read gate (it does not narrow by
-                // management group today); the list-view correction is tracked #1718 PR-B.
                 bool scope_filtered = false;
                 std::size_t dropped_agents = 0;
-                if (response_scope_fn) {
-                    std::unordered_map<std::string, bool> memo;
+                if (gate.scope) {
+                    std::unordered_set<std::string> dropped_ids;
                     std::vector<StoredResponse> visible;
                     visible.reserve(responses.size());
                     for (auto& r : responses) {
-                        // try_emplace returns a VALID iterator + an inserted flag, so we
-                        // never re-read a find() iterator across the insert (the insert
-                        // can rehash). `inserted` marks the first sighting of this
-                        // agent_id — run the scope check once, then memoise.
-                        auto [m, inserted] = memo.try_emplace(r.agent_id, false);
-                        if (inserted)
-                            m->second = response_scope_fn(session->username, r.agent_id);
-                        if (m->second) {
+                        if (authz::in_scope(gate.scope, r.agent_id)) {
                             visible.push_back(std::move(r));
                         } else {
                             scope_filtered = true;
-                            if (inserted) // count each DISTINCT dropped agent once
-                                ++dropped_agents;
+                            dropped_ids.insert(r.agent_id);
                         }
                     }
                     responses.swap(visible);
+                    dropped_agents = dropped_ids.size();
                 }
 
                 JArr arr;
@@ -5751,14 +5735,15 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── aggregate_responses ───────────────────────────────────────
             if (tool_name == "aggregate_responses") {
-                if (!tier_allows(tier, "Response", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("aggregate_responses: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Response", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Response", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!response_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Response store unavailable"),
@@ -5794,24 +5779,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 else
                     aq.op = AggregateOp::Count;
 
-                // #1634: management-group scope (filter-BEFORE-aggregate). The flat
-                // Response:Read gate above is not a per-agent ownership check, so
-                // without this an operator could aggregate ANOTHER operator's
-                // instruction rows (e.g. count-by-status across agents outside their
-                // groups). A folded aggregate can't be post-filtered — the out-of-
-                // scope rows are already summed in — so we resolve the in-scope agent
-                // set and push it into the aggregate's WHERE clause via the dedicated
-                // `scope` arg. response_scope_fn routes through the single fail-closed
-                // response_agent_in_scope helper, so a corrupt rbac.db drops EVERY agent
-                // here → empty scope → zero rows (UP-1). A distinct_agent_ids() read
-                // ERROR returns nullopt → we fail CLOSED to the empty set, never an
-                // unrestricted read (UP-2). Only when the read succeeds AND no agent is
-                // dropped (operator sees every responding agent / RBAC cleanly disabled)
-                // do we leave scope nullopt — unrestricted, correct totals at any scale
-                // (the residual dropped==0 TOCTOU window is an acknowledged LOW, #1634).
+                // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
+                // empty AggregateScope is deliberate and produces zero rows.
                 AggregateScope agg_scope; // nullopt = unrestricted
                 std::size_t dropped_agents = 0;
-                if (response_scope_fn) {
+                if (gate.scope) {
                     auto distinct = response_store->distinct_agent_ids(instr_id);
                     if (!distinct) {
                         // Store-read error resolving the in-scope set. Surface it as an
@@ -5830,13 +5802,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::vector<std::string> in_scope;
                     in_scope.reserve(distinct->size());
                     for (auto& aid : *distinct) {
-                        if (response_scope_fn(session->username, aid))
+                        if (authz::in_scope(gate.scope, aid))
                             in_scope.push_back(std::move(aid));
                         else
                             ++dropped_agents;
                     }
-                    if (dropped_agents > 0)
-                        agg_scope = std::move(in_scope);
+                    agg_scope = std::move(in_scope);
                 }
 
                 auto results_opt = response_store->aggregate(instr_id, aq, {}, agg_scope);

@@ -1,0 +1,1 @@
+- Confine response, execution-detail, visualization, and execution-event reads to the caller's visible management-group agents.

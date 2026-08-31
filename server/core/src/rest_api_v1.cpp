@@ -16,6 +16,7 @@
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "execution_event_scope.hpp"
 #include "guardian_rule_spec.hpp"
 #include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
@@ -6822,14 +6823,25 @@ void RestApiV1::register_routes(
     // /api/v1/events startup-window behavior.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128}))",
-        [auth_fn, perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, fleet_read_fn, execution_tracker](const httplib::Request& req,
+                                                    httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/executions/{{id}}: fleet_read_fn unwired; cid={}", cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            // The fleet-read gate already authenticated the request. Re-read the
+            // resolved session only to apply dispatcher ownership below.
             auto session = auth_fn(req, res);
             if (!session)
                 return;
-            if (!perm_fn(req, res, "Execution", "Read"))
-                return;
-            const auto cid = detail::make_correlation_id();
-            res.set_header("X-Correlation-Id", cid);
             if (!execution_tracker) {
                 res.status = 503;
                 res.set_content(
@@ -6842,35 +6854,78 @@ void RestApiV1::register_routes(
             }
             auto exec_id = req.matches[1].str();
             auto exec_opt = execution_tracker->get_execution(exec_id);
-            if (!exec_opt) {
+            // Fetch and scan the same status set for a missing id and an invisible
+            // id. Do not stop on the first visible row: #1634 collapses both cases
+            // to one 404 without a scan-length existence oracle.
+            auto agents = execution_tracker->get_agent_statuses(exec_id);
+            bool has_visible_agent = false;
+            for (const auto& a : agents)
+                has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+            const bool owns_execution =
+                exec_opt && exec_opt->dispatched_by == session->username;
+            const bool visible = !gate.scope || owns_execution || has_visible_agent;
+            if (!exec_opt || !visible) {
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "execution not found", cid),
                                 "application/json");
                 return;
             }
             const auto& e = *exec_opt;
-            // Mirrors the Execution struct field-for-field (per
-            // execution_tracker.hpp). `last_error_detail` is PII-
-            // adjacent (agent stderr) — the perm_fn(Execution:Read)
-            // gate above is the same one mcp_server.cpp:get_execution_status
-            // uses to protect this field; if those policies ever diverge,
-            // sibling-handler parity needs revisiting.
+            int agents_targeted = e.agents_targeted;
+            int agents_responded = e.agents_responded;
+            int agents_success = e.agents_success;
+            int agents_failure = e.agents_failure;
+            std::string last_error_detail = e.last_error_detail;
+            std::string scope_expression = e.scope_expression;
+            std::string parameter_values = e.parameter_values;
+            if (gate.scope && !owns_execution) {
+                // #1634 residual: agent status rows are response-arrival seeded, not
+                // dispatch-time target seeded. A confined non-dispatcher can therefore
+                // see a teammate's execution only after an in-scope response lands.
+                // These projections intentionally undercount pending in-scope targets.
+                agents_targeted = 0;
+                agents_responded = 0;
+                agents_success = 0;
+                agents_failure = 0;
+                last_error_detail.clear();
+                int64_t newest_error_at = 0;
+                for (const auto& a : agents) {
+                    if (!authz::in_scope(gate.scope, a.agent_id))
+                        continue;
+                    ++agents_targeted;
+                    ++agents_responded;
+                    if (a.status == "success") {
+                        ++agents_success;
+                    } else if (a.status == "failure" || a.status == "timeout" ||
+                               a.status == "rejected") {
+                        ++agents_failure;
+                    }
+                    if (!a.error_detail.empty() && a.completed_at >= newest_error_at) {
+                        newest_error_at = a.completed_at;
+                        last_error_detail = a.error_detail;
+                    }
+                }
+                scope_expression = "(redacted - confined view)";
+                parameter_values = "(redacted - confined view)";
+            }
+            // Deliberately keep status, completion time, dispatcher, and lineage
+            // truthful for this narrower #1634 slice; none directly names another agent.
             auto data = JObj()
                             .add("id", e.id)
                             .add("definition_id", e.definition_id)
                             .add("status", e.status)
-                            .add("scope_expression", e.scope_expression)
-                            .add("parameter_values", e.parameter_values)
+                            .add("scope_expression", scope_expression)
+                            .add("parameter_values", parameter_values)
                             .add("dispatched_by", e.dispatched_by)
                             .add("dispatched_at", static_cast<int64_t>(e.dispatched_at))
-                            .add("agents_targeted", e.agents_targeted)
-                            .add("agents_responded", e.agents_responded)
-                            .add("agents_success", e.agents_success)
-                            .add("agents_failure", e.agents_failure)
+                            .add("agents_targeted", agents_targeted)
+                            .add("agents_responded", agents_responded)
+                            .add("agents_success", agents_success)
+                            .add("agents_failure", agents_failure)
                             .add("completed_at", static_cast<int64_t>(e.completed_at))
                             .add("parent_id", e.parent_id)
                             .add("rerun_of", e.rerun_of)
-                            .add("last_error_detail", e.last_error_detail)
+                            .add("last_error_detail", last_error_detail)
                             .str();
             res.set_content(ok_json(data), "application/json");
         });
@@ -6952,13 +7007,17 @@ void RestApiV1::register_routes(
     // all read response_store on the same gate. Governance gate C-1.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
-        [auth_fn, perm_fn, audit_fn, response_store, instruction_store, response_scope_fn](
+        [fleet_read_fn, audit_fn, response_store, instruction_store](
             const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Response", "Read"))
+            if (!fleet_read_fn) {
+                spdlog::error("execution.visualization.fetch: fleet_read_fn unwired");
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
-            auto session = auth_fn(req, res);
-            if (!session)
-                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
             if (!response_store || !instruction_store || !response_store->is_open() ||
                 !instruction_store->is_open()) {
                 res.status = 503;
@@ -7067,41 +7126,27 @@ void RestApiV1::register_routes(
             auto responses = std::move(*responses_opt);
             // rows_capped is computed on the RAW (pre-scope-filter) result, so it
             // still signals "more rows existed past the 10000 cap" independent of
-            // the scope drop below (#1634 keyset follow-up). NOTE (#1634): the scope
-            // filter below is INERT under the current global Response:Read gate (a
-            // global holder admits every agent → nothing dropped); effective scoping
-            // needs the admit-then-filter gate (remaining #1634 work). Its only active
-            // effect today is failing closed on a corrupt rbac.db.
+            // the scope drop below (#1634 keyset follow-up).
             bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
             if (rows_capped) {
                 spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
                              kRowCap, execution_id, definition_id);
             }
 
-            // #1634: management-group scope — drop out-of-scope agents' rows BEFORE
-            // the chart transform, mirroring MCP query_responses. The flat
-            // Response:Read gate is not a per-agent ownership check, so without this
-            // an operator could chart ANOTHER operator's execution by id. Filter
-            // per-agent through the injected predicate (production:
-            // check_scoped_permission, the same chokepoint the per-device routes
-            // use), memoised per distinct agent_id, passing the already-resolved
-            // principal. Unwired / RBAC-off → no filter (legacy-open), matching
-            // require_scoped_permission.
+            // #1634: drop out-of-scope rows before the chart transform.
             std::size_t scope_dropped = 0;
-            if (response_scope_fn) {
-                std::unordered_map<std::string, bool> memo;
+            if (gate.scope) {
+                std::unordered_set<std::string> dropped_ids;
                 std::vector<StoredResponse> visible;
                 visible.reserve(responses.size());
                 for (auto& r : responses) {
-                    auto [m, inserted] = memo.try_emplace(r.agent_id, false);
-                    if (inserted)
-                        m->second = response_scope_fn(session->username, r.agent_id);
-                    if (m->second)
+                    if (authz::in_scope(gate.scope, r.agent_id))
                         visible.push_back(std::move(r));
-                    else if (inserted) // count each DISTINCT dropped agent once
-                        ++scope_dropped;
+                    else
+                        dropped_ids.insert(r.agent_id);
                 }
                 responses.swap(visible);
+                scope_dropped = dropped_ids.size();
             }
 
             VisualizationEngine engine;
@@ -11992,43 +12037,40 @@ void RestApiV1::register_routes(
     //     `yuzu_server_sse_api_queue_overflow_total` (counter),
     //     `yuzu_server_sse_api_replay_gap_total` (counter).
     //
-    // **Known race window (governance unhappy-R10):** `replay_since`
-    // and `subscribe` run under separate locks. A publish that fires
-    // between the two is neither replayed (it post-dates the buffer
-    // snapshot) nor delivered live (the listener is not yet
-    // installed). The bus-side fix now EXISTS - track 2f PR 3a landed
-    // `ExecutionEventBus::subscribe_and_replay` (atomic install-then-
-    // replay under one channel-mutex hold; the 2f MCP progress bridge
-    // uses it). Only the migration of THIS surface + the dashboard
-    // sibling remains; tracked in issue #2410.
-    //
     // Parity with the dashboard sibling at `workflow_routes.cpp` —
     // both consume the same per-execution channel from
-    // `ExecutionEventBus` and apply identical preflight ordering
-    // (auth → perm → tracker → bus → execution → terminal → audit →
-    // headers → replay → subscribe → chunked provider). The wire
+    // `ExecutionEventBus`, use the fleet-read gate as their sole
+    // auth+authz gate, establish execution visibility before terminal
+    // state or streaming side effects, and atomically subscribe+replay.
+    // The wire
     // shapes differ on purpose: this surface emits the A3-mandated
     // JSON envelope with `execution_id` baked into every event so an
     // agentic worker subscribed to one channel can still discriminate
     // events; the dashboard sibling emits raw `ev.data` because the
     // browser already knows the channel from the URL path.
-    sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
-                                metrics_registry, stream_budget](const httplib::Request& req,
-                                                                 httplib::Response& res) {
-        auto session = auth_fn(req, res);
-        if (!session) {
-            // auth_fn already set 401 + body. Nothing to do.
-            return;
-        }
-        if (!perm_fn(req, res, "Execution", "Read")) {
-            // perm_fn already set 403 + body.
-            return;
-        }
-
+    sink.Get("/api/v1/events", [auth_fn, fleet_read_fn, audit_fn, execution_tracker,
+                                execution_event_bus, metrics_registry,
+                                stream_budget](const httplib::Request& req,
+                                               httplib::Response& res) {
         // A4 correlation id binds every error / audit row / spdlog
         // line on this request to a single grep token. Generated
         // once up-front so 4xx branches and the audit row share it.
         const auto cid = detail::make_correlation_id();
+        if (!fleet_read_fn) {
+            spdlog::error("api.v1.events.subscribe: fleet_read_fn unwired cid={}", cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Execution", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the response.
+        // The fleet-read gate already authenticated the request. Re-read the
+        // resolved session only for ownership, audit, and stream budgeting.
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
 
         // execution_id is mandatory for the W5.1 skeleton — see
         // sprint plan §2 R-4. Unfiltered subscription expands the
@@ -12083,10 +12125,19 @@ void RestApiV1::register_routes(
         }
 
         auto exec_opt = execution_tracker->get_execution(exec_id);
-        if (!exec_opt) {
-            spdlog::warn("api.v1.events.subscribe denied: unknown execution cid={} "
-                         "principal={} exec_id={}",
-                         cid, session->username, exec_id);
+        auto agents = execution_tracker->get_agent_statuses(exec_id);
+        bool has_visible_agent = false;
+        for (const auto& a : agents)
+            has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+        const bool owns_execution =
+            exec_opt && exec_opt->dispatched_by == session->username;
+        const bool visible = !gate.scope || owns_execution || has_visible_agent;
+        if (!exec_opt || !visible) {
+            // Keep nonexistent and outside-scope cases caller-identical. The
+            // distinction stays only in this server-side debug line.
+            spdlog::debug("api.v1.events.subscribe: {} cid={} principal={} exec_id={}",
+                          exec_opt ? "outside caller fleet-read scope" : "execution not found",
+                          cid, session->username, exec_id);
             res.status = 404;
             res.set_content(detail::error_json_a4(404, "execution not found", cid),
                             "application/json");
@@ -12219,7 +12270,7 @@ void RestApiV1::register_routes(
         // cannot distinguish from "not yet emitted". governance
         // round unhappy-R1 / R2.
         //
-        // The snapshot is taken BEFORE replay_since walks the
+        // The snapshot is taken BEFORE subscribe_and_replay walks the
         // buffer — `snapshot()` already serialises on the channel
         // mutex, so the lowest id we observe is a valid lower
         // bound. A concurrent publish can widen the buffer at the
@@ -12259,39 +12310,32 @@ void RestApiV1::register_routes(
             }
         }
 
-        // Replay then subscribe. Note: a `publish` arriving
-        // between the two calls is NOT delivered to this
-        // connection — it post-dates the replay walk but
-        // pre-dates the listener attach. See the per-route
-        // header block above; bus-level fix is tracked as a
-        // follow-up.
         std::string exec_id_for_capture = exec_id;
-        // Cap enforcement lives in `detail::enqueue_capped`
-        // (event_bus.hpp) so it's unit-testable without driving
-        // the handler. Both the replay walker and the live
-        // subscriber go through it.
-        execution_event_bus->replay_since(
-            exec_id, since_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
-                detail::SseEvent sse;
-                sse.event_type = ev.event_type;
-                // Frame the per-bus event into <id>\n<JSON
-                // envelope> so the content provider can split and
-                // emit `id:` + `event:` + `data:` lines without
-                // re-touching the bus.
-                sse.data = std::to_string(ev.id) + "\n" +
-                           detail::make_event_envelope(exec_id_for_capture, ev);
-                detail::enqueue_capped(sink_state, std::move(sse));
-            });
-
         auto* bus = execution_event_bus;
-        sink_state->sub_id =
-            bus->subscribe(exec_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
-                detail::SseEvent sse;
-                sse.event_type = ev.event_type;
-                sse.data = std::to_string(ev.id) + "\n" +
-                           detail::make_event_envelope(exec_id_for_capture, ev);
-                detail::enqueue_capped(sink_state, std::move(sse));
-                sink_state->cv.notify_one();
+        // Install the listener and replay atomically. The same scope projection
+        // therefore applies to buffered and live events with no split-call race.
+        sink_state->sub_id = bus->subscribe_and_replay(
+            exec_id, since_id,
+            [sink_state, exec_id_for_capture, scope = gate.scope](const ExecutionEvent& ev) noexcept {
+                try {
+                    const auto verdict = classify_execution_event_for_scope(ev, scope);
+                    if (verdict == ExecutionEventVerdict::kDrop)
+                        return;
+                    ExecutionEvent sanitized;
+                    const ExecutionEvent* served = &ev;
+                    if (verdict == ExecutionEventVerdict::kSanitize) {
+                        sanitized = sanitize_execution_event_for_scope(ev);
+                        served = &sanitized;
+                    }
+                    detail::SseEvent sse;
+                    sse.event_type = served->event_type;
+                    sse.data = std::to_string(served->id) + "\n" +
+                               detail::make_event_envelope(exec_id_for_capture, *served);
+                    detail::enqueue_capped(sink_state, std::move(sse));
+                    sink_state->cv.notify_one();
+                } catch (...) {
+                    // A projection failure drops the event for this confined stream.
+                }
             });
 
         // UP-1: adopt any pending engine QuotaSlot into this stream's
