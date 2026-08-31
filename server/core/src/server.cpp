@@ -180,7 +180,6 @@
 #include "secure_buffer.hpp"
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
-#include "instruction_db_pool.hpp"
 #include "tag_store.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
@@ -5089,38 +5088,89 @@ public:
             }
         }
 
-        // InstructionDbPool — a SEPARATE SQLite pool onto the SAME instructions.db file,
-        // backing the still-unmigrated ExecutionTracker/ApprovalManager/ScheduleEngine
-        // (ADR-0058: only instruction_definitions/instruction_sets moved to Postgres; these
-        // three siblings are unaffected and keep reading/writing the physical file directly —
-        // it is not retired by this migration). Deliberately NOT gated on instruction_store_'s
-        // (now Postgres) is_open() — the two are independent post-migration, unlike
-        // pre-migration where they happened to share one SQLite-open check. RAII pool owns the
-        // shared connection (fixes G3-ARCH-T2-002); declared before the consumers in the member
-        // list so that consumers are destroyed before the pool closes the DB.
-        if (!startup_failed_) {
-            auto instr_db = cfg_.db_dir() / "instructions.db";
-            instr_db_pool_ = std::make_unique<InstructionDbPool>(instr_db);
-            if (instr_db_pool_->is_open()) {
-                // PR 3 — per-execution SSE event bus. Constructed
-                // before the tracker so the tracker can attach
-                // immediately and we keep the "bus outlives tracker"
-                // invariant that the member-order comment encodes.
-                execution_event_bus_ = std::make_unique<ExecutionEventBus>();
-                execution_tracker_ = std::make_unique<ExecutionTracker>(instr_db_pool_->get());
-                execution_tracker_->create_tables();
+        // ExecutionTracker — migrated Postgres store (ADR-0009/0065, schema
+        // `execution_tracker`; migration-programme PR 5, 3/3 — the LAST of the 7
+        // Wave-4 SQLite components). Construction fail-CLOSED per ADR-0012 §1 — a
+        // posture UPGRADE from the SQLite era, where migration failure set a flag
+        // (`migration_ok_`) that NOTHING here ever checked (only the shared
+        // InstructionDbPool's own `is_open()` gated construction and fed
+        // `/readyz`). InstructionDbPool — the SQLite pool this store, ScheduleEngine,
+        // and ApprovalManager used to share onto `instructions.db` — is DELETED as
+        // of this commit; it had exactly one consumer, `server.cpp` (repo-wide grep
+        // verified before the migration programme started), and all three of its
+        // former borrowers are now independent Postgres stores. NO backfill
+        // (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the legacy
+        // `instructions.db` file is never copied; the detect-and-warn obligation
+        // still applies, so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) if either the
+        // `executions` or `agent_exec_status` table still holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            // PR 3 — per-execution SSE event bus. Constructed before the tracker
+            // so the tracker can attach immediately — the "bus outlives tracker"
+            // invariant the member-order comment (`[BUS-BEFORE-TRACKER]`) encodes.
+            // Relocated here (was inside the now-deleted InstructionDbPool gate)
+            // — still constructed only when the tracker itself is about to be,
+            // still strictly before it.
+            execution_event_bus_ = std::make_unique<ExecutionEventBus>();
+            execution_tracker_ = std::make_unique<ExecutionTracker>(*pg_pool_);
+            if (!execution_tracker_->is_open()) {
+                spdlog::error("[PG] Refusing to start: execution tracker migration/open failed "
+                              "(database reachable but the execution_tracker schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
                 execution_tracker_->set_event_bus(execution_event_bus_.get());
                 // UAT 2026-05-06 #8: AgentServiceImpl notifies the
                 // tracker on every response so the per-agent KPI
                 // table populates and SSE agent-transition fires
                 // for live drawer updates.
                 agent_service_.set_execution_tracker(execution_tracker_.get());
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
+                                                         "ExecutionTracker",
+                                                         {"executions", "agent_exec_status"});
+            }
+        }
 
-                approval_manager_ = std::make_unique<ApprovalManager>(instr_db_pool_->get());
-                approval_manager_->create_tables();
+        // Phase 2b: ScheduleEngine — migrated Postgres store (ADR-0009/0065,
+        // schema `schedule_engine`; migration-programme PR 5, 1/3 by commit
+        // order). Construction fail-CLOSED per ADR-0012 §1 — a posture UPGRADE
+        // from the SQLite era, where migration failure was log-only and no
+        // caller ever checked an availability flag. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // instructions.db is never copied; the detect-and-warn obligation still
+        // applies, so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if the
+        // `schedules` table actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            schedule_engine_ = std::make_unique<ScheduleEngine>(*pg_pool_);
+            if (!schedule_engine_->is_open()) {
+                spdlog::error("[PG] Refusing to start: schedule engine migration/open failed "
+                              "(database reachable but the schedule_engine schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
+                                                         "ScheduleEngine", {"schedules"});
+            }
+        }
 
-                schedule_engine_ = std::make_unique<ScheduleEngine>(instr_db_pool_->get());
-                schedule_engine_->create_tables();
+        // ApprovalManager — migrated Postgres store (ADR-0009/0065, schema
+        // `approval_manager`; migration-programme PR 5, 2/3). Construction was
+        // ALREADY fail-closed in the SQLite era (a failed migration nulled
+        // db_) — this is a shape preservation, not a posture upgrade like its
+        // ScheduleEngine sibling. NO backfill, same rationale as ScheduleEngine
+        // above; the legacy `approvals` table is covered by the same
+        // legacy_sqlite_probe call.
+        if (pg_pool_ && !startup_failed_) {
+            approval_manager_ = std::make_unique<ApprovalManager>(*pg_pool_);
+            if (!approval_manager_->is_open()) {
+                spdlog::error("[PG] Refusing to start: approval manager migration/open failed "
+                              "(database reachable but the approval_manager schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "instructions.db",
+                                                         "ApprovalManager", {"approvals"});
             }
         }
 
@@ -8614,7 +8664,6 @@ public:
         execution_event_bus_.reset();
         approval_manager_.reset();
         schedule_engine_.reset();
-        instr_db_pool_.reset();
 
         // PostgreSQL substrate teardown (ADR-0007). The gRPC drain above has
         // quiesced every handler thread that could hold a pool lease through a
@@ -12688,10 +12737,11 @@ private:
             // Resolve auth FIRST so we can gate expensive work on it.
             // Governance Gate 7 round 2 (security MEDIUM): /health and
             // /api/health are rate-limit-exempt for monitoring stability;
-            // the bounded but non-trivial work below (SQLite scans on
-            // pending-agents and execution_tracker) must only run for
-            // authenticated callers, otherwise an unauth flood becomes a
-            // DoS amplification primitive. Unauth callers get the cheap
+            // the bounded but non-trivial work below (a pending-agents scan
+            // and bounded execution_tracker reads — two PG pool leases,
+            // ADR-0065) must only run for authenticated callers, otherwise
+            // an unauth flood becomes a DoS amplification primitive. Unauth
+            // callers get the cheap
             // probe response — status, uptime, agent count from in-memory
             // registry, store ok flags from is_open() (constant-time member
             // checks), and version. Authed callers additionally get
@@ -12838,6 +12888,16 @@ private:
             // workflow_engine was already in /readyz's StoreCheck vector (below) but absent
             // here in the SQLite era.
             bool workflow_engine_ok = workflow_engine_ && workflow_engine_->is_open();
+            // ADR-0065 (migration-programme PR 5, 1/3) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Net-new: the SQLite era had
+            // no is_open()/availability flag for this store at all.
+            bool schedule_engine_ok = schedule_engine_ && schedule_engine_->is_open();
+            // ADR-0065 (migration-programme PR 5, 3/3) — net-new: the SQLite era
+            // had no /healthz entry for this store at all (its shared
+            // InstructionDbPool fed /readyz only; approval_ok above is the ONE
+            // sibling that already had full probe coverage pre-migration).
+            bool execution_tracker_ok = execution_tracker_ && execution_tracker_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12848,7 +12908,8 @@ private:
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
                 notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-                patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok;
+                patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok &&
+                schedule_engine_ok && execution_tracker_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12896,7 +12957,9 @@ private:
                   {"patch_manager", patch_manager_ok ? "ok" : "error"},
                   {"session_store", session_store_ok ? "ok" : "error"},
                   {"directory_sync", directory_sync_ok ? "ok" : "error"},
-                  {"workflow_engine", workflow_engine_ok ? "ok" : "error"}}},
+                  {"workflow_engine", workflow_engine_ok ? "ok" : "error"},
+                  {"schedule_engine", schedule_engine_ok ? "ok" : "error"},
+                  {"execution_tracker", execution_tracker_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -12915,7 +12978,8 @@ private:
 
             // Authenticated extension — heavier work, only run when the caller
             // has a session. Adds: agents.pending (SQLite scan), executions.*
-            // (SQLite scan + 1h-window loop), system.* (process_health_sampler).
+            // (two bounded execution_tracker pool leases, ADR-0065 + a
+            // 1h-window loop), system.* (process_health_sampler).
             if (is_authenticated) {
                 auto pending_agents = auth_mgr_.list_pending_agents();
                 int pending_count = 0;
@@ -13042,22 +13106,24 @@ private:
                 // offload_target_store and notification_store below, were
                 // already covered) - same HC-1 gap class.
                 {"webhook_store", webhook_store_ && webhook_store_->is_open()},
-                // Governance UAT 2026-05-06 SRE-1: ExecutionTracker became
-                // load-bearing in this batch — AgentServiceImpl's
-                // notify_exec_tracker calls update_agent_status on every
-                // CommandResponse frame. The tracker has no is_open() of
-                // its own; it shares the instructions DB pool. We probe
-                // the pointer (nullptr means the pool failed to construct)
-                // AND the underlying instr_db_pool_ explicitly, so a
-                // pool-open failure surfaces as /readyz=503 rather than a
-                // silent no-op on every response.
-                // gov B-1: ALSO probe schema_ok(). The store shares this pool,
-                // so a FAILED MIGRATION leaves the pool open and this row green
-                // while every execution-status write fails against a missing
-                // column — every execution wedged at `dispatched`, /readyz ready.
-                {"execution_tracker", execution_tracker_ != nullptr && instr_db_pool_ &&
-                                          instr_db_pool_->is_open() &&
-                                          execution_tracker_->schema_ok()},
+                // ADR-0065 (migration-programme PR 5, 3/3): ExecutionTracker
+                // became a fail-closed Postgres store (was fail-open SQLite
+                // sharing InstructionDbPool, now deleted — migration failure
+                // set a flag, `migration_ok_`/`schema_ok()`, that nothing here
+                // ever checked; only the pool's own `is_open()` gated
+                // construction and fed this probe). Re-keyed from
+                // `instr_db_pool_->is_open() && execution_tracker_->schema_ok()`
+                // to the store's own `is_open()` — same governance UAT 2026-05-06
+                // SRE-1 / gov B-1 property this row has always protected: a
+                // failed migration must surface as /readyz=503, not a green
+                // probe over silently-wedged executions.
+                {"execution_tracker", execution_tracker_ && execution_tracker_->is_open()},
+                // ADR-0065 (migration-programme PR 5, 1/3): ScheduleEngine became
+                // a fail-closed Postgres store (was fail-open SQLite with no
+                // is_open() of its own — migration failure was log-only and no
+                // caller ever checked availability). Net-new row: the SQLite era
+                // had no equivalent probe at all.
+                {"schedule_engine", schedule_engine_ && schedule_engine_->is_open()},
                 // gov R3 HC-1: FleetTopologyStore became load-bearing for
                 // /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology.
                 // Pure in-memory store with no is_open(); pointer-not-null is
@@ -16972,7 +17038,18 @@ private:
             auto session = auth_routes_->resolve_session(req);
             auto user = session ? session->username : "unknown";
 
-            execution_tracker_->mark_cancelled(id, user);
+            // governance PR review (2026-08-31): mark_cancelled now reports
+            // whether the update actually happened — do not tell the
+            // operator "cancelled" (HTTP 200 + a "success" audit row) when
+            // it didn't.
+            if (!execution_tracker_->mark_cancelled(id, user)) {
+                (void)audit_log(req, "execution.cancel", "failure", "execution", id);
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"cancel failed - execution store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             (void)audit_log(req, "execution.cancel", "success", "execution", id);
             emit_event("execution.completed", req, {{"status", "cancelled"}},
                        {{"execution_id", id}});
@@ -21751,8 +21828,6 @@ private:
 
     // Phase 2: Instruction system
     std::unique_ptr<InstructionStore> instruction_store_;
-    std::unique_ptr<InstructionDbPool>
-        instr_db_pool_; // RAII owner — declared before consumers so it outlives them
     /// PR 3 — per-execution SSE event bus. Process-local; the tracker
     /// borrows this pointer and publishes onto it; `WorkflowRoutes`
     /// registers the SSE handler that subscribes per-connection.

@@ -30,7 +30,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <memory>
@@ -74,16 +73,7 @@ struct DispatchCall {
     yuzu::server::authz::VisibleSet exec_visible;
 };
 
-struct SqliteHandleGuard {
-    sqlite3* db{nullptr};
-    ~SqliteHandleGuard() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 struct AsyncHarness {
-    SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
     std::unique_ptr<ResultSetStore> store;
@@ -146,9 +136,8 @@ struct AsyncHarness {
         store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
 
-        REQUIRE(sqlite3_open(":memory:", &tracker_guard.db) == SQLITE_OK);
-        tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
-        tracker->create_tables();
+        tracker = std::make_unique<ExecutionTracker>(pool);
+        REQUIRE(tracker->is_open());
 
         // ADR-0058: InstructionStore is now a migrated Postgres store — shares
         // the same pool/database as the store constructed above it (schema-per-store).

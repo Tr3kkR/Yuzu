@@ -28,7 +28,9 @@
 #    could not. First it took a single expected code and RE-RAN the case with the opposite
 #    expectation on mismatch (a broken escalation failed run 1, passed run 2, reported PASS).
 #    Then it accepted the SET {0,1} for the escalation case -- and BOTH members were reachable by
-#    a defect: a broken escalation exits 0, and a since-deferred shutdown deadline also exited 1.
+#    a defect: a broken escalation exits 0, and (at the time) the shutdown deadline was still
+#    deferred to a later PR and had no exit code of its own to collide with 1. #2233 item 3 has
+#    since landed that deadline as exit code 4, not 1 -- this harness does not yet exercise it.
 #    An assertion that accepts the failure mode is a green light wired to the bug.
 #    (governance: quality-engineer, twice.)
 #

@@ -12,8 +12,9 @@ metadata:
   version: 1.1.0
   description: >
     Execute a command with arguments directly on the endpoint. No shell
-    interpretation is applied — the program is invoked via CreateProcess
-    (Windows) or execvp (POSIX). Stdout and stderr are streamed back
+    interpretation is applied — the resolved program path and its
+    arguments are run as a direct argv exec through the agent's shared
+    bounded subprocess runner. Stdout and stderr are streamed back
     line-by-line. Enforces a configurable timeout (default 300 seconds,
     max 3600). Returns the process exit code and final status.
   tags: [scripting, execution, admin, remediation]
@@ -172,9 +173,10 @@ metadata:
   version: 1.1.0
   description: >
     Execute a bash script on a Linux or macOS endpoint. The script body
-    is passed as a single argument to /bin/bash -c via execvp (no shell
-    expansion of the outer wrapper). Output is streamed line-by-line
-    with timeout enforcement.
+    is passed as a single argument to /bin/bash -c, run through the
+    agent's shared bounded subprocess runner (no shell expansion of the
+    outer wrapper — only bash itself interprets the script). Output is
+    streamed line-by-line with timeout enforcement.
   tags: [scripting, bash, linux, macos, admin, remediation]
 
 spec:

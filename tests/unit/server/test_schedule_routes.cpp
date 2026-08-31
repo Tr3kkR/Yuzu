@@ -37,7 +37,6 @@
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
-#include <sqlite3.h>
 
 #include <ctime>
 #include <filesystem>
@@ -52,15 +51,6 @@
 using namespace yuzu::server;
 
 namespace {
-
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
 
 // Pre-migrated template for RbacStore (PG port). Shares the "rbacstore" key
 // with test_rbac_store.cpp's own template (identical setup, replay-verified
@@ -89,8 +79,13 @@ struct ScheduleRouteHarness {
     std::optional<yuzu::test::PostgresTestDb> rbac_db;
     std::optional<yuzu::server::pg::PgPool> rbac_pool;
     std::optional<RbacStore> rbac;
-    TestDb sdb;
-    ScheduleEngine schedule_engine{sdb.db};
+    // ADR-0065 (migration-programme PR 5, 1/3): ScheduleEngine now migrated
+    // to Postgres. Built on the SAME rbac_pool below (ADR-0008's
+    // schema-per-store-on-one-connection model), not a second ephemeral
+    // database — same pattern as `analytics` just below. unique_ptr because
+    // it can only be constructed after the PG SKIP-check + rbac_pool are
+    // available (see the constructor body).
+    std::unique_ptr<ScheduleEngine> schedule_engine;
     yuzu::test::TempDir tmp;
     // ApiTokenStore ported to Postgres (PR 4.1) — SKIPs the current TEST_CASE
     // when YUZU_TEST_POSTGRES_DSN is unset, FAILs when set but broken. Every
@@ -124,7 +119,8 @@ struct ScheduleRouteHarness {
         rbac.emplace(*rbac_pool);
         REQUIRE(rbac->is_open());
 
-        schedule_engine.create_tables();
+        schedule_engine = std::make_unique<ScheduleEngine>(*rbac_pool);
+        REQUIRE(schedule_engine->is_open());
         rbac->set_rbac_enabled(true);
 
         // TempDir only computes a unique path; it does not create the
@@ -217,10 +213,10 @@ TEST_CASE("POST /api/schedules: Schedule:Write alone is rejected without Executi
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
 
     httplib::Response res;
-    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+    handle_create_schedule(*h.auth_routes, h.schedule_engine.get(), req, res);
 
     CHECK(res.status == 403);
-    CHECK(h.schedule_engine.query_schedules().empty());
+    CHECK(h.schedule_engine->query_schedules().empty());
 }
 
 TEST_CASE("POST /api/schedules: Execution:Execute alone is rejected without Schedule:Write",
@@ -230,10 +226,10 @@ TEST_CASE("POST /api/schedules: Execution:Execute alone is rejected without Sche
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
 
     httplib::Response res;
-    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+    handle_create_schedule(*h.auth_routes, h.schedule_engine.get(), req, res);
 
     CHECK(res.status == 403);
-    CHECK(h.schedule_engine.query_schedules().empty());
+    CHECK(h.schedule_engine->query_schedules().empty());
 }
 
 TEST_CASE("POST /api/schedules: Schedule:Write + Execution:Execute together create the schedule",
@@ -244,10 +240,10 @@ TEST_CASE("POST /api/schedules: Schedule:Write + Execution:Execute together crea
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
 
     httplib::Response res;
-    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+    handle_create_schedule(*h.auth_routes, h.schedule_engine.get(), req, res);
 
     CHECK(res.status != 403);
-    auto scheds = h.schedule_engine.query_schedules();
+    auto scheds = h.schedule_engine->query_schedules();
     REQUIRE(scheds.size() == 1);
     CHECK(scheds[0].name == "nightly-scan");
     CHECK(scheds[0].created_by == "sched-op");
@@ -260,7 +256,7 @@ TEST_CASE("POST /api/schedules: Schedule:Write + Execution:Execute together crea
 // ── PR1.5a: typed schedule parameters ───────────────────────────────────────
 
 TEST_CASE("POST /api/schedules: parameters round-trip to the stored canonical form",
-          "[server][schedule][params][rest]") {
+          "[server][schedule][params][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
                                      {{"Schedule", "Write"}, {"Execution", "Execute"}});
@@ -268,17 +264,17 @@ TEST_CASE("POST /api/schedules: parameters round-trip to the stored canonical fo
               R"("parameters":{"zeta":"1","alpha":2}})";
 
     httplib::Response res;
-    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+    handle_create_schedule(*h.auth_routes, h.schedule_engine.get(), req, res);
 
     CHECK(res.status != 400);
-    auto scheds = h.schedule_engine.query_schedules();
+    auto scheds = h.schedule_engine->query_schedules();
     REQUIRE(scheds.size() == 1);
     // Canonical: sorted keys, regardless of the caller's JSON key order.
     CHECK(scheds[0].parameter_values == R"({"alpha":2,"zeta":"1"})");
 }
 
 TEST_CASE("POST /api/schedules: invalid parameters are rejected with 400 and create no row",
-          "[server][schedule][params][rest]") {
+          "[server][schedule][params][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
                                      {{"Schedule", "Write"}, {"Execution", "Execute"}});
@@ -286,25 +282,25 @@ TEST_CASE("POST /api/schedules: invalid parameters are rejected with 400 and cre
               R"("parameters":{"nested":{"a":1}}})";
 
     httplib::Response res;
-    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+    handle_create_schedule(*h.auth_routes, h.schedule_engine.get(), req, res);
 
     CHECK(res.status == 400);
-    CHECK(h.schedule_engine.query_schedules().empty());
+    CHECK(h.schedule_engine->query_schedules().empty());
 }
 
 TEST_CASE("POST /api/schedules: an omitted parameters field defaults to the canonical empty "
           "object",
-          "[server][schedule][params][rest]") {
+          "[server][schedule][params][rest][pg]") {
     ScheduleRouteHarness h;
     auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
                                      {{"Schedule", "Write"}, {"Execution", "Execute"}});
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
 
     httplib::Response res;
-    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+    handle_create_schedule(*h.auth_routes, h.schedule_engine.get(), req, res);
 
     CHECK(res.status != 400);
-    auto scheds = h.schedule_engine.query_schedules();
+    auto scheds = h.schedule_engine->query_schedules();
     REQUIRE(scheds.size() == 1);
     CHECK(scheds[0].parameter_values == "{}");
 }
@@ -330,10 +326,10 @@ TEST_CASE("POST /api/schedules: a service-scoped token is denied even holding "
     req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
 
     httplib::Response res;
-    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+    handle_create_schedule(*h.auth_routes, h.schedule_engine.get(), req, res);
 
     CHECK(res.status == 403);
-    CHECK(h.schedule_engine.query_schedules().empty());
+    CHECK(h.schedule_engine->query_schedules().empty());
     // Gate 8 (#2298 PR 3 hardening round, supersedes the prior GC-7 fix this
     // test pinned): `.permission` is now omitted entirely, not renamed to
     // the "correct" grant — `kServiceScopeGlobalSafe` is compile-time-empty,
