@@ -746,6 +746,52 @@ TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly 
     CHECK(*replay == false);
 }
 
+// ── #2399: white-box coverage of the monotonic guard's WHERE predicate ──────
+//
+// The concurrency test above proves single-consumption end-to-end, but under
+// the production `FOR UPDATE` lock the guard's own zero-rows branch is
+// unreachable (verify_window rejects a replay before the UPDATE runs). This
+// test exercises the guard clause DIRECTLY against a seeded row so BOTH
+// outcomes — a forward advance (1 row) and a non-forward reject (0 rows) — are
+// deterministically pinned. It mirrors the exact `mfa_last_counter < $matched`
+// predicate from `mfa_verify_login_code`; a drift between the two is the thing
+// to notice.
+TEST_CASE("AuthDB MFA: monotonic counter guard accepts a forward advance, rejects "
+          "a non-forward one",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("guardrow", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    // Seed the stored counter at 100.
+    {
+        const char* v[] = {"guardrow"};
+        PgResult seed{PQexecParams(h.conn.get(),
+                                   "UPDATE auth.users SET mfa_last_counter = 100 WHERE username = $1",
+                                   1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(seed.ok());
+    }
+
+    // The exact monotonic predicate from mfa_verify_login_code, keyed by username
+    // for the test's convenience (production keys by id — the `mfa_last_counter <
+    // $1 RETURNING` clause is identical). Returns the row count the guard yields.
+    auto run_guard = [&](const char* matched) -> int {
+        const char* v[] = {matched, "guardrow"};
+        PgResult r{PQexecParams(
+            h.conn.get(),
+            "UPDATE auth.users SET mfa_last_counter = $1, last_login_at = now() "
+            "WHERE username = $2 AND mfa_last_counter < $1 RETURNING id",
+            2, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+
+    CHECK(run_guard("101") == 1); // forward advance (101 > 100): matches the one row
+    CHECK(run_guard("101") == 0); // equal (101 == stored-now-101): non-forward → rejected
+    CHECK(run_guard("50") == 0);  // backward (50 < 101): rejected
+    CHECK(run_guard("102") == 1); // a further forward advance (102 > 101) is accepted
+}
+
 // ── ★ fail-closed: corrupted/undecryptable secret NEVER reads as "not
 //    enrolled" or "code didn't match" ─────────────────────────────────────
 

@@ -1515,8 +1515,16 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
         // whose stored counter has already reached `*matched` touches zero rows
         // and is graded a replayed code (clean `false`), NEVER a burned success
         // and NEVER an error. `verify_window` only ever returns a counter
-        // strictly greater than the SELECTed `row.last_counter`, so in the
-        // normal single-writer path this guard always matches the one row.
+        // strictly greater than the SELECTed `row.last_counter`, so on the
+        // normal FOR-UPDATE-serialized path this guard always matches the one row.
+        //
+        // LOAD-BEARING: `RETURNING id` is what makes this an `PGRES_TUPLES_OK`
+        // result, so the zero-rows check below can distinguish a guard rejection
+        // from a genuine write. Dropping `RETURNING` (e.g. a "simplify" refactor)
+        // WITHOUT also reverting the `!= PGRES_TUPLES_OK` check would grade every
+        // successful advance as `WriteFailed` and 503 every legitimate MFA login
+        // (fail-closed, not a bypass — but a total login outage). Change both or
+        // neither.
         pg::PgResult upd = pg::exec_params(
             conn,
             "UPDATE auth.users SET mfa_last_counter = $1, last_login_at = now() "
@@ -1530,6 +1538,15 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
             // The monotonic guard rejected the advance — the stored counter had
             // already reached `*matched` (a replay that slipped past the window
             // read). Treat exactly as an already-consumed code; nothing to commit.
+            // This branch is unreachable while the `FOR UPDATE` lock holds (the
+            // window read already rejects the replay first), so if it EVER fires
+            // it signals a weakened-isolation regression (a replica SELECT, a
+            // lock-free refactor) — warn rather than swallow it silently, since
+            // it is otherwise indistinguishable from an ordinary wrong code.
+            spdlog::warn("AuthDB: MFA monotonic guard rejected a counter advance "
+                         "(user_id={}, matched_counter={}) — the FOR UPDATE lock should make "
+                         "this unreachable; investigate isolation/replica routing",
+                         row.id, *matched);
             result = false;
             return false;
         }
