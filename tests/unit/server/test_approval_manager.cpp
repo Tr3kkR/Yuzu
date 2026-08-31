@@ -902,8 +902,8 @@ TEST_CASE("ApprovalManager: a full stale pending queue self-heals on the next su
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
 
-    // 1000 pending approvals, all 8 days old — at the cap, and all expirable.
-    seed_pending(mgr_bundle.pool(), "stale-", 1000, k8Days);
+    // At the cap, all 8 days old and expirable.
+    seed_pending(mgr_bundle.pool(), "stale-", ApprovalManager::kMaxPendingApprovals, k8Days);
 
     // Before the fix, this returned "approval queue is full" and never ran
     // the expiry sweep, permanently wedging the store.
@@ -924,9 +924,10 @@ TEST_CASE("ApprovalManager: a full queue of NON-stale pending approvals still re
     yuzu::test::ApprovalManagerPg mgr_bundle;
     ApprovalManager& mgr = *mgr_bundle;
 
-    // 1000 pending approvals, fresh (not expirable) — the cap must still bind
-    // when there is genuinely nothing for the sweep to clear.
-    seed_pending(mgr_bundle.pool(), "fresh-", 1000, /*age_seconds=*/60);
+    // At the cap, fresh (not expirable) — the cap must still bind when there
+    // is genuinely nothing for the sweep to clear.
+    seed_pending(mgr_bundle.pool(), "fresh-", ApprovalManager::kMaxPendingApprovals,
+                /*age_seconds=*/60);
 
     auto id = mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(!id.has_value());

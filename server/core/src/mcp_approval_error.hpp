@@ -15,8 +15,9 @@ namespace yuzu::server::mcp {
 /// separately at first and said different things about the same condition.
 ///
 /// `ConsumeFailure::kStoreError` (and the equivalent `get_checked` failure at
-/// rung 1) has producers that are TRANSIENT (a busy or erroring SQLite step,
-/// which a retry clears) and producers that are PERMANENT for the life of the
+/// rung 1) has producers that are TRANSIENT (a lease-acquire timeout or a
+/// transient Postgres error, which a retry clears) and producers that are
+/// PERMANENT for the life of the
 /// process (the store never opened). Answering the permanent case with "retry
 /// this call unchanged" is an unbounded loop, and every attempt also writes
 /// an audit row, so a degraded approval store turns into an audit-write loop

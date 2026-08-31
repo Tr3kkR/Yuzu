@@ -827,15 +827,16 @@ def _selftest():
     _pg_specs = [s for s in _shard_specs if s not in _NONPG_SPECS]
     check(all(spec in _shard_specs for spec in _NONPG_SPECS),
           "meson.build: all four non-pg shard tag filters extracted verbatim")
-    # _pg_specs = 11 real pg shards (10 + K) + the smoke entry (also
-    # server_test_exe, also not one of the three excluded non-pg tuples) =
-    # 12. Not 11 -- the smoke entry's own spec ('[pg-smoke]',) has always
-    # been counted here; this is a pre-existing property of the extraction,
-    # not new to this split (verified against the pre-split source: smoke
-    # was already included, making the OLD floor's true value 11, not the
-    # "10 pg-shard entries" the old message claimed).
-    check(len(_pg_specs) >= 12,
-          f"meson.build: at least 12 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
+    # _pg_specs = 12 real pg shards (10 + K + L, ADR-0065's instruction-
+    # cluster carve, 2026-08-31) + the smoke entry (also server_test_exe,
+    # also not one of the three excluded non-pg tuples) = 13. The smoke
+    # entry's own spec ('[pg-smoke]',) has always been counted here; this is
+    # a pre-existing property of the extraction, not new to any split
+    # (verified against the pre-split source: smoke was already included,
+    # making the OLD floor's true value 11 before K, not the "10 pg-shard
+    # entries" an even older message claimed).
+    check(len(_pg_specs) >= 13,
+          f"meson.build: at least 13 pg-shard-or-smoke entries found (got {len(_pg_specs)}) "
           "-- exact partition identity is proven separately, against the real "
           "binary, by check-pg-shard-partition.py")
 

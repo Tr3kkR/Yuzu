@@ -6,11 +6,16 @@
  */
 
 #include "execution_tracker.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
+
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -355,6 +360,78 @@ TEST_CASE("ExecutionTracker: summary after refresh_counts", "[pg][execution_trac
     CHECK(summary.agents_success == 2);
     CHECK(summary.agents_failure == 1);
     CHECK(summary.progress_pct > 0);
+}
+
+TEST_CASE("ExecutionTracker: refresh_counts retries and recovers from transient row-lock "
+          "contention instead of wedging the execution (governance adversarial review "
+          "2026-08-31, CHAOS-01)",
+          "[pg][execution_tracker][chaos]") {
+    // Reproduces UP-1: the pre-migration SQLite recursive_mutex blocked
+    // UNBOUNDEDLY on contention (never dropped an update, only queued); the
+    // Postgres port's bounded lock_timeout can cancel a queued
+    // refresh_counts call instead, and pre-fix that failure was silent and
+    // final — the execution stayed "running" forever. This test proves the
+    // fix's single retry recovers once the contending transaction releases,
+    // which it reliably does well inside a real lock_timeout window.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::execution_tracker_pg_template);
+
+    // A short lock_timeout makes the injected contention resolve in
+    // milliseconds instead of the production 10s default (PgPool::Options).
+    yuzu::server::pg::PgPool store_pool{
+        {.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = 100}};
+    REQUIRE(store_pool.valid());
+    ExecutionTracker tracker{store_pool};
+    REQUIRE(tracker.is_open());
+
+    auto exec = make_execution();
+    exec.agents_targeted = 1;
+    auto id_result = tracker.create_execution(exec);
+    REQUIRE(id_result.has_value());
+    const std::string execution_id = *id_result;
+
+    // A second, independent connection holds an exclusive row lock on the
+    // execution for longer than store_pool's 100ms lock_timeout, so the
+    // FIRST refresh_counts attempt (chained inside update_agent_status)
+    // is guaranteed to be cancelled and abandoned.
+    yuzu::server::pg::PgPool locker_pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(locker_pool.valid());
+    auto locker_lease = locker_pool.try_acquire_for(std::chrono::milliseconds{2000});
+    REQUIRE(locker_lease);
+    auto begin = pg::exec_params(locker_lease.get(), "BEGIN", std::vector<std::string>{});
+    REQUIRE(begin.status() == PGRES_COMMAND_OK);
+    auto lock = pg::exec_params(
+        locker_lease.get(), "SELECT 1 FROM execution_tracker.executions WHERE id=$1 FOR UPDATE",
+        std::vector<std::string>{execution_id});
+    REQUIRE(lock.status() == PGRES_TUPLES_OK);
+
+    // Releases the lock partway through the store's retry window — well
+    // after the 100ms lock_timeout has already cancelled attempt 1, well
+    // before a human would notice anything.
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{150});
+        auto rollback =
+            pg::exec_params(locker_lease.get(), "ROLLBACK", std::vector<std::string>{});
+        CHECK(rollback.status() == PGRES_COMMAND_OK);
+    });
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.dispatched_at = 1000;
+    as.completed_at = 1005;
+    as.exit_code = 0;
+    tracker.update_agent_status(execution_id, as);
+
+    releaser.join();
+
+    // Pre-fix: this would be stuck at "running" with stale (zero) aggregate
+    // counts — attempt 1 was cancelled and nothing ever retried it.
+    auto summary = tracker.get_summary(execution_id);
+    CHECK(summary.agents_responded == 1);
+    CHECK(summary.agents_success == 1);
+    auto row = tracker.get_execution(execution_id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "succeeded");
 }
 
 // ── Parent-Child Hierarchy ─────────────────────────────────────────────────

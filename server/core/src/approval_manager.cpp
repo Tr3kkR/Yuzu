@@ -347,7 +347,6 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         return std::unexpected(id_r.error());
     auto id = *id_r;
     auto ts = now_epoch();
-    constexpr int kMaxPendingApprovals = 1000;
     constexpr int64_t k7Days = 7 * 24 * 3600;
     auto cutoff = std::to_string(ts - k7Days);
 
@@ -384,8 +383,9 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             std::vector<std::string>{cutoff});
         if (exp.status() != PGRES_TUPLES_OK)
             return false;
-        if (int n = PQntuples(exp.get()); n > 0)
-            spdlog::info("ApprovalManager: expired {} stale pending approvals", n);
+        int expired_pending = PQntuples(exp.get());
+        if (expired_pending > 0)
+            spdlog::info("ApprovalManager: expired {} stale pending approvals", expired_pending);
 
         pg::PgResult expa = pg::exec_params(
             conn,
@@ -404,6 +404,24 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
             return false;
         int pending = static_cast<int>(to_i64(col(cnt.get(), 0, 0)));
         if (pending >= kMaxPendingApprovals) {
+            // Clock-guard signal (governance cpp-safety, 2026-08-31): a
+            // backward clock skew (NTP correction, VM snapshot restore) moves
+            // `cutoff` into the past, so the sweep above matches nothing even
+            // though it should have — this WARN is the only thing that
+            // distinguishes that anomaly from an ordinary, healthy full
+            // queue, both of which otherwise look identical ("queue is full"
+            // with zero rows just expired). Not a full clock-guard apparatus
+            // (ADR-0065's "Expiry-sweep clock-guard adjudication": this sweep
+            // is a state-transition UPDATE, never a DELETE, so the
+            // irreversible-loss trigger the full 7-part apparatus exists for
+            // is not met) — a log line an operator can alert on is
+            // proportionate to the risk.
+            if (expired_pending == 0) {
+                spdlog::warn(
+                    "ApprovalManager: pending queue at cap ({}) and the stale-pending sweep "
+                    "expired nothing — if this persists, check for clock skew (cutoff={})",
+                    kMaxPendingApprovals, cutoff);
+            }
             queue_full_error = "approval queue is full (" +
                                std::to_string(kMaxPendingApprovals) + " pending)";
             return false;
@@ -661,15 +679,18 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // TEST DEPENDENCY: with no precondition supplied (today's only production
     // caller, the MCP recall), this is the 2nd top-level SELECT this call
     // issues against the store — the 1st is the caller's own pre-consume
-    // lookup (e.g. mcp_server.cpp's rung-1 get_checked). The MCP integration
-    // test "a store fault AT the origin check masks a foreign-origin ticket's
-    // kind" isolates a fault to THIS read specifically via a countdown
-    // `sqlite3_set_authorizer` that lets the 1st SELECT through and denies
-    // the 2nd. A future read added between the caller's lookup and this one
-    // (on the same connection) would shift that test onto the wrong read
-    // without it failing loudly — update the countdown if you add one. The
-    // submitter check below extends this SAME read rather than adding a 3rd
-    // SELECT, for exactly that reason.
+    // lookup (e.g. mcp_server.cpp's rung-1 get_checked). ADR-0065 (governance
+    // adversarial review, 2026-08-31): the SQLite-era MCP integration test
+    // that isolated a fault to THIS read specifically via a countdown
+    // `sqlite3_set_authorizer` has no Postgres analogue and was deleted, not
+    // ported — the equivalent coverage now lives at the store level
+    // (`test_approval_manager.cpp`, asserts `binding_check_unevaluated=true`
+    // + a non-empty `sqlstate` when this read fails), since consume_ticket's
+    // own logic here is unchanged by the migration. A future read added
+    // between the caller's lookup and this one would still need that
+    // store-level test updated to target the right read. The submitter check
+    // below extends this SAME read rather than adding a 3rd SELECT, for
+    // exactly that reason.
     {
         auto row = get_checked(id); // takes its own bounded lease
         if (!row) {

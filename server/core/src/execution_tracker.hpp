@@ -203,6 +203,13 @@ public:
     [[nodiscard]] bool schema_ok() const noexcept { return open_; }
 
 private:
+    /// One attempt at `refresh_counts`'s aggregate recompute + conditional
+    /// terminal transition + SSE publish. Returns false on a bounded-timeout
+    /// abandon (row-lock contention) or a lease-acquire failure; `true`
+    /// otherwise, including the ordinary "nothing changed" case. See
+    /// `refresh_counts`'s retry-and-log wrapper for why this is split out.
+    bool refresh_counts_once(const std::string& execution_id);
+
     pg::PgPool& pool_;
     bool open_{false};
     /// Borrowed — owned by the server. nullptr = no SSE publishing.

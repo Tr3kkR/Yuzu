@@ -352,8 +352,15 @@ std::expected<std::string, std::string> ExecutionTracker::create_execution(const
             std::to_string(exec.agents_success), std::to_string(exec.agents_failure),
             std::to_string(exec.completed_at), exec.parent_id, exec.rerun_of});
 
-    if (res.status() != PGRES_COMMAND_OK)
-        return std::unexpected(std::string("insert failed: ") + PQresultErrorMessage(res.get()));
+    if (res.status() != PGRES_COMMAND_OK) {
+        // Scrubbed generic string to the caller (matches ScheduleEngine/
+        // ApprovalManager's equivalent path — governance consistency-auditor,
+        // 2026-08-31: this used to leak the raw Postgres diagnostic); the
+        // diagnostic itself goes server-side only.
+        spdlog::error("ExecutionTracker::create_execution: insert failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected("insert failed (pool degraded or transaction failed)");
+    }
     return id;
 }
 
@@ -449,6 +456,37 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
     if (!open_)
         return;
 
+    // Retry once on failure (governance adversarial review 2026-08-31,
+    // CHAOS-01): the aggregate UPDATE below takes a row-level lock other
+    // concurrent refresh_counts calls for the SAME execution_id queue behind.
+    // Under high agent-fanout that queue can exceed Postgres's server-side
+    // lock_timeout (10s default, set once at connection-open in
+    // pg::PgPool — NOT this file's kWriteTimeout, which only bounds the pool
+    // lease acquisition), which cancels the statement and rolls back. The
+    // pre-migration SQLite code used a recursive_mutex that blocked
+    // UNBOUNDEDLY (no timeout, so it could never drop an update, only
+    // queue) — this bounded-abandon failure mode is net-new to the Postgres
+    // port. A single retry is not a no-op: by the time the first attempt has
+    // waited out the full lock_timeout, the transaction(s) that were holding
+    // the row have almost certainly long since committed or themselves timed
+    // out, so the retry is very likely uncontended. A second failure is
+    // logged loudly rather than silently dropped — without this, an
+    // execution can wedge at "running" forever (agents_responded/success/
+    // failure stale, no terminal transition, no execution-completed SSE)
+    // with zero operator-visible signal (tracked for a fuller fix — a
+    // periodic reconciler sweep — in the follow-up this finding filed).
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (refresh_counts_once(execution_id))
+            return;
+    }
+    spdlog::error("ExecutionTracker: refresh_counts failed twice for execution {} — aggregate "
+                  "counts and terminal transition may be stale; a subsequent agent status "
+                  "update will retry, but a fully-reported execution may need operator "
+                  "investigation (see docs/executions-history-ladder.md)",
+                  execution_id);
+}
+
+bool ExecutionTracker::refresh_counts_once(const std::string& execution_id) {
     // Snapshot-and-release (perf-B1 / UP-A9). See update_agent_status for
     // the full rationale. We snapshot up to two SSE payloads inside the
     // transaction below, then publish after it commits and the lease is
@@ -530,7 +568,7 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
     }); // transaction committed / lease released here — publishes below run lease-free.
 
     if (!ok)
-        return;
+        return false;
 
     if (publish_progress) {
         event_bus_->publish(execution_id, "execution-progress", progress_payload.dump(),
@@ -540,6 +578,7 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
         event_bus_->publish(execution_id, "execution-completed", terminal_payload.dump(),
                             /*is_terminal=*/true);
     }
+    return true;
 }
 
 std::expected<std::string, std::string>

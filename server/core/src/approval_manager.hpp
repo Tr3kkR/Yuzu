@@ -365,6 +365,12 @@ using ConsumePrecondition = std::function<std::expected<void, std::string>(const
 
 class ApprovalManager {
 public:
+    /// Global cap on `status='pending'` rows `submit()` enforces (queue-cap +
+    /// lazy-expiry-sweep, see `submit()`'s body). Exposed so tests exercising
+    /// the boundary reference this constant instead of duplicating the
+    /// literal (governance quality-engineer finding, 2026-08-31).
+    static constexpr int kMaxPendingApprovals = 1000;
+
     explicit ApprovalManager(pg::PgPool& pool);
     ~ApprovalManager() = default;
 

@@ -997,6 +997,17 @@ respectively). This is a **fresh-start cutover with no data migration**
 upgrade. `InstructionDbPool` itself is deleted; `instructions.db` is retired
 and no Yuzu store writes to it again.
 
+**Before upgrading, capture what you'll lose** (none of it carries over):
+`GET /api/schedules`, `GET /api/approvals`, and `GET /api/v1/executions` are
+safe, non-mutating reads — use them to record your active recurring
+schedules and any outstanding (pending or approved-but-unconsumed) approval
+tickets before you cut over, so you know what to re-create afterward rather
+than discovering gaps after the fact. The retired `instructions.db` file is
+**left on disk, not deleted** — if you need to recover consumed-approval
+audit evidence (the `submitted_by → reviewed_by → consumed_by` chain) after
+upgrading, that file is your only source; back it up separately before any
+unrelated disk cleanup removes it, since Yuzu itself never will.
+
 **What happens on first PG boot:**
 - The server logs three one-time lines — `ScheduleEngine initialized (schema
   schedule_engine) — fresh start, no legacy backfill`, similarly for

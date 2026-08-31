@@ -1,11 +1,15 @@
 # ADR-0065: Instruction Cluster (ScheduleEngine / ApprovalManager / ExecutionTracker) → PostgreSQL
 
 - **Status:** Accepted — all three components ported, the whole binary compiles and links, and
-  both the full `[pg]`-tagged suite (2888 cases, 2885 passed, 3 pre-existing unrelated skips —
+  both the full `[pg]`-tagged suite (2933 cases, 2930 passed, 3 pre-existing unrelated skips —
   unconditional placeholders in `test_saml_routes.cpp` for coverage unreachable via a real
   HTTP-POST binding at `kMaxGroupValues=200`, unrelated to this migration) and the full non-pg
-  suite (2976 cases, 2895 passed, 81 pre-existing unrelated skips) pass with zero failures;
-  `check-pg-shard-partition.py` confirms an exact 11-pg/4-non-pg partition.
+  suite (2984 cases, 2984 passed, 0 skipped on this Linux run) pass with zero failures;
+  `check-pg-shard-partition.py` confirms an exact 12-pg/4-non-pg partition. (Counts as of the
+  governance adversarial-review hardening round, 2026-08-31 — the trio's own regression tests
+  plus a `[pg]` shard L carve and the #1398/WorkflowEngine merge-reconciliation moved these
+  numbers up from this ADR's original 2888/11-shard figures; see the "Correction" sections below
+  for what changed.)
 - **Date:** 2026-08-30
 - **Deciders:** pg workstream (migration-programme PR 5, the last of the 7-store SQLite→Postgres
   ladder — `WorkflowEngine`/ADR-0064 merged separately as PR 4, #1328/#1325/#3653)
@@ -327,6 +331,43 @@ calling another store method while holding a lock, no mutex of any kind is neede
 plain `bool`, not atomic (construction-then-read-only, matching every other store in this
 ladder).
 
+**Correction (governance adversarial review, 2026-08-31 — CHAOS-01):** the mutex-deletion
+analysis above establishes there is no re-entrant DEADLOCK risk, but it did not address a
+different failure mode the removal introduces. The pre-migration `recursive_mutex` blocked
+UNBOUNDEDLY on contention — a caller queued behind another `refresh_counts` call for the same
+execution could wait arbitrarily long, but the update could never simply be dropped. Postgres's
+own per-connection `lock_timeout` (10s default, `pg::PgPool::Options`) bounds the equivalent wait
+on this port's row-level lock instead: under high agent-fanout, enough concurrent
+`refresh_counts` calls for the SAME execution can queue behind that row lock that a caller near
+the back of the queue gets its statement cancelled by Postgres, and `update_agent_status`
+(`execution_tracker.cpp:435`, pre-fix) discarded that failure silently — no log, no counter, no
+retry. Because `refresh_counts` is the ONLY path that advances an execution past its
+all-agents-responded threshold, a dropped call for the LAST reporting agent left the execution
+wedged at `status='running'` forever, with stale aggregate counts and no `execution-completed`
+SSE — a state-machine wedge (derived HIGH: I5 raise (c), E1/E2 — ordinary fleet-wide-dispatch
+fanout, no attacker required), independently confirmed by governance's chaos-injector,
+compliance-officer (a wedged execution is also an inaccurate Processing-Integrity evidentiary
+record — `completed_at` never populates), and sre (no detection path exists today: no metric, no
+log, no alert distinguishes a wedged execution from a healthy in-flight one; realistic
+pool-exhaustion threshold under the same contention is "tens of concurrent same-execution
+completions," not hundreds — see `server.cpp`'s default `pg_pool_` size of 16, shared
+server-wide).
+
+**Fix:** `refresh_counts` retries once on failure before giving up, and logs loudly
+(`spdlog::error`) if the retry also fails, rather than dropping silently
+(`execution_tracker.cpp`, `refresh_counts`/`refresh_counts_once`). The retry is not a no-op: by
+the time the first attempt has waited out the full `lock_timeout`, the transaction(s) that were
+holding the row have almost certainly long since committed or themselves timed out, so the retry
+is very likely uncontended — proven empirically by a regression test
+(`test_execution_tracker.cpp`, `"refresh_counts retries and recovers from transient row-lock
+contention"`) that holds a real row lock from a second connection, verified to fail against the
+pre-fix single-attempt code and pass against the fix. This closes the common case but is
+explicitly a MITIGATION, not a complete fix: under sustained contention both attempts could still
+fail. A periodic reconciler sweep (re-check any execution stuck at `running` past N minutes,
+sre's Gate 6 preference over pure retry) would close the residual risk completely but is a larger
+architectural change — out of scope for a storage-backend migration, filed as #3729 rather than
+fixed here.
+
 **`InstructionDbPool` deletion.** `instruction_db_pool.{hpp,cpp}` is deleted along with its
 `server.cpp` member (`instr_db_pool_`), its dedicated construction block, and its teardown line
 — verified beforehand by a repo-wide grep that `server.cpp` was its only consumer. The
@@ -445,8 +486,35 @@ only its construction converts (to `ExecutionTrackerPg`); the payload assertions
   due schedule across replicas unaddressed — ADR-2002 already commits to a fenced-leader +
   transactional-outbox model for exactly this class of problem. All three are irrelevant on
   today's single-server design (`docs/adr/2002-high-availability-architecture.md`).
-- **Not fixed here, filed separately:** unbounded growth of `executions`/`agent_exec_status`
+- **Not fixed here, filed as #3728:** unbounded growth of `executions`/`agent_exec_status`
   (`execution_tracker` schema) and `approvals` (`approval_manager` schema) — a retention pass is
   its own clock-guarded change (routed-concerns row 38's seven-part apparatus), out of scope for a
-  storage-backend migration. `ConcurrencyManager` (test-only dead code, no `server.cpp`
-  construction site) — noted, not deleted in this PR (scope discipline).
+  storage-backend migration. **These are two different problems, not one** (governance
+  compliance-officer, 2026-08-31): `executions`/`agent_exec_status` is ordinary operational
+  history a routine retention pass can prune; `approvals` is SOC 2 CC7.2 audit evidence
+  (`submitted_by → reviewed_by → consumed_by`) and, per the access-review campaign precedent
+  (`docs/security-reviews/access-reviews-2026-07-21.md`), any future prune of it needs its own
+  explicit, separately-reviewed compliance decision — never a side effect of whatever retention
+  pass `executions` gets. `ConcurrencyManager` (test-only dead code, no `server.cpp` construction
+  site) — noted, not deleted in this PR (scope discipline).
+- **Not fixed here, filed as #3727:** none of the three migrated stores has a
+  `MetricsRegistry*`/`set_metrics()` wired, so runtime Postgres degrade paths (lease timeout,
+  query failure) have no `yuzu_server_<store>_{read,write}_degrade_total{reason}` counter per
+  `docs/postgres-store-playbook.md`'s mandate. Verified (governance sre, 2026-08-31) to be a
+  program-wide gap — `PatchManager`/`DirectorySync`/`WorkflowEngine` (Wave 4 PRs 2-4) share it;
+  only `UpdateRegistry` (PR 1) has it — so it is scoped as one cross-cutting fix, not three
+  piecemeal ones. Noted on #3727 (sre): the approval-queue-full refusal path (`submit()`'s
+  `queue_full_error`) is a business-logic rejection, not an infra degrade, so #3727 as scoped
+  will not cover it — a `yuzu_approval_manager_pending` gauge or a distinct refusal-reason counter
+  is a candidate for #3727's eventual fix to also close.
+- **Read-degrade posture (governance cpp-expert, 2026-08-31):** runtime Postgres read failures
+  (lease-acquire timeout, query error) in all three stores' query/list/count methods degrade to
+  an empty result or zero, matching the pre-migration SQLite shape exactly — this is a deliberate
+  posture choice for this migration (preserve existing caller-visible behavior), not an oversight,
+  though it means these reads are NOT authoritative in the ADR-0012 §1 sense for callers that
+  cannot distinguish "no data" from "store degraded." `ApprovalManager::get_checked` (added for
+  #2786) is the one exception, returning `std::expected<std::optional<Approval>, StoreReadError>`
+  because the MCP redemption path specifically cannot afford to burn a valid ticket on a
+  transient store hiccup. Generalizing that shape to the other read methods is a larger,
+  cross-store API change, not appropriate mid-migration — tracked as a follow-up alongside #3727
+  rather than fixed here.
