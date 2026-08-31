@@ -7,4 +7,6 @@
   paths; manual dispatch once the file reaches `main`) grows a persistent corpus in
   batch mode, publishes the coverage report the PR job prunes against, offers
   corpus pruning as an explicit manual dispatch, and auto-files a
-  `cflite-batch-broken` issue on a red run.
+  `cflite-batch-broken` issue on a red run. The PR job's fuzz budget drops from
+  a fixed 300s single-worker run to 180s with `parallel-fuzzing` (more total
+  executions, less wall time), landing the whole job under 6 minutes.
