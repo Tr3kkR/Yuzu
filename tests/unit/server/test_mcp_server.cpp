@@ -766,17 +766,45 @@ struct McpTestServer {
     /// default to nullptr/degraded-but-harmless. Left unset here, EVERY
     /// existing execute_instruction test in this file would start refusing
     /// with "classifier unavailable". The harness DEFAULT therefore wires a
-    /// classifier that is WIRED (satisfies the fail-closed gate) but
-    /// classifies everything Unclassified — a real answer, not an absence,
-    /// so Policy B's fall-through applies and every pre-#3685 test keeps its
-    /// exact prior behaviour with zero fixture churn. A Destructive-specific
-    /// test overrides this with a classifier that returns a real Destructive
-    /// `CommandCapability` for the pair it cares about; a fail-closed test
-    /// sets this to `{}` (genuinely unwired) to prove the gate itself.
+    /// classifier that is WIRED (satisfies the fail-closed gate).
+    ///
+    /// governance round 2 (#3685, Doomgoose review item 3): it classifies
+    /// everything as a benign, non-Destructive `ReadOnly` row rather than
+    /// always `Unclassified`. Before item 3, C8's `ClassifyMiss` verdict fell
+    /// through to Policy B (the existing dispatch chokepoint's own denial),
+    /// so a wired-but-always-miss default was inert — no pre-#3685 test
+    /// depended on what a miss actually did. Item 3 made C8's `ClassifyMiss`
+    /// verdict a hard local denial with no ticket minted, so an
+    /// always-Unclassified default would now incorrectly refuse every
+    /// supervised-tier `execute_instruction` test in this file that doesn't
+    /// opt into a Destructive-specific classifier — turning the common case
+    /// (an ordinary ticket-mint / schema-validation / approval_id-tolerance
+    /// test) into the one that has to opt out of a "classifier" defect,
+    /// backwards from the fixture's job. Only `.dispatch_class` is read at
+    /// either gate site for a non-Destructive verdict
+    /// (`evaluate_destructive_targeting`, `dispatch_destructive_gate.hpp`),
+    /// so the row's other fields are placeholders, not asserted on. A
+    /// Destructive-specific test overrides this with a classifier that
+    /// returns a real Destructive `CommandCapability` for the pair it cares
+    /// about (`destructive_classify_stub`); a genuine classify-miss test
+    /// overrides it with one that returns `Unclassified`/`Ambiguous` for the
+    /// pair under test; a fail-closed test sets this to `{}` (genuinely
+    /// unwired) to prove the gate itself.
     yuzu::server::mcp::McpServer::ClassifyFn classify_fn_for_test{
         [](std::string_view, std::string_view)
             -> std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError> {
-            return std::unexpected(yuzu::server::ClassificationError::Unclassified);
+            static constexpr yuzu::server::CommandCapability kBenignRow{
+                .plugin = "*",
+                .action = "*",
+                .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+                .mutability = yuzu::server::Mutability::None,
+                .securable = "Execution",
+                .operation = yuzu::server::authz::Operation::Read,
+                .risk_tier = yuzu::server::authz::RiskTier::Low,
+                .system_reserved = false,
+                .execute_gate = yuzu::server::ExecuteGate::None,
+            };
+            return kBenignRow;
         }};
 
     /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
@@ -7172,6 +7200,49 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
     CHECK(body["error"]["message"].get<std::string>() ==
           std::string(yuzu::server::kDestructiveUntargetedMessage));
     CHECK(appr.pending_count() == 0);
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3): a classify-miss at C8 denies "
+          "immediately — NO approval ticket minted",
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // Proves the C8-only Policy-B deviation: unlike RefuseUntargeted (test
+    // above, which this mirrors), a classify-miss used to fall through
+    // (Policy B) and mint a ticket here before the downstream chokepoint
+    // denied it on actual dispatch — burning a real admin approval on a call
+    // that was always going to be refused. `destructive_classify_stub`
+    // returns `ClassificationError::Unclassified` for every plugin.action
+    // pair except `tar.purge_source` (its own doc comment above), so any
+    // OTHER pair exercises exactly the ClassifyMiss verdict without a new
+    // stub. The `Ambiguous` sub-case shares the same code path (a ternary on
+    // `gate.miss`), so this one case exercises both mapped reasons'
+    // machinery.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    ts.approval_manager_for_test = &appr;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — refused before a ticket exists at all, same
+    // as the RefuseUntargeted pre-mint test above.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "unknown or ambiguous plugin.action");
+    CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
     CHECK_FALSE(dispatched);
 }
 

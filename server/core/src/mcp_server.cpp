@@ -4429,8 +4429,85 @@ McpServer::HandlerFn McpServer::build_handler(
                             switch (gate.verdict) {
                             case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
                             case yuzu::server::DestructiveTargetingVerdict::Targeted:
-                            case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
                                 break;
+                            case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss: {
+                                // #3685 governance-round-2 (Doomgoose colleague review,
+                                // item 3): C8-ONLY deviation from Policy B. REST's
+                                // `/api/command` switch (server.cpp) and this same
+                                // handler's main-handler backstop switch below (~7896)
+                                // both keep Policy B UNCHANGED — explicit fall-through
+                                // to the shared dispatch chokepoint's own unconditional
+                                // classify-miss denial — because an independent early
+                                // denial there would only DUPLICATE evidence the
+                                // chokepoint already produces (it denies a classify-miss
+                                // unconditionally either way; there is no escape to
+                                // close, only evidence to not duplicate).
+                                //
+                                // C8 is different: it runs BEFORE a supervised-tier
+                                // approval ticket is minted. Falling through here does
+                                // not merely duplicate evidence — it lets a
+                                // classify-miss call MINT a ticket, wait on a human
+                                // approval, and only THEN be denied by the downstream
+                                // chokepoint on actual dispatch: a real admin approval
+                                // burned on a call that was always going to be refused,
+                                // undercutting this gate's own stated purpose (this PR's
+                                // earlier commit message: "a Destructive call on the
+                                // supervised tier never wastes an admin's approval or
+                                // burns a ticket on a call that was always going to be
+                                // refused" — that guarantee held only for
+                                // RefuseUntargeted until now). So C8 denies a
+                                // classify-miss locally and mints NO ticket — reusing
+                                // the EXISTING classify-miss denial vocabulary
+                                // (`yuzu::server::detail::DispatchDenialReason::
+                                // {Unclassified,Ambiguous}`, agent_registry.hpp) rather
+                                // than inventing a fourth taxonomy, so this reads as
+                                // "the same denial, surfaced earlier" in
+                                // logs/metrics/audit, not a new denial kind. Closes
+                                // #3685 AC1 ("fail closed on the block itself") for the
+                                // ticket-sensitive path specifically.
+                                const auto reason =
+                                    gate.miss == yuzu::server::ClassificationError::Ambiguous
+                                        ? yuzu::server::detail::DispatchDenialReason::Ambiguous
+                                        : yuzu::server::detail::DispatchDenialReason::
+                                              Unclassified;
+                                // Counted on the SAME series the shared chokepoint's own
+                                // denial uses (yuzu_server_dispatch_denied_total{reason},
+                                // NOT yuzu_server_dispatch_target_rejected_total — a
+                                // classify-miss is not a targeting-shape mistake).
+                                // Pre-seeded at boot for every DispatchDenialReason
+                                // already (server.cpp), so no new pre-seed line is
+                                // needed for this MCP-origin increment.
+                                if (metrics != nullptr) {
+                                    try {
+                                        metrics
+                                            ->counter(
+                                                "yuzu_server_dispatch_denied_total",
+                                                {{"reason",
+                                                  std::string(yuzu::server::detail::to_string(
+                                                      reason))}})
+                                            .increment();
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                    }
+                                }
+                                const std::string cid =
+                                    yuzu::server::detail::make_correlation_id();
+                                const bool audit_ok = mcp_audit(
+                                    "denied",
+                                    std::string("reason=") +
+                                        std::string(yuzu::server::detail::to_string(reason)) +
+                                        " " + yuzu::server::detail::sanitize_detail_value(p) +
+                                        ":" + yuzu::server::detail::sanitize_detail_value(a) +
+                                        " correlation_id=" + cid);
+                                res.set_content(
+                                    a4_error(kInvalidParams, "unknown or ambiguous plugin.action",
+                                             "confirm the plugin/action name via "
+                                             "discover_plugins or discover_instructions and "
+                                             "re-call; no approval ticket was created or "
+                                             "consumed",
+                                             -1, cid, audit_ok),
+                                    "application/json");
+                                return;
+                            }
                             case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
                                 // #3685 (checkpoint 3, commit 6): counted on the SAME
                                 // series REST's `/api/command` 400 arm uses
