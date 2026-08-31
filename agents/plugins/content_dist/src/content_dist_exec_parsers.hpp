@@ -240,7 +240,7 @@ namespace yuzu::content_dist::exec {
     opts.exec_verify.require_root_owned = false;
 
     // BR4-007 (whole-branch review round 4): the deleted Windows launcher
-    // passed CREATE_NO_WINDOW to CreateProcessA; migrating onto this
+    // passed CREATE_NO_WINDOW to CreateProcessW; migrating onto this
     // runner's shared Windows backend (whose create_flags never set that
     // bit for a caller with no pre-existing behaviour to preserve) silently
     // dropped it. Windows-only significance -- see
