@@ -1,8 +1,10 @@
 # Resource Ledger — Wave 5 PR5.1 runner convergence (`script_exec`/`content_dist` onto `run_bounded_subprocess`)
 
-This ledger documents the new/modified owned C resource this branch's Windows leg
-introduces. Reviewers must verify that every code path (normal fall-through,
-early exit, and exception unwind) releases exactly the listed resource.
+This ledger documents the new/modified owned C resources this branch introduces,
+on both the Windows leg and the Linux B6 verified-exec primitive `content_dist`
+now reaches (`exec_verify.enabled = is_linux`). Reviewers must verify that every
+code path (normal fall-through, early exit, and exception unwind) releases
+exactly the listed resource.
 
 ---
 
@@ -45,24 +47,72 @@ early exit, and exception unwind) releases exactly the listed resource.
 
 ---
 
+### `int` fd — B6 verified-exec's `open()` of the payload, consumed by `execveat`
+- **Site:** `agents/core/src/subprocess_runner.cpp`, `toctou_verified_exec`
+  (the async-signal-safe post-`fork()` path taken when
+  `LaunchSpec::ExecVerification::enabled`; `content_dist`'s
+  `execute_verified_payload` is the in-tree caller, Linux leg only).
+- **Allocated by:** `open(c_argv[0], O_RDONLY | O_NOFOLLOW)`.
+- **Released by:** a successful `execveat(fd, "", c_argv, c_envp, AT_EMPTY_PATH)` —
+  the exec transition replaces the process image, which tears down every fd
+  the outgoing image held, this one included; there is no explicit `close()`
+  after a successful exec because there is no "after" in this process image.
+  Every OTHER path closes it explicitly: a failed `fstat`, a failed
+  verification check (`!regular || !root_owned || !not_group_other_writable
+  || !size_ok`), an `ETXTBSY` retry (closed before the bounded backoff sleep,
+  reopened fresh next attempt), and the final `errno` path when `execveat`
+  itself fails or retries are exhausted.
+- **Deliberately NOT `O_CLOEXEC`, and this is a transfer, not a leak:** this
+  is the exact fd meant to be exec'd, not one that should be hidden from the
+  child, so it is intentionally left open across the exec so the kernel can
+  read the target binary through it during the transition — CLOEXEC would
+  tear the fd down as part of that same transition, before the kernel could
+  use it, and empirically (gcc-15/Linux 7.x, forked child, isolated
+  per-flag-combination) `O_CLOEXEC` makes `execveat(..., AT_EMPTY_PATH)` fail
+  every attempt with `ENOENT` — see the comment above
+  `toctou_verified_exec`'s definition for the full reproduction. The
+  content_dist seam's shebang-rejection message previously claimed the
+  opposite (that CLOEXEC closes this fd) — corrected in
+  `content_dist_exec_seam.hpp` in the same change that added this entry, so
+  operator-facing text and this ledger now agree with the runner's actual
+  behavior.
+- **All paths covered:** successful `execveat` (fd consumed by the exec
+  transition, not leaked into the new image as a stray inheritable handle —
+  no `O_CLOEXEC` needed for this because nothing survives past the exec to
+  inherit it) ✓ · `fstat` failure ✓ · any verification-check failure ✓ ·
+  `ETXTBSY` retry (closed, reopened) ✓ · final `execveat` failure after
+  retries exhausted ✓.
+- **Platform note:** Linux-only (`#if defined(__linux__) && defined(SYS_execveat)`);
+  runtime-verified on this branch's own CI (the comment above the function
+  records this was "the first Linux CI run of this code path to ever
+  actually execute past compile time").
+
+---
+
 ## Known limitations
 
 ### `no_window=true` makes `soft_terminate_grace` ineffective on Windows (BR-006)
-- **Sites:** `content_dist_exec_parsers.hpp::build_execution_options` (30s
-  grace) and `script_exec_plugin.cpp`'s Windows leg (10s grace), the only two
-  callers that set both `no_window=true` and a nonzero
-  `soft_terminate_grace`.
+- **Sites:** `content_dist_exec_parsers.hpp::build_execution_options` and
+  `script_exec_plugin.cpp`'s Windows leg — the only two callers that set
+  `no_window=true`.
 - **Cause:** `CREATE_NO_WINDOW` gives the child no console at all (not merely
   a hidden window) — Microsoft's own documented contract for
   `GenerateConsoleCtrlEvent` requires the target process group to share a
   console with the caller, which a `no_window=true` child never has. Every
-  deadline/cancel against these two call sites therefore skips CTRL_BREAK
-  delivery entirely and goes straight to `TerminateJobObject`, silently
-  discarding the configured grace.
-- **Status:** confirmed by the documented Win32 API contract (adversarial
-  review, HIGH); not runtime-verified — no Windows host available to this
-  branch's authoring session. No in-scope fix: a soft-unwind channel that
-  works against a console-less child is a separate, larger design (a
-  dedicated IPC/event mechanism), not an extension of CTRL_BREAK delivery.
-  Documented at `SubprocessOptions::no_window`'s doc comment
-  (`subprocess_runner.hpp`) and both call sites above.
+  deadline/cancel against a `no_window=true` child therefore skips CTRL_BREAK
+  delivery entirely and goes straight to `TerminateJobObject`.
+- **Status:** the real fix (a cooperative-termination channel that works
+  against a console-less child) is confirmed out of scope — a separate,
+  larger design (a dedicated IPC/event mechanism), not an extension of
+  CTRL_BREAK delivery — and stays a known limitation, confirmed by the
+  documented Win32 API contract (adversarial review, HIGH), not
+  runtime-verified (no Windows host available to this branch's authoring
+  session). **What IS fixed (Gate-8 remediation):** both call sites
+  previously ALSO set a nonzero `soft_terminate_grace` (30s / 10s) alongside
+  `no_window=true`, arming a grace the platform can never deliver — pure
+  configuration dishonesty, since the option struct claimed a soft-unwind
+  step that was a guaranteed no-op. Both sites now zero
+  `soft_terminate_grace` on the `no_window=true` path, so the configuration
+  matches what Windows actually delivers (an immediate hard kill on
+  deadline/cancel). Documented at `SubprocessOptions::no_window`'s doc
+  comment (`subprocess_runner.hpp`) and both call sites above.
