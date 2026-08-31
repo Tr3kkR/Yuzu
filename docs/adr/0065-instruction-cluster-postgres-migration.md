@@ -524,5 +524,4 @@ only its construction converts (to `ExecutionTrackerPg`); the payload assertions
   #2786) is the one exception, returning `std::expected<std::optional<Approval>, StoreReadError>`
   because the MCP redemption path specifically cannot afford to burn a valid ticket on a
   transient store hiccup. Generalizing that shape to the other read methods is a larger,
-  cross-store API change, not appropriate mid-migration — tracked as a follow-up alongside #3727
-  rather than fixed here.
+  cross-store API change, not appropriate mid-migration — filed as #3730 rather than fixed here.
