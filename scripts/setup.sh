@@ -172,7 +172,13 @@ MACHINE_FILE_SETS_PKGCONF=false
 for MF in "$NATIVE_FILE" "$CROSS_FILE"; do
   [[ -z "$MF" ]] && continue
   [[ ! -f "$MF" ]] && MF="$PROJECT_ROOT/$MF"
-  if [[ -f "$MF" ]] && grep -Eq '^[[:space:]]*pkg_config_path[[:space:]]*=' "$MF"; then
+  # Section-aware: only a pkg_config_path key inside [built-in options] (or
+  # [project options]) sets the meson option - the same identifier inside,
+  # say, [constants] must not suppress our flag.
+  if [[ -f "$MF" ]] && awk -F= '
+      /^[[:space:]]*\[/ { insec = ($0 ~ /\[(built-in|project) options\]/) }
+      insec && $1 ~ /^[[:space:]]*pkg_config_path[[:space:]]*$/ { found=1 }
+      END { exit !found }' "$MF"; then
     MACHINE_FILE_SETS_PKGCONF=true
   fi
 done
@@ -221,6 +227,9 @@ if [[ -d "$PROJECT_ROOT/$BUILDDIR" ]]; then
     MESON_ARGS+=(--wipe)
   else
     echo "── Reconfiguring existing build directory: $BUILDDIR ──"
+    echo "   note: dependency-resolution options (e.g. -Dpkg_config_path) do not affect"
+    echo "   deps this build dir already resolved - meson caches them. Re-run with"
+    echo "   --wipe (or run: meson configure $BUILDDIR --clearcache) to re-resolve."
     MESON_ARGS+=(--reconfigure)
   fi
 fi
