@@ -719,7 +719,9 @@ TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly 
     std::atomic<bool> go{false};
     auto submit = [&] {
         while (!go.load(std::memory_order_acquire)) {
-        } // spin so both threads reach the store as close together as possible
+            std::this_thread::yield(); // start barrier — yield (not busy-spin) so two
+                                       // spinners don't burn a core on the shared 4-runner CI box
+        }
         auto r = h.db.mfa_verify_login_code("racer", login_code);
         if (!r.has_value())
             errored.fetch_add(1, std::memory_order_relaxed);
