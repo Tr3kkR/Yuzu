@@ -1505,12 +1505,49 @@ AuthDB::mfa_verify_login_code(const std::string& username, std::string_view code
             result = false; // wrong or already-consumed (replayed) code
             return false;
         }
+        // Belt-and-suspenders monotonic guard (#2399): fold the counter check
+        // into the UPDATE's WHERE. The `FOR UPDATE` row lock above already
+        // serializes concurrent verifies, so `mfa_last_counter` cannot advance
+        // between the SELECT and this write on a correctly-isolated store — but
+        // conditioning the write on `mfa_last_counter < $1 RETURNING id` makes
+        // the advance self-consistent even if that isolation were ever weakened
+        // (a replica read, a future lock-free refactor): a stale/racing write
+        // whose stored counter has already reached `*matched` touches zero rows
+        // and is graded a replayed code (clean `false`), NEVER a burned success
+        // and NEVER an error. `verify_window` only ever returns a counter
+        // strictly greater than the SELECTed `row.last_counter`, so on the
+        // normal FOR-UPDATE-serialized path this guard always matches the one row.
+        //
+        // LOAD-BEARING: `RETURNING id` is what makes this a `PGRES_TUPLES_OK`
+        // result, so the zero-rows check below can distinguish a guard rejection
+        // from a genuine write. Dropping `RETURNING` (e.g. a "simplify" refactor)
+        // WITHOUT also reverting the `!= PGRES_TUPLES_OK` check would grade every
+        // successful advance as `WriteFailed` and 503 every legitimate MFA login
+        // (fail-closed, not a bypass — but a total login outage). Change both or
+        // neither.
         pg::PgResult upd = pg::exec_params(
             conn,
-            "UPDATE auth.users SET mfa_last_counter = $1, last_login_at = now() WHERE id = $2",
+            "UPDATE auth.users SET mfa_last_counter = $1, last_login_at = now() "
+            "WHERE id = $2 AND mfa_last_counter < $1 RETURNING id",
             std::vector<std::string>{std::to_string(*matched), std::to_string(row.id)});
-        if (upd.status() != PGRES_COMMAND_OK) {
-            err = AuthDBError::WriteFailed;
+        if (upd.status() != PGRES_TUPLES_OK) {
+            err = AuthDBError::WriteFailed; // write outage → fail closed (503), never "wrong code"
+            return false;
+        }
+        if (PQntuples(upd.get()) == 0) {
+            // The monotonic guard rejected the advance — the stored counter had
+            // already reached `*matched` (a replay that slipped past the window
+            // read). Treat exactly as an already-consumed code; nothing to commit.
+            // This branch is unreachable while the `FOR UPDATE` lock holds (the
+            // window read already rejects the replay first), so if it EVER fires
+            // it signals a weakened-isolation regression (a replica SELECT, a
+            // lock-free refactor) — warn rather than swallow it silently, since
+            // it is otherwise indistinguishable from an ordinary wrong code.
+            spdlog::warn("AuthDB: MFA monotonic guard rejected a counter advance "
+                         "(user_id={}, matched_counter={}) — the FOR UPDATE lock should make "
+                         "this unreachable; investigate isolation/replica routing",
+                         row.id, *matched);
+            result = false;
             return false;
         }
         result = true;

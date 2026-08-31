@@ -4,7 +4,9 @@
 // (insert_mapdrive_events). Core capture-source pattern — types/decls in
 // tar_collectors.hpp. See docs/tar-implementer.md "Adding a capture source".
 //
-// Two directions, both in scope (Windows + Linux; macOS kPlanned):
+// Two directions, both in scope on Windows + Linux; macOS has outbound live
+// only (getfsstat exposes the current mount table and nothing historical or
+// inbound — honestly out of reach for an unprivileged agent):
 //   outbound = drives THIS host maps to remote shares
 //   inbound  = remote hosts mapping THIS host's shares (the §3.8 lateral-movement signal)
 // and two modes:
@@ -13,29 +15,33 @@
 //
 // The raw text parsers (parse_proc_mounts / parse_fstab / parse_smbstatus /
 // parse_win_security_logons / parse_samba_logs) are PURE and compiled on every
-// platform so each leg is unit-tested off its native OS from captured samples.
-// Only the I/O (WNet / NetApi / registry hive loads / subprocess / file reads)
-// is #ifdef-guarded.
+// platform so each leg is unit-tested off its native OS from captured samples;
+// the macOS classifier (classify_macos_mounts, tar_mapdrive_macos_parsers.hpp)
+// follows the same pure/impure split. Only the I/O (WNet / NetApi / registry
+// hive loads / subprocess / getfsstat / file reads) is #ifdef-guarded.
 //
 // PII: mapped-drive rows expose usernames + share paths. Per the works-council
 // posture the source is opt-in (default_enabled=false); rows are NOT run through
 // redact_cmdline (cmdline-only; it would mangle UNC paths) — opt-in + audit is
 // the protection, exactly as dns_live does for visited domains.
 
+#include "tar_capture_status.hpp" // classify_subprocess_capture, IncompleteCaptureError, would_exceed_cap
 #include "tar_collectors.hpp"
+
+#include <yuzu/agent/subprocess_runner.hpp> // run_bounded_subprocess (rung 2 argv sites)
 
 #include <spdlog/spdlog.h>
 
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib> // std::strtol — timestamp/event-field parsing (no scanf family)
+#include <format>
 #include <fstream>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -50,6 +56,7 @@
 #include <windows.h>
 #include <winnetwk.h> // WNetOpenEnumW / WNetEnumResourceW / WNetGetUserW (mpr)
 #include <lm.h>       // NetSessionEnum / NetApiBufferFree (netapi32)
+#include "tar_win_raii_guards.hpp" // yuzu::tar::win_raii::WNetEnumGuard / NetApiBufGuard
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 // Shared per-user profile/hive ladder (#2771) — replaces this file's private
 // ProfileList walk, system-SID filter and mount/unload guards.
@@ -57,6 +64,12 @@
 #include <win_profiles.hpp>
 #include <win_reg_handle.hpp>
 #include <cwchar>      // wcslen
+#elif defined(__linux__)
+// Candidate-path probing on Linux goes through yuzu::agent::probe_tool_path
+// (subprocess_runner.hpp, already included above) — no direct unistd.h use.
+#elif defined(__APPLE__)
+#include <sys/mount.h> // getfsstat / struct statfs — rung 1 native, no shell
+#include "tar_mapdrive_macos_parsers.hpp"
 #endif
 
 namespace yuzu::tar {
@@ -214,20 +227,58 @@ bool is_network_fstype(const std::string& fs) {
 
 // Best-effort host extraction from a share/device string across the forms:
 //   \\server\share  //server/share  server:/export  user@host:/path
+//   scheme://[user@]host/path  (afp://, https:// (WebDAV), smb://, ...)
+//   //user@server/share  (credentialed UNC — macOS getfsstat can surface
+//   embedded usernames in f_mntfromname for smbfs mounts)
+//   user@[2001:db8::1]:/path  2001:db8::1:/path  (IPv6 NFS hosts, BR-003)
 std::string remote_host_of(const std::string& path) {
     std::string p = path;
+    // Both the URI-authority and UNC forms below may embed "user@" ahead of
+    // the host; strip it so the returned host is never a credential.
+    auto strip_userinfo = [](std::string authority) {
+        if (auto at = authority.rfind('@'); at != std::string::npos)
+            authority.erase(0, at + 1);
+        return authority;
+    };
+    // scheme://[user@]host[/path] — checked first since "://" never appears
+    // in the UNC or bare user@host: forms below.
+    if (auto scheme = p.find("://"); scheme != std::string::npos) {
+        const auto start = scheme + 3;
+        const auto end = p.find('/', start);
+        return strip_userinfo(
+            p.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    }
     // UNC: leading \\ or //
     if (p.size() >= 2 && (p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/')) {
         std::size_t start = 2;
         std::size_t end = p.find_first_of("\\/", start);
-        return p.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        return strip_userinfo(
+            p.substr(start, end == std::string::npos ? std::string::npos : end - start));
     }
-    // user@host:/path — strip the user@ prefix first
+    // user@host:/path — the NFS host/export separator is specifically
+    // ":/" (a colon immediately followed by a slash), not the first bare
+    // colon: an IPv6 host (bracketed "[2001:db8::1]:/export" or unbracketed
+    // "2001:db8::1:/export") embeds colons of its own, and the first-colon
+    // split used before this fix (BR-003) truncated either shape at the
+    // host's very first hextet. rfind, not find: NFS export paths only ever
+    // start with a single leading '/', so the LAST ":/" in the string is
+    // always the host/export boundary, never a colon inside the path.
     auto at = p.find('@');
-    auto colon = p.find(':');
-    if (colon != std::string::npos && (at == std::string::npos || at < colon)) {
+    auto separator = p.rfind(":/");
+    if (separator == std::string::npos) {
+        // No "<colon><slash>" boundary at all -- fall back to the first
+        // bare colon (the pre-BR-003 behavior), covering a colon-separated
+        // host whose export path doesn't start with '/' (e.g.
+        // "server:export"); an IPv4/hostname host has at most one colon, so
+        // this fallback never mis-splits one of those.
+        separator = p.find(':');
+    }
+    if (separator != std::string::npos && (at == std::string::npos || at < separator)) {
         std::size_t start = (at != std::string::npos) ? at + 1 : 0;
-        return p.substr(start, colon - start);
+        std::string host = p.substr(start, separator - start);
+        if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+            host = host.substr(1, host.size() - 2);
+        return host;
     }
     return {};
 }
@@ -273,60 +324,37 @@ std::string word_after(const std::string& line, const std::string& marker) {
     return line.substr(start, pos - start);
 }
 
-// cpp-conventions.md §Shell/process boundaries: this is a popen/_popen shell
-// site. DOCUMENTED EXCEPTION (a shell is used rather than argv-style
-// CreateProcess/posix_spawn):
-//   1. Every command passed here is either a COMPILE-TIME CONSTANT literal, or
-//      built at runtime from an OS-derived System32 path (system32_path, below)
-//      that is quoted for the shell — never from the network, registry,
-//      filesystem, or operator, so there is no command-injection surface.
-//   2. The Linux tools (smbstatus/journalctl) live at distro-varying paths and we
-//      parse their line-oriented text output; an argv helper would still need a
-//      PATH lookup. The one Windows tool (wevtutil) is invoked by its ABSOLUTE
-//      System32 path (see system32_path) so PATH resolution cannot be hijacked on
-//      the privileged agent.
-//   3. Output is byte-capped (max_bytes) so a runaway tool cannot exhaust memory;
-//      the pipe is fully drained so the child never blocks on a full pipe.
-// [[maybe_unused]]: unused on the macOS stub build.
-[[maybe_unused]] std::string run_command(const std::string& cmd,
-                                         std::size_t max_bytes = 8u * 1024 * 1024) {
-    std::string out;
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd.c_str(), "r");
-#else
-    FILE* pipe = popen(cmd.c_str(), "r");
-#endif
-    if (!pipe)
-        return out;
-    std::array<char, 4096> buf{};
-    std::size_t n;
-    bool capped = false;
-    while ((n = std::fread(buf.data(), 1, buf.size(), pipe)) > 0) {
-        if (out.size() < max_bytes) {
-            std::size_t take = std::min(n, max_bytes - out.size());
-            out.append(buf.data(), take);
-            if (out.size() >= max_bytes)
-                capped = true;
-        }
-        // Past the cap: keep reading (discarding) so the child can finish writing
-        // rather than blocking on a full pipe — memory stays bounded by max_bytes.
-    }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-    if (capped)
-        spdlog::warn("TAR mapdrive: command output capped at {} bytes (tail discarded)", max_bytes);
-    return out;
-}
-
 [[maybe_unused]] std::string read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f)
         return {};
     std::ostringstream ss;
     ss << f.rdbuf();
+    return ss.str();
+}
+
+// Like read_file, but for a file whose content is REQUIRED for a genuinely
+// complete capture -- /proc/mounts (Linux live outbound) below -- rather
+// than best-effort history (/etc/fstab, the Samba log tail, both still on
+// read_file above). BR4-004 (round 4): read_file's silent {} on open
+// failure, and its never checking rdbuf() extraction for a mid-stream
+// error, is the right degrade for OPTIONAL history sources but was also
+// feeding /proc/mounts -- a transient procfs read failure (a restricted
+// container/namespace, a race during teardown) then came back
+// indistinguishable from "this host genuinely has zero outbound network
+// mounts", and enumerate_mapdrive() diffed/persisted that empty result as
+// complete, fabricating a false `removed` event for every previously known
+// outbound mount. Throws IncompleteCaptureError instead, same contract as
+// every other required-read leg in this file (smbstatus/wevtutil above)
+// and the adjacent ARP procfs leg (tar_arp_collector.cpp) this mirrors.
+[[maybe_unused]] std::string read_required_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        throw yuzu::tar::IncompleteCaptureError("TAR: failed to open " + path);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    if (f.bad())
+        throw yuzu::tar::IncompleteCaptureError("TAR: read error mid-stream on " + path);
     return ss.str();
 }
 
@@ -388,17 +416,28 @@ std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> ro
 
 // ── Pure parsers (compiled everywhere; unit-tested off-OS) ────────────────────
 
-std::vector<MapDriveEntry> parse_proc_mounts(const std::string& text) {
-    std::vector<MapDriveEntry> out;
+ProcMountsParse parse_proc_mounts(const std::string& text) {
+    ProcMountsParse out;
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
         auto tok = split_ws(line);
-        if (tok.size() < 3)
+        if (tok.size() < 3) {
+            // BUG 2 fix: a structurally short row (fewer than the
+            // device/mountpoint/fstype 3 fields every /proc/mounts row
+            // carries) is a malformed row, not a legitimate skip -- flag it
+            // so the caller (enumerate_mapdrive()) can tell "this row was
+            // dropped because it wasn't a network filesystem" (a normal,
+            // routine skip, never flagged) apart from "this row was dropped
+            // because it was truncated/corrupt" (BR-mapdrive-001; same
+            // policy as tar_arp_parsers.hpp's BR4-005 and
+            // tar_service_parsers.hpp's BR-service-001).
+            out.malformed = true;
             continue;
+        }
         std::string fstype = tok[2];
         if (!is_network_fstype(fstype))
-            continue;
+            continue; // legitimate skip: well-formed row, just not a network fs
         std::string device = decode_mount_escapes(tok[0]);
         std::string mountpoint = decode_mount_escapes(tok[1]);
         MapDriveEntry e;
@@ -407,7 +446,7 @@ std::vector<MapDriveEntry> parse_proc_mounts(const std::string& text) {
         e.remote_path = device;
         e.remote_host = remote_host_of(device);
         e.provider = fstype;
-        out.push_back(std::move(e));
+        out.entries.push_back(std::move(e));
     }
     return out;
 }
@@ -440,32 +479,40 @@ std::vector<MapDriveHistoryRow> parse_fstab(const std::string& text) {
     return out;
 }
 
-std::vector<MapDriveEntry> parse_smbstatus(const std::string& text) {
+SmbStatusParse parse_smbstatus(const std::string& text) {
     // `smbstatus -b` sessions table:
     //   PID  Username  Group  Machine                       Protocol  ...
     //   1234 alice     alice  192.168.1.50 (ipv4:1.2.3.4:445) SMB3_11 ...
     // A data row starts with a numeric PID; the client is the parenthetical IP if
     // present, else the Machine token (index 3).
-    std::vector<MapDriveEntry> out;
+    SmbStatusParse out;
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
         auto tok = split_ws(line);
-        if (tok.size() < 4)
-            continue;
-        bool pid = !tok[0].empty();
-        for (char c : tok[0])
-            if (!std::isdigit(static_cast<unsigned char>(c)))
-                pid = false;
+        bool pid = !tok.empty() && !tok[0].empty();
+        if (pid)
+            for (char c : tok[0])
+                if (!std::isdigit(static_cast<unsigned char>(c)))
+                    pid = false;
         if (!pid)
+            continue; // legitimate skip: header/separator/trailer line, not a data row
+        if (tok.size() < 4) {
+            // Finding 4 (BR-mapdrive-001, missed site): looks like a data
+            // row (a bare numeric PID leads it) but is structurally short --
+            // a truncated/corrupt capture, not a legitimate skip. Flag it
+            // instead of silently dropping it (same policy as
+            // parse_proc_mounts's tok.size() < 3 branch above).
+            out.malformed = true;
             continue;
+        }
         MapDriveEntry e;
         e.direction = "inbound";
         e.username = tok[1];
         std::string ip = extract_paren_ip(line);
         e.remote_host = !ip.empty() ? ip : tok[3];
         e.provider = "SMB";
-        out.push_back(std::move(e));
+        out.entries.push_back(std::move(e));
     }
     return out;
 }
@@ -609,47 +656,44 @@ void warn_capped(std::atomic<bool>& flag, const char* what, std::size_t cap) {
 // governance finding). from_wide / vector::push_back below can throw, so the
 // handle/buffer must free on every exit including an exceptional unwind. Same
 // shape as this file's RegKeyGuard, agents/shared/win_reg_handle.hpp's
-// ScopedUserHive, and the in-repo HandleGuard
-// (processes_plugin.cpp) / MibTableGuard (network_config_plugin.cpp).
-struct WNetEnumGuard {
-    HANDLE h{nullptr};
-    explicit WNetEnumGuard(HANDLE hh) noexcept : h(hh) {}
-    ~WNetEnumGuard() {
-        if (h)
-            WNetCloseEnum(h);
-    }
-    WNetEnumGuard(const WNetEnumGuard&) = delete;
-    WNetEnumGuard& operator=(const WNetEnumGuard&) = delete;
-};
-struct NetApiBufGuard {
-    LPVOID p{nullptr};
-    explicit NetApiBufGuard(LPVOID pp) noexcept : p(pp) {}
-    ~NetApiBufGuard() {
-        if (p)
-            NetApiBufferFree(p);
-    }
-    NetApiBufGuard(const NetApiBufGuard&) = delete;
-    NetApiBufGuard& operator=(const NetApiBufGuard&) = delete;
-};
+// ScopedUserHive, and the in-repo HandleGuard (processes_plugin.cpp).
+// Shared implementation in tar_win_raii_guards.hpp (injectable closer,
+// unit-tested).
+using yuzu::tar::win_raii::WNetEnumGuard;
+using yuzu::tar::win_raii::NetApiBufGuard;
 
-// Absolute path to a System32 tool, quoted for the shell (cpp-conventions §Shell:
-// removes PATH-hijack exposure for wevtutil on the privileged agent). Falls back
-// to the bare name if GetSystemDirectoryW fails (defensive; effectively never).
+// Absolute path to a System32 tool, as a bare (unquoted) argv element —
+// run_bounded_subprocess execs argv[0] directly (no shell in between), so the
+// quoting the old shell-pipe call needed to protect a spaced path is neither
+// needed nor wanted here; quotes embedded in the string would become literal
+// characters in the exec'd path. Removes PATH-hijack exposure for wevtutil on
+// the privileged agent the same way the old quoted-shell form did. Falls back
+// to the bare name if GetSystemDirectoryW fails (defensive; effectively
+// never) — the runner will report spawn_error for a relative argv[0], which
+// degrades to an empty parse the same way the old shell-pipe call failing did.
 std::string system32_path(const char* exe) {
     wchar_t dir[MAX_PATH]{};
     UINT n = GetSystemDirectoryW(dir, MAX_PATH);
     if (n == 0 || n >= MAX_PATH)
-        return exe; // fallback: bare name resolved via PATH
-    return "\"" + yuzu::win::from_wide(dir) + "\\" + exe + "\"";
+        return exe; // fallback: bare name (spawn_error via the runner, not a PATH search)
+    return yuzu::win::from_wide(dir) + "\\" + exe;
 }
 
 // --- outbound live: currently-connected network drives (WNet) ---
 void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
     HANDLE hEnum = nullptr;
     DWORD rc = WNetOpenEnumW(RESOURCE_CONNECTED, RESOURCETYPE_DISK, 0, nullptr, &hEnum);
-    if (rc != NO_ERROR)
-        return; // no connected network resources (or provider unavailable)
-    WNetEnumGuard eg{hEnum}; // closes on every exit (cap return / throw / normal)
+    // BR4-003 (round 4): a WNetOpenEnumW failure was previously conflated
+    // with "no connected network resources" and swallowed to an empty `out`
+    // -- WNetOpenEnumW's own contract has no such benign-empty failure mode
+    // (an empty result comes back as a valid handle whose first
+    // WNetEnumResourceW call then returns ERROR_NO_MORE_ITEMS, handled
+    // below); any open failure is a real provider/transport error that must
+    // not be silently persisted as "this host has zero outbound mappings".
+    if (yuzu::tar::is_unexpected_enumeration_status(rc, {NO_ERROR}))
+        throw yuzu::tar::IncompleteCaptureError(
+            std::format("TAR: WNetOpenEnumW failed (rc={})", rc));
+    WNetEnumGuard eg{hEnum}; // closes on every exit (cap throw / normal)
 
     std::vector<char> buffer(16384);
     for (;;) {
@@ -662,10 +706,34 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
             buffer.resize(size);
             continue;
         }
+        // BR4-003 (round 4): ONLY ERROR_NO_MORE_ITEMS is the documented
+        // "table exhausted" terminal status -- the prior `if (rc != NO_ERROR)
+        // break` conflated every other unexpected status (provider dropped,
+        // transport error, etc.) with normal completion, so a partial
+        // outbound set could still replace the last complete baseline. Any
+        // status outside {NO_ERROR (more rows this page), ERROR_NO_MORE_ITEMS
+        // (exhausted)} throws instead of silently stopping the loop.
+        if (yuzu::tar::is_unexpected_enumeration_status(rc, {NO_ERROR, ERROR_NO_MORE_ITEMS}))
+            throw yuzu::tar::IncompleteCaptureError(
+                std::format("TAR: WNetEnumResourceW failed (rc={})", rc));
         if (rc != NO_ERROR)
-            break; // ERROR_NO_MORE_ITEMS or a failure — done
+            break; // ERROR_NO_MORE_ITEMS — done, genuinely exhausted
         auto* res = reinterpret_cast<NETRESOURCEW*>(buffer.data());
         for (DWORD i = 0; i < count; ++i) {
+            // Test capacity BEFORE building/pushing the candidate row (round
+            // 3, B3-001/B3-004): the prior check-AFTER-push shape (a)
+            // misclassified an exact-cap table as truncated, and (b) merely
+            // `return`ed the partial `out` to the caller instead of
+            // signalling incompleteness -- enumerate_mapdrive() then diffed
+            // and persisted it as though it were the complete combined
+            // outbound+inbound snapshot. Throwing here is what makes B3-001's
+            // "combined snapshot known to fit" requirement hold: NEITHER
+            // direction's rows are usable once either direction's cap trips.
+            if (yuzu::tar::would_exceed_cap(out.size(), kMapDriveEntryCap)) {
+                static std::atomic<bool> warned{false};
+                warn_capped(warned, "live", kMapDriveEntryCap);
+                throw yuzu::tar::IncompleteCaptureError("TAR: mapdrive live entry cap reached");
+            }
             MapDriveEntry e;
             e.direction = "outbound";
             if (res[i].lpLocalName)
@@ -681,11 +749,6 @@ void enum_wnet_outbound(std::vector<MapDriveEntry>& out) {
             if (key && WNetGetUserW(key, ubuf, &ulen) == NO_ERROR)
                 e.username = yuzu::win::from_wide(ubuf);
             out.push_back(std::move(e));
-            if (out.size() >= kMapDriveEntryCap) {
-                static std::atomic<bool> warned{false};
-                warn_capped(warned, "live", kMapDriveEntryCap);
-                return; // eg unwinds WNetCloseEnum
-            }
         }
     }
 }
@@ -704,27 +767,34 @@ void collect_sessions(INFO* buf, DWORD n, std::vector<MapDriveEntry>& out,
         e.provider = "SMB";
         if (e.remote_host.empty() && e.username.empty())
             continue;
+        // Check-before-push (round 3, B3-001/B3-004), same reasoning as
+        // enum_wnet_outbound above: throws rather than silently returning a
+        // partial `out` the caller would otherwise diff/persist as complete.
+        if (yuzu::tar::would_exceed_cap(out.size(), kMapDriveEntryCap))
+            throw yuzu::tar::IncompleteCaptureError("TAR: mapdrive live entry cap reached");
         out.push_back(std::move(e));
-        if (out.size() >= kMapDriveEntryCap)
-            return;
     }
 }
 
 // Drain one NetSessionEnum level, paging on ERROR_MORE_DATA via the resume
 // handle (MAX_PREFERRED_LENGTH usually returns everything in one call, but the
 // API may still page — a single call silently drops sessions past page one on a
-// busy file server). Stops at kMapDriveEntryCap with a truncation warn (§8
-// cap-with-warn); each page's buffer is freed by NetApiBufGuard even on a throw.
-// Returns the final NET_API_STATUS so the caller can branch on access-denied.
+// busy file server). collect_sessions() now throws internally the moment the
+// combined cap would be exceeded (round 3), so this loop no longer needs its
+// own post-collect cap check; each page's buffer is freed by NetApiBufGuard
+// even on that throw. Returns the final NET_API_STATUS so the caller can
+// branch on access-denied.
 template <typename INFO>
 NET_API_STATUS enum_sessions_level(DWORD level, LPWSTR INFO::*cname, LPWSTR INFO::*uname,
                                    std::vector<MapDriveEntry>& out) {
     DWORD resume = 0; // NetSessionEnum resume_handle is LPDWORD (DWORD), not DWORD_PTR
     NET_API_STATUS s;
-    // Hard progress backstop: the cap check below only trips once `out` grows, so a
-    // (pathological) provider returning ERROR_MORE_DATA without advancing `resume`
-    // and yielding only skipped rows could otherwise spin. Real result sets need
-    // far fewer than this many pages; exceeding it means no forward progress.
+    // Hard progress backstop: a (pathological) provider returning
+    // ERROR_MORE_DATA without advancing `resume` and yielding only skipped
+    // rows could otherwise spin forever (collect_sessions's cap throw only
+    // trips once `out` actually grows, which a no-progress page never does).
+    // Real result sets need far fewer than this many pages; exceeding it
+    // means no forward progress.
     constexpr unsigned kMaxPages = 4096;
     unsigned pages = 0;
     do {
@@ -734,17 +804,18 @@ NET_API_STATUS enum_sessions_level(DWORD level, LPWSTR INFO::*cname, LPWSTR INFO
                            MAX_PREFERRED_LENGTH, &read, &total, &resume);
         NetApiBufGuard g{buf};
         if (s == NERR_Success || s == ERROR_MORE_DATA)
-            collect_sessions<INFO>(buf, read, out, cname, uname); // caps internally
-        if (out.size() >= kMapDriveEntryCap) {
-            static std::atomic<bool> warned{false};
-            warn_capped(warned, "inbound", kMapDriveEntryCap);
-            return s;
-        }
+            collect_sessions<INFO>(buf, read, out, cname, uname); // throws on cap (round 3)
         if (s == ERROR_MORE_DATA && (read == 0 || ++pages >= kMaxPages)) {
+            // round 3 (B3-001): a stalled pager silently returned a partial
+            // inbound list before -- that partial `out` would then be
+            // combined with outbound and diffed/persisted as though it were
+            // the complete snapshot. Throw instead, same contract as every
+            // other incomplete-capture path in this file.
             spdlog::warn("TAR mapdrive: NetSessionEnum paging made no progress — stopping "
                          "(read={}, pages={})",
                          read, pages);
-            break; // no forward progress — bail rather than spin
+            throw yuzu::tar::IncompleteCaptureError(
+                "TAR: NetSessionEnum paging made no progress");
         }
     } while (s == ERROR_MORE_DATA);
     return s;
@@ -760,12 +831,24 @@ void enum_netsession_inbound(std::vector<MapDriveEntry>& out) {
         s = enum_sessions_level<SESSION_INFO_10>(
             10, &SESSION_INFO_10::sesi10_cname, &SESSION_INFO_10::sesi10_username, out);
 
-    // Access denied at both levels (not local-admin / Server-Operator) — degrade
-    // to empty, warned once.
+    // Access denied at both levels (not local-admin / Server-Operator) —
+    // documented, constrained-empty outcome: degrade to empty, warned once.
     static std::atomic<bool> s_denied_warned{false};
-    if (s == ERROR_ACCESS_DENIED && !s_denied_warned.exchange(true))
-        spdlog::warn("TAR mapdrive: NetSessionEnum access denied — inbound sessions require "
-                     "local-admin / Server-Operator; skipping (repeats suppressed)");
+    if (s == ERROR_ACCESS_DENIED) {
+        if (!s_denied_warned.exchange(true))
+            spdlog::warn("TAR mapdrive: NetSessionEnum access denied — inbound sessions require "
+                         "local-admin / Server-Operator; skipping (repeats suppressed)");
+        return;
+    }
+    // BR4-003 (round 4): every OTHER unexpected NetSessionEnum status was
+    // previously silently accepted -- `out` (whatever collect_sessions
+    // gathered before the failure, possibly empty) was returned as though
+    // it were the complete inbound session list. Any final status besides
+    // NERR_Success (clean) or ERROR_ACCESS_DENIED (handled above) is a real
+    // provider/transport failure and must not be persisted as complete.
+    if (yuzu::tar::is_unexpected_enumeration_status(s, {NERR_Success}))
+        throw yuzu::tar::IncompleteCaptureError(
+            std::format("TAR: NetSessionEnum failed (rc={})", s));
 }
 
 // --- registry helpers for outbound history ---
@@ -987,9 +1070,17 @@ void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
 
 std::vector<MapDriveEntry> enumerate_mapdrive() {
     std::vector<MapDriveEntry> out;
+    // round 3 (B3-001): the mapdrive snapshot is a COMBINED outbound+inbound
+    // result, so inbound is ALWAYS collected too, never skipped because
+    // outbound alone already used up (or came close to) the cap. Both
+    // enum_wnet_outbound and enum_netsession_inbound now throw internally
+    // the moment the shared `out` vector would exceed kMapDriveEntryCap
+    // (would_exceed_cap, checked before every push), so this function
+    // either returns the complete combined snapshot or never returns at all
+    // for this tick -- there is no path back to the caller with a partial
+    // `out`.
     enum_wnet_outbound(out);
-    if (out.size() < kMapDriveEntryCap)
-        enum_netsession_inbound(out);
+    enum_netsession_inbound(out);
     return out;
 }
 
@@ -1001,10 +1092,42 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     // not parsed, so including it would waste up to half the newest-first /c:5000
     // budget on events we discard, halving the effective backfill depth. Bounded
     // read; constant query (no interpolation). Empty on access denial.
-    const std::string cmd =
-        system32_path("wevtutil.exe") +
-        " qe Security /q:\"*[System[(EventID=4624)]]\" /c:5000 /f:text /rd:true 2>nul";
-    auto inbound = parse_win_security_logons(run_command(cmd));
+    //
+    // The \" quotes the old shell string wrapped around the XPath were
+    // SHELL-level protection (so the space-and-bracket-laden filter survived
+    // the shell's `cmd /c` parse) — run_bounded_subprocess execs argv directly,
+    // so the XPath is one quote-free argv element; embedding literal '"' chars
+    // here would pass them straight to wevtutil and break the filter. The old
+    // `2>nul` is subsumed by the runner's default (stderr discarded unless
+    // merge_stderr is set).
+    std::vector<std::string> argv = {system32_path("wevtutil.exe"),
+                                     "qe",
+                                     "Security",
+                                     "/q:*[System[(EventID=4624)]]",
+                                     "/c:5000",
+                                     "/f:text",
+                                     "/rd:true"};
+    auto run = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
+                                             .output_cap_bytes = 8u * 1024 * 1024});
+    // zero_exit_required=true is ASSUMED from documented wevtutil behaviour
+    // (`wevtutil qe` exits 0 on a successful query including zero matching
+    // events, non-zero on a channel/query error), NOT independently verified
+    // on a live Windows host in this session. A partial capture here must
+    // not be recorded as "no historical inbound mappings" -- throwing
+    // propagates to init()'s existing enumerate_mapdrive_history() try/catch
+    // (tar_plugin.cpp), which leaves mapdrive_backfill_done unset so the next
+    // restart retries the whole one-time backfill rather than permanently
+    // losing the inbound leg.
+    auto status = yuzu::tar::classify_subprocess_capture(run.tool_ran, run.timed_out,
+                                                          run.output_truncated, run.exit_code);
+    if (!status.complete) {
+        spdlog::error("TAR: mapdrive historical backfill incomplete (wevtutil {}) -- backfill "
+                      "left undone, retried on restart",
+                      status.reason);
+        throw yuzu::tar::IncompleteCaptureError("TAR: wevtutil capture incomplete: " + status.reason);
+    }
+    auto inbound = parse_win_security_logons(run.output);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));
 }
@@ -1013,16 +1136,83 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
 #elif defined(__linux__)
 
 std::vector<MapDriveEntry> enumerate_mapdrive() {
-    std::vector<MapDriveEntry> out = parse_proc_mounts(read_file("/proc/mounts"));
-    // Inbound: current Samba sessions. Empty if Samba isn't installed / no perms.
-    auto inbound = parse_smbstatus(run_command("timeout 10 smbstatus -b 2>/dev/null"));
+    auto mounts = parse_proc_mounts(read_required_file("/proc/mounts"));
+    if (mounts.malformed) {
+        // BUG 2 fix: read_required_file() already guards acquisition
+        // failure (open/read errors on /proc/mounts itself); this is the
+        // layer below it -- a row that opened and read fine but didn't
+        // tokenize into the fields every /proc/mounts row carries. Without
+        // this throw the returned entry count could silently be LESS than
+        // the true outbound-mount count, with no signal reaching the
+        // caller that anything was dropped -- same completeness-contract
+        // gap BR-service-001 closes for the service parsers.
+        spdlog::error("TAR mapdrive: /proc/mounts produced a malformed row -- skipping diff, "
+                      "retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError("TAR: /proc/mounts produced a malformed row");
+    }
+    std::vector<MapDriveEntry> out = std::move(mounts.entries);
+    // Inbound: current Samba sessions. Empty if Samba isn't installed / no perms
+    // (unmodified degrade-to-empty contract — `timeout 10` becomes the
+    // runner's own deadline, `2>/dev/null` becomes its default stderr discard).
+    // yuzu::agent::probe_tool_path (the shared runner's own probe) requires a
+    // regular, executable file — stricter than a bare access(X_OK) check,
+    // which would also accept a directory or other non-regular executable
+    // object at the candidate path.
+    std::string tool = yuzu::agent::probe_tool_path(
+        {"/usr/bin/smbstatus", "/usr/local/bin/smbstatus", "/bin/smbstatus"});
+    std::vector<MapDriveEntry> inbound;
+    if (!tool.empty()) {
+        auto run = yuzu::agent::run_bounded_subprocess(
+            std::vector<std::string>{tool, "-b"},
+            yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10),
+                                           .output_cap_bytes = 8u * 1024 * 1024});
+        // zero_exit_required=true verified live (Docker dperson/samba, Alpine
+        // Samba 4.13.7): `smbstatus -b` exits 0 both with an active session
+        // listed and with none connected -- an incomplete run here must not
+        // be diffed (this feeds the LIVE mapdrive snapshot, not history), so
+        // throw and let the caller skip the whole tick's diff/baseline
+        // advance rather than record a partial inbound session list.
+        auto status = yuzu::tar::classify_subprocess_capture(
+            run.tool_ran, run.timed_out, run.output_truncated, run.exit_code);
+        if (!status.complete) {
+            spdlog::error("TAR: mapdrive snapshot incomplete (smbstatus {}) -- skipping diff, "
+                          "retaining previous baseline",
+                          status.reason);
+            throw yuzu::tar::IncompleteCaptureError("TAR: smbstatus capture incomplete: " + status.reason);
+        }
+        auto smb = parse_smbstatus(run.output);
+        if (smb.malformed) {
+            // Finding 4 (same shape as the /proc/mounts malformed throw
+            // above): a truncated/corrupt smbstatus row (a bare numeric PID
+            // leading a structurally short line) means the returned inbound
+            // session count could silently be LESS than the true count, with
+            // no signal reaching the caller. Throw so this tick's diff/
+            // baseline advance is skipped rather than recording a partial
+            // inbound session list.
+            spdlog::error("TAR mapdrive: smbstatus produced a malformed row -- skipping diff, "
+                          "retaining previous baseline");
+            throw yuzu::tar::IncompleteCaptureError("TAR: smbstatus produced a malformed row");
+        }
+        inbound = std::move(smb.entries);
+    }
     out.insert(out.end(), inbound.begin(), inbound.end());
+    // round 3 (B3-001): this is the COMBINED outbound(/proc/mounts)+inbound
+    // (smbstatus) snapshot, checked only after both directions are known --
+    // silently resizing here (the pre-fix behaviour) discarded real mounts
+    // from the combined result without telling the caller, which then
+    // diffed/persisted the truncated vector as though it were complete.
+    // Throw instead, same contract as every other capped/failed leg in this
+    // file: the caller (collect_or_retain) skips this tick's diff/state
+    // advance and retains the previous baseline.
     if (out.size() > kMapDriveEntryCap) {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
             spdlog::warn("TAR mapdrive: live cap {} reached — truncating (repeats suppressed)",
                          kMapDriveEntryCap);
-        out.resize(kMapDriveEntryCap);
+        spdlog::warn("TAR mapdrive: snapshot incomplete (entry cap reached) -- skipping diff, "
+                     "retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError(
+            std::format("TAR: mapdrive entry cap {} reached", kMapDriveEntryCap));
     }
     return out;
 }
@@ -1033,18 +1223,143 @@ std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
     // journald. Best-effort (log verbosity varies) — empty where neither exists.
     // Bounded: read only the last 4 MiB (the recent tail — a busy server's
     // log.smbd is unbounded with `max log size = 0`) and cap the journalctl
-    // fallback with a timeout so a hung journald can't stall the init backfill.
+    // fallback with a deadline so a hung journald can't stall the init backfill.
     constexpr std::size_t kSambaLogTailBytes = 4u * 1024 * 1024;
     std::string logs = read_file_tail("/var/log/samba/log.smbd", kSambaLogTailBytes);
-    if (logs.empty())
-        logs = run_command(
-            "timeout 15 journalctl -u smbd --no-pager -o short-iso -n 5000 2>/dev/null");
+    if (logs.empty()) {
+        std::string jtool = yuzu::agent::probe_tool_path(
+            {"/usr/bin/journalctl", "/bin/journalctl", "/usr/local/bin/journalctl"});
+        if (!jtool.empty()) {
+            auto run = yuzu::agent::run_bounded_subprocess(
+                std::vector<std::string>{jtool, "-u", "smbd", "--no-pager", "-o", "short-iso",
+                                         "-n", "5000"},
+                yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(15),
+                                               .output_cap_bytes = 8u * 1024 * 1024});
+            // zero_exit_required=true verified live (Docker jrei/systemd-ubuntu:22.04,
+            // amd64 emulation, real journald): `journalctl -u <unit> --no-pager
+            // -o short-iso -n 5000` exits 0 for a non-existent unit and for a
+            // unit with zero matching entries alike ("-- No entries --" on
+            // stdout, exit 0) -- it only returns non-zero on a genuine error
+            // (bad options, journal corruption, permission denial). This is the
+            // sole inbound-history source when log.smbd is absent, so an
+            // incomplete run here must not silently become "no inbound
+            // history" -- throwing propagates to init()'s existing
+            // enumerate_mapdrive_history() try/catch (tar_plugin.cpp), which
+            // leaves mapdrive_backfill_done unset so the next restart retries.
+            auto status = yuzu::tar::classify_subprocess_capture(
+                run.tool_ran, run.timed_out, run.output_truncated, run.exit_code);
+            if (!status.complete) {
+                spdlog::error("TAR: mapdrive historical backfill incomplete (journalctl {}) -- "
+                              "backfill left undone, retried on restart",
+                              status.reason);
+                throw yuzu::tar::IncompleteCaptureError("TAR: journalctl capture incomplete: " + status.reason);
+            }
+            logs = run.output;
+        }
+    }
     auto inbound = parse_samba_logs(logs);
     rows.insert(rows.end(), inbound.begin(), inbound.end());
     return dedup_history(std::move(rows));
 }
 
-// ── macOS / other: kPlanned ───────────────────────────────────────────────────
+// ── macOS platform shell ──────────────────────────────────────────────────────
+#elif defined(__APPLE__)
+
+namespace {
+
+// Size-then-fill getfsstat(2) (rung 1 — native syscall, no shell/subprocess):
+// a NULL buf with bufsize 0 returns the current mount count with no
+// allocation; a second call fills a buffer sized to that count. MNT_NOWAIT
+// reads the kernel's cached mount table without blocking on a hung/
+// unreachable remote filesystem, matching this collector's degrade-not-block
+// contract for every other leg (WNet/NetSessionEnum/smbstatus/journalctl
+// all avoid blocking calls too).
+//
+// getfsstat(2)'s documented contract is: returns -1 and sets errno on
+// failure, else the number of matches (0 is a legitimate, if practically
+// unreachable, "no mounts" result). `ok=false` is the ONLY signal for the
+// former; collapsing both cases to "return {}" (as this used to) makes a
+// transient getfsstat failure indistinguishable from a genuinely empty
+// mount table once it reaches enumerate_mapdrive() (BR-002, round 2).
+//
+// A mount appearing between the count and fill calls is NOT simply dropped
+// (as an earlier round did) — getfsstat fills only "up to the size
+// specified by bufsize", so an exactly-full fill is indistinguishable from
+// truncation, and silently accepting it as complete can make a still-present
+// mount look removed-then-reappeared across ticks (BR-002, round 3). The
+// retry-with-headroom algorithm that resolves this is
+// run_getfsstat_with_retry (tar_mapdrive_macos_parsers.hpp) — extracted so
+// it is unit-testable against synthetic count/fill sequences; this function
+// wires in the two real getfsstat(2) calls.
+GetfsstatFetchOutcome read_getfsstat() {
+    return run_getfsstat_with_retry(
+        []() { return getfsstat(nullptr, 0, MNT_NOWAIT); },
+        [](std::size_t capacity, std::vector<MacMountRec>& out_mounts) {
+            std::vector<struct statfs> buf(capacity);
+            int filled = getfsstat(buf.data(), static_cast<int>(buf.size() * sizeof(struct statfs)),
+                                   MNT_NOWAIT);
+            if (filled < 0)
+                return filled;
+            if (static_cast<std::size_t>(filled) < buf.size())
+                buf.resize(static_cast<std::size_t>(filled));
+            out_mounts.clear();
+            out_mounts.reserve(buf.size());
+            for (const auto& fs : buf)
+                out_mounts.push_back(MacMountRec{fs.f_fstypename, fs.f_mntfromname, fs.f_mntonname});
+            return filled;
+        },
+        kMapDriveEntryCap);
+}
+
+} // namespace
+
+std::vector<MapDriveEntry> enumerate_mapdrive() {
+    auto fetch = read_getfsstat();
+    if (!fetch.ok) {
+        // A getfsstat(2) failure (errno, e.g. EIO on a hung/unreachable
+        // remote filesystem) is not a genuinely empty mount table -- same
+        // distinction the Linux/Windows subprocess legs' `tool_ran`/timeout/
+        // truncation checks preserve via classify_subprocess_capture. Throw
+        // rather than diff/persist an empty vector as though every mapping
+        // had been removed (BR-002, round 2): same contract as
+        // enumerate_services()/the Linux+Windows enumerate_mapdrive() legs.
+        spdlog::warn(
+            "TAR mapdrive: getfsstat failed -- skipping diff, retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError("TAR: getfsstat failed");
+    }
+
+    // remote_host_of is injected so the pure classifier
+    // (tar_mapdrive_macos_parsers.hpp) stays free of any dependency on this
+    // translation unit's anonymous-namespace helpers — the same function a
+    // unit test can substitute a fixture-equivalent implementation for.
+    auto out = classify_macos_mounts(fetch.mounts, remote_host_of);
+    // Cap-and-warn parity with the Linux leg (same pattern, same message);
+    // the truncation decision itself is apply_entry_cap (pure, unit-tested).
+    if (apply_entry_cap(out, kMapDriveEntryCap)) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            spdlog::warn("TAR mapdrive: live cap {} reached — truncating (repeats suppressed)",
+                         kMapDriveEntryCap);
+        // An over-cap snapshot omits real mounts -- the same "indistinguishable
+        // from a genuinely smaller table" problem the failed-fetch path above
+        // guards against. Skip this tick's diff/state advance too (BR-002).
+        spdlog::warn("TAR mapdrive: snapshot incomplete (entry cap reached) -- skipping diff, "
+                     "retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError(std::format("TAR: mapdrive entry cap {} reached", kMapDriveEntryCap));
+    }
+    return out;
+}
+
+std::vector<MapDriveHistoryRow> enumerate_mapdrive_history() {
+    // Inbound (this host's own SMB/NFS/AFP server sessions) and any
+    // persistent history artifact equivalent to Linux's /etc/fstab or
+    // Windows' registry MRU/event log are honestly out of reach for an
+    // unprivileged agent on macOS — getfsstat exposes only the current live
+    // mount table, nothing historical. Empty, not guessed.
+    return {};
+}
+
+// ── other: kPlanned ───────────────────────────────────────────────────────────
 #else
 
 std::vector<MapDriveEntry> enumerate_mapdrive() { return {}; }
