@@ -1164,10 +1164,12 @@ public:
         // is emitted-but-unseeded: it passes its own test while the dashboard reads
         // zero and the alert never fires.
         metrics_.describe("yuzu_server_dispatch_target_rejected_total",
-                          "REST dispatch calls refused because a supplied targeting argument "
+                          "Dispatch calls refused because a supplied targeting argument "
                           "named no device, plus dispatch-closure calls that named no target at "
-                          "all (#2500). Both labels are closed sets; every reachable pair is "
-                          "pre-seeded at boot so absent() stays meaningful.",
+                          "all (#2500), plus Destructive-class capabilities targeted without "
+                          "explicit agent_ids on REST (route=command) or MCP execute_instruction "
+                          "(route=mcp, #3685). Both labels are closed sets; every reachable pair "
+                          "is pre-seeded at boot so absent() stays meaningful.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
         // (dispatch_target_shape.hpp). They are spelled out here rather than
@@ -1190,6 +1192,19 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonBodyType)}});
         }
+        // #3685: Destructive-class targeting refusal. Seeded on `command`
+        // (REST `/api/command`) and `mcp` (MCP `execute_instruction`, both
+        // the C8 pre-mint gate and the main-handler backstop share this one
+        // label — mutually exclusive per request, so no double-count) —
+        // deliberately NOT `instruction_execute`: that route has no
+        // Destructive gate yet (tracked as a residual parity follow-up), and
+        // seeding it here would publish a series claiming a reachability
+        // that does not exist, which is exactly what the per-route seeding
+        // above exists to avoid.
+        for (const char* route : {"command", "mcp"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
         for (const auto reason : {yuzu::server::kReasonParentIdType,
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
@@ -14578,6 +14593,17 @@ private:
                         return;
                     if (gate.verdict ==
                         yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                        // #3685: counted like every other refusal in this
+                        // family (#2500 precedent above) — an uncounted
+                        // refusal on a P1 security control cannot reach the
+                        // dashboard/alert this observability commit ships.
+                        metrics_
+                            .counter("yuzu_server_dispatch_target_rejected_total",
+                                     {{"route", "command"},
+                                      {"reason",
+                                       std::string(
+                                           yuzu::server::kReasonDestructiveUntargeted)}})
+                            .increment();
                         res.status = 400;
                         res.set_content(
                             R"({"error":{"code":400,"message":")" +

@@ -4404,6 +4404,27 @@ McpServer::HandlerFn McpServer::build_handler(
                                 /*scope_key_present=*/args.contains("scope"));
                             if (gate.verdict ==
                                 yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                                // #3685 (checkpoint 3, commit 6): counted on the SAME
+                                // series REST's `/api/command` 400 arm uses
+                                // (`yuzu_server_dispatch_target_rejected_total`,
+                                // `route="mcp"`) — #881's `quarantined` reason already
+                                // crosses this series into MCP-origin traffic via the
+                                // shared dispatch closure, so this is not a new
+                                // precedent. `metrics` is nullable here (as in
+                                // `count_denial` above); guarded the same way so
+                                // observability can never fail the refusal itself.
+                                if (metrics != nullptr) {
+                                    try {
+                                        metrics
+                                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                                      {{"route", "mcp"},
+                                                       {"reason",
+                                                        std::string(yuzu::server::
+                                                                        kReasonDestructiveUntargeted)}})
+                                            .increment();
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                    }
+                                }
                                 const std::string cid =
                                     yuzu::server::detail::make_correlation_id();
                                 mcp_audit(
@@ -7833,6 +7854,24 @@ McpServer::HandlerFn McpServer::build_handler(
                         /*scope_key_present=*/!scope.empty());
                     if (gate.verdict ==
                         yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                        // #3685 (checkpoint 3, commit 6): same series + label as
+                        // the C8 pre-mint site above and REST's /api/command 400
+                        // arm. C8 and this backstop are mutually exclusive per
+                        // request (see the comment above this block), so a
+                        // supervised call refused at C8 is never also counted
+                        // here.
+                        if (metrics != nullptr) {
+                            try {
+                                metrics
+                                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                                              {{"route", "mcp"},
+                                               {"reason",
+                                                std::string(yuzu::server::
+                                                                kReasonDestructiveUntargeted)}})
+                                    .increment();
+                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                            }
+                        }
                         const std::string cid = yuzu::server::detail::make_correlation_id();
                         mcp_audit("denied",
                                   std::string("destructive_untargeted ") +

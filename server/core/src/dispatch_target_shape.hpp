@@ -140,13 +140,26 @@ inline constexpr std::string_view kReasonParentIdType{"parent_id_type"};
 inline constexpr std::string_view kReasonParentIdEmpty{"parent_id_empty"};
 inline constexpr std::string_view kReasonClosureNoTarget{"closure_no_target"};
 inline constexpr std::string_view kReasonScopeUnsupported{"scope_unsupported"};
+/// #3685: a Destructive-class capability was targeted without an explicit,
+/// non-empty `agent_ids` list (broadcast, `scope`, and omitted-target fan-out
+/// are all refused). Unlike its four siblings above this one IS emitted by
+/// more than a single HTTP route — REST's `/api/command` 400 arm AND MCP's
+/// `execute_instruction` (both the C8 pre-mint gate and the main-handler
+/// backstop) — but it belongs here rather than in `kTargetingShapeReasons`
+/// for the same reason its siblings do: it is not something
+/// `check_targeting_shape`/`check_exec_instruction_shape` itself produces,
+/// so forcing it into that array would force it into the MCP bound-check
+/// containment static_assert in `mcp_input_bounds.hpp` for no reason — this
+/// reason already has its own emit sites on both surfaces without that.
+inline constexpr std::string_view kReasonDestructiveUntargeted{"destructive_untargeted"};
 
-inline constexpr std::array<std::string_view, 5> kRouteRejectReasons{
-    kReasonBodyType,         ///< the request body was not a JSON object
-    kReasonParentIdType,     ///< parent_id was supplied and is not a string
-    kReasonParentIdEmpty,    ///< parent_id was supplied and is an empty string
-    kReasonClosureNoTarget,  ///< a dispatch closure was called naming no target
-    kReasonScopeUnsupported, ///< the route cannot honour `scope` and refuses it
+inline constexpr std::array<std::string_view, 6> kRouteRejectReasons{
+    kReasonBodyType,             ///< the request body was not a JSON object
+    kReasonParentIdType,         ///< parent_id was supplied and is not a string
+    kReasonParentIdEmpty,        ///< parent_id was supplied and is an empty string
+    kReasonClosureNoTarget,      ///< a dispatch closure was called naming no target
+    kReasonScopeUnsupported,     ///< the route cannot honour `scope` and refuses it
+    kReasonDestructiveUntargeted, ///< a Destructive-class capability lacked explicit targeting
 };
 
 /// #881: a target the caller was AUTHORISED to reach (it survived the
