@@ -93,10 +93,25 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
         g_stop_requested.store(true, std::memory_order_relaxed);
-        // 30s to match the START_PENDING hint; Agent::stop() itself is
-        // non-blocking (sets flags, TryCancels in-flight stream writes), so
-        // teardown is bounded well under that -- no checkpoint-bumping thread
-        // needed for a single-shot pending report.
+        // 30s to match the START_PENDING hint. The "Agent::stop() itself is non-blocking...
+        // teardown is bounded well under that" claim this comment used to make here was
+        // false - #2233 item 3 proved guardian_/dex_observer_ teardown can hang unboundedly,
+        // which is exactly why AgentImpl::stop() now arms a ShutdownDeadlineGuard
+        // (agents/core/src/shutdown_deadline_guard.hpp, kShutdownDeadlineGrace = 20s) as its
+        // first statement. 20s leaves only a 10s margin under this 30s hint, not "well under"
+        // it - a wedge diagnosed slowly by the guard's own worker dispatch could still cost
+        // the SCM's patience in a worst case. That reasoning is about SERVICE_CONTROL_STOP's
+        // own STOP_PENDING hint specifically; on SERVICE_CONTROL_SHUTDOWN the OS applies its
+        // own WaitToKillServiceTimeout instead, which can be shorter and is outside this
+        // process's control either way. No checkpoint-bumping thread added regardless: a wedge
+        // that outlives the 30s hint now hard_exit()s the whole process before the SCM's own
+        // timeout would matter, rather than needing a live checkpoint to survive it. --install-
+        // service's own SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 - SC_ACTION_RESTART
+        // x3, with SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it fires on a clean exit with
+        // no SERVICE_STOPPED report too, not just a crash) DOES auto-restart a watchdog-fired
+        // TerminateProcess, similar to the Linux systemd Restart=always path (an earlier
+        // revision of this comment claimed the opposite - governance Gate 6 sre finding,
+        // corrected at Gate 8 re-verify after direct code read).
         report_status(SERVICE_STOP_PENDING, NO_ERROR, 0, 30000);
         {
             std::lock_guard<std::mutex> lock(g_agent_mu);

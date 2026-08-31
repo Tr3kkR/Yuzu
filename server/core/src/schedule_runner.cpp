@@ -356,8 +356,10 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
         count("yuzu_schedule_fire_failures_total");
         spdlog::error("schedule_runner: dispatch failed for schedule '{}' (id={}): {}", s.name,
                       s.id, e.what());
-        if (d_.execution_tracker && !exec_id.empty())
-            d_.execution_tracker->mark_cancelled(exec_id, s.created_by);
+        if (d_.execution_tracker && !exec_id.empty() &&
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
+            spdlog::error("schedule_runner: mark_cancelled failed for execution_id={}", exec_id);
+        }
         audit(s, "instruction.schedule_fired", "failure",
               "dispatch_failed schedule_id=" + s.id + " execution_id=" + exec_id);
         return 0;
@@ -370,8 +372,10 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
         count("yuzu_schedule_fire_failures_total");
         spdlog::warn("schedule_runner: schedule '{}' (id={}) reached no agents (scope='{}')",
                      s.name, s.id, s.scope_expression);
-        if (d_.execution_tracker && !exec_id.empty())
-            d_.execution_tracker->mark_cancelled(exec_id, s.created_by);
+        if (d_.execution_tracker && !exec_id.empty() &&
+            !d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
+            spdlog::error("schedule_runner: mark_cancelled failed for execution_id={}", exec_id);
+        }
         audit(s, "instruction.schedule_fired", "failure",
               "no_agents schedule_id=" + s.id + " execution_id=" + exec_id);
         return 0;
@@ -379,22 +383,24 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
 
     if (d_.execution_tracker && !exec_id.empty()) {
         // L-03 (#1806): dispatch has already succeeded at this point — a
-        // throw from set_agents_targeted (store error) must not leave the
+        // failed set_agents_targeted (store error) must not leave the
         // execution row stuck at "running" forever, since tick()'s
         // outer catch only advances the SCHEDULE, not the execution it
         // already created. Mark the row failed here so it can't idle to the
         // materialise timeout while still counting the fire as a success.
-        try {
-            d_.execution_tracker->set_agents_targeted(exec_id, sent);
-        } catch (const std::exception& e) {
-            spdlog::error("schedule_runner: set_agents_targeted threw for schedule '{}' (id={}, "
-                          "execution_id={}): {}",
-                          s.name, s.id, exec_id, e.what());
-            try {
-                d_.execution_tracker->mark_cancelled(exec_id, s.created_by);
-            } catch (const std::exception& e2) {
-                spdlog::error("schedule_runner: mark_cancelled also threw for execution_id={}: {}",
-                              exec_id, e2.what());
+        //
+        // governance PR review (2026-08-31): this used to be a try/catch
+        // around a void call that never actually threw on a store failure
+        // (it swallowed the failure silently instead) — dead recovery code.
+        // set_agents_targeted/mark_cancelled now report success via their
+        // return value instead, which is what actually makes this reachable.
+        if (!d_.execution_tracker->set_agents_targeted(exec_id, sent)) {
+            spdlog::error("schedule_runner: set_agents_targeted failed for schedule '{}' (id={}, "
+                          "execution_id={})",
+                          s.name, s.id, exec_id);
+            if (!d_.execution_tracker->mark_cancelled(exec_id, s.created_by)) {
+                spdlog::error("schedule_runner: mark_cancelled also failed for execution_id={}",
+                              exec_id);
             }
             audit(s, "instruction.schedule_fired", "failure",
                   "set_agents_targeted_failed schedule_id=" + s.id + " execution_id=" + exec_id);

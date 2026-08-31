@@ -24,6 +24,16 @@
  * so the server-side parser cleanly rejects the payload rather than
  * ingesting a half-finished structure; the dispatcher signals the
  * truncation through the `truncated` field on the result.
+ *
+ * BR-001 (Wave 5 PR5.1 whole-branch review): `result_status`/
+ * `result_completeness`/`result_provenance` surface whatever the plugin
+ * reported via `CommandContext::set_result_status()` (the ABI4 CC-07
+ * result-status seam, `yuzu_ctx_set_result_status`), read back from the
+ * SAME `CommandContextImpl` `dispatch_with_capture` already constructs --
+ * same shape as `truncated` above, not a second dispatch mechanism. Added
+ * so a unit test can prove a migrated plugin's `forward_runner_failure`
+ * call (runner_status.hpp) actually reaches the host seam, not just that
+ * the call site exists.
  */
 
 #include <yuzu/plugin.h>
@@ -41,6 +51,12 @@ public:
         int rc{0};             ///< plugin's return code; 0 == success
         std::string captured;  ///< concatenated output (newline-joined)
         bool truncated{false}; ///< true iff capture hit the byte cap
+        /// ABI4 CC-07 typed result the plugin reported via
+        /// CommandContext::set_result_status(), if any -- UNDECLARED/UNKNOWN/
+        /// empty when the plugin never called it (see the file header).
+        YuzuResultStatus result_status{YUZU_RESULT_STATUS_UNDECLARED};
+        YuzuResultCompleteness result_completeness{YUZU_RESULT_COMPLETENESS_UNKNOWN};
+        std::string result_provenance;
     };
 
     /// Matches the server-side `FleetTopologyStore::kPushedSnapshotMaxBytes`.

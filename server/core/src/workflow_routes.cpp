@@ -58,6 +58,47 @@ static std::string product_pack_client_message(const char* op, const std::string
     return err;
 }
 
+// F031/#3481: the same per-kind delete dispatch is needed in two places now — DELETE
+// /api/product-packs/:id's uninstall_fn, and POST /api/product-packs's new compensate_fn
+// (best-effort undo of items install_fn already committed, on a late persist failure).
+// Factored out so the two call sites can't drift.
+//
+// ADR-0058/ADR-0064: InstructionDefinition and Workflow pass through their store's real
+// db_error/not_found split (kProductPackDbErrorPrefix) — a null/unopen store is a genuine
+// unavailability, not "this item doesn't exist"; using the tolerated not_found prefix here
+// would let the caller (ProductPackStore::uninstall()/install()'s compensation path) proceed
+// as if the item were already gone while it's still live underneath. PolicyFragment/Policy's
+// origin stores are still bool-only — `false` there maps to a tolerated not_found, matching
+// pre-ADR-0058 behaviour for those kinds.
+static ItemUninstallFn make_item_delete_fn(InstructionStore* instruction_store,
+                                           PolicyStore* policy_store,
+                                           WorkflowEngine* workflow_engine) {
+    return [instruction_store, policy_store, workflow_engine](
+               const std::string& kind,
+               const std::string& item_id) -> std::expected<void, std::string> {
+        if (kind == "InstructionDefinition") {
+            if (!instruction_store)
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "instruction store unavailable");
+            return instruction_store->delete_definition(item_id);
+        } else if (kind == "PolicyFragment") {
+            if (policy_store && policy_store->delete_fragment(item_id))
+                return {};
+            return std::unexpected("not_found: policy fragment '" + item_id + "'");
+        } else if (kind == "Policy") {
+            if (policy_store && policy_store->delete_policy(item_id))
+                return {};
+            return std::unexpected("not_found: policy '" + item_id + "'");
+        } else if (kind == "Workflow") {
+            if (!workflow_engine)
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "workflow engine unavailable");
+            return workflow_engine->delete_workflow(item_id);
+        }
+        return std::unexpected("not_found: unsupported item kind '" + kind + "'");
+    };
+}
+
 // Production overload — wraps the Server in an HttplibRouteSink and forwards
 // to the sink-based body. Defined first so callers see a familiar signature.
 void WorkflowRoutes::register_routes(httplib::Server& svr, Deps deps) {
@@ -2027,8 +2068,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // forever on dispatch failure. mark_cancelled records the
             // attempt for forensic audit instead of orphaning it as a
             // phantom in-flight run that the LIST handler keeps showing.
-            if (execution_tracker && !execution_id.empty()) {
-                execution_tracker->mark_cancelled(execution_id, session->username);
+            if (execution_tracker && !execution_id.empty() &&
+                !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
+                              execution_id);
             }
             res.status = 500;
             res.set_content(
@@ -2038,8 +2081,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         if (sent == 0) {
-            if (execution_tracker && !execution_id.empty()) {
-                execution_tracker->mark_cancelled(execution_id, session->username);
+            if (execution_tracker && !execution_id.empty() &&
+                !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
+                              execution_id);
             }
             // #881: "no agents reached" now covers a THIRD condition this
             // route cannot see — every target withheld by the containment
@@ -2060,7 +2105,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // count and refresh agents_responded counters now that dispatch
         // has confirmed how many agents the command went to.
         if (execution_tracker && !execution_id.empty()) {
-            execution_tracker->set_agents_targeted(execution_id, sent);
+            if (!execution_tracker->set_agents_targeted(execution_id, sent)) {
+                spdlog::error("workflow_routes: set_agents_targeted failed for execution_id={}",
+                              execution_id);
+            }
         }
 
         // governance R1 happy-LOW-1 (#1088 round): include execution_id
@@ -2177,6 +2225,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             yaml_bundle = req.body;
         }
 
+        // F033/#3481: optional client-supplied dedup key. Missing header -> empty string ->
+        // install()'s existing unguarded behavior, unchanged. Length-bounded before it ever
+        // reaches the store — an unbounded header is an easy way to bloat the idempotency_key
+        // column/index for no functional benefit.
+        std::string idempotency_key = req.get_header_value("Idempotency-Key");
+        if (idempotency_key.size() > 200) {
+            res.status = 400;
+            res.set_content(
+                detail::a4_error(res, "Idempotency-Key header too long (max 200 characters)"),
+                "application/json");
+            return;
+        }
+
         // Install callback: delegate each document to the appropriate store
         auto install_fn =
             [instruction_store, policy_store, workflow_engine](
@@ -2235,7 +2296,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         };
 
-        auto result = product_pack_store->install(yaml_bundle, install_fn);
+        // F031/#3481: best-effort undo of whatever install_fn already committed, if the final
+        // persist transaction below fails.
+        auto compensate_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
+        // #3479: per-document detail — a bundle where some (not all) documents fail no longer
+        // silently drops which ones and why behind a bare "installed" response.
+        InstallPartialResult partial_result;
+        auto result = product_pack_store->install(yaml_bundle, install_fn, compensate_fn,
+                                                  idempotency_key, &partial_result);
         if (!result) {
             // gov W7.4 R1 UP-1 / compliance CC6.7 / sre B2: SOC 2 CC6.7
             // requires "all access decisions logged". The pack-install
@@ -2275,13 +2343,34 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // (1484/1533/1647/1692), and the audit-log.md docs entry. Was
         // "product_pack" pre-W7.4 R2 — SIEM rules filtering on either
         // string would have missed half the rows for this action.
-        audit_fn(req, "product_pack.install", "success", "ProductPack", *result, "");
+        // #3479: audit detail names the partial-failure count too, so an auditor doesn't need
+        // to reconstruct it from the response body — same "identity, not just outcome" bar the
+        // compensation N/M suffix (#3481) already set for the denied path.
+        std::string audit_detail;
+        nlohmann::json response_body{{"id", *result}, {"status", "installed"}};
+        if (!partial_result.errors.empty()) {
+            response_body["errors"] = partial_result.errors;
+            response_body["installed_count"] = partial_result.installed_count;
+            response_body["total_items"] = partial_result.total_items;
+            audit_detail = std::to_string(partial_result.errors.size()) + "/" +
+                           std::to_string(partial_result.total_items) +
+                           " item(s) failed to install";
+        }
+        audit_fn(req, "product_pack.install", "success", "ProductPack", *result, audit_detail);
         emit_fn("product_pack.installed", req);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Product pack installed","level":"success"}})");
         res.status = 201;
-        res.set_content(nlohmann::json({{"id", *result}, {"status", "installed"}}).dump(),
-                        "application/json");
+        // Gate 8 review (security-guardian, #3479/#3481): unlike `id` (server-generated hex,
+        // always valid UTF-8), `errors[]` entries can reflect attacker-controlled YAML field
+        // values (e.g. an invalid `mode:` value quoted verbatim into the error string) — the
+        // default strict dump() throws on invalid UTF-8, which would 500 AFTER the partial
+        // install (and its audit row) already committed. error_handler_t::replace (established
+        // convention — see analytics_event_store.cpp/bundle_service.cpp/preflight_eval.cpp)
+        // substitutes U+FFFD instead.
+        res.set_content(
+            response_body.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+            "application/json");
     });
 
     // GET /api/product-packs/:id -- get product pack detail
@@ -2354,47 +2443,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
 
-        // Uninstall callback: delegate to the appropriate store. InstructionDefinition passes
-        // through InstructionStore's real db_error/not_found split (ADR-0058) so a genuine DB
-        // failure aborts the whole pack uninstall instead of being silently tolerated as a
-        // removed item (product_pack_store.cpp's uninstall() checks the prefix). PolicyFragment/
-        // Policy/Workflow's origin stores are still bool-only — `false` there maps to a tolerated
-        // not_found, matching pre-ADR-0058 behaviour for those kinds.
-        auto uninstall_fn = [instruction_store, policy_store,
-                             workflow_engine](const std::string& kind, const std::string& item_id)
-            -> std::expected<void, std::string> {
-            if (kind == "InstructionDefinition") {
-                // db_error, not not_found (gov Gate 3/4 finding): a null instruction_store is
-                // a genuine unavailability, not "this item doesn't exist" — using the tolerated
-                // prefix here would let ProductPackStore::uninstall delete the pack row while
-                // the (never-touched) instruction definition stays live. Currently unreachable
-                // (instruction_store_ and product_pack_store_ share one boot latch — cpp-expert
-                // Gate 3), kept correct as defense-in-depth against that invariant changing.
-                if (!instruction_store)
-                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
-                                           "instruction store unavailable");
-                return instruction_store->delete_definition(item_id);
-            } else if (kind == "PolicyFragment") {
-                if (policy_store && policy_store->delete_fragment(item_id))
-                    return {};
-                return std::unexpected("not_found: policy fragment '" + item_id + "'");
-            } else if (kind == "Policy") {
-                if (policy_store && policy_store->delete_policy(item_id))
-                    return {};
-                return std::unexpected("not_found: policy '" + item_id + "'");
-            } else if (kind == "Workflow") {
-                // Mirrors the InstructionDefinition arm above (ADR-0064): a null
-                // workflow_engine is a genuine unavailability, not "this item doesn't
-                // exist" — the tolerated-not-found prefix here would let
-                // ProductPackStore::uninstall delete the pack row while a still-live
-                // workflow stays undeleted underneath it.
-                if (!workflow_engine)
-                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
-                                           "workflow engine unavailable");
-                return workflow_engine->delete_workflow(item_id);
-            }
-            return std::unexpected("not_found: unsupported item kind '" + kind + "'");
-        };
+        // Uninstall callback: delegate to the appropriate store (same dispatch install's
+        // compensate_fn uses — see make_item_delete_fn's doc comment for the per-kind
+        // db_error/not_found split, currently unreachable here since instruction_store_ and
+        // product_pack_store_ share one boot latch, kept as defense-in-depth).
+        auto uninstall_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);
         if (!result) {

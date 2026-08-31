@@ -82,10 +82,17 @@
 #include <cstdint>
 #include <cstring> // std::memcpy (spawn_errno decode below)
 
+// Unconditional (both platforms): BR-005's Windows-side inherit_parent_env
+// filter logs a withheld-var line the same way the POSIX backend does, so
+// spdlog must be visible on the Windows compile path too -- it was
+// previously nested inside the #ifndef _WIN32 block below, which built fine
+// on POSIX (where every spdlog:: call site lives) but left the later
+// Windows-side spdlog::debug() call with no declaration at all, undetected
+// locally because this TU is only actually Windows-compiled in CI.
+#include <spdlog/spdlog.h>
+
 #ifndef _WIN32
 #include <yuzu/agent/fork_lock.hpp>
-
-#include <spdlog/spdlog.h>
 
 #include <cerrno>
 #include <csignal>
@@ -99,6 +106,10 @@
 #include <sys/stat.h> // umask, fstat, S_ISREG/S_IWGRP/S_IWOTH (A6, B6)
 #include <sys/wait.h>
 #if defined(__APPLE__)
+#include <crt_externs.h> // _NSGetEnviron() -- BR-001 POSIX inherit_parent_env below: a
+                         // dylib (this TU builds into yuzu_agent_core_lib, a
+                         // shared_library) cannot rely on a directly-linked
+                         // `environ` symbol the way a main executable can.
 #include <sys/sysctl.h> // sysctlbyname(kern.maxfilesperproc) — per-process fd ceiling
 #endif
 #if defined(__linux__)
@@ -127,10 +138,27 @@
 
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (CDX-R4-05, #1681)
 
-#include <cctype> // std::toupper in the env-sort comparator below -- <cwctype>
-                  // supplies towupper, NOT toupper, and this branch is compiled
-                  // only by MSVC, which no reviewer on a POSIX host can check.
-#include <cwctype>
+// BR-003 (whole-branch review round 2): the env-sort comparator below used
+// to hand-roll ASCII-only case folding via std::toupper/<cctype> here; it
+// now calls Win32's own CompareStringOrdinal (windows.h, already included
+// above) for a real locale-independent Unicode ordinal comparison, so
+// neither <cctype> nor <cwctype> is needed in this branch any more.
+#include <memory> // std::unique_ptr -- BR-004 GetEnvironmentStringsW RAII owner below
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+// POSIX guarantees this variable exists but NOT that any header declares
+// it without a feature-test macro (glibc only exposes it via <unistd.h>
+// under _GNU_SOURCE; musl/other libcs vary) -- declare it explicitly rather
+// than depend on an include-order accident. Declared at TRUE FILE SCOPE,
+// outside every namespace: libc's `environ` is a plain, unmangled C global.
+// An `extern` re-declaration inside a C++ namespace -- named or anonymous --
+// mangles into that namespace's own symbol name instead of binding to the
+// real libc one, so a strict linker (mold) reports it undefined at link
+// time rather than silently resolving to garbage. Caught only on Linux CI:
+// this whole branch is `#if !defined(__APPLE__)`, so macOS never compiles
+// it locally, and Windows never reaches this leg either.
+extern char** environ;
 #endif
 
 namespace yuzu::agent {
@@ -470,8 +498,8 @@ void sweep_fd_range_cloexec_fallback(long ceiling) {
     }
 }
 
-// B6 (optional, off by default; runner primitive only -- no in-tree caller
-// enables this in this PR). Async-signal-safe: opens argv[0] O_NOFOLLOW so a
+// B6: content_dist's execute_verified_payload is the in-tree caller (Linux
+// leg, is_linux=true). Async-signal-safe: opens argv[0] O_NOFOLLOW so a
 // symlink swap between the probe and this open() can't redirect us, fstat()s
 // the FD (never the path, closing the classic stat-vs-exec TOCTOU as far as
 // an fd-based check can), and on Linux execs THAT SAME FD via a raw
@@ -479,11 +507,25 @@ void sweep_fd_range_cloexec_fallback(long ceiling) {
 // than glibc's fexecve() wrapper, which can fall back to an unsafe
 // /proc/self/fd string-formatting path on kernels without execveat().
 // Bounded ETXTBSY backoff (a binary still being written) — never unbounded.
+//
+// Deliberately NOT O_CLOEXEC: documented Linux kernel behavior is that
+// execveat(fd, "", ..., AT_EMPTY_PATH) on an O_CLOEXEC-opened fd fails with
+// ENOENT -- the CLOEXEC flag causes the fd to be torn down as part of the
+// exec transition itself, before the kernel can read the target binary
+// through it. This is the exact fd meant to be exec'd (not one that should
+// be hidden from a child), so CLOEXEC has no protective purpose here and
+// actively breaks the primitive. Reproduced directly (gcc-15/Linux 7.x,
+// forked child, isolated per-flag-combination): O_RDONLY and
+// O_RDONLY|O_NOFOLLOW both exec cleanly; adding O_CLOEXEC to either
+// deterministically fails every attempt with ENOENT. Caught on the first
+// Linux CI run of this code path to ever actually execute past compile
+// time (2026-08-31) -- this primitive had never successfully exec'd
+// anything on real Linux before this fix.
 [[noreturn]] void toctou_verified_exec(char* const* c_argv, char* const* c_envp,
                                         const LaunchSpec::ExecVerification& v, int err_fd) {
     constexpr int kMaxRetries = 5;
     for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-        int fd = open(c_argv[0], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        int fd = open(c_argv[0], O_RDONLY | O_NOFOLLOW);
         if (fd < 0)
             report_setup_failure_and_exit(err_fd, errno);
         struct stat st{};
@@ -571,6 +613,26 @@ void wait_for_activity(int read_fd, int err_read_fd, int pidfd, long nanos) {
     sleep_briefly(nanos);
 }
 
+// BR-001 (whole-branch review round 2): this process' own live environment,
+// as a char** NUL-terminated block -- the read side of POSIX
+// inherit_parent_env below. Deliberately NOT a bare `extern char** environ;`
+// used directly at the call site: this TU builds into yuzu_agent_core_lib
+// (a shared_library, agents/core/meson.build), and on Apple platforms the
+// `environ` symbol is reliably available only to a directly-linked main
+// executable -- a dylib must go through _NSGetEnviron() instead
+// (crt_externs.h, included above under __APPLE__) or risk an unresolved
+// symbol / wrong-image environ at link or load time. glibc/other POSIX
+// exposes `environ` to any translation unit that declares it extern, no
+// such indirection needed. The `extern` declaration itself lives at true
+// file scope, above -- see that declaration's own comment for why.
+char** current_environ() {
+#if defined(__APPLE__)
+    return *_NSGetEnviron();
+#else
+    return ::environ;
+#endif
+}
+
 } // namespace
 
 SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
@@ -602,6 +664,19 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.exec_verify = {.enabled = opts.exec_verify.enabled,
                                .require_root_owned = opts.exec_verify.require_root_owned,
                                .expected_size = opts.exec_verify.expected_size};
+    // extra_env: SubprocessOptions::extra_env (vector<pair<string,string>>)
+    // and LaunchOptions::extra_env (vector<EnvVar>) are field-identical but
+    // SEPARATE types -- same reason as rlimits/exec_verify above -- so this
+    // is a manual element copy rather than a brace-init.
+    launch_opts.extra_env.reserve(opts.extra_env.size());
+    for (const auto& [key, value] : opts.extra_env)
+        launch_opts.extra_env.push_back({key, value});
+    // BR-001 (whole-branch review round 2): passed through for the pure
+    // LaunchSpec passthrough/testability, AND now actually acted on below --
+    // see the envp-construction block further down and
+    // SubprocessOptions::inherit_parent_env's doc comment, point (c), for
+    // the full contract this (POSIX) backend now honours.
+    launch_opts.inherit_parent_env = opts.inherit_parent_env;
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
@@ -621,14 +696,58 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         c_argv.push_back(const_cast<char*>(arg.c_str()));
     c_argv.push_back(nullptr);
 
-    // A5: explicit clear-and-allow-list envp, built here from spec.env (which
-    // build_launch_spec assembled from nothing -- LD_*/DYLD_*/IFS/BASH_ENV/
-    // GCONV_PATH are stripped by construction, never copied from this
-    // process' own environment).
+    // A5 (ordinary case): explicit clear-and-allow-list envp, built here
+    // from spec.env (which build_launch_spec assembled from nothing --
+    // LD_*/DYLD_*/IFS/BASH_ENV/GCONV_PATH are stripped by construction,
+    // never copied from this process' own environment).
+    //
+    // BR-001 (whole-branch review round 2, Alex ruling): when
+    // inherit_parent_env is set, this backend now mirrors the Windows
+    // backend's existing inherit_parent_env branch (see that code for the
+    // twin structure) -- swap the BASE for this envp from the A5 allow-list
+    // to a live read of THIS process' own real environment (POSIX
+    // `environ`, via current_environ() above), with the ADR-3002 A5
+    // injection class stripped via filter_inherited_env()
+    // (subprocess_launch_spec.hpp) and extra_env layered on top via the
+    // SAME merge_launch_env() replace-never-duplicate semantics used below
+    // for the ordinary case. extra_env was already validated (denylist/
+    // malformed-entry checks) by build_launch_spec() above UNCONDITIONALLY,
+    // so nothing here can smuggle a denied name through just because this
+    // flag is set -- that fail-closed behaviour is UNCHANGED.
+    //
+    // filter_inherited_env's strip, by contrast, is SILENT: an inherited
+    // parent-environment variable that matches the injection class is
+    // simply withheld from the child, never a reason to refuse the whole
+    // launch -- see that function's own comment for why an inherited
+    // variable's failure mode must differ from extra_env's. Log what was
+    // stripped so the behaviour stays observable rather than silent at the
+    // OPERATOR level, even though it is silent at the API level.
     std::vector<std::string> envp_strings;
-    envp_strings.reserve(spec.env.size());
-    for (const auto& e : spec.env)
-        envp_strings.push_back(e.key + "=" + e.value);
+    if (spec.inherit_parent_env) {
+        std::vector<EnvVar> parent_env;
+        for (char** e = current_environ(); e && *e != nullptr; ++e) {
+            std::string_view entry(*e);
+            auto eq = entry.find('=');
+            if (eq == std::string_view::npos)
+                continue; // malformed entry with no '=' at all -- skip, don't guess
+            parent_env.push_back({std::string(entry.substr(0, eq)), std::string(entry.substr(eq + 1))});
+        }
+        EnvInheritResult filtered = filter_inherited_env(parent_env, /*windows=*/false);
+        for (const auto& name : filtered.stripped) {
+            spdlog::debug("run_bounded_subprocess: withholding inherited env var '{}' from the "
+                         "child (ADR-3002 A5 injection class, inherit_parent_env)",
+                         name);
+        }
+        std::vector<EnvVar> merged =
+            merge_launch_env(filtered.env, launch_opts.extra_env, /*windows=*/false).env;
+        envp_strings.reserve(merged.size());
+        for (const auto& e : merged)
+            envp_strings.push_back(e.key + "=" + e.value);
+    } else {
+        envp_strings.reserve(spec.env.size());
+        for (const auto& e : spec.env)
+            envp_strings.push_back(e.key + "=" + e.value);
+    }
     std::vector<char*> c_envp;
     c_envp.reserve(envp_strings.size() + 1);
     for (auto& s : envp_strings)
@@ -1011,14 +1130,20 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     auto store_line = [&](std::string line) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        if (line.empty())
-            return;
         // ADR-3002 streaming primitive: every completed line reaches the
         // caller's callback (if any) UNCAPPED -- neither max_lines nor the
         // output_cap blob budget gates it (CDX-P2-005: the caller's live
-        // stream must not silently stop when stored capture saturates).
+        // stream must not silently stop when stored capture saturates), AND
+        // a blank completed line is delivered too (A2-006: "every completed
+        // line" means every one -- a script's blank stdout lines produced a
+        // wire record under both spawn paths this runner replaced, and the
+        // doc comment above has always promised it uncapped, not
+        // uncapped-except-empty). Only STORAGE below excludes blank lines --
+        // callback delivery must happen before that early return, not after.
         if (opts.on_line)
             opts.on_line(line);
+        if (line.empty())
+            return;
         // result.lines (the collect-at-end snapshot) STAYS bounded: by
         // max_lines when armed, else by the output_cap byte budget -- so an
         // unlimited-max_lines run past the blob cap can't grow it without end.
@@ -1030,13 +1155,23 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         // accumulator below), independent of the output_cap budget this same
         // cap is supposed to enforce on result.output. Both caps now apply
         // together whenever max_lines is armed.
-        const bool line_room =
-            stored_line_bytes < output_cap && (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
+        // BR-008 (whole-branch review round 2): comparing stored_line_bytes
+        // against output_cap with a strict `<` only proved SOME budget
+        // remained, not that THIS line's bytes fit within it -- a single
+        // stored line can be up to output_cap bytes long (line_buf's own
+        // accumulator caps it there), so a one-byte remainder could still
+        // admit a whole second cap-sized line, letting result.lines grow to
+        // nearly 2x the documented output_cap budget. Require the line's
+        // OWN source-byte count (+1 for the terminating newline, same
+        // accounting as below) to fit in the REMAINING budget instead.
+        const std::size_t source_bytes = line.size() + 1;
+        const bool line_room = source_bytes <= output_cap - stored_line_bytes &&
+                               (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
         if (line_room) {
             // +1 for the terminating newline: count the SOURCE bytes the line
             // consumed, matching output_cap's blob accounting so result.lines
             // stays bounded by the same cap as result.output (BR-001).
-            stored_line_bytes += line.size() + 1;
+            stored_line_bytes += source_bytes;
             result.lines.push_back(std::move(line));
             if (opts.stop_after_max_lines && opts.max_lines != 0 &&
                 result.lines.size() >= opts.max_lines)
@@ -1459,6 +1594,25 @@ std::wstring utf8_to_wide(const std::string& s) {
 
 } // namespace
 
+const std::string& windows_system_directory() {
+    // BR3-001 (whole-branch review round 3): resolved once, cached for the
+    // process's lifetime -- the system directory cannot change while this
+    // process is running, and this is called on every Windows spawn whose
+    // working_dir defaults ("/" sentinel, mapped below) plus every
+    // Windows-plugin caller (e.g. script_exec's PowerShell path) that needs
+    // a trusted absolute System32 path. Same pattern as
+    // quarantine_plugin.cpp's netsh_path(): an honest empty return on
+    // failure, never a guessed fallback -- callers fail closed on it.
+    static const std::string dir = [] {
+        wchar_t buf[MAX_PATH]{};
+        UINT n = GetSystemDirectoryW(buf, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH)
+            return std::string{};
+        return yuzu::win::from_wide(buf);
+    }();
+    return dir;
+}
+
 SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
                                          const SubprocessOptions& opts) {
     SubprocessResult result;
@@ -1495,6 +1649,21 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     launch_opts.exec_verify = {.enabled = opts.exec_verify.enabled,
                                .require_root_owned = opts.exec_verify.require_root_owned,
                                .expected_size = opts.exec_verify.expected_size};
+    // extra_env: SubprocessOptions::extra_env (vector<pair<string,string>>)
+    // and LaunchOptions::extra_env (vector<EnvVar>) are field-identical but
+    // SEPARATE types -- same reason as rlimits/exec_verify above -- so this
+    // is a manual element copy rather than a brace-init.
+    launch_opts.extra_env.reserve(opts.extra_env.size());
+    for (const auto& [key, value] : opts.extra_env)
+        launch_opts.extra_env.push_back({key, value});
+    // A2-002: THIS backend is the one that actually honours the flag -- see
+    // the env-block construction below and SubprocessOptions::
+    // inherit_parent_env's doc comment for the full contract.
+    launch_opts.inherit_parent_env = opts.inherit_parent_env;
+    // BR4-007: THIS backend is the one that actually honours no_window --
+    // see the create_flags computation below and SubprocessOptions::
+    // no_window's doc comment for the full contract.
+    launch_opts.no_window = opts.no_window;
 
     LaunchSpec spec = build_launch_spec(argv, launch_opts);
     if (spec.error != LaunchSpecError::none)
@@ -1516,25 +1685,158 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     const std::wstring app = utf8_to_wide(spec.argv.front());
     std::wstring cmdline = utf8_to_wide(spec.windows_command_line);
 
-    // A5: explicit lpEnvironment built from the SAME allow-list
-    // build_launch_spec assembled -- never NULL/never inherited.
+    // A5 (ordinary case): explicit lpEnvironment built from the SAME
+    // allow-list build_launch_spec assembled -- never NULL/never inherited.
+    //
+    // A2-002 (opt-in exception, script_exec's Windows-parity ruling): when
+    // inherit_parent_env is set, swap the BASE for this merge from the A5
+    // allow-list to a live read of this process' own real environment block
+    // -- reproducing the deleted CreateProcessA call's null-lpEnvironment
+    // behaviour (full parent-environment inheritance) -- and layer extra_env
+    // on top of THAT base via the exact same merge_launch_env()
+    // replace-never-duplicate semantics used below for the ordinary case.
+    // extra_env was already validated (denylist/malformed-entry checks) by
+    // build_launch_spec() above UNCONDITIONALLY, so nothing here can smuggle
+    // a denied name through just because this flag is set. This whole block
+    // is the impure boundary layer this flag's contract requires: reading
+    // GetEnvironmentStringsW() is real OS I/O that subprocess_launch_spec.hpp
+    // (a pure header) must never perform itself.
+    std::vector<EnvVar> sorted_env;
+    // BR-002 (whole-branch review round 2): the `=X:` per-drive current-
+    // directory pseudo-entries below (e.g. "=C:=C:\Users\foo") are excluded
+    // from `parent_env`/`sorted_env` (they are not real, settable
+    // environment variable NAMES -- see the loop comment) but are still
+    // part of process-environment inheritance semantics per the CreateProcess
+    // contract: they carry each drive's current directory, and Windows
+    // itself always emits them at the FRONT of GetEnvironmentStringsW()'s
+    // block, ahead of the alphabetically sorted real variables. Dropping
+    // them (the previous behaviour) meant a caller relying on `D:relative`
+    // path resolution after this migration silently lost that state.
+    // Collected as raw wide entries (never round-tripped through
+    // EnvVar/UTF-8 -- they are not KEY=VALUE pairs in the ordinary sense)
+    // and serialized verbatim ahead of `sorted_env` below.
+    std::vector<std::wstring> drive_pseudo_vars;
+    if (spec.inherit_parent_env) {
+        std::vector<EnvVar> parent_env;
+        // BR-004 (whole-branch review): GetEnvironmentStringsW() returns an
+        // OWNED block that used to be released only by a later, lexically
+        // paired FreeEnvironmentStringsW() call below -- lexical pairing is
+        // not ownership proof, because std::wstring construction/append and
+        // parent_env.push_back() between acquisition and that call are NOT
+        // noexcept. An exception thrown from any of them (allocation
+        // failure snapshotting a large service environment block, most
+        // plausibly) would skip the free entirely and leak the block; the
+        // agent's plugin exception firewall catches the exception, so the
+        // process survives to leak it again on the next inherit_parent_env
+        // call. Wrap the pointer in a scope-owning RAII guard immediately
+        // on acquisition instead, so every exit path -- normal fall-through
+        // OR an exception unwinding through this scope -- releases it
+        // exactly once via the destructor, never a manual call.
+        struct EnvironmentStringsDeleter {
+            void operator()(wchar_t* value) const noexcept {
+                if (value)
+                    FreeEnvironmentStringsW(value);
+            }
+        };
+        std::unique_ptr<wchar_t, EnvironmentStringsDeleter> env_strings{
+            GetEnvironmentStringsW()};
+        // BR-008 (whole-branch review): a null return here used to fall
+        // through silently, launching the child with an EMPTY parent-env
+        // base plus only opts.extra_env's few named overrides -- the
+        // OPPOSITE of inherit_parent_env's contract (full parent-env
+        // inheritance), with no error signalled anywhere. Fail the spawn
+        // instead: a caller that opted into full inheritance and can't get
+        // it should see spawn_error, not a child silently missing the
+        // credentials/proxy/tool configuration the parent's real
+        // environment would have carried.
+        if (!env_strings) {
+            result.termination_reason = TerminationReason::spawn_error;
+            return result;
+        }
+        for (const wchar_t* p = env_strings.get(); *p != L'\0';) {
+            std::wstring entry(p);
+            p += entry.size() + 1;
+            // BR-002: Windows' per-drive "=C:=C:\..." pseudo-variables are
+            // not a real, settable environment variable NAME (a leading '='
+            // means merge_launch_env/EnvVar's ordinary KEY=VALUE model does
+            // not apply), so they never go through parent_env/merge_launch_env
+            // -- but they ARE still part of what CreateProcessW's contract
+            // means by "the parent's environment", so preserve them verbatim
+            // for later, rather than discarding them entirely as the
+            // previous version of this loop did.
+            if (entry.empty() || entry.front() == L'=') {
+                if (!entry.empty())
+                    drive_pseudo_vars.push_back(std::move(entry));
+                continue;
+            }
+            auto eq = entry.find(L'=');
+            if (eq == std::wstring::npos)
+                continue; // malformed entry with no '=' at all -- skip, don't guess
+            parent_env.push_back({yuzu::win::from_wide(entry.substr(0, eq).c_str()),
+                                  yuzu::win::from_wide(entry.substr(eq + 1).c_str())});
+        }
+        // env_strings releases here (scope exit), on every path including
+        // an exception from the loop body above.
+        //
+        // BR-005 (adversarial review, HIGH): the POSIX backend above strips
+        // the ADR-3002 A5 injection class (LD_*/DYLD_*/IFS/BASH_ENV/ENV/
+        // GCONV_PATH/NLSPATH/LOCPATH) from an inherited parent environment
+        // via filter_inherited_env() BEFORE merging -- this branch used to
+        // merge the raw parent_env directly, so a Windows child opting into
+        // inherit_parent_env received the agent process' full, unfiltered
+        // environment (variables such as PROMPT/COMSPEC-adjacent injection
+        // vectors this process itself never authored). Apply the identical
+        // filter here so both backends enforce the same fail-closed
+        // contract; log what was withheld the same way the POSIX backend
+        // does, for the same observability reason (filter_inherited_env's
+        // own comment above).
+        EnvInheritResult filtered = filter_inherited_env(parent_env, /*windows=*/true);
+        for (const auto& name : filtered.stripped) {
+            spdlog::debug("run_bounded_subprocess: withholding inherited env var '{}' from the "
+                         "child (ADR-3002 A5 injection class, inherit_parent_env)",
+                         name);
+        }
+        sorted_env = merge_launch_env(filtered.env, launch_opts.extra_env, /*windows=*/true).env;
+    } else {
+        sorted_env.assign(spec.env.begin(), spec.env.end());
+    }
     //
     // K-10/L-d: a CreateProcess environment block MUST be sorted (MSDN:
     // "the block must be sorted alphabetically by name, case-insensitively, as
-    // in Unicode order"). build_launch_spec emits the allow-list in a fixed but
-    // not-necessarily-sorted order, so sort a copy by upper-cased key here
-    // before serializing. The keys are unique (allow-list), so a stable name
-    // sort is total.
-    std::vector<EnvVar> sorted_env(spec.env.begin(), spec.env.end());
+    // in Unicode order"). Both branches above emit their result in a fixed
+    // but not-necessarily-sorted order, so sort a copy by upper-cased key here
+    // before serializing. The keys are unique (allow-list / merge dedup), so
+    // a stable name sort is total.
+    // BR-003 (whole-branch review round 2): CreateProcess's own contract
+    // (MSDN) requires the block "sorted alphabetically... case-insensitively,
+    // as in Unicode order" -- a locale-independent ORDINAL comparison. The
+    // previous comparator upper-cased individual UTF-8 BYTES
+    // (std::toupper, which is also C-locale-dependent -- see
+    // to_upper_ascii's own comment in subprocess_launch_spec.hpp for why a
+    // security-adjacent comparison must never depend on process locale
+    // state), which is correct only for ASCII names and produces an
+    // unspecified, non-ordinal order for any non-ASCII byte -- reachable
+    // only via a genuinely non-ASCII INHERITED parent-environment variable
+    // name (extra_env's own is_malformed_env_entry check already rejects a
+    // non-ASCII name fail-closed, so this gap cannot come from there).
+    // CompareStringOrdinal is the actual Win32 primitive CreateProcessW's
+    // own contract is defined against -- use it directly on the wide form
+    // rather than re-deriving ordinal comparison by hand.
     std::sort(sorted_env.begin(), sorted_env.end(), [](const EnvVar& a, const EnvVar& b) {
-        auto up = [](std::string s) {
-            for (char& c : s)
-                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            return s;
-        };
-        return up(a.key) < up(b.key);
+        const std::wstring wa = utf8_to_wide(a.key);
+        const std::wstring wb = utf8_to_wide(b.key);
+        return CompareStringOrdinal(wa.c_str(), -1, wb.c_str(), -1, TRUE) == CSTR_LESS_THAN;
     });
     std::wstring env_block;
+    // BR-002: the `=X:` drive-current-directory pseudo-entries go FIRST,
+    // matching the order Windows itself always uses in
+    // GetEnvironmentStringsW()'s own block -- empty on the ordinary A5 case
+    // (drive_pseudo_vars is only ever populated inside the inherit_parent_env
+    // branch above), so this is a strict no-op there.
+    for (const auto& raw : drive_pseudo_vars) {
+        env_block += raw;
+        env_block += L'\0';
+    }
     for (const auto& e : sorted_env) {
         env_block += utf8_to_wide(e.key + "=" + e.value);
         env_block += L'\0';
@@ -1542,9 +1844,25 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     env_block += L'\0'; // double-NUL terminator
     std::vector<wchar_t> env_buf(env_block.begin(), env_block.end());
 
-    // A6: safe, non-writable working directory.
-    const std::wstring cwd =
-        spec.working_dir == "/" ? std::wstring(L"C:\\Windows\\System32") : utf8_to_wide(spec.working_dir);
+    // A6: safe, non-writable working directory. BR3-001 (whole-branch
+    // review round 3): resolved via windows_system_directory()
+    // (GetSystemDirectoryW) rather than trusted as a hard-coded
+    // "C:\Windows\System32" literal -- an install with Windows on a
+    // non-C: volume would otherwise default every migrated action into an
+    // untrusted, attacker-populatable directory tree. Fails the spawn
+    // (never falls back to the old literal) if resolution fails, matching
+    // the null-GetEnvironmentStringsW handling above.
+    std::wstring cwd;
+    if (spec.working_dir == "/") {
+        const std::string& sys_dir = windows_system_directory();
+        if (sys_dir.empty()) {
+            result.termination_reason = TerminationReason::spawn_error;
+            return result;
+        }
+        cwd = utf8_to_wide(sys_dir);
+    } else {
+        cwd = utf8_to_wide(spec.working_dir);
+    }
 
     // Output pipe: only the WRITE end must ever be inheritable, and only it is
     // named in the handle allow-list below (A1) -- the read end must never be.
@@ -1649,8 +1967,15 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     // CREATE_NEW_PROCESS_GROUP gives the group a CTRL_BREAK target for
     // soft_terminate_grace -- the Windows twin of POSIX's process-group
     // SIGTERM.
+    // BR4-007 (whole-branch review round 4): CREATE_NO_WINDOW, opt-in via
+    // spec.no_window (SubprocessOptions::no_window's doc comment has the
+    // full contract) -- suppresses a visible console window for a migrated
+    // caller whose deleted private Windows launcher used to set this flag
+    // itself. Does not otherwise change CREATE_NEW_PROCESS_GROUP's
+    // CTRL_BREAK target.
     const DWORD create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
-                                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP;
+                                CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_PROCESS_GROUP |
+                                (spec.no_window ? CREATE_NO_WINDOW : 0);
 
     std::vector<wchar_t> cmdline_buf(cmdline.begin(), cmdline.end());
     cmdline_buf.push_back(L'\0'); // CreateProcessW requires a MUTABLE lpCommandLine buffer
@@ -1751,25 +2076,38 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
     auto store_line = [&](std::string line) {
         if (!line.empty() && line.back() == '\r')
             line.pop_back();
-        if (line.empty())
-            return;
         // Uncapped streaming primitive (CDX-P2-005): every completed line
-        // reaches the callback regardless of max_lines or the blob cap.
+        // reaches the callback regardless of max_lines or the blob cap, AND
+        // a blank completed line is delivered too (A2-006 -- see the POSIX
+        // loop's store_line for the full reasoning; this is the same fix,
+        // mirrored). Only STORAGE below excludes blank lines.
         if (opts.on_line)
             opts.on_line(line);
+        if (line.empty())
+            return;
         // result.lines stays bounded: by max_lines when armed, else by the
         // output_cap byte budget. sec-7: the byte budget applies REGARDLESS
         // of whether max_lines is armed -- see the POSIX loop's store_line
         // for the full reasoning (an armed max_lines used to skip the
         // stored_line_bytes check entirely, letting result.lines grow up to
         // max_lines * output_cap).
-        const bool line_room =
-            stored_line_bytes < output_cap && (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
+        // BR-008 (whole-branch review round 2): comparing stored_line_bytes
+        // against output_cap with a strict `<` only proved SOME budget
+        // remained, not that THIS line's bytes fit within it -- a single
+        // stored line can be up to output_cap bytes long (line_buf's own
+        // accumulator caps it there), so a one-byte remainder could still
+        // admit a whole second cap-sized line, letting result.lines grow to
+        // nearly 2x the documented output_cap budget. Require the line's
+        // OWN source-byte count (+1 for the terminating newline, same
+        // accounting as below) to fit in the REMAINING budget instead.
+        const std::size_t source_bytes = line.size() + 1;
+        const bool line_room = source_bytes <= output_cap - stored_line_bytes &&
+                               (opts.max_lines == 0 || result.lines.size() < opts.max_lines);
         if (line_room) {
             // +1 for the terminating newline: count the SOURCE bytes the line
             // consumed, matching output_cap's blob accounting so result.lines
             // stays bounded by the same cap as result.output (BR-001).
-            stored_line_bytes += line.size() + 1;
+            stored_line_bytes += source_bytes;
             result.lines.push_back(std::move(line));
             if (opts.stop_after_max_lines && opts.max_lines != 0 &&
                 result.lines.size() >= opts.max_lines)

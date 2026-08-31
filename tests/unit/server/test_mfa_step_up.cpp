@@ -93,9 +93,25 @@ struct StepUpFixture {
         auth::Session s;
         s.username = user;
         s.role = (user == "alice") ? Role::admin : Role::user;
-        s.expires_at = std::chrono::system_clock::now() + std::chrono::hours(1);
         s.auth_source = source;
-        s.mfa_verified_at = verified_at;
+        // Since HA WS-1/1a DB-clock authority (ADR-2002 §4), require_mfa_step_up
+        // ages against the local monotonic `steady_mfa_verified` derived by
+        // AuthManager::derive_session_deadlines, not the raw wall `mfa_verified_at`
+        // — so populate through it (here the local wall clock is the authority).
+        // The total verified→check elapsed age is identical to the old wall path,
+        // and derive maps an epoch (no proof) / future-dated (backward step) proof
+        // to the {} sentinel exactly as the old `mfa_verified_at > now` guard did.
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+        const std::int64_t verified_ms =
+            verified_at.time_since_epoch().count() == 0
+                ? 0
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      verified_at.time_since_epoch())
+                      .count();
+        auth::AuthManager::derive_session_deadlines(s, now, now + 3600'000, now, verified_ms,
+                                                    /*elevated_until*/ 0, /*issued*/ 0, now);
         return s;
     }
 };
