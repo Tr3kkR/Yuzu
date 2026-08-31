@@ -1501,6 +1501,40 @@ TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true forwards the
     CHECK(result.lines[1] == "extra_value");
 }
 
+TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true withholds the ADR-3002 A5 "
+          "injection class from the child, matching the POSIX backend (BR-005)",
+          "[subprocess][windows][env][inherit_parent_env]") {
+    // Present in the raw GetEnvironmentStringsW() snapshot (proven by the
+    // no-regression test above establishing the harness can see a marker
+    // set via _putenv_s), but must never reach the child once
+    // inherit_parent_env=true routes it through filter_inherited_env --
+    // Windows matching is case-insensitive, so an uppercased "LD_PRELOAD"
+    // and "IFS" both exercise the same detail::is_denied_env_name() path
+    // the POSIX test above exercises.
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value");
+    (void)_putenv_s("LD_PRELOAD", "evil.dll");
+    (void)_putenv_s("IFS", "broken");
+    SubprocessResult result = run_bounded_subprocess(
+        {kCmdExe, "/d", "/c",
+         "echo %YUZU_TEST_INHERIT_ENV_MARKER% & echo [%LD_PRELOAD%] & echo [%IFS%]"},
+        SubprocessOptions{.deadline = 10000ms, .inherit_parent_env = true});
+    (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", ""); // best-effort cleanup
+    (void)_putenv_s("LD_PRELOAD", "");
+    (void)_putenv_s("IFS", "");
+
+    CHECK(result.tool_ran);
+    REQUIRE(result.lines.size() == 3);
+    // The real parent value survives -- this name is not in the A5 injection
+    // class, so ordinary full-environment inheritance still applies.
+    CHECK(result.lines[0] == "parent_value");
+    // cmd.exe echoes the literal "%VAR%" placeholder when the child's OWN
+    // environment has no such name -- proving filter_inherited_env withheld
+    // both, exactly as the POSIX backend's twin test proves for LD_PRELOAD
+    // and IFS.
+    CHECK(result.lines[1] == "[%LD_PRELOAD%]");
+    CHECK(result.lines[2] == "[%IFS%]");
+}
+
 // K2/CDX-P2-003: the Windows "is executable" half of probe_tool_path's
 // header contract -- previously the backend only checked exists-and-not-a-
 // directory, so an existing .txt, a directory sibling, or a spawn-banned

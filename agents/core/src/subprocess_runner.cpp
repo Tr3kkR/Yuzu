@@ -1748,7 +1748,26 @@ SubprocessResult run_bounded_subprocess(const std::vector<std::string>& argv,
         }
         // env_strings releases here (scope exit), on every path including
         // an exception from the loop body above.
-        sorted_env = merge_launch_env(parent_env, launch_opts.extra_env, /*windows=*/true).env;
+        //
+        // BR-005 (adversarial review, HIGH): the POSIX backend above strips
+        // the ADR-3002 A5 injection class (LD_*/DYLD_*/IFS/BASH_ENV/ENV/
+        // GCONV_PATH/NLSPATH/LOCPATH) from an inherited parent environment
+        // via filter_inherited_env() BEFORE merging -- this branch used to
+        // merge the raw parent_env directly, so a Windows child opting into
+        // inherit_parent_env received the agent process' full, unfiltered
+        // environment (variables such as PROMPT/COMSPEC-adjacent injection
+        // vectors this process itself never authored). Apply the identical
+        // filter here so both backends enforce the same fail-closed
+        // contract; log what was withheld the same way the POSIX backend
+        // does, for the same observability reason (filter_inherited_env's
+        // own comment above).
+        EnvInheritResult filtered = filter_inherited_env(parent_env, /*windows=*/true);
+        for (const auto& name : filtered.stripped) {
+            spdlog::debug("run_bounded_subprocess: withholding inherited env var '{}' from the "
+                         "child (ADR-3002 A5 injection class, inherit_parent_env)",
+                         name);
+        }
+        sorted_env = merge_launch_env(filtered.env, launch_opts.extra_env, /*windows=*/true).env;
     } else {
         sorted_env.assign(spec.env.begin(), spec.env.end());
     }
