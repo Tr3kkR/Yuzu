@@ -1,45 +1,72 @@
 /**
  * test_session_store.cpp -- SessionStore (HA WS-1/1a) behaviour tests.
  *
- * Behaviour cases use the pre-migrated template (YUZU_REQUIRE_PG_DB_TPL); the
- * fresh-migrate / fail-closed cases use YUZU_REQUIRE_PG_MIGRATION_DB. All behind
- * YUZU_TEST_ENABLE_PG (server suite only) — skipped when the DSN is unset.
+ * Since the WS-1/1a DB-clock-authority completion (ADR-2002 §4), the store
+ * AUTHORS every timestamp from Postgres now() (create takes a DURATION, not an
+ * absolute; set_elevation/mark_mfa/touch stamp now()) and find() returns db_now_ms
+ * in the same SELECT. These tests assert against the store-RETURNED authored
+ * values (never a test-computed wall clock), and the reap clock-anomaly cases
+ * poison the persisted anchor directly (reap reads the DB clock itself now).
+ *
+ * Behind YUZU_TEST_ENABLE_PG (server suite only) — skipped when the DSN is unset.
  */
 
 #include "session_store.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
-#include <chrono>
+#include <cstdlib>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
 
 namespace {
 
-std::int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
+constexpr std::int64_t k8hMs = 8LL * 3600 * 1000;
+
+SessionWriteParams make_params(std::string hash, std::string user,
+                               std::int64_t lifetime_ms = k8hMs) {
+    SessionWriteParams p;
+    p.token_hash = std::move(hash);
+    p.username = std::move(user);
+    p.display_name = "Test User";
+    p.role = "admin";
+    p.auth_source = "local";
+    p.principal_kind = "human";
+    p.session_lifetime_ms = lifetime_ms;
+    return p;
 }
 
-SessionRow make_row(std::string hash, std::string user, std::int64_t now) {
-    SessionRow r;
-    r.token_hash = std::move(hash);
-    r.username = std::move(user);
-    r.display_name = "Test User";
-    r.role = "admin";
-    r.auth_source = "local";
-    r.principal_kind = "human";
-    r.created_at_ms = now;
-    r.expires_at_ms = now + 8 * 3600 * 1000; // +8h
-    r.last_activity_ms = now;
-    return r;
+// The DB clock in wall-clock epoch-millis (the same expression the store uses).
+std::int64_t db_now_ms(PgPool& pool) {
+    auto lease = pool.acquire();
+    auto r = pg::exec_params(lease.get(), "SELECT (extract(epoch from now())*1000)::bigint",
+                             std::vector<std::string>{});
+    return std::strtoll(PQgetvalue(r.get(), 0, 0), nullptr, 10);
+}
+
+void set_meta(PgPool& pool, const std::string& key, std::int64_t value) {
+    auto lease = pool.acquire();
+    pg::exec_params(lease.get(),
+                    "INSERT INTO session_store.session_meta (key, value) VALUES ($1, $2) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    std::vector<std::string>{key, std::to_string(value)});
+}
+
+void set_last_activity(PgPool& pool, const std::string& hash, std::int64_t ms) {
+    auto lease = pool.acquire();
+    pg::exec_params(lease.get(),
+                    "UPDATE session_store.sessions SET last_activity_ms=$2::bigint "
+                    "WHERE token_hash=$1",
+                    std::vector<std::string>{hash, std::to_string(ms)});
 }
 
 // Setup constructs the store (runs the migration), then closes all conns.
@@ -52,30 +79,37 @@ yuzu::test::PgTestTemplate session_store_tpl{"sessstore", [](const std::string& 
 
 } // namespace
 
-TEST_CASE("SessionStore: create → find round-trips every field", "[session_store][pg]") {
+TEST_CASE("SessionStore: create authors from now() and find round-trips every field",
+          "[session_store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SessionStore store{pool};
     REQUIRE(store.is_open());
 
-    const auto now = now_ms();
-    auto row = make_row("hash-abc", "alice", now);
-    row.oidc_sub = "sub-123";
-    row.mcp_tier = "operator";
-    row.mfa_verified_ms = now;
+    auto p = make_params("hash-abc", "alice");
+    p.oidc_sub = "sub-123";
+    p.mcp_tier = "operator";
+    p.mfa_verified_now = true; // local step-up → mfa_verified authored = now()
 
-    REQUIRE(store.create(row).has_value());
+    auto created = store.create(p);
+    REQUIRE(created.has_value());
+    // Timestamps are DB-authored: expires = now() + lifetime; mfa/last_activity = now().
+    CHECK(created->expires_at_ms == created->db_now_ms + k8hMs);
+    CHECK(created->mfa_verified_ms == created->db_now_ms);
+    CHECK(created->last_activity_ms == created->db_now_ms);
+    CHECK(created->created_at_ms == created->db_now_ms);
 
     auto got = store.find("hash-abc");
-    REQUIRE(got.has_value());          // no DB error
-    REQUIRE(got->has_value());         // present
-    CHECK((*got)->username == "alice");
-    CHECK((*got)->role == "admin");
-    CHECK((*got)->oidc_sub == "sub-123");
-    CHECK((*got)->mcp_tier == "operator");
-    CHECK((*got)->expires_at_ms == row.expires_at_ms);
-    CHECK((*got)->mfa_verified_ms == now);
+    REQUIRE(got.has_value());  // no DB error
+    REQUIRE(got->has_value()); // present
+    CHECK((*got)->row.username == "alice");
+    CHECK((*got)->row.role == "admin");
+    CHECK((*got)->row.oidc_sub == "sub-123");
+    CHECK((*got)->row.mcp_tier == "operator");
+    CHECK((*got)->row.expires_at_ms == created->expires_at_ms);
+    CHECK((*got)->row.mfa_verified_ms == created->mfa_verified_ms);
+    CHECK((*got)->db_now_ms >= created->db_now_ms); // the read clock is at/after authoring
 
     // A definitively-absent read is nullopt, NOT an error (type-distinguishable).
     auto missing = store.find("nope");
@@ -89,55 +123,71 @@ TEST_CASE("SessionStore: mutations bump the durable generation; touch does not",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    const auto now = now_ms();
 
     auto g0 = store.read_generation();
     REQUIRE(g0.has_value());
 
-    REQUIRE(store.create(make_row("h1", "bob", now)).has_value());
+    REQUIRE(store.create(make_params("h1", "bob")).has_value());
     auto g1 = store.read_generation();
     REQUIRE(g1.has_value());
     CHECK(*g1 > *g0); // create bumped
 
-    REQUIRE(store.mark_mfa("h1", now).has_value());
+    auto mfa = store.mark_mfa("h1");
+    REQUIRE(mfa.has_value());
+    REQUIRE(mfa->has_value()); // session existed
     auto g2 = store.read_generation();
-    REQUIRE(*g2 > *g1); // mfa bumped
+    CHECK(*g2 > *g1); // mfa bumped
 
     // touch_activity is a sliding update — must NOT bump the generation.
-    REQUIRE(store.touch_activity("h1", now + 1000).has_value());
+    auto touched = store.touch_activity("h1");
+    REQUIRE(touched.has_value());
+    CHECK(*touched); // existed
     auto g3 = store.read_generation();
     REQUIRE(g3.has_value());
     CHECK(*g3 == *g2);
 }
 
-TEST_CASE("SessionStore: elevation set/clear and per-user clear", "[session_store][pg]") {
+TEST_CASE("SessionStore: elevation authored from now(), clamped to expiry, cleared per-user",
+          "[session_store][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    const auto now = now_ms();
 
-    REQUIRE(store.create(make_row("h1", "carol", now)).has_value());
-    REQUIRE(store.create(make_row("h2", "carol", now)).has_value());
+    REQUIRE(store.create(make_params("h1", "carol")).has_value());
+    REQUIRE(store.create(make_params("h2", "carol")).has_value());
 
-    auto set = store.set_elevation("h1", now + 600'000, now);
+    auto set = store.set_elevation("h1", 600'000); // 10 min
     REQUIRE(set.has_value());
-    CHECK(*set); // existed
+    REQUIRE(set->has_value()); // a row was updated
+    CHECK((*set)->elevation_issued_ms == (*set)->db_now_ms);
+    CHECK((*set)->elevated_until_ms == (*set)->db_now_ms + 600'000); // < expiry (+8h): unclamped
     auto row = store.find("h1");
-    CHECK((*row)->elevated_until_ms == now + 600'000);
-    CHECK((*row)->elevation_issued_ms == now);
+    CHECK((*row)->row.elevated_until_ms == (*set)->elevated_until_ms);
+    CHECK((*row)->row.elevation_issued_ms == (*set)->elevation_issued_ms);
 
-    // set on a missing session returns existed=false, not an error.
-    auto missing = store.set_elevation("nope", now + 1, now);
+    // A duration LONGER than the remaining lifetime is CLAMPED to expires_at (SQL LEAST).
+    auto over = store.set_elevation("h2", 100LL * 3600 * 1000); // 100h >> 8h lifetime
+    REQUIRE(over.has_value());
+    REQUIRE(over->has_value());
+    CHECK((*over)->elevated_until_ms == (*over)->expires_at_ms); // clamped to absolute expiry
+
+    // set on a missing session → nullopt (no row updated), not an error.
+    auto missing = store.set_elevation("nope", 1000);
     REQUIRE(missing.has_value());
-    CHECK_FALSE(*missing);
+    CHECK_FALSE(missing->has_value());
 
-    // clear per-user clears every elevated session for that user.
-    REQUIRE(store.set_elevation("h2", now + 600'000, now).has_value());
+    // A grant on an ALREADY-EXPIRED session hits the SQL dead-window guard → nullopt.
+    REQUIRE(store.create(make_params("h3", "carol", -1000)).has_value()); // expired at birth
+    auto dead = store.set_elevation("h3", 600'000);
+    REQUIRE(dead.has_value());
+    CHECK_FALSE(dead->has_value());
+
+    // per-user clear clears every elevated session for that user.
     auto cleared = store.clear_user_elevations("carol");
     REQUIRE(cleared.has_value());
-    CHECK(*cleared == 2);
-    CHECK((*store.find("h1"))->elevated_until_ms == 0);
+    CHECK(*cleared == 2); // h1 + h2 (h3 never elevated)
+    CHECK((*store.find("h1"))->row.elevated_until_ms == 0);
 }
 
 TEST_CASE("SessionStore: invalidate one and per-user", "[session_store][pg]") {
@@ -145,11 +195,10 @@ TEST_CASE("SessionStore: invalidate one and per-user", "[session_store][pg]") {
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    const auto now = now_ms();
 
-    REQUIRE(store.create(make_row("h1", "dave", now)).has_value());
-    REQUIRE(store.create(make_row("h2", "dave", now)).has_value());
-    REQUIRE(store.create(make_row("h3", "erin", now)).has_value());
+    REQUIRE(store.create(make_params("h1", "dave")).has_value());
+    REQUIRE(store.create(make_params("h2", "dave")).has_value());
+    REQUIRE(store.create(make_params("h3", "erin")).has_value());
 
     auto one = store.invalidate("h1");
     REQUIRE(one.has_value());
@@ -158,7 +207,7 @@ TEST_CASE("SessionStore: invalidate one and per-user", "[session_store][pg]") {
 
     auto n = store.invalidate_user("dave");
     REQUIRE(n.has_value());
-    CHECK(*n == 1); // only h2 remained for dave
+    CHECK(*n == 1);                       // only h2 remained for dave
     CHECK(store.find("h3")->has_value()); // erin untouched
 }
 
@@ -168,15 +217,11 @@ TEST_CASE("SessionStore: reap deletes only absolutely-expired sessions",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    const auto now = now_ms();
 
-    auto live = make_row("live", "frank", now); // expires_at = now + 8h
-    auto dead = make_row("dead", "frank", now);
-    dead.expires_at_ms = now - 1000; // already expired
-    REQUIRE(store.create(live).has_value());
-    REQUIRE(store.create(dead).has_value());
+    REQUIRE(store.create(make_params("live", "frank")).has_value());        // +8h
+    REQUIRE(store.create(make_params("dead", "frank", -1000)).has_value()); // already expired
 
-    auto reaped = store.reap_expired(now);
+    auto reaped = store.reap_expired();
     REQUIRE(reaped.has_value());
     CHECK(reaped->deleted == 1);
     CHECK_FALSE(reaped->clock_anomaly); // a normal accepted pass is not an anomaly
@@ -184,76 +229,61 @@ TEST_CASE("SessionStore: reap deletes only absolutely-expired sessions",
     CHECK_FALSE(store.find("dead")->has_value());
 }
 
-TEST_CASE("SessionStore: reap declines an implausibly-forward clock reading",
+TEST_CASE("SessionStore: reap declines an anchor implausibly BEHIND the DB clock (forward skew)",
           "[session_store][pg][retention]") {
+    // reap reads the DB clock itself now, so a forward-skew is modelled by a
+    // POISONED anchor far in the past: DB now() > anchor + kMaxPlausibleSkewMs.
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    const auto now = now_ms();
 
-    auto dead = make_row("dead", "gina", now);
-    dead.expires_at_ms = now - 1000;
-    REQUIRE(store.create(dead).has_value());
+    REQUIRE(store.create(make_params("dead2", "gina", -1000)).has_value());
+    // Anchor ~2 years behind the DB clock (kMaxPlausibleSkewMs is ~1y).
+    set_meta(pool, "reap_anchor_ms", db_now_ms(pool) - 2LL * 366 * 24 * 3600 * 1000);
 
-    // First pass at a sane clock anchors it.
-    REQUIRE(store.reap_expired(now).has_value());
-
-    auto dead2 = make_row("dead2", "gina", now);
-    dead2.expires_at_ms = now - 1000;
-    REQUIRE(store.create(dead2).has_value());
-
-    // A wildly-forward reading (well beyond the plausible-skew bound) is declined:
-    // the pass must NOT delete under an anomalous clock.
-    auto reaped = store.reap_expired(now + 2LL * 366 * 24 * 3600 * 1000);
+    auto reaped = store.reap_expired();
     REQUIRE(reaped.has_value());
     CHECK(reaped->deleted == 0);
-    CHECK(reaped->clock_anomaly); // forward-skew decline is a clock anomaly
+    CHECK(reaped->clock_anomaly);            // forward-skew decline is a clock anomaly
     CHECK(store.find("dead2")->has_value()); // survived the declined pass
 }
 
-TEST_CASE("SessionStore: reap declines a reading BEHIND the anchor (backward/poisoned)",
+TEST_CASE("SessionStore: reap declines an anchor AHEAD of the DB clock (backward/poisoned)",
           "[session_store][pg][retention]") {
-    // Adversarial C8/K5: a now_ms below the highest accepted anchor means the
-    // clock moved backward (or an earlier forward-skewed pass poisoned the
-    // anchor); the pass must decline, never mass-delete under a rewound clock.
+    // A DB now() below the highest accepted anchor = the clock moved backward (or
+    // the anchor was poisoned forward); the pass must decline, never mass-delete.
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    const auto now = now_ms();
 
-    auto dead = make_row("dead", "hank", now);
-    dead.expires_at_ms = now - 1000;
-    REQUIRE(store.create(dead).has_value());
-    REQUIRE(store.reap_expired(now).has_value()); // anchors at `now`
+    REQUIRE(store.create(make_params("dead2", "hank", -1000)).has_value());
+    // Anchor 1h AHEAD of the DB clock → now_ms < anchor → backward decline.
+    set_meta(pool, "reap_anchor_ms", db_now_ms(pool) + 3600LL * 1000);
 
-    auto dead2 = make_row("dead2", "hank", now);
-    dead2.expires_at_ms = now - 1000;
-    REQUIRE(store.create(dead2).has_value());
-
-    // A reading an hour BEHIND the anchor is declined (would otherwise delete a
-    // still-live-under-true-time session when the anchor is poisoned forward).
-    auto reaped = store.reap_expired(now - 3600LL * 1000);
+    auto reaped = store.reap_expired();
     REQUIRE(reaped.has_value());
     CHECK(reaped->deleted == 0);
     CHECK(reaped->clock_anomaly); // backward-skew decline is a clock anomaly
     CHECK(store.find("dead2")->has_value());
 }
 
-TEST_CASE("SessionStore: touch_activity is monotonic — never regresses last_activity",
+TEST_CASE("SessionStore: touch_activity is monotonic — a now() stamp never regresses last_activity",
           "[session_store][pg]") {
-    // Adversarial C3: GREATEST() so an out-of-order / skewed write cannot move
-    // the idle anchor backward and prematurely idle-out an active session.
+    // GREATEST() so a now()-stamp on this replica cannot move the idle anchor
+    // backward past a newer value written by another (forward) writer.
     YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     SessionStore store{pool};
     REQUIRE(store.is_open());
-    const auto now = now_ms();
-    REQUIRE(store.create(make_row("h", "ivy", now)).has_value());
+    REQUIRE(store.create(make_params("h", "ivy")).has_value());
 
-    REQUIRE(store.touch_activity("h", now + 5000).has_value()); // forward
-    CHECK((*store.find("h"))->last_activity_ms == now + 5000);
-    REQUIRE(store.touch_activity("h", now + 1000).has_value()); // stale/out-of-order
-    CHECK((*store.find("h"))->last_activity_ms == now + 5000);   // NOT regressed
+    // Force last_activity to the FUTURE (as if a forward writer stamped it), then
+    // touch (which stamps the DB clock, i.e. ~now, well below the future value):
+    // GREATEST must keep the future value, not regress to now().
+    const std::int64_t future = db_now_ms(pool) + 60'000;
+    set_last_activity(pool, "h", future);
+    REQUIRE(store.touch_activity("h").has_value());
+    CHECK((*store.find("h"))->row.last_activity_ms == future); // NOT regressed
 }

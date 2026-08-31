@@ -3697,7 +3697,12 @@ Custom properties are operator-defined key-value pairs on agents, separate from 
 
 List all custom properties for a specific agent.
 
-**Permission:** `Infrastructure:Read`
+**Permission:** `Infrastructure:Read`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
+confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
+below for a degraded properties-store read.
 
 **Error (503) -- store degraded:** `custom_properties_store` is a migrated Postgres store
 (authoritative posture); a transient database read failure returns `503` rather than an
@@ -3732,7 +3737,12 @@ properties."
 
 Set or update a custom property value on an agent. If a property schema exists for the key, the value is validated against it.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
+confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
+below for a degraded properties-store write.
 
 **Request body:**
 
@@ -3783,7 +3793,13 @@ accepting it unvalidated); this change only affects which status code that rejec
 
 Delete a custom property from an agent.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
+confinement check (management-group store unavailable) denies with `403` -- distinct from the `404`
+degrade conflation noted below, which is a property-store issue on the delete path itself, not the
+authorization check.
 
 **Response:**
 
@@ -7733,17 +7749,22 @@ Install a product pack from a multi-document YAML bundle.
 |---|---|---|---|
 | `yaml_bundle` | string | Yes | Multi-document YAML; each `---`-separated document is parsed for its `kind:` and delegated to the matching store (`InstructionDefinition` → instructions, `PolicyFragment` → policies, etc.). A `ProductPack` document carries the pack metadata (`name`, `version`, `description`, optional `signature` + `publicKey`). |
 
+**Optional request header (#3481):** `Idempotency-Key` (max 200 characters). A retry carrying the same key and a `yaml_bundle` **identical after sanitization** (the same sanitize-on-write step every free-text column goes through — invalid UTF-8/embedded NULs are normalized before comparison, so this is not a literal byte-for-byte check) returns `201` with the *original* pack id — no sibling-store install delegation runs again. The same key reused with a **different** `yaml_bundle` is rejected as `400` (see below). The key is global (not scoped per-caller/principal), so use a value unlikely to collide across callers (a UUID, for example). Omitting the header preserves prior behavior exactly: every call mints a fresh pack id with no dedup. A narrow race remains between two concurrent installs sharing the same not-yet-used key: both can pass the pre-check before either commits, in which case the loser hits the partial unique index as an ordinary persist failure and is compensated via the same path as any other late failure. A client retry then converges — to the winner's id if the retried body matches the winner's, or to the `400` idempotency-conflict error below if it differs (the loser's original body, not the winner's, is what gets retried in practice).
+
 **Response:**
-- `201 Created` `{"id": "<pack-id>", "status": "installed"}` on success.
-- `400 Bad Request` — malformed YAML, missing required fields, item-install delegation failures, or a signature rejection. Distinct error messages:
+- `201 Created` `{"id": "<pack-id>", "status": "installed"}` on success, or on an idempotent replay (same key, same body). **Partial success (#3479):** `install_fn` tolerates a single document failing without failing the whole bundle — when at least one document failed alongside ones that succeeded, the body additionally carries `"errors": [...]` (one entry per failed document, in bundle order — `"<kind>: <reason>"` for a document whose `install_fn` delegate rejected it, or a bare `"document <N> has no kind"` for one with no inferrable `kind:` at all), `"installed_count"` (how many succeeded), and `"total_items"` (item documents in the bundle, excluding the `ProductPack` metadata document itself). These three fields are OMITTED entirely when every item document succeeded — a client checking `body.errors` (or its absence) can distinguish a clean install from a partial one without parsing anything else. An idempotency-key replay never populates them (`install_fn` doesn't re-run on a replay), even if the ORIGINAL install that minted the key was itself partial (gov Gate 4, unhappy-path UP-1) — the two attempts' audit rows will disagree (the original's `success` row names a failed/total count in `detail`, the replay's does not), which is expected: the replay is reporting "no new install_fn work happened," not re-asserting the original outcome. Check the ORIGINAL attempt's audit row (same `target_id`) for the authoritative partial-failure detail, not the replay's.
+- `400 Bad Request` — malformed YAML, missing required fields, item-install delegation failures, a signature rejection, or an idempotency-key conflict. Distinct error messages:
+  - `no items installed: <reason>; <reason>; ...` — EVERY item document in the bundle failed to install (each `<reason>` is `<kind>: <install_fn's rejection>`, or a bare `document <N> has no kind` for one with no inferrable `kind:` at all — same two shapes as the partial-success `errors[]` array above). `#3479`: every document's reason is joined here (`; `-separated, bundle order), not just the first — a bundle with several independently-wrong documents used to only ever surface one.
   - `pack '<name>' is unsigned and signature enforcement is enabled (set --allow-unsigned-packs / YUZU_ALLOW_UNSIGNED_PACKS=1 to bypass)` — the install was refused because the pack carried no `signature:` field and the server is enforcing signatures (default since #802). Either sign the pack or set the escape-hatch flag.
   - `signature verification failed for pack '<name>' — content may have been tampered with` — the signature was present but did not verify against the supplied public key.
   - `pack '<name>' has signature but no publicKey — cannot verify` — the bundle carried a `signature:` field but no `publicKey:`.
-  - `duplicate item id in bundle: '<item_id>'` — two documents in the bundle were assigned the same item id (by their `install_fn` delegate). Detected before any database interaction; this condition is deterministic, so a retry with the same bundle always fails the same way — never retry, fix the bundle instead.
-- `503 Service Unavailable` — the product pack store is unreachable (down/unmigrated) or a database error occurred persisting the pack. The response body carries only a generic `"service unavailable"` message; the specific database error is logged server-side, never echoed to the caller (migrated store — ADR-0054, mirrors `sw_deploy_client_message`/`device_token_client_message`'s established rationale for not leaking `PQerrorMessage()` fragments).
+  - `duplicate item id in bundle: '<item_id>' (compensated N/M item(s))` — two documents in the bundle were assigned the same item id (by their `install_fn` delegate). Detected before any database interaction; this condition is deterministic, so a retry with the same bundle always fails the same way — never retry, fix the bundle instead. The `(compensated N/M item(s))` suffix (#3481, gov Gate 6) is appended whenever a compensation attempt actually ran (the real REST route always supplies `compensate_fn`, so in practice this always appears here) — `N == M` means every already-installed item was cleaned up; `N < M` means a residual orphan needs manual/operator cleanup (see the compensation metric below).
+  - `idempotency key already used with a different request body` (#3481) — the `Idempotency-Key` header matches a prior install whose `yaml_bundle` differs from this request's. Use a fresh key for a genuinely new install.
+  - `Idempotency-Key header too long (max 200 characters)` (#3481) — rejected before the store is touched; not audited (see below).
+- `503 Service Unavailable` — the product pack store is unreachable (down/unmigrated) or a database error occurred persisting the pack. The response body carries only a generic `"service unavailable"` message; the specific database error is logged server-side, never echoed to the caller (migrated store — ADR-0054, mirrors `sw_deploy_client_message`/`device_token_client_message`'s established rationale for not leaking `PQerrorMessage()` fragments). **Since #3481:** any sibling-store items already installed before this failure are now best-effort compensated (rolled back) rather than silently orphaned — see `yuzu_server_product_pack_install_compensation_total` in the metrics reference.
 - Both the `400` and `503` bodies use the standard **A4 error envelope** (`{"error": {"code", "message", "correlation_id", ...}, "meta": {"api_version": "v1"}}`, see [JSON Envelope](#json-envelope) above). **Breaking change (ADR-0054):** pre-migration, a rejected install returned a bare `{"error": "<message>"}` body — a client parsing that flat shape (rather than treating the body as opaque diagnostic text) must switch to reading `error.message`.
 
-**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on accepted install, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any `400` or `503` rejection (closes the SOC 2 CC6.7 logging gap from W7.4 governance).
+**Audit:** Emits `product_pack.install` with `result=success` and `target_id=<pack-id>` on an accepted install OR an idempotent replay, or `result=denied` with `target_type=ProductPack`, empty `target_id`, and the rejection message in `detail` on any rejection that reaches `ProductPackStore::install()` — this covers every `400`/`503` above **except** an oversized `Idempotency-Key` header, which is rejected before `install()` is ever called and is not audited, the same pre-existing convention this endpoint uses for a malformed request body or an unavailable store (see `audit-log.md`). On a partial success (#3479), the `success` row's `detail` additionally carries `"<failed>/<total> item(s) failed to install"` — an auditor doesn't need to re-fetch the response body to know a partial failure occurred, only its count; the specific per-item reasons live in the response body only.
 
 #### `GET /api/product-packs`
 

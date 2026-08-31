@@ -85,6 +85,36 @@ constexpr const char* kSelectCols =
     "token_hash, username, display_name, role, auth_source, oidc_sub, token_scope_service, "
     "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, mfa_verified_ms, "
     "elevated_until_ms, elevation_issued_ms";
+// The 15 columns kSelectCols lists (indices 0..14 in row_from) — so find()'s
+// appended db_now expression lands at index kSessionRowColumns. Keep these two in
+// lockstep: a column added to kSelectCols/row_from MUST bump this, or the db_now
+// read shifts silently. find() also guards PQnfields at runtime as a backstop.
+constexpr int kSessionRowColumns = 15;
+
+// The DB clock at statement time, in wall-clock epoch-millis. `now()` is
+// transaction-start time and is STABLE within a txn, so every use inside one
+// txn (SET value, WHERE guard, RETURNING) reads the same instant — that
+// stability is what makes "author and return the same now()" exact.
+constexpr const char* kDbNowMsSql = "(extract(epoch from now())*1000)::bigint";
+
+// RETURNING clause naming the six authored time columns + db_now, in the order
+// authored_from() reads them. Shared by create/set_elevation/mark_mfa so the
+// caller always seeds its cache with the exact DB-authored values.
+constexpr const char* kAuthoredReturning =
+    "created_at_ms, expires_at_ms, last_activity_ms, mfa_verified_ms, "
+    "elevated_until_ms, elevation_issued_ms, (extract(epoch from now())*1000)::bigint";
+
+AuthoredTimes authored_from(PGresult* res, int i) {
+    AuthoredTimes t;
+    t.created_at_ms = to_i64(PQgetvalue(res, i, 0));
+    t.expires_at_ms = to_i64(PQgetvalue(res, i, 1));
+    t.last_activity_ms = to_i64(PQgetvalue(res, i, 2));
+    t.mfa_verified_ms = to_i64(PQgetvalue(res, i, 3));
+    t.elevated_until_ms = to_i64(PQgetvalue(res, i, 4));
+    t.elevation_issued_ms = to_i64(PQgetvalue(res, i, 5));
+    t.db_now_ms = to_i64(PQgetvalue(res, i, 6));
+    return t;
+}
 
 const std::vector<pg::PgMigration>& migrations() {
     static const std::vector<pg::PgMigration> kMigrations = {
@@ -128,22 +158,29 @@ SessionStore::SessionStore(pg::PgPool& pool) : pool_(pool) {
     open_ = true;
 }
 
-std::expected<void, SessionStore::Error> SessionStore::create(const SessionRow& row) {
+std::expected<AuthoredTimes, SessionStore::Error>
+SessionStore::create(const SessionWriteParams& params) {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
-    if (row.token_hash.empty() || row.username.empty())
+    if (params.token_hash.empty() || params.username.empty())
         return std::unexpected(Error{"token_hash and username are required"});
 
+    AuthoredTimes authored;
     std::string err;
+    // created_at / expires_at / last_activity are authored from the ONE DB clock
+    // (`now()`, txn-stable); mfa_verified is now() for a local login step-up, else
+    // the passed absolute (an IdP proof time, or 0). `n.ms` is that now() reused
+    // across the INSERT and the RETURNING so the caller's cache gets exact values.
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         PgResult r = exec_params(
             c,
-            "INSERT INTO session_store.sessions ("
+            ("INSERT INTO session_store.sessions ("
             "token_hash, username, display_name, role, auth_source, oidc_sub, token_scope_service, "
             "mcp_tier, principal_kind, created_at_ms, expires_at_ms, last_activity_ms, "
-            "mfa_verified_ms, elevated_until_ms, elevation_issued_ms) VALUES ("
-            "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10::bigint,$11::bigint,$12::bigint,$13::bigint,"
-            "$14::bigint,$15::bigint) "
+            "mfa_verified_ms, elevated_until_ms, elevation_issued_ms) "
+            "SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9, n.ms, n.ms + $10::bigint, n.ms, "
+            "CASE WHEN $11::bool THEN n.ms ELSE $12::bigint END, 0, 0 "
+            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
             "ON CONFLICT (token_hash) DO UPDATE SET "
             "username=EXCLUDED.username, display_name=EXCLUDED.display_name, role=EXCLUDED.role, "
             "auth_source=EXCLUDED.auth_source, oidc_sub=EXCLUDED.oidc_sub, "
@@ -151,25 +188,27 @@ std::expected<void, SessionStore::Error> SessionStore::create(const SessionRow& 
             "principal_kind=EXCLUDED.principal_kind, created_at_ms=EXCLUDED.created_at_ms, "
             "expires_at_ms=EXCLUDED.expires_at_ms, last_activity_ms=EXCLUDED.last_activity_ms, "
             "mfa_verified_ms=EXCLUDED.mfa_verified_ms, elevated_until_ms=EXCLUDED.elevated_until_ms, "
-            "elevation_issued_ms=EXCLUDED.elevation_issued_ms",
-            std::vector<std::string>{row.token_hash, row.username, row.display_name, row.role,
-                                     row.auth_source, row.oidc_sub, row.token_scope_service,
-                                     row.mcp_tier, row.principal_kind,
-                                     std::to_string(row.created_at_ms),
-                                     std::to_string(row.expires_at_ms),
-                                     std::to_string(row.last_activity_ms),
-                                     std::to_string(row.mfa_verified_ms),
-                                     std::to_string(row.elevated_until_ms),
-                                     std::to_string(row.elevation_issued_ms)});
-        if (r.status() != PGRES_COMMAND_OK) {
+            "elevation_issued_ms=EXCLUDED.elevation_issued_ms "
+            "RETURNING " +
+                std::string(kAuthoredReturning))
+                .c_str(),
+            std::vector<std::string>{params.token_hash, params.username, params.display_name,
+                                     params.role, params.auth_source, params.oidc_sub,
+                                     params.token_scope_service, params.mcp_tier,
+                                     params.principal_kind,
+                                     std::to_string(params.session_lifetime_ms),
+                                     params.mfa_verified_now ? "true" : "false",
+                                     std::to_string(params.mfa_verified_ms_abs)});
+        if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0) {
             err = std::string("session insert failed: ") + PQerrorMessage(c);
             return false;
         }
+        authored = authored_from(r.get(), 0);
         return bump_generation_in_txn(c);
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "create failed" : err});
-    return {};
+    return authored;
 }
 
 std::expected<bool, SessionStore::Error> SessionStore::invalidate(const std::string& token_hash) {
@@ -216,30 +255,42 @@ SessionStore::invalidate_user(const std::string& username) {
     return count;
 }
 
-std::expected<bool, SessionStore::Error>
-SessionStore::set_elevation(const std::string& token_hash, std::int64_t elevated_until_ms,
-                            std::int64_t elevation_issued_ms) {
+std::expected<std::optional<AuthoredTimes>, SessionStore::Error>
+SessionStore::set_elevation(const std::string& token_hash, std::int64_t elevation_duration_ms) {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
-    bool existed = false;
+    std::optional<AuthoredTimes> authored;
     std::string err;
+    // elevation_issued = now(); elevated_until = LEAST(now()+duration, expires_at)
+    // — the "never past absolute expiry" clamp is atomic in SQL against the row's
+    // own expiry. The WHERE dead-window guard (computed until > now()) matches NO
+    // row when the session is already at/past expiry OR duration<=0, so a
+    // near-expired grant writes nothing and does not bump the generation for a
+    // failed op (design-review S4). 0 rows ⇒ nullopt (absent OR dead-window).
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         PgResult r = exec_params(
             c,
-            "UPDATE session_store.sessions SET elevated_until_ms=$2::bigint, "
-            "elevation_issued_ms=$3::bigint WHERE token_hash=$1 RETURNING token_hash",
-            std::vector<std::string>{token_hash, std::to_string(elevated_until_ms),
-                                     std::to_string(elevation_issued_ms)});
+            "UPDATE session_store.sessions s SET "
+            "elevation_issued_ms = n.ms, "
+            "elevated_until_ms = LEAST(n.ms + $2::bigint, s.expires_at_ms) "
+            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+            "WHERE s.token_hash = $1 AND LEAST(n.ms + $2::bigint, s.expires_at_ms) > n.ms "
+            "RETURNING s.created_at_ms, s.expires_at_ms, s.last_activity_ms, s.mfa_verified_ms, "
+            "s.elevated_until_ms, s.elevation_issued_ms, n.ms",
+            std::vector<std::string>{token_hash, std::to_string(elevation_duration_ms)});
         if (r.status() != PGRES_TUPLES_OK) {
             err = std::string("set_elevation failed: ") + PQerrorMessage(c);
             return false;
         }
-        existed = PQntuples(r.get()) > 0;
-        return bump_generation_in_txn(c);
+        if (PQntuples(r.get()) > 0)
+            authored = authored_from(r.get(), 0);
+        // Bump the generation only when a row actually changed — a no-op
+        // (absent/dead-window) is not an authz change worth clearing caches for.
+        return authored.has_value() ? bump_generation_in_txn(c) : true;
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "set_elevation failed" : err});
-    return existed;
+    return authored;
 }
 
 std::expected<bool, SessionStore::Error>
@@ -258,7 +309,9 @@ SessionStore::clear_elevation(const std::string& token_hash) {
             return false;
         }
         existed = PQntuples(r.get()) > 0;
-        return bump_generation_in_txn(c);
+        // Skip the bump on a no-op (nonexistent token) — a spurious bump needlessly
+        // clears every replica's validate-cache (authdb LOW, parity w/ set_elevation).
+        return existed ? bump_generation_in_txn(c) : true;
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "clear_elevation failed" : err});
@@ -282,79 +335,92 @@ SessionStore::clear_user_elevations(const std::string& username) {
             return false;
         }
         count = PQntuples(r.get());
-        return bump_generation_in_txn(c);
+        return count > 0 ? bump_generation_in_txn(c) : true; // no bump on a 0-row no-op
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "clear_user_elevations failed" : err});
     return count;
 }
 
-std::expected<bool, SessionStore::Error> SessionStore::mark_mfa(const std::string& token_hash,
-                                                                std::int64_t mfa_verified_ms) {
+std::expected<std::optional<AuthoredTimes>, SessionStore::Error>
+SessionStore::mark_mfa(const std::string& token_hash) {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
-    bool existed = false;
+    std::optional<AuthoredTimes> authored;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         PgResult r = exec_params(
             c,
-            "UPDATE session_store.sessions SET mfa_verified_ms=$2::bigint WHERE token_hash=$1 "
-            "RETURNING token_hash",
-            std::vector<std::string>{token_hash, std::to_string(mfa_verified_ms)});
+            "UPDATE session_store.sessions s SET mfa_verified_ms = n.ms "
+            "FROM (SELECT (extract(epoch from now())*1000)::bigint AS ms) n "
+            "WHERE s.token_hash = $1 "
+            "RETURNING s.created_at_ms, s.expires_at_ms, s.last_activity_ms, s.mfa_verified_ms, "
+            "s.elevated_until_ms, s.elevation_issued_ms, n.ms",
+            std::vector<std::string>{token_hash});
         if (r.status() != PGRES_TUPLES_OK) {
             err = std::string("mark_mfa failed: ") + PQerrorMessage(c);
             return false;
         }
-        existed = PQntuples(r.get()) > 0;
-        return bump_generation_in_txn(c);
+        if (PQntuples(r.get()) > 0)
+            authored = authored_from(r.get(), 0);
+        return authored.has_value() ? bump_generation_in_txn(c) : true;
     });
     if (!ok)
         return std::unexpected(Error{err.empty() ? "mark_mfa failed" : err});
-    return existed;
+    return authored;
 }
 
 std::expected<bool, SessionStore::Error>
-SessionStore::touch_activity(const std::string& token_hash, std::int64_t last_activity_ms) {
+SessionStore::touch_activity(const std::string& token_hash) {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
     // NO generation bump — a sliding idle update is not an authz change, and
     // bumping here would invalidate every replica's cache on every request.
-    // MONOTONIC: GREATEST() so an out-of-order / cross-replica-skewed write
-    // cannot REGRESS last_activity_ms and prematurely idle-out a session whose
-    // latest authenticated activity is newer (adversarial C3). A later request
-    // that commits first must not be overwritten by an earlier, slower one.
+    // Authored from the DB clock (`now()`), GREATEST-clamped so an out-of-order /
+    // cross-replica write cannot REGRESS last_activity_ms and prematurely idle-out
+    // a session whose latest authenticated activity is newer (adversarial C3).
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(Error{"database unavailable"});
     PgResult r = exec_params(
         lease.get(),
-        "UPDATE session_store.sessions "
-        "SET last_activity_ms=GREATEST(last_activity_ms, $2::bigint) WHERE token_hash=$1 "
-        "RETURNING token_hash",
-        std::vector<std::string>{token_hash, std::to_string(last_activity_ms)});
+        (std::string("UPDATE session_store.sessions "
+                     "SET last_activity_ms=GREATEST(last_activity_ms, ") +
+         kDbNowMsSql + ") WHERE token_hash=$1 RETURNING token_hash")
+            .c_str(),
+        std::vector<std::string>{token_hash});
     if (r.status() != PGRES_TUPLES_OK)
         return std::unexpected(Error{std::string("touch_activity failed: ") +
                                      PQerrorMessage(lease.get())});
     return PQntuples(r.get()) > 0;
 }
 
-std::expected<std::optional<SessionRow>, SessionStore::Error>
+std::expected<std::optional<FoundSession>, SessionStore::Error>
 SessionStore::find(const std::string& token_hash) const {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
         return std::unexpected(Error{"database unavailable"});
-    PgResult r = exec_params(lease.get(),
-                             (std::string("SELECT ") + kSelectCols +
-                              " FROM session_store.sessions WHERE token_hash=$1")
-                                 .c_str(),
-                             std::vector<std::string>{token_hash});
+    // db_now_ms is the LAST column, read in the SAME atomic SELECT as the row, so
+    // adjudication is against the DB clock at read time — never the replica's
+    // local clock, and never a separate query that could skew (design-review N1).
+    PgResult r =
+        exec_params(lease.get(),
+                    (std::string("SELECT ") + kSelectCols + ", " + kDbNowMsSql +
+                     " FROM session_store.sessions WHERE token_hash=$1")
+                        .c_str(),
+                    std::vector<std::string>{token_hash});
     if (r.status() != PGRES_TUPLES_OK)
         return std::unexpected(Error{std::string("find failed: ") + PQerrorMessage(lease.get())});
     if (PQntuples(r.get()) == 0)
-        return std::optional<SessionRow>{}; // definitively absent
-    return std::optional<SessionRow>{row_from(r.get(), 0)};
+        return std::optional<FoundSession>{}; // definitively absent
+    if (PQnfields(r.get()) <= kSessionRowColumns) // db_now column missing — never trust a 0
+        return std::unexpected(Error{"find: db_now column absent (kSelectCols/db_now drift)"});
+    FoundSession fs;
+    fs.row = row_from(r.get(), 0);
+    fs.db_now_ms = to_i64(PQgetvalue(r.get(), 0, kSessionRowColumns)); // db_now after the row cols
+    return std::optional<FoundSession>{std::move(fs)};
 }
 
 std::expected<std::uint64_t, SessionStore::Error> SessionStore::read_generation() const {
@@ -376,16 +442,18 @@ std::expected<std::uint64_t, SessionStore::Error> SessionStore::read_generation(
 }
 
 std::expected<SessionStore::ReapOutcome, SessionStore::Error>
-SessionStore::reap_expired(std::int64_t now_ms) {
+SessionStore::reap_expired() {
     if (!open_)
         return std::unexpected(Error{"session store not open"});
 
     // Clock-guarded, single-writer across replicas. The advisory lock is taken as
     // its OWN statement before the check-and-delete (a CTE-embedded lock does not
-    // work — fixed-snapshot hazard). now_ms is the caller's wall clock; it is
-    // sanitised against a durable anchor in session_meta so a forward-skewed
-    // reading (an already-wrong clock on the pass that matters) is DECLINED, not
-    // acted on. Every accepted pass is unconditionally capped.
+    // work — fixed-snapshot hazard). now_ms is the DB clock (Postgres now(), read
+    // once in-SQL under the lock below — the SAME clock that authors expires_at,
+    // #3715), NOT a caller-supplied wall clock; it is sanitised against a durable
+    // anchor in session_meta so a forward-skewed reading (an already-wrong clock on
+    // the pass that matters) is DECLINED, not acted on. Every accepted pass is
+    // unconditionally capped.
     //
     // Part-6 (missing-anchor) DECISION, recorded per the clock-guarded-retention
     // rule: on the FIRST pass (no `reap_anchor_ms` yet) this store PROCEEDS to
@@ -400,6 +468,7 @@ SessionStore::reap_expired(std::int64_t now_ms) {
     // (kMaxPlausibleSkewMs) still declines a later implausibly-forward reading.
     int deleted = 0;
     bool clock_anomaly = false;
+    std::int64_t now_ms = 0;
     std::string err;
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         if (exec_params(c, "SELECT pg_advisory_xact_lock(hashtext('session_store:reap'))",
@@ -407,6 +476,19 @@ SessionStore::reap_expired(std::int64_t now_ms) {
                 .status() != PGRES_TUPLES_OK) {
             err = "reap advisory lock failed";
             return false;
+        }
+        // now_ms is the DB clock (`now()`, txn-stable), NOT a caller-supplied wall
+        // clock — so the cutoff, the anchor comparison, and the anchor update all
+        // live in the ONE clock domain that authored expires_at (design-review
+        // S2). Read once under the lock and reuse for every guard below.
+        {
+            PgResult nr = exec_params(c, (std::string("SELECT ") + kDbNowMsSql).c_str(),
+                                      std::vector<std::string>{});
+            if (nr.status() != PGRES_TUPLES_OK || PQntuples(nr.get()) == 0) {
+                err = "reap now() read failed";
+                return false;
+            }
+            now_ms = to_i64(PQgetvalue(nr.get(), 0, 0));
         }
         // Persisted anchor = the max now_ms any prior pass accepted. A reading
         // implausibly far ahead of it is an anomaly: decline this pass, do not
@@ -453,7 +535,8 @@ SessionStore::reap_expired(std::int64_t now_ms) {
             return false;
         }
         deleted = PQntuples(dr.get());
-        const std::int64_t new_anchor = has_anchor ? std::max(anchor, now_ms) : now_ms;
+        // (std::max) parenthesised to dodge the <windows.h> `max` function-like macro (MSVC).
+        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_ms) : now_ms;
         PgResult ur = exec_params(
             c,
             "INSERT INTO session_store.session_meta (key, value) VALUES ('reap_anchor_ms', $1) "
