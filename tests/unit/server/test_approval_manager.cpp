@@ -916,7 +916,7 @@ TEST_CASE("ApprovalManager: a full stale pending queue self-heals on the next su
 
     // The stale queue was swept, not just tolerated once.
     auto pending = mgr.pending_count();
-    CHECK(pending == 1); // only the new one — all 1000 stale rows expired
+    CHECK(pending == 1); // only the new one — all kMaxPendingApprovals stale rows expired
 }
 
 TEST_CASE("ApprovalManager: a full queue of NON-stale pending approvals still rejects",

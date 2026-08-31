@@ -998,14 +998,19 @@ upgrade. `InstructionDbPool` itself is deleted; `instructions.db` is retired
 and no Yuzu store writes to it again.
 
 **Before upgrading, capture what you'll lose** (none of it carries over):
-`GET /api/schedules`, `GET /api/approvals`, and `GET /api/v1/executions` are
+`GET /api/schedules`, `GET /api/approvals`, and `GET /api/executions` are
 safe, non-mutating reads — use them to record your active recurring
 schedules and any outstanding (pending or approved-but-unconsumed) approval
 tickets before you cut over, so you know what to re-create afterward rather
-than discovering gaps after the fact. The retired `instructions.db` file is
-**left on disk, not deleted** — if you need to recover consumed-approval
-audit evidence (the `submitted_by → reviewed_by → consumed_by` chain) after
-upgrading, that file is your only source; back it up separately before any
+than discovering gaps after the fact. `GET /api/executions` defaults to the
+100 most recent rows (`?limit=<N>` to raise it) — for a fleet with more
+history than that, page through or raise the limit before relying on this
+as a full capture. The retired `instructions.db` file is **left on disk,
+not deleted** — if you need to recover consumed-approval audit evidence
+(the `submitted_by → reviewed_by → consumed_by` chain) after upgrading,
+that file is the most complete source (the audit store also carries
+`approval.approve`/`approval.reject` and `mcp.<tool>` consume events for
+the same tickets, but not the full row); back it up separately before any
 unrelated disk cleanup removes it, since Yuzu itself never will.
 
 **What happens on first PG boot:**

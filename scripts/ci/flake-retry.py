@@ -744,14 +744,15 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    # Windows CI test-phase restructuring (#3443, 2026-08-28): 11 pg shards
-    # (10 + new shard K) + 4 non-pg shards (A/B + shard C, then a later
+    # Windows CI test-phase restructuring (#3443, 2026-08-28): 12 pg shards
+    # (10 + shard K + shard L, ADR-0065's instruction-cluster carve,
+    # 2026-08-31) + 4 non-pg shards (A/B + shard C, then a later
     # measured-by-time follow-up added shard D, carved from B's [body_cap]
-    # tests) + the smoke entry (also server_test_exe) = 16. The floor stays
+    # tests) + the smoke entry (also server_test_exe) = 17. The floor stays
     # a loose ">=", same spirit as the original "twelve" (itself a floor,
     # not an exact pin) -- exactness is check-pg-shard-partition.py's job,
     # against the real binary.
-    check(len(_entries) >= 16, "meson.build: all sixteen server shard entries located")
+    check(len(_entries) >= 17, "meson.build: all seventeen server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -812,9 +813,9 @@ def _selftest():
     # 2026-08-28) -- comparatively stable, unlike the pg shards, which get
     # rebalanced -- so a small verbatim pin is proportionate for them
     # specifically. Plus a COUNT-based (not exact-string) sanity check that
-    # extraction still finds a real pg-shard population (now 11: 10 + shard
-    # K, plus the smoke entry makes 12 total non-excluded specs -- see the
-    # comment on the >= 12 floor below), as a second, independent signal
+    # extraction still finds a real pg-shard population (now 12: 10 + shard
+    # K + shard L, plus the smoke entry makes 13 total non-excluded specs --
+    # see the comment on the >= 13 floor below), as a second, independent signal
     # alongside check-pg-shard-partition.py's own hollow-discovery guard, in
     # case the two checks are ever run without each other.
     _NONPG_SPECS = (

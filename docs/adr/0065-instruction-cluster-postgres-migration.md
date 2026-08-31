@@ -363,10 +363,18 @@ is very likely uncontended — proven empirically by a regression test
 contention"`) that holds a real row lock from a second connection, verified to fail against the
 pre-fix single-attempt code and pass against the fix. This closes the common case but is
 explicitly a MITIGATION, not a complete fix: under sustained contention both attempts could still
-fail. A periodic reconciler sweep (re-check any execution stuck at `running` past N minutes,
-sre's Gate 6 preference over pure retry) would close the residual risk completely but is a larger
-architectural change — out of scope for a storage-backend migration, filed as #3729 rather than
-fixed here.
+fail — the residual is the SAME Processing-Integrity gap this section opened with (a wedged
+execution's `completed_at`/aggregate counts stay wrong with no automatic correction), just lower
+probability, now logged rather than silent. A periodic reconciler sweep (re-check any execution
+stuck at `running` past N minutes, sre's Gate 6 preference over pure retry) would close the
+residual risk completely but is a larger architectural change — out of scope for a
+storage-backend migration, filed as #3729 rather than fixed here. Governance Gate 8 re-review
+(2026-08-31) additionally found, independently by sre and unhappy-path, that the retry itself
+roughly doubles a losing caller's worst-case connection-hold time under row-lock contention,
+narrowing (not widening) the margin before pool exhaustion in the band where the pool still
+grants leases but the contended row's lock queue is saturated — folded into #3729's design note
+rather than reworked here, since the reconciler sweep resolves it structurally by not holding a
+request-path connection across any lock wait at all.
 
 **`InstructionDbPool` deletion.** `instruction_db_pool.{hpp,cpp}` is deleted along with its
 `server.cpp` member (`instr_db_pool_`), its dedicated construction block, and its teardown line
