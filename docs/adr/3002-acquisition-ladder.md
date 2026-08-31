@@ -173,7 +173,7 @@ recognised categories:
 
 - **The fleet is split by platform and by history.** Windows plugins largely
   live at rung 1 already (WMI/Win32, registry via `Reg*W`); TAR capture
-  sources were built at rung 1 (ES/ETW). But 27 of 48 plugins — heavily
+  sources were built at rung 1 (ES/ETW). But 26 of 47 plugins — heavily
   concentrated on macOS and Linux — sit at an *ungoverned* rung 3: per-plugin
   shell helpers of varying shapes (`run_command`, `run_command_rc`,
   `run_command_lines`, bare `system()` probes, bespoke `tar`/`interaction`
@@ -204,7 +204,7 @@ recognised categories:
   spawn site runs bare. Once #2321 lands, the global fork lock serialises the
   `[pipe()..fork()]` window in the launchers that take it (the runner,
   `script_exec`, `content_dist`, `trigger_engine`'s macOS `popen`) — but the
-  27 spawning plugins' scattered `popen` calls remain **not** covered; each
+  26 spawning plugins' scattered `popen` calls remain **not** covered; each
   is an unserialised `fork()` that can leak fds. The residual closes only if
   every spawn, including approved shell use, routes through covered code
   (Decisions 2 and 7). Rung-1 promotions close it harder still — a spawn
@@ -315,7 +315,7 @@ another thread and inherits A's half-configured pipe. So whatever the
 architecture, one process-global lock must exist and every spawn site must take
 it. In principle N implementations could share that lock; in practice that is
 today's failure mode — `fork_lock.hpp` warns that any site which forgets it
-silently reopens the race, and 27 scattered helpers is how sites get
+silently reopens the race, and 26 scattered helpers is how sites get
 forgotten. One runner makes "every spawn takes the lock" a property of the
 architecture instead of a per-site discipline, and makes a spawn-mechanism swap
 (Decision 9) a one-file change.
@@ -335,7 +335,7 @@ the fix if ever measured, not decentralisation. And every rung-1 promotion
 removes its spawn from the picture entirely.
 
 **Scaling levers, should spawn rate ever grow orders of magnitude** — both work
-*through* the single API and neither is reachable from 27 plugin-local copies:
+*through* the single API and neither is reachable from 26 plugin-local copies:
 
 - **`posix_spawn` + `POSIX_SPAWN_CLOEXEC_DEFAULT` (Darwin)** — a documented,
   public Apple extension (non-POSIX, non-portable): every fd not explicitly
@@ -650,7 +650,7 @@ schedule; ordering is owned by the roadmap:
   shell-metacharacter injection is eliminated structurally at rungs ≤2 in
   bundled plugins (out-of-tree plugins: see Decision 4's stated gap); every
   surviving spawn — shell exceptions included — gains a deadline, caps, group
-  kill, honest termination reporting, and fork-lock coverage; 27 divergent
+  kill, honest termination reporting, and fork-lock coverage; 26 divergent
   helpers collapse into one tested seam; once the migration and the
   Decision-10 gates land, the standard, the CI gates, and the code agree for
   the first time; a future spawn-mechanism swap becomes a one-file
@@ -659,7 +659,7 @@ schedule; ordering is owned by the roadmap:
   state, so an autonomous remediation step can hang indefinitely — the
   runner's mandatory deadline converts every step into a bounded outcome,
   the precondition for autonomous retry/escalation existing at all.
-- **Negative / accepted:** migration effort across 27 plugins (sequencing
+- **Negative / accepted:** migration effort across 26 plugins (sequencing
   owned by the separated roadmap); rung-1 promotions cost per-OS API code and
   carry their own ABI/blocking risks — hence the recognised evidence
   categories rather than silent judgment; the sequential-descent rule

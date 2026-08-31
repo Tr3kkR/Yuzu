@@ -146,7 +146,7 @@ abi4_declared_fixture_plugin = shared_library(
 # through the C++ `yuzu::Plugin` + YUZU_PLUGIN_EXPORT path rather than
 # hand-rolling the C descriptor. It is the regression proving the descriptor
 # seam (the two non-pure virtuals on yuzu::Plugin) actually reaches
-# capmatrix-gen — the path all 48 real plugins take.
+# capmatrix-gen — the path all 47 real plugins take.
 abi4_cpp_wrapper_fixture_plugin = shared_library(
   'abi4_cpp_wrapper_fixture_plugin',
   files('fixtures/abi4/abi4_cpp_wrapper_fixture_plugin.cpp'),
