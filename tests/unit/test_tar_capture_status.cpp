@@ -538,3 +538,45 @@ TEST_CASE("snapshot_phase_outcome: multiple failed phases are all reported, call
     CHECK(snapshot_result_line(skipped_sources) ==
           "tar|snapshot|partial|arp,collect_fast,collect_slow,software");
 }
+
+// ── snapshot_phase_outcome: has_earlier_skips (round 5, adversarial-review) ──
+//
+// A collect_or_retain skip (arp/service/mapdrive) leaves every phase rc at 0
+// -- it is not a persistence failure, so fast_rc/slow_rc/software_rc alone
+// cannot see it. Previously the action's own return code came ONLY from
+// those three integers, so a forced snapshot that silently retained one of
+// those sources' stale baseline still reported rc 0 -- a clean SUCCESS at
+// the wire level -- even though the text line said "partial". A generic/
+// MCP/automation consumer reading only the return code (not the text line)
+// could not tell. has_earlier_skips closes that gap.
+
+TEST_CASE("snapshot_phase_outcome: no phase failures and no earlier skips reports rc 0",
+          "[tar_capture_status][snapshot]") {
+    const auto out =
+        snapshot_phase_outcome(/*fast_rc=*/0, /*slow_rc=*/0, /*software_rc=*/0,
+                               /*has_earlier_skips=*/false);
+    CHECK(out.failed_phases.empty());
+    CHECK(out.return_code == 0);
+}
+
+TEST_CASE("snapshot_phase_outcome: an earlier collect_or_retain skip (e.g. arp) with all three "
+          "phase rcs clean still fails the action -- a partial snapshot must never report "
+          "success at the return-code level",
+          "[tar_capture_status][snapshot]") {
+    const auto out =
+        snapshot_phase_outcome(/*fast_rc=*/0, /*slow_rc=*/0, /*software_rc=*/0,
+                               /*has_earlier_skips=*/true);
+    CHECK(out.failed_phases.empty()); // no NEW phase failure -- the skip predates this call
+    CHECK(out.return_code == 1);      // but the action-level result is still non-zero
+}
+
+TEST_CASE("snapshot_phase_outcome: an earlier skip composes with a genuine phase failure -- "
+          "still exactly one failing return code, and the failed_phases list is unaffected",
+          "[tar_capture_status][snapshot]") {
+    const auto out =
+        snapshot_phase_outcome(/*fast_rc=*/1, /*slow_rc=*/0, /*software_rc=*/0,
+                               /*has_earlier_skips=*/true);
+    REQUIRE(out.failed_phases.size() == 1);
+    CHECK(out.failed_phases[0] == "collect_fast");
+    CHECK(out.return_code == 1);
+}

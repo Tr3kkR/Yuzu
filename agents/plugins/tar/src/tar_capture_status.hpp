@@ -242,7 +242,20 @@ struct SnapshotPhaseOutcome {
     int return_code{0};
 };
 
-inline SnapshotPhaseOutcome snapshot_phase_outcome(int fast_rc, int slow_rc, int software_rc) {
+/// `has_earlier_skips` folds in whatever collect_or_retain already pushed
+/// onto skipped_sources BEFORE this call (arp/service/mapdrive -- the legs
+/// that throw IncompleteCaptureError and are silently retained rather than
+/// returning a nonzero phase rc). Without it, a forced snapshot that
+/// retained one of those sources still returned rc 0 here -- the phase
+/// integers were all zero -- and a generic/MCP/automation consumer reading
+/// only the action's return code (not the "tar|snapshot|partial|<sources>"
+/// text line) saw a clean SUCCESS for a snapshot that silently kept stale
+/// state (adversarial-review finding, round 5). A partial snapshot must
+/// never report success at the return-code level, regardless of which of
+/// the two independent mechanisms (a failed phase rc, or an earlier
+/// collect_or_retain skip) produced the partial-ness.
+inline SnapshotPhaseOutcome snapshot_phase_outcome(int fast_rc, int slow_rc, int software_rc,
+                                                   bool has_earlier_skips = false) {
     SnapshotPhaseOutcome out;
     if (fast_rc != 0)
         out.failed_phases.push_back("collect_fast");
@@ -250,7 +263,7 @@ inline SnapshotPhaseOutcome snapshot_phase_outcome(int fast_rc, int slow_rc, int
         out.failed_phases.push_back("collect_slow");
     if (software_rc != 0)
         out.failed_phases.push_back("software");
-    out.return_code = out.failed_phases.empty() ? 0 : 1;
+    out.return_code = (out.failed_phases.empty() && !has_earlier_skips) ? 0 : 1;
     return out;
 }
 

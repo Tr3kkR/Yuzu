@@ -2666,10 +2666,27 @@ private:
         const int software_rc = do_collect_software(ctx);
         // BR4-001 (round 4): fold each phase's own return code into the
         // honesty response -- see the comment above skipped_sources.
+        //
+        // round 5 (adversarial-review finding): by this point skipped_sources
+        // already holds every arp/service/mapdrive name collect_fast_impl /
+        // collect_slow_impl pushed for a collect_or_retain skip (each phase
+        // rc above stays 0 for that kind of skip -- it's not a persistence
+        // failure). Fold that into the honesty decision too, so a snapshot
+        // that silently retained a source's stale baseline returns nonzero
+        // at the action level, not just in the "tar|snapshot|partial|..."
+        // text line a generic/MCP/automation consumer may not parse.
+        const bool had_earlier_skips = !skipped_sources.empty();
         const auto phase_outcome =
-            yuzu::tar::snapshot_phase_outcome(fast_rc, slow_rc, software_rc);
+            yuzu::tar::snapshot_phase_outcome(fast_rc, slow_rc, software_rc, had_earlier_skips);
         skipped_sources.insert(skipped_sources.end(), phase_outcome.failed_phases.begin(),
                                phase_outcome.failed_phases.end());
+        if (!skipped_sources.empty()) {
+            // Structured ABI4 result seam (runner_status.hpp's pattern) --
+            // a partial/skipped-sources snapshot is CONSTRAINED/PARTIAL for
+            // any consumer reading the typed status, not only the text line.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "tar:snapshot_skipped_sources");
+        }
         ctx.write_output(yuzu::tar::snapshot_result_line(skipped_sources));
         return phase_outcome.return_code;
     }
