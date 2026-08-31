@@ -97,7 +97,7 @@ duplicates.
 | bitlocker | ✅ | ✅ | ✅ | BitLocker via in-process Win32_EncryptableVolume WMI (rung 1, no subprocess) · LUKS via in-process libblkid + `/sys/class/block/dm-*/dm/uuid` reads (rung 1, no subprocess) · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` via direct argv through the bounded runner (rung 2; encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
 | certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain reads via a pre-split argv through the bounded runner (rung 2, #3406 — the former Decision-7 governed-shell path is retired); macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
-| content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
+| content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS. `execute_staged` on Linux is CONSTRAINED, not unconditional: shebang-interpreted (`#!`) staged payloads are rejected (B6 fd-exec is incompatible with the kernel's binfmt_script re-open) — native executables only. Per-action detail: the generated plugin-action table below |
 | device_identity | ✅ | ✅ | ✅ | all three branches implemented |
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
 | discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
@@ -237,9 +237,9 @@ implementation is.
 | content_dist | stage | linux | supported | 1 | httplib_tls | - |
 | content_dist | stage | macos | supported | 1 | httplib_tls | - |
 | content_dist | stage | windows | constrained | 1 | httplib_tls | requires OpenSSL to be found at build time; HTTPS unavailable if absent |
-| content_dist | execute_staged | linux | supported | 2 | fork_execvp | - |
-| content_dist | execute_staged | macos | supported | 2 | fork_execvp | - |
-| content_dist | execute_staged | windows | supported | 2 | createprocessw | - |
+| content_dist | execute_staged | linux | constrained | 2 | subprocess_runner:staged_payload | shebang-interpreted (#!) staged payloads are rejected -- B6 fd-exec (execveat O_CLOEXEC) is incompatible with the kernel's binfmt_script re-open; native executables only |
+| content_dist | execute_staged | macos | supported | 2 | subprocess_runner:staged_payload | - |
+| content_dist | execute_staged | windows | supported | 2 | subprocess_runner:staged_payload | - |
 | content_dist | list_staged | linux | supported | 1 | std_filesystem | - |
 | content_dist | list_staged | macos | supported | 1 | std_filesystem | - |
 | content_dist | list_staged | windows | supported | 1 | std_filesystem | - |
@@ -540,14 +540,14 @@ implementation is.
 | sccm | site | linux | unsupported | - | - | - |
 | sccm | site | macos | unsupported | - | - | - |
 | sccm | site | windows | supported | 1 | registry+com_dispatch | - |
-| script_exec | exec | linux | supported | 2 | fork_execvp | - |
-| script_exec | exec | macos | supported | 2 | fork_execvp | - |
-| script_exec | exec | windows | supported | 2 | create_process | - |
+| script_exec | exec | linux | supported | 2 | subprocess_runner:direct_argv | - |
+| script_exec | exec | macos | supported | 2 | subprocess_runner:direct_argv | - |
+| script_exec | exec | windows | supported | 2 | subprocess_runner:direct_argv | - |
 | script_exec | powershell | linux | unsupported | - | - | - |
 | script_exec | powershell | macos | unsupported | - | - | - |
-| script_exec | powershell | windows | supported | 3 | powershell_encodedcommand | - |
-| script_exec | bash | linux | supported | 3 | bash_c | - |
-| script_exec | bash | macos | supported | 3 | bash_c | - |
+| script_exec | powershell | windows | supported | 3 | subprocess_runner:powershell_encodedcommand | - |
+| script_exec | bash | linux | supported | 3 | subprocess_runner:bash_c | - |
+| script_exec | bash | macos | supported | 3 | subprocess_runner:bash_c | - |
 | script_exec | bash | windows | unsupported | - | - | - |
 | services | list | linux | supported | 2 | runner argv 'systemctl list-units' | - |
 | services | list | macos | supported | 2 | runner argv 'launchctl list' | - |

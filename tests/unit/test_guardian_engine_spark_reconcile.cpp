@@ -16,6 +16,7 @@
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
 #include "guardian_outbox_drain_worker.hpp" // GuardianOutboxDrainWorker (started_for_test, #2238)
+#include "shutdown_deadline_guard.hpp" // #2233 item 3 ("S+") wedge-pattern test
 #include "spark_engine.hpp"
 #include "spark_mechanism.hpp"
 
@@ -32,6 +33,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <string_view>
@@ -90,11 +92,31 @@ class FakeServiceMechanism final : public ISparkMechanism {
 public:
     void start(SparkEmitFn, SparkFaultFn) override {}
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
-        std::lock_guard<std::mutex> lk{mu_};
-        if (fail_next_watch_) {
-            fail_next_watch_ = false;
-            return std::unexpected("forced watch failure");
+        bool hang = false;
+        {
+            std::lock_guard<std::mutex> lk{mu_};
+            if (fail_next_watch_) {
+                fail_next_watch_ = false;
+                return std::unexpected("forced watch failure");
+            }
+            hang = hang_next_watch_;
+            hang_next_watch_ = false;
         }
+        // #2233 item 3 ("S+") wedge-pattern test only: the gate wait is deliberately
+        // OUTSIDE mu_ so release_hang() (which only touches gate_mu_, never mu_) can never
+        // deadlock against a concurrent is_watching()/watching_count() poll. Minimal,
+        // single-purpose - this branch's own #2233 item 3 repro branch
+        // (test/2233-arm-disarm-liveness-repro) has a fuller version of this same idiom
+        // with generation tracking etc.; this PR is independent of that unmerged branch and
+        // needs only enough to prove the watchdog fires during a real, blocked
+        // GuardianEngine::stop() - not to re-characterise #2233 itself.
+        if (hang) {
+            std::unique_lock<std::mutex> gate_lk{gate_mu_};
+            entered_hang_ = true;
+            gate_cv_.notify_all();
+            gate_cv_.wait(gate_lk, [this] { return released_; });
+        }
+        std::lock_guard<std::mutex> lk{mu_};
         watched_.insert(key);
         return {};
     }
@@ -106,6 +128,22 @@ public:
     void set_fail_next_watch() {
         std::lock_guard<std::mutex> lk{mu_};
         fail_next_watch_ = true;
+    }
+    /// Next watch() blocks until release_hang() is called. See watch()'s own comment.
+    void hang_next_watch() {
+        std::lock_guard<std::mutex> lk{mu_};
+        hang_next_watch_ = true;
+    }
+    bool wait_entered_hang(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> gate_lk{gate_mu_};
+        return gate_cv_.wait_for(gate_lk, timeout, [this] { return entered_hang_; });
+    }
+    void release_hang() {
+        {
+            std::lock_guard<std::mutex> gate_lk{gate_mu_};
+            released_ = true;
+        }
+        gate_cv_.notify_all();
     }
     bool is_watching(const std::string& key) {
         std::lock_guard<std::mutex> lk{mu_};
@@ -124,6 +162,12 @@ private:
     std::mutex mu_;
     std::set<std::string> watched_;
     bool fail_next_watch_{false};
+    bool hang_next_watch_{false};
+    // Separate lock from mu_ - see watch()'s comment.
+    std::mutex gate_mu_;
+    std::condition_variable gate_cv_;
+    bool entered_hang_{false};
+    bool released_{false};
 };
 
 // Service: the ONE type with a mechanism registered in this fixture -> Arm.
@@ -1877,4 +1921,86 @@ TEST_CASE("start-drain-then-stop: the this-capturing send races stop()'s join (T
     CHECK(!f.sent.empty());
     for (const auto& e : f.sent)
         CHECK(!e.event_id.empty());
+}
+
+// ---------------------------------------------------------------------------
+// #2233 item 3 ("S+") wedge-pattern test: proves ShutdownDeadlineGuard fires while a
+// REAL GuardianEngine::stop() is genuinely blocked (the confirmed #2233 hazard - the
+// same lock chain GuardianEngine::apply_rules -> GuardianSparkRuntime::attach_rule ->
+// SparkEngine::arm_impl -> a mechanism's watch()). The watchdog's action here is an
+// injected recorder, never the real hard_exit() - proving the watchdog FIRES under a
+// real wedge, not that it terminates the test process. The real hard_exit() /
+// production exit-code path is proven separately, in a subprocess, by
+// test_shutdown_deadline_guard.cpp's own death test.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("#2233 item 3 (S+): the watchdog fires while GuardianEngine::stop() is "
+          "genuinely blocked",
+          "[spark][guardian][reconcile][shutdown_deadline_guard]") {
+    SparkReconcileFixture f;
+    f.mechanism->hang_next_watch();
+
+    std::atomic<int> push_exit_code{-1};
+    std::atomic<bool> push_done{false};
+    // watchdog_fired is declared here, BEFORE Cleanup, so it outlives every thread that
+    // could reference it - same reverse-declaration-order reasoning as Cleanup's own
+    // members below.
+    auto watchdog_fired = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<bool> stop_returned{false};
+
+    // Cleanup OWNS both worker threads as members (never a pointer to a separately-
+    // declared local): on ANY unwind (a fatal REQUIRE below), the destructor releases the
+    // mechanism's hang gate FIRST - so the thread parked in watch() can actually finish -
+    // THEN joins both. Joining before releasing would deadlock the test's own cleanup.
+    struct Cleanup {
+        FakeServiceMechanism* mech;
+        std::thread pusher_thread;
+        std::optional<std::thread> stopper_thread;
+        ~Cleanup() {
+            mech->release_hang();
+            if (pusher_thread.joinable())
+                pusher_thread.join();
+            if (stopper_thread && stopper_thread->joinable())
+                stopper_thread->join();
+        }
+    } cleanup{f.mechanism, std::thread{[&] {
+                  gpb::GuaranteedStatePush p;
+                  p.set_full_sync(true);
+                  *p.add_rules() = make_service_rule("r1");
+                  auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(
+                      *f.engine, p.SerializeAsString());
+                  push_exit_code.store(dr.exit_code, std::memory_order_release);
+                  push_done.store(true, std::memory_order_release);
+              }}};
+
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
+
+    // GuardianEngine::stop() is now genuinely blocked (the pusher thread above holds
+    // mtx_, parked inside the hung watch() call). A short-grace watchdog around the real
+    // call proves it fires under a real wedge, not a synthetic one.
+    cleanup.stopper_thread.emplace([&] {
+        yuzu::agent::ShutdownDeadlineGuard watchdog{
+            std::chrono::milliseconds(200),
+            [watchdog_fired] { watchdog_fired->store(true, std::memory_order_release); }};
+        f.engine->stop();
+        stop_returned.store(true, std::memory_order_release);
+    });
+
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return watchdog_fired->load(std::memory_order_acquire); },
+        std::chrono::seconds(5)));
+    // The recorder firing doesn't unblock the real, still-wedged stop() call - only the
+    // injected action ran. Prove stop() genuinely hasn't returned yet.
+    CHECK_FALSE(stop_returned.load(std::memory_order_acquire));
+
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return stop_returned.load(std::memory_order_acquire); },
+        std::chrono::seconds(10)));
+
+    cleanup.stopper_thread->join();
+    cleanup.pusher_thread.join();
+
+    CHECK(push_done.load(std::memory_order_acquire));
+    CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
 }

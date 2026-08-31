@@ -4440,7 +4440,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                       " (lookup)");
                         res.set_content(approval_store_error_body(
                                             *approval_manager, a4_error,
-                                            appr_read.error().extended_errcode),
+                                            appr_read.error().sqlstate),
                                         "application/json");
                         return;
                     }
@@ -4739,14 +4739,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         // stops THIS site becoming the fail-open one if rung 1's
                         // lookup ever changes.
                         //
-                        // An OPEN handle whose reads fail permanently — CORRUPT,
-                        // NOTADB, READONLY, FULL — is classified by the shared
-                        // body via `extended_errcode` (#2786 "PR 1c") rather
-                        // than taking the transient "retry forever" arm.
+                        // An OPEN store whose reads fail permanently — schema
+                        // drift, corruption, disk-full, read-only — is
+                        // classified by the shared body via `sqlstate`
+                        // (ADR-0065 port of #2786 "PR 1c") rather than taking
+                        // the transient "retry forever" arm.
                         if (kind == ConsumeFailure::kStoreError) {
                             res.set_content(approval_store_error_body(
                                                 *approval_manager, a4_error,
-                                                consumed.error().extended_errcode),
+                                                consumed.error().sqlstate),
                                             "application/json");
                             return;
                         }
@@ -8137,8 +8138,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         bridge->abandon(bridge_sid, id);
                         bridge_active = false;
                     }
-                    if (execution_tracker && !execution_id.empty()) {
-                        execution_tracker->mark_cancelled(execution_id, session->username);
+                    if (execution_tracker && !execution_id.empty() &&
+                        !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                        spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
+                                      execution_id);
                     }
                     mcp_audit("failure",
                               std::string("dispatch_exception execution_id=") + execution_id);
@@ -8164,8 +8167,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (`session->username`, not literal `"mcp"`) so any
                     // future change to ExecutionTracker that persists the
                     // user field records the authenticated principal.
-                    if (execution_tracker && !execution_id.empty()) {
-                        execution_tracker->mark_cancelled(execution_id, session->username);
+                    if (execution_tracker && !execution_id.empty() &&
+                        !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                        spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
+                                      execution_id);
                     }
                     // governance R1 unhappy-UP-7: structured signal so
                     // the agentic worker can branch on `status` without
@@ -8245,7 +8250,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // dispatch confirmed how many agents the command went to.
                 // Mirrors workflow_routes.cpp:1461-1463.
                 if (execution_tracker && !execution_id.empty()) {
-                    execution_tracker->set_agents_targeted(execution_id, agents_reached);
+                    if (!execution_tracker->set_agents_targeted(execution_id, agents_reached)) {
+                        spdlog::error("mcp_server: set_agents_targeted failed for execution_id={}",
+                                      execution_id);
+                    }
                     // S4.5 (2f PR 3a) - terminal-starvation fix: responses that
                     // arrived BEFORE set_agents_targeted saw agents_targeted==0
                     // and could not transition the row to terminal

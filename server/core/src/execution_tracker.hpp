@@ -1,13 +1,40 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file execution_tracker.hpp
+/// Postgres-backed execution-history store (ADR-0009/0065). Schema
+/// `execution_tracker`, two tables (`executions`, `agent_exec_status`).
+///
+/// Posture (ADR-0012 §1): AUTHORITATIVE/fail-hard construction — a
+/// reachable database whose schema can't migrate/open is a fatal startup
+/// error (`startup_failed_`), a posture UPGRADE from the SQLite era, where
+/// migration failure set `migration_ok_ = false` but `server.cpp` never
+/// checked it (the shared `InstructionDbPool`'s own `is_open()` was the
+/// only thing `/readyz` keyed on). Runtime reads/writes keep their
+/// pre-migration plain-container/`std::expected<std::string,std::string>`
+/// shapes — this store's consumers (gRPC `AgentServiceImpl`, REST v1,
+/// legacy REST, MCP, dashboard, `ScheduleRunner`) are unaffected by this
+/// migration.
+///
+/// Backfill: NONE (ADR-0009's 2026-08-25 fresh-start-by-default amendment).
+/// The legacy `instructions.db` (shared with the ScheduleEngine/
+/// ApprovalManager siblings, both already migrated — ADR-0065) is never
+/// read for data; construction logs a one-time "fresh start, no legacy
+/// backfill" line, and the caller (`server.cpp`) runs
+/// `legacy_sqlite_probe::warn_if_legacy_rows()` over the legacy file so an
+/// environment where "no production fleet" turns out to be locally wrong
+/// gets a loud signal instead of silent loss. This is the LAST of the 7
+/// Wave-4 SQLite components — `InstructionDbPool` is deleted once this
+/// store moves.
 
 #include <cstdint>
 #include <expected>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
+
+namespace yuzu::server::pg {
+class PgPool;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
 
@@ -114,13 +141,16 @@ struct ExecutionStatsQuery {
 
 class ExecutionTracker {
 public:
-    explicit ExecutionTracker(sqlite3* db);
+    explicit ExecutionTracker(pg::PgPool& pool);
     ~ExecutionTracker() = default;
 
     ExecutionTracker(const ExecutionTracker&) = delete;
     ExecutionTracker& operator=(const ExecutionTracker&) = delete;
 
-    void create_tables();
+    /// Idempotent no-op kept for call-site compatibility — migration now
+    /// runs unconditionally inside the constructor (PgMigrationRunner),
+    /// unlike the SQLite era where callers invoked this explicitly.
+    void create_tables() {}
 
     /// PR 3 — attach a per-execution SSE bus. When set, every mutating call
     /// (update_agent_status, refresh_counts, mark_cancelled) publishes a
@@ -145,35 +175,60 @@ public:
     /// handler which now creates the execution row BEFORE dispatch (to thread
     /// execution_id into cmd_dispatch and close the FAST-agent race UP2-4),
     /// then updates `agents_targeted` once dispatch confirms how many agents
-    /// the command actually reached.
-    void set_agents_targeted(const std::string& execution_id, int agents_targeted);
+    /// the command actually reached. Returns false on a pool/query failure
+    /// (governance PR review, 2026-08-31) — the row never learns its real
+    /// agent count and can never reach refresh_counts's all-responded
+    /// threshold, wedging it at "running"; callers should log/surface this.
+    /// `[[nodiscard]]` (scoped re-review, cpp-expert) matches this
+    /// codebase's own convention for a must-check success signal
+    /// (`AuditStore::log`) — a future call site silently discarding this
+    /// return would reintroduce the exact bug this fix closes.
+    [[nodiscard]] bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
 
-    void mark_cancelled(const std::string& id, const std::string& user);
+    /// Returns false on a pool/query failure (governance PR review,
+    /// 2026-08-31) — the execution was NOT actually cancelled; callers must
+    /// not report success (an audit "success" row or an HTTP 200) on a
+    /// false return. `[[nodiscard]]` for the same reason as
+    /// `set_agents_targeted` above.
+    [[nodiscard]] bool mark_cancelled(const std::string& id, const std::string& user);
 
     // Statistics (capability 1.9)
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
     FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;
 
-    /// Whether the schema is USABLE — i.e. every migration applied.
-    ///
-    /// This store shares the instructions pool, so it must NOT close the
-    /// connection on a migration failure the way `ResponseStore` (which owns
-    /// its own) does; a flag is the only honest signal available. Without it a
-    /// failed migration is invisible: `/readyz` probes the shared pool, which is
-    /// still open, and reports ready while every `update_agent_status` INSERT
-    /// references a column that does not exist — wedging every execution at
-    /// `dispatched` forever. The failure mode became reachable when this store
-    /// gained its FIRST migration (v2, the typed plugin_result_status column).
-    [[nodiscard]] bool schema_ok() const noexcept { return db_ != nullptr && migration_ok_; }
+    /// Whether the store is usable (schema migrated). False after a failed
+    /// migration — feeds the `/readyz` probe so a broken execution-history
+    /// schema fails closed instead of serving errors (or silently wedging
+    /// every execution at `dispatched`) behind a green light.
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// Alias kept for calling-code continuity across the migration —
+    /// `schema_ok()` and `is_open()` mean the same thing now that there is
+    /// no separate borrowed-handle-vs-migration-applied distinction to make
+    /// (the SQLite era needed both: `db_ != nullptr` for "the pool is still
+    /// open" and `migration_ok_` for "this store's own migration succeeded
+    /// on that shared handle").
+    [[nodiscard]] bool schema_ok() const noexcept { return open_; }
 
 private:
-    sqlite3* db_;
-    bool migration_ok_{true};
-    mutable std::recursive_mutex mtx_;
+    /// One attempt at `refresh_counts`'s aggregate recompute + conditional
+    /// terminal transition + SSE publish. Returns false on a bounded-timeout
+    /// abandon (row-lock contention) or a lease-acquire failure; `true`
+    /// otherwise, including the ordinary "nothing changed" case. See
+    /// `refresh_counts`'s retry-and-log wrapper for why this is split out.
+    bool refresh_counts_once(const std::string& execution_id);
+
+    /// One attempt at `update_agent_status`'s upsert + agent-transition SSE
+    /// publish. Returns false on a lease-acquire failure or a query failure;
+    /// `true` otherwise. See `update_agent_status`'s retry-and-log wrapper.
+    bool upsert_agent_status_once(const std::string& execution_id, const AgentExecStatus& s);
+
+    pg::PgPool& pool_;
+    bool open_{false};
     /// Borrowed — owned by the server. nullptr = no SSE publishing.
     ExecutionEventBus* event_bus_{nullptr};
 };
