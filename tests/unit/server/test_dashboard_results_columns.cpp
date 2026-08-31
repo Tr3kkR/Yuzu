@@ -95,6 +95,7 @@ struct DashboardResultsColumnsTestAccess {
                                    const std::string& username = {}) {
         return routes.render_filter_bar(command_id, plugin, /*definition_id=*/{},
                                         /*template_id=*/{}, username);
+    }
     // #1712 / #3290 Phase 2 — the fleet-read gate's composed
     // meet(management-group, service-scope) VisibleSet.
     std::string render_scoped(const std::string& command_id, const std::string& plugin,
@@ -103,9 +104,6 @@ struct DashboardResultsColumnsTestAccess {
                                      /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
                                      /*filters=*/{}, /*text_query=*/"", /*definition_id=*/"",
                                      /*template_id=*/"", /*visible_columns=*/{}, scope);
-    }
-    std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
-        return routes.render_filter_bar(command_id, plugin);
     }
 };
 
@@ -395,7 +393,9 @@ TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
 TEST_CASE("render_filter_bar: visible_set_fn_ confines facet options to the "
           "scoped agent's values only (CONFINED)",
           "[pg][server][dashboard][render_filter_bar]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -421,7 +421,9 @@ TEST_CASE("render_filter_bar: visible_set_fn_ returning an engaged-empty set "
           "denies all agents and renders a genuinely-empty dropdown, never "
           "the degraded-store rendering (DENY-ALL != DEGRADE)",
           "[pg][server][dashboard][render_filter_bar]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -453,7 +455,9 @@ TEST_CASE("render_filter_bar: a degraded store still renders the disabled "
           "(regression pin: scoping must not swallow the #2691 degrade "
           "rendering)",
           "[server][dashboard][render_filter_bar]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
@@ -476,7 +480,9 @@ TEST_CASE("render_filter_bar: a degraded store still renders the disabled "
 TEST_CASE("render_filter_bar: visible_set_fn_ left unwired renders every "
           "agent's facet values (UNWIRED LEGACY-OPEN)",
           "[pg][server][dashboard][render_filter_bar]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
