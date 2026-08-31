@@ -55,14 +55,44 @@ struct DispatchCall {
     std::unordered_map<std::string, std::string> params;
 };
 
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate schedrunner_instr_tpl{
+    "schedrunnerinstr", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("schedrunner instruction template: store failed to migrate");
+    }};
+
+// A trivial first-declared Harness member whose sole purpose is running the
+// YUZU_REQUIRE_PG_DB_TPL skip-check BEFORE the non-movable PostgresTestDb/
+// PgPool members below it construct (both delete their move ctor, so they
+// cannot be built elsewhere and relocated in). SKIP() works correctly here
+// because we're still within the dynamic extent of the TEST_CASE that
+// constructs Harness — Catch2's macros don't care about call depth, only
+// about running inside a live test case (Harness's own constructor body
+// already relies on this same fact for its REQUIRE calls, below). Keeping
+// every one of the 19 existing `Harness h;` / `Harness h(...)` call sites
+// unchanged is the whole point of gating this way instead of threading a
+// pg::PgPool& through the constructor.
+struct PgSkipGate {
+    PgSkipGate() {
+        if (yuzu::test::pg_admin_dsn_env() == nullptr)
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+};
+
 struct Harness {
+    PgSkipGate pg_gate_; // MUST stay the first declared member — see its own doc comment.
+    yuzu::test::PostgresTestDb instr_db{schedrunner_instr_tpl};
+    yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+
     TestDb db; // shared by engine + tracker + approvals (production shape)
-    yuzu::test::TempDbFile insdb{std::string_view("schedrun-ins-")};
 
     ScheduleEngine engine{db.db};
     ExecutionTracker tracker{db.db};
     ApprovalManager approvals{db.db};
-    InstructionStore is{insdb.path};
+    InstructionStore is{instr_pool};
 
     std::vector<DispatchCall> calls;
     int reach{1};        // agents "reached" by the fake dispatch
@@ -78,10 +108,11 @@ struct Harness {
                           [](const std::string&, const std::string&, const std::string&) {
                               return true;
                           },
-                      AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr)
+                      AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr,
+                      InstructionStore* instruction_store_override = nullptr)
         : runner(ScheduleRunner::Deps{
               .schedule_engine = &engine,
-              .instruction_store = &is,
+              .instruction_store = instruction_store_override ? instruction_store_override : &is,
               .execution_tracker = &tracker,
               .approval_manager = &approvals,
               .audit_store = audit,
@@ -108,6 +139,9 @@ struct Harness {
               },
               .arming_check = std::move(arming),
           }) {
+        INFO("[schedrunner instr] fixture status (blank == database came up OK): "
+             << instr_db.error());
+        REQUIRE(instr_db.available());
         engine.create_tables();
         tracker.create_tables();
         approvals.create_tables();
@@ -192,6 +226,10 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
     // silently, since none of them inspect the caller at all.
     CHECK_FALSE(h.calls[0].caller.system);
     CHECK(h.calls[0].caller.principal == "admin");
+    // #1398: a direct auto-mode fire carries no approval provenance — the
+    // gate at the dispatch chokepoint relies on principal_is_admin alone
+    // for a role-gated pair reached this way, never a fabricated ticket.
+    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::None);
 
     // Tracked execution row, targeted count recorded.
     auto exec = h.tracker.get_execution(h.calls[0].execution_id);
@@ -233,6 +271,30 @@ TEST_CASE("ScheduleRunner: unknown definition skips the occurrence but advances"
     CHECK(h.calls.empty());
     auto s = h.get(id);
     CHECK(s.next_execution_at > 1); // advanced — must not re-fire every tick
+}
+
+TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOUT advancing "
+          "(retries next tick)",
+          "[schedule][runner]") {
+    // Regression pin (gov Gate 3/6 sibling finding): a genuine InstructionStore DB error used
+    // to advance_schedule() unconditionally, permanently consuming that occurrence on a
+    // transient Postgres blip — the same class of bug PolicyEvaluator::dispatch_due's
+    // throttle-restore fix closed, not originally applied here.
+    yuzu::server::pg::PgPool broken_pool{{.conninfo = "=quohth4eeQu5 garbage =", .size = 1}};
+    REQUIRE_FALSE(broken_pool.valid());
+    InstructionStore broken_is{broken_pool};
+    REQUIRE_FALSE(broken_is.is_open());
+
+    Harness h(
+        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
+        nullptr, &broken_is);
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick();
+
+    CHECK(h.calls.empty());
+    // NOT advanced — still due, so the next tick retries rather than losing the occurrence.
+    CHECK(h.get(id).next_execution_at == 1);
 }
 
 TEST_CASE("ScheduleRunner: disabled definition skips the occurrence but advances",
@@ -320,6 +382,11 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 
     REQUIRE(h.calls.size() == 1);
     CHECK(h.get(id).execution_count == 1);
+    // #1398: firing on an approved ticket stamps Ticket provenance — the
+    // ONE non-MCP redemption loop this ladder's gate relies on for a
+    // role-gated/always-gated definition's schedule to ever fire for a
+    // non-admin creator.
+    CHECK(h.calls[0].caller.approval_provenance == ApprovalProvenance::Ticket);
 
     // One-approval == one-run: force the next occurrence due — the spent
     // (still 'approved') ticket must be stale under the occurrence anchor,
@@ -329,6 +396,60 @@ TEST_CASE("ScheduleRunner: approving the ticket fires the held occurrence exactl
 
     CHECK(h.calls.size() == 1); // no second fire
     CHECK(h.approvals.query({.status = "pending"}).size() == 1);
+}
+
+// #1398 hardening (governance Gate 4 unhappy-path CRITICAL finding): a
+// ticket is minted for the definition's CONTENT at submit time, but
+// `fire()` re-fetches the definition fresh every tick and previously
+// matched a ticket by `(definition_id, scope_expression, schedule_id)`
+// alone — so a definition mutated between ticket-approval and the next
+// tick would fire under review that was never given for the NEW content.
+// Concrete exploit this closes: a seeded non-admin role (e.g. Operator,
+// which holds InstructionDefinition:Write + Schedule:Write + Execution:
+// Execute) gets a benign action approved, then mutates the SAME
+// definition to point at `script_exec.bash` (also `Execution:Execute`,
+// also gated) before the next tick — without this fix, the stale ticket
+// would silently cover the swapped, unreviewed action.
+TEST_CASE("ScheduleRunner: a definition mutated AFTER ticket approval does not fire under "
+          "the stale ticket (#1398 content-swap hardening)",
+          "[schedule][runner][approval][1398]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits a ticket for procs.list (test.def's content)
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+
+    // Mutate the definition's plugin/action AFTER approval, BEFORE the next
+    // tick — exactly the PUT /api/instructions/{id} write an operator with
+    // only InstructionDefinition:Write can perform.
+    auto def_result = h.is.get_definition("test.def");
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    InstructionDefinition mutated = **def_result;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+
+    h.runner.tick(); // must NOT fire the swapped action under the old ticket
+
+    CHECK(h.calls.empty()); // no dispatch happened at all — the swap was refused
+    // A fresh ticket for the NEW content is submitted and held, distinct
+    // from the original (now permanently stale — target mismatched) approved
+    // one. Two separate fields (not a concatenated string, #1398
+    // security-guardian re-review) so a definition whose plugin/action
+    // happen to concatenate to the same string as another pair still can't
+    // collide here — asserted independently.
+    auto still_pending = h.approvals.query({.status = "pending"});
+    REQUIRE(still_pending.size() == 1);
+    CHECK(still_pending[0].target_plugin == "script_exec");
+    CHECK(still_pending[0].target_action == "bash");
+    auto approved_now = h.approvals.query({.status = "approved"});
+    REQUIRE(approved_now.size() == 1);
+    CHECK(approved_now[0].target_plugin == "procs"); // the stale, never-consumed ticket
+    CHECK(approved_now[0].target_action == "list");
+    CHECK(approved_now[0].consumed_at == 0); // never redeemed
 }
 
 TEST_CASE("ScheduleRunner: rejecting the ticket skips the occurrence and re-asks next time",
@@ -585,4 +706,59 @@ TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + targe
         }
     }
     CHECK(found);
+}
+
+// #1398 (compliance-officer + sre governance findings): the
+// approval_content_mismatch audit event added alongside the content-swap
+// hardening test (above, in the SQLite-only harness section) had no test
+// verifying the audit row is actually written (compliance-officer) — a
+// future refactor of fire_with_approval could silently drop the audit()
+// call and nothing would catch it. This test wires a real AuditStore
+// (mirroring the D7 audit test just above) and checks two things: (1) the
+// row exists with the expected detail fields, and (2) it fires exactly
+// ONCE across two ticks that both re-detect the same stale mismatch — not
+// once per tick (sre finding: the stale approved ticket never changes
+// status, so an un-deduplicated audit call would re-fire on every tick for
+// as long as the fresh replacement ticket stays pending).
+TEST_CASE("ScheduleRunner: a content mismatch audits once, with the approved vs. current "
+          "target in the detail, not once per tick (#1398)",
+          "[schedule][runner][approval][1398][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, schedrunner_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    Harness h(
+        [](const std::string&, const std::string&, const std::string&) { return true; }, &audit);
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick(); // submits a ticket for procs.list
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+
+    auto def_result = h.is.get_definition("test.def");
+    REQUIRE(def_result.has_value());
+    REQUIRE(def_result->has_value());
+    InstructionDefinition mutated = **def_result;
+    mutated.plugin = "script_exec";
+    mutated.action = "bash";
+    REQUIRE(h.is.update_definition(mutated).has_value());
+
+    h.runner.tick(); // detects the mismatch, audits once, submits a fresh ticket
+    h.runner.tick(); // re-detects the SAME stale mismatch — must NOT audit again
+
+    auto mismatch_rows_res = audit.query({.action = "instruction.schedule_fired"});
+    REQUIRE(mismatch_rows_res.has_value());
+    int mismatch_rows = 0;
+    for (const auto& e : *mismatch_rows_res) {
+        if (e.result == "denied" &&
+            e.detail.find("approval_content_mismatch") != std::string::npos) {
+            ++mismatch_rows;
+            CHECK(e.detail.find("approved_target=procs.list") != std::string::npos);
+            CHECK(e.detail.find("current_target=script_exec.bash") != std::string::npos);
+            CHECK(e.detail.find("schedule_id=" + id) != std::string::npos);
+        }
+    }
+    CHECK(mismatch_rows == 1);
 }

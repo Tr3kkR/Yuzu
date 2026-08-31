@@ -462,7 +462,7 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
 
 TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still erases the rest",
           "[pg][decommission][software_licensing]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, decommission_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 8}};
     REQUIRE(pool.valid());
 

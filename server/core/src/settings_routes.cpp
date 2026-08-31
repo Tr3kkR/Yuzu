@@ -416,8 +416,8 @@ std::string SettingsRoutes::render_tls_fragment() {
 
     // Insecure-skip-client-verify (one-way TLS) — color red when enabled to flag the
     // weakened posture in the operator dashboard, not just the warm-orange "warning" hue.
-    std::string owt_color = cfg_->allow_one_way_tls ? "#f85149" : "#8b949e";
-    std::string owt_text = cfg_->allow_one_way_tls
+    std::string owt_color = cfg_->insecure_skip_client_verify ? "#f85149" : "#8b949e";
+    std::string owt_text = cfg_->insecure_skip_client_verify
                                ? "Client cert verification DISABLED (--insecure-skip-client-verify)"
                                : "Disabled (mTLS enforced)";
     html += "<div class=\"form-row\" style=\"margin-top:0.75rem\">"

@@ -182,6 +182,7 @@ inline constexpr std::array<CommandCapability, 4> kOperatorFixture{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "chargen",
@@ -192,6 +193,7 @@ inline constexpr std::array<CommandCapability, 4> kOperatorFixture{{
         .operation = authz::Operation::Execute,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "tar",
@@ -202,6 +204,7 @@ inline constexpr std::array<CommandCapability, 4> kOperatorFixture{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "antivirus",
@@ -212,6 +215,7 @@ inline constexpr std::array<CommandCapability, 4> kOperatorFixture{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 }};
 
@@ -250,6 +254,7 @@ TEST_CASE("classify_and_authorize_dispatch: an ambiguous plugin.action is reject
             .operation = authz::Operation::Write,
             .risk_tier = authz::RiskTier::Medium,
             .system_reserved = false,
+            .execute_gate = ExecuteGate::None,
         },
     }};
     CommandCapabilityRegistry registry{std::span<const CommandCapability>(kOperatorFixture),
@@ -323,6 +328,35 @@ TEST_CASE("caller_for_stored_username: an unresolvable creator denies at the cho
         CHECK(caller.principal_role == "operator");
         CHECK_FALSE(caller.system);
         CHECK_FALSE(caller.exec_visible.has_value()); // nullopt passed through unchanged
+        // #1398 (quality-engineer, Gate 3): the trailing `principal_is_admin`
+        // param is defaulted, so an omitted call site (this one) must still
+        // land `false` — the fail-closed direction. Not asserted before this
+        // fix; a positional-arg regression here would have gone unnoticed.
+        CHECK_FALSE(caller.principal_is_admin);
+
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "filesystem", "read", always_allow);
+        REQUIRE(result.has_value());
+    }
+    // #1398 (quality-engineer, Gate 3): the pure half of
+    // `ServerImpl::derive_dispatch_caller_for_username`'s admin-flag wiring
+    // (server.cpp) — this function has no unit test of its own (it lives on
+    // the ServerImpl god object and cannot be constructed in isolation), so
+    // this section is the falsifier for the ONLY part of that wiring that
+    // IS directly testable: `principal_is_admin` reaching the returned
+    // `DispatchCaller` in the correct positional slot. A wrong comparison
+    // inside `derive_dispatch_caller_for_username` itself (`user->role ==
+    // auth::Role::admin`) stays an accepted residual gap — unlike the
+    // provenance stamp this mirrors (schedule_runner.cpp, directly tested),
+    // the admin-flag derivation FAILS OPEN if wrong (could admit a
+    // role-gated dispatch with no ticket), which is why this coverage is
+    // worth adding even though the ServerImpl-embedded half is not.
+    SECTION("resolvable + admin: principal_is_admin reaches the returned caller") {
+        const auto caller = caller_for_stored_username(
+            "root-admin", /*principal_resolves=*/true, "admin", std::nullopt,
+            /*principal_is_admin=*/true);
+        CHECK(caller.principal == "root-admin");
+        CHECK(caller.principal_is_admin);
 
         auto result =
             classify_and_authorize_dispatch(registry, caller, "filesystem", "read", always_allow);
@@ -372,6 +406,195 @@ TEST_CASE("classify_and_authorize_dispatch: a non-authorized operator principal 
         CHECK(result.error().reason == DispatchDenialReason::Forbidden);
         CHECK(result.error().securable == "Security");
     }
+}
+
+namespace {
+
+// #1398: a dedicated fixture for the ExecuteGate/ApprovalRequired matrix —
+// kept separate from kOperatorFixture so its four rows' None gates aren't
+// disturbed by adding gated ones here.
+inline constexpr std::array<CommandCapability, 3> kGateFixture{{
+    {
+        .plugin = "registry",
+        .action = "set_value",
+        .dispatch_class = DispatchClass::Mutating,
+        .mutability = Mutability::Reversible,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Write,
+        .risk_tier = authz::RiskTier::Medium,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "server",
+        .action = "policy.delete",
+        .dispatch_class = DispatchClass::Destructive,
+        .mutability = Mutability::Irreversible,
+        .securable = "Policy",
+        .operation = authz::Operation::Delete,
+        .risk_tier = authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AlwaysApproval,
+    },
+    {
+        .plugin = "tar",
+        .action = "sql",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+}};
+
+} // namespace
+
+TEST_CASE("classify_and_authorize_dispatch: ExecuteGate::AdminOrApproval — non-admin needs "
+          "provenance, admin needs neither, Forbidden still takes precedence over "
+          "ApprovalRequired",
+          "[server][dispatch][chokepoint][1398]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kGateFixture)};
+
+    SECTION("non-admin, no provenance, RBAC allows: ApprovalRequired") {
+        DispatchCaller caller{.principal = "alice", .principal_is_admin = false};
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "registry", "set_value", always_allow);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().reason == DispatchDenialReason::ApprovalRequired);
+        CHECK(result.error().securable == "Infrastructure");
+    }
+    SECTION("non-admin, Ticket provenance, RBAC allows: admitted") {
+        DispatchCaller caller{.principal = "alice",
+                              .principal_is_admin = false,
+                              .approval_provenance = ApprovalProvenance::Ticket};
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "registry", "set_value", always_allow);
+        REQUIRE(result.has_value());
+    }
+    SECTION("non-admin, GovernedPipeline provenance, RBAC allows: admitted") {
+        DispatchCaller caller{.principal = "alice",
+                              .principal_is_admin = false,
+                              .approval_provenance = ApprovalProvenance::GovernedPipeline};
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "registry", "set_value", always_allow);
+        REQUIRE(result.has_value());
+    }
+    SECTION("admin, no provenance, RBAC allows: admitted — admin bypass, matching the governed "
+            "role-gated path's own effective-admin bypass") {
+        DispatchCaller caller{.principal = "bob", .principal_is_admin = true};
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "registry", "set_value", always_allow);
+        REQUIRE(result.has_value());
+    }
+    SECTION("admin, no provenance, RBAC DENIES: Forbidden — approval is never a substitute for "
+            "a missing RBAC grant, checked BEFORE the gate") {
+        DispatchCaller caller{.principal = "bob", .principal_is_admin = true};
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "registry", "set_value", always_deny);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().reason == DispatchDenialReason::Forbidden);
+    }
+    SECTION("non-admin, Ticket provenance, RBAC DENIES: still Forbidden, not ApprovalRequired — "
+            "precedence holds regardless of provenance") {
+        DispatchCaller caller{.principal = "alice",
+                              .principal_is_admin = false,
+                              .approval_provenance = ApprovalProvenance::Ticket};
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "registry", "set_value", always_deny);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().reason == DispatchDenialReason::Forbidden);
+    }
+}
+
+TEST_CASE("classify_and_authorize_dispatch: ExecuteGate::AlwaysApproval admits ONLY real "
+          "provenance — the admin bypass does NOT apply",
+          "[server][dispatch][chokepoint][1398]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kGateFixture)};
+
+    SECTION("admin, no provenance, RBAC allows: STILL ApprovalRequired") {
+        DispatchCaller caller{.principal = "bob", .principal_is_admin = true};
+        auto result = classify_and_authorize_dispatch(registry, caller, "server",
+                                                       "policy.delete", always_allow);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().reason == DispatchDenialReason::ApprovalRequired);
+    }
+    SECTION("non-admin, Ticket provenance, RBAC allows: admitted") {
+        DispatchCaller caller{.principal = "alice",
+                              .principal_is_admin = false,
+                              .approval_provenance = ApprovalProvenance::Ticket};
+        auto result = classify_and_authorize_dispatch(registry, caller, "server",
+                                                       "policy.delete", always_allow);
+        REQUIRE(result.has_value());
+    }
+    SECTION("admin, Ticket provenance, RBAC allows: admitted (provenance alone is sufficient)") {
+        DispatchCaller caller{.principal = "bob",
+                              .principal_is_admin = true,
+                              .approval_provenance = ApprovalProvenance::Ticket};
+        auto result = classify_and_authorize_dispatch(registry, caller, "server",
+                                                       "policy.delete", always_allow);
+        REQUIRE(result.has_value());
+    }
+}
+
+TEST_CASE("classify_and_authorize_dispatch: ExecuteGate::None never gates, regardless of admin "
+          "or provenance",
+          "[server][dispatch][chokepoint][1398]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kGateFixture)};
+    DispatchCaller caller{.principal = "alice", .principal_is_admin = false};
+    auto result = classify_and_authorize_dispatch(registry, caller, "tar", "sql", always_allow);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("classify_and_authorize_dispatch: a system caller bypasses the gate entirely, "
+          "regardless of what ExecuteGate the row carries",
+          "[server][dispatch][chokepoint][1398]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kGateFixture)};
+    const DispatchCaller system_caller{.system = true};
+
+    // always_deny proves this isn't accidentally passing through RBAC or
+    // provenance — the system arm returns before either is consulted.
+    auto result = classify_and_authorize_dispatch(registry, system_caller, "server",
+                                                   "policy.delete", always_deny);
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("classify_and_authorize_dispatch: a row whose execute_gate parsed as Unspecified is "
+          "refused exactly like an unclassified pair — this should be unreachable in production "
+          "(every fragment's compile-time sweep prevents it), proven here as defense in depth",
+          "[server][dispatch][chokepoint][1398]") {
+    static constexpr std::array<CommandCapability, 1> kUnspecifiedFixture{{
+        {
+            .plugin = "widget",
+            .action = "explode",
+            .dispatch_class = DispatchClass::Mutating,
+            .mutability = Mutability::Irreversible,
+            .securable = "Infrastructure",
+            .operation = authz::Operation::Write,
+            .risk_tier = authz::RiskTier::Medium,
+            .system_reserved = false,
+            // .execute_gate deliberately omitted — value-initializes to
+            // ExecuteGate::Unspecified, the exact omission the compile-time
+            // sweep exists to prevent in a real fragment.
+        },
+    }};
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kUnspecifiedFixture)};
+    // always_allow proves the refusal fires before RBAC/provenance are ever
+    // consulted, exactly like the Unclassified/Ambiguous cases above — and
+    // even under a system caller, matching that both are checked before the
+    // caller.system early return.
+    DispatchCaller caller{.principal = "alice", .principal_is_admin = true};
+    auto result =
+        classify_and_authorize_dispatch(registry, caller, "widget", "explode", always_allow);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().reason == DispatchDenialReason::Unclassified);
+
+    const DispatchCaller system_caller{.system = true};
+    auto system_result =
+        classify_and_authorize_dispatch(registry, system_caller, "widget", "explode", always_allow);
+    REQUIRE_FALSE(system_result.has_value());
+    CHECK(system_result.error().reason == DispatchDenialReason::Unclassified);
 }
 
 TEST_CASE("classify_and_authorize_dispatch: the three system dispatches succeed under a system "

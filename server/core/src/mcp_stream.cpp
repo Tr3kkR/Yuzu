@@ -807,6 +807,14 @@ void McpStreamState::close_sink(const std::shared_ptr<McpStreamSink>& sink, McpS
 }
 
 void McpStreamState::close(McpStreamClose reason) {
+    // Only live_ — draining_, if any, is never left unsignaled by this omission: a
+    // takeover closes the superseded sink synchronously and unconditionally the
+    // moment it becomes draining_ (attach_and_replay's "wake the superseded provider"
+    // step, above), so a mid-handover session reaching a caller of close() (gc(),
+    // terminate(), shutdown() (#3042)) always has an already-closed draining_ sink.
+    // This relies on that invariant holding at every attach site — if a future change
+    // ever defers or batches the takeover's own close-signal, this call would need to
+    // close draining_ too.
     std::shared_ptr<McpStreamSink> live;
     {
         std::lock_guard<std::mutex> lk(mu_);

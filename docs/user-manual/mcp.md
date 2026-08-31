@@ -253,6 +253,16 @@ too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close rea
 
 ---
 
+
+[^1398]: Except the ~42 `plugin.action` pairs a compiled `ExecuteGate` marks
+`AdminOrApproval`/`AlwaysApproval` (#1398, `command_capability.hpp`) — e.g.
+`script_exec.exec`, `filesystem.delete`, `registry.set_value`. Those are denied
+at the shared dispatch chokepoint regardless of MCP tier, admin-role-holding
+tokens excepted (`principal_is_admin`). Today that denial surfaces as the SAME
+`no_agents_reached`-shaped tool result an offline/unreachable agent gets, not a
+discriminated approval error — JSON-RPC error-shaping for this case is tracked
+as #1398 Rung 4, not yet shipped. See `docs/mcp-server.md` "Security Model" for
+the full gate list.
 ## Authorization Tiers
 
 MCP tokens use a **tier** system that restricts what operations are available,
@@ -263,7 +273,7 @@ all writes.
 | Tier | Read | Tag Write/Delete | Execute Instructions | Policy/Security/Group Write | Delete (any) |
 |---|---|---|---|---|---|
 | `readonly` | Yes | No | No | No | No |
-| `operator` | Yes | Yes | Yes (auto-approved) | No | Tags only (via approval) |
+| `operator` | Yes | Yes | Yes (auto-approved)[^1398] | No | Tags only (via approval) |
 | `supervised` | Yes | Yes | Yes (via approval) | Yes (via approval) | Yes (via approval) |
 
 ### Tier details
@@ -274,7 +284,7 @@ log, and browse instruction definitions. It cannot make any changes.
 
 **operator** -- Adds the ability to write and delete tags, and to execute
 instructions. Instruction executions are auto-approved (they run immediately
-without admin approval). Tag deletions still require approval. Suitable for
+without admin approval)[^1398]. Tag deletions still require approval. Suitable for
 day-to-day operational use.
 
 **supervised** -- Full access to all operations, but destructive actions
@@ -403,10 +413,10 @@ for the tool to execute.
 | # | Tool | Description | RBAC Permission |
 |---|------|-------------|-----------------|
 | 1 | `list_agents` | List all connected agents with hostname, OS, architecture, and version. | `Infrastructure:Read` |
-| 2 | `get_agent_details` | Get detailed info for a single agent including tags and inventory. | `Infrastructure:Read` |
+| 2 | `get_agent_details` | Get detailed info for a single agent including tags and inventory. **Confined (#1700, #3290 Phase 2 continuation):** gated by `require_fleet_read`, the admit-then-filter fleet-read gate — an `agent_id` outside the caller's management-group/service-scope confinement returns the same "Agent not found" error as a genuinely nonexistent id (a 404-collapse; the tool never discloses whether an out-of-scope agent exists). | `Infrastructure:Read` |
 | 3 | `query_audit_log` | Query the audit log with filters (principal, action, target, time range). | `AuditLog:Read` |
-| 4 | `list_definitions` | List available instruction definitions (filterable by plugin, type, enabled). | `InstructionDefinition:Read` |
-| 5 | `get_definition` | Get a single instruction definition with parameter and result schemas. | `InstructionDefinition:Read` |
+| 4 | `list_definitions` | List available instruction definitions (filterable by plugin, type, enabled). A degraded InstructionStore returns `kInternalError` (-32603, "Instruction store unavailable") — retryable, never an empty list (ADR-0058). | `InstructionDefinition:Read` |
+| 5 | `get_definition` | Get a single instruction definition with parameter and result schemas. A degraded InstructionStore returns `kInternalError` (-32603, "Instruction store unavailable") — retryable, distinct from `kInvalidParams` ("Definition not found") for a genuinely unknown id (ADR-0058). | `InstructionDefinition:Read` |
 | 6 | `query_responses` | Query command response data. Pass `execution_id` to collect exactly the responses from one `execute_instruction` dispatch (closes the dispatch→collect loop), or `instruction_id` for all responses to a definition. At least one required (execution_id wins if both given); returns up to `limit` rows (max 1000). **A per-agent management-group drop filter is applied** (out-of-scope rows dropped, audited `result=denied`) — but **not yet effective under the global `Response:Read` gate (ADR-0017; logic fix tracked #1634 / #1718 PR-B):** a confined operator is denied at the gate, a global operator's filter is a no-op, so results are not narrowed by management group today. The result object may carry three outer fields: `audit_persisted:false` if the access-audit row could not be written (SOC 2 evidence gap — investigate); `result_truncated_by_cap:true` if the raw query hit the 1000-row cap (the page is incomplete — do **not** treat `count<limit` as "done"; paginate via the keyset follow-up); and (#3344) `retry_after_ms` when `execution_id` was supplied and the dispatch is confirmed still in flight — its **absence**, even with zero rows, means either no rows currently match or (instruction_id-only queries) in-flight-ness could not be determined. | `Response:Read` |
 | 7 | `aggregate_responses` | Aggregate response data (COUNT, SUM, AVG, MIN, MAX) grouped by a column. **Hardening (#1634, partial):** a per-agent management-group filter is applied before aggregation, but it is **inert under the current global `Response:Read` gate** — a normal `Response:Read` holder still aggregates across all agents (effective scoping needs the gate change tracked in #1634). Its active effect today is failing **closed** (and a JSON-RPC error, not empty totals) when the RBAC store is corrupt or the response store read errors. A distinct `result=denied` audit row is emitted when any agent is filtered out; the result carries `audit_persisted:false` if that row could not be written (SOC 2 evidence gap — investigate). | `Response:Read` |
 | 8 | `query_inventory` | Query **generic** per-source inventory blobs across agents (filterable by agent, plugin). For the **typed** installed-software inventory use `query_installed_software` (#37) instead. | `Infrastructure:Read` |
@@ -447,7 +457,7 @@ for the tool to execute.
 | 43 | `delete_tag` | Delete a device tag by `agent_id` + `key`. Destructive — **approval-gated** on the operator AND supervised tiers: the first call returns `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after an admin approves, re-call with the `approval_id` argument to execute (one-time; replay rejected). Returns `{deleted, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row) — a **superset** of REST `DELETE /api/v1/tags/{agent_id}/{key}`'s bare `{deleted:true}`; a missing tag is a 404-equivalent (`kInvalidParams`, "tag not found"); a degraded tag store is `kInternalError` (-32603, "Tag store unavailable") — retryable, never conflated with not-found. **A service-scoped API token can never delete the `service` key on any agent** — `kPermissionDenied` (#3289). Note the approval flow runs first: a ticket can be minted and approved for such a call, and is consumed on the recall before the #3289 denial fires — an admin should reject a `delete_tag` approval request for the `service` key from a service-scoped principal rather than spend the one-time approval on a call that will be denied anyway. | `Tag:Delete` |
 | 44 | `approve_request` | Approve a pending approval request by `approval_id` (optional `comment`, audited). The reviewer is the MCP principal and **cannot be the submitter** (store-enforced), and only a **pending** request can be reviewed — a retry on an already-approved/rejected id returns `kInvalidParams` ("approval already reviewed"), **not** a success (approve is a one-shot state transition, not an idempotent write; treat a retry-after-timeout accordingly). Returns `{approved, approval_id}` (plus `audit_persisted:false` on a dropped audit row). Writes through the same `ApprovalManager::approve()` as the legacy dashboard route `POST /api/approvals/{id}/approve`, but that route's response is `{"status":"approved"}` (an HTMX toast payload) — **NOT** the same wire shape; do not treat the two as interchangeable. Requires the **supervised** tier. | `Approval:Approve` |
 | 45 | `reject_request` | Reject a pending approval request by `approval_id` (optional `comment`). Same reviewer≠submitter + pending-only rules as `approve_request`. Returns `{rejected, approval_id}` (plus `audit_persisted:false` on a dropped audit row). Writes through the same `ApprovalManager::reject()` as the legacy dashboard route `POST /api/approvals/{id}/reject`, but that route returns `{"status":"rejected"}` (an HTMX toast payload) — **NOT** the same wire shape. Requires the **supervised** tier. | `Approval:Approve` |
-| 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record, dispatch_confirmed}` (plus `audit_persisted:false` on a dropped audit row). **A success envelope is returned only when the isolation dispatch was accepted (#3127).** `agents_reached=0` (the agent was offline) or a dispatch that threw is **no longer reported as success**: it answers `-32603` ("quarantine recorded but isolation was not confirmed") with the record still persisted — retry the same call to re-drive dispatch. `retry_after_ms` is `5000` on a **first** failure and `60000` on a repeat against a device that already has a record: a second failure means the device is offline rather than busy, and a 5s loop would re-drive a store write, a store read, a dispatch attempt and an audit write every five seconds for as long as it stays down. **Nothing re-applies the endpoint firewall on reconnect** — a device quarantined while offline is contained at the control plane (the #881 gate refuses dispatch to it) but not at its own firewall until a quarantine dispatch actually reaches it, so re-issue once it is back. `dispatch_confirmed:true` means the plugin registry **accepted the frame**, never that the device is provably isolated: for a gateway-attached agent `send_to` only queues the command, so confirming containment requires a follow-up `quarantine.status` read returning `state\|active`. **An already-quarantined device is no longer a terminal `400`-class error** (#3127): the call re-drives dispatch against the **stored** `reason`/`whitelist`, not this call's arguments — a retry must not silently rewrite a contained device's allow-list with no store update and no audit trail (`whitelist_ignored=1` appears in the audit detail when it did). Not an executions-drawer producer. **No MCP release counterpart yet** — to lift a quarantine, use REST `DELETE /api/v1/quarantine/{agent_id}` or the dashboard (a `release_quarantine` MCP tool is a tracked follow-up). The live isolation keeps the agent's existing management connection alive (`ESTABLISHED,RELATED`); a device that fully drops and reconnects while quarantined is matched only by an explicit `whitelist` entry, so a device that may reconnect needs its management address whitelisted explicitly. **Once a device is quarantined, every other MCP tool and REST route that dispatches to it is refused at the server** (#881) — `execute_instruction`, `execute_bundle` and the REST dispatch routes drop the target before it reaches the agent and audit `quarantine.dispatch_denied`. The quarantine plugin's own four actions (`quarantine`/`unquarantine`/`status`/`whitelist`) are exempt so release stays reachable, as are three server-internal pushes that are not operator dispatch (`tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` — a closed set, counted by `yuzu_server_system_reserved_push_total`). Nothing else is. **Since ADR-0047** (the backing store's Postgres migration): a genuine store/pool/query failure answers JSON-RPC `-32603` (`kInternalError`, retryable, carrying `error.data.retry_after_ms: 5000` per A5 — matched on the REST twin's equivalent 503s in the Gate 8 hardening round) rather than the business-error code below (which stays non-retryable, `error.data.retry_after_ms: null`), mirroring the REST twin's 503-vs-400 split — same distinction, different transport's error-code pair. Store-unavailable, scope-gate-unwired, and the write-failure branch are now audited (`mcp.quarantine_device`), matching the REST twin's coverage of those same three branches — **input-validation rejections are not**: a missing `agent_id`, an oversized `reason`/`whitelist`, or a malformed whitelist token return their error before any audit call, on both this tool and the REST twin's malformed-JSON-body 400 (tracked follow-up). | `Security:Execute` |
+| 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record, dispatch_confirmed}` (plus `audit_persisted:false` on a dropped audit row). **A success envelope is returned only when the isolation dispatch was accepted (#3127).** `agents_reached=0` (the agent was offline) or a dispatch that threw is **no longer reported as success**: it answers `-32603` ("quarantine recorded but isolation was not confirmed") with the record still persisted — retry the same call to re-drive dispatch. `retry_after_ms` is `5000` on a **first** failure and `60000` on a repeat against a device that already has a record: a second failure means the device is offline rather than busy, and a 5s loop would re-drive a store write, a store read, a dispatch attempt and an audit write every five seconds for as long as it stays down. **The endpoint firewall re-applies automatically on reconnect (#3425)** — a device quarantined while offline is contained at the control plane (the #881 gate refuses dispatch to it) immediately, and `QuarantineContainmentReconciler` re-drives the stored whitelist once the device reconnects (heartbeat-triggered, with a periodic ~20s tick backstop for anything a heartbeat misses), confirming via a follow-up `quarantine.status` read before marking it converged — see `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full state machine, the `quarantine.reapply` audit verb, and the `yuzu_server_quarantine_endpoint_unconfirmed{reachability}` divergence gauge. A manual re-issue of this call still works and is never required. `dispatch_confirmed:true` means the plugin registry **accepted the frame**, never that the device is provably isolated: for a gateway-attached agent `send_to` only queues the command, so confirming containment requires a follow-up `quarantine.status` read returning `state\|active`. **An already-quarantined device is no longer a terminal `400`-class error** (#3127): the call re-drives dispatch against the **stored** `reason`/`whitelist`, not this call's arguments — a retry must not silently rewrite a contained device's allow-list with no store update and no audit trail (`whitelist_ignored=1` appears in the audit detail when it did). Not an executions-drawer producer. **No MCP release counterpart yet** — to lift a quarantine, use REST `DELETE /api/v1/quarantine/{agent_id}` (quarantine has no dashboard surface — REST/MCP only; a `release_quarantine` MCP tool is a tracked follow-up). The live isolation keeps the agent's existing management connection alive (`ESTABLISHED,RELATED`); a device that fully drops and reconnects while quarantined is matched only by an explicit `whitelist` entry, so a device that may reconnect needs its management address whitelisted explicitly. **Once a device is quarantined, every other MCP tool and REST route that dispatches to it is refused at the server** (#881) — `execute_instruction`, `execute_bundle` and the REST dispatch routes drop the target before it reaches the agent and audit `quarantine.dispatch_denied`. The quarantine plugin's own four actions (`quarantine`/`unquarantine`/`status`/`whitelist`) are exempt so release stays reachable, as are three server-internal pushes that are not operator dispatch (`tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync` — a closed set, counted by `yuzu_server_system_reserved_push_total`). Nothing else is. **Since ADR-0047** (the backing store's Postgres migration): a genuine store/pool/query failure answers JSON-RPC `-32603` (`kInternalError`, retryable, carrying `error.data.retry_after_ms: 5000` per A5 — matched on the REST twin's equivalent 503s in the Gate 8 hardening round) rather than the business-error code below (which stays non-retryable, `error.data.retry_after_ms: null`), mirroring the REST twin's 503-vs-400 split — same distinction, different transport's error-code pair. Store-unavailable, scope-gate-unwired, and the write-failure branch are now audited (`mcp.quarantine_device`), matching the REST twin's coverage of those same three branches — **input-validation rejections are not**: a missing `agent_id`, an oversized `reason`/`whitelist`, or a malformed whitelist token return their error before any audit call, on both this tool and the REST twin's malformed-JSON-body 400 (tracked follow-up). | `Security:Execute` |
 | 47 | `discover_permissions` | A2 discovery (roadmap Issue 17.1): RBAC permission catalog — every `securable_type` × `operation` pair, plus the full role → allowed-operations grid **for callers holding `UserManagement:Read`**; without it the tool still succeeds and returns the taxonomy with `roles_omitted: true` and a reason (declared, never silent). Mirrors `GET /api/v1/discover/permissions`, same builder function (no drift). | `Infrastructure:Read` (taxonomy); the `roles[]` grid additionally needs `UserManagement:Read` (#2376) |
 | 48 | `discover_instructions` | A2 discovery: published (`enabled_only=true`) `InstructionDefinition` catalog with `parameter_schema` as a nested JSON Schema object. Mirrors `GET /api/v1/discover/instructions`. | `InstructionDefinition:Read` |
 | 49 | `discover_routes` | A2 discovery: REST route catalog, a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves. Carries `source:"openapi"` and a caveat that it is hand-maintained, not generated from the live route table. Mirrors `GET /api/v1/discover/routes`. | `Infrastructure:Read` |
@@ -586,7 +596,7 @@ for the tool to execute.
 
 > **`execute_instruction` tier behavior:**
 > - `readonly` tier: blocked.
-> - `operator` tier: executes immediately (auto-approved). If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
+> - `operator` tier: executes immediately (auto-approved)[^1398]. If neither `scope` nor `agent_ids` is provided, targets **all** connected agents.
 > - `supervised` tier: **approval-gated via the ticket-then-recall flow** (see the note above) — the first call returns `kApprovalRequired`, and after an admin approves, a re-call with the `approval_id` argument dispatches.
 
 > **`execute_instruction` response — agentic-first bridging (#1088):**
@@ -859,7 +869,7 @@ The following table shows which operations require approval, by tier:
 
 | Operation | `operator` tier | `supervised` tier |
 |-----------|----------------|-------------------|
-| Execute instruction | No (auto-approved) | Yes |
+| Execute instruction | No (auto-approved)[^1398] | Yes |
 | Delete tag | Yes | Yes |
 | Delete (any resource) | -- | Yes |
 | Write policy | -- | Yes |
@@ -964,7 +974,7 @@ rotation schedule:
 | Use Case | Recommended Tier |
 |----------|-----------------|
 | Read-only dashboards, reporting, investigation | `readonly` |
-| Day-to-day operations with AI assistance (tagging, auto-approved executions) | `operator` |
+| Day-to-day operations with AI assistance (tagging, auto-approved executions[^1398]) | `operator` |
 | Automation pipelines with human approval gates | `supervised` |
 | Unattended, unsupervised AI access | Not recommended. Use `readonly` at most. |
 
@@ -1222,6 +1232,28 @@ streamed POST is parked without having delivered its final (the client
 disconnected, the response cap elapsed, or the server could not complete the
 stream). Pass `--no-mcp-streamed-post` to rule this path out entirely.
 
+### -32015: Server is shutting down (HTTP 503)
+
+**Symptom**: `initialize` (with streaming on) returns `-32015` / HTTP `503`,
+"Server is shutting down", no `Mcp-Session-Id` header.
+
+**Cause**: `ServerImpl::stop()` (#3042) close-signals the session registry
+before closing the listening socket — every live session is closed, and an
+`initialize` that reaches the registry after its closing flag is set is
+refused rather than raced against the socket close or left to mint a session
+that is about to be torn down anyway. (A request whose `mint()` call happens
+to win the registry's lock a hair earlier still succeeds, but that session is
+then closed by the same drain a moment later — same outcome, no client-visible
+difference, just not literally "refused.") This is a narrow, transient window
+(seconds, not the deploy's whole grace period).
+
+**Fix**: Reconnect and re-`initialize` once the server is back — no
+`retry_after_ms` is given, since this process has no visibility into
+when that will be. A session that was already live when
+shutdown began instead receives a `notifications/yuzu.stream_closed` frame
+with `reason: session_terminated` (see that entry above) and should
+re-`initialize` the same way.
+
 ### A streamed final can be dropped entirely
 
 **Symptom**: A parked streamed request produces **no terminal frame and no close
@@ -1271,8 +1303,10 @@ carrying a `correlation_id`, `retry_after_ms: null`, and a `remediation` hint.
 `readonly` token attempting a write). It is also the **degraded** response for an
 approval-gated operation when the server has no `ApprovalManager` and therefore
 cannot mint a pollable ticket (a stripped deploy); normally an approval-gated
-operation returns `-32006` (below), not `-32004`. (`operator`-tier executions are
-auto-approved and do not hit this path.)
+operation returns `-32006` (below), not `-32004`. (Most `operator`-tier executions
+are auto-approved and do not hit this path — the ~42 pairs a compiled gate marks
+approval-required[^1398] don't hit it either, since that denial happens at the
+dispatch chokepoint, not the MCP-level approval workflow this section describes.)
 
 **Fix**: Create a new token with a higher tier (`operator` or `supervised`), or
 use a tool within the current tier's permissions.

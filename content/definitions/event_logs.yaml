@@ -3,8 +3,9 @@
 ## Plugin: event_logs | Actions: errors, query
 ##
 ## Sources by platform:
-##   Windows: Get-WinEvent PowerShell cmdlet
-##   Linux:   journalctl (systemd journal)
+##   Windows: wevtapi EvtQuery/EvtRender (in-process Event Log API)
+##   Linux:   sd_journal (in-process), falling back to a bounded journalctl
+##            invocation where libsystemd is unavailable
 ##   macOS:   log show (unified logging)
 
 ---
@@ -17,11 +18,14 @@ metadata:
   description: >
     Retrieve recent error-level events from a system event log. On
     Windows, queries the specified log (default "System") for Level 2
-    (Error) events within the time window via Get-WinEvent. On Linux,
-    uses journalctl -p err. On macOS, uses log show with error predicate.
-    Returns up to 100 events with timestamp, event ID, source, and
-    truncated message (max 200 chars). Input sanitization prevents
-    command injection.
+    (Error) events within the time window via the in-process Event Log
+    API (wevtapi). On Linux, reads the journal in-process at priority
+    err or worse, falling back to a bounded journalctl invocation where
+    libsystemd is unavailable. On macOS, uses log show with an error
+    predicate. Returns up to 100 events with timestamp, event ID,
+    source, and truncated message (max 200 chars). A read that fails, is
+    denied, or is cut short by its bound reports a typed status rather
+    than an empty result.
   tags: [diagnostics, event-logs, monitoring, compliance]
 
 spec:
@@ -98,11 +102,14 @@ metadata:
   version: 1.0.0
   description: >
     Search event log entries by keyword filter within a specified log.
-    On Windows, uses Get-WinEvent with a Where-Object message filter.
-    On Linux, uses journalctl --grep. On macOS, uses log show with an
+    On Windows, reads events via the in-process Event Log API (wevtapi)
+    and matches the keyword against the event's data and provider name.
+    On Linux, matches a case-insensitive substring against the journal
+    message. On macOS, uses log show with an
     eventMessage contains predicate (last 24h). Returns matching events
     with timestamp, level, event ID, source, and message. Input is
-    sanitized to prevent command injection.
+    matched in-process; no operator-supplied value is passed to an
+    external command.
   tags: [diagnostics, event-logs, search, monitoring]
 
 spec:
@@ -141,7 +148,10 @@ spec:
         type: int32
         displayName: Max Results
         description: >
-          Maximum number of events to return. Range: 1-500. Default: 50.
+          Maximum number of recent events EXAMINED for a match on
+          Windows (the filter is applied within that window); the maximum
+          number of matches returned on Linux and macOS. Range: 1-500.
+          Default: 50.
         default: 50
         validation:
           minimum: 1

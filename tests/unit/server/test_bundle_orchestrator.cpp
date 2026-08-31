@@ -42,6 +42,11 @@ struct FakeDispatch {
         std::vector<std::string> agent_ids;
         yuzu::server::authz::VisibleSet exec_visible; // governance UP-8: what the caller threaded
         std::string principal; // M11: the IDENTITY half — see the test below
+        // #1398 (adversarial-review finding): the two fields dispatch()'s own
+        // per-step DispatchCaller reconstruction used to silently drop.
+        bool principal_is_admin = false;
+        yuzu::server::ApprovalProvenance approval_provenance =
+            yuzu::server::ApprovalProvenance::None;
     };
     std::vector<Call> calls;
     int sent = 1; // agents_reached returned for every step
@@ -52,8 +57,9 @@ struct FakeDispatch {
                       const std::unordered_map<std::string, std::string>& /*params*/,
                       const std::string& correlation,
                       const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
-            calls.push_back(
-                Call{plugin, action, correlation, agent_ids, caller.exec_visible, caller.principal});
+            calls.push_back(Call{plugin, action, correlation, agent_ids, caller.exec_visible,
+                                 caller.principal, caller.principal_is_admin,
+                                 caller.approval_provenance});
             return {"cmd-" + plugin + "-" + action, sent};
         };
     }
@@ -149,6 +155,58 @@ TEST_CASE("orchestrator threads the caller's exec_visible into DispatchFn unchan
         // was about. `dispatch()`'s third positional argument ("alice"
         // above) is exactly `caller.principal`.
         CHECK(call.principal == "alice");
+    }
+}
+
+TEST_CASE("orchestrator threads principal_is_admin and approval_provenance into DispatchFn "
+          "unchanged (#1398, adversarial-review finding)",
+          "[pg][bundle][orchestrator][1398]") {
+    // Before this fix `dispatch()` reconstructed a per-step DispatchCaller
+    // carrying only `.principal`/`.exec_visible` — `principal_is_admin` and
+    // `approval_provenance` silently defaulted to false/None regardless of
+    // the real caller, so an admin's (or a ticket-holding supervised MCP
+    // caller's) bundle step on an AdminOrApproval/AlwaysApproval pair was
+    // refused ApprovalRequired unconditionally at the dispatch chokepoint,
+    // with no way to satisfy the gate via this surface at all. Both
+    // independent adversarial-review reviewers (Kimi + Codex, 2026-08-28)
+    // found this; this test is the falsifier they both asked for.
+    FakeDispatch fd;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    BundleOrchestrator orch(fd.fn(), &store, fixed_id("admin"));
+
+    SECTION("admin caller, no ticket") {
+        auto res = orch.dispatch("agent-1", two_steps(), "boss", null_audit(), std::nullopt,
+                                 /*principal_is_admin=*/true);
+        CHECK(res.expected == 2);
+        REQUIRE(fd.calls.size() == 2);
+        for (const auto& call : fd.calls) {
+            CHECK(call.principal_is_admin);
+            CHECK(call.approval_provenance == yuzu::server::ApprovalProvenance::None);
+        }
+    }
+    SECTION("non-admin caller with a consumed ticket") {
+        auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit(), std::nullopt,
+                                 /*principal_is_admin=*/false,
+                                 yuzu::server::ApprovalProvenance::Ticket);
+        CHECK(res.expected == 2);
+        REQUIRE(fd.calls.size() == 2);
+        for (const auto& call : fd.calls) {
+            CHECK_FALSE(call.principal_is_admin);
+            CHECK(call.approval_provenance == yuzu::server::ApprovalProvenance::Ticket);
+        }
+    }
+    SECTION("neither admin nor ticket — defaults preserved, matching pre-#1398 behavior for an "
+            "ungated pair") {
+        auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
+        CHECK(res.expected == 2);
+        REQUIRE(fd.calls.size() == 2);
+        for (const auto& call : fd.calls) {
+            CHECK_FALSE(call.principal_is_admin);
+            CHECK(call.approval_provenance == yuzu::server::ApprovalProvenance::None);
+        }
     }
 }
 

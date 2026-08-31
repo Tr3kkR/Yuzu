@@ -317,6 +317,14 @@ TEST_CASE("POST /login for an ENROLLED user with an unreadable MFA secret fails 
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Set-Cookie").empty());
     CHECK(res->body.find(R"("code":503)") != std::string::npos);
+    // #2396: the fail-closed 503 now carries an honest, machine-readable
+    // backoff hint — a Retry-After header AND a retry_after_ms body field — so
+    // a client/LB backs off instead of hammering a degraded store. (The
+    // reason-labelled yuzu_auth_read_degrade_total counter is exercised at the
+    // store layer + server metric wiring; this harness wires no
+    // MetricsRegistry, so the handler's null-guarded increment is inert here.)
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->body.find(R"("retry_after_ms":2000)") != std::string::npos);
     // No session was minted on ANY path — the terminal auth.login row never
     // fires for this login attempt.
     CHECK(h.count_audits("auth.login", "admin") == 0);

@@ -60,7 +60,10 @@ std::chrono::milliseconds ConvergenceScheduler::jittered(std::uint64_t base_ms,
                                                          std::mt19937& rng) const {
     if (cfg_.jitter_pct == 0 || base_ms == 0)
         return std::chrono::milliseconds{base_ms};
-    const std::uint64_t span = (base_ms * cfg_.jitter_pct) / 100; // +/- this many ms
+    // Single-sourced with guardian_spark_bridge.hpp's debounce-default computation
+    // (spark.hpp's guardian_jitter_span_ms, #3388 Gate 3) - not just the same input
+    // constants, the same arithmetic, so the two can't silently desync.
+    const std::uint64_t span = guardian_jitter_span_ms(base_ms, cfg_.jitter_pct); // +/- this many ms
     if (span == 0)
         return std::chrono::milliseconds{base_ms};
     std::uniform_int_distribution<std::int64_t> dist(-static_cast<std::int64_t>(span),

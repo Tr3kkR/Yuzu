@@ -60,6 +60,8 @@
 #include "guardian_rule_eval.hpp" // RuleAssertion, AssertionKind
 #include "guaranteed_state.pb.h"
 
+#include <spdlog/spdlog.h>
+
 #include <charconv>
 #include <cstdint>
 #include <expected>
@@ -192,12 +194,74 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
     // returned ResilienceConfig itself (remediation MODE) is intentionally
     // discarded: spark is detection-only through this rung (enforcement lands
     // rung 3), so only the debounce window applies here.
+    //
+    // Fallback default (#3388): legacy's 1000ms default suits its notification-
+    // driven model (no scheduled re-evaluation). Spark's convergence scheduler
+    // re-evaluates every armed rule on a fixed per-type cadence, so a 1000ms
+    // debounce expires before every single sweep, and a persistently-drifted
+    // rule re-emits drift.detected on every sweep of its lane - jitter-adjusted
+    // worst case ~1800/day on the 60s service/registry lanes, ~180/day on the
+    // 600s file lane (naive no-jitter figures of 1440/144 understate the worst
+    // case; full jitter-floor derivation in docs/spark-legacy-delta-registry.md's
+    // D3 row).
+    // Interim fix (owner decision, pending a possible full M1-shaped
+    // edge+refresh redesign later): default to the rule's own lane
+    // cadence plus the scheduler's own jitter span, so debounce reliably
+    // survives at least one full sweep even at the jitter-shortened extreme -
+    // roughly halves steady-state re-emission frequency. Reuses the SAME
+    // cadence/jitter constants AND the same jitter-span formula the convergence
+    // scheduler itself uses (guardian_jitter_span_ms, spark.hpp), so the two
+    // can't silently drift apart on either axis.
     const auto& rem = rule.remediation();
     auto get = [&rem](std::string_view k) -> std::string {
         const auto it = rem.params().find(std::string(k));
         return it != rem.params().end() ? it->second : std::string{};
     };
-    (void)parse_resilience_params(get, out.debounce_ms);
+    // No `default:` label below, deliberately: that keeps -Wswitch live as a build-time
+    // SIGNAL if SparkType ever gains an enumerator this switch doesn't handle - not a
+    // guaranteed compile-time BLOCK, since this project builds with werror=false and
+    // MSVC's equivalent (C4062) is off even at /W4. The std::optional (rather than a
+    // pre-seeded 1000ms literal) is the RUNTIME net for
+    // the same gap (#3531) - a future unhandled case must be caught and logged, not
+    // silently fall back to the exact 1000ms default that reintroduces #3388's flood.
+    std::optional<std::uint64_t> default_debounce_ms;
+    switch (*spark_type) {
+    case SparkType::File:
+        default_debounce_ms =
+            kGuardianFileLaneCadenceMs + guardian_jitter_span_ms(kGuardianFileLaneCadenceMs,
+                                                                 kGuardianLaneJitterPct);
+        break;
+    case SparkType::Registry:
+        default_debounce_ms =
+            kGuardianRegistryLaneCadenceMs + guardian_jitter_span_ms(kGuardianRegistryLaneCadenceMs,
+                                                                     kGuardianLaneJitterPct);
+        break;
+    case SparkType::Service:
+        default_debounce_ms =
+            kGuardianServiceLaneCadenceMs + guardian_jitter_span_ms(kGuardianServiceLaneCadenceMs,
+                                                                    kGuardianLaneJitterPct);
+        break;
+    case SparkType::Interval:
+    case SparkType::Startup:
+    case SparkType::Disk:
+        break; // unreachable here (spark_type_from_token already rejected these above)
+    }
+    if (!default_debounce_ms) {
+        // Unreachable today - kept as a loud, logged degrade rather than a silent one
+        // (#3531). No assert: this project leaves b_ndebug unset, so asserts are LIVE
+        // in release builds, and aborting here is exactly what the #3388 ledger ruled
+        // out in favor of safe degrade. Falling back to the legacy default is safe (it
+        // just re-admits the per-sweep flood for this one rule until the switch above
+        // is updated for the new SparkType), but it must never be silent. Reuses
+        // parse_resilience_params' own kGuardianLegacyDebounceMs rather than repeating
+        // the literal, so a future change to the legacy default can't leave this
+        // fallback silently stale.
+        default_debounce_ms = kGuardianLegacyDebounceMs;
+        spdlog::error("Guardian: rule '{}' has spark type '{}' unhandled by the debounce-"
+                      "default switch - falling back to the legacy {}ms default (#3531)",
+                      out.rule_id, spark_type_token(*spark_type), *default_debounce_ms);
+    }
+    (void)parse_resilience_params(get, out.debounce_ms, *default_debounce_ms);
 
     const std::string& atype = assertion.type();
     switch (*spark_type) {

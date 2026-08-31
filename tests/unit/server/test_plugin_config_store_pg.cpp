@@ -142,7 +142,7 @@ private:
 
 TEST_CASE("PluginConfigStore opens on a fresh Postgres and migrates once",
           "[pg][store][plugin_config]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     Wired w{db.dsn()};
     CHECK(w.store.is_open());
 

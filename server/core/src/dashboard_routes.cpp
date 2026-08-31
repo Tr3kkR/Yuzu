@@ -234,7 +234,27 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     // -- GET /fragments/results -----------------------------------------------
     sink.Get("/fragments/results",
             [this](const httplib::Request& req, httplib::Response& res) {
-                if (!perm_fn_(req, res, "Response", "Read")) return;
+                // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
+                // (fleet_read_fn_), mirroring query_installed_software: the
+                // gate is now the SOLE authorization check (never stacked
+                // with perm_fn_ — the BLOCKING defect require_fleet_read's
+                // own doc comment warns against).
+                if (!fleet_read_fn_) {
+                    spdlog::error("/fragments/results: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.status = 503;
+                    res.set_content(
+                        "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
+                        "Service unavailable.</td></tr></tbody>",
+                        "text/html; charset=utf-8");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Response", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                            // (JSON — same shape perm_fn_'s require_permission
+                            // already wrote on this route pre-migration; not a
+                            // content-type change for an HTMX consumer).
 
                 auto command_id = req.get_param_value("command_id");
                 auto plugin = req.get_param_value("plugin");
@@ -294,14 +314,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 }
                 if (!template_id.empty() && !definition_id.empty() &&
                     instruction_store_ && instruction_store_->is_open()) {
-                    auto def = instruction_store_->get_definition(definition_id);
-                    if (def) {
+                    // ADR-0058: a DB-error outer result skips this best-effort template
+                    // resolution, same as a not-found inner optional did pre-migration.
+                    auto def_result = instruction_store_->get_definition(definition_id);
+                    if (def_result && *def_result) {
+                        const auto& def = **def_result;
                         ResponseTemplatesEngine engine;
                         std::vector<ResponseTemplate> templates;
-                        if (auto parsed = engine.parse(def->response_templates_spec); parsed)
+                        if (auto parsed = engine.parse(def.response_templates_spec); parsed)
                             templates = std::move(*parsed);
                         auto resolved = engine.resolve(templates, template_id,
-                                                      def->result_schema, def->plugin);
+                                                      def.result_schema, def.plugin);
                         // Sort default — only when URL didn't supply one.
                         if (!sort_explicit && !resolved.sort_column.empty()) {
                             // The dashboard sort param uses lowercased,
@@ -339,7 +362,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto html = render_results(command_id, plugin, sort_col, sort_dir,
                                            page, per_page, filters, text_query,
                                            definition_id, template_id,
-                                           visible_columns);
+                                           visible_columns, gate.scope);
                 res.set_content(html, "text/html; charset=utf-8");
             });
 
@@ -418,9 +441,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 // and canonical array shapes.
                 int chart_count = 0;
                 if (instruction_store_ && instruction_store_->is_open()) {
-                    auto def = instruction_store_->get_definition(definition_id);
-                    if (def)
-                        chart_count = VisualizationEngine::count(def->visualization_spec);
+                    // ADR-0058: a DB-error outer result leaves chart_count at 0 (deck
+                    // skipped below), same as a not-found inner optional did pre-migration.
+                    auto def_result = instruction_store_->get_definition(definition_id);
+                    if (def_result && *def_result)
+                        chart_count = VisualizationEngine::count((*def_result)->visualization_spec);
                 }
                 if (chart_count <= 0) {
                     res.set_content("", "text/html; charset=utf-8");
@@ -717,13 +742,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      q.plugin_filter = plugin;
                      q.enabled_only = true;
                      q.limit = 50;
-                     for (const auto& d : instruction_store_->query_definitions(q)) {
-                         if (d.action != action) continue;
-                         if (!VisualizationEngine::has_visualization(d.visualization_spec) &&
-                             d.result_schema.empty())
-                             continue;
-                         def_id = d.id;
-                         break;
+                     // ADR-0058: a DB-error result leaves def_id empty (enrichment
+                     // skipped below), same as an empty result did pre-migration.
+                     auto defs_result = instruction_store_->query_definitions(q);
+                     if (defs_result) {
+                         for (const auto& d : *defs_result) {
+                             if (d.action != action) continue;
+                             if (!VisualizationEngine::has_visualization(d.visualization_spec) &&
+                                 d.result_schema.empty())
+                                 continue;
+                             def_id = d.id;
+                             break;
+                         }
                      }
                  }
 
@@ -1633,10 +1663,12 @@ std::vector<FacetFilter> DashboardRoutes::parse_filters(const httplib::Request& 
 std::vector<std::string> DashboardRoutes::resolve_render_columns(
     const std::string& plugin, const std::string& definition_id) const {
     if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
-        if (auto def = instruction_store_->get_definition(definition_id);
-            def && !def->result_schema.empty()) {
+        // ADR-0058: a DB-error outer result falls through to columns_for_plugin below,
+        // same as a not-found inner optional did pre-migration.
+        if (auto def_result = instruction_store_->get_definition(definition_id);
+            def_result && *def_result && !(*def_result)->result_schema.empty()) {
             ResponseTemplatesEngine engine;
-            auto tmpl = engine.synthesise_default(def->result_schema, plugin);
+            auto tmpl = engine.synthesise_default((*def_result)->result_schema, plugin);
             if (!tmpl.columns.empty()) {
                 std::vector<std::string> cols{"Agent"};
                 cols.insert(cols.end(), tmpl.columns.begin(), tmpl.columns.end());
@@ -1659,7 +1691,8 @@ std::string DashboardRoutes::render_results(
     const std::string& text_query,
     const std::string& definition_id,
     const std::string& template_id,
-    const std::vector<std::string>& visible_columns) {
+    const std::vector<std::string>& visible_columns,
+    const authz::VisibleSet& scope) {
 
     if (!response_store_) {
         return "<tbody id=\"results-tbody\"><tr><td class=\"empty-state\">"
@@ -1728,6 +1761,25 @@ std::string DashboardRoutes::render_results(
         auto count_opt = response_store_->facet_agent_count(command_id, filters);
         store_degraded = store_degraded || !count_opt.has_value();
         total_agent_count = count_opt.value_or(0);
+    }
+
+    // #1712 / #3290 Phase 2 — scope filter (the gate's composed
+    // meet(management-group, service-scope) VisibleSet), applied BEFORE
+    // total_agent_count is used anywhere below: a fleet-wide count served
+    // to a confined caller is the same disclosure class this migration
+    // closes, so `total_agent_count` is recomputed from the filtered set
+    // rather than left at its pre-filter (facet_agent_count/response-count)
+    // value. nullopt (TOP) ⇒ unfiltered, byte-identical to the pre-#1712
+    // path for that caller class.
+    if (scope) {
+        std::vector<StoredResponse> visible;
+        visible.reserve(responses.size());
+        for (auto& r : responses) {
+            if (authz::in_scope(scope, r.agent_id))
+                visible.push_back(std::move(r));
+        }
+        responses.swap(visible);
+        total_agent_count = static_cast<int64_t>(responses.size());
     }
 
     // Phase 2: parse output lines, apply per-line filters and text search
@@ -1950,7 +2002,18 @@ std::string DashboardRoutes::render_results(
                 std::to_string(total_agent_count) + " agent" +
                 (total_agent_count != 1 ? "s" : "");
 
-        if (!filters.empty() && total_agent_count > 0) {
+        // Confined-caller withhold (Gate 6 enterprise-readiness finding, this
+        // round): /fragments/create-group-form and /api/dashboard/group-from-
+        // results gate on ManagementGroup:Write only — a DIFFERENT securable,
+        // unrelated to this caller's Response:Read confinement — and apply no
+        // per-agent scope filter of their own (tracked, deliberately deferred:
+        // ADR-0017 "Doc honesty"/#3489). Before this migration a confined-only
+        // (AdmitScoped) caller could not reach /fragments/results at all, so
+        // could never see this button. Now that require_fleet_read admits
+        // them, withhold the button itself when scope is engaged rather than
+        // surface an entry point into a flow that would silently re-widen to
+        // the unscoped facet count/ids on submit.
+        if (!filters.empty() && total_agent_count > 0 && !scope) {
             // Build filter params for the create-group-form URL
             std::string filter_params;
             for (const auto& f : filters) {
@@ -1983,9 +2046,11 @@ std::string DashboardRoutes::render_results(
     // command is cleared.
     int chart_count = 0;
     if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
-        auto def = instruction_store_->get_definition(definition_id);
-        if (def)
-            chart_count = VisualizationEngine::count(def->visualization_spec);
+        // ADR-0058: a DB-error outer result leaves chart_count at 0 (empty deck
+        // below), same as a not-found inner optional did pre-migration.
+        auto def_result = instruction_store_->get_definition(definition_id);
+        if (def_result && *def_result)
+            chart_count = VisualizationEngine::count((*def_result)->visualization_spec);
     }
     html += R"(<div id="chart-deck-host" hx-swap-oob="innerHTML">)";
     if (chart_count > 0) {
@@ -2033,11 +2098,14 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
     // /fragments/results with template_id=<chosen>; the route handler
     // resolves the template and applies sort/filter/columns defaults.
     if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
-        auto def = instruction_store_->get_definition(definition_id);
-        if (def) {
+        // ADR-0058: a DB-error outer result skips this best-effort template
+        // selector, same as a not-found inner optional did pre-migration.
+        auto def_result = instruction_store_->get_definition(definition_id);
+        if (def_result && *def_result) {
+            const auto& def = **def_result;
             ResponseTemplatesEngine engine;
             std::vector<ResponseTemplate> templates;
-            if (auto parsed = engine.parse(def->response_templates_spec); parsed)
+            if (auto parsed = engine.parse(def.response_templates_spec); parsed)
                 templates = std::move(*parsed);
             // The dropdown lists the synthesised default first when no
             // operator template is marked default; otherwise it omits
