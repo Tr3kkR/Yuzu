@@ -524,10 +524,20 @@ int do_exec(yuzu::CommandContext& ctx, yuzu::Params params) {
     // -- unlike default_cwd's own resolution above, a missing app
     // directory only means fewer places are searched, never a wrong or
     // untrusted one.
+    // BR-007 (adversarial review, HIGH): `.string()` on a
+    // std::filesystem::path narrows the native wide path through the
+    // process' ACTIVE CODE PAGE, not UTF-8 -- an install path containing a
+    // character outside that code page would silently corrupt or throw.
+    // content_dist_exec_seam.hpp's identical app-directory-search-stage
+    // problem is already solved correctly via yuzu::win::from_wide() on the
+    // wide form directly (win_str.hpp, already included above); match that
+    // pattern here instead of round-tripping through .string().
     std::vector<std::string> windows_search_dirs;
-    if (auto app_dir = yuzu::agent::current_executable_path().parent_path().string();
-        !app_dir.empty())
-        windows_search_dirs.push_back(std::move(app_dir));
+    if (auto app_dir_wide = yuzu::agent::current_executable_path().parent_path();
+        !app_dir_wide.empty()) {
+        if (auto app_dir = yuzu::win::from_wide(app_dir_wide.c_str()); !app_dir.empty())
+            windows_search_dirs.push_back(std::move(app_dir));
+    }
     windows_search_dirs.push_back(default_cwd); // == windows_system_directory() here
     windows_search_dirs.insert(windows_search_dirs.end(), path_entries.begin(),
                                path_entries.end());
