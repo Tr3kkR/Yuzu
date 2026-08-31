@@ -666,6 +666,8 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_netqual_nstat.cpp',
     '../agents/plugins/tar/src/tar_netconn_win.cpp',
     '../agents/plugins/tar/src/tar_mapdrive_collector.cpp',
+    '../agents/plugins/tar/src/tar_arp_collector.cpp',     # Wave 5 PR5.2 Finding 4: real enumerate_arp() macOS smoke test
+    '../agents/plugins/tar/src/tar_service_collector.cpp', # Wave 5 PR5.2 Finding 3: real enumerate_services() argv-assertion tests
     '../agents/plugins/tar/src/tar_fleet_snapshot.cpp',
   ),
   include_directories: [

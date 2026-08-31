@@ -33,11 +33,28 @@
 #include "tar_service_parsers.hpp" // yuzu::tar::{parse_systemctl_list_units,parse_launchctl_list}
 
 #include <chrono>
+#include <functional>
 
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
 #endif
 
 namespace yuzu::tar {
+
+#ifndef _WIN32
+// Finding 3 (Wave 5 PR5.2 round): the systemctl/launchctl runner-migration
+// call sites (argv construction, deadline, --plain) were proven only at the
+// pure-parser layer -- no test called enumerate_services() itself, so a
+// regression to the old popen body, a dropped --plain, or wrong argv would
+// still pass. RunSubprocessFn is the injectable seam: production calls go
+// through the real yuzu::agent::run_bounded_subprocess (the default
+// argument on each *_impl below); a test injects a fixture double that
+// captures the exact argv/options it was called with and returns a
+// caller-controlled SubprocessResult, exercising the REAL enumerate_*_impl
+// body (probe_tool_path, argv, classify_subprocess_capture,
+// IncompleteCaptureError) rather than a hand-simulated stand-in.
+using RunSubprocessFn = std::function<yuzu::agent::SubprocessResult(
+    const std::vector<std::string>& argv, const yuzu::agent::SubprocessOptions& opts)>;
+#endif
 
 // -- Windows implementation ---------------------------------------------------
 #ifdef _WIN32
@@ -181,7 +198,14 @@ std::vector<ServiceInfo> enumerate_services() {
 // -- Linux implementation -----------------------------------------------------
 #elif defined(__linux__)
 
-std::vector<ServiceInfo> enumerate_services() {
+// Finding 3 seam: the real body, parameterised over the subprocess runner so
+// a test can inject a fixture double (tests/unit/test_tar_service.cpp) and
+// assert the EXACT argv/options this leg passes, plus that a spawn
+// failure/timeout/output-cap/non-zero-exit fixture result throws
+// IncompleteCaptureError through this real function -- not a hand-simulated
+// stand-in. enumerate_services() (below) is the production entry point,
+// calling this with the real runner.
+std::vector<ServiceInfo> enumerate_services_impl(const RunSubprocessFn& run) {
     // Probed over the two absolute paths systemctl actually lives at across
     // distros (mirrors the services plugin's own probe --
     // services_plugin.cpp's enumerate_services_linux precedent). Degrades
@@ -217,7 +241,7 @@ std::vector<ServiceInfo> enumerate_services() {
     // outright (verified live, same container: `yzfail.service ...` with no
     // leading column at all under either locale), so parsing no longer
     // depends on the runner's environment.
-    auto res = yuzu::agent::run_bounded_subprocess(
+    auto res = run(
         {systemctl_path, "list-units", "--type=service", "--all", "--plain", "--no-pager",
          "--no-legend"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{10}});
@@ -249,10 +273,17 @@ std::vector<ServiceInfo> enumerate_services() {
     return std::move(parsed.entries);
 }
 
+std::vector<ServiceInfo> enumerate_services() {
+    return enumerate_services_impl(yuzu::agent::run_bounded_subprocess);
+}
+
 // -- macOS implementation -----------------------------------------------------
 #elif defined(__APPLE__)
 
-std::vector<ServiceInfo> enumerate_services() {
+// Finding 3 seam -- see the Linux enumerate_services_impl comment above; same
+// shape, this leg's real production entry point is enumerate_services()
+// below.
+std::vector<ServiceInfo> enumerate_services_impl(const RunSubprocessFn& run) {
     // launchctl lives at exactly one absolute path on macOS (no /usr/bin
     // alternative, unlike systemctl's cross-distro split) -- probe_tool_path
     // still verifies it exists+is executable before trusting it into
@@ -271,7 +302,7 @@ std::vector<ServiceInfo> enumerate_services() {
     // subprocess_runner.hpp:98), matching the old `2>/dev/null` shell
     // suffix. Parsing (including the header-row skip) is pure
     // (tar_service_parsers.hpp), unit-testable independent of the runner.
-    auto res = yuzu::agent::run_bounded_subprocess(
+    auto res = run(
         {launchctl_path, "list"}, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{10}});
     // zero_exit_required=true verified live on this host: `launchctl list`
     // exits 0 (511 jobs listed, including third-party agents/daemons).
@@ -292,6 +323,10 @@ std::vector<ServiceInfo> enumerate_services() {
         throw yuzu::tar::IncompleteCaptureError("TAR: launchctl produced a malformed row");
     }
     return std::move(parsed.entries);
+}
+
+std::vector<ServiceInfo> enumerate_services() {
+    return enumerate_services_impl(yuzu::agent::run_bounded_subprocess);
 }
 
 #else

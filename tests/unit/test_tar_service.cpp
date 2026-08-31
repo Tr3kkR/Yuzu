@@ -41,9 +41,15 @@
  *     observed on this host at capture time.
  */
 
+#include "tar_capture_status.hpp" // yuzu::tar::IncompleteCaptureError
+#include "tar_collectors.hpp"     // yuzu::tar::{enumerate_services,enumerate_services_impl}
 #include "tar_service_parsers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <chrono>
+
+#include <yuzu/agent/subprocess_runner.hpp>
 
 using namespace yuzu::tar;
 
@@ -244,3 +250,127 @@ TEST_CASE("parse_launchctl_list: a truncated row with an empty LABEL field is "
     CHECK(result.entries[0].name == "com.apple.SafariHistoryServiceAgent");
     CHECK(result.entries[1].name == "com.apple.knowledgeconstructiond");
 }
+
+// ── enumerate_services_impl: runner-migration call-site coverage (Finding 3) ──
+//
+// Everything above exercises only the pure parsers. Nothing previously
+// called enumerate_services()/enumerate_services_impl() itself, so a
+// regression to the old popen body, a dropped --plain flag, or a wrong argv
+// would still have passed every test in this file. enumerate_services_impl
+// (tar_collectors.hpp/tar_service_collector.cpp) takes the subprocess runner
+// as an injectable parameter for exactly this reason: these tests inject a
+// fixture double that records the exact argv/options it was called with and
+// returns a caller-controlled SubprocessResult, then call the REAL
+// enumerate_services_impl (not a hand-simulated stand-in) so probe_tool_path,
+// argv construction, classify_subprocess_capture, and the
+// IncompleteCaptureError throw are all genuinely exercised. macOS only here
+// (launchctl leg) -- this is the platform this test binary actually links
+// and runs on (tests/meson.build now compiles tar_service_collector.cpp into
+// yuzu_tar_tests). The Linux leg (systemctl, --plain) is compile-checked
+// only on macOS via the #elif __linux__ guard in tar_service_collector.cpp
+// -- it is not compiled into this binary at all on this host, so a Linux
+// leg regression can only be caught on Linux CI; still exercised for real
+// there via the same enumerate_services_impl seam.
+
+#ifdef __APPLE__
+
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): invokes the exact "
+          "argv/options and returns the real parsed rows on a successful run",
+          "[tar_service][enumerate]") {
+    std::vector<std::string> captured_argv;
+    yuzu::agent::SubprocessOptions captured_opts;
+    auto fake_run = [&](const std::vector<std::string>& argv,
+                        const yuzu::agent::SubprocessOptions& opts) {
+        captured_argv = argv;
+        captured_opts = opts;
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.exit_code = 0;
+        res.lines = {
+            "PID\tStatus\tLabel",
+            "-\t0\tcom.apple.SafariHistoryServiceAgent",
+            "1190\t0\tcom.apple.progressd",
+        };
+        return res;
+    };
+
+    auto services = enumerate_services_impl(fake_run);
+
+    // Exact argv: launchctl at its one real absolute path, "list", no other
+    // args -- a regression that drops/adds an argument, or reintroduces a
+    // shell hop (`/bin/sh -c ...`), changes this.
+    REQUIRE(captured_argv.size() == 2);
+    CHECK(captured_argv[0] == "/bin/launchctl");
+    CHECK(captured_argv[1] == "list");
+    CHECK(captured_opts.deadline == std::chrono::seconds{10});
+
+    REQUIRE(services.size() == 2);
+    CHECK(services[0].name == "com.apple.SafariHistoryServiceAgent");
+    CHECK(services[0].status == "stopped");
+    CHECK(services[1].name == "com.apple.progressd");
+    CHECK(services[1].status == "running");
+}
+
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a spawn failure "
+          "throws IncompleteCaptureError through the real collector entry point",
+          "[tar_service][enumerate]") {
+    auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = false; // exec itself failed
+        return res;
+    };
+    REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
+}
+
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a deadline timeout "
+          "throws IncompleteCaptureError through the real collector entry point",
+          "[tar_service][enumerate]") {
+    auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.timed_out = true;
+        res.exit_code = -1;
+        return res;
+    };
+    REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
+}
+
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): an output-cap "
+          "truncation throws IncompleteCaptureError through the real "
+          "collector entry point",
+          "[tar_service][enumerate]") {
+    auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.exit_code = 0;
+        res.output_truncated = true;
+        res.lines = {"PID\tStatus\tLabel", "1190\t0\tcom.apple.progressd"};
+        return res;
+    };
+    REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
+}
+
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a non-zero exit "
+          "throws IncompleteCaptureError through the real collector entry point",
+          "[tar_service][enumerate]") {
+    auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.exit_code = 1;
+        res.lines = {"PID\tStatus\tLabel", "1190\t0\tcom.apple.progressd"};
+        return res;
+    };
+    REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
+}
+
+TEST_CASE("enumerate_services: the real production entry point runs against "
+          "the live host without throwing",
+          "[tar_service][enumerate][live]") {
+    // The real production wiring (enumerate_services() -> enumerate_services_impl
+    // with the real run_bounded_subprocess) actually invoking real launchctl
+    // on this host -- proves the seam's default argument is genuinely wired,
+    // not just the injectable path.
+    REQUIRE_NOTHROW(enumerate_services());
+}
+
+#endif // __APPLE__

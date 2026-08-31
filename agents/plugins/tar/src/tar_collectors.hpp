@@ -23,8 +23,13 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#ifndef _WIN32
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::{SubprocessResult,SubprocessOptions} — enumerate_services_impl's RunFn seam
+#endif
+
 #include <algorithm>
 #include <cstdint>
+#include <functional> // enumerate_services_impl's injectable-runner RunFn (non-Windows)
 #include <string>
 #include <string_view>
 #include <vector>
@@ -234,6 +239,25 @@ std::string_view netqual_effective_capture_method();
 
 /** Enumerate installed system services on the current host. */
 std::vector<ServiceInfo> enumerate_services();
+
+#ifndef _WIN32
+/**
+ * Finding 3 (Wave 5 PR5.2 round) seam: the Linux/macOS enumerate_services()
+ * bodies, parameterised over the subprocess runner
+ * (agents/core/include/yuzu/agent/subprocess_runner.hpp's
+ * run_bounded_subprocess signature) so tests/unit/test_tar_service.cpp can
+ * inject a fixture double and assert the EXACT argv/options systemctl and
+ * launchctl are invoked with, plus that a spawn-failure/timeout/output-cap/
+ * non-zero-exit fixture result throws IncompleteCaptureError through this
+ * real function -- never a hand-simulated stand-in. enumerate_services()
+ * above is the production entry point and always calls this with the real
+ * run_bounded_subprocess. Not declared on Windows: that leg uses
+ * EnumServicesStatusExW, not a subprocess.
+ */
+std::vector<ServiceInfo> enumerate_services_impl(
+    const std::function<yuzu::agent::SubprocessResult(
+        const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&)>& run);
+#endif
 
 /** Enumerate active user sessions on the current host. */
 std::vector<UserSession> enumerate_users();
