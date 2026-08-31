@@ -312,6 +312,28 @@ std::string route_block_at(const std::string& src, std::size_t marker_pos) {
     return src.substr(marker_pos, (next == std::string::npos ? src.size() : next) - marker_pos);
 }
 
+// Collapses any run of whitespace (including a clang-format line-wrap
+// inserted between a call's arguments) to a single space, so the needle
+// searches below survive a reformat that doesn't touch the call itself --
+// only a REAL change to the call (gate swapped, operation changed) should
+// ever flip these assertions, never incidental column-limit wrapping.
+std::string collapse_ws(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    bool in_ws = false;
+    for (char c : s) {
+        if (std::isspace(static_cast<unsigned char>(c))) {
+            if (!in_ws)
+                out.push_back(' ');
+            in_ws = true;
+        } else {
+            out.push_back(c);
+            in_ws = false;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("route wiring: GET/PUT/DELETE /api/agents/:id/properties[/:key] still call "
@@ -328,15 +350,24 @@ TEST_CASE("route wiring: GET/PUT/DELETE /api/agents/:id/properties[/:key] still 
     const std::string key_marker = "/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))";
 
     auto get_pos = src.find(get_marker);
+    REQUIRE(get_pos != std::string::npos);
     auto put_pos = src.find(key_marker);
     REQUIRE(put_pos != std::string::npos);
     auto delete_pos = src.find(key_marker, put_pos + key_marker.size());
+    REQUIRE(delete_pos != std::string::npos);
 
-    for (auto marker_pos : {get_pos, put_pos, delete_pos}) {
-        auto block = route_block_at(src, marker_pos);
-        CHECK(block.find(R"(require_scoped_permission(req, res, "Infrastructure",)") !=
-              std::string::npos);
-        CHECK(block.find(R"(require_permission(req, res, "Infrastructure",)") ==
-              std::string::npos);
+    // Pins the operation too, not just that SOME require_scoped_permission
+    // call exists in the block -- a Read/Write drift on one route is a
+    // different, real regression class this would otherwise miss.
+    struct Route {
+        std::size_t marker_pos;
+        const char* op;
+    };
+    for (const auto& route :
+         {Route{get_pos, "Read"}, Route{put_pos, "Write"}, Route{delete_pos, "Write"}}) {
+        auto block = collapse_ws(route_block_at(src, route.marker_pos));
+        CHECK(block.find(std::string(R"(require_scoped_permission(req, res, "Infrastructure", ")") +
+                          route.op + "\",") != std::string::npos);
+        CHECK(block.find(R"(require_permission(req, res, "Infrastructure",)") == std::string::npos);
     }
 }

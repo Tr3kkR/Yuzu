@@ -3698,7 +3698,9 @@ Custom properties are operator-defined key-value pairs on agents, separate from 
 List all custom properties for a specific agent.
 
 **Permission:** `Infrastructure:Read`, scoped to the agent (a global grant **or** a role assigned on
-the agent's management group / an ancestor; RBAC-off legacy behavior is unchanged). A degraded
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store read.
 
@@ -3736,7 +3738,9 @@ properties."
 Set or update a custom property value on an agent. If a property schema exists for the key, the value is validated against it.
 
 **Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
-the agent's management group / an ancestor; RBAC-off legacy behavior is unchanged). A degraded
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
 below for a degraded properties-store write.
 
@@ -3790,7 +3794,9 @@ accepting it unvalidated); this change only affects which status code that rejec
 Delete a custom property from an agent.
 
 **Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
-the agent's management group / an ancestor; RBAC-off legacy behavior is unchanged). A degraded
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403` -- distinct from the `404`
 degrade conflation noted below, which is a property-store issue on the delete path itself, not the
 authorization check.
