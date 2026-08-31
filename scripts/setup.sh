@@ -227,9 +227,10 @@ if [[ -d "$PROJECT_ROOT/$BUILDDIR" ]]; then
     MESON_ARGS+=(--wipe)
   else
     echo "── Reconfiguring existing build directory: $BUILDDIR ──"
-    echo "   note: dependency-resolution options (e.g. -Dpkg_config_path) do not affect"
-    echo "   deps this build dir already resolved - meson caches them. Re-run with"
-    echo "   --wipe (or run: meson configure $BUILDDIR --clearcache) to re-resolve."
+    echo "   note: dependency-resolution options (e.g. -Dpkg_config_path) may not affect"
+    echo "   deps this build dir already resolved - meson can serve them from its"
+    echo "   dependency cache. Re-run with --wipe (or run:"
+    echo "   meson configure \"$BUILDDIR\" --clearcache) to re-resolve."
     MESON_ARGS+=(--reconfigure)
   fi
 fi
