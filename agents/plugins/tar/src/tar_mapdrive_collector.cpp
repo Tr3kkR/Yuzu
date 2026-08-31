@@ -478,32 +478,40 @@ std::vector<MapDriveHistoryRow> parse_fstab(const std::string& text) {
     return out;
 }
 
-std::vector<MapDriveEntry> parse_smbstatus(const std::string& text) {
+SmbStatusParse parse_smbstatus(const std::string& text) {
     // `smbstatus -b` sessions table:
     //   PID  Username  Group  Machine                       Protocol  ...
     //   1234 alice     alice  192.168.1.50 (ipv4:1.2.3.4:445) SMB3_11 ...
     // A data row starts with a numeric PID; the client is the parenthetical IP if
     // present, else the Machine token (index 3).
-    std::vector<MapDriveEntry> out;
+    SmbStatusParse out;
     std::istringstream in(text);
     std::string line;
     while (std::getline(in, line)) {
         auto tok = split_ws(line);
-        if (tok.size() < 4)
-            continue;
-        bool pid = !tok[0].empty();
-        for (char c : tok[0])
-            if (!std::isdigit(static_cast<unsigned char>(c)))
-                pid = false;
+        bool pid = !tok.empty() && !tok[0].empty();
+        if (pid)
+            for (char c : tok[0])
+                if (!std::isdigit(static_cast<unsigned char>(c)))
+                    pid = false;
         if (!pid)
+            continue; // legitimate skip: header/separator/trailer line, not a data row
+        if (tok.size() < 4) {
+            // Finding 4 (BR-mapdrive-001, missed site): looks like a data
+            // row (a bare numeric PID leads it) but is structurally short --
+            // a truncated/corrupt capture, not a legitimate skip. Flag it
+            // instead of silently dropping it (same policy as
+            // parse_proc_mounts's tok.size() < 3 branch above).
+            out.malformed = true;
             continue;
+        }
         MapDriveEntry e;
         e.direction = "inbound";
         e.username = tok[1];
         std::string ip = extract_paren_ip(line);
         e.remote_host = !ip.empty() ? ip : tok[3];
         e.provider = "SMB";
-        out.push_back(std::move(e));
+        out.entries.push_back(std::move(e));
     }
     return out;
 }
@@ -1188,7 +1196,20 @@ std::vector<MapDriveEntry> enumerate_mapdrive() {
                           status.reason);
             throw yuzu::tar::IncompleteCaptureError("TAR: smbstatus capture incomplete: " + status.reason);
         }
-        inbound = parse_smbstatus(run.output);
+        auto smb = parse_smbstatus(run.output);
+        if (smb.malformed) {
+            // Finding 4 (same shape as the /proc/mounts malformed throw
+            // above): a truncated/corrupt smbstatus row (a bare numeric PID
+            // leading a structurally short line) means the returned inbound
+            // session count could silently be LESS than the true count, with
+            // no signal reaching the caller. Throw so this tick's diff/
+            // baseline advance is skipped rather than recording a partial
+            // inbound session list.
+            spdlog::error("TAR mapdrive: smbstatus produced a malformed row -- skipping diff, "
+                          "retaining previous baseline");
+            throw yuzu::tar::IncompleteCaptureError("TAR: smbstatus produced a malformed row");
+        }
+        inbound = std::move(smb.entries);
     }
     out.insert(out.end(), inbound.begin(), inbound.end());
     // round 3 (B3-001): this is the COMBINED outbound(/proc/mounts)+inbound

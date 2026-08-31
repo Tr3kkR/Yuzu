@@ -117,7 +117,9 @@ TEST_CASE("mapdrive parse_smbstatus: client + user from sessions table",
         "-------------------------------------------------------------------------------\n"
         "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n"
         "3789    bob          bob          ws7 (ipv4:10.0.0.7:50012)               SMB3_11\n";
-    auto out = parse_smbstatus(text);
+    auto parsed = parse_smbstatus(text);
+    CHECK_FALSE(parsed.malformed);
+    auto out = parsed.entries;
     REQUIRE(out.size() == 2);
     CHECK(out[0].direction == "inbound");
     CHECK(out[0].username == "alice");
@@ -125,6 +127,51 @@ TEST_CASE("mapdrive parse_smbstatus: client + user from sessions table",
     CHECK(out[0].provider == "SMB");
     CHECK(out[1].username == "bob");
     CHECK(out[1].remote_host == "10.0.0.7");
+}
+
+TEST_CASE("mapdrive parse_smbstatus: header/separator/blank lines are a legitimate "
+          "skip, never flagged malformed",
+          "[tar][mapdrive][parse]") {
+    // Regression guard for a false positive, same shape as parse_proc_mounts's
+    // "well-formed table never flagged malformed" test above: the header row,
+    // the blank line, and the dashed separator all have a non-numeric (or
+    // absent) first token, so none of them look like an attempted data row.
+    const std::string text =
+        "Samba version 4.15.13\n"
+        "\n"
+        "PID     Username     Group        Machine                          Protocol\n"
+        "-------------------------------------------------------------------------------\n"
+        "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n";
+    auto parsed = parse_smbstatus(text);
+    CHECK_FALSE(parsed.malformed);
+    REQUIRE(parsed.entries.size() == 1);
+    CHECK(parsed.entries[0].username == "alice");
+}
+
+TEST_CASE("mapdrive parse_smbstatus: a truncated numeric-PID-looking row is dropped "
+          "and flagged malformed, not silently omitted",
+          "[tar][mapdrive][parse][finding4]") {
+    // Finding 4 (adversarial-review round 5, BR-mapdrive-001 missed site):
+    // this row's first token IS a bare numeric PID -- it is clearly
+    // attempting to be a data row -- but it has fewer than the 4 fields a
+    // real session row carries (a truncated/corrupt capture). Previously
+    // this vanished via a bare `continue`, identical to the pre-fix
+    // parse_proc_mounts bug: the returned inbound-session count could
+    // silently be LESS than the true count with no signal reaching the
+    // caller.
+    const std::string text =
+        "PID     Username     Group        Machine                          Protocol\n"
+        "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n"
+        "9999 bob\n" // synthetic: numeric PID, only 2 fields -- truncated
+        "3789    bob          bob          ws7 (ipv4:10.0.0.7:50012)               SMB3_11\n";
+    auto parsed = parse_smbstatus(text);
+    CHECK(parsed.malformed);
+    // The two well-formed rows around the malformed one still decode --
+    // same defensive-tolerance shape as parse_proc_mounts's equivalent test.
+    REQUIRE(parsed.entries.size() == 2);
+    CHECK(parsed.entries[0].username == "alice");
+    CHECK(parsed.entries[1].username == "bob");
+    CHECK(parsed.entries[1].remote_host == "10.0.0.7");
 }
 
 // ── wevtutil Security 4624/4634 (Windows inbound historic) ────────────────────
@@ -738,7 +785,9 @@ TEST_CASE("mapdrive argv re-home: parse_smbstatus/parse_win_security_logons/pars
     const std::string smb_blob =
         "PID     Username     Group        Machine                          Protocol\n"
         "3456    alice        domain users 192.168.1.50 (ipv4:192.168.1.50:44556)  SMB3_11\n";
-    auto smb = parse_smbstatus(smb_blob);
+    auto smb_parsed = parse_smbstatus(smb_blob);
+    CHECK_FALSE(smb_parsed.malformed);
+    auto smb = smb_parsed.entries;
     REQUIRE(smb.size() == 1);
     CHECK(smb[0].username == "alice");
     CHECK(smb[0].remote_host == "192.168.1.50");

@@ -378,8 +378,26 @@ ProcMountsParse parse_proc_mounts(const std::string& text);
 /** Parse `/etc/fstab` text into historical outbound network mappings (ts=0). */
 std::vector<MapDriveHistoryRow> parse_fstab(const std::string& text);
 
+/** Result of parsing `smbstatus -b`/`-S` text: the decoded inbound session
+ *  entries plus whether at least one row was malformed. Same {entries,
+ *  malformed} shape as ProcMountsParse above (BR-mapdrive-001) and
+ *  tar_arp_parsers.hpp's ProcNetArpParse (BR4-005) -- Finding 4
+ *  (adversarial-review round 5) closed the one site in this file that had
+ *  been missed. A row is malformed when it LOOKS LIKE it was attempting to
+ *  be a data row (its first token is a non-empty, purely-numeric PID) but
+ *  is structurally short (fewer than the 4 whitespace-separated fields a
+ *  real session row carries) -- a truncated/corrupt capture. A row whose
+ *  first token is not a bare PID (the header line, a blank separator, a
+ *  "No locked files" trailer, etc.) is a LEGITIMATE skip and never sets
+ *  `malformed`, exactly mirroring parse_proc_mounts's is_network_fstype
+ *  legitimate-skip-vs-malformed judgement. */
+struct SmbStatusParse {
+    std::vector<MapDriveEntry> entries;
+    bool malformed{false};
+};
+
 /** Parse `smbstatus -b`/`-S` text into current inbound (client) sessions. */
-std::vector<MapDriveEntry> parse_smbstatus(const std::string& text);
+SmbStatusParse parse_smbstatus(const std::string& text);
 
 /** Parse `wevtutil qe Security … /f:text` output into historical inbound rows:
  *  4624 events with logon_type=3 (network), ts = event time. 4634 (logoff) blocks
