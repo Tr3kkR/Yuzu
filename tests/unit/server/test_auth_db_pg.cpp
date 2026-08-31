@@ -802,10 +802,12 @@ TEST_CASE("AuthDB MFA: enrollment guard predicate claims a provisional row, reje
 // ── #3762: the enrollment guard must NOT wedge a legitimate re-enroll ───────
 //
 // The `mfa_enrolled_at IS NULL` guard is safe against blocking a post-disable
-// re-enroll ONLY because every un-enroll path NULLs `mfa_enrolled_at` (mfa_disable +
-// soft-delete). This pins that coupling: enroll → disable → re-enroll must yield a fresh
-// 10-code set. A future un-enroll variant that forgot to clear the column would wedge
-// re-enrollment into a permanent MfaAlreadyEnrolled, and this test is what catches it.
+// re-enroll ONLY because the un-enroll paths NULL `mfa_enrolled_at`. This pins the
+// `mfa_disable` path specifically (the primary un-enroll path): enroll → disable →
+// re-enroll must yield a fresh 10-code set. A future `mfa_disable` variant that forgot
+// to clear the column would wedge re-enrollment into a permanent MfaAlreadyEnrolled, and
+// this test is what catches it. (Soft-delete also NULLs the column, but is not exercised
+// here — a re-enroll through that path additionally requires reactivation.)
 TEST_CASE("AuthDB MFA: disable then re-enroll succeeds — the guard does not wedge re-enroll",
           "[pg][auth_db][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
