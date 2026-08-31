@@ -3738,7 +3738,7 @@ Set or update a custom property value on an agent. If a property schema exists f
 **Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
 the agent's management group / an ancestor; RBAC-off legacy behavior is unchanged). A degraded
 confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
-below for a degraded properties-store read.
+below for a degraded properties-store write.
 
 **Request body:**
 

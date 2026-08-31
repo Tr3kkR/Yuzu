@@ -370,14 +370,18 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   `DELETE /api/agents/:id/properties[/:key]` (`server.cpp`) read and wrote per-agent
   custom-properties data behind bare `require_permission("Infrastructure","Read"/"Write")` with no
   per-agent scope filter at all. Not introduced or worsened by #1712 — pre-existing, and absent from
-  every prior enumeration of this ADR's surface list. The WRITE path was a stronger risk class than
-  the read-only surfaces #1712 addressed: a caller holding global `Infrastructure:Write` could
-  mutate custom-properties data for any agent regardless of their otherwise-confined visibility
-  elsewhere. Fixed by migrating all three routes to `require_scoped_permission("Infrastructure",
-  "Read"/"Write", agent_id)`, the same per-target gate the Tag routes in `server.cpp` use — RBAC-off
-  behavior is unchanged (`Infrastructure` is not in `kTopologyFloor`, so the legacy fallback branch
-  is identical to `require_permission`'s). Coverage: `tests/unit/server/
-  test_agent_properties_scope_authz.cpp`.
+  every prior enumeration of this ADR's surface list. Fixed by migrating all three routes to
+  `require_scoped_permission("Infrastructure", "Read"/"Write", agent_id)`, the same per-target gate
+  the Tag routes in `server.cpp` use — RBAC-off behavior is unchanged (`Infrastructure` is not in
+  `kTopologyFloor`, so the legacy fallback branch is identical to `require_permission`'s). **Precision
+  note (this fix's own PR review corrected an earlier draft of this bullet's framing):** the fix
+  restores confinement for a management-group-**scoped-only** operator, previously denied outright
+  on every agent (the flat gate never consulted management-group assignments) — not a narrowing of
+  a global grant, which was and remains unconditional fleet-wide access by design, identical to
+  every other `require_scoped_permission` caller. Coverage: `tests/unit/server/
+  test_agent_properties_scope_authz.cpp`, including a source-text tripwire proving the route
+  handlers still call the scoped gate (a primitive-level test alone cannot detect a handler reverted
+  back to `require_permission`).
 
 ## Consequences
 

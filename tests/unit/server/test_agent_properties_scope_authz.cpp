@@ -15,6 +15,17 @@
  * (`RbacStore::check_scoped_permission`) is covered directly in
  * test_rbac_store.cpp, but no prior test drove it through this gate with
  * group-scoped confinement.
+ *
+ * The primitive-level cases above cannot detect a wiring regression in the
+ * route handlers themselves (a future edit reverting one handler back to
+ * `require_permission`, or swapping the regex capture index) — that's a
+ * real, disclosed limitation of the no-route-injection-seam shape, flagged
+ * independently by both the adversarial review (Kimi/Codex) and a PR #3742
+ * review (Doomgoose). The last TEST_CASE in this file is a source-text
+ * tripwire (the `test_body_cap_route_inventory.cpp` pattern, scoped down to
+ * these three routes) that closes exactly that gap: it reads `server.cpp`
+ * at test-run time and fails if any of the three handlers no longer calls
+ * `require_scoped_permission("Infrastructure", ...)`.
  */
 
 #include "audit_store.hpp"
@@ -36,6 +47,8 @@
 #include <httplib.h>
 
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -263,4 +276,67 @@ TEST_CASE("require_scoped_permission(Infrastructure,Write): RBAC disabled — le
 
     CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Write", "a_s"));
     CHECK(res.status == 403);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Regression tripwire: the primitive-level cases above prove
+// require_scoped_permission's own branch semantics, but say nothing about
+// whether the three server.cpp route handlers still CALL it. A revert of
+// any one handler back to the bare `require_permission` gate -- the exact
+// #3700 vulnerability -- would leave every case above green.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// YUZU_SERVER_SRC_DIR is injected for the whole yuzu_server_tests target
+// (tests/meson.build, originally for test_body_cap_route_inventory.cpp) --
+// available here with no build-file change.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+
+std::string read_server_cpp() {
+    std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(in.is_open());
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+// Bounds a route registration's handler body as the source text from its
+// regex-pattern marker up to the NEXT `web_server_->` registration (or
+// EOF) -- a source-text tripwire, not a real parse, matching
+// test_body_cap_route_inventory.cpp's documented rationale for why a
+// hand-copied line-range would go stale exactly like the thing it tests.
+std::string route_block_at(const std::string& src, std::size_t marker_pos) {
+    REQUIRE(marker_pos != std::string::npos);
+    auto next = src.find("web_server_->", marker_pos + 1);
+    return src.substr(marker_pos, (next == std::string::npos ? src.size() : next) - marker_pos);
+}
+
+} // namespace
+
+TEST_CASE("route wiring: GET/PUT/DELETE /api/agents/:id/properties[/:key] still call "
+          "require_scoped_permission, not require_permission (#3700 regression tripwire)",
+          "[properties_authz]") {
+    const std::string src = read_server_cpp();
+
+    // GET's regex has no trailing key segment, so its literal text is not a
+    // substring of PUT/DELETE's (which share the identical regex). PUT and
+    // DELETE share one marker text: find the first occurrence (PUT,
+    // registered first in this file) then continue past it for the second
+    // (DELETE).
+    const std::string get_marker = "/api/agents/([^/]+)/properties)";
+    const std::string key_marker = "/api/agents/([^/]+)/properties/([a-zA-Z0-9_.:-]+))";
+
+    auto get_pos = src.find(get_marker);
+    auto put_pos = src.find(key_marker);
+    REQUIRE(put_pos != std::string::npos);
+    auto delete_pos = src.find(key_marker, put_pos + key_marker.size());
+
+    for (auto marker_pos : {get_pos, put_pos, delete_pos}) {
+        auto block = route_block_at(src, marker_pos);
+        CHECK(block.find(R"(require_scoped_permission(req, res, "Infrastructure",)") !=
+              std::string::npos);
+        CHECK(block.find(R"(require_permission(req, res, "Infrastructure",)") ==
+              std::string::npos);
+    }
 }
