@@ -91,6 +91,48 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: Destructive-class dispatch now requires explicit `agent_ids` on REST and MCP (#3685)
+
+17 `plugin.action` pairs are classified `Destructive` in the command catalogue: `tar.purge_source`,
+`tar.rollup`, `filesystem.delete_lines`, `registry.delete_value`, `registry.delete_key`,
+`storage.clear`, `content_dist.stage`, `content_dist.execute_staged`, `content_dist.cleanup`,
+`content_dist.upload_file`, `tags.clear`, `script_exec.exec`, `script_exec.powershell`,
+`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`.
+Dispatching any of them without explicit, non-empty `agent_ids` — an omitted/empty target, or a
+`scope` (including `"__all__"`, even alongside `agent_ids`) — is now refused with `400`
+(`"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are
+refused"`) on REST `POST /api/command`, and `-32602` with the same message on MCP
+`execute_instruction` (refused before an approval ticket is minted or consumed, at both the
+supervised-tier pre-mint gate and the operator-tier handler).
+
+**MCP `execute_instruction` had no Destructive-targeting gate at all before this release** — a
+scope-targeted or broadcast call to one of the 17 rows above dispatched normally and succeeded.
+
+**REST `/api/command`'s outcome for these 17 rows is unchanged** — the prior guard already denied
+a scope-targeted or broadcast dispatch to any of them, both before and after this release. What
+changed on REST is the guard's shape, not its outcome: the prior code was an `if` that collapsed
+"classified and not Destructive" and "failed to classify at all" (a classify-miss) into the same
+skipped branch, relying on a classify-miss being denied unconditionally further downstream
+(`build_classified_command`) rather than proving that locally. This release replaces it with an
+exhaustive switch with no default arm, so a future change to the verdict enum forces a
+compile-time decision here too, instead of silently falling through to a guard shape that was
+correct only because of a downstream backstop.
+
+**Who this affects:** any operator or automation dispatching one of the 17 rows above via MCP
+`execute_instruction` with `scope` or an omitted/empty target — this is the surface whose outcome
+actually changes. A REST `/api/command` caller doing the same was already refused before this
+release and sees no behavior change. Explicit `agent_ids` dispatches to these rows, and any
+dispatch to a row NOT on this list, are unaffected on either surface.
+
+**What to do:** switch any such call to explicit, non-empty `agent_ids`. `POST
+/api/instructions/{id}/execute`, the dashboard execute surface, and MCP `execute_bundle` do not yet
+enforce this gate for these same 17 rows — a tracked follow-up, not a gap this release closes.
+
+**Verify:** re-run the affected dispatch with explicit `agent_ids` and confirm it succeeds as
+before; a scope/broadcast call to one of the 17 rows should now return the refusal above rather
+than dispatching. `yuzu_server_dispatch_target_rejected_total{route="command"|"mcp",reason="destructive_untargeted"}`
+counts refusals on both surfaces if you want to confirm the gate is exercising in your environment.
+
 ## Behaviour change: SAML login gains a new availability coupling to `rbac_store` (#1832)
 
 SAML SSO now reaches parity with OIDC's group-to-role RBAC reconciliation (see
@@ -1274,17 +1316,38 @@ server `PgPool`).
   on it post-upgrade.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period, but understand what that does and does not buy you.** A
-  graceful `SIGTERM` walks several independently-bounded waits in sequence —
-  up to 30 s draining in-flight executions, up to 5 s waiting on the
-  NVD-sync background thread, up to 15 s waiting on the HTTP listener thread
-  (#2703 Gate 7 item 2), up to 5 s on the gRPC shutdown deadline, and (#3261
-  governance hardening) up to 60 s waiting for WebhookStore and
-  OffloadTargetStore to drain their delivery queues — the last of which runs
-  the two stores CONCURRENTLY, not sequentially, so it adds 60 s to the
-  total rather than 120 s. Stacked, this can reach **~115 s** in the worst
-  case if more than one stage is genuinely wedged. The shipped
+  graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
+  draining in-flight executions, up to 5 s on the gRPC shutdown deadline
+  (moved up by #3495 to run earlier in the sequence, ahead of the four
+  joins below and several other quick housekeeping joins not separately
+  listed here, though still after the execution drain — see below),
+  up to 5 s waiting on the NVD-sync background thread, up to 15 s waiting on
+  the HTTP listener thread (#2703 Gate 7 item 2), and (#3261 governance
+  hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to
+  drain their delivery queues — the last of which runs the two stores
+  CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
+  120 s. Stacked, this can reach **~115 s** in the worst case if more than
+  one stage is genuinely wedged; the total and each stage's own bound are
+  unchanged by the reorder, only their relative sequence is. **(#3495) The policy
+  evaluation, pre-flight runner, quarantine containment reconciler, and
+  schedule tick background threads' gRPC dispatch calls now ride on the
+  same 5 s gRPC shutdown deadline bucket above, not a separate stage** —
+  `ServerImpl::stop()` now cancels in-flight gRPC RPCs before joining those
+  four threads (previously it cancelled them after, so a thread genuinely
+  blocked inside a gRPC stream write had no bound at
+  all — not covered by the ~115 s figure, and not fixable by raising the
+  grace period, since nothing in `stop()` would ever reach the cancellation
+  that unblocks it). This is a strictly protective fix — no grace-period
+  change is needed on upgrade, whether or not you ever hit the pre-#3495
+  gap in practice; it was a real but narrow window (a stalled agent stream
+  during shutdown), not a routine occurrence. **One narrower residual is NOT covered by this fix**:
+  the policy-evaluation thread's join can also stall on its own Postgres
+  claim call (`PolicyStore::claim_due_policies`), which isn't a gRPC
+  operation and isn't bounded by `Shutdown(deadline)` — tracked separately
+  (#3706), not fixed here. The shipped
   docker-compose/systemd units already set a 210 s grace period
-  (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this —
+  (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this
+  residual's ordinary-contention case —
   but if you deploy under Kubernetes or another orchestrator, its default is
   frequently far shorter (Kubernetes' own default
   `terminationGracePeriodSeconds` is **30**), and a pod with slow-draining
@@ -2796,8 +2859,14 @@ Before upgrading any component:
   by the same 20s watchdog; the agent's `--install-service` recovery-actions
   configuration (#1822) auto-restarts on a watchdog fire similarly to the
   Linux `Restart=always` unit, but the exit shows up as a generic unexpected
-  termination rather than one of the SCM's own "specific error" buckets. See
-  *Stopping a wedged agent* in [Server Administration](server-admin.md).
+  termination rather than one of the SCM's own "specific error" buckets.
+  `AgentImpl::stop()` and the run()-exit teardown each arm this deadline
+  separately, and in the worst case the two can compose sequentially to as
+  much as ~40s before either one fires, past the 30s SCM hint — but that
+  specific case is a slow clean stop, not a hang or a restart (a clean
+  `SERVICE_STOPPED` report doesn't trigger the recovery actions above
+  either). See *Stopping a wedged agent* in
+  [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously

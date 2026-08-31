@@ -22,6 +22,9 @@
 #include "agent_registry.hpp"
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
+#include "command_capability.hpp" // #3685: CommandCapability / ClassificationError for classify_fn_for_test
+#include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting / kDestructive*Message
+#include "reserved_definition_id.hpp" // #3685: kMcpDefinitionPrefix, for the pre-seeded-ticket test
 #include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
@@ -756,6 +759,54 @@ struct McpTestServer {
             return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{}};
         }};
 
+    /// #3685: the Destructive-targeting classifier `execute_instruction` now
+    /// consults at both gate sites. `McpServer::ClassifyFn`'s contract is
+    /// FAIL-CLOSED-WHEN-UNWIRED (mcp_server.hpp) — the OPPOSITE default
+    /// posture from every other `_for_test` seam in this fixture, which
+    /// default to nullptr/degraded-but-harmless. Left unset here, EVERY
+    /// existing execute_instruction test in this file would start refusing
+    /// with "classifier unavailable". The harness DEFAULT therefore wires a
+    /// classifier that is WIRED (satisfies the fail-closed gate).
+    ///
+    /// governance round 2 (#3685, Doomgoose review item 3): it classifies
+    /// everything as a benign, non-Destructive `ReadOnly` row rather than
+    /// always `Unclassified`. Before item 3, C8's `ClassifyMiss` verdict fell
+    /// through to Policy B (the existing dispatch chokepoint's own denial),
+    /// so a wired-but-always-miss default was inert — no pre-#3685 test
+    /// depended on what a miss actually did. Item 3 made C8's `ClassifyMiss`
+    /// verdict a hard local denial with no ticket minted, so an
+    /// always-Unclassified default would now incorrectly refuse every
+    /// supervised-tier `execute_instruction` test in this file that doesn't
+    /// opt into a Destructive-specific classifier — turning the common case
+    /// (an ordinary ticket-mint / schema-validation / approval_id-tolerance
+    /// test) into the one that has to opt out of a "classifier" defect,
+    /// backwards from the fixture's job. Only `.dispatch_class` is read at
+    /// either gate site for a non-Destructive verdict
+    /// (`evaluate_destructive_targeting`, `dispatch_destructive_gate.hpp`),
+    /// so the row's other fields are placeholders, not asserted on. A
+    /// Destructive-specific test overrides this with a classifier that
+    /// returns a real Destructive `CommandCapability` for the pair it cares
+    /// about (`destructive_classify_stub`); a genuine classify-miss test
+    /// overrides it with one that returns `Unclassified`/`Ambiguous` for the
+    /// pair under test; a fail-closed test sets this to `{}` (genuinely
+    /// unwired) to prove the gate itself.
+    yuzu::server::mcp::McpServer::ClassifyFn classify_fn_for_test{
+        [](std::string_view, std::string_view)
+            -> std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError> {
+            static constexpr yuzu::server::CommandCapability kBenignRow{
+                .plugin = "unused",
+                .action = "unused",
+                .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+                .mutability = yuzu::server::Mutability::None,
+                .securable = "Execution",
+                .operation = yuzu::server::authz::Operation::Read,
+                .risk_tier = yuzu::server::authz::RiskTier::Low,
+                .system_reserved = false,
+                .execute_gate = yuzu::server::ExecuteGate::None,
+            };
+            return kBenignRow;
+        }};
+
     /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
     /// real ExecutionTracker so the create_execution / set_agents_targeted
     /// / mark_cancelled lifecycle is exercised end-to-end on the MCP path.
@@ -1088,6 +1139,15 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // #3685: the Destructive-targeting classifier ALSO rides a setter,
+        // same pattern as the two above — wire before the handlers are
+        // built. UNCONDITIONAL, but NOT a no-op default like its siblings:
+        // classify_fn_for_test's own default is a WIRED (non-empty)
+        // classifier (see its doc comment above) precisely so this call
+        // preserves every pre-#3685 test's behaviour instead of tripping
+        // the new fail-closed-when-unwired gate.
+        mcp.set_capability_classify_fn(classify_fn_for_test);
 
         // M5 remediation: the plugin-config/upload-grant stores ALSO ride
         // setters, same pattern as the two above — wire before the handlers
@@ -6043,6 +6103,85 @@ TEST_CASE("MCP Integration: execute_instruction null dispatch_fn", "[mcp][integr
           std::string::npos);
 }
 
+// ── 24b. #3685: unwired Destructive-targeting classifier fails CLOSED ──────
+//
+// McpServer::ClassifyFn's contract (mcp_server.hpp) is the OPPOSITE default
+// posture from every other injected seam: unset means execute_instruction
+// cannot determine whether ANY pair is Destructive, so it refuses EVERY call
+// with a distinguishable "classifier unavailable" denial rather than falling
+// through silently. These two cases genuinely UNWIRE it
+// (classify_fn_for_test = {}) — every OTHER test in this file relies on the
+// fixture's non-empty default (see classify_fn_for_test's own doc comment)
+// to keep the pre-#3685 fall-through behaviour, so this is the one place
+// that default is deliberately overridden to {}.
+
+TEST_CASE("MCP #3685: operator-tier execute_instruction refuses with "
+          "classifier-unavailable when the classifier is genuinely unwired",
+          "[mcp][integration][execute][3685]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = {}; // genuinely unwired, not "wired but Unclassified"
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("classification is unavailable") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(dispatched); // refused before any dispatch, even for an explicitly-targeted call
+}
+
+TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8 pre-mint site "
+          "when the classifier is unwired — no ticket minted",
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // ADR-0065 rebase: ApprovalManager moved SQLite -> Postgres; this test's
+    // sqlite3_open/TempDbFile/Guard scaffolding is replaced by the shared PG
+    // fixture (ApprovalManagerPg self-provisions + migrates an ephemeral DB,
+    // SKIPs without YUZU_TEST_POSTGRES_DSN) — same pattern as the 100+ other
+    // ApprovalManager/ExecutionTracker fixtures in this file.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.classify_fn_for_test = {};
+    ts.approval_manager_for_test = &appr;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — the gate must refuse BEFORE a ticket is minted,
+    // not mint one and then let a later step deny it.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("classification is unavailable") !=
+          std::string::npos);
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK_FALSE(dispatched);
+}
+
 // ── 25. Missing plugin ───────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integration][execute]") {
@@ -6905,6 +7044,441 @@ TEST_CASE("MCP Integration: execute_instruction operator tier carries no approva
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(captured == yuzu::server::ApprovalProvenance::None);
+}
+
+// ── 36b. #3685 checkpoint 2 commit 5: Destructive-class targeting on MCP ──
+//
+// evaluate_destructive_targeting (dispatch_destructive_gate.hpp, checkpoint
+// 1) wired into execute_instruction at both gate sites. A classifier that
+// reports tar.purge_source as Destructive is used throughout — every other
+// plugin.action stays Unclassified (Policy B fall-through), so these cases
+// exercise ONLY the new Destructive arm without disturbing the rest of the
+// tool's behaviour.
+
+namespace {
+[[nodiscard]] std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError>
+destructive_classify_stub(std::string_view plugin, std::string_view action) {
+    static constexpr yuzu::server::CommandCapability kDestructiveRow{
+        .plugin = "tar",
+        .action = "purge_source",
+        .dispatch_class = yuzu::server::DispatchClass::Destructive,
+        .mutability = yuzu::server::Mutability::Irreversible,
+        .securable = "Infrastructure",
+        .operation = yuzu::server::authz::Operation::Delete,
+        .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = yuzu::server::ExecuteGate::None,
+    };
+    if (plugin == kDestructiveRow.plugin && action == kDestructiveRow.action)
+        return kDestructiveRow;
+    return std::unexpected(yuzu::server::ClassificationError::Unclassified);
+}
+} // namespace
+
+TEST_CASE("MCP #3685: Destructive + omitted target is refused with the new envelope, dispatch_fn "
+          "NOT invoked",
+          "[mcp][integration][execute][3685]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    // No agent_ids, no scope — the omitted-target case, which normalises to
+    // broadcast for every OTHER tool but must refuse here.
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"tar","action":"purge_source"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() ==
+          std::string(yuzu::server::kDestructiveUntargetedMessage));
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK_FALSE(body["error"]["data"]["remediation"].is_null());
+    CHECK_FALSE(dispatched);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("destructive_untargeted") != std::string::npos);
+}
+
+TEST_CASE("MCP #3685: Destructive + scope target (real scope or __all__) is refused identically, "
+          "dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3685]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"tar","action":"purge_source","scope":"tag:prod"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK_FALSE(dispatched);
+
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"execute_instruction","arguments":{"plugin":"tar","action":"purge_source","scope":"__all__"}}})");
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP #3685: Destructive + explicit valid agent_ids dispatches normally",
+          "[mcp][integration][execute][3685]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    bool dispatched = false;
+    std::vector<std::string> seen_ids;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>& agent_ids, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        dispatched = true;
+        seen_ids = agent_ids;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"tar","action":"purge_source","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(dispatched);
+    CHECK(seen_ids == std::vector<std::string>{"dev-1"});
+}
+
+TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-mint — NO approval "
+          "ticket created",
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // ADR-0065 rebase: see the identical ApprovalManagerPg note on the first
+    // #3685 test above.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    ts.approval_manager_for_test = &appr;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"tar","action":"purge_source"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — refused before a ticket exists at all.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() ==
+          std::string(yuzu::server::kDestructiveUntargetedMessage));
+    CHECK(appr.pending_count() == 0);
+    CHECK_FALSE(dispatched);
+    // Gate 8 round 3 (residual B, coordinator follow-up): this is the C8
+    // pre-mint RefuseUntargeted arm specifically — the audit-detail test at
+    // line ~7111 above exercises the OPERATOR-tier main-handler backstop's
+    // RefuseUntargeted arm instead, so it cannot see this arm's "reason="
+    // prefix (added in the prior commit for parity with the adjacent
+    // ClassifyMiss arm). Assert it here so the prefix ships with coverage.
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=destructive_untargeted") != std::string::npos);
+}
+
+namespace {
+// Gate 8 round 3 (quality-engineer + security-guardian SHOULD item 4):
+// `destructive_classify_stub` above always maps a miss to `Unclassified`, so
+// no existing test drives the `Ambiguous` branch of C8's `gate.miss ==
+// ClassificationError::Ambiguous ? Ambiguous : Unclassified` ternary — a
+// mutation swapping which miss maps to which reason string would pass every
+// prior test. A separate small stub (not a parameter on
+// `destructive_classify_stub` itself, which 8 existing call sites already
+// bind directly to `ClassifyFn` by name — adding a parameter would change
+// its signature and break every one of them) reusing the same
+// `kDestructiveRow`/miss-shape, differing only in which
+// `ClassificationError` a miss reports. Mirrors the real
+// `CommandCapabilityRegistry`-level technique
+// (`test_dispatch_destructive_gate.cpp`'s `kCollidingFragment`: two
+// independently-authored fragments redeclaring the same `plugin.action`)
+// without needing a real registry at the MCP-fixture level, where
+// `ClassifyFn` is injected directly.
+[[nodiscard]] std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError>
+destructive_classify_stub_ambiguous(std::string_view plugin, std::string_view action) {
+    static constexpr yuzu::server::CommandCapability kDestructiveRow{
+        .plugin = "tar",
+        .action = "purge_source",
+        .dispatch_class = yuzu::server::DispatchClass::Destructive,
+        .mutability = yuzu::server::Mutability::Irreversible,
+        .securable = "Infrastructure",
+        .operation = yuzu::server::authz::Operation::Delete,
+        .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = yuzu::server::ExecuteGate::None,
+    };
+    if (plugin == kDestructiveRow.plugin && action == kDestructiveRow.action)
+        return kDestructiveRow;
+    return std::unexpected(yuzu::server::ClassificationError::Ambiguous);
+}
+} // namespace
+
+TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3): a classify-miss at C8 denies "
+          "immediately — NO approval ticket minted",
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // Proves the C8-only Policy-B deviation: unlike RefuseUntargeted (test
+    // above, which this mirrors), a classify-miss used to fall through
+    // (Policy B) and mint a ticket here before the downstream chokepoint
+    // denied it on actual dispatch — burning a real admin approval on a call
+    // that was always going to be refused. `destructive_classify_stub`
+    // returns `ClassificationError::Unclassified` for every plugin.action
+    // pair except `tar.purge_source` (its own doc comment above), so any
+    // OTHER pair exercises exactly the ClassifyMiss verdict without a new
+    // stub. Gate 8 round 3 item 4: this case also pins the actual `reason=`
+    // VALUE threaded into the metrics label and audit detail — not just that
+    // the same code path runs — so a mutation swapping which miss maps to
+    // which reason string fails this test. The `Ambiguous` sub-case
+    // (`destructive_classify_stub_ambiguous`, its own test below) shares the
+    // same ternary but must independently pin `reason="ambiguous"`; this
+    // test proves nothing about that other branch.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — refused before a ticket exists at all, same
+    // as the RefuseUntargeted pre-mint test above.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "unknown or ambiguous plugin.action");
+    CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "unclassified"}})
+              .value() == 1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=unclassified") != std::string::npos);
+}
+
+TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3 / Gate 8 round 3 item 4): an AMBIGUOUS "
+          "classify-miss at C8 also denies immediately, with reason=\"ambiguous\" threaded "
+          "correctly — NO approval ticket minted",
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // Same shape as the Unclassified case above, but drives
+    // `gate.miss == ClassificationError::Ambiguous` through C8's ternary via
+    // `destructive_classify_stub_ambiguous`. Without this test, a mutation
+    // that swapped the ternary's two branches (mapping `Ambiguous` to
+    // `DispatchDenialReason::Unclassified` and vice versa) would pass every
+    // other test in this file, since the Unclassified test above cannot
+    // distinguish "correctly maps Unclassified" from "always reports
+    // Unclassified regardless of gate.miss".
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub_ambiguous;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "unknown or ambiguous plugin.action");
+    CHECK(appr.pending_count() == 0); // no ticket minted, same as the Unclassified case
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "ambiguous"}})
+              .value() == 1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=ambiguous") != std::string::npos);
+}
+
+TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive ticket is refused on "
+          "recall WITHOUT being consumed — proves the C8 gate runs before consume_ticket, not "
+          "just before mint",
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // ADR-0065 rebase: see the identical ApprovalManagerPg note on the first
+    // #3685 test above.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    ts.approval_manager_for_test = &appr;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    // The untargeted Destructive args this ticket is bound to — arguments an
+    // MCP mint call could never itself produce post-#3685 (it would be
+    // refused pre-mint by the test above), which is exactly why this test
+    // seeds the ticket DIRECTLY through ApprovalManager rather than through
+    // ts.call(...): it stands in for a ticket that predates this fix, or one
+    // that reached the approved state through any route that bypassed the
+    // MCP gate. canon must match canonical_args' own computation
+    // (mcp_server.cpp: JSON dump with approval_id erased) byte-for-byte, or
+    // consume_ticket's precondition would already refuse it for an unrelated
+    // reason and this test would prove nothing.
+    const nlohmann::json untargeted_args{{"plugin", "tar"}, {"action", "purge_source"}};
+    const std::string canon = untargeted_args.dump();
+    auto submitted = appr.submit(std::string(yuzu::server::kMcpDefinitionPrefix) +
+                                     "execute_instruction",
+                                 "test-user", canon, "", yuzu::server::ApprovalOrigin::kMcp);
+    REQUIRE(submitted.has_value());
+    const std::string approval_id = *submitted;
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    nlohmann::json recall_args = untargeted_args;
+    recall_args["approval_id"] = approval_id;
+    auto res = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                      {"method", "tools/call"},
+                                      {"id", 2},
+                                      {"params",
+                                       {{"name", "execute_instruction"}, {"arguments", recall_args}}}}
+                            .dump());
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() ==
+          std::string(yuzu::server::kDestructiveUntargetedMessage));
+    CHECK_FALSE(dispatched);
+
+    // The sharpest assertion: the ticket is STILL unconsumed and STILL
+    // approved — the C8 gate refused before ever touching consume_ticket,
+    // not merely before minting one.
+    auto after = appr.get(approval_id);
+    REQUIRE(after.has_value());
+    CHECK(after->status == "approved");
+    CHECK(after->consumed_at == 0);
+}
+
+TEST_CASE("MCP #3685: operator-tier Destructive refusal happens BEFORE execution-row creation and "
+          "dispatch",
+          "[mcp][pg][integration][execute][3685]") {
+    // ADR-0065 rebase: ExecutionTracker moved SQLite -> Postgres; same
+    // ExecutionTrackerPg fixture the other ExecutionTracker tests in this
+    // file already use (e.g. line ~5236) replaces the sqlite3_open/Guard
+    // scaffolding.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    ts.execution_tracker_for_test = &tracker;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"tar","action":"purge_source","scope":"tag:prod"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(dispatched);
+    CHECK(tracker.query_executions({}).empty()); // no execution row was ever created
+}
+
+TEST_CASE("MCP #3685: a Targeted Destructive call is NOT refused and still reaches the caller's "
+          "existing #1788 visible-set confinement unchanged",
+          "[mcp][integration][execute][3685][scope]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = destructive_classify_stub;
+    // A narrowed VisibleSet, exactly as any other confined caller would get
+    // from derive_dispatch_caller in production — proves the new gate is a
+    // pure pass-through for Targeted and does not touch, bypass, or
+    // substitute for the #1788 confinement machinery.
+    const yuzu::server::authz::VisibleSet narrowed{
+        std::unordered_set<std::string>{"dev-1", "dev-2"}};
+    ts.caller_fn_for_test = [&](const auth::Session&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.principal = "confined-op", .exec_visible = narrowed};
+    };
+    yuzu::server::authz::VisibleSet seen;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller& caller)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        seen = caller.exec_visible;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"tar","action":"purge_source","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(dispatched);
+    REQUIRE(seen.has_value());
+    CHECK(*seen == std::unordered_set<std::string>{"dev-1", "dev-2"});
 }
 
 // ── 36. Audit on success ─────────────────────────────────────────────────

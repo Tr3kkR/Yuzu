@@ -1,0 +1,257 @@
+#pragma once
+
+#include <cstdint>
+#include <expected>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
+
+#include "command_capability.hpp"
+
+/// @file dispatch_destructive_gate.hpp
+/// #3685 — the pure Destructive-class TARGETING decision for `/api/command`
+/// (and, in a later checkpoint, MCP `execute_instruction`), extracted the
+/// same way `dispatch_confined_arms.hpp` and `dispatch_target_shape.hpp`
+/// extract their own shared rules: pure functions, injected inputs, no
+/// `ServerImpl`, so the decision is directly unit-testable and cannot
+/// silently drift between callers.
+///
+/// THE RULE, stated once, is the part that must not drift: a `plugin.action`
+/// pair classified `DispatchClass::Destructive` (`command_capability.hpp`)
+/// MUST name explicit, in-scope `agent_ids` — broadcast and scope fan-out are
+/// always refused, and a classification MISS is a first-class verdict the
+/// caller must explicitly handle, never a branch that can be silently
+/// skipped.
+///
+/// THE BUG THIS REPLACES (#3685 defect 1): the inline `/api/command` block it
+/// replaces guarded on `if (classified_for_gate && classified_for_gate->
+/// dispatch_class == DispatchClass::Destructive)` — an `if` whose condition
+/// is false for BOTH "classified and not Destructive" and "failed to
+/// classify at all" collapses two different facts into one branch. That was
+/// not exploitably fail-open here (`build_classified_command` denies every
+/// classify-miss unconditionally, downstream), but it is exactly the shape
+/// that WOULD be fail-open the next time a similar gate is written without
+/// that same downstream backstop. `DestructiveTargetingVerdict::ClassifyMiss`
+/// makes the miss an enumerator with no `default:` arm available (repo
+/// doctrine, `-Werror=switch`) — a caller cannot compile a switch over this
+/// verdict without deciding what a miss means for it.
+///
+/// POLICY IS THE CALLER'S TO CHOOSE, deliberately not baked into this header:
+/// `/api/command` (checkpoint 1, #3685) treats `ClassifyMiss` as `break;` —
+/// explicit fall-through to `build_classified_command`, which denies a real
+/// miss anyway with its own taxonomy/metric/audit shape (Policy B, chosen
+/// over an earlier draft's Policy A after external review: the early gate
+/// would consult the SAME registry/classifier as the downstream chokepoint,
+/// so an independent early denial would only duplicate — and risk drifting
+/// from — evidence the chokepoint already produces). A future caller is free
+/// to choose differently; the verdict shape supports either without a header
+/// change.
+///
+/// D4 — WHY THIS GATE DOES NOT ITSELF ELEVATE PERMISSION: four of today's
+/// (verified live, `capability_decls/*.hpp`) Destructive rows —
+/// `script_exec.{exec,powershell,bash}` and `content_dist.execute_staged` —
+/// carry `.securable = "Execution"` and `.execute_gate =
+/// ExecuteGate::AdminOrApproval`, enforced at the dispatch chokepoint
+/// (`classify_and_authorize_dispatch`, `agent_registry.hpp`) for every
+/// caller including MCP. For those four rows, this gate's only job is
+/// TARGETING confinement — the chokepoint's `AdminOrApproval` gate is
+/// already the elevation ceiling. For the other (13, at last count — see the
+/// catalogue-consistency test) Destructive rows, the caller's own
+/// `require_permission(cap.securable, cap.operation)` check IS real
+/// elevation (e.g. `tar.purge_source` -> `Infrastructure:Delete`) and stays
+/// in the caller, deliberately — see D3 below.
+///
+/// D3 — WHY THIS GATE DOES NOT CALL `require_permission`/`has_permission`
+/// ITSELF, AND WHY IT DOES NOT LIVE INSIDE `dispatch_confined_arms.hpp`:
+///   * `require_permission` (the REST caller's JIT-elevation-aware surface
+///     gate, `server.cpp`) and the dispatch chokepoint's `has_permission`
+///     callback (base-grants-only, `agent_registry.hpp:168-180` "do not
+///     silently widen") are DELIBERATELY DIFFERENT checks answering
+///     different questions. Collapsing them here would either silently
+///     widen the chokepoint's base-grants-only posture to admit JIT
+///     elevation it does not today, or silently narrow the caller's
+///     elevation-aware gate to the chokepoint's weaker one. Neither is this
+///     header's call to make — it stays a pure TARGETING decision, and the
+///     caller keeps its own authorization call exactly where it is.
+///   * `dispatch_confined_arms.hpp`'s `dispatch_confined_arms` is called by
+///     FOUR seams (`ServerImpl::dispatch_confined`'s background/schedule/
+///     workflow/dashboard/MCP callers, per that header's own doc comment),
+///     several of which legitimately scope-target a Destructive row today
+///     (a scheduled purge, a governed deployment) and have no `res` to
+///     answer a refusal on. Gating THERE would silently break those
+///     legitimate callers as a side effect of fixing `/api/command` and MCP
+///     `execute_instruction` — the two operator-facing route handlers that
+///     actually owe a caller a decision-grade refusal. This gate is called
+///     from route/handler code, never from the shared confined-dispatch
+///     closure.
+///
+/// `confine_destructive_targets` below is the REST-side visible-set
+/// narrowing this gate's `RefuseUntargeted`/`Targeted` split makes
+/// necessary — unrelated to, and never a replacement for, the #1788
+/// intersection `dispatch_confined_arms` performs on every dispatch arm
+/// (that one still runs, later, on the confined `agent_ids` this function
+/// returns).
+namespace yuzu::server {
+
+/// The two refusal messages, spelled ONCE so `/api/command`, a future MCP
+/// twin, and their tests pin the exact same bytes (#3685 defect 4 — these
+/// strings had zero test occurrences before this file). Copied byte-exact
+/// from the `/api/command` handler's current inline literals
+/// (`server.cpp`, verified via `git grep -n` against this worktree) —
+/// do not paraphrase either one.
+inline constexpr std::string_view kDestructiveUntargetedMessage{
+    "destructive action requires explicit in-scope agent_ids; broadcast and "
+    "scope fan-out are refused"};
+inline constexpr std::string_view kDestructiveNoVisibleAgentMessage{
+    "no reachable in-scope agent"};
+
+/// Verdict of the Destructive-dispatch targeting decision.
+///
+/// A `switch` over this with no `default:` is the structural fix for #3685
+/// defect 1 (see this file's own doc comment above): a classify-miss is an
+/// enumerator the caller MUST handle, never a skipped `if` branch.
+enum class DestructiveTargetingVerdict : uint8_t {
+    NotDestructive,   ///< Classified, and not Destructive — this gate does not apply; the
+                      ///< caller's ordinary dispatch path (and its own authorization) proceeds
+                      ///< unchanged.
+    Targeted,         ///< Destructive, with explicit non-empty `agent_ids` and no scope/
+                      ///< broadcast supplied — proceed to `confine_destructive_targets`.
+    RefuseUntargeted, ///< Destructive, but `agent_ids` was empty/absent, or a scope key
+                      ///< (including `"__all__"` broadcast) was supplied alongside or instead
+                      ///< of it — refuse with `kDestructiveUntargetedMessage`.
+    ClassifyMiss,     ///< `Unclassified`/`Ambiguous` — see `miss` on the decision struct.
+                      ///< The caller decides policy for this arm; see the file-level doc
+                      ///< comment above for `/api/command`'s Policy B choice.
+};
+
+/// The full decision: the verdict, plus whichever of `capability`/`miss` the
+/// verdict engages. Exactly one of the two is engaged, mirroring the
+/// `std::expected` input this is built from:
+///   - `ClassifyMiss`   -> `miss` engaged, `capability` empty.
+///   - every other verdict -> `capability` engaged, `miss` empty.
+struct DestructiveTargetingDecision {
+    DestructiveTargetingVerdict verdict;
+    /// Engaged for every verdict except `ClassifyMiss` — the classified row,
+    /// so the caller can read `.securable`/`.operation` for its own
+    /// authorization check (D3 above) without reclassifying.
+    std::optional<CommandCapability> capability;
+    /// Engaged only for `ClassifyMiss` — which of the two classification
+    /// failures it was, for a caller that wants to shape its own denial
+    /// evidence off it (e.g. a Policy-A caller answering with the same
+    /// taxonomy `build_classified_command` uses).
+    std::optional<ClassificationError> miss;
+};
+
+/// Pure, total, `noexcept` — the whole decision is a handful of comparisons
+/// over already-computed inputs, no I/O.
+///
+/// CALLER CONTRACT — READ BEFORE WIRING THIS UP: `valid_nonempty_agent_ids`
+/// and `scope_key_present` MUST be derived from the PARSED REQUEST BODY
+/// AFTER `check_targeting_shape` (`dispatch_target_shape.hpp`) has already
+/// run and returned no violation — never computed from a raw extraction
+/// helper's output directly. `extract_json_string_array`/
+/// `extract_json_string` collapse "omitted", "empty", "wrong type" and
+/// "parse failure" into the same `{}`/`""` result; that erasure is exactly
+/// the #2500/#2492 defect `check_targeting_shape` exists to close upstream
+/// of this function, and reproducing the collapse here (by calling this
+/// function on unvalidated extraction output) would silently reopen it for
+/// the Destructive-class rows this gate protects.
+///   - `valid_nonempty_agent_ids`: true iff `agent_ids` was supplied AND is
+///     non-empty — which, downstream of a successful `check_targeting_shape`
+///     call, also means every entry is a string (the shape check already
+///     refused a non-array, an empty array, and a non-string entry).
+///   - `scope_key_present`: true iff `scope` is present as a non-empty
+///     string — INCLUDING `scope:"__all__"`. Broadcast is exactly what a
+///     Destructive row refuses, and `check_targeting_shape` deliberately
+///     permits `agent_ids` alongside `scope:"__all__"` (its one exemption
+///     to the ids-vs-scope conflict rule) — so that combination reaches
+///     this function and MUST still refuse here, even though the ids list
+///     itself is well-formed.
+[[nodiscard]] inline DestructiveTargetingDecision evaluate_destructive_targeting(
+    const std::expected<CommandCapability, ClassificationError>& classified,
+    bool valid_nonempty_agent_ids, bool scope_key_present) noexcept {
+    if (!classified) {
+        return DestructiveTargetingDecision{DestructiveTargetingVerdict::ClassifyMiss,
+                                            std::nullopt, classified.error()};
+    }
+    if (classified->dispatch_class != DispatchClass::Destructive) {
+        return DestructiveTargetingDecision{DestructiveTargetingVerdict::NotDestructive,
+                                            *classified, std::nullopt};
+    }
+    if (!valid_nonempty_agent_ids || scope_key_present) {
+        return DestructiveTargetingDecision{DestructiveTargetingVerdict::RefuseUntargeted,
+                                            *classified, std::nullopt};
+    }
+    return DestructiveTargetingDecision{DestructiveTargetingVerdict::Targeted, *classified,
+                                        std::nullopt};
+}
+
+/// #3685 (Sol's header-design review) — the input type for
+/// `confine_destructive_targets`'s visible-agent parameter.
+///
+/// A DELIBERATELY DISTINCT type from `authz::VisibleSet`
+/// (`std::optional<std::unordered_set<std::string>>`, `authz_model.hpp`) /
+/// `DispatchCaller::exec_visible` (`dispatch_caller.hpp:54-59`). THOSE
+/// types' `nullopt` means UNFILTERED — pass every target through, reserved
+/// for a caller that has deliberately opted OUT of confinement
+/// (background/system dispatch; every operator-facing surface's unwired
+/// fallback is a PRESENT-EMPTY deny-all instead, never `nullopt` — see that
+/// file's own doc comment).
+///
+/// `DestructiveVisibleAgents`'s `nullopt` means the OPPOSITE: the
+/// management-group visible-agents read came back absent (no store wired)
+/// or degraded (ADR-0042) — `confine_destructive_targets` must FAIL CLOSED
+/// and admit nobody. Reusing `authz::VisibleSet` unchanged here — or even a
+/// same-shaped `using` alias to `std::optional<std::vector<std::string>>` —
+/// would leave a call site free to pass `exec_visible` (or any other
+/// "unfiltered means nullopt" value) straight through, silently inverting
+/// the fail-closed contract this function exists to enforce. The
+/// constructor is deliberately EXPLICIT, not a converting one: at this
+/// authorization seam, forcing a call site to spell
+/// `DestructiveVisibleAgents{vis}` is a feature, not boilerplate — it is
+/// the one line in the caller that says "yes, I know nullopt here means
+/// deny-all."
+struct DestructiveVisibleAgents {
+    /// `nullopt` == absent/degraded read == FAIL CLOSED (empty result).
+    /// Present (possibly empty) == the actual visible-agent set: an id
+    /// absent from it is confined out; a present-but-empty set means
+    /// deny-all too, by ordinary set-membership, with no special case
+    /// needed.
+    std::optional<std::vector<std::string>> agents;
+
+    explicit DestructiveVisibleAgents(std::optional<std::vector<std::string>> agents_in)
+        : agents(std::move(agents_in)) {}
+};
+
+/// REST-side management-group confinement for a Destructive-class dispatch —
+/// unchanged semantics from the inline `/api/command` block this replaces:
+/// preserves the input order and multiplicity of `agent_ids`, silently
+/// drops any id absent from `visible`. `visible.agents == std::nullopt`
+/// (absent or degraded read, ADR-0042) fails closed: the result is always
+/// empty, matching the deny-all posture the dashboard fragment already uses
+/// for the same degradation. Distinct from `authz::filter_to_scope`
+/// (`authz_model.hpp`), whose `nullopt` means UNFILTERED — the OPPOSITE
+/// posture; see `DestructiveVisibleAgents`'s doc comment above. Do not
+/// merge the two functions or their semantics.
+///
+/// Pure, but not `noexcept` — it allocates the output vector (and a
+/// temporary lookup set), so a `std::bad_alloc` is possible in principle,
+/// same as the inline block it replaces.
+[[nodiscard]] inline std::vector<std::string>
+confine_destructive_targets(const std::vector<std::string>& agent_ids,
+                            const DestructiveVisibleAgents& visible) {
+    if (!visible.agents)
+        return {};
+    const std::unordered_set<std::string> allow(visible.agents->begin(), visible.agents->end());
+    std::vector<std::string> out;
+    out.reserve(agent_ids.size());
+    for (const auto& id : agent_ids) {
+        if (allow.contains(id))
+            out.push_back(id);
+    }
+    return out;
+}
+
+} // namespace yuzu::server

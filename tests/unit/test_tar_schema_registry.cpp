@@ -424,6 +424,56 @@ TEST_CASE("TAR schema: netconn source is registered live-only with Windows wevta
     CHECK(cols == expected);
 }
 
+// ── Wave-2 registry reconciliation: arp/mapdrive graduations ────────────────
+//
+// b3 (arp) and b2 (mapdrive-macOS) wired their non-Windows legs; this
+// registry-reconciliation package flipped the three rows below from
+// kPlanned to their real status. These pin the flips directly (independent
+// of the dynamic TSV cross-check in test_tar_capability_table.cpp) so a
+// future edit that regresses either side back toward "planned" is caught
+// here even if the TSV mirror were edited in lockstep.
+
+TEST_CASE("TAR schema: arp graduated to supported on Linux (procfs)",
+          "[tar][schema][arp]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "arp"; });
+    REQUIRE(it != sources.end());
+    auto os_it = std::find_if(it->os_support.begin(), it->os_support.end(),
+                              [](const auto& os) { return os.os == "linux"; });
+    REQUIRE(os_it != it->os_support.end());
+    CHECK(os_it->status == OsSupportStatus::kSupported);
+    CHECK(os_it->capture_method == "procfs");
+}
+
+TEST_CASE("TAR schema: arp graduated to constrained on macOS (route_sysctl, "
+         "entry_type always unknown)",
+          "[tar][schema][arp]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "arp"; });
+    REQUIRE(it != sources.end());
+    auto os_it = std::find_if(it->os_support.begin(), it->os_support.end(),
+                              [](const auto& os) { return os.os == "macos"; });
+    REQUIRE(os_it != it->os_support.end());
+    CHECK(os_it->status == OsSupportStatus::kSupportedConstrained);
+    CHECK(os_it->capture_method == "route_sysctl");
+}
+
+TEST_CASE("TAR schema: mapdrive graduated to constrained on macOS (getfsstat, "
+         "outbound-live-only)",
+          "[tar][schema][mapdrive]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "mapdrive"; });
+    REQUIRE(it != sources.end());
+    auto os_it = std::find_if(it->os_support.begin(), it->os_support.end(),
+                              [](const auto& os) { return os.os == "macos"; });
+    REQUIRE(os_it != it->os_support.end());
+    CHECK(os_it->status == OsSupportStatus::kSupportedConstrained);
+    CHECK(os_it->capture_method == "getfsstat");
+}
+
 // ── #2204 unification: OsSupportStatus <-> the ABI4 descriptor enum ────────
 //
 // PR1.1 pins OsSupportStatus's four values 1:1 onto YuzuSupportLevel

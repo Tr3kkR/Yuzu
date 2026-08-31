@@ -711,7 +711,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // binding — a changing entry_type on the same binding is a value update,
         // not churn. Opt-in (default_enabled=false): low-PII infrastructure data
         // but shipped disabled per the standing capture-source posture. Windows
-        // only in this slice; Linux/macOS are kPlanned (see docs/tar-implementer.md
+        // (GetIpNetTable2), Linux (/proc/net/arp) and macOS (NET_RT_FLAGS
+        // sysctl, constrained) are all wired (see docs/tar-implementer.md
         // "Adding a capture source").
         {
             .name = "arp",
@@ -722,13 +723,22 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "GetIpNetTable2(AF_UNSPEC) — the kernel ARP / IPv6 neighbour "
                  "cache. Full interface/ip/mac/entry_type. Polled at the fast "
                  "collector interval."},
-                {"linux",   OsSupportStatus::kPlanned,             "procfs",
-                 "/proc/net/arp — kernel ARP table (IPv4). Wired in the Linux "
-                 "follow-up."},
-                {"macos",   OsSupportStatus::kPlanned,             "route_sysctl",
-                 "sysctl NET_RT_FLAGS / RTF_LLINFO routing-socket dump. MAC is "
-                 "available; entry_type reported 'unknown' (constrained). Wired "
-                 "in the macOS follow-up."},
+                {"linux",   OsSupportStatus::kSupported,           "procfs",
+                 "/proc/net/arp — kernel ARP table (IPv4). Flags column mapped "
+                 "to entry_type (static/dynamic/incomplete/other; ATF_PERM "
+                 "checked before ATF_COM so a permanent+resolved entry reads "
+                 "'static'). Capped at kArpEntryCap=2048 live entries; the "
+                 "truncation warn fires only when an entry is actually dropped, "
+                 "not merely when the count reaches the cap."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "route_sysctl",
+                 "Reuses agents/shared/route_sysctl_arp.hpp's NET_RT_FLAGS / "
+                 "RTF_LLINFO routing-socket dump (the same mechanism native "
+                 "discovery's scan_subnet uses). MAC is available; entry_type "
+                 "is always reported 'unknown' — this source distinguishes "
+                 "neither static/permanent nor dynamic/stale/probe entries, "
+                 "unlike the Windows/Linux legs. No interface field (the "
+                 "shared record carries none). Capped at kArpEntryCap=2048 "
+                 "live entries."},
             },
             .granularities = {
                 {
@@ -886,7 +896,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // live-observed, and `historical` rows bypass the live diff entirely.
         // Opt-in (default_enabled=false): rows expose usernames + share paths
         // (identity/usage-class PII), shipped disabled per the standing
-        // capture-source posture (like arp/dns).
+        // capture-source posture (like arp/dns). macOS is outbound-live only
+        // via getfsstat — no inbound, no history (honestly out of reach for
+        // an unprivileged agent; see the macOS os_support row below).
         {
             .name = "mapdrive",
             .dollar_name = "MapDrive",
@@ -907,9 +919,17 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "installed + read access, degrades to empty otherwise. Inbound "
                  "history: /var/log/samba connect events (bounded tail), journalctl "
                  "-u smbd fallback."},
-                {"macos",   OsSupportStatus::kPlanned,              "getfsstat",
-                 "Outbound via getfsstat / `mount` NFS/SMB entries; inbound via "
-                 "smbutil. Wired in the macOS follow-up (returns empty today)."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "getfsstat",
+                 "Outbound live only: getfsstat(2) mount table filtered to "
+                 "network fstypes {nfs, smbfs, cifs, afpfs, webdav}. The dedicated "
+                 "username column is always blank (getfsstat exposes no separate "
+                 "credential field) — but unlike Linux's /proc/mounts, a "
+                 "credentialed SMB mount source (e.g. //alice@host/share) is "
+                 "surfaced VERBATIM in remote_path, so the account name is still "
+                 "observable there even though the username column is empty. No "
+                 "inbound (no smbutil integration) and no history (getfsstat "
+                 "exposes only the current mount table, nothing historical) — "
+                 "honestly out of reach for an unprivileged agent."},
             },
             .granularities = {
                 {

@@ -3697,7 +3697,12 @@ Custom properties are operator-defined key-value pairs on agents, separate from 
 
 List all custom properties for a specific agent.
 
-**Permission:** `Infrastructure:Read`
+**Permission:** `Infrastructure:Read`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
+confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
+below for a degraded properties-store read.
 
 **Error (503) -- store degraded:** `custom_properties_store` is a migrated Postgres store
 (authoritative posture); a transient database read failure returns `503` rather than an
@@ -3732,7 +3737,12 @@ properties."
 
 Set or update a custom property value on an agent. If a property schema exists for the key, the value is validated against it.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
+confinement check (management-group store unavailable) denies with `403`, distinct from the `503`
+below for a degraded properties-store write.
 
 **Request body:**
 
@@ -3783,7 +3793,13 @@ accepting it unvalidated); this change only affects which status code that rejec
 
 Delete a custom property from an agent.
 
-**Permission:** `Infrastructure:Write`
+**Permission:** `Infrastructure:Write`, scoped to the agent (a global grant **or** a role assigned on
+the agent's management group / an ancestor, **or** a service-scoped API token whose
+`ITServiceOwner` role is admitted on agents matching its own service tag; RBAC-off legacy behavior
+is unchanged). A degraded
+confinement check (management-group store unavailable) denies with `403` -- distinct from the `404`
+degrade conflation noted below, which is a property-store issue on the delete path itself, not the
+authorization check.
 
 **Response:**
 
@@ -6632,6 +6648,48 @@ The single exception is `"scope": "__all__"` alongside `agent_ids`: `__all__` is
 Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",reason=...}` and
 write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body
 must be a JSON object; anything else is `400`.
+
+**Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
+fan-out are refused (#3685).** The command catalogue currently classifies 17 `plugin.action` pairs
+`Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
+any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
+`"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
+than the general targeting rule two paragraphs above: for an ordinary (non-Destructive) row,
+`"scope": "__all__"` supplied alongside `agent_ids` is the one case where the explicit id list
+wins and the call proceeds; for a Destructive row, supplying `scope` at all is refused even when
+`agent_ids` is also present and non-empty — the `__all__`-alongside-`agent_ids` exemption does
+not apply here.
+
+```json
+{"error": {"code": 400, "message": "destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
+```
+
+`audit_emitted` follows this file's usual convention (see `DELETE /api/v1/sessions?username=<name>` above):
+present and `false` only when the paired `command.dispatch` audit row failed to persist (the response also
+sets `Sec-Audit-Failed: true` in that case), and omitted entirely when no audit store is configured — absent
+means no claim, not `false`.
+
+The elevated securable/operation this row's catalogue entry names (per-row, e.g.
+`Infrastructure:Delete` for `tar.purge_source`) is checked via `require_permission` **before**
+this refusal — a caller lacking the grant gets the ordinary `403` first, preserving the
+pre-#3685 403-before-400 ordering. A caller who *is* authorized but named explicit `agent_ids`
+is then confined to their currently visible agents (management-group scope); an id list that
+confines to nothing returns:
+
+```json
+{"error": {"code": 404, "message": "no reachable in-scope agent"}, "meta": {"api_version": "v1"}}
+```
+
+A `plugin.action` pair the registry cannot classify (`Unclassified`/`Ambiguous`) is **not**
+independently denied by this gate — it falls through to the same dispatch chokepoint that denies
+every other unclassified pair, so a classify miss never silently reaches an agent through this
+path. Refusals are counted the same way as every other targeting refusal on this route
+(`yuzu_server_dispatch_target_rejected_total{route="command",reason="destructive_untargeted"}`)
+and audited (`command.dispatch`, `result=denied`).
+
+MCP `execute_instruction` enforces the identical rule (same refusal message, same
+`agent_ids`-only requirement) — see `docs/mcp-server.md`. `POST /api/instructions/{id}/execute`,
+the dashboard execute surface, and MCP `execute_bundle` do not yet enforce this gate.
 
 **Response (403): unauthorized dispatch.** Two distinct causes share the `403` status but carry
 different messages (#1398) — an incident review can tell them apart from the audit trail's

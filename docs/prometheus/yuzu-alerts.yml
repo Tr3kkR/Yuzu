@@ -3784,15 +3784,19 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Durable-session reap declined on a wall-clock anomaly (DB/host clock integrity)"
+          summary: "Durable-session reap declined on a DB-primary clock anomaly (ADR-2002 §4 integrity)"
           description: >-
-            A durable-session reap pass was declined because the server's
-            wall-clock reading was implausibly ahead of or behind the persisted
-            reap anchor — the DB-clock-integrity signal ADR-2002 §4 requires be
-            monitored. A backward clock step un-expires sessions and extends live
-            JIT-elevation / MFA step-up windows beyond their authored maximums
-            (the residual the per-window ceilings deliberately do not resist).
-            Investigate NTP / DB-host / server-host clock health; correlate with
+            A durable-session reap pass was declined because the DB-PRIMARY clock
+            reading (Postgres now(), read in-SQL — the same clock that authors
+            session expires_at since #3715) was implausibly ahead of or behind the
+            persisted reap anchor — the DB-primary clock-integrity signal ADR-2002
+            §4 mitigation (a) requires be monitored. A backward step un-expires
+            sessions and extends live JIT-elevation / MFA step-up windows toward
+            their authored maximums (the residual the per-window clamps/ceilings
+            bound but do not eliminate). Investigate the DATABASE primary's NTP /
+            clock health first (not the app host — a local app-host wobble is the
+            separate yuzu_auth_local_clock_backward_total signal, which does NOT
+            affect session adjudication under DB-clock authority); correlate with
             yuzu_auth_session_store_degrade_total.
       - alert: YuzuSessionStoreDegraded
         expr: |
