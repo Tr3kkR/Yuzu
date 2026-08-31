@@ -80,10 +80,13 @@ execute_verified_payload(const std::filesystem::path& path, std::string_view arg
 
     if (is_linux) {
         // CDX-002: reject a shebang-interpreted script before it ever
-        // reaches the runner -- B6 exec_verify's fd-exec primitive closes
-        // the verified fd before the kernel's binfmt_script handler gets a
-        // chance to re-open the interpreter path, so a shebang script is
-        // structurally incompatible with fd-exec. Best-effort operator UX,
+        // reaches the runner -- B6 exec_verify's fd-exec primitive execs the
+        // verified fd via execveat(fd, "", ..., AT_EMPTY_PATH), which gives
+        // the kernel no real path string. The binfmt_script handler needs a
+        // resolvable path to build the interpreter's argv (it invokes
+        // "<interpreter> <script-path> ...", not "<interpreter> <fd>"), so a
+        // shebang script is structurally incompatible with fd-exec
+        // regardless of the fd's own CLOEXEC state. Best-effort operator UX,
         // NOT a security boundary (see content_dist_plugin.cpp's original
         // comment for the full rationale, preserved verbatim there).
         std::ifstream probe{path, std::ios::binary};
@@ -93,9 +96,9 @@ execute_verified_payload(const std::filesystem::path& path, std::string_view arg
             is_shebang_payload(std::string_view{first_bytes, sizeof(first_bytes)})) {
             outcome.lines.push_back(
                 "error|script payloads (shebang) are not supported for verified "
-                "execution on Linux: the runner's fd-exec primitive is incompatible "
-                "with shebang interpreters (execveat O_CLOEXEC closes the fd before "
-                "binfmt_script re-opens it); stage a native executable");
+                "execution on Linux: the runner's fd-exec primitive (execveat with "
+                "AT_EMPTY_PATH) has no real path for binfmt_script to build the "
+                "interpreter's argv from; stage a native executable");
             outcome.rc = 1;
             return outcome;
         }
@@ -109,18 +112,28 @@ execute_verified_payload(const std::filesystem::path& path, std::string_view arg
     }
 
 #ifndef _WIN32
-    // Make the staged file executable -- the ONLY thing that turns a staged
-    // 0644 download into something the runner can exec at all. A chmod
-    // failure is not fatal here -- it is reported via a warn| line and
+    // Normalize the staged file to owner-only rwx (0700) -- REPLACE, not add.
+    // Two things this must do at once: turn a staged 0644 download into
+    // something the runner can exec at all, and clear any group/other write
+    // bit the download arrived with (a copy/extract preserves the source
+    // mode verbatim, and umask 0002 -- a common collaborative default --
+    // yields 0775 for a locally-built or locally-copied payload). The B6
+    // verified-exec guard in subprocess_runner.cpp refuses to launch a
+    // group/other-writable payload ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0
+    // -> EPERM) precisely because a writable-by-others staged binary is a
+    // TOCTOU target between this chmod and the exec; only ADDING owner_exec
+    // left that bit exactly as staged, so a 0775 payload was rejected with
+    // no way for this seam to ever produce a launchable file for it. A
+    // chmod failure is not fatal here -- it is reported via a warn| line and
     // execution proceeds; the exec itself then fails honestly with its own
-    // EACCES, which the runner reports through
+    // EACCES/EPERM, which the runner reports through
     // termination_reason==spawn_error/spawn_errno like any other exec
     // failure, rather than this step silently papering over a permissions
     // problem.
     {
         std::error_code chmod_ec;
-        std::filesystem::permissions(path, std::filesystem::perms::owner_exec,
-                                     std::filesystem::perm_options::add, chmod_ec);
+        std::filesystem::permissions(path, std::filesystem::perms::owner_all,
+                                     std::filesystem::perm_options::replace, chmod_ec);
         if (chmod_ec) {
             outcome.lines.push_back(std::format(
                 "warn|failed to set execute permission on staged file: {}", chmod_ec.message()));
