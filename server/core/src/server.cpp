@@ -13728,7 +13728,14 @@ private:
         // GET /api/agents/:id/properties
         web_server_->Get(R"(/api/agents/([^/]+)/properties)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
+            auto agent_id = req.matches[1].str();
+            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Read
+            // gate. The old require_permission("Infrastructure","Read") admitted
+            // a global-permission holder with no target check, disclosing
+            // custom-properties data for agents outside a management-group-
+            // confined caller's scope (World A gap, ADR-0017). Same pattern as
+            // the Tag routes' require_scoped_permission (see /api/tags/set).
+            if (!require_scoped_permission(req, res, "Infrastructure", "Read", agent_id))
                 return;
             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                 res.status = 503;
@@ -13738,7 +13745,6 @@ private:
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             auto props = custom_properties_store_->get_properties(agent_id);
             if (!props) {
                 res.status = 503;
@@ -13766,7 +13772,15 @@ private:
                                                                                      httplib::
                                                                                          Response&
                                                                                              res) {
-            if (!require_permission(req, res, "Infrastructure", "Write"))
+            auto agent_id = req.matches[1].str();
+            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
+            // gate. The old require_permission("Infrastructure","Write") admitted
+            // any global-permission holder with no target check, letting a
+            // caller mutate custom-properties data for any agent regardless of
+            // their otherwise-confined visibility elsewhere (World A gap,
+            // ADR-0017). Same pattern as the Tag routes' require_scoped_permission
+            // (see /api/tags/set).
+            if (!require_scoped_permission(req, res, "Infrastructure", "Write", agent_id))
                 return;
             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                 res.status = 503;
@@ -13776,7 +13790,6 @@ private:
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
 
             std::string value;
@@ -13805,6 +13818,8 @@ private:
 
             auto result = custom_properties_store_->set_property(agent_id, key, value, type);
             if (!result) {
+                (void)audit_log(req, "custom_property.set", "failure", "Agent", agent_id,
+                                key + ": " + result.error());
                 if (is_custom_properties_db_error(result.error())) {
                     spdlog::error("PUT /api/agents/{}/properties/{}: {}", agent_id, key,
                                   result.error());
@@ -13838,7 +13853,15 @@ private:
                                                                                         httplib::
                                                                                             Response&
                                                                                                 res) {
-            if (!require_permission(req, res, "Infrastructure", "Write"))
+            auto agent_id = req.matches[1].str();
+            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
+            // gate. The old require_permission("Infrastructure","Write") admitted
+            // any global-permission holder with no target check, letting a
+            // caller delete custom-properties data for any agent regardless of
+            // their otherwise-confined visibility elsewhere (World A gap,
+            // ADR-0017). Same pattern as the Tag routes' require_scoped_permission
+            // (see /api/tags/delete).
+            if (!require_scoped_permission(req, res, "Infrastructure", "Write", agent_id))
                 return;
             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                 res.status = 503;
@@ -13848,11 +13871,12 @@ private:
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
 
             bool deleted = custom_properties_store_->delete_property(agent_id, key);
             if (!deleted) {
+                (void)audit_log(req, "custom_property.delete", "not_found", "Agent", agent_id,
+                                "key=" + key);
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"property not found"},"meta":{"api_version":"v1"}})",
