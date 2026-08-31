@@ -1616,7 +1616,12 @@ private:
         if (!in) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "network_config:proc_net_arp_unreadable");
-            ctx.write_output("arp|not_available");
+            // "error|..." (matching the Windows leg), not "arp|...": the
+            // documented arp row shape is 5 fields (arp|iface|ip|mac|type),
+            // so a failure sentinel under the "arp|" prefix would emit a
+            // 2-field row breaking that contract for any consumer that
+            // trusts the prefix to imply the shape.
+            ctx.write_output("error|/proc/net/arp unreadable");
             return 0;
         }
         std::ostringstream contents;
@@ -1624,7 +1629,7 @@ private:
         if (in.bad()) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "network_config:proc_net_arp_read_error");
-            ctx.write_output("arp|not_available");
+            ctx.write_output("error|/proc/net/arp read error");
             return 0;
         }
         const auto entries = yuzu::network_config::parse_proc_net_arp(contents.str());
@@ -1646,7 +1651,8 @@ private:
         if (!fetched.ok) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "network_config:pf_route_arp_sysctl_failed");
-            ctx.write_output("arp|not_available");
+            // "error|..." — see the Linux leg's identical note above.
+            ctx.write_output("error|PF_ROUTE ARP sysctl failed");
             return 0;
         }
         auto parsed = yuzu::shared::parse_rt_flags_llinfo(fetched.blob);
@@ -1688,8 +1694,10 @@ private:
         return 0;
 
 #else
-        // Honest sentinel, not an error: no ARP mechanism on this platform.
-        ctx.write_output("arp|not_available");
+        // Honest sentinel: no ARP mechanism on this platform. "error|..." —
+        // see the Linux leg's note above; keeps "arp|" reserved for real
+        // 5-field rows on every leg, this one included.
+        ctx.write_output("error|no ARP mechanism on this platform");
         return 0;
 #endif
     }
