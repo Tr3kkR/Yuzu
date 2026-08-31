@@ -50,7 +50,7 @@ using namespace yuzu::tar;
 // ── parse_systemctl_list_units ──────────────────────────────────────────────
 
 TEST_CASE("parse_systemctl_list_units: empty input yields empty output", "[tar_service]") {
-    CHECK(parse_systemctl_list_units({}).empty());
+    CHECK(parse_systemctl_list_units({}).entries.empty());
 }
 
 TEST_CASE("parse_systemctl_list_units: real systemd-ubuntu container capture",
@@ -66,7 +66,7 @@ TEST_CASE("parse_systemctl_list_units: real systemd-ubuntu container capture",
         "  systemd-journald.service                 loaded    inactive dead   Journal Service",
     };
 
-    auto services = parse_systemctl_list_units(lines);
+    auto services = parse_systemctl_list_units(lines).entries;
     REQUIRE(services.size() == 5);
 
     CHECK(services[0].name == "dbus.service");
@@ -107,7 +107,7 @@ TEST_CASE("parse_systemctl_list_units: real --plain capture has no marker column
         "yzfail.service                       loaded    failed   failed  yzfail test unit",
     };
 
-    auto services = parse_systemctl_list_units(lines);
+    auto services = parse_systemctl_list_units(lines).entries;
     REQUIRE(services.size() == 3);
 
     CHECK(services[0].name == "dbus.service");
@@ -128,12 +128,12 @@ TEST_CASE("parse_systemctl_list_units: real --plain capture has no marker column
 // ── parse_launchctl_list ─────────────────────────────────────────────────────
 
 TEST_CASE("parse_launchctl_list: empty input yields empty output", "[tar_service]") {
-    CHECK(parse_launchctl_list({}).empty());
+    CHECK(parse_launchctl_list({}).entries.empty());
 }
 
 TEST_CASE("parse_launchctl_list: header-only input yields empty output", "[tar_service]") {
     std::vector<std::string> lines = {"PID\tStatus\tLabel"};
-    CHECK(parse_launchctl_list(lines).empty());
+    CHECK(parse_launchctl_list(lines).entries.empty());
 }
 
 TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
@@ -146,7 +146,7 @@ TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
         "93175\t-9\tcom.apple.knowledgeconstructiond",
     };
 
-    auto services = parse_launchctl_list(lines);
+    auto services = parse_launchctl_list(lines).entries;
     REQUIRE(services.size() == 3);
 
     CHECK(services[0].name == "com.apple.SafariHistoryServiceAgent");
@@ -161,4 +161,86 @@ TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
     // only ever tested the pid field, never the status-code field.
     CHECK(services[2].name == "com.apple.knowledgeconstructiond");
     CHECK(services[2].status == "running");
+}
+
+// ── malformed-row detection (BR-service-001) ────────────────────────────────
+//
+// A malformed/truncated row must be DROPPED from `entries` and flag
+// `malformed = true`, never pushed as a ServiceInfo carrying an
+// empty/garbage name -- mirrors tar_arp_parsers.hpp's BR4-005 tests
+// (test_tar_arp.cpp). These two rows are SYNTHETIC edge cases (a
+// deliberately truncated/blank line no real systemctl/launchctl invocation
+// produces under normal conditions) -- labeled here per the branch's
+// fixture-provenance discipline, unlike the real-capture rows above.
+
+TEST_CASE("parse_systemctl_list_units: a well-formed real capture is never "
+          "flagged malformed",
+          "[tar_service]") {
+    // Regression guard for a false positive: re-run the real --plain
+    // capture from the case above and assert `malformed` stays false so a
+    // genuinely complete table is never misreported as incomplete.
+    std::vector<std::string> lines = {
+        "dbus.service                         loaded    inactive dead    D-Bus System Message Bus",
+        "yzfail.service                       loaded    failed   failed  yzfail test unit",
+    };
+    auto result = parse_systemctl_list_units(lines);
+    CHECK_FALSE(result.malformed);
+    CHECK(result.entries.size() == 2);
+}
+
+TEST_CASE("parse_systemctl_list_units: a truncated row missing ACTIVE/SUB is "
+          "dropped and flagged malformed, not silently included with a "
+          "garbage empty status",
+          "[tar_service]") {
+    // Synthetic edge case: a row with only a UNIT token (LOAD/ACTIVE/SUB all
+    // missing, e.g. a truncated read mid-row) -- the exact "malformed row
+    // produces a ServiceInfo with an empty or garbage name/status" shape BUG
+    // 1 describes. si.name comes back non-empty ("bad-row.service") but
+    // si.status comes back "" once next_token() runs out of columns, which
+    // is what the fix's malformed check catches.
+    std::vector<std::string> lines = {
+        "dbus.service                         loaded    inactive dead    D-Bus System Message Bus",
+        "bad-row.service", // synthetic: truncated row, only the UNIT column present
+        "yzfail.service                       loaded    failed   failed  yzfail test unit",
+    };
+    auto result = parse_systemctl_list_units(lines);
+    CHECK(result.malformed);
+    // The two well-formed rows around the malformed one still decode --
+    // same defensive-tolerance shape as tar_arp_parsers.hpp's BR4-005.
+    REQUIRE(result.entries.size() == 2);
+    CHECK(result.entries[0].name == "dbus.service");
+    CHECK(result.entries[1].name == "yzfail.service");
+}
+
+TEST_CASE("parse_launchctl_list: a well-formed real capture is never flagged "
+          "malformed",
+          "[tar_service]") {
+    std::vector<std::string> lines = {
+        "PID\tStatus\tLabel",
+        "-\t0\tcom.apple.SafariHistoryServiceAgent",
+        "1190\t0\tcom.apple.progressd",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK_FALSE(result.malformed);
+    CHECK(result.entries.size() == 2);
+}
+
+TEST_CASE("parse_launchctl_list: a truncated row with an empty LABEL field is "
+          "dropped and flagged malformed, not silently included",
+          "[tar_service]") {
+    // Synthetic edge case: a row with only PID + status code, no LABEL at
+    // all (fewer than 3 tab-separated fields) -- next_field() returns "" for
+    // the missing LABEL, which previously became a ServiceInfo with an
+    // empty name pushed unconditionally.
+    std::vector<std::string> lines = {
+        "PID\tStatus\tLabel",
+        "-\t0\tcom.apple.SafariHistoryServiceAgent",
+        "1190\t0", // synthetic: truncated row, LABEL column missing
+        "93175\t-9\tcom.apple.knowledgeconstructiond",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.malformed);
+    REQUIRE(result.entries.size() == 2);
+    CHECK(result.entries[0].name == "com.apple.SafariHistoryServiceAgent");
+    CHECK(result.entries[1].name == "com.apple.knowledgeconstructiond");
 }

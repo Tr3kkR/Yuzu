@@ -236,7 +236,17 @@ std::vector<ServiceInfo> enumerate_services() {
         throw yuzu::tar::IncompleteCaptureError("TAR: systemctl capture incomplete: " + status.reason);
     }
 
-    return parse_systemctl_list_units(res.lines);
+    auto parsed = parse_systemctl_list_units(res.lines);
+    if (parsed.malformed) {
+        // BR-service-001: a malformed row is a missing binding relative to a
+        // genuinely complete table (tar_service_parsers.hpp) -- same policy
+        // as the ARP leg's BR4-005. Throw rather than diff/persist the
+        // surviving subset as though it were the whole service table.
+        spdlog::error("TAR: service snapshot incomplete (systemctl produced a malformed row) -- "
+                      "skipping diff, retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError("TAR: systemctl produced a malformed row");
+    }
+    return std::move(parsed.entries);
 }
 
 // -- macOS implementation -----------------------------------------------------
@@ -274,7 +284,14 @@ std::vector<ServiceInfo> enumerate_services() {
         throw yuzu::tar::IncompleteCaptureError("TAR: launchctl capture incomplete: " + status.reason);
     }
 
-    return parse_launchctl_list(res.lines);
+    auto parsed = parse_launchctl_list(res.lines);
+    if (parsed.malformed) {
+        // BR-service-001: same policy as the systemctl leg above.
+        spdlog::error("TAR: service snapshot incomplete (launchctl produced a malformed row) -- "
+                      "skipping diff, retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError("TAR: launchctl produced a malformed row");
+    }
+    return std::move(parsed.entries);
 }
 
 #else

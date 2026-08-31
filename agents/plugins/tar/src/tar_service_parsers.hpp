@@ -30,6 +30,20 @@
 
 namespace yuzu::tar {
 
+/// Result of parsing a service-enumeration tool's output: the decoded rows
+/// plus whether at least one row was malformed (dropped rather than
+/// included as a garbage/empty-name entry). Mirrors tar_arp_parsers.hpp's
+/// ProcNetArpParse{entries, malformed} shape (BR4-005) so the two
+/// parser families stay consistent: a malformed row is a missing binding
+/// relative to a genuinely complete table, and the CALLER
+/// (enumerate_services(), tar_service_collector.cpp) is the one that turns
+/// this flag into an IncompleteCaptureError throw, mirroring how ARP's
+/// `malformed` is only acted on there too.
+struct ServiceParseResult {
+    std::vector<ServiceInfo> entries;
+    bool malformed{false};
+};
+
 /// Parse the line-split stdout of `systemctl list-units --type=service
 /// --all --plain --no-pager --no-legend` (SubprocessResult::lines -- blank
 /// lines already dropped and a trailing '\r' already stripped by the
@@ -46,10 +60,10 @@ namespace yuzu::tar {
 /// nothing to trim) and correct if a future caller ever invokes this parser
 /// against non-`--plain` C-locale output; `--no-legend` means there is no
 /// header row to skip either way.
-inline std::vector<ServiceInfo>
+inline ServiceParseResult
 parse_systemctl_list_units(const std::vector<std::string>& lines) {
-    std::vector<ServiceInfo> services;
-    services.reserve(lines.size());
+    ServiceParseResult out;
+    out.entries.reserve(lines.size());
 
     for (std::string line : lines) {
         // Trim leading whitespace and the bullet systemctl marks a failed
@@ -81,11 +95,33 @@ parse_systemctl_list_units(const std::vector<std::string>& lines) {
         if (desc_start != std::string::npos)
             si.display_name = line.substr(desc_start);
 
+        // BR-service-001: a malformed/truncated row -- fewer than the 4
+        // required columns (UNIT/LOAD/ACTIVE/SUB) on the line, so UNIT
+        // and/or SUB come back "" once next_token() runs out of tokens --
+        // must not be pushed as a ServiceInfo carrying an empty/garbage
+        // name or status. A real systemctl row always carries a non-empty
+        // SUB (dead/running/exited/failed/...), so an empty si.status is as
+        // reliable a malformed signal as an empty si.name: checking name
+        // alone would miss a row like "myservice.service loaded" that has a
+        // real UNIT token but is missing ACTIVE/SUB, which previously
+        // silently corrupted the diff the same way (a name-less row can
+        // never match a previous snapshot's row, so it reads as a spurious
+        // `appeared`, and the row it should have represented reads as a
+        // spurious `removed` once a well-formed line replaces it). Same
+        // policy as tar_arp_parsers.hpp's BR4-005: drop the row from
+        // `entries` but set `malformed` so the CALLER (enumerate_services())
+        // throws IncompleteCaptureError instead of diffing a subset as
+        // complete.
+        if (si.name.empty() || si.status.empty()) {
+            out.malformed = true;
+            continue;
+        }
+
         si.startup_type = "unknown";
-        services.push_back(std::move(si));
+        out.entries.push_back(std::move(si));
     }
 
-    return services;
+    return out;
 }
 
 /// Parse the line-split stdout of `launchctl list`
@@ -94,11 +130,11 @@ parse_systemctl_list_units(const std::vector<std::string>& lines) {
 /// "PID\tStatus\tLabel" header and is skipped unconditionally, matching the
 /// original fgets-based skip; an empty `lines` (no output at all) yields an
 /// empty result, same as the original no-output early return.
-inline std::vector<ServiceInfo> parse_launchctl_list(const std::vector<std::string>& lines) {
-    std::vector<ServiceInfo> services;
+inline ServiceParseResult parse_launchctl_list(const std::vector<std::string>& lines) {
+    ServiceParseResult out;
     if (lines.empty())
-        return services;
-    services.reserve(lines.size() - 1);
+        return out;
+    out.entries.reserve(lines.size() - 1);
 
     for (std::size_t i = 1; i < lines.size(); ++i) {
         const std::string& line = lines[i];
@@ -123,13 +159,23 @@ inline std::vector<ServiceInfo> parse_launchctl_list(const std::vector<std::stri
         next_field(); // status code
         si.name = next_field();
 
+        // BR-service-001 (same policy as parse_systemctl_list_units above,
+        // and tar_arp_parsers.hpp's BR4-005): a malformed/truncated row --
+        // fewer than 3 tab-separated fields, so LABEL never got a token --
+        // must not be pushed as a name-less ServiceInfo. Drop it and flag
+        // `malformed` instead of silently including or dropping it.
+        if (si.name.empty()) {
+            out.malformed = true;
+            continue;
+        }
+
         si.status = (pid_str != "-" && !pid_str.empty()) ? "running" : "stopped";
         // macOS launchctl list does not provide startup type; 'unknown' is correct
         si.startup_type = "unknown";
-        services.push_back(std::move(si));
+        out.entries.push_back(std::move(si));
     }
 
-    return services;
+    return out;
 }
 
 } // namespace yuzu::tar
