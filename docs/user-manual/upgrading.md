@@ -91,6 +91,41 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: Destructive-class dispatch now requires explicit `agent_ids` on REST and MCP (#3685)
+
+17 `plugin.action` pairs are classified `Destructive` in the command catalogue: `tar.purge_source`,
+`tar.rollup`, `filesystem.delete_lines`, `registry.delete_value`, `registry.delete_key`,
+`storage.clear`, `content_dist.stage`, `content_dist.execute_staged`, `content_dist.cleanup`,
+`content_dist.upload_file`, `tags.clear`, `script_exec.exec`, `script_exec.powershell`,
+`script_exec.bash`, `http_client.download`, `certificates.delete`, and `quarantine.quarantine`.
+Dispatching any of them without explicit, non-empty `agent_ids` — an omitted/empty target, or a
+`scope` (including `"__all__"`, even alongside `agent_ids`) — is now refused with `400`
+(`"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are
+refused"`) on REST `POST /api/command`, and `-32602` with the same message on MCP
+`execute_instruction` (refused before an approval ticket is minted or consumed, at both the
+supervised-tier pre-mint gate and the operator-tier handler).
+
+**MCP `execute_instruction` had no Destructive-targeting gate at all before this release** — a
+scope-targeted or broadcast call to one of the 17 rows above dispatched normally and succeeded.
+On REST `/api/command`, a classify-miss shape defect in the prior gate meant a scope-targeted or
+broadcast dispatch to one of these rows could, in some cases, also go through rather than being
+refused — this release closes that gate to an exhaustive, no-default-arm decision over every
+possible outcome so a future miscategorisation fails to compile rather than falling open silently.
+
+**Who this affects:** any operator or automation dispatching one of the 17 rows above via MCP
+`execute_instruction` with `scope` or an omitted/empty target, or via REST `/api/command` the same
+way. Explicit `agent_ids` dispatches to these rows, and any dispatch to a row NOT on this list, are
+unaffected.
+
+**What to do:** switch any such call to explicit, non-empty `agent_ids`. `POST
+/api/instructions/{id}/execute`, the dashboard execute surface, and MCP `execute_bundle` do not yet
+enforce this gate for these same 17 rows — a tracked follow-up, not a gap this release closes.
+
+**Verify:** re-run the affected dispatch with explicit `agent_ids` and confirm it succeeds as
+before; a scope/broadcast call to one of the 17 rows should now return the refusal above rather
+than dispatching. `yuzu_server_dispatch_target_rejected_total{route="command"|"mcp",reason="destructive_untargeted"}`
+counts refusals on both surfaces if you want to confirm the gate is exercising in your environment.
+
 ## Behaviour change: SAML login gains a new availability coupling to `rbac_store` (#1832)
 
 SAML SSO now reaches parity with OIDC's group-to-role RBAC reconciliation (see

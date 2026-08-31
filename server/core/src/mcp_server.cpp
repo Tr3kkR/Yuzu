@@ -804,7 +804,9 @@ static const ToolDef kTools[] = {
      "for actions with a published definition) or discover_instructions - do not guess action "
      "names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
-     "agents.",
+     "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
+     "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
+     "ticket is minted or consumed, matching REST POST /api/command.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
      // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the
@@ -820,8 +822,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
      R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__."},)j"
-     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet."})j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__. EXCEPTION (#3685): for a Destructive-classified plugin.action pair, supplying scope AT ALL - including __all__ alongside agent_ids - is refused; explicit agent_ids is the only way to target one."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires this field, non-empty - omitting it is refused rather than treated as target-all."})j"
      R"j(},"required":["plugin","action"]})j",
      // #2712: two fully self-contained, mutually-exclusive branches - each
      // declares its OWN complete properties/required/additionalProperties:false
@@ -3905,7 +3907,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
                                   std::string_view remediation = {}, long retry_after_ms = -1,
-                                  std::string_view cid_override = {}) {
+                                  std::string_view cid_override = {}, bool audit_ok = true) {
                 // cid_override lets a caller mint the correlation id FIRST and
                 // stamp it into its log/audit records before building the
                 // envelope (#2423 review F4); default preserves mint-here.
@@ -3928,6 +3930,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // json_quoted_string returns a fully-quoted, escaped JSON string.
                     data += json_quoted_string(remediation);
                 }
+                // #3685 governance round: trailing default-true param, so every
+                // existing call site is byte-unchanged. MCP has no response-header
+                // channel like REST's Sec-Audit-Failed (documented elsewhere in
+                // this file), so a caller that wants to surface a dropped denial
+                // audit row on an ERROR envelope — the same evidence-gap signal
+                // `revoke_certificate`'s error_response(...) call already puts in
+                // its own error.data, and the same fact `audit_persisted:false`
+                // already surfaces on every SUCCESS result in this file — passes
+                // its own audit_fn/mcp_audit return here instead.
+                if (!audit_ok)
+                    data += R"(,"audit_persisted":false)";
                 data += "}";
                 return error_response(id, code, message, data);
             };
@@ -4402,8 +4415,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                 classify_fn_(p, a),
                                 /*valid_nonempty_agent_ids=*/args.contains("agent_ids"),
                                 /*scope_key_present=*/args.contains("scope"));
-                            if (gate.verdict ==
-                                yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                            // #3685 governance round: exhaustive switch, no
+                            // `default:` arm — matches REST's `/api/command`
+                            // switch over the SAME enum (server.cpp) and the
+                            // header's own doc comment intent
+                            // (dispatch_destructive_gate.hpp). A future 5th
+                            // `DestructiveTargetingVerdict` now forces a
+                            // compile-time decision at BOTH surfaces; the
+                            // prior `if (... == RefuseUntargeted) {...}` shape
+                            // let every other verdict fall through silently,
+                            // which is exactly the fail-open shape #3685
+                            // itself fixed on REST.
+                            switch (gate.verdict) {
+                            case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                            case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                            case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                                break;
+                            case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
                                 // #3685 (checkpoint 3, commit 6): counted on the SAME
                                 // series REST's `/api/command` 400 arm uses
                                 // (`yuzu_server_dispatch_target_rejected_total`,
@@ -4427,7 +4455,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                 }
                                 const std::string cid =
                                     yuzu::server::detail::make_correlation_id();
-                                mcp_audit(
+                                // #3685 governance round: capture and surface a
+                                // dropped denial-audit row, matching this file's
+                                // OWN established convention (the audit_persisted
+                                // doc comment ~3763, the denied_ok = mcp_audit(...)
+                                // working example ~5424) — a dropped row on this
+                                // P1 security refusal's evidence chain is the more
+                                // security-relevant gap, not less.
+                                const bool audit_ok = mcp_audit(
                                     "denied",
                                     std::string("destructive_untargeted ") +
                                         yuzu::server::detail::sanitize_detail_value(p) + ":" +
@@ -4440,9 +4475,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                              "name explicit agent_ids (no scope, no broadcast) "
                                              "and re-call; no approval ticket was created or "
                                              "consumed",
-                                             -1, cid),
+                                             -1, cid, audit_ok),
                                     "application/json");
                                 return;
+                            }
                             }
                         }
                     }
@@ -7852,8 +7888,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         classify_fn_(plugin, action),
                         /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
                         /*scope_key_present=*/!scope.empty());
-                    if (gate.verdict ==
-                        yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                    // #3685 governance round: exhaustive switch, no `default:`
+                    // arm — matches REST's `/api/command` switch over the SAME
+                    // enum (server.cpp), the C8 pre-mint site above, and the
+                    // header's own doc comment intent
+                    // (dispatch_destructive_gate.hpp).
+                    switch (gate.verdict) {
+                    case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                    case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                        // Both proceed to dispatch unchanged.
+                        break;
+                    case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                        // Policy B: defers to the existing dispatch chokepoint,
+                        // which denies a real miss on its own terms.
+                        break;
+                    case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
                         // #3685 (checkpoint 3, commit 6): same series + label as
                         // the C8 pre-mint site above and REST's /api/command 400
                         // arm. C8 and this backstop are mutually exclusive per
@@ -7873,24 +7922,25 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                         }
                         const std::string cid = yuzu::server::detail::make_correlation_id();
-                        mcp_audit("denied",
-                                  std::string("destructive_untargeted ") +
-                                      yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
-                                      yuzu::server::detail::sanitize_detail_value(action) +
-                                      " correlation_id=" + cid);
+                        // #3685 governance round: capture and surface a dropped
+                        // denial-audit row — same convention as the C8 pre-mint
+                        // site above (audit_persisted doc comment ~3763, the
+                        // denied_ok = mcp_audit(...) working example ~5424).
+                        const bool audit_ok = mcp_audit(
+                            "denied",
+                            std::string("destructive_untargeted ") +
+                                yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
+                                yuzu::server::detail::sanitize_detail_value(action) +
+                                " correlation_id=" + cid);
                         res.set_content(
                             a4_error(kInvalidParams, yuzu::server::kDestructiveUntargetedMessage,
                                      "this plugin.action is classified Destructive: name "
                                      "explicit agent_ids (no scope, no broadcast) and re-call",
-                                     -1, cid),
+                                     -1, cid, audit_ok),
                             "application/json");
                         return;
                     }
-                    // NotDestructive, Targeted, and ClassifyMiss all fall
-                    // through unchanged: NotDestructive/Targeted proceed to
-                    // dispatch as before, and ClassifyMiss (Policy B) defers to
-                    // the existing dispatch chokepoint, which denies a real
-                    // miss on its own terms.
+                    }
                 }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────

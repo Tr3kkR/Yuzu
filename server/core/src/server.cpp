@@ -14597,13 +14597,21 @@ private:
                         // family (#2500 precedent above) — an uncounted
                         // refusal on a P1 security control cannot reach the
                         // dashboard/alert this observability commit ships.
-                        metrics_
-                            .counter("yuzu_server_dispatch_target_rejected_total",
-                                     {{"route", "command"},
-                                      {"reason",
-                                       std::string(
-                                           yuzu::server::kReasonDestructiveUntargeted)}})
-                            .increment();
+                        // #3685 governance round: guarded the same way MCP's
+                        // two equivalent increments already are in this PR
+                        // (mcp_server.cpp, both #3685 gate sites) — an
+                        // increment failure must never skip the audit write
+                        // or the response below it.
+                        try {
+                            metrics_
+                                .counter("yuzu_server_dispatch_target_rejected_total",
+                                         {{"route", "command"},
+                                          {"reason",
+                                           std::string(
+                                               yuzu::server::kReasonDestructiveUntargeted)}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
                         // #3685 fix round (adversarial review F2): audited like
                         // the check_targeting_shape refusal ~100 lines above in
                         // this same function, and like MCP's twin refusal
@@ -14620,11 +14628,23 @@ private:
                         if (!audit_ok)
                             res.set_header("Sec-Audit-Failed", "true");
                         res.status = 400;
-                        res.set_content(
-                            R"({"error":{"code":400,"message":")" +
-                                std::string(yuzu::server::kDestructiveUntargetedMessage) +
-                                R"("},"meta":{"api_version":"v1"}})",
-                            "application/json");
+                        // #3685 governance round: same nlohmann::json +
+                        // `audit_emitted` shape as this handler's three
+                        // sibling denial arms (body-type,
+                        // check_targeting_shape, build_classified_command) —
+                        // this row is now documented as audited, so its
+                        // response must not be the one denial arm that
+                        // silently omits the caller-visible evidence-gap
+                        // signal.
+                        nlohmann::json err{
+                            {"error",
+                             {{"code", 400},
+                              {"message",
+                               std::string(yuzu::server::kDestructiveUntargetedMessage)}}},
+                            {"meta", {{"api_version", "v1"}}}};
+                        if (audit_store_)
+                            err["audit_emitted"] = audit_ok;
+                        res.set_content(err.dump(), "application/json");
                         return;
                     }
                     // Confine to the operator's visible agents (fail-closed: an
