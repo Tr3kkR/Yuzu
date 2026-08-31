@@ -498,8 +498,8 @@ void sweep_fd_range_cloexec_fallback(long ceiling) {
     }
 }
 
-// B6 (optional, off by default; runner primitive only -- no in-tree caller
-// enables this in this PR). Async-signal-safe: opens argv[0] O_NOFOLLOW so a
+// B6: content_dist's execute_verified_payload is the in-tree caller (Linux
+// leg, is_linux=true). Async-signal-safe: opens argv[0] O_NOFOLLOW so a
 // symlink swap between the probe and this open() can't redirect us, fstat()s
 // the FD (never the path, closing the classic stat-vs-exec TOCTOU as far as
 // an fd-based check can), and on Linux execs THAT SAME FD via a raw
@@ -507,11 +507,25 @@ void sweep_fd_range_cloexec_fallback(long ceiling) {
 // than glibc's fexecve() wrapper, which can fall back to an unsafe
 // /proc/self/fd string-formatting path on kernels without execveat().
 // Bounded ETXTBSY backoff (a binary still being written) — never unbounded.
+//
+// Deliberately NOT O_CLOEXEC: documented Linux kernel behavior is that
+// execveat(fd, "", ..., AT_EMPTY_PATH) on an O_CLOEXEC-opened fd fails with
+// ENOENT -- the CLOEXEC flag causes the fd to be torn down as part of the
+// exec transition itself, before the kernel can read the target binary
+// through it. This is the exact fd meant to be exec'd (not one that should
+// be hidden from a child), so CLOEXEC has no protective purpose here and
+// actively breaks the primitive. Reproduced directly (gcc-15/Linux 7.x,
+// forked child, isolated per-flag-combination): O_RDONLY and
+// O_RDONLY|O_NOFOLLOW both exec cleanly; adding O_CLOEXEC to either
+// deterministically fails every attempt with ENOENT. Caught on the first
+// Linux CI run of this code path to ever actually execute past compile
+// time (2026-08-31) -- this primitive had never successfully exec'd
+// anything on real Linux before this fix.
 [[noreturn]] void toctou_verified_exec(char* const* c_argv, char* const* c_envp,
                                         const LaunchSpec::ExecVerification& v, int err_fd) {
     constexpr int kMaxRetries = 5;
     for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
-        int fd = open(c_argv[0], O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+        int fd = open(c_argv[0], O_RDONLY | O_NOFOLLOW);
         if (fd < 0)
             report_setup_failure_and_exit(err_fd, errno);
         struct stat st{};
