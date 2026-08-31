@@ -684,6 +684,121 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     CHECK_FALSE(after_disable->enrolled);
 }
 
+// ── #3762: enrollment double-verify is atomic — one winner, no orphaned codes ──
+//
+// `mfa_verify_enrollment`'s pre-txn `mfa_status().enrolled` check and its enrollment
+// UPDATE are not atomic; the guard predicate `AND mfa_enrolled_at IS NULL` closes the
+// window where two concurrent verifies of one enrollment code both stamp `enrolled_at`
+// and both run `regenerate_recovery_codes_locked` (DELETE-all + INSERT) — the loser
+// deleting the winner's just-issued set. Exactly one caller must get 10 codes; the loser
+// must be graded `MfaAlreadyEnrolled` (NOT a false `WriteFailed`/503 from the classify
+// branch); and the PERSISTED set must be the winner's (a winner code must still consume).
+// Assert on COUNTS, not which thread wins, so the test is deterministic; each thread
+// writes only its own codes slot (via a distinct pointer), so there is no shared mutation.
+TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orphaned "
+          "recovery codes",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()}; // pool size 4 — enough for two concurrent verifies
+    REQUIRE(h.db.upsert_user("enrollrace", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto init = h.db.mfa_init_enrollment("enrollrace", "Yuzu");
+    REQUIRE(init.has_value());
+    auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw_secret.has_value());
+    auto secret_view =
+        std::string_view(reinterpret_cast<const char*>(raw_secret->data()), raw_secret->size());
+    auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
+    auto code = yuzu::server::mfa::generate(secret_view, counter);
+
+    std::atomic<int> ok{0};
+    std::atomic<int> already{0};   // MfaAlreadyEnrolled — the intended loser outcome
+    std::atomic<int> other_err{0}; // any other error (e.g. a false WriteFailed/503)
+    std::atomic<bool> go{false};
+    std::vector<std::string> v1, v2;
+    auto submit = [&](std::vector<std::string>* slot) {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        auto r = h.db.mfa_verify_enrollment("enrollrace", code);
+        if (r.has_value()) {
+            *slot = *r;
+            ok.fetch_add(1, std::memory_order_relaxed);
+        } else if (r.error() == AuthDBError::MfaAlreadyEnrolled) {
+            already.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            other_err.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    std::thread t1(submit, &v1);
+    std::thread t2(submit, &v2);
+    go.store(true, std::memory_order_release);
+    t1.join();
+    t2.join();
+
+    // Exactly one enrollment; the loser is graded MfaAlreadyEnrolled — never a false
+    // WriteFailed/503, and never a second success.
+    CHECK(ok.load() == 1);
+    CHECK(already.load() == 1);
+    CHECK(other_err.load() == 0);
+
+    const std::vector<std::string>& winner = v1.empty() ? v2 : v1;
+    REQUIRE(winner.size() == 10);
+
+    // Anti-orphan: the persisted set is the winner's — 10 remain, and a winner code
+    // consumes (it would fail if the loser had regenerated over it).
+    auto status = h.db.mfa_status("enrollrace");
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+    CHECK(status->recovery_codes_remaining == 10);
+    CHECK(h.db.mfa_consume_recovery_code("enrollrace", winner[0]).value());
+}
+
+// ── #3762: white-box coverage of the enrollment guard's WHERE predicate ─────
+//
+// The concurrency test above proves exactly-once end-to-end, but the loser can be
+// caught by the pre-txn `mfa_status().enrolled` check before ever reaching the guarded
+// UPDATE, so it does not deterministically exercise the guard's own 0-row branch. This
+// pins the `is_active = TRUE AND mfa_enrolled_at IS NULL` predicate directly against a
+// seeded row: a provisional (NULL) row is claimed (1 row), an already-enrolled row and a
+// deactivated row are both rejected (0 rows). It mirrors the exact predicate from
+// `mfa_verify_enrollment`; a drift between the two is the thing to notice.
+TEST_CASE("AuthDB MFA: enrollment guard predicate claims a provisional row, rejects an "
+          "enrolled or deactivated one",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("enrollguard", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    // The exact guard from mfa_verify_enrollment. Returns the row count it yields.
+    auto run_guard = [&]() -> int {
+        const char* v[] = {"7", "enrollguard"};
+        PgResult r{PQexecParams(
+            h.conn.get(),
+            "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
+            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL RETURNING id",
+            2, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    auto set_col = [&](const char* sql) {
+        const char* v[] = {"enrollguard"};
+        PgResult r{PQexecParams(h.conn.get(), sql, 1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.ok());
+    };
+
+    // Provisional (mfa_enrolled_at NULL, active): the guard claims it.
+    CHECK(run_guard() == 1);
+    // Now enrolled (the guard just stamped it): a second run is rejected — 0 rows.
+    CHECK(run_guard() == 0);
+    // Reset to provisional but deactivate: is_active = FALSE also rejects — 0 rows.
+    set_col("UPDATE auth.users SET mfa_enrolled_at = NULL, is_active = FALSE WHERE username = $1");
+    CHECK(run_guard() == 0);
+    // Re-activate the provisional row: claimed again — 1 row.
+    set_col("UPDATE auth.users SET is_active = TRUE WHERE username = $1");
+    CHECK(run_guard() == 1);
+}
+
 // ── #2399: a single valid TOTP code is consumed AT MOST ONCE, even under two
 //    concurrent submissions ─────────────────────────────────────────────────
 //

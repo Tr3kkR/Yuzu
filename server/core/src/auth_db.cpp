@@ -1419,13 +1419,45 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
     std::vector<std::string> raw_codes;
     AuthDBError txn_error = AuthDBError::WriteFailed;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // ★ TOCTOU guard (#3762): the `mfa_enrolled_at IS NULL` predicate makes the
+        // provisional→enrolled commit atomic with its own precondition, exactly as
+        // `mfa_consume_recovery_code` guards on `consumed_at IS NULL` (docs/auth-mfa-
+        // design.md "Recovery codes", "race-safe without an explicit transaction"). The
+        // pre-txn `mfa_status().enrolled` check above is a separate pooled read, so two
+        // concurrent verifies of one enrollment code otherwise BOTH pass it, BOTH stamp
+        // enrolled_at, and BOTH run regenerate_recovery_codes_locked (DELETE-all +
+        // INSERT) — the loser deletes the winner's just-issued codes, orphaning the set
+        // the winner was handed. Under READ COMMITTED the loser's UPDATE blocks on the row
+        // lock, re-evaluates its WHERE against the winner's committed row → 0 rows →
+        // returns before the regen. LOAD-BEARING two ways: (1) dropping this predicate
+        // reopens the double-regen; (2) it is safe against wedging a legitimate re-enroll
+        // ONLY because `mfa_disable` NULLs `mfa_enrolled_at` (the sole un-enroll path also
+        // clears the column), so no state has it set with a fresh verify allowed.
         pg::PgResult r = pg::exec_params(
             conn,
             "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
-            "WHERE username = $2 AND is_active = TRUE RETURNING id",
+            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL RETURNING id",
             std::vector<std::string>{std::to_string(*matched), username});
-        if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0)
-            return false; // user deactivated/deleted mid-request — fail closed
+        if (r.status() != PGRES_TUPLES_OK)
+            return false; // write outage → fail closed (WriteFailed → 503)
+        if (PQntuples(r.get()) == 0) {
+            // 0 rows = the user was deactivated/deleted mid-request, OR a concurrent
+            // verify already enrolled them (the guard above). Classify so the
+            // concurrent-enroll loser is graded MfaAlreadyEnrolled — NOT WriteFailed,
+            // which `is_store_unavailable()` routes to a false 503 + a
+            // secret-unavailable degrade metric + a kCritical "store unavailable" audit
+            // for a benign race. A genuinely deactivated user keeps the fail-closed
+            // WriteFailed/503 (unchanged).
+            pg::PgResult cls = pg::exec_params(
+                conn,
+                "SELECT is_active, (mfa_enrolled_at IS NOT NULL) FROM auth.users WHERE username = $1",
+                std::vector<std::string>{username});
+            if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1 &&
+                to_bool(col(cls.get(), 0, 0)) && to_bool(col(cls.get(), 0, 1))) {
+                txn_error = AuthDBError::MfaAlreadyEnrolled;
+            }
+            return false;
+        }
 
         auto codes = regenerate_recovery_codes_locked(conn, username);
         if (!codes) {
