@@ -535,7 +535,8 @@ SessionStore::reap_expired() {
             return false;
         }
         deleted = PQntuples(dr.get());
-        const std::int64_t new_anchor = has_anchor ? std::max(anchor, now_ms) : now_ms;
+        // (std::max) parenthesised to dodge the <windows.h> `max` function-like macro (MSVC).
+        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_ms) : now_ms;
         PgResult ur = exec_params(
             c,
             "INSERT INTO session_store.session_meta (key, value) VALUES ('reap_anchor_ms', $1) "

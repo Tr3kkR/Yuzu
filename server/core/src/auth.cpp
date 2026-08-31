@@ -499,7 +499,9 @@ bool AuthManager::derive_session_deadlines(Session& s, std::int64_t created_ms,
     // below creation) cannot inflate the remaining past the authored lifetime
     // (H2); a signed remaining <= 0 means already expired at populate — fail
     // closed (H4). The caller must not cache/honor a false return.
-    const std::int64_t rem_session = expires_ms - std::max(now_ms, created_ms);
+    // (std::max) parenthesised to dodge the <windows.h> `max` function-like macro
+    // (same MSVC defense as the `min` sites below; GCC/Clang unaffected).
+    const std::int64_t rem_session = expires_ms - (std::max)(now_ms, created_ms);
     if (rem_session <= 0)
         return false;
     s.steady_expires = steady + milliseconds(rem_session);
@@ -532,7 +534,8 @@ bool AuthManager::derive_session_deadlines(Session& s, std::int64_t created_ms,
         const std::int64_t kMaxElevMs = duration_cast<milliseconds>(kMaxElevationWindow).count();
         const std::int64_t width = elevated_until_ms - elevation_issued_ms;
         if (width > 0 && width <= kMaxElevMs) {
-            const std::int64_t rem_elev = elevated_until_ms - std::max(now_ms, elevation_issued_ms);
+            const std::int64_t rem_elev =
+                elevated_until_ms - (std::max)(now_ms, elevation_issued_ms); // (std::max): MSVC macro
             if (rem_elev > 0)
                 s.steady_elevated_until = steady + milliseconds(rem_elev);
         }
