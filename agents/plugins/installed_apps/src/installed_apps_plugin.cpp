@@ -570,8 +570,6 @@ InvCollection get_inventory_linux() {
         // installed_apps/get_inventory_linux#4
         // Alpine — first apk enumeration on the sync path (the legacy `list`
         // has no apk branch; precedent was the retired vuln_scan enumerator).
-        collect("apk info -v 2>/dev/null", inv::parse_apk_inv_line);
-        // has no apk branch; precedent is vuln_scan's enumerator).
         collect({path, "info", "-v"}, inv::parse_apk_inv_line);
     }
 
