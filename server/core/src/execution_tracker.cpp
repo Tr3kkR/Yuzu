@@ -911,51 +911,70 @@ namespace {
 constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
 constexpr int kCmdExecutionReapCap = 5000;
 // A DB `now()` reading more than this far ahead of the persisted anchor is
-// an anomaly, not legitimate elapsed time between reap ticks (~ minutes).
-constexpr std::int64_t kMaxPlausibleSkewSecs = 3600;
+// an anomaly, not legitimate elapsed time between reap ticks. The nominal
+// inter-pass interval is ~3600s (server.cpp's kCmdExecutionReapEveryNTicks),
+// but this threshold MUST carry real headroom over that nominal value, not
+// merely equal it (governance Gate 4 consistency-auditor finding, self-
+// verified): four OTHER reaps share this thread's tick loop and coincide on
+// the same tick as this one, and ordinary scheduler jitter across ~1800
+// individual sleep_for(1s) calls between passes is a plausible, non-clock-
+// skew way to exceed a zero-margin threshold — and because a declined pass
+// never advances the anchor, a single false trip would NEVER self-heal (the
+// gap only grows on every subsequent tick). 24h matches this table's own
+// reap window (kCmdExecutionReapWindowSecs) — ~24x the nominal cadence,
+// comfortably absorbing ordinary jitter while still catching a genuinely
+// wrong clock (a jump of days, not seconds).
+constexpr std::int64_t kMaxPlausibleSkewSecs = 24 * 3600;
 } // namespace
 
-void ExecutionTracker::record_command_execution(const std::string& command_id,
+bool ExecutionTracker::record_command_execution(const std::string& command_id,
                                                 const std::string& execution_id) {
     if (!open_)
-        return;
+        return false;
 
-    auto attempt_once = [&]() -> bool {
-        auto lease = pool_.try_acquire_for(kWriteTimeout);
-        if (!lease)
-            return false;
-        pg::PgResult res =
-            execution_id.empty()
-                ? pg::exec_params(lease.get(),
-                                  "DELETE FROM execution_tracker.command_execution "
-                                  "WHERE command_id = $1",
-                                  std::vector<std::string>{command_id})
-                : pg::exec_params(
-                      lease.get(),
-                      "INSERT INTO execution_tracker.command_execution "
-                      "(command_id, execution_id, created_at) VALUES ($1, $2, $3) "
-                      "ON CONFLICT (command_id) DO UPDATE SET "
-                      "execution_id = EXCLUDED.execution_id, created_at = EXCLUDED.created_at",
-                      std::vector<std::string>{command_id, execution_id,
-                                               std::to_string(now_epoch())});
-        return res.status() == PGRES_COMMAND_OK;
-    };
-
-    // Retry once, same rationale as update_agent_status: a lease-acquire
-    // timeout or a cancelled statement under contention is otherwise silent,
-    // and unlike refresh_counts's failure mode there is no reconciler for a
-    // correlation row that was never written — the response that would have
-    // consumed it does not re-arrive.
-    bool ok = attempt_once();
-    if (!ok)
-        ok = attempt_once();
-    if (!ok) {
-        spdlog::error("ExecutionTracker::record_command_execution: write failed twice for "
+    // SINGLE attempt, no retry — deliberately NOT update_agent_status's
+    // retry-once shape (governance Gate 4 unhappy-path/Gate 3 performance
+    // finding). This call sits on the SYNCHRONOUS pre-RPC dispatch path
+    // (record_execution_id / server.cpp's command_dispatch_fn calls this
+    // BEFORE the RPC, UP2-4); a retry-once here would double the worst-case
+    // block on the calling worker thread (REST/dashboard/MCP dispatch, or a
+    // background runner such as ScheduleRunner/PreflightRunner/
+    // PolicyEvaluator — anything feeding the shared CommandDispatchFn
+    // closure) (2*kWriteTimeout)
+    // under sustained pool contention. update_agent_status's retry lives on
+    // the async gateway-response path, where that tradeoff is free.
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ExecutionTracker::record_command_execution: pool exhausted for "
                       "command_id={} — this command's responses will not correlate to an "
                       "execution_id on any replica (executions-drawer/SSE degraded for it, "
                       "dispatch itself is unaffected)",
                       command_id);
+        return false;
     }
+    pg::PgResult res =
+        execution_id.empty()
+            ? pg::exec_params(lease.get(),
+                              "DELETE FROM execution_tracker.command_execution "
+                              "WHERE command_id = $1",
+                              std::vector<std::string>{command_id})
+            : pg::exec_params(
+                  lease.get(),
+                  "INSERT INTO execution_tracker.command_execution "
+                  "(command_id, execution_id, created_at) VALUES ($1, $2, $3) "
+                  "ON CONFLICT (command_id) DO UPDATE SET "
+                  "execution_id = EXCLUDED.execution_id, created_at = EXCLUDED.created_at",
+                  std::vector<std::string>{command_id, execution_id,
+                                           std::to_string(now_epoch())});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error("ExecutionTracker::record_command_execution: write failed for "
+                      "command_id={} — this command's responses will not correlate to an "
+                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
+                      "dispatch itself is unaffected)",
+                      command_id);
+        return false;
+    }
+    return true;
 }
 
 std::optional<std::string>

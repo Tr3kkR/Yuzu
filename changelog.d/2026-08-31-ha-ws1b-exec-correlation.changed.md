@@ -6,4 +6,7 @@
   ADR-2002 named as a prerequisite for a second server replica. `ExecutionTracker`'s own tables
   were already migrated to Postgres (ADR-0065); this closes the remaining half of WS-1(1b). The
   mapping ages out via a new clock-guarded retention sweep (`reap_command_execution_mappings`,
-  ~60m cadence) rather than growing unbounded for process lifetime.
+  ~60m cadence) rather than growing unbounded for process lifetime. New metrics:
+  `yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` / `_store_degrade_total` (the
+  retention sweep) and `_write_degrade_total` (the dispatch-time write, distinct from the sweep),
+  plus a new `YuzuExecCorrelationReapClockAnomaly` Prometheus alert on the clock-anomaly counter.

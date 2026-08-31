@@ -225,13 +225,27 @@ public:
     /// wins on a repeated command_id, matching the former map's `operator[]=`
     /// semantics. An empty `execution_id` deletes any existing mapping (the
     /// former map's explicit-clear branch; no current caller exercises it).
-    /// Best-effort / non-blocking by design, same posture as
-    /// `update_agent_status`: a write failure (logged, retried once) degrades
-    /// OBSERVABILITY for this one command — the executions drawer misses its
-    /// agent-transition events — it must never fail or delay the dispatch
-    /// that is calling this (record_execution_id / server.cpp's
-    /// command_dispatch_fn calls this BEFORE the RPC, UP2-4).
-    void record_command_execution(const std::string& command_id, const std::string& execution_id);
+    /// Best-effort by design: a write failure degrades OBSERVABILITY for
+    /// this one command — the executions drawer misses its agent-transition
+    /// events — it never FAILS the dispatch that is calling this
+    /// (record_execution_id / server.cpp's command_dispatch_fn calls this
+    /// BEFORE the RPC, UP2-4; the return value is best-effort telemetry for
+    /// the caller to count, not a signal to act on).
+    ///
+    /// It DOES have a bounded worst-case DELAY: a single attempt at
+    /// `kWriteTimeout` (no retry — deliberately NOT `update_agent_status`'s
+    /// retry-once shape, because that call sits on the async gateway-
+    /// response path while this one sits on the SYNCHRONOUS pre-RPC dispatch
+    /// path; a second attempt here would double the worst-case block on the
+    /// calling worker thread — REST/dashboard/MCP dispatch, or a background
+    /// runner such as ScheduleRunner/PreflightRunner/PolicyEvaluator,
+    /// anything feeding the shared CommandDispatchFn closure — under
+    /// sustained pool contention). Returns false on failure so the caller can count a
+    /// degrade metric; a caller MUST NOT fail or delay dispatch on a false
+    /// return (governance Gate 4 unhappy-path UP-1/UP-11, Gate 3 performance
+    /// review — the prior wording here claimed zero delay, which was false).
+    [[nodiscard]] bool record_command_execution(const std::string& command_id,
+                                                const std::string& execution_id);
 
     /// Resolves a previously-recorded mapping. Returns nullopt for an unknown
     /// command_id (out-of-band dispatch, a reaped/aged-out mapping, or a

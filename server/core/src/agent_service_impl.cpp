@@ -1477,7 +1477,14 @@ void AgentServiceImpl::record_execution_id(const std::string& command_id,
     auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (!tracker)
         return;
-    tracker->record_command_execution(command_id, execution_id);
+    // Best-effort: a false return degrades observability for this one
+    // command (see record_command_execution's doc comment) and is
+    // deliberately not propagated to the dispatch caller — it is counted
+    // here so a sustained write-side degrade is visible in Prometheus
+    // (governance Gate 4/6 finding: previously log-only, asymmetric with
+    // the reap path's yuzu_exec_correlation_store_degrade_total).
+    if (!tracker->record_command_execution(command_id, execution_id))
+        metrics_.counter("yuzu_exec_correlation_write_degrade_total").increment();
 }
 
 // -- process_gateway_response -------------------------------------------------

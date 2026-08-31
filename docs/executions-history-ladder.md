@@ -51,7 +51,11 @@ on the first agent's terminal would leave agents 2..N stamping empty
 `ExecutionTracker::reap_command_execution_mappings` instead (HA WS-1(1b)) — a
 clock-guarded retention sweep on a ~60m cadence
 (`yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` /
-`_store_degrade_total`), not an unbounded in-process leak.
+`_store_degrade_total`), not an unbounded in-process leak. The dispatch-time
+write (`record_command_execution`, single attempt, no retry — deliberately
+bounded to `kWriteTimeout` since it sits on the synchronous pre-RPC dispatch
+path) has its own counter on failure, `yuzu_exec_correlation_write_degrade_total`,
+distinct from the reap counters above.
 
 Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
 47 assertions) drives `process_gateway_response` end-to-end into a real

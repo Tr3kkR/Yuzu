@@ -742,21 +742,21 @@ TEST_CASE("ExecutionTracker: record/lookup command_execution round-trips",
 
     CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-unknown").has_value());
 
-    tracker_bundle->record_command_execution("cmd-1", "exec-1");
+    REQUIRE(tracker_bundle->record_command_execution("cmd-1", "exec-1"));
     auto looked_up = tracker_bundle->lookup_execution_id("cmd-1");
     REQUIRE(looked_up.has_value());
     CHECK(*looked_up == "exec-1");
 
     // Last-write-wins on a repeated command_id (mirrors the former map's
     // operator[]= semantics).
-    tracker_bundle->record_command_execution("cmd-1", "exec-2");
+    REQUIRE(tracker_bundle->record_command_execution("cmd-1", "exec-2"));
     looked_up = tracker_bundle->lookup_execution_id("cmd-1");
     REQUIRE(looked_up.has_value());
     CHECK(*looked_up == "exec-2");
 
     // Empty execution_id deletes the mapping (the former map's explicit-
     // clear branch).
-    tracker_bundle->record_command_execution("cmd-1", "");
+    REQUIRE(tracker_bundle->record_command_execution("cmd-1", ""));
     CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-1").has_value());
 }
 
@@ -767,7 +767,7 @@ TEST_CASE("ExecutionTracker: lookup is non-destructive across a multi-agent "
     // response against the SAME command_id. A lookup must never consume the
     // mapping, or agents 2..N would find nothing to stamp.
     yuzu::test::ExecutionTrackerPg tracker_bundle;
-    tracker_bundle->record_command_execution("cmd-fanout", "exec-fanout");
+    REQUIRE(tracker_bundle->record_command_execution("cmd-fanout", "exec-fanout"));
 
     for (int i = 0; i < 5; ++i) {
         auto looked_up = tracker_bundle->lookup_execution_id("cmd-fanout");
@@ -782,7 +782,7 @@ TEST_CASE("ExecutionTracker: a command_execution mapping written on one "
           "[pg][execution_tracker]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle; // "replica A" — dispatches
 
-    tracker_bundle->record_command_execution("cmd-cross-replica", "exec-cross-replica");
+    REQUIRE(tracker_bundle->record_command_execution("cmd-cross-replica", "exec-cross-replica"));
 
     // "replica B" — a second pool AND a second ExecutionTracker instance
     // against the SAME database, sharing no process memory with A. The
@@ -806,7 +806,7 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades "
     ExecutionTracker closed(unreachable);
     REQUIRE(!closed.is_open());
 
-    closed.record_command_execution("cmd-1", "exec-1"); // no-op, not a crash
+    CHECK_FALSE(closed.record_command_execution("cmd-1", "exec-1")); // no-op, not a crash
     CHECK_FALSE(closed.lookup_execution_id("cmd-1").has_value());
     auto reaped = closed.reap_command_execution_mappings();
     REQUIRE_FALSE(reaped.has_value());
@@ -818,7 +818,7 @@ TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "
           "[pg][execution_tracker]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
 
-    tracker_bundle->record_command_execution("cmd-fresh", "exec-fresh");
+    REQUIRE(tracker_bundle->record_command_execution("cmd-fresh", "exec-fresh"));
     REQUIRE(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
 
     // First pass: no anchor yet, nothing aged out (the fresh row's
@@ -851,4 +851,99 @@ TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "
     CHECK(second->deleted == 1);
     CHECK_FALSE(second->clock_anomaly);
     CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
+}
+
+TEST_CASE("ExecutionTracker: reap declines on an implausibly-forward "
+          "anchor gap (forward-skew decline)",
+          "[pg][execution_tracker]") {
+    // Governance Gate 4/5/6 finding (consistency-auditor + chaos-injector
+    // CH-4): the forward/backward anomaly-decline branches were previously
+    // untested for this reap, unlike SessionStore's equivalent guard.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    // Establish a real anchor via one ordinary pass.
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    // Rewrite the persisted anchor to look implausibly far in the PAST
+    // relative to the real DB clock — from the next pass's point of view,
+    // now_s reads as far ahead of the anchor, exactly the forward-skew
+    // shape a poisoned or stale anchor produces.
+    {
+        pg::PgPool& pool = tracker_bundle.pool();
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "(value::bigint - 200000)::text WHERE key = 'cmd_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
+TEST_CASE("ExecutionTracker: reap declines on a backward-stepped clock "
+          "(backward-anomaly decline)",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    // Rewrite the persisted anchor to look far in the FUTURE relative to
+    // the real DB clock — the next pass's now_s reads as BEHIND the
+    // anchor, the backward-clock-movement shape (a rewound host clock, or
+    // an earlier forward-skewed pass that poisoned the anchor).
+    {
+        pg::PgPool& pool = tracker_bundle.pool();
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "(value::bigint + 200000)::text WHERE key = 'cmd_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
+TEST_CASE("ExecutionTracker: the four non-tracked correlation-id VALUES "
+          "round-trip opaquely through the PG-backed store",
+          "[pg][execution_tracker]") {
+    // Governance Gate 4 consistency-auditor finding / chaos-injector CH-5,
+    // corrected per Gate 8 quality-engineer re-review: polchk-/bundle-/
+    // preflight-/deployment- are minted as the execution_id VALUE (by
+    // PolicyEvaluator/BundleOrchestrator/PreflightRunner/the deployment
+    // engine), never as the command_id KEY — the ORIGINAL version of this
+    // test looked up an unwritten prefixed STRING AS A KEY, which is
+    // vacuously nullopt for any string and proved nothing (a false-green
+    // policy-floor finding, caught before merge). The real property: the
+    // store must treat these values as opaque data, storing and returning
+    // them byte-for-byte under an ordinary command_id key — the
+    // PREFIX-SKIP decision itself lives in AgentServiceImpl::
+    // notify_exec_tracker (see the companion test in
+    // test_agent_service_impl.cpp), not in the store.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    for (const std::string& execution_id :
+         {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
+        CAPTURE(execution_id);
+        const std::string command_id = "plugin-cmd-" + execution_id;
+        REQUIRE(tracker_bundle->record_command_execution(command_id, execution_id));
+        auto looked_up = tracker_bundle->lookup_execution_id(command_id);
+        REQUIRE(looked_up.has_value());
+        CHECK(*looked_up == execution_id);
+    }
 }

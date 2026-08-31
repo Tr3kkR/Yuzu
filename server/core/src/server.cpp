@@ -2597,6 +2597,18 @@ public:
                           "degradation), distinct from a clock-anomaly decline",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_store_degrade_total");
+        // Distinct from the reap-only counter above: this fires on the
+        // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
+        // not the retention sweep. Governance Gate 4/6 finding: previously
+        // log-only, no counter, so a sustained write-side degrade (unlike a
+        // reap failure) was invisible to Prometheus.
+        metrics_.describe("yuzu_exec_correlation_write_degrade_total",
+                          "Command-dispatch-time command_id -> execution_id correlation writes "
+                          "that failed (pool exhausted or query error) - the executions drawer "
+                          "misses these commands' agent-transition events; dispatch itself is "
+                          "unaffected",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_write_degrade_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -4191,7 +4203,9 @@ public:
         //    refill happening every 60s would otherwise spam its history
         //    pane. record_send_time stays so the standard latency
         //    histogram still observes these dispatches (sec-INFO-10:
-        //    intentionally opted-out of cmd_execution_ids_).
+        //    intentionally opted out of the command_id -> execution_id
+        //    correlation, HA WS-1(1b)'s ExecutionTracker::command_execution
+        //    table).
         //  * forward_gateway_pending() drains commands queued for
         //    gateway-proxied agents so a fleet that mixes direct and
         //    gateway-connected hosts gets uniform dispatch.
@@ -21596,8 +21610,9 @@ private:
                 cfg_.mcp_read_only, cfg_.mcp_disable,
                 // DispatchFn — reuses /api/command dispatch logic for MCP execute_instruction.
                 // #1088 — execution_id parameter added so the MCP tool's
-                // pre-created execution row is bridged into
-                // AgentServiceImpl's cmd_execution_ids_ map BEFORE any
+                // pre-created execution row is bridged into the
+                // command_id -> execution_id correlation (HA WS-1(1b):
+                // ExecutionTracker::record_command_execution) BEFORE any
                 // RPC fires (UP2-4 race close from PR 2). Empty
                 // execution_id is the legacy untracked path.
                 [this](const std::string& plugin, const std::string& action,
