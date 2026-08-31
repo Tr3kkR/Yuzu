@@ -29,6 +29,7 @@
 #endif
 #include <windows.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include "tar_win_raii_guards.hpp" // yuzu::tar::win_raii::ScHandleGuard
 #else
 #include "tar_service_parsers.hpp" // yuzu::tar::{parse_systemctl_list_units,parse_launchctl_list}
 
@@ -94,19 +95,9 @@ const char* startup_type_str(DWORD start_type) {
 // (std::vector<BYTE> buffer(bytes_needed)/config_buf(config_bytes), the
 // from_wide string conversions, services.push_back) -- a throwing
 // allocation between a successful Open*/CloseServiceHandle used to skip the
-// close entirely, leaking the handle. Same shape as this repo's other Win32
-// RAII guards (processes_plugin.cpp's HandleGuard, tar_arp_collector.cpp's
-// MibTableGuard, tar_mapdrive_collector.cpp's WNetEnumGuard/NetApiBufGuard).
-struct ScHandleGuard {
-    SC_HANDLE h{nullptr};
-    explicit ScHandleGuard(SC_HANDLE hh) noexcept : h(hh) {}
-    ~ScHandleGuard() {
-        if (h)
-            CloseServiceHandle(h);
-    }
-    ScHandleGuard(const ScHandleGuard&) = delete;
-    ScHandleGuard& operator=(const ScHandleGuard&) = delete;
-};
+// close entirely, leaking the handle. Shared implementation in
+// tar_win_raii_guards.hpp (injectable closer, unit-tested).
+using yuzu::tar::win_raii::ScHandleGuard;
 
 } // namespace
 
@@ -177,13 +168,13 @@ std::vector<ServiceInfo> enumerate_services() {
         // compute_service_diff in tar_diff.cpp) never treats it as an
         // authoritative value change (Finding 3, adversarial-review round 5).
         ScHandleGuard svc_guard{OpenServiceW(scm, entries[i].lpServiceName, SERVICE_QUERY_CONFIG)};
-        if (svc_guard.h) {
+        if (svc_guard.get()) {
             DWORD config_bytes = 0;
-            BOOL ok = QueryServiceConfigW(svc_guard.h, nullptr, 0, &config_bytes);
+            BOOL ok = QueryServiceConfigW(svc_guard.get(), nullptr, 0, &config_bytes);
             if (!ok && GetLastError() == ERROR_INSUFFICIENT_BUFFER && config_bytes > 0) {
                 std::vector<BYTE> config_buf(config_bytes);
                 auto* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(config_buf.data());
-                if (QueryServiceConfigW(svc_guard.h, config, config_bytes, &config_bytes)) {
+                if (QueryServiceConfigW(svc_guard.get(), config, config_bytes, &config_bytes)) {
                     si.startup_type = startup_type_str(config->dwStartType);
                 } else {
                     si.startup_type = "unknown";

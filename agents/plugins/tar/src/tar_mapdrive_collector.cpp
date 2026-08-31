@@ -56,6 +56,7 @@
 #include <windows.h>
 #include <winnetwk.h> // WNetOpenEnumW / WNetEnumResourceW / WNetGetUserW (mpr)
 #include <lm.h>       // NetSessionEnum / NetApiBufferFree (netapi32)
+#include "tar_win_raii_guards.hpp" // yuzu::tar::win_raii::WNetEnumGuard / NetApiBufGuard
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 // Shared per-user profile/hive ladder (#2771) — replaces this file's private
 // ProfileList walk, system-SID filter and mount/unload guards.
@@ -655,28 +656,11 @@ void warn_capped(std::atomic<bool>& flag, const char* what, std::size_t cap) {
 // governance finding). from_wide / vector::push_back below can throw, so the
 // handle/buffer must free on every exit including an exceptional unwind. Same
 // shape as this file's RegKeyGuard, agents/shared/win_reg_handle.hpp's
-// ScopedUserHive, and the in-repo HandleGuard
-// (processes_plugin.cpp) / MibTableGuard (network_config_plugin.cpp).
-struct WNetEnumGuard {
-    HANDLE h{nullptr};
-    explicit WNetEnumGuard(HANDLE hh) noexcept : h(hh) {}
-    ~WNetEnumGuard() {
-        if (h)
-            WNetCloseEnum(h);
-    }
-    WNetEnumGuard(const WNetEnumGuard&) = delete;
-    WNetEnumGuard& operator=(const WNetEnumGuard&) = delete;
-};
-struct NetApiBufGuard {
-    LPVOID p{nullptr};
-    explicit NetApiBufGuard(LPVOID pp) noexcept : p(pp) {}
-    ~NetApiBufGuard() {
-        if (p)
-            NetApiBufferFree(p);
-    }
-    NetApiBufGuard(const NetApiBufGuard&) = delete;
-    NetApiBufGuard& operator=(const NetApiBufGuard&) = delete;
-};
+// ScopedUserHive, and the in-repo HandleGuard (processes_plugin.cpp).
+// Shared implementation in tar_win_raii_guards.hpp (injectable closer,
+// unit-tested).
+using yuzu::tar::win_raii::WNetEnumGuard;
+using yuzu::tar::win_raii::NetApiBufGuard;
 
 // Absolute path to a System32 tool, as a bare (unquoted) argv element —
 // run_bounded_subprocess execs argv[0] directly (no shell in between), so the

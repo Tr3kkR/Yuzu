@@ -53,6 +53,7 @@
 #include <iphlpapi.h>
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 / ConvertInterfaceLuidToAlias
+#include "tar_win_raii_guards.hpp" // yuzu::tar::win_raii::MibTableGuard
 #elif defined(__APPLE__)
 #include <route_sysctl_arp.hpp> // agents/shared — fetch_rt_flags_llinfo / parse_rt_flags_llinfo
 #include <span>
@@ -126,19 +127,9 @@ std::string iface_alias(const NET_LUID& luid, NET_IFINDEX idx) {
 // sockaddr_inet_to_string, mac_to_string, out.push_back) between a successful
 // GetIpNetTable2 and the table free -- a throwing allocation there used to
 // skip the manual FreeMibTable(table) call entirely, leaking the table.
-// Same shape as this repo's other Win32 RAII guards (network_config_plugin.cpp's
-// own MibTableGuard, processes_plugin.cpp's HandleGuard, tar_mapdrive_collector.cpp's
-// WNetEnumGuard/NetApiBufGuard).
-struct MibTableGuard {
-    PMIB_IPNET_TABLE2 t{nullptr};
-    explicit MibTableGuard(PMIB_IPNET_TABLE2 tbl) noexcept : t(tbl) {}
-    ~MibTableGuard() {
-        if (t)
-            FreeMibTable(t);
-    }
-    MibTableGuard(const MibTableGuard&) = delete;
-    MibTableGuard& operator=(const MibTableGuard&) = delete;
-};
+// Shared implementation in tar_win_raii_guards.hpp (injectable closer,
+// unit-tested) -- also used by network_config_plugin.cpp's own copy.
+using yuzu::tar::win_raii::MibTableGuard;
 
 } // namespace
 
