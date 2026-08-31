@@ -1274,17 +1274,38 @@ server `PgPool`).
   on it post-upgrade.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period, but understand what that does and does not buy you.** A
-  graceful `SIGTERM` walks several independently-bounded waits in sequence —
-  up to 30 s draining in-flight executions, up to 5 s waiting on the
-  NVD-sync background thread, up to 15 s waiting on the HTTP listener thread
-  (#2703 Gate 7 item 2), up to 5 s on the gRPC shutdown deadline, and (#3261
-  governance hardening) up to 60 s waiting for WebhookStore and
-  OffloadTargetStore to drain their delivery queues — the last of which runs
-  the two stores CONCURRENTLY, not sequentially, so it adds 60 s to the
-  total rather than 120 s. Stacked, this can reach **~115 s** in the worst
-  case if more than one stage is genuinely wedged. The shipped
+  graceful `SIGTERM` walks several independently-bounded waits — up to 30 s
+  draining in-flight executions, up to 5 s on the gRPC shutdown deadline
+  (moved up by #3495 to run earlier in the sequence, ahead of the four
+  joins below and several other quick housekeeping joins not separately
+  listed here, though still after the execution drain — see below),
+  up to 5 s waiting on the NVD-sync background thread, up to 15 s waiting on
+  the HTTP listener thread (#2703 Gate 7 item 2), and (#3261 governance
+  hardening) up to 60 s waiting for WebhookStore and OffloadTargetStore to
+  drain their delivery queues — the last of which runs the two stores
+  CONCURRENTLY, not sequentially, so it adds 60 s to the total rather than
+  120 s. Stacked, this can reach **~115 s** in the worst case if more than
+  one stage is genuinely wedged; the total and each stage's own bound are
+  unchanged by the reorder, only their relative sequence is. **(#3495) The policy
+  evaluation, pre-flight runner, quarantine containment reconciler, and
+  schedule tick background threads' gRPC dispatch calls now ride on the
+  same 5 s gRPC shutdown deadline bucket above, not a separate stage** —
+  `ServerImpl::stop()` now cancels in-flight gRPC RPCs before joining those
+  four threads (previously it cancelled them after, so a thread genuinely
+  blocked inside a gRPC stream write had no bound at
+  all — not covered by the ~115 s figure, and not fixable by raising the
+  grace period, since nothing in `stop()` would ever reach the cancellation
+  that unblocks it). This is a strictly protective fix — no grace-period
+  change is needed on upgrade, whether or not you ever hit the pre-#3495
+  gap in practice; it was a real but narrow window (a stalled agent stream
+  during shutdown), not a routine occurrence. **One narrower residual is NOT covered by this fix**:
+  the policy-evaluation thread's join can also stall on its own Postgres
+  claim call (`PolicyStore::claim_due_policies`), which isn't a gRPC
+  operation and isn't bounded by `Shutdown(deadline)` — tracked separately
+  (#3706), not fixed here. The shipped
   docker-compose/systemd units already set a 210 s grace period
-  (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this —
+  (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this
+  residual's ordinary-contention case —
   but if you deploy under Kubernetes or another orchestrator, its default is
   frequently far shorter (Kubernetes' own default
   `terminationGracePeriodSeconds` is **30**), and a pod with slow-draining

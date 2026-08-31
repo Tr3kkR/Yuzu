@@ -1448,6 +1448,12 @@ sum(rate(yuzu_server_instruction_read_degrade_total[5m])) by (reason) > 0
 absent_over_time(yuzu_server_instruction_bundled_content_total{result="clean"}[15m])
 ```
 
+## Shutdown-time dispatch metrics (#3495)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_shutdown_dispatch_reach_zero_total` | counter | Fires on ANY dispatch through the shared `dispatch_confined` chokepoint (NOT quarantine-specific — MCP, REST, workflows, schedules, and every background engine funnel through the same seam) that reached zero agents while `ServerImpl::stop()` was in progress. **A correlated signal, not a precise one**, in two directions. False-positive direction: it cannot distinguish "`agent_server_->Shutdown(deadline)` forcibly cancelled the underlying stream write mid-dispatch" from "an ordinary zero-reach dispatch (every target offline, a quarantine denial) that happened to land during the shutdown window" — before #3495's fix moved that Shutdown call earlier in `stop()`, the former case existed as an invisible failure mode with no trace anywhere (governance sre finding, 2026-08-30). False-negative direction (governance unhappy-path, 2026-08-30): the condition is `outcome.sent == 0` — a dispatch that reached SOME targets before the write to the LAST one got forcibly cancelled has `sent > 0` and does not increment this counter at all, even though that partial-delivery case (some agents got the instruction, others silently didn't) is arguably the more concerning shape. No dedicated audit row backs it (the process may be exiting before one could be durably written); pair with the `spdlog::warn` line at the same call site, which names the `plugin`/`action`/`command_id`. Expect this to stay at `0` on a routine restart with no in-flight dispatches; a nonzero reading during a rolling deploy is worth a closer look, not an automatic page — no alert rule ships for it. |
+
 ## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)
 
 The `QuarantineStore` — which agents are network-isolated, who isolated them, why, and their

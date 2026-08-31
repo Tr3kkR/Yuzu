@@ -120,6 +120,14 @@ public:
         CommandDispatchFn dispatch_fn;                  // required
         ResolveCallerFn resolve_caller;                 // required
         ArmingCheckFn arming_check;                      // fail-closed when unset — see above
+        // #3495: lets a shutdown request stop tick() from firing further due
+        // schedules once stop_requested_ flips — checked once per schedule,
+        // before fire() runs, so a schedule already firing still completes
+        // cleanly (this only stops the NEXT one from starting). Ports the
+        // same field QuarantineContainmentReconciler::Deps already carries
+        // (governance Gate 5, #3425). Unset (default) = never stop, matching
+        // every existing production/test Deps that predates this field.
+        std::function<bool()> should_stop;
     };
 
     explicit ScheduleRunner(Deps deps);

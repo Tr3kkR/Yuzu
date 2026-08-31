@@ -31,6 +31,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -107,6 +108,12 @@ struct Harness {
     std::vector<DispatchCall> calls;
     int reach{1};        // agents "reached" by the fake dispatch
     bool throw_on_dispatch{false};
+    // #3495: settable AFTER construction (mirrors throw_on_dispatch above) so
+    // existing call sites are unaffected — Deps::should_stop wraps a lambda
+    // that reads this field live rather than the field's value at
+    // construction time, since Deps is copied into the runner once and
+    // there's no other way to change should_stop's behavior per-test.
+    std::function<bool()> should_stop_hook;
 
     ScheduleRunner runner;
 
@@ -148,6 +155,7 @@ struct Harness {
                   return DispatchCaller{.principal = username, .system = false};
               },
               .arming_check = std::move(arming),
+              .should_stop = [this] { return should_stop_hook && should_stop_hook(); },
           }) {
         INFO("[schedrunner instr] fixture status (blank == database came up OK): "
              << instr_db.error());
@@ -781,4 +789,90 @@ TEST_CASE("ScheduleRunner: a content mismatch audits once, with the approved vs.
         }
     }
     CHECK(mismatch_rows == 1);
+}
+
+// #3495 governance (chaos-injector HIGH + codex external tie-break,
+// 2026-08-24): tick()'s per-schedule loop had NO interior cancellation
+// check — once started, a single tick() call could fire every due schedule
+// with no way to interrupt it, compounding with ServerImpl::stop()'s
+// schedule_tick_thread_.join() ahead of it. Deps::should_stop closes this,
+// ported from QuarantineContainmentReconciler::Deps: checked once per
+// schedule, before fire() runs, so a schedule already firing still
+// completes cleanly — this only stops the NEXT one from starting.
+TEST_CASE("ScheduleRunner: tick() stops firing further schedules once should_stop() "
+          "reports true, deferring the rest to the next tick",
+          "[schedule][runner]") {
+    Harness h;
+    auto id_a = h.make_due("test.def", "interval");
+    auto id_b = h.make_due("test.def", "daily");
+
+    // Stop signals true once the first schedule has fired — proving the
+    // loop actually checks should_stop() before the SECOND schedule and
+    // exits early rather than pushing through both.
+    h.should_stop_hook = [&h] { return h.calls.size() >= 1; };
+
+    h.runner.tick();
+
+    REQUIRE(h.calls.size() == 1); // NOT 2 — the loop stopped before the second schedule
+
+    const auto sa = h.get(id_a);
+    const auto sb = h.get(id_b);
+    // Exactly one of the two fired (advanced past next_execution_at == 1);
+    // the other is untouched and stays due for the next tick — a clean
+    // defer, not a partial or lost fire.
+    const bool a_fired = sa.next_execution_at != 1;
+    const bool b_fired = sb.next_execution_at != 1;
+    CHECK(a_fired != b_fired);
+}
+
+// #3495 companion (governance happy-path, 2026-08-30): Harness::runner always
+// wires a non-empty `.should_stop` lambda (`[this]{ return should_stop_hook &&
+// should_stop_hook(); }`, itself false unless a test sets should_stop_hook) —
+// so no existing ScheduleRunner test ever exercises `d_.should_stop` as a
+// literal default-constructed empty std::function, the exact production
+// shape every unwired Deps carries. PreflightRunner and PolicyEvaluator each
+// got a dedicated unset-should_stop control test at Gate 3; this is
+// ScheduleRunner's. Constructs a second, raw ScheduleRunner sharing the
+// Harness's already-built engine/tracker/approvals/instruction-store rather
+// than going through Harness's own runner (which cannot leave should_stop
+// unset).
+TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
+          "not just the first",
+          "[schedule][runner]") {
+    Harness h;
+    auto id_a = h.make_due("test.def", "interval");
+    auto id_b = h.make_due("test.def", "daily");
+
+    std::vector<DispatchCall> calls;
+    ScheduleRunner raw_runner(ScheduleRunner::Deps{
+        .schedule_engine = &h.engine,
+        .instruction_store = &h.is,
+        .execution_tracker = &h.tracker,
+        .approval_manager = &h.approvals,
+        .dispatch_fn =
+            [&](const std::string& plugin, const std::string& action,
+                const std::vector<std::string>&, const std::string& scope,
+                const std::unordered_map<std::string, std::string>& params,
+                const std::string& execution_id,
+                const DispatchCaller& caller) -> std::pair<std::string, int> {
+            calls.push_back({plugin, action, scope, execution_id, caller, params});
+            return {"cmd-" + std::to_string(calls.size()), 1};
+        },
+        .resolve_caller =
+            [](const std::string& username) {
+            return DispatchCaller{.principal = username, .system = false};
+        },
+        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+            return true;
+        },
+        // .should_stop left unset (default std::function<bool()>{}).
+    });
+
+    raw_runner.tick();
+
+    CHECK(calls.size() == 2); // both fired — an unset should_stop never breaks the loop
+    const auto sa = h.get(id_a);
+    const auto sb = h.get(id_b);
+    CHECK(sa.next_execution_at != 1);
+    CHECK(sb.next_execution_at != 1);
 }
