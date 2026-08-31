@@ -1,6 +1,31 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file approval_manager.hpp
+/// Postgres-backed one-time approval-ticket store (ADR-0009/0065). Schema
+/// `approval_manager`, one table (`approvals`).
+///
+/// Posture (ADR-0012 §1): AUTHORITATIVE/fail-hard construction — a
+/// reachable database whose schema can't migrate/open is a fatal startup
+/// error (`startup_failed_`). This store was ALREADY fail-closed in the
+/// SQLite era (a failed migration nulled `db_`), so this is a shape
+/// preservation, not a posture upgrade like its ScheduleEngine sibling.
+/// Runtime method signatures are unchanged — `submit`/`approve`/`reject`
+/// keep their `std::expected<T, std::string>` shapes, `consume_ticket`
+/// keeps `std::expected<void, ConsumeError>` — this store's consumers
+/// (`mcp_server.cpp`, REST v1, `ScheduleRunner`, `workflow_routes.cpp`) are
+/// unaffected by this migration, with ONE exception: `StoreReadError`/
+/// `ConsumeError::extended_errcode` (a raw `sqlite3_extended_errcode()`)
+/// becomes `sqlstate` (a Postgres SQLSTATE string) — see the field's own
+/// doc comment and `pg_error_class.hpp`.
+///
+/// Backfill: NONE (ADR-0009's 2026-08-25 fresh-start-by-default amendment).
+/// The legacy `instructions.db` (shared with the ExecutionTracker/
+/// ScheduleEngine siblings, ADR-0065 — ScheduleEngine already migrated,
+/// ExecutionTracker still to come) is never read for data; construction
+/// logs a one-time "fresh start, no legacy backfill" line, and the caller
+/// (`server.cpp`) runs `legacy_sqlite_probe::warn_if_legacy_rows()` over
+/// the legacy file so an environment where "no production fleet" turns out
+/// to be locally wrong gets a loud signal instead of silent loss.
 
 #include <cstdint>
 #include <expected>
@@ -10,6 +35,10 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace yuzu::server::pg {
+class PgPool;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
 
@@ -59,14 +88,20 @@ bool declares_non_mcp_surface(ApprovalOrigin origin);
 
 /// Column text for `origin`. `kUnspecified` stores the empty string.
 ///
-/// A row that predates the column does NOT read back as `kUnspecified`, and the
-/// difference still matters even though both are refused at redemption today
-/// (#2442's closing half): migration v7 rewrites every `''` row it finds to a
-/// sentinel that decodes to `kUnrecognised`, while a caller that stays silent
-/// writes `''` and decodes to `kUnspecified`. "No declared origin" and
-/// "declared nothing because the column did not exist yet" are deliberately
-/// not the same value — collapsing them would make a future, more permissive
-/// treatment of one silently apply to the other.
+/// History (SQLite era, ADR-0065 port): `origin` was an additive column
+/// (migration v5) on a store that predated it, so a v7 migration rewrote
+/// every pre-existing `''` row to a sentinel decoding as `kUnrecognised`,
+/// keeping "no declared origin" (a caller that stays silent) distinct from
+/// "declared nothing because the column did not exist yet" (a stored row
+/// from before it did) — collapsing them would make a future, more
+/// permissive treatment of one silently apply to the other. The Postgres
+/// schema (ADR-0065) creates `origin` from row one, fresh-start, so no
+/// stored row can predate it any more and the v7 back-fill has nothing
+/// left to run against — but the DECODE side of this distinction stays
+/// live defense-in-depth: any future stored value `approval_origin_from_
+/// string` does not recognize (a newer binary's row, or corruption) still
+/// decodes to `kUnrecognised`, not folded into the granting-adjacent
+/// `kUnspecified`.
 const char* to_string(ApprovalOrigin origin);
 ApprovalOrigin approval_origin_from_string(std::string_view text);
 
@@ -82,12 +117,12 @@ struct Approval {
     std::string scope_expression;
     // One-time-consumption stamp for the MCP approval-ticket flow (#289 / Issue
     // 13.5): epoch-seconds when an approved ticket was recalled-and-executed,
-    // 0 while unconsumed. Additive column (migration v2) — keeps the eventual
-    // Postgres port trivial.
+    // 0 while unconsumed. SQLite-era additive column (v2); part of the
+    // Postgres v1 DDL from creation (ADR-0065).
     int64_t consumed_at{0};
     // WHO consumed the ticket (PR #1796 review H3/N2, SOC-2 CC7.2): the
     // principal whose recall executed the gated tool. Empty while unconsumed.
-    // Additive column (migration v3). Completes the ticket's evidence chain:
+    // SQLite-era additive column (v3). Completes the ticket's evidence chain:
     // submitted_by → reviewed_by → consumed_by.
     std::string consumed_by;
     /// Empty for an interactively-submitted ticket (workflow_routes.cpp) or an
@@ -96,11 +131,11 @@ struct Approval {
     /// ScheduleRunner::fire_with_approval can match a ticket to the ONE
     /// schedule occurrence that asked for it, instead of to every schedule
     /// sharing the same (submitted_by, definition_id, scope_expression)
-    /// tuple. Additive column (migration v4).
+    /// tuple. SQLite-era additive column (v4).
     std::string schedule_id;
-    /// Which surface minted this ticket (#2442). Additive column (migration
-    /// v5); rows that predate it are rewritten by v7 and read back as
-    /// kUnrecognised, NOT kUnspecified — see `to_string`'s comment.
+    /// Which surface minted this ticket (#2442). SQLite-era additive column
+    /// (v5); see `to_string`'s comment for the pre-Postgres back-fill
+    /// history and why the decode side of that distinction still matters.
     ApprovalOrigin origin{ApprovalOrigin::kUnspecified};
     /// `target_plugin`/`target_action`, snapshotted at `submit()` time
     /// (#1398 hardening, governance Gate 4 unhappy-path CRITICAL finding).
@@ -191,8 +226,8 @@ struct ApprovalQuery {
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
-    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure —
-                    ///< see ConsumeError::extended_errcode/binding_check_unevaluated
+    kStoreError,    ///< store unavailable, missing argument, or a Postgres failure —
+                    ///< see ConsumeError::sqlstate/binding_check_unevaluated
     kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
     kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
 };
@@ -270,31 +305,35 @@ inline constexpr const char* kNotConsumableMessage =
     "approval not consumable (already used, not approved, or absent)";
 
 /// A store read's failure, kept apart from the row simply not being there.
-/// `extended_errcode` is `sqlite3_extended_errcode()` at the failing
-/// prepare/step, or 0 when the failure has no SQLite origin (store not open,
-/// missing argument) — see `is_permanent_sqlite_error` (#2786 "PR 1c").
+/// `sqlstate` is the Postgres SQLSTATE (`PQresultErrorField(...,
+/// PG_DIAG_SQLSTATE)`) at the failing query, or empty when the failure has
+/// no Postgres origin (store not open, missing argument) — see
+/// `pg_error_class.hpp::is_permanent_pg_error` (ADR-0065 port of #2786
+/// "PR 1c", which this field replaces: was `int extended_errcode`, a raw
+/// `sqlite3_extended_errcode()`).
 struct StoreReadError {
     std::string message;
-    int extended_errcode = 0;
+    std::string sqlstate;
 };
 
 struct ConsumeError {
     ConsumeFailure kind{ConsumeFailure::kStoreError};
     std::string message;
-    /// `sqlite3_extended_errcode()` for a `kStoreError` produced by a SQLite
-    /// read/write failure; 0 otherwise (store not open, missing argument, a
-    /// throwing precondition). See `is_permanent_sqlite_error` (#2786). The 0
-    /// default is safe for the store-not-open producer specifically because
-    /// `approval_store_error_body`'s permanent-arm check is `!is_open() ||
-    /// is_permanent_sqlite_error(extended_errcode)` — the `is_open()` disjunct
-    /// alone correctly forces the permanent arm there regardless of
-    /// `extended_errcode`. The missing-argument/throwing-precondition
+    /// The Postgres SQLSTATE for a `kStoreError` produced by a Postgres
+    /// read/write failure; empty otherwise (store not open, missing
+    /// argument, a throwing precondition). See
+    /// `pg_error_class.hpp::is_permanent_pg_error` (ADR-0065 port of #2786).
+    /// The empty default is safe for the store-not-open producer
+    /// specifically because `approval_store_error_body`'s permanent-arm
+    /// check is `!is_open() || is_permanent_pg_error(sqlstate)` — the
+    /// `is_open()` disjunct alone correctly forces the permanent arm there
+    /// regardless of `sqlstate`. The missing-argument/throwing-precondition
     /// producers are NOT similarly protected: the store IS open in those
-    /// cases, so a 0 `extended_errcode` DOES take the transient arm if that
+    /// cases, so an empty `sqlstate` DOES take the transient arm if that
     /// `kStoreError` ever reaches `approval_store_error_body` (see
     /// `consume_ticket`'s guard-clause comment for why this is harmless
     /// today — the sole production caller never triggers them).
-    int extended_errcode = 0;
+    std::string sqlstate;
     /// True ONLY when the #2442 cross-surface/cross-submitter binding check's
     /// own read (`get_checked` inside `consume_ticket`) is the thing that
     /// faulted — so NEITHER the origin nor the submitter comparison ran, and
@@ -326,13 +365,22 @@ using ConsumePrecondition = std::function<std::expected<void, std::string>(const
 
 class ApprovalManager {
 public:
-    explicit ApprovalManager(sqlite3* db);
+    /// Global cap on `status='pending'` rows `submit()` enforces (queue-cap +
+    /// lazy-expiry-sweep, see `submit()`'s body). Exposed so tests exercising
+    /// the boundary reference this constant instead of duplicating the
+    /// literal (governance quality-engineer finding, 2026-08-31).
+    static constexpr int kMaxPendingApprovals = 1000;
+
+    explicit ApprovalManager(pg::PgPool& pool);
     ~ApprovalManager() = default;
 
     ApprovalManager(const ApprovalManager&) = delete;
     ApprovalManager& operator=(const ApprovalManager&) = delete;
 
-    void create_tables();
+    /// Idempotent no-op kept for call-site compatibility — migration now
+    /// runs unconditionally inside the constructor (PgMigrationRunner),
+    /// unlike the SQLite era where callers invoked this explicitly.
+    void create_tables() {}
 
     /// `schedule_id` (M-02, #1806): empty for the interactive submit path;
     /// the owning schedule's id for a scheduled-fire submission — see the
@@ -376,8 +424,8 @@ public:
     /// True iff the store is usable (schema migrated). False after a failed
     /// migration — feeds the /readyz + /healthz conjunction so a broken approval
     /// schema fails the probe instead of serving errors behind a green light
-    /// (governance sre-BLOCKING-1). The handle is borrowed; this never closes it.
-    bool is_open() const { return db_ != nullptr; }
+    /// (governance sre-BLOCKING-1).
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     std::optional<Approval> get(const std::string& id) const;
 
@@ -461,8 +509,17 @@ private:
                                                        const std::string& reviewer,
                                                        const std::string& comment);
 
-    sqlite3* db_;
-    mutable std::mutex mtx_; // protects all db_ access (G4-UHP-MCP-005)
+    pg::PgPool& pool_;
+    bool open_{false};
+    // Protects ONLY submit()'s compound cap-check + expiry-sweep + insert
+    // (G4-UHP-MCP-005) — narrowed from the SQLite era's "all db_ access"
+    // scope now that Postgres's own per-row/per-statement concurrency
+    // replaces the rest (consume_ticket's CAS is a single atomic
+    // UPDATE...RETURNING; every other method issues one statement per
+    // call). This mutex still only serializes THIS PROCESS's callers —
+    // multi-replica coordination of the pending-cap/expiry-sweep
+    // check-then-act is an ADR-2002 (HA) concern, not addressed here.
+    mutable std::mutex mtx_;
 };
 
 } // namespace yuzu::server

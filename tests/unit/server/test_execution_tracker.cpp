@@ -6,25 +6,19 @@
  */
 
 #include "execution_tracker.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
+
+#include <libpq-fe.h>
 
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
-
-// ── RAII wrapper for sqlite3* ──────────────────────────────────────────────
-
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -41,29 +35,30 @@ static Execution make_execution(const std::string& definition_id = "def-001",
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: create_tables succeeds", "[execution_tracker][db]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables(); // should not crash
-    REQUIRE(true);
+TEST_CASE("ExecutionTracker: construction migrates and opens the store",
+          "[pg][execution_tracker][db]") {
+    // The fixture's own constructor already REQUIREs is_open() — this test
+    // exists so a construction failure surfaces here by name rather than as
+    // an opaque fixture assertion inside the first unrelated test that
+    // happens to run.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    REQUIRE(tracker_bundle->is_open());
 }
 
 // ── Create Execution ───────────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: create execution", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: create execution", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto result = tracker.create_execution(make_execution());
     REQUIRE(result.has_value());
     CHECK(!result->empty());
 }
 
-TEST_CASE("ExecutionTracker: create execution with parameter_values", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: create execution with parameter_values", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto exec = make_execution();
     exec.parameter_values = R"({"timeout": 30, "force": true})";
@@ -77,10 +72,9 @@ TEST_CASE("ExecutionTracker: create execution with parameter_values", "[executio
 
 // ── Get Execution ──────────────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: get execution", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: get execution", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto result =
         tracker.create_execution(make_execution("def-hostname", "ostype = 'windows'", "operator1"));
@@ -94,10 +88,9 @@ TEST_CASE("ExecutionTracker: get execution", "[execution_tracker]") {
     CHECK(exec->status == "running");
 }
 
-TEST_CASE("ExecutionTracker: get nonexistent returns empty", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: get nonexistent returns empty", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto result = tracker.get_execution("nonexistent-id");
     CHECK(!result.has_value());
@@ -105,10 +98,9 @@ TEST_CASE("ExecutionTracker: get nonexistent returns empty", "[execution_tracker
 
 // ── Query with Filters ─────────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: query all executions", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: query all executions", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     tracker.create_execution(make_execution("def-1"));
     tracker.create_execution(make_execution("def-2"));
@@ -118,10 +110,9 @@ TEST_CASE("ExecutionTracker: query all executions", "[execution_tracker]") {
     REQUIRE(results.size() == 3);
 }
 
-TEST_CASE("ExecutionTracker: query by definition_id", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: query by definition_id", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     tracker.create_execution(make_execution("def-alpha"));
     tracker.create_execution(make_execution("def-beta"));
@@ -133,16 +124,15 @@ TEST_CASE("ExecutionTracker: query by definition_id", "[execution_tracker]") {
     REQUIRE(results.size() == 2);
 }
 
-TEST_CASE("ExecutionTracker: query by status", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: query by status", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id1_result = tracker.create_execution(make_execution());
     auto id2_result = tracker.create_execution(make_execution());
     REQUIRE(id1_result.has_value());
     REQUIRE(id2_result.has_value());
-    tracker.mark_cancelled(*id1_result, "admin");
+    REQUIRE(tracker.mark_cancelled(*id1_result, "admin"));
 
     ExecutionQuery q;
     q.status = "cancelled";
@@ -151,10 +141,9 @@ TEST_CASE("ExecutionTracker: query by status", "[execution_tracker]") {
     CHECK(results[0].id == *id1_result);
 }
 
-TEST_CASE("ExecutionTracker: query with limit", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: query with limit", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     for (int i = 0; i < 10; ++i) {
         tracker.create_execution(make_execution("def-" + std::to_string(i)));
@@ -169,10 +158,9 @@ TEST_CASE("ExecutionTracker: query with limit", "[execution_tracker]") {
 // ── Update Agent Status ────────────────────────────────────────────────────
 
 TEST_CASE("ExecutionTracker: update_agent_status dispatched -> running -> success",
-          "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -203,10 +191,9 @@ TEST_CASE("ExecutionTracker: update_agent_status dispatched -> running -> succes
 }
 
 TEST_CASE("ExecutionTracker: update_agent_status failure with error_detail",
-          "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -227,10 +214,9 @@ TEST_CASE("ExecutionTracker: update_agent_status failure with error_detail",
     CHECK(statuses[0].error_detail == "plugin timeout");
 }
 
-TEST_CASE("ExecutionTracker: get_agent_statuses multiple agents", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: get_agent_statuses multiple agents", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -250,16 +236,15 @@ TEST_CASE("ExecutionTracker: get_agent_statuses multiple agents", "[execution_tr
 }
 
 TEST_CASE("ExecutionTracker: update_agent_status on unknown execution_id is a no-op",
-          "[execution_tracker][issue872]") {
+          "[pg][execution_tracker][issue872]") {
     // Out-of-band dispatches that bypass the workflow-routes create path
     // (CLI / direct gRPC / re-mapped command_id) can reach
     // update_agent_status with an execution_id that has no row in the
     // `executions` table. The mutator must tolerate this — no crash, no
     // SQL constraint violation. The chained refresh_counts must likewise
     // return cleanly when there is nothing to aggregate.
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     AgentExecStatus as;
     as.agent_id = "agent-ghost";
@@ -291,7 +276,7 @@ TEST_CASE("ExecutionTracker: update_agent_status on unknown execution_id is a no
 
 TEST_CASE("ExecutionTracker: update_agent_status alone advances parent aggregates "
           "(chain invariant)",
-          "[execution_tracker][issue872]") {
+          "[pg][execution_tracker][issue872]") {
     // UAT 2026-05-06 fix 18e8766 chained refresh_counts inside
     // update_agent_status so callers no longer need an explicit refresh.
     // The `test_rest_api_t2.cpp` cleanup in PR #1068 dropped 7 redundant
@@ -301,9 +286,8 @@ TEST_CASE("ExecutionTracker: update_agent_status alone advances parent aggregate
     // pass with stale aggregates — only the workflow_routes terminal-
     // threshold test would bite. This case pins the chain at the mutator
     // itself so any chain-break fails ONE focused test with a clear name.
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto exec = make_execution();
     exec.agents_targeted = 1;
@@ -328,10 +312,9 @@ TEST_CASE("ExecutionTracker: update_agent_status alone advances parent aggregate
 
 // ── Summary ────────────────────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: get_summary", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: get_summary", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto exec = make_execution();
     exec.agents_targeted = 4;
@@ -343,10 +326,9 @@ TEST_CASE("ExecutionTracker: get_summary", "[execution_tracker]") {
     CHECK(summary.agents_targeted == 4);
 }
 
-TEST_CASE("ExecutionTracker: summary after refresh_counts", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: summary after refresh_counts", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto exec = make_execution();
     exec.agents_targeted = 3;
@@ -380,12 +362,102 @@ TEST_CASE("ExecutionTracker: summary after refresh_counts", "[execution_tracker]
     CHECK(summary.progress_pct > 0);
 }
 
+TEST_CASE("ExecutionTracker: refresh_counts retries and recovers from transient row-lock "
+          "contention instead of wedging the execution (governance adversarial review "
+          "2026-08-31, CHAOS-01)",
+          "[pg][execution_tracker][chaos]") {
+    // Reproduces UP-1: the pre-migration SQLite recursive_mutex blocked
+    // UNBOUNDEDLY on contention (never dropped an update, only queued); the
+    // Postgres port's bounded lock_timeout can cancel a queued
+    // refresh_counts call instead, and pre-fix that failure was silent and
+    // final — the execution stayed "running" forever. This test proves the
+    // fix's single retry recovers once the contending transaction releases,
+    // which it reliably does well inside a real lock_timeout window.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::execution_tracker_pg_template);
+
+    // lock_timeout wide enough to be robust to CI scheduling jitter
+    // (governance PR review, 2026-08-31, Doomgoose: the original 100ms/150ms
+    // pair left only a ~50ms margin on each side, and a mutant that broke the
+    // retry was observed to false-green under a loaded run). Attempt 2 gets
+    // its OWN fresh lock_timeout window starting when attempt 1 fails
+    // (~kLockTimeout after t=0), so the safe range for the release delay is
+    // strictly between kLockTimeout and 2*kLockTimeout — kReleaseDelay sits
+    // centered in that range with a wide (150ms) margin on both sides.
+    constexpr auto kLockTimeout = std::chrono::milliseconds{300};
+    constexpr auto kReleaseDelay = std::chrono::milliseconds{450};
+    yuzu::server::pg::PgPool store_pool{
+        {.conninfo = db.dsn(), .size = 4, .lock_timeout_ms = static_cast<int>(kLockTimeout.count())}};
+    REQUIRE(store_pool.valid());
+    ExecutionTracker tracker{store_pool};
+    REQUIRE(tracker.is_open());
+
+    auto exec = make_execution();
+    exec.agents_targeted = 1;
+    auto id_result = tracker.create_execution(exec);
+    REQUIRE(id_result.has_value());
+    const std::string execution_id = *id_result;
+
+    // A second, independent connection holds an exclusive row lock on the
+    // execution for longer than store_pool's lock_timeout, so the FIRST
+    // refresh_counts attempt (chained inside update_agent_status) is
+    // guaranteed to be cancelled and abandoned.
+    yuzu::server::pg::PgPool locker_pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(locker_pool.valid());
+    auto locker_lease = locker_pool.try_acquire_for(std::chrono::milliseconds{2000});
+    REQUIRE(locker_lease);
+    auto begin = pg::exec_params(locker_lease.get(), "BEGIN", std::vector<std::string>{});
+    REQUIRE(begin.status() == PGRES_COMMAND_OK);
+    auto lock = pg::exec_params(
+        locker_lease.get(), "SELECT 1 FROM execution_tracker.executions WHERE id=$1 FOR UPDATE",
+        std::vector<std::string>{execution_id});
+    REQUIRE(lock.status() == PGRES_TUPLES_OK);
+
+    // Releases the lock partway through the store's retry window — well
+    // after kLockTimeout has already cancelled attempt 1, well before a
+    // human would notice anything.
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(kReleaseDelay);
+        auto rollback =
+            pg::exec_params(locker_lease.get(), "ROLLBACK", std::vector<std::string>{});
+        CHECK(rollback.status() == PGRES_COMMAND_OK);
+    });
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.dispatched_at = 1000;
+    as.completed_at = 1005;
+    as.exit_code = 0;
+    auto before = std::chrono::steady_clock::now();
+    tracker.update_agent_status(execution_id, as);
+    auto elapsed = std::chrono::steady_clock::now() - before;
+
+    releaser.join();
+
+    // Proves attempt 1 actually got cancelled rather than the test passing
+    // by luck (e.g. the lock happening to already be free) — the call must
+    // have blocked for at least one full lock_timeout window before the
+    // retry could succeed. No log-capture seam exists in this file, so a
+    // coarse wall-clock floor is the cheapest reliable proof (governance PR
+    // review, 2026-08-31, Doomgoose: "never asserts attempt 1 was
+    // cancelled").
+    CHECK(elapsed >= kLockTimeout);
+
+    // Pre-fix: this would be stuck at "running" with stale (zero) aggregate
+    // counts — attempt 1 was cancelled and nothing ever retried it.
+    auto summary = tracker.get_summary(execution_id);
+    CHECK(summary.agents_responded == 1);
+    CHECK(summary.agents_success == 1);
+    auto row = tracker.get_execution(execution_id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "succeeded");
+}
+
 // ── Parent-Child Hierarchy ─────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: parent-child relationship", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: parent-child relationship", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto parent_result = tracker.create_execution(make_execution());
     REQUIRE(parent_result.has_value());
@@ -400,10 +472,9 @@ TEST_CASE("ExecutionTracker: parent-child relationship", "[execution_tracker]") 
     CHECK(children[0].parent_id == *parent_result);
 }
 
-TEST_CASE("ExecutionTracker: multiple children", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: multiple children", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto parent_result = tracker.create_execution(make_execution());
     REQUIRE(parent_result.has_value());
@@ -419,10 +490,9 @@ TEST_CASE("ExecutionTracker: multiple children", "[execution_tracker]") {
 }
 
 TEST_CASE("ExecutionTracker: get_children empty for execution without children",
-          "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -433,10 +503,9 @@ TEST_CASE("ExecutionTracker: get_children empty for execution without children",
 
 // ── Rerun ──────────────────────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: create_rerun all agents", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: create_rerun all agents", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -462,10 +531,9 @@ TEST_CASE("ExecutionTracker: create_rerun all agents", "[execution_tracker]") {
     CHECK(rerun->definition_id == "def-001");
 }
 
-TEST_CASE("ExecutionTracker: create_rerun failed_only", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: create_rerun failed_only", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -495,10 +563,9 @@ TEST_CASE("ExecutionTracker: create_rerun failed_only", "[execution_tracker]") {
     CHECK(rerun->rerun_of == *id_result);
 }
 
-TEST_CASE("ExecutionTracker: create_rerun nonexistent fails", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: create_rerun nonexistent fails", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto rerun_result = tracker.create_rerun("nonexistent-id", "admin", false);
     CHECK(!rerun_result.has_value());
@@ -506,15 +573,14 @@ TEST_CASE("ExecutionTracker: create_rerun nonexistent fails", "[execution_tracke
 
 // ── Mark Cancelled ─────────────────────────────────────────────────────────
 
-TEST_CASE("ExecutionTracker: mark_cancelled", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: mark_cancelled", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
 
-    tracker.mark_cancelled(*id_result, "admin");
+    CHECK(tracker.mark_cancelled(*id_result, "admin"));
 
     auto exec = tracker.get_execution(*id_result);
     REQUIRE(exec.has_value());
@@ -522,10 +588,9 @@ TEST_CASE("ExecutionTracker: mark_cancelled", "[execution_tracker]") {
     CHECK(exec->completed_at > 0);
 }
 
-TEST_CASE("ExecutionTracker: mark_cancelled sets completed_at", "[execution_tracker]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+TEST_CASE("ExecutionTracker: mark_cancelled sets completed_at", "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -534,7 +599,7 @@ TEST_CASE("ExecutionTracker: mark_cancelled sets completed_at", "[execution_trac
     REQUIRE(before.has_value());
     CHECK(before->completed_at == 0);
 
-    tracker.mark_cancelled(*id_result, "operator1");
+    CHECK(tracker.mark_cancelled(*id_result, "operator1"));
 
     auto after = tracker.get_execution(*id_result);
     REQUIRE(after.has_value());
@@ -552,10 +617,9 @@ TEST_CASE("ExecutionTracker: mark_cancelled sets completed_at", "[execution_trac
 // UNAVAILABLE), chosen distinct from exit_code so a crossed bind is caught.
 
 TEST_CASE("ExecutionTracker: plugin_result_status round-trips through update/get (CC-07)",
-          "[execution_tracker][cc07]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_tracker][cc07]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -589,10 +653,9 @@ TEST_CASE("ExecutionTracker: plugin_result_status round-trips through update/get
 }
 
 TEST_CASE("ExecutionTracker: a later frame overwrites the typed status via ON CONFLICT (CC-07)",
-          "[execution_tracker][cc07]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][execution_tracker][cc07]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto id_result = tracker.create_execution(make_execution());
     REQUIRE(id_result.has_value());
@@ -616,163 +679,50 @@ TEST_CASE("ExecutionTracker: a later frame overwrites the typed status via ON CO
     CHECK(statuses[0].plugin_result_status == 2);
 }
 
-// ── UP-12 / A-5 / D4(a): v2 pre-migration predecessor guard ─────────────────
-//
-// The v2 probe pre-stamps schema_meta to 2 when it finds plugin_result_status
-// already present on a schema_meta=0 dev DB (an iterated build that manually
-// added the column ahead of time), so MigrationRunner's ALTER doesn't hit
-// "duplicate column name". Because v1 creates the tables AND their indexes
-// in one migration, the guard must also confirm v1's index actually exists
-// before stamping — otherwise it silently skips v1's CREATE INDEX forever.
+TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every method, "
+          "never crashes",
+          "[execution_tracker]") {
+    // A store that never opened, ported to Postgres (ADR-0065): an unreachable
+    // port fails construction's own connect attempt deterministically
+    // (test_engine_principal_store.cpp's #2456 precedent) — no live database
+    // needed, so this test carries no [pg] tag. Mirrors
+    // test_approval_manager.cpp's equivalent closed-store coverage.
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
 
-namespace {
-// CDX-P1-04: `omit_index` lets a test build a schema where SOME but not ALL of
-// v1's four indexes exist — the exact partial-repair state the single-index
-// guard (checking only idx_agent_exec_agent) could not distinguish from a
-// fully-applied v1.
-void create_v1_schema_by_hand(sqlite3* db, bool with_index, const char* omit_index = nullptr) {
-    std::string sql = R"(
-        CREATE TABLE executions (
-            id TEXT PRIMARY KEY,
-            definition_id TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'pending',
-            scope_expression TEXT NOT NULL DEFAULT '',
-            parameter_values TEXT NOT NULL DEFAULT '',
-            dispatched_by TEXT NOT NULL DEFAULT '',
-            dispatched_at INTEGER NOT NULL DEFAULT 0,
-            agents_targeted INTEGER NOT NULL DEFAULT 0,
-            agents_responded INTEGER NOT NULL DEFAULT 0,
-            agents_success INTEGER NOT NULL DEFAULT 0,
-            agents_failure INTEGER NOT NULL DEFAULT 0,
-            completed_at INTEGER NOT NULL DEFAULT 0,
-            parent_id TEXT NOT NULL DEFAULT '',
-            rerun_of TEXT NOT NULL DEFAULT ''
-        );
-        CREATE TABLE agent_exec_status (
-            execution_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            dispatched_at INTEGER NOT NULL DEFAULT 0,
-            first_response_at INTEGER NOT NULL DEFAULT 0,
-            completed_at INTEGER NOT NULL DEFAULT 0,
-            exit_code INTEGER NOT NULL DEFAULT 0,
-            error_detail TEXT NOT NULL DEFAULT '',
-            plugin_result_status INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (execution_id, agent_id)
-        );
-    )";
-    if (with_index) {
-        for (const auto& [name, stmt] :
-             {std::pair{"idx_executions_status",
-                        "CREATE INDEX idx_executions_status ON executions(status);"},
-              std::pair{"idx_agent_exec_agent",
-                        "CREATE INDEX idx_agent_exec_agent ON agent_exec_status(agent_id);"},
-              std::pair{"idx_executions_dispatched",
-                        "CREATE INDEX idx_executions_dispatched ON executions(dispatched_at);"},
-              std::pair{"idx_executions_definition",
-                        "CREATE INDEX idx_executions_definition ON executions(definition_id);"}}) {
-            if (omit_index && std::string(name) == omit_index)
-                continue;
-            sql += stmt;
-        }
-    }
-    REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    CHECK(closed.query_executions(ExecutionQuery{}).empty());
+    CHECK_FALSE(closed.get_execution("exec-1").has_value());
+    CHECK(closed.get_summary("exec-1").id == "exec-1"); // id echoed, everything else defaulted
+    CHECK(closed.get_agent_statuses("exec-1").empty());
+
+    auto created = closed.create_execution(make_execution());
+    REQUIRE_FALSE(created.has_value());
+    CHECK(created.error() == "database not open");
+
+    // Mutations on a closed store are no-ops, not crashes — and the two
+    // that report success/failure (governance PR review, 2026-08-31) must
+    // honestly report failure rather than silently claiming success.
+    AgentExecStatus status;
+    status.agent_id = "agent-1";
+    status.status = "running";
+    closed.update_agent_status("exec-1", status);
+    closed.refresh_counts("exec-1");
+    CHECK_FALSE(closed.mark_cancelled("exec-1", "tester"));
+    CHECK_FALSE(closed.set_agents_targeted("exec-1", 1));
 }
 
-bool index_exists(sqlite3* db, const char* name) {
-    sqlite3_stmt* stmt = nullptr;
-    bool exists = false;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", -1,
-                          &stmt, nullptr) == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, name, -1, SQLITE_STATIC);
-        exists = (sqlite3_step(stmt) == SQLITE_ROW);
-    }
-    sqlite3_finalize(stmt);
-    return exists;
-}
-} // namespace
-
-TEST_CASE("ExecutionTracker: v2 probe stamps straight through when v1's index is "
-          "also already present",
-          "[execution_tracker][migration]") {
-    TestDb tdb;
-    // The realistic "iterated build" case: v1 fully happened by hand (table +
-    // index), and the column was pre-added too, but schema_meta reads as
-    // untracked (0) — e.g. the meta table was reset independently of the
-    // data. The guard should stamp straight to v2 without re-running v1 or
-    // hitting the v2 ALTER's duplicate-column error.
-    create_v1_schema_by_hand(tdb.db, /*with_index=*/true);
-
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
-
-    CHECK(tracker.schema_ok());
-    CHECK(index_exists(tdb.db, "idx_agent_exec_agent"));
-
-    // And the store is actually usable afterward.
-    auto id_result = tracker.create_execution(make_execution());
-    REQUIRE(id_result.has_value());
-    AgentExecStatus s;
-    s.agent_id = "agent-1";
-    s.status = "success";
-    s.plugin_result_status = 4;
-    tracker.update_agent_status(*id_result, s);
-    auto statuses = tracker.get_agent_statuses(*id_result);
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].plugin_result_status == 4);
-}
-
-TEST_CASE("ExecutionTracker: v2 probe does not silently skip v1's CREATE INDEX "
-          "when only the column pre-exists",
-          "[execution_tracker][migration]") {
-    TestDb tdb;
-    // The inconsistent state the missing guard let through: the v2 column is
-    // present but v1's index never was (hand-rolled schema surgery), and
-    // schema_meta reads as untracked (0). Without the predecessor guard, the
-    // probe stamps schema_meta straight to 2, MigrationRunner::run() then has
-    // nothing left with version > 2 to apply, and idx_agent_exec_agent is
-    // never created — silently, with no error. The guard must refuse to
-    // stamp in this case instead.
-    create_v1_schema_by_hand(tdb.db, /*with_index=*/false);
-    REQUIRE(index_exists(tdb.db, "idx_agent_exec_agent") == false);
-
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
-
-    // v1 (idempotent CREATE TABLE/INDEX) now runs and creates the index —
-    // the guard no longer lets it be skipped silently.
-    CHECK(index_exists(tdb.db, "idx_agent_exec_agent"));
-    // v2's ALTER then genuinely collides with the pre-added column: the
-    // failure surfaces loudly via schema_ok(), which is the documented
-    // contract (see ExecutionTracker::schema_ok()) for a migration that
-    // didn't fully apply — not a silent, permanently-missing index.
-    CHECK_FALSE(tracker.schema_ok());
-}
-
-TEST_CASE("ExecutionTracker: v2 probe refuses to stamp when only SOME of v1's "
-          "indexes are present (CDX-P1-04)",
-          "[execution_tracker][migration]") {
-    TestDb tdb;
-    // idx_agent_exec_agent (the ONE index the pre-fix guard checked) is
-    // present, but idx_executions_status — one of v1's other three — is
-    // missing (e.g. hand-rolled schema surgery that only rebuilt one index).
-    // A guard that checks only idx_agent_exec_agent cannot see this and would
-    // stamp straight to v2, permanently skipping v1's CREATE INDEX for the
-    // missing one. Requiring ALL FOUR must refuse to stamp here too.
-    create_v1_schema_by_hand(tdb.db, /*with_index=*/true,
-                             /*omit_index=*/"idx_executions_status");
-    REQUIRE(index_exists(tdb.db, "idx_agent_exec_agent"));
-    REQUIRE(index_exists(tdb.db, "idx_executions_status") == false);
-
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
-
-    // v1 (idempotent CREATE TABLE/INDEX) now re-runs and creates the missing
-    // index — under the pre-fix single-index guard this assertion fails,
-    // because that guard stamped schema_meta straight to 2 and v1 never ran.
-    CHECK(index_exists(tdb.db, "idx_executions_status"));
-    // v2's ALTER then genuinely collides with the pre-added column, exactly
-    // as the all-indexes-missing case above — the documented loud-failure
-    // contract, not a silent gap.
-    CHECK_FALSE(tracker.schema_ok());
-}
+// "v2 probe stamps straight through..."/"v2 probe does not silently skip
+// v1's CREATE INDEX..."/"v2 probe refuses to stamp when only SOME of v1's
+// indexes are present" (UP-12/A-5/D4(a)/CDX-P1-04) are DELETED, not ported
+// (ADR-0065) — they pinned SQLite-era migration-probe logic (a hand-rolled
+// pre-migration check reconciling a partially-hand-surgeried schema against
+// schema_meta before running MigrationRunner) that has no equivalent once
+// the v1+v2 ladder folds into one PG v1 DDL created fresh on an empty
+// schema: there is no "column pre-exists but the index doesn't" state a
+// fresh Postgres schema can ever be in. See test_approval_manager.cpp's
+// equivalent deletions for the same reasoning applied to that store's own
+// SQLite migration-ladder-specific tests.

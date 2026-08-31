@@ -17,11 +17,11 @@
 #include "license_store.hpp"
 #include "pg/pg_pool.hpp"
 #include "software_deployment_store.hpp"
+#include "test_execution_tracker_pg_helper.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -30,10 +30,10 @@
 
 using namespace yuzu::server;
 
-// LicenseStore (ADR-0048), SoftwareDeploymentStore (ADR-0051), and
-// DeviceTokenStore (ADR-0052) are all Postgres-backed; ExecutionTracker in
-// this file remains pre-migration SQLite. Mirrors test_deployment_store.cpp's
-// PgTestTemplate declaration.
+// LicenseStore (ADR-0048), SoftwareDeploymentStore (ADR-0051),
+// DeviceTokenStore (ADR-0052), and ExecutionTracker (ADR-0065) are all
+// Postgres-backed. Mirrors test_deployment_store.cpp's PgTestTemplate
+// declaration.
 namespace {
 yuzu::test::PgTestTemplate license_store_tpl{
     "licensestore_t2", [](const std::string& dsn) {
@@ -66,17 +66,6 @@ yuzu::test::PgTestTemplate t2_device_token_tpl{
     }};
 } // namespace
 
-// ── RAII wrapper for sqlite3* (in-memory) ─────────────────────────────────
-
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 static Execution make_execution(const std::string& definition_id = "def-001",
                                 const std::string& scope = "ostype = 'windows'",
                                 const std::string& dispatched_by = "admin",
@@ -95,10 +84,9 @@ static Execution make_execution(const std::string& definition_id = "def-001",
 // ============================================================================
 
 TEST_CASE("T2 REST: get_fleet_summary with multiple statuses",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Create executions with various statuses
     auto e1 = make_execution("def-001");
@@ -145,10 +133,9 @@ TEST_CASE("T2 REST: get_fleet_summary with multiple statuses",
 }
 
 TEST_CASE("T2 REST: get_fleet_summary with zero executions returns zeroed fields",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto summary = tracker.get_fleet_summary();
     CHECK(summary.total_executions == 0);
@@ -159,10 +146,9 @@ TEST_CASE("T2 REST: get_fleet_summary with zero executions returns zeroed fields
 }
 
 TEST_CASE("T2 REST: get_agent_statistics with pagination (limit=5)",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Create a single execution targeting 8 agents
     auto exec = make_execution();
@@ -188,10 +174,9 @@ TEST_CASE("T2 REST: get_agent_statistics with pagination (limit=5)",
 }
 
 TEST_CASE("T2 REST: get_agent_statistics filters by agent_id",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     auto exec = make_execution();
     auto id = tracker.create_execution(exec);
@@ -221,10 +206,9 @@ TEST_CASE("T2 REST: get_agent_statistics filters by agent_id",
 }
 
 TEST_CASE("T2 REST: get_definition_statistics returns per-definition aggregates",
-          "[rest_api_t2][execution_statistics]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][execution_statistics]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Two different definitions
     auto e1 = make_execution("def-alpha");
@@ -814,10 +798,9 @@ TEST_CASE("T2 REST: license remove", "[rest_api_t2][license][pg]") {
 // ============================================================================
 
 TEST_CASE("T2 REST: execution statistics work with concurrent agent updates",
-          "[rest_api_t2][cross_store]") {
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+          "[pg][rest_api_t2][cross_store]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Create two executions concurrently
     auto e1 = make_execution("def-cross-1");
@@ -918,9 +901,8 @@ TEST_CASE("T2 REST: license store and execution tracker independent operation",
     LicenseStore license_store{pool};
     REQUIRE(license_store.is_open());
 
-    TestDb tdb;
-    ExecutionTracker tracker(tdb.db);
-    tracker.create_tables();
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
 
     // Activate a license
     License lic;

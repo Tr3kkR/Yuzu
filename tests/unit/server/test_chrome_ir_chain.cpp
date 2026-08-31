@@ -42,7 +42,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
-#include <sqlite3.h>
 
 #include <memory>
 #include <optional>
@@ -80,19 +79,10 @@ struct AuditRecord {
     std::string action, result, target_type, target_id, detail;
 };
 
-struct SqliteHandleGuard {
-    sqlite3* db{nullptr};
-    ~SqliteHandleGuard() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 // Real ResultSetStore + ExecutionTracker + InstructionStore, in-process route
 // dispatch, a recording fake command-dispatch, and an audit sink that captures
 // every emitted row. Mirrors AsyncHarness in test_rest_result_sets_async.cpp.
 struct ChromeIrHarness {
-    SqliteHandleGuard tracker_guard;
     yuzu::server::test::TestRouteSink sink;
 
     std::unique_ptr<ResultSetStore> store;
@@ -109,9 +99,8 @@ struct ChromeIrHarness {
         store = std::make_unique<ResultSetStore>(pool);
         REQUIRE(store->is_open());
 
-        REQUIRE(sqlite3_open(":memory:", &tracker_guard.db) == SQLITE_OK);
-        tracker = std::make_unique<ExecutionTracker>(tracker_guard.db);
-        tracker->create_tables();
+        tracker = std::make_unique<ExecutionTracker>(pool);
+        REQUIRE(tracker->is_open());
 
         // ADR-0058: InstructionStore is now a migrated Postgres store — shares
         // the same pool/database as ResultSetStore above (schema-per-store).

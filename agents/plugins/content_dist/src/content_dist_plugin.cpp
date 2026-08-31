@@ -11,13 +11,19 @@
  *                       receive protocol (PR1.6, CC-06).
  *
  * Security: uses cpp-httplib for downloads/uploads (no shell invocation).
- *           execute_staged uses CreateProcessW/fork+execvp (no shell interpretation).
+ *           execute_staged runs the staged file via
+ *           yuzu::agent::run_bounded_subprocess (no shell interpretation).
  *           Args validated to block shell metacharacters.
  */
 
 #include <yuzu/plugin.hpp>
 
+#include "content_dist_exec_parsers.hpp"
+#include "content_dist_exec_seam.hpp"
 #include "content_dist_upload_parsers.hpp"
+
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
+#include <yuzu/agent/subprocess_runner.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -40,17 +46,11 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+#include <win_str.hpp> // yuzu::win::from_wide (agents/shared, #1681)
 #else
-#include <yuzu/agent/fork_lock.hpp> // BR-001: process-wide fork/CLOEXEC serialization
-
 #include <openssl/evp.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 #endif
 
 #include <httplib.h>
@@ -354,201 +354,25 @@ int download_file(std::string_view url, const fs::path& dest, std::string& error
     return 0;
 }
 
-// ── Safe argument validation and splitting ──────────────────────────────────
-
-// Validate args contain no shell metacharacters
-bool is_safe_arg(std::string_view arg) {
-    // Allow alphanumeric, dash, underscore, dot, equals, colon, slash, backslash, space
-    // Block: ; & | ` $ ( ) { } < > ! ~ ^ " ' # * ? [ ] \n \r
-    for (char c : arg) {
-        if (c == ';' || c == '&' || c == '|' || c == '`' || c == '$' || c == '(' || c == ')' ||
-            c == '{' || c == '}' || c == '<' || c == '>' || c == '!' || c == '~' || c == '^' ||
-            c == '\'' || c == '"' || c == '#' || c == '*' || c == '?' || c == '[' || c == ']' ||
-            c == '\n' || c == '\r') {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Split a string by spaces into argument vector (simple split, no shell parsing)
-std::vector<std::string> split_args(std::string_view args) {
-    std::vector<std::string> result;
-    std::string current;
-    for (char c : args) {
-        if (c == ' ' || c == '\t') {
-            if (!current.empty()) {
-                result.push_back(std::move(current));
-                current.clear();
-            }
-        } else {
-            current += c;
-        }
-    }
-    if (!current.empty())
-        result.push_back(std::move(current));
-    return result;
-}
+// BR-006 (whole-branch review round 2): is_safe_arg/split_args moved to
+// content_dist_exec_parsers.hpp (yuzu::content_dist::exec) -- pure, no-I/O
+// string functions belong in the *_parsers.hpp pure decision layer, not
+// this TU's anonymous namespace, and moving them there is what let
+// content_dist_exec_seam.hpp's execute_verified_payload() (see do_execute
+// below) call them without duplicating a second copy.
 
 // ── Safe process execution (no shell) ───────────────────────────────────────
-
-#ifdef _WIN32
-
-// Windows: CreateProcessW — no shell interpretation
-int safe_execute(const fs::path& exe_path, std::string_view args_str, std::string& output) {
-    // Build command line: "path" arg1 arg2 ...
-    std::wstring wpath = exe_path.wstring();
-    std::wstring cmdline = L"\"" + wpath + L"\"";
-
-    if (!args_str.empty()) {
-        cmdline += L" " + yuzu::win::to_wide(args_str); // (#1681) size-based convert, no NUL
-    }
-
-    // Create pipes for stdout capture
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
-    HANDLE stdout_rd = nullptr, stdout_wr = nullptr;
-    if (!CreatePipe(&stdout_rd, &stdout_wr, &sa, 0)) {
-        output = "failed to create pipe";
-        return -1;
-    }
-    SetHandleInformation(stdout_rd, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.hStdOutput = stdout_wr;
-    si.hStdError = stdout_wr;
-    si.dwFlags = STARTF_USESTDHANDLES;
-
-    PROCESS_INFORMATION pi{};
-
-    BOOL ok = CreateProcessW(wpath.c_str(),    // application name
-                             cmdline.data(),   // command line (mutable)
-                             nullptr,          // process security attributes
-                             nullptr,          // thread security attributes
-                             TRUE,             // inherit handles
-                             CREATE_NO_WINDOW, // creation flags — no console window
-                             nullptr,          // environment
-                             nullptr,          // current directory
-                             &si,              // startup info
-                             &pi               // process info
-    );
-
-    CloseHandle(stdout_wr); // close write end in parent
-
-    if (!ok) {
-        CloseHandle(stdout_rd);
-        output = "CreateProcessW failed: " + std::to_string(GetLastError());
-        return -1;
-    }
-
-    // Read stdout
-    char buf[1024];
-    DWORD bytes_read = 0;
-    while (ReadFile(stdout_rd, buf, sizeof(buf) - 1, &bytes_read, nullptr) && bytes_read > 0) {
-        buf[bytes_read] = '\0';
-        output += buf;
-    }
-    CloseHandle(stdout_rd);
-
-    // Wait for process
-    WaitForSingleObject(pi.hProcess, 30000); // 30 second timeout
-    DWORD exit_code = 1;
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    return static_cast<int>(exit_code);
-}
-
-#else
-
-// Unix: fork + execvp — no shell interpretation
-int safe_execute(const fs::path& exe_path, std::string_view args_str, std::string& output) {
-    // Make executable
-    std::error_code ec;
-    fs::permissions(exe_path, fs::perms::owner_exec, fs::perm_options::add, ec);
-
-    auto args = split_args(args_str);
-
-    // Build argv
-    std::vector<const char*> argv;
-    std::string exe_str = exe_path.string();
-    argv.push_back(exe_str.c_str());
-    for (const auto& a : args)
-        argv.push_back(a.c_str());
-    argv.push_back(nullptr);
-
-    // Create pipe for stdout capture
-    //
-    // BR-001: hold the process-wide fork lock across [pipe()..fork()] --
-    // macOS/BSD has no pipe2(), so an unrelated thread's fork() landing in
-    // this window could inherit these still-inheritable fds. Released in
-    // the PARENT right after fork() returns; the child inherits it locked
-    // and never touches it (see fork_lock.hpp's contract).
-    std::unique_lock<std::mutex> fork_pipe_lock(yuzu::agent::global_fork_lock());
-
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        output = "failed to create pipe";
-        return -1;
-    }
-
-    // Fail closed: fork_lock.hpp's release precondition requires CLOEXEC on
-    // both pipe ends before the lock is released, so a concurrent locked
-    // launcher forking in the unlock->close window can never inherit a live,
-    // non-CLOEXEC write end. A failed fcntl here is treated the same as a
-    // failed pipe() above rather than silently forking with a leaky fd.
-    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) == -1 ||
-        fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) == -1) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        output = "failed to set pipe close-on-exec";
-        return -1;
-    }
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        output = "fork failed";
-        return -1;
-    }
-
-    if (pid == 0) {
-        // Child
-        close(pipefd[0]); // close read end
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-
-        execvp(exe_str.c_str(), const_cast<char* const*>(argv.data()));
-        _exit(127); // execvp failed
-    }
-
-    // Parent: fork() has returned and this is not the child branch --
-    // release the fork lock now (see fork_lock.hpp's contract).
-    fork_pipe_lock.unlock();
-
-    // Parent
-    close(pipefd[1]); // close write end
-
-    char buf[1024];
-    ssize_t n;
-    while ((n = read(pipefd[0], buf, sizeof(buf) - 1)) > 0) {
-        buf[n] = '\0';
-        output += buf;
-    }
-    close(pipefd[0]);
-
-    int status = 0;
-    waitpid(pid, &status, 0);
-    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-}
-
-#endif
+//
+// The plugin's former OS-specific direct-argv spawn helpers (a Windows
+// child-process launcher and a POSIX child-process launcher, each with its
+// own pipe/capture/reap plumbing) are replaced by one cross-platform call to
+// yuzu::agent::run_bounded_subprocess (agents/core/src/subprocess_runner.cpp)
+// in `do_execute` below — the runner already provides no-shell argv exec, a
+// bounded output capture, a deadline, and (on Linux) B6 TOCTOU-safe exec; it
+// also takes the process-wide child-launch serialization lock internally, so
+// this plugin no longer links against that lock at all. `build_execution_options`/
+// `map_execution_result` (content_dist_exec_parsers.hpp) are the pure
+// decision layer around that call.
 
 // ── ABI4 per-OS capability declaration (#2204) ──────────────────────────────
 //
@@ -574,12 +398,30 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
     {
         /* .action      = */ "execute_staged",
-        // Spawns the staged binary directly from a pre-split argv —
-        // CreateProcessW on Windows, fork+execvp on POSIX — never a shell
-        // (see `safe_execute` above): rung 2 on every OS.
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
-        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "createprocessw", nullptr},
+        // Spawns the staged binary directly from a pre-split argv via
+        // yuzu::agent::run_bounded_subprocess — never a shell (see
+        // `do_execute`/content_dist_exec_seam.hpp): rung 2 on every OS,
+        // same token convention as filesystem_plugin.cpp's runner-based legs.
+        //
+        // BR-004 (whole-branch review round 2): Linux is CONSTRAINED, not
+        // unconditionally SUPPORTED -- the CDX-002 gate in
+        // content_dist_exec_seam.hpp's execute_verified_payload() rejects
+        // every shebang-interpreted staged payload on Linux (B6 exec_verify's
+        // fd-exec primitive, execveat with O_CLOEXEC, is structurally
+        // incompatible with the kernel's binfmt_script re-open), which the
+        // deleted pre-migration POSIX launcher (a plain execvp()) never did.
+        // Declaring this leg unconditionally SUPPORTED was truthful about
+        // the migration's happy path but silently omitted a real, migration-
+        // introduced compatibility break for any staged `#!`-interpreted
+        // script; the constraint string exists so this ABI4 descriptor
+        // itself carries that disclosure, not just a code comment.
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2, "subprocess_runner:staged_payload",
+         "shebang-interpreted (#!) staged payloads are rejected -- B6 fd-exec "
+         "(execveat O_CLOEXEC) is incompatible with the kernel's binfmt_script "
+         "re-open; native executables only"},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:staged_payload", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:staged_payload", nullptr},
     },
     {
         /* .action      = */ "list_staged",
@@ -761,22 +603,69 @@ private:
             return 1;
         }
 
-        auto args = params.get("args");
-        // Validate args to block shell metacharacters
-        if (!args.empty() && !is_safe_arg(args)) {
-            ctx.write_output(
-                "error|args contain forbidden characters (shell metacharacters blocked)");
-            return 1;
-        }
+#ifdef __linux__
+        constexpr bool kIsLinux = true;
+#else
+        constexpr bool kIsLinux = false;
+#endif
+#ifdef _WIN32
+        constexpr bool kIsWindows = true;
+#else
+        constexpr bool kIsWindows = false;
+#endif
 
-        std::string output;
-        int rc = safe_execute(path, args, output);
-
-        ctx.write_output(std::format("status|{}", rc == 0 ? "ok" : "error"));
-        ctx.write_output(std::format("exit_code|{}", rc));
-        if (!output.empty())
-            ctx.write_output(std::format("output|{}", output));
-        return rc;
+        // BR-006 (whole-branch review round 2): everything past this point
+        // -- the CDX-002 Linux shebang gate, the args safety check, the
+        // POSIX chmod, argv assembly, and the actual
+        // build_execution_options/run_bounded_subprocess/map_execution_result
+        // call sequence -- is content_dist_exec_seam.hpp's
+        // execute_verified_payload(), extracted so it is directly unit-
+        // testable against a real staged file without content_dist's KV/
+        // init machinery (g_ctx) ever entering the picture. `path` here is
+        // already hash-verified by the #808 KV re-verification above,
+        // exactly as execute_verified_payload's own contract requires.
+        //
+        // CDX-001 RESIDUAL RISK (accepted, documented -- not fixed here,
+        // and not moved into the seam header since it is about THIS
+        // hash-verification step, not the seam's own logic): the trusted
+        // SHA-256 above (#808 KV re-verification) is computed against
+        // `path`, and the seam's B6 exec_verify independently OPENS that
+        // same path and fd-execs it. The fd-exec closes only the
+        // fstat-to-exec race (TOCTOU between the runner's own permission
+        // check and the exec syscall); nothing binds the digest just
+        // checked to the exact fd the runner ends up executing, so a
+        // hash-time-to-open-time swap window remains AT THE PRIMITIVE
+        // LEVEL. This is ACCEPTED, not closed, because: staging_dir()
+        // enforces an agent-owned 0700 directory on POSIX, so any actor
+        // able to swap the staged file in that window already holds
+        // agent-uid or root -- capabilities that already subsume whatever
+        // the swap would gain them; and exec_verify.expected_size (set
+        // inside the seam) further pins the exec'd fd to the hash-verified
+        // file's exact size, narrowing a same-size-swap window rather than
+        // leaving it fully open. Full closure requires the runner itself to
+        // accept a caller-supplied digest and verify it against its own
+        // already-opened fd before execveat -- a frozen-contract change to
+        // subprocess_runner's B6 exec_verify, deferred to a follow-up
+        // runner package (reference: CDX-001). Do not attempt a plugin-
+        // local open/fstat/execveat workaround here to close this gap --
+        // that would duplicate (and diverge from) the runner's own B6
+        // logic; the fix belongs in the runner, not this caller.
+        auto outcome = yuzu::content_dist::exec::execute_verified_payload(
+            path, params.get("args"), kIsLinux, kIsWindows);
+        // BR-001: forward a runner-level failure through the ABI4 CC-07
+        // result-status seam BEFORE the wire lines below -- same one-line
+        // pattern every other migrated mutating plugin uses (services_
+        // plugin.cpp, network_actions_plugin.cpp, interaction_plugin.cpp),
+        // and required end-to-end by ADR-3002's "Honest termination
+        // reporting" precondition for a mutating site. Only set on the
+        // ordinary run_bounded_subprocess path -- an early shebang/args
+        // rejection never reaches the runner, so there is nothing to
+        // forward.
+        if (outcome.run)
+            yuzu::agent::forward_runner_failure(ctx, *outcome.run);
+        for (const auto& line : outcome.lines)
+            ctx.write_output(line);
+        return outcome.rc;
     }
 
     int do_list(yuzu::CommandContext& ctx) {
