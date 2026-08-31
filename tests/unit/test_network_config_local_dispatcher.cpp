@@ -39,6 +39,7 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -127,6 +128,39 @@ struct LoadedPlugin {
     const YuzuPluginDescriptor* descriptor;
 };
 
+#if defined(__linux__)
+// do_adapters() unconditionally filters `lo` on Linux (network_config_plugin.cpp),
+// so a loopback-only network namespace (`unshare -n`, `docker run --network=none`,
+// or any other network-isolated sandbox) legitimately yields zero `adapter|` rows
+// -- that is not a migration failure. Reads /proc/net/dev's interface column
+// (skipping the two header lines) rather than trusting the environment to have
+// a non-loopback link, so the row-count assertion below can tell "empty because
+// isolated" apart from "empty because the leg broke".
+bool linux_has_non_loopback_interface() {
+    std::ifstream in("/proc/net/dev");
+    if (!in)
+        return true; // can't tell -- don't suppress the assertion on a read failure
+    std::string line;
+    int lineno = 0;
+    while (std::getline(in, line)) {
+        if (++lineno <= 2)
+            continue; // two fixed header lines
+        auto colon = line.find(':');
+        if (colon == std::string::npos)
+            continue;
+        std::string name = line.substr(0, colon);
+        // Trim leading whitespace the column is padded with.
+        auto start = name.find_first_not_of(" \t");
+        if (start == std::string::npos)
+            continue;
+        name = name.substr(start);
+        if (name != "lo")
+            return true;
+    }
+    return false;
+}
+#endif
+
 std::optional<LoadedPlugin> load_network_config_plugin() {
     auto plugin_path = find_network_config_plugin();
     if (plugin_path.empty())
@@ -159,11 +193,17 @@ TEST_CASE("network_config plugin: adapters lists at least one real interface via
     // on the OUTPUT so a broken or reverted leg actually turns this red.
     const auto rows = rows_with_prefix(result.captured, "adapter|");
 
-    // NOT platform-gated, deliberately. Every supported host has at least one
-    // interface this leg reports: macOS reports lo0, and a Linux host — even a
-    // bare container — has at least `lo` plus its own interface, of which the
-    // Linux leg reports everything except `lo`. An empty row set therefore
-    // means the leg failed, and it must fail the test on EVERY platform.
+    // macOS reports lo0 unconditionally (do_adapters() never filters it there),
+    // so a real macOS host always yields at least one row — an empty result
+    // means the leg failed. On Linux, do_adapters() unconditionally filters
+    // `lo`, so a host in a loopback-only network namespace (`unshare -n`,
+    // `docker run --network=none`, or any other network-isolated sandbox)
+    // legitimately has ZERO non-loopback interfaces and correctly emits zero
+    // rows — that is a legitimate host state, not a migration failure, the
+    // same reasoning the `arp` test below already applies to an empty ARP
+    // table. So the row-count assertion is conditioned on /proc/net/dev
+    // actually exposing a non-loopback interface; the row-SHAPE assertions
+    // below stay unconditional either way.
     //
     // This assertion was originally written inside the __APPLE__ block below,
     // which made the whole case degenerate to `CHECK(rc == 0)` plus a loop
@@ -171,8 +211,15 @@ TEST_CASE("network_config plugin: adapters lists at least one real interface via
     // completely broken rtnetlink leg, since do_adapters() returns 0 on
     // getifaddrs failure and on an incomplete dump alike. Linux is the only
     // platform where the new rtnetlink code actually executes, so gating the
-    // one load-bearing guard behind macOS inverted the test's purpose.
+    // one load-bearing guard behind macOS inverted the test's purpose. It
+    // must still fail on Linux when a non-loopback interface exists but the
+    // leg reports nothing.
+#if defined(__linux__)
+    if (linux_has_non_loopback_interface())
+        REQUIRE_FALSE(rows.empty());
+#else
     REQUIRE_FALSE(rows.empty());
+#endif
 
 #if defined(__APPLE__)
     // macOS always has lo0, and the pre-migration `ifconfig -a` leg reported
