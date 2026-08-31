@@ -4365,8 +4365,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         // production wiring regressed) — BEFORE a ticket is
                         // minted or consumed. The actual Destructive-targeting
                         // refusal (a WIRED classifier reporting a Destructive,
-                        // untargeted call) is added in commit 5; this arm alone
-                        // covers only the "cannot even ask the question" case.
+                        // untargeted call) follows immediately below (commit 5).
                         if (!classify_fn_) {
                             const std::string cid =
                                 yuzu::server::detail::make_correlation_id();
@@ -4378,6 +4377,52 @@ McpServer::HandlerFn McpServer::build_handler(
                                          kClassifierUnavailableRemediation, -1, cid),
                                 "application/json");
                             return;
+                        }
+                        // #3685 (checkpoint 2, commit 5): C8 PRE-MINT parity —
+                        // refuse a Destructive, untargeted execute_instruction
+                        // BEFORE a ticket is minted (supplied_id.empty() below) or
+                        // consumed (supplied_id non-empty, the recall arm). Reads
+                        // `args` directly rather than the handler's own locals
+                        // (which do not exist yet at this point in the request) —
+                        // `check_exec_instruction_shape` above already guarantees
+                        // `agent_ids`/`scope`, if present, are shape-valid, so
+                        // `args.contains(...)` is the same post-shape-check
+                        // precondition evaluate_destructive_targeting's contract
+                        // requires (dispatch_destructive_gate.hpp). No omitted-
+                        // target normalisation is needed here: an omitted
+                        // agent_ids alone already forces RefuseUntargeted
+                        // (!valid_nonempty_agent_ids), independent of scope_key_
+                        // present — provably the SAME verdict the handler site
+                        // reaches after its own __all__ normalisation, for every
+                        // one of the four (ids, scope, both, neither) shapes.
+                        {
+                            const auto p = param_str(args, "plugin");
+                            const auto a = param_str(args, "action");
+                            const auto gate = yuzu::server::evaluate_destructive_targeting(
+                                classify_fn_(p, a),
+                                /*valid_nonempty_agent_ids=*/args.contains("agent_ids"),
+                                /*scope_key_present=*/args.contains("scope"));
+                            if (gate.verdict ==
+                                yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                                const std::string cid =
+                                    yuzu::server::detail::make_correlation_id();
+                                mcp_audit(
+                                    "denied",
+                                    std::string("destructive_untargeted ") +
+                                        yuzu::server::detail::sanitize_detail_value(p) + ":" +
+                                        yuzu::server::detail::sanitize_detail_value(a) +
+                                        " correlation_id=" + cid);
+                                res.set_content(
+                                    a4_error(kInvalidParams,
+                                             yuzu::server::kDestructiveUntargetedMessage,
+                                             "this plugin.action is classified Destructive: "
+                                             "name explicit agent_ids (no scope, no broadcast) "
+                                             "and re-call; no approval ticket was created or "
+                                             "consumed",
+                                             -1, cid),
+                                    "application/json");
+                                return;
+                            }
                         }
                     }
 
@@ -7765,6 +7810,48 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     scope = std::string(yuzu::server::kBroadcastScope);
+                }
+
+                // #3685 (checkpoint 2, commit 5): Destructive-class targeting
+                // parity with /api/command — a DispatchClass::Destructive pair
+                // must name explicit agent_ids; broadcast (including the
+                // omitted-target __all__ normalisation just above) and scope
+                // fan-out are refused. Confinement to the caller's visible set
+                // is already downstream (#1788 arms, via dispatch_confined);
+                // what MCP lacked was the refusal itself — a chokepoint denial
+                // surfaces only as the ambiguous sent=0/no_agents_reached
+                // envelope. This is the BACKSTOP site: it runs for every tier,
+                // including operator (which skips the C8 block entirely) and a
+                // supervised call that already passed the C8 gate below (the
+                // same pure function on the same shape-checked inputs cannot
+                // disagree between the two sites, so this never double-refuses
+                // a call C8 already allowed through).
+                {
+                    const auto gate = yuzu::server::evaluate_destructive_targeting(
+                        classify_fn_(plugin, action),
+                        /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                        /*scope_key_present=*/!scope.empty());
+                    if (gate.verdict ==
+                        yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                        const std::string cid = yuzu::server::detail::make_correlation_id();
+                        mcp_audit("denied",
+                                  std::string("destructive_untargeted ") +
+                                      yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
+                                      yuzu::server::detail::sanitize_detail_value(action) +
+                                      " correlation_id=" + cid);
+                        res.set_content(
+                            a4_error(kInvalidParams, yuzu::server::kDestructiveUntargetedMessage,
+                                     "this plugin.action is classified Destructive: name "
+                                     "explicit agent_ids (no scope, no broadcast) and re-call",
+                                     -1, cid),
+                            "application/json");
+                        return;
+                    }
+                    // NotDestructive, Targeted, and ClassifyMiss all fall
+                    // through unchanged: NotDestructive/Targeted proceed to
+                    // dispatch as before, and ClassifyMiss (Policy B) defers to
+                    // the existing dispatch chokepoint, which denies a real
+                    // miss on its own terms.
                 }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
