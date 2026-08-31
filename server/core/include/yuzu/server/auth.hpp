@@ -17,8 +17,9 @@ class MetricsRegistry;
 }
 namespace yuzu::server {
 class AuthDB;
-class SessionStore;  // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
-struct SessionRow;   // session_store.hpp — the durable row shape
+class SessionStore;       // HA WS-1/1a — durable operator sessions (Postgres, ADR-2002 §4)
+struct SessionRow;        // session_store.hpp — the durable row shape
+struct SessionWriteParams; // session_store.hpp — duration-based create params (DB-clock authoring)
 } // namespace yuzu::server
 
 namespace yuzu::server::auth {
@@ -193,6 +194,31 @@ struct Session {
     /// validate when the feature is on.
     std::chrono::system_clock::time_point last_activity_at{};
     std::chrono::system_clock::time_point last_activity_persisted_at{};
+
+    // ── Local monotonic adjudication (ADR-2002 §4 DB-clock authority, WS-1/1a) ──
+    // Per-request authorization is decided against these steady_clock deadlines,
+    // derived ONCE at session mint / cache-populate from the AUTHORITY clock
+    // (Postgres `now()` for a durable session, this host's wall clock for the
+    // legacy no-store path) by `AuthManager::derive_session_deadlines`. They are
+    // immune to local wall-clock skew and steps: a +Nh-skewed replica derives the
+    // same REMAINING duration and ages it monotonically. The system_clock fields
+    // above stay the AUTHORED ABSOLUTE instants — used for display/audit and as
+    // the suspend backstop (a steady_clock deadline is blind to host suspend; a
+    // generous wall sanity ceiling on the absolute instant is not — see
+    // is_elevated / validate). The `{}` (steady-epoch) sentinel is fail-closed:
+    // an underived session reads as instantly-expired / not-elevated / no-proof.
+    std::chrono::steady_clock::time_point steady_expires{};        ///< base-lifetime deadline
+    std::chrono::steady_clock::time_point steady_elevated_until{}; ///< {} = not (validly) elevated
+    std::chrono::steady_clock::time_point steady_last_activity{};  ///< idle slide anchor
+    std::chrono::steady_clock::time_point steady_mfa_verified{};   ///< {} = no valid MFA proof
+    /// Durable-touch throttle marker — the local MONOTONIC instant this replica
+    /// last mirrored `last_activity` to the store (seeded at populate from how
+    /// stale the durable row already is). The throttle MUST be steady, not wall:
+    /// gating the durable write on `system_clock` vs a DB-authored timestamp
+    /// (cross clock domains) lets host skew suppress touches so an actively-used
+    /// session idles out on another replica / after failover (adversarial-review
+    /// CDX-P1-001) — the very cross-host-skew contract WS-1/1a exists to close.
+    std::chrono::steady_clock::time_point steady_last_persisted{};
 };
 
 /// Defense-in-depth hard ceiling on any JIT elevation window (ADR-2002 §4).
@@ -205,27 +231,40 @@ struct Session {
 /// config-capped) passes while an implausible far-future value is refused.
 inline constexpr auto kMaxElevationWindow = std::chrono::hours(24);
 
+/// Wall-clock sanity tolerance for the suspend backstop (ADR-2002 §4, design-
+/// review H5). A steady_clock deadline is blind to host/VM suspend
+/// (CLOCK_MONOTONIC pauses), so a cached session could out-live its authored
+/// expiry by the suspend duration. The absolute `system_clock` deadline is the
+/// backstop, consulted with THIS slack. The tradeoff: a replica whose local wall
+/// clock is synced within this slack of the DB primary is never wrongly rejected,
+/// and only a gross wall jump past expiry (a long suspend) trips it; but a replica
+/// whose wall clock LEADS the DB primary by MORE than this slack WILL fail-CLOSED
+/// (spurious 401 / re-auth) on a session in its last (skew − slack). That is
+/// deliberate and fail-safe — it requires replicas to be roughly NTP-synced within
+/// this slack, which is the operational precondition for the suspend backstop
+/// (the steady deadline alone handles arbitrary skew; this only backstops
+/// suspend). Bounds suspend over-extension to this slack + the residual, negligible
+/// against an 8h session / 24h elevation ceiling.
+inline constexpr auto kWallSanitySkew = std::chrono::minutes(5);
+
 /// True iff `s` currently holds an unexpired, in-ceiling JIT admin elevation.
-/// Wall-clock (`system_clock`) since HA WS-1/1a; the ceiling below is the
-/// defense-in-depth replacement for the former monotonic NTP-step resistance.
+/// Decided against the local MONOTONIC steady deadline derived at populate
+/// (ADR-2002 §4 DB-clock authority) — immune to local wall skew/steps — with a
+/// generous wall-clock sanity backstop for steady_clock's suspend-blindness. The
+/// authored-width ceiling and future-issued rejection are pre-applied when
+/// `steady_elevated_until` is derived (derive_session_deadlines); {} means not
+/// (validly) elevated.
 inline bool is_elevated(const Session& s) {
-    if (s.elevated_until.time_since_epoch().count() == 0)
+    if (s.steady_elevated_until.time_since_epoch().count() == 0)
         return false;
-    const auto now = std::chrono::system_clock::now();
-    if (now >= s.elevated_until)
+    if (std::chrono::steady_clock::now() >= s.steady_elevated_until)
         return false;
-    // Backward-step guard, symmetric with mfa_step_up's future-dated-proof
-    // rejection: an issued-at in the future relative to `now` means the wall
-    // clock stepped backward below the grant instant — fail closed rather than
-    // honor a window a rewind would stretch. (A smaller rewind that stays above
-    // issued_at can still extend the live window; that residual is the
-    // WS-11-monitored DB-primary-clock dependency, ADR-2002 §4.)
-    if (now < s.elevation_issued_at)
+    // Suspend backstop: the absolute authored instant, consulted only with the
+    // generous slack so a skewed-but-not-suspended replica is unaffected.
+    if (s.elevated_until.time_since_epoch().count() != 0 &&
+        std::chrono::system_clock::now() > s.elevated_until + kWallSanitySkew)
         return false;
-    // Reject a granted window wider than the hard ceiling (a forward-corrupted
-    // `elevated_until`, or an elevated_until set without its issued-at anchor —
-    // which reads as an epoch-anchored, thus enormous, window and is refused).
-    return (s.elevated_until - s.elevation_issued_at) <= kMaxElevationWindow;
+    return true;
 }
 
 /// The session's EFFECTIVE legacy role: `admin` while a JIT elevation is active,
@@ -443,6 +482,21 @@ public:
     /// NOT call this — no caller in `server/core/src/**` references it. A
     /// no-op if `token` is not a live session.
     void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
+
+    /// Derive a cache `Session`'s adjudication deadlines from the DB-authored
+    /// timestamps and the AUTHORITY clock `now_ms` (Postgres `now()` for a durable
+    /// session; this host's wall clock for the legacy no-store path). Sets the
+    /// wall-clock absolutes (display/audit + suspend backstop) and the local
+    /// monotonic steady deadlines, CLAMPING every derived remaining so a backward
+    /// `now_ms` cannot inflate the lived duration past its authored maximum
+    /// (design-review H2). Returns false iff the base lifetime is already past at
+    /// `now_ms` (the caller must NOT cache or honor it — H4 underflow guard).
+    /// PUBLIC because the clamps are security-critical and unit-tested directly.
+    [[nodiscard]] static bool
+    derive_session_deadlines(Session& s, std::int64_t created_ms, std::int64_t expires_ms,
+                             std::int64_t last_activity_ms, std::int64_t mfa_verified_ms,
+                             std::int64_t elevated_until_ms, std::int64_t elevation_issued_ms,
+                             std::int64_t now_ms);
 
     /// Look up a session by cookie token.
     std::optional<Session> validate_session(const std::string& token) const;
@@ -819,23 +873,23 @@ private:
     /// counters). No-op when no MetricsRegistry is wired (tests/CLI).
     void note_session_store_degrade(const char* op) const;
 
-    /// Reconstruct a cache `Session` from a durable `SessionRow` (wall-clock).
-    /// Stamps last_activity and both elevation fields so the ceiling and idle
-    /// gates read a fully-formed session (auth.hpp Session invariant).
-    static Session session_from_row(const yuzu::server::SessionRow& row);
+    /// Reconstruct a cache `Session` from a durable `SessionRow` PLUS the DB
+    /// clock at read time (`db_now_ms`, from `SessionStore::find`). Sets the
+    /// authored wall-clock absolutes AND the local monotonic steady deadlines
+    /// (via `derive_session_deadlines`) so is_elevated/idle/MFA read a
+    /// fully-formed, DB-clock-adjudicated session (ADR-2002 §4).
+    static Session session_from_row(const yuzu::server::SessionRow& row, std::int64_t db_now_ms);
 
-    /// Serialize a cache `Session` (+ its raw token) into a durable `SessionRow`.
-    yuzu::server::SessionRow row_from_session(const std::string& raw_token,
-                                              const Session& s) const;
-
-    /// Write-through a newly-created session: when a durable store is
-    /// configured, INSERT the row FIRST (outside `mu_`) and FAIL CLOSED on a
-    /// store error — a login whose session cannot be made durable is not
-    /// honored (ADR-0007 fail-closed; the server already refuses to run without
-    /// Postgres). Then cache it under `mu_`. Returns false on durable-write
-    /// failure; always true in the legacy in-memory path. Caller must NOT hold
-    /// `mu_`.
-    [[nodiscard]] bool persist_new_session(const std::string& raw_token, const Session& s);
+    /// Write-through a newly-created session from DB-clock-authored params: when
+    /// a durable store is configured, `create()` FIRST (outside `mu_`, authoring
+    /// timestamps from Postgres `now()`) and FAIL CLOSED on a store error — a
+    /// login whose session cannot be made durable is not honored (ADR-0007). The
+    /// cached `Session` is built from the RETURNED authored times so it matches
+    /// the durable row exactly. In the legacy no-store path the timestamps are
+    /// authored from this host's wall clock. Returns false on durable-write
+    /// failure; always true legacy. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool persist_new_session(const std::string& raw_token,
+                                           const yuzu::server::SessionWriteParams& params);
 
     /// Durably delete every session for a username (bumps the generation so all
     /// replicas drop the cached copies). Called from the role-change / demote /

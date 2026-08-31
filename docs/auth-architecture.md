@@ -29,30 +29,37 @@ Certificate setup instructions: `scripts/Certificate Instructions.txt`.
 ### Durable operator sessions (HA WS-1/1a, ADR-2002 §4)
 
 Operator sessions are durable Postgres rows so a session survives a core-replica
-restart/failover and (once the clock-authority item below lands) validates
-identically on any replica — a prerequisite of the HA "safe-to-scale" gate. The
-design:
+restart/failover and — with DB-clock authority (#3715, below) — validates
+identically on any replica under arbitrary cross-host clock skew, a prerequisite
+of the HA "safe-to-scale" gate. The design:
 
-> **KNOWN GAP — cross-host clock authority (tracked, multi-replica prerequisite).**
-> As shipped in WS-1/1a, durable timestamps are authored and adjudicated with
-> the **core replica's** `system_clock`, NOT PostgreSQL `now()`. On a **single
-> replica** (the only supported topology until the safe-to-scale gate) this is
-> self-consistent and satisfies ADR-2002 §4's required mitigations — (a) the one
-> host's clock is the monitored security dependency (the reap clock-anomaly
-> signal + its alert), (b) both short windows carry a hard issue-time + max-delta
-> ceiling independent of their configured length: JIT elevation via
-> `elevation_issued_at` + `kMaxElevationWindow` (24 h), and MFA step-up via
-> `mfa_verified_at` + `kMaxMfaStepUpWindowSecs` (24 h) in `require_mfa_step_up`.
-> (Both ceilings, like JIT's, bound the authored/forward direction; the residual
-> smaller-backward-step is what mitigation (a)'s monitor covers.) But it
-> does NOT yet realize ADR-2002 §4's choice of Postgres `now()` as the shared
-> clock that *fixes cross-host skew*: with two replicas, a backward-skewed
-> replica could accept a session past its DB-authored absolute expiry (bounded by
-> the skew). Making the durable base-session lifetime DB-clock-authored (author
-> via `now()`; derive a local monotonic remaining-duration deadline at
-> cache-populate time) is a **required item before a second replica is enabled**,
-> tracked with the rest of the safe-to-scale gate. Until then "validates
-> identically on any replica" holds only under a common/synchronised clock.
+> **DB-clock authority (ADR-2002 §4, completed — WS-1/1a, #3715).**
+> Durable timestamps are **authored from PostgreSQL `now()`** (in the store, in
+> SQL — `SessionStore::create`/`set_elevation`/`mark_mfa`/`touch_activity`), NOT
+> the calling replica's `system_clock`, so every replica dates a session in the
+> ONE DB clock domain — the fix for cross-host skew. Reads (`find`) return
+> `db_now_ms` in the **same atomic SELECT**; `AuthManager` adjudicates absolute
+> expiry / idle / elevation / MFA against `db_now_ms` and then derives a **local
+> monotonic (`steady_clock`) remaining-duration deadline** at cache-populate
+> (`derive_session_deadlines`), so the per-request hot path touches neither the DB
+> nor the local wall clock and is immune to local skew/steps.
+>
+> A backward `now()` on the DB primary is the residual the reversal admits
+> (ADR-2002 §4). Four layered defences bound it: **(1)** every derived remaining
+> is CLAMPED so a lowered `now` cannot inflate the LIVED duration past its
+> authored maximum — elevation against `elevation_issued + kMaxElevationWindow`,
+> the base session against `created_at`, MFA against its window ceiling; **(2)**
+> the authored-width ceilings still REJECT an over-`kMaxElevationWindow` (24 h)
+> elevation and a future-dated MFA proof outright; **(3)** a generous
+> `kWallSanitySkew` (5 min) wall-clock ceiling backstops `steady_clock`'s
+> suspend-blindness (a suspended replica's monotonic clock pauses); **(4)**
+> DB-primary clock integrity is monitored — `reap_expired()` reads `now()` itself
+> and declines + raises `yuzu_auth_session_reap_clock_anomaly_total` (distinct
+> from the local host-clock `yuzu_auth_local_clock_backward_total`) on a backward
+> step, alerted by `YuzuSessionReapClockAnomaly`. So "validates identically on any
+> replica" now holds under arbitrary cross-host skew (the steady deadline is
+> derived from the shared DB clock), with the wall ceiling assuming replicas stay
+> roughly NTP-synced for the suspend backstop only.
 
 - **Store.** `SessionStore` (`server/core/src/session_store.{hpp,cpp}`, schema
   `session_store`) is a born-on-PG, fail-closed store (ADR-0012). The row key is
@@ -216,16 +223,19 @@ previously-reserved `sessions.last_activity_at` column end-to-end.
   write-throughs every session and validates against it, with the in-memory
   `AuthManager::sessions_` map serving as a generation-gated process-local
   cache (see "Durable operator sessions" below). The idle state
-  (`last_activity_at`) is now a **wall-clock** (`system_clock`) row column
-  advanced via `SessionStore::touch_activity`, which deliberately does NOT bump
-  the write-generation (a slide is not an authz change, so it never invalidates
-  any replica's cache), and mirrored into the cache. It survives a replica
-  restart/failover and validates identically on any replica under a common clock
-  (see the cross-host clock-authority gap above). (Before HA WS-1/1a
-  the idle state lived only in-memory on a monotonic `steady_clock`; the clock
-  is now wall-clock, with the JIT-elevation/MFA windows carrying hard wall-clock
-  ceilings — see below.) `AuthManager::session_inactivity_` holds the configured
-  window (set once at startup via `set_session_inactivity`).
+  (`last_activity_ms`) is a durable row column **authored from Postgres `now()`**
+  (GREATEST-clamped, monotonic) via `SessionStore::touch_activity`, which
+  deliberately does NOT bump the write-generation (a slide is not an authz change,
+  so it never invalidates any replica's cache). The idle window is adjudicated
+  against a **local monotonic (`steady_clock`) anchor** derived from the DB clock
+  at cache-populate (`derive_session_deadlines`), so it survives a replica
+  restart/failover and ages identically on any replica under arbitrary cross-host
+  skew (DB-clock authority, #3715). (Before HA WS-1/1a the idle state lived only
+  in-memory on a monotonic `steady_clock`; it is now a durable DB-clock-authored
+  column adjudicated on a derived steady deadline, with the JIT-elevation/MFA
+  windows carrying the same treatment plus hard authored-width ceilings — see
+  below.) `AuthManager::session_inactivity_` holds the configured window (set once
+  at startup via `set_session_inactivity`).
 - **Enforcement is in `validate_session`** (the same place the absolute
   `expires_at` is checked, and which already conditionally upgrades its shared
   lock for the opportunistic reap). When the feature is on: a session idle
@@ -393,14 +403,19 @@ auto-reverts — so a compromised everyday session is not a standing admin sessi
   analytics event); `role.elevation.denied` for an ineligible /
   failed-eligibility / not-MFA-enrolled caller.
 - **Effective role** — `auth::effective_role(session)` returns `admin` while
-  `system_clock::now() < elevated_until`, else the base `role`. THE authorization
-  functions gate on it: `require_admin` checks `effective_role`, and
+  `is_elevated(session)` holds, else the base `role`. THE authorization functions
+  gate on it: `require_admin` checks `effective_role`, and
   `require_permission`/`require_scoped_permission` **short-circuit to allow** an
   elevated session (full admin for the window). Since HA WS-1/1a (ADR-2002 §4)
-  `elevated_until` (with its `elevation_issued_at` anchor) is a wall-clock
-  `system_clock` instant **durably persisted** to `SessionStore`, so the
-  elevation **survives a server restart** — it is bounded by a hard
-  `kMaxElevationWindow` (24 h) wall-clock ceiling and by the session's own
+  `elevated_until`/`elevation_issued_ms` are **durably persisted** to
+  `SessionStore` and authored from Postgres `now()` (#3715), so the elevation
+  **survives a server restart** and adjudicates identically on any replica.
+  `is_elevated` decides against a **local monotonic (`steady_clock`) deadline**
+  derived from the DB clock at cache-populate (`derive_session_deadlines`) — with
+  a generous `kWallSanitySkew` wall backstop for `steady_clock`'s suspend-
+  blindness — and REJECTS a grant whose authored width exceeds the hard
+  `kMaxElevationWindow` (24 h) ceiling or whose issued-at is in the future
+  (a backward clock step below the grant). It is also bounded by the session's own
   absolute expiry, and auto-reverts when the window lapses or on explicit
   revoke/logout, but **not** on restart. See `docs/auth-architecture.md` →
   "Durable operator sessions (HA WS-1/1a, ADR-2002 §4)".
