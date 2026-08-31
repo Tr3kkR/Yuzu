@@ -364,13 +364,34 @@ TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a non-zero exit "
 }
 
 TEST_CASE("enumerate_services: the real production entry point runs against "
-          "the live host without throwing",
+          "the live host without throwing, or correctly reports "
+          "IncompleteCaptureError when this host's launchctl genuinely has no "
+          "usable launchd bootstrap context",
           "[tar_service][enumerate][live]") {
     // The real production wiring (enumerate_services() -> enumerate_services_impl
     // with the real run_bounded_subprocess) actually invoking real launchctl
     // on this host -- proves the seam's default argument is genuinely wired,
     // not just the injectable path.
-    REQUIRE_NOTHROW(enumerate_services());
+    //
+    // A sandboxed/bootstrap-less runner can make `launchctl list` genuinely
+    // return exit 1 with empty output -- the collector then correctly
+    // classifies that as IncompleteCaptureError (the completeness contract
+    // this whole branch exists to enforce). An unconditional REQUIRE_NOTHROW
+    // would turn that CORRECT classification into a red test. So probe
+    // launchctl directly first (the same invocation the collector itself
+    // makes) to decide which outcome this host actually supports, then
+    // assert strictly against that -- this still fails if the collector does
+    // the WRONG thing for the launchctl state this host has.
+    yuzu::agent::SubprocessOptions probe_opts;
+    auto probe = yuzu::agent::run_bounded_subprocess({"/bin/launchctl", "list"}, probe_opts);
+    const bool launchctl_usable =
+        probe.tool_ran && probe.exit_code == 0 && !probe.output_truncated;
+
+    if (launchctl_usable) {
+        REQUIRE_NOTHROW(enumerate_services());
+    } else {
+        REQUIRE_THROWS_AS(enumerate_services(), yuzu::tar::IncompleteCaptureError);
+    }
 }
 
 #endif // __APPLE__
