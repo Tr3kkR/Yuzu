@@ -187,8 +187,8 @@ TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operat
     // reason string into target_id, leaving detail empty -- the same
     // slot-swap class cc93f499c fixed for confine_agent_target, but this
     // call site was never fixed. Pre-existing, not touched by #3700's
-    // diff (auth_routes.cpp is unmodified here) -- tracked as a follow-up
-    // issue rather than asserted (right or wrong) by this test.
+    // diff (auth_routes.cpp is unmodified here) -- tracked as issue #3219
+    // rather than asserted (right or wrong) by this test.
     auto rows = r.audit_store.query({});
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);
