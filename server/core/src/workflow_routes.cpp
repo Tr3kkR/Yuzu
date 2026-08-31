@@ -2027,8 +2027,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // forever on dispatch failure. mark_cancelled records the
             // attempt for forensic audit instead of orphaning it as a
             // phantom in-flight run that the LIST handler keeps showing.
-            if (execution_tracker && !execution_id.empty()) {
-                execution_tracker->mark_cancelled(execution_id, session->username);
+            if (execution_tracker && !execution_id.empty() &&
+                !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
+                              execution_id);
             }
             res.status = 500;
             res.set_content(
@@ -2038,8 +2040,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         if (sent == 0) {
-            if (execution_tracker && !execution_id.empty()) {
-                execution_tracker->mark_cancelled(execution_id, session->username);
+            if (execution_tracker && !execution_id.empty() &&
+                !execution_tracker->mark_cancelled(execution_id, session->username)) {
+                spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
+                              execution_id);
             }
             // #881: "no agents reached" now covers a THIRD condition this
             // route cannot see — every target withheld by the containment
@@ -2060,7 +2064,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // count and refresh agents_responded counters now that dispatch
         // has confirmed how many agents the command went to.
         if (execution_tracker && !execution_id.empty()) {
-            execution_tracker->set_agents_targeted(execution_id, sent);
+            if (!execution_tracker->set_agents_targeted(execution_id, sent)) {
+                spdlog::error("workflow_routes: set_agents_targeted failed for execution_id={}",
+                              execution_id);
+            }
         }
 
         // governance R1 happy-LOW-1 (#1088 round): include execution_id

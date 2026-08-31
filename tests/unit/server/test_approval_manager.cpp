@@ -9,51 +9,43 @@
 #include <array>
 #include "approval_manager.hpp"
 #include "mcp_approval_error.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "pg_error_class.hpp"
 #include "reserved_definition_id.hpp"
-#include "migration_runner.hpp"
-#include "sqlite_raii.hpp"
+#include "test_approval_manager_pg_helper.hpp"
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <expected>
-#include <future>
 #include <stdexcept>
-#include <thread>
 #include <string>
 #include <string_view>
 #include <vector>
 
 using namespace yuzu::server;
 
-// ── RAII wrapper for sqlite3* ──────────────────────────────────────────────
-
-struct TestDb {
-    sqlite3* db = nullptr;
-    TestDb() { sqlite3_open(":memory:", &db); }
-    ~TestDb() {
-        if (db)
-            sqlite3_close(db);
-    }
-};
-
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: create_tables succeeds", "[approval_manager][db]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-    REQUIRE(true);
+TEST_CASE("ApprovalManager: construction migrates and opens the store",
+          "[pg][approval_manager][db]") {
+    // The fixture's own constructor already REQUIREs is_open() — this test
+    // exists so a construction failure surfaces here by name rather than as
+    // an opaque fixture assertion inside the first unrelated test that
+    // happens to run.
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    REQUIRE(mgr_bundle->is_open());
 }
 
 // ── Submit ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: submit creates pending approval", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: submit creates pending approval", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result =
         mgr.submit("def-001", "operator1", "ostype = 'windows'", "", ApprovalOrigin::kInstruction);
@@ -61,10 +53,9 @@ TEST_CASE("ApprovalManager: submit creates pending approval", "[approval_manager
     CHECK(!result->empty());
 }
 
-TEST_CASE("ApprovalManager: submitted approval has pending status", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: submitted approval has pending status", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result =
         mgr.submit("def-001", "operator1", "ostype = 'windows'", "", ApprovalOrigin::kInstruction);
@@ -83,10 +74,9 @@ TEST_CASE("ApprovalManager: submitted approval has pending status", "[approval_m
     CHECK(pending[0].reviewed_by.empty());
 }
 
-TEST_CASE("ApprovalManager: submit multiple approvals", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: submit multiple approvals", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     mgr.submit("def-001", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
     mgr.submit("def-002", "operator2", "scope-2", "", ApprovalOrigin::kInstruction);
@@ -98,10 +88,9 @@ TEST_CASE("ApprovalManager: submit multiple approvals", "[approval_manager]") {
 
 // ── Query by Status ────────────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: query by status — pending", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: query by status — pending", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
     mgr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction);
@@ -115,10 +104,9 @@ TEST_CASE("ApprovalManager: query by status — pending", "[approval_manager]") 
     REQUIRE(pending.size() == 2);
 }
 
-TEST_CASE("ApprovalManager: query by status — approved", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: query by status — approved", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto r1 = mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
     mgr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction);
@@ -132,10 +120,9 @@ TEST_CASE("ApprovalManager: query by status — approved", "[approval_manager]")
     CHECK(approved[0].definition_id == "def-1");
 }
 
-TEST_CASE("ApprovalManager: query empty returns empty", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: query empty returns empty", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     ApprovalQuery q;
     q.status = "pending";
@@ -145,10 +132,9 @@ TEST_CASE("ApprovalManager: query empty returns empty", "[approval_manager]") {
 
 // ── Query by submitted_by ──────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: query by submitted_by", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: query by submitted_by", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
     mgr.submit("def-2", "operator2", "scope-2", "", ApprovalOrigin::kInstruction);
@@ -162,18 +148,16 @@ TEST_CASE("ApprovalManager: query by submitted_by", "[approval_manager]") {
 
 // ── Pending Count ──────────────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: pending_count starts at zero", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: pending_count starts at zero", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     CHECK(mgr.pending_count() == 0);
 }
 
-TEST_CASE("ApprovalManager: pending_count increments and decrements", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: pending_count increments and decrements", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
     mgr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction);
@@ -191,10 +175,9 @@ TEST_CASE("ApprovalManager: pending_count increments and decrements", "[approval
 
 // ── Approve ────────────────────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: approve sets status, reviewer, timestamp", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: approve sets status, reviewer, timestamp", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -212,10 +195,9 @@ TEST_CASE("ApprovalManager: approve sets status, reviewer, timestamp", "[approva
     CHECK(approved[0].review_comment == "Approved for deployment");
 }
 
-TEST_CASE("ApprovalManager: approve with empty comment", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: approve with empty comment", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -226,10 +208,9 @@ TEST_CASE("ApprovalManager: approve with empty comment", "[approval_manager]") {
 
 // ── Reject ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: reject sets status, reviewer, comment", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: reject sets status, reviewer, comment", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -249,10 +230,9 @@ TEST_CASE("ApprovalManager: reject sets status, reviewer, comment", "[approval_m
 
 // ── Self-Approval Prevention ───────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: self-approval prevented", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: self-approval prevented", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-1", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -267,10 +247,9 @@ TEST_CASE("ApprovalManager: self-approval prevented", "[approval_manager]") {
 
 // ── Cannot Approve/Reject Already-Reviewed ─────────────────────────────────
 
-TEST_CASE("ApprovalManager: cannot approve already approved", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: cannot approve already approved", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -280,10 +259,9 @@ TEST_CASE("ApprovalManager: cannot approve already approved", "[approval_manager
     CHECK(!approve2.has_value());
 }
 
-TEST_CASE("ApprovalManager: cannot reject already approved", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: cannot reject already approved", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -293,10 +271,9 @@ TEST_CASE("ApprovalManager: cannot reject already approved", "[approval_manager]
     CHECK(!reject_result.has_value());
 }
 
-TEST_CASE("ApprovalManager: cannot approve already rejected", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: cannot approve already rejected", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -306,10 +283,9 @@ TEST_CASE("ApprovalManager: cannot approve already rejected", "[approval_manager
     CHECK(!approve_result.has_value());
 }
 
-TEST_CASE("ApprovalManager: cannot reject already rejected", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: cannot reject already rejected", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
@@ -321,19 +297,17 @@ TEST_CASE("ApprovalManager: cannot reject already rejected", "[approval_manager]
 
 // ── Approve/Reject Nonexistent ─────────────────────────────────────────────
 
-TEST_CASE("ApprovalManager: approve nonexistent ID fails", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: approve nonexistent ID fails", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.approve("nonexistent-id", "admin1", "approving nothing");
     CHECK(!result.has_value());
 }
 
-TEST_CASE("ApprovalManager: reject nonexistent ID fails", "[approval_manager]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+TEST_CASE("ApprovalManager: reject nonexistent ID fails", "[pg][approval_manager]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto result = mgr.reject("nonexistent-id", "admin1", "rejecting nothing");
     CHECK(!result.has_value());
@@ -342,10 +316,9 @@ TEST_CASE("ApprovalManager: reject nonexistent ID fails", "[approval_manager]") 
 // ── Consumption traceability (PR #1796 H3/N2, SOC-2 CC7.2) ─────────────────
 
 TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling principal",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}", "",
                          ApprovalOrigin::kMcp);
@@ -362,10 +335,9 @@ TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling
 }
 
 TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -380,7 +352,7 @@ TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
 }
 
 TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the original consumer",
-          "[approval_manager][approval]") {
+          "[pg][approval_manager][approval]") {
     // Replay by the SAME submitter, deliberately (#2442 submitter binding,
     // added after this test was written): a replay by a DIFFERENT principal
     // would now be refused by the binding check as kForeignSubmitter, BEFORE
@@ -388,9 +360,8 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     // principal here would silently stop testing replay protection at all
     // (the CAS's already-consumed guard could be deleted and this test would
     // still pass, refused for the wrong reason).
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -411,7 +382,7 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
 // definition id is a ticket the MCP gate would accept.
 
 TEST_CASE("ApprovalManager: minting into the mcp. namespace is deliberately NOT refused",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // This asserts an ABSENCE on purpose, so that restoring the mint-time
     // refusal fails here rather than silently stranding operator content.
     //
@@ -422,9 +393,8 @@ TEST_CASE("ApprovalManager: minting into the mcp. namespace is deliberately NOT 
     // schedule between definitions is not supported (#2742). Authoring a NEW
     // definition under the prefix is still refused, at the two authoring sites
     // that call `is_reserved_definition_id`.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
                              ApprovalOrigin::kInstruction);
@@ -443,10 +413,9 @@ TEST_CASE("ApprovalManager: minting into the mcp. namespace is deliberately NOT 
 }
 
 TEST_CASE("ApprovalManager: a declared origin is recorded on the ticket",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto instr = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kInstruction);
     REQUIRE(instr.has_value());
@@ -464,7 +433,7 @@ TEST_CASE("ApprovalManager: a declared origin is recorded on the ticket",
 
 TEST_CASE("ApprovalManager: an undeclared submit still records kUnspecified, and it is "
           "refused at redemption",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // Formerly the TETHER on the kUnspecified exemption ("an undeclared mint
     // records no origin and keeps the mcp. prefix"), back when the MCP gate
     // itself minted through this same undeclared path and the test asserted
@@ -475,9 +444,8 @@ TEST_CASE("ApprovalManager: an undeclared submit still records kUnspecified, and
     // omitting `origin` is now a compile error (no default), so this can only
     // happen via an explicit kUnspecified, and that must still decode and
     // still refuse, exactly like kUnrecognised.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}", "",
                          ApprovalOrigin::kUnspecified);
@@ -494,7 +462,7 @@ TEST_CASE("ApprovalManager: an undeclared submit still records kUnspecified, and
 }
 
 TEST_CASE("ApprovalManager: origin round-trips through its column text",
-          "[approval_manager][approval]") {
+          "[pg][approval_manager][approval]") {
     CHECK(std::string_view(to_string(ApprovalOrigin::kInstruction)) == "instruction");
     CHECK(std::string_view(to_string(ApprovalOrigin::kSchedule)) == "schedule");
     CHECK(std::string_view(to_string(ApprovalOrigin::kMcp)) == "mcp");
@@ -517,58 +485,18 @@ TEST_CASE("ApprovalManager: origin round-trips through its column text",
     CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
 }
 
-TEST_CASE("ApprovalManager: a pre-column row is back-filled to a fail-closed sentinel",
-          "[approval_manager][db][security]") {
-    TestDb tdb;
-    // A v4-shaped store with a row already in it: create_tables() runs v5, v6
-    // AND v7 in one call. v5 adds the column ('' for the existing row); v7 is
-    // what moves it off '', and is the ONLY back-fill — so deleting v7's UPDATE
-    // fails this test. An earlier cut of this branch put the same UPDATE in v5
-    // as well, which made this assertion unable to observe its own subject:
-    // removing either one left the other to produce an identical outcome.
-    REQUIRE(sqlite3_exec(tdb.db,
-                         "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
-                         " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
-                         "INSERT INTO schema_meta (store, version, upgraded_at)"
-                         " VALUES ('approval_manager', 4, 0);"
-                         "CREATE TABLE approvals ("
-                         "id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
-                         "status TEXT NOT NULL DEFAULT 'pending',"
-                         "submitted_by TEXT NOT NULL DEFAULT '',"
-                         "submitted_at INTEGER NOT NULL DEFAULT 0,"
-                         "reviewed_by TEXT NOT NULL DEFAULT '',"
-                         "reviewed_at INTEGER NOT NULL DEFAULT 0,"
-                         "review_comment TEXT NOT NULL DEFAULT '',"
-                         "scope_expression TEXT NOT NULL DEFAULT '',"
-                         "consumed_at INTEGER NOT NULL DEFAULT 0,"
-                         "consumed_by TEXT NOT NULL DEFAULT '',"
-                         "schedule_id TEXT NOT NULL DEFAULT '');"
-                         "INSERT INTO approvals (id, definition_id, status, submitted_by)"
-                         " VALUES ('legacy-1', 'inventory.audit', 'pending', 'operator1');",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
-
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables(); // runs v5, v6 and v7 over the existing table
-    REQUIRE(mgr.is_open());
-
-    auto row = mgr.get("legacy-1");
-    REQUIRE(row.has_value());
-    CHECK(row->definition_id == "inventory.audit");
-    // NOT back-filled to 'instruction': the row is evidence, and its surface is
-    // genuinely unknown. NOT left at '' either: at the time this migration was
-    // written, '' (kUnspecified) was the GRANTING value, so every pre-v5 row
-    // would have stayed cross-surface redeemable — the defect #2442 exists to
-    // close. kUnspecified stopped granting once the MCP mint declared kMcp
-    // (#2442's closing half), but the sentinel is kept distinct from it
-    // regardless: "predates the column" and "declared nothing" are different
-    // facts even now that both refuse. The sentinel claims no surface and
-    // fails closed.
-    CHECK(row->origin == ApprovalOrigin::kUnrecognised);
-    CHECK(declares_non_mcp_surface(row->origin));
-}
+// "a pre-column row is back-filled to a fail-closed sentinel" (the SQLite v4
+// -> v5/v6/v7 migration-ladder back-fill test) is DELETED, not ported —
+// ADR-0065 folds the whole v1..v7 SQLite ladder into one PG v1 DDL
+// (approval_manager.cpp's migrations()), so there is no pre-v5/pre-column
+// intermediate state a fresh Postgres schema can ever be in, and nothing left
+// for a back-fill migration to run against. The DECODE-side property this
+// test also touched (an unrecognised stored value refuses, not grants) is
+// pinned directly below by "a pre-v5 ticket cannot be redeemed" and by
+// "an unrecognised origin column value is refused, not exempted" further down.
 
 TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // THE POPULATION THE GUARD MISSED. A governance reviewer built this by
     // probe: mint through the REST instruction gate under an `mcp.`-prefixed
     // definition id, set origin to the sentinel v7 back-fills, and the recall
@@ -578,18 +506,26 @@ TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall
     // Driven through the store rather than the migration so it fails if the
     // DECODE ever folds an unknown value back into the granting case, not only
     // if the back-fill regresses. The migration half is pinned above.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.quarantine_device", "attacker", "{\"agent_id\":\"a1\"}", "",
                          ApprovalOrigin::kInstruction);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
-    // Rewrite the column to exactly what migration v7 back-fills.
-    const std::string sql = "UPDATE approvals SET origin = 'legacy' WHERE id = '" + *id + "'";
-    REQUIRE(sqlite3_exec(tdb.db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    // Rewrite the column to exactly what the SQLite-era v7 migration used to
+    // back-fill (ADR-0065's port has no such migration on a fresh schema —
+    // see the deleted-test note above — but the STORED VALUE this decodes is
+    // still real data a future binary/corruption could produce).
+    {
+        auto lease = mgr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res = pg::exec_params(
+            lease.get(), "UPDATE approval_manager.approvals SET origin = 'legacy' WHERE id = $1",
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
     REQUIRE(mgr.get(*id)->origin == ApprovalOrigin::kUnrecognised);
 
     auto denied = mgr.consume_ticket(*id, "operator1", {});
@@ -605,10 +541,9 @@ TEST_CASE("ApprovalManager: a pre-v5 ticket cannot be redeemed at the MCP recall
 // human-approved capability on a no-op is the defect being fixed.
 
 TEST_CASE("ApprovalManager: a failing pre-consume recheck denies WITHOUT consuming",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{\"token_id\":\"t1\"}", "",
                          ApprovalOrigin::kMcp);
@@ -631,10 +566,9 @@ TEST_CASE("ApprovalManager: a failing pre-consume recheck denies WITHOUT consumi
 }
 
 TEST_CASE("ApprovalManager: a ticket denied by the recheck is still consumable afterwards",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -658,10 +592,9 @@ TEST_CASE("ApprovalManager: a ticket denied by the recheck is still consumable a
 }
 
 TEST_CASE("ApprovalManager: the pre-consume recheck sees the matched ticket's own row",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}", "",
                          ApprovalOrigin::kMcp);
@@ -684,10 +617,9 @@ TEST_CASE("ApprovalManager: the pre-consume recheck sees the matched ticket's ow
 }
 
 TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running the recheck",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -734,10 +666,9 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
 }
 
 TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-argument overload",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -750,10 +681,9 @@ TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-
 }
 
 TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck overload too",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -774,10 +704,9 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck over
 }
 
 TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during the recheck",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -806,10 +735,9 @@ TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during t
 }
 
 TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does not escape",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -841,10 +769,9 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
 }
 
 TEST_CASE("ApprovalManager: a store failure during the recheck is not reported as spent",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -854,7 +781,14 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
     // get(), which reports a FAILED read and a missing row identically. Drop
     // the table to force a real read failure and confirm the caller is told the
     // store broke, NOT that its human-approved capability is spent.
-    REQUIRE(sqlite3_exec(tdb.db, "DROP TABLE approvals", nullptr, nullptr, nullptr) == SQLITE_OK);
+    {
+        auto lease = mgr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res =
+            pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
 
     bool ran = false;
     auto r = mgr.consume_ticket(*id, "operator1",
@@ -867,136 +801,54 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
     CHECK(!ran); // no row to hand the callback
     // The fault hit BEFORE the precondition block ever runs: consume_ticket's
     // unconditional #2442 origin+submitter binding-check read
-    // (approval_manager.cpp:665-ish) sees the dropped table first, and this
-    // refusal is exactly what #2786 arm 1 says must never be silently
-    // indistinguishable from an ordinary store error — the flag and a
-    // non-zero errcode must ride along.
+    // (approval_manager.cpp's get_checked call ahead of the CAS) sees the
+    // dropped table first, and this refusal is exactly what #2786 arm 1 says
+    // must never be silently indistinguishable from an ordinary store error —
+    // the flag and a real SQLSTATE must ride along.
     CHECK(r.error().binding_check_unevaluated);
-    CHECK(r.error().extended_errcode != 0);
+    CHECK(!r.error().sqlstate.empty());
 
     // And the same read through get_checked directly.
     CHECK(!mgr.get_checked(*id).has_value());
 }
 
-TEST_CASE("ApprovalManager: migration v6 applies to an existing v5 store",
-          "[approval_manager][db]") {
-    TestDb tdb;
-    // A v5-shaped store: every column through `origin`, schema_meta pinned at 5,
-    // and only the four pre-v6 indexes.
-    REQUIRE(sqlite3_exec(tdb.db,
-                         "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
-                         " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
-                         "INSERT INTO schema_meta (store, version, upgraded_at)"
-                         " VALUES ('approval_manager', 5, 0);"
-                         "CREATE TABLE approvals ("
-                         "id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
-                         "status TEXT NOT NULL DEFAULT 'pending',"
-                         "submitted_by TEXT NOT NULL DEFAULT '',"
-                         "submitted_at INTEGER NOT NULL DEFAULT 0,"
-                         "reviewed_by TEXT NOT NULL DEFAULT '',"
-                         "reviewed_at INTEGER NOT NULL DEFAULT 0,"
-                         "review_comment TEXT NOT NULL DEFAULT '',"
-                         "scope_expression TEXT NOT NULL DEFAULT '',"
-                         "consumed_at INTEGER NOT NULL DEFAULT 0,"
-                         "consumed_by TEXT NOT NULL DEFAULT '',"
-                         "schedule_id TEXT NOT NULL DEFAULT '',"
-                         "origin TEXT NOT NULL DEFAULT '');"
-                         "INSERT INTO approvals (id, definition_id, status, submitted_by)"
-                         " VALUES ('v5-row', 'inventory.audit', 'approved', 'operator1');",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
-
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-    REQUIRE(mgr.is_open()); // a failed v6 would null db_ and fail the probes
-
-    // Both v6 indexes exist, and the pre-existing row is untouched.
-    auto has_index = [&tdb](const char* name) {
-        SqliteStmt st;
-        REQUIRE(sqlite3_prepare_v2(tdb.db,
-                                   "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", -1,
-                                   st.addr(), nullptr) == SQLITE_OK);
-        sqlite3_bind_text(st.get(), 1, name, -1, SQLITE_TRANSIENT);
-        return sqlite3_step(st.get()) == SQLITE_ROW;
-    };
-    CHECK(has_index("idx_approvals_status_submitted"));
-    CHECK(has_index("idx_approvals_status_consumed_reviewed"));
-    // And that migration SIX is what put them there: index existence alone
-    // would also hold if v6 were folded back into an earlier migration. Pinned
-    // to the current head rather than to 6 — folding v6 away would renumber the
-    // tail and this still catches it. Bumped to 8 (#1398 hardening — the
-    // target_action content-binding column, migration v8).
-    CHECK(MigrationRunner::current_version(tdb.db, "approval_manager") == 8);
-    auto row = mgr.get("v5-row");
-    REQUIRE(row.has_value());
-    CHECK(row->definition_id == "inventory.audit");
-}
+// "migration v6 applies to an existing v5 store" is DELETED, not ported —
+// same reason as the pre-column back-fill test above: ADR-0065's single PG
+// v1 DDL has no v5/v6 intermediate state, and both indexes it pinned are
+// simply part of that one DDL now (verified by inspection of
+// approval_manager.cpp's migrations(), and exercised incidentally by every
+// other test in this file that hits an indexed query path). The origin/dev
+// SQLite-era counterpart also asserted `current_version(...) == 8` for the
+// #1398 target_plugin/target_action columns — moot for the same reason.
 
 TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
-          "[approval_manager][approval]") {
-    // The callback runs with mtx_ RELEASED, so a precondition that consults the
-    // approval store (a plausible shape: "no newer ticket supersedes this one")
-    // is safe. Under a lock-held design this self-deadlocks on the
-    // non-recursive mutex.
-    //
-    // Three things about the shape below, each from a reviewer who reproduced
-    // the alternative. It runs on its own thread with a bounded wait, because a
-    // deadlocked assertion in the test body hangs the whole binary until the CI
-    // job times out. On timeout the thread is DETACHED before the assertion
-    // fires: a joinable std::thread destroyed during an assertion's unwind
-    // calls std::terminate, which aborts the run and loses every remaining
-    // test — worse than the hang it replaced. And joining instead is not an
-    // option, because by then the thread is genuinely deadlocked.
-    //
-    // Detaching is only safe because the fixture is shared_ptr-owned and
-    // captured BY VALUE: a thread parked on the mutex outlives this scope, and
-    // under by-reference captures it would hold a dangling ApprovalManager and
-    // a closed sqlite3*.
-    struct Fixture {
-        TestDb tdb;
-        ApprovalManager mgr{tdb.db};
-        std::promise<bool> done;
-    };
-    auto fx = std::make_shared<Fixture>();
-    fx->mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    // The callback runs with mtx_ fully released (ADR-0065: mtx_ now scopes
+    // ONLY submit()'s compound cap-check+sweep+insert — see approval_manager.hpp
+    // — so consume_ticket and every read method it calls back into never touch
+    // it at all), so a precondition that consults the approval store (a
+    // plausible shape: "no newer ticket supersedes this one") is safe. The
+    // SQLite-era version of this test needed a background thread + a bounded
+    // timeout because a lock-held design would have self-deadlocked on a
+    // non-recursive mutex; that hazard is now structurally impossible
+    // (consume_ticket's CAS is a single atomic Postgres statement, needing no
+    // app-level lock at all), so a synchronous call suffices to pin the
+    // behavior.
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
-    auto id = fx->mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
-    REQUIRE(fx->mgr.approve(*id, "admin1", "").has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    auto fut = fx->done.get_future();
-    std::thread worker([fx, ticket = *id] {
-        auto consumed = fx->mgr.consume_ticket(
-            ticket, "operator1", [fx](const Approval& a) -> std::expected<void, std::string> {
-                (void)fx->mgr.get(a.id);
-                (void)fx->mgr.pending_count();
-                (void)fx->mgr.query({});
-                return {};
-            });
-        fx->done.set_value(consumed.has_value());
-    });
-
-    // Under `--abort` even a CHECK throws, so the join below can be unwound past.
-    // The guard makes "joined or detached exactly once" true on every path
-    // rather than on the paths we thought of.
-    struct Reaper {
-        std::thread& t;
-        ~Reaper() {
-            if (t.joinable())
-                t.detach();
-        }
-    } reaper{worker};
-
-    const bool finished = fut.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-    if (!finished) {
-        // Deadlocked, so unjoinable. The Fixture outlives this scope through the
-        // worker's own shared_ptr and leaks for the process lifetime — a
-        // deliberate trade on an already-failing run, and the reason the
-        // captures are by value.
-        FAIL("timed out - the precondition ran with mtx_ held, self-deadlocking on the "
-             "non-recursive mutex");
-    }
-    CHECK(fut.get());
-    worker.join();
+    auto consumed = mgr.consume_ticket(
+        *id, "operator1", [&mgr](const Approval& a) -> std::expected<void, std::string> {
+            (void)mgr.get(a.id);
+            (void)mgr.pending_count();
+            (void)mgr.query({});
+            return {};
+        });
+    CHECK(consumed.has_value());
 }
 
 // ── Expiry sweep (PR #1796 N3 + L2) ────────────────────────────────────────
@@ -1008,23 +860,88 @@ TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
 namespace {
 /// Backdate a timestamp column directly — the sweep triggers on the NEXT
 /// submit(), exactly like production (no test-only sweep entry point).
-void backdate(sqlite3* db, const std::string& id, const char* column, int64_t seconds_ago) {
-    auto sql = std::string("UPDATE approvals SET ") + column + " = " + column + " - " +
-               std::to_string(seconds_ago) + " WHERE id = '" + id + "'";
-    REQUIRE(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+/// `column` is a fixed literal at every call site (never caller-supplied
+/// text), so interpolating it into the SQL string carries no injection risk.
+void backdate(pg::PgPool& pool, const std::string& id, const char* column, int64_t seconds_ago) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto sql = std::string("UPDATE approval_manager.approvals SET ") + column + " = " + column +
+               " - $1 WHERE id = $2";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(seconds_ago), id});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
 }
 constexpr int64_t k8Days = 8 * 24 * 3600;
 } // namespace
 
+namespace {
+/// Bulk-inserts `count` pending approvals directly via SQL (bypassing
+/// `submit()`'s own cap, which would refuse past 1000) so cap-boundary tests
+/// stay fast — one INSERT instead of `count` round-trips through submit().
+void seed_pending(pg::PgPool& pool, const std::string& id_prefix, int count, int64_t age_seconds) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto sql = std::string(
+                   "INSERT INTO approval_manager.approvals "
+                   "(id, definition_id, status, submitted_by, submitted_at) "
+                   "SELECT '") +
+               id_prefix +
+               "' || gs, 'def-seeded', 'pending', 'operator1', "
+               "extract(epoch from now())::bigint - $1 "
+               "FROM generate_series(1, $2) AS gs";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{std::to_string(age_seconds), std::to_string(count)});
+    REQUIRE(res.status() == PGRES_COMMAND_OK);
+}
+} // namespace
+
+TEST_CASE("ApprovalManager: a full stale pending queue self-heals on the next submit "
+          "(governance adversarial review 2026-08-31 — was permanently wedged)",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    // At the cap, all 8 days old and expirable.
+    seed_pending(mgr_bundle.pool(), "stale-", ApprovalManager::kMaxPendingApprovals, k8Days);
+
+    // Before the fix, this returned "approval queue is full" and never ran
+    // the expiry sweep, permanently wedging the store.
+    auto id = mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+
+    auto row = mgr.get(*id);
+    REQUIRE(row.has_value());
+    CHECK(row->status == "pending");
+
+    // The stale queue was swept, not just tolerated once.
+    auto pending = mgr.pending_count();
+    CHECK(pending == 1); // only the new one — all kMaxPendingApprovals stale rows expired
+}
+
+TEST_CASE("ApprovalManager: a full queue of NON-stale pending approvals still rejects",
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
+
+    // At the cap, fresh (not expirable) — the cap must still bind when there
+    // is genuinely nothing for the sweep to clear.
+    seed_pending(mgr_bundle.pool(), "fresh-", ApprovalManager::kMaxPendingApprovals,
+                /*age_seconds=*/60);
+
+    auto id = mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction);
+    REQUIRE(!id.has_value());
+    CHECK(id.error().find("queue is full") != std::string::npos);
+}
+
 TEST_CASE("ApprovalManager: stale pending approvals expire on the next submit",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto stale = mgr.submit("def-old", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(stale.has_value());
-    backdate(tdb.db, *stale, "submitted_at", k8Days);
+    backdate(mgr_bundle.pool(), *stale, "submitted_at", k8Days);
 
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
                 .has_value()); // triggers the sweep
@@ -1035,15 +952,14 @@ TEST_CASE("ApprovalManager: stale pending approvals expire on the next submit",
 }
 
 TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after review",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
-    backdate(tdb.db, *id, "reviewed_at", k8Days);
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
 
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
                 .has_value()); // triggers the sweep
@@ -1058,16 +974,15 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
 }
 
 TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
     REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
-    backdate(tdb.db, *id, "reviewed_at", k8Days);
+    backdate(mgr_bundle.pool(), *id, "reviewed_at", k8Days);
 
     REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
                 .has_value()); // triggers the sweep
@@ -1087,10 +1002,9 @@ TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
 // that: they are what stops the guard being dropped or narrowed unnoticed.
 
 TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot be redeemed",
-          "[approval_manager][approval][security]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     // The REST instruction gate: definition id caller-influenced, scope
     // expression caller-supplied verbatim. The mint SUCCEEDS — refusing it here
@@ -1121,10 +1035,9 @@ TEST_CASE("ApprovalManager: a ticket minted by a declared non-MCP surface cannot
 }
 
 TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a distinct message",
-          "[approval_manager][approval][security]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{}", "",
                              ApprovalOrigin::kInstruction);
@@ -1151,12 +1064,11 @@ TEST_CASE("ApprovalManager: the redemption refusal is a distinct kind but not a 
 }
 
 TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still redeems",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // The positive control. Without it, a guard that refused EVERYTHING would
     // pass every assertion above.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto declared = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
                                ApprovalOrigin::kMcp);
@@ -1174,16 +1086,15 @@ TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still
 }
 
 TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption too",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // The guard is keyed on ORIGIN, not on the `mcp.` id prefix — so a REST-
     // minted ticket for an ordinary definition is equally unredeemable through
     // the recall. This is the property that survives the MCP mint changing how
     // it builds its ids, which the prefix rule did not. It costs nothing: no
     // legitimate flow redeems a REST-minted ticket here (the REST gate matches
     // its own approvals by field comparison, it does not call consume_ticket).
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto rest = mgr.submit("inventory.audit", "operator1", "{}", "", ApprovalOrigin::kInstruction);
     REQUIRE(rest.has_value());
@@ -1202,12 +1113,11 @@ TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption 
 // Checked in the SAME store read as the origin check above, not a new one.
 
 TEST_CASE("ApprovalManager: a ticket recalls for the principal it was submitted by",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // The positive control. Without it, a guard that refused EVERYTHING would
     // pass every negative assertion below.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
                          ApprovalOrigin::kMcp);
@@ -1219,10 +1129,9 @@ TEST_CASE("ApprovalManager: a ticket recalls for the principal it was submitted 
 
 TEST_CASE("ApprovalManager: a ticket recalled by a different principal is refused, "
           "even with the correct origin",
-          "[approval_manager][approval][security]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     // Correctly MCP-declared, so this isolates the submitter check from the
     // origin check above it in the same block.
@@ -1253,10 +1162,9 @@ TEST_CASE("ApprovalManager: a ticket recalled by a different principal is refuse
 
 TEST_CASE("ApprovalManager: the foreign-submitter refusal is a distinct kind but not a "
           "distinct message",
-          "[approval_manager][approval][security]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -1277,16 +1185,15 @@ TEST_CASE("ApprovalManager: the foreign-submitter refusal is a distinct kind but
 
 TEST_CASE("ApprovalManager: a ticket wrong on BOTH origin and submitter reports "
           "kForeignOrigin, the more specific fact",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // The origin check runs first in the shared binding block, so it wins
     // when both are true — pinned here rather than left as a claim in a
     // comment. Not a security-relevant choice (both kinds are refused
     // identically to the caller; this only affects which audit token is
     // written), but a future reordering that silently flips it should fail a
     // test, not just a review.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     // Declared non-MCP surface AND a different submitter than the one
     // recalling it — wrong on both axes at once.
@@ -1304,36 +1211,45 @@ TEST_CASE("ApprovalManager: a ticket wrong on BOTH origin and submitter reports 
 
 TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-submitter "
           "ticket's kind — until the fault clears",
-          "[approval_manager][approval][security]") {
-    // Sibling to the origin-check chaos test above (#2786 arm 1), same
-    // mechanism: a second connection holds an exclusive lock so the first
-    // connection's read inside the SAME binding-check block gets a real
-    // SQLITE_BUSY. This time the origin is correctly kMcp and only the
-    // submitter is wrong, isolating that the flag and the eventual
-    // kForeignSubmitter kind both survive sharing the read with the origin
-    // check.
-    yuzu::test::TempDbFile dbfile("yuzu_test_2442_submitter_chaos_");
-    SqliteDb db;
-    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), db.addr()) == SQLITE_OK);
-    ApprovalManager mgr(db.get());
-    mgr.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    // Sibling to the origin-check chaos test below (#2786 arm 1), same
+    // mechanism, ported to Postgres (ADR-0065): a second raw connection holds
+    // an ACCESS EXCLUSIVE table lock, and the store's own pool is built with
+    // a short `lock_timeout_ms` so its blocked read fails with a real,
+    // deterministic SQLSTATE 55P03 (lock_not_available) rather than hanging
+    // (the `test_engine_principal_store.cpp` #2456 precedent for this
+    // technique — a real non-42 SQLSTATE with no sleep/retry loop needed).
+    // This time the origin is correctly kMcp and only the submitter is
+    // wrong, isolating that the flag and the eventual kForeignSubmitter kind
+    // both survive sharing the read with the origin check.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::approval_manager_pg_template);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    ApprovalManager mgr{pool};
+    REQUIRE(mgr.is_open());
 
     auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    SqliteDb locker;
-    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), locker.addr()) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(locker.get(), "BEGIN EXCLUSIVE;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE approval_manager.approvals IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
 
     auto faulted = mgr.consume_ticket(*id, "operator2", {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
-    CHECK((faulted.error().extended_errcode & 0xff) == SQLITE_BUSY);
+    CHECK(faulted.error().sqlstate == "55P03");
     CHECK(faulted.error().binding_check_unevaluated);
 
-    REQUIRE(sqlite3_exec(locker.get(), "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
-    locker.close();
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    locker.reset();
 
     CHECK(mgr.get(*id)->consumed_at == 0); // untouched
 
@@ -1349,10 +1265,9 @@ TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-s
 }
 
 TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition supplied",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
@@ -1365,10 +1280,9 @@ TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition 
 }
 
 TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck path too",
-          "[approval_manager][approval]") {
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+          "[pg][approval_manager][approval]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(id.has_value());
@@ -1389,7 +1303,7 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck path
 }
 
 TEST_CASE("ApprovalManager: a store failure is not reported as spent in the message either",
-          "[approval_manager][approval]") {
+          "[pg][approval_manager][approval]") {
     // The case above pins the KIND on a store failure. This pins the MESSAGE.
     // The kind is what drives the branch: the sole production caller is the MCP
     // recall (grep `consume_ticket(` in server/core/src — one production hit),
@@ -1403,21 +1317,27 @@ TEST_CASE("ApprovalManager: a store failure is not reported as spent in the mess
     // K3/CDX-P2-003) because a future caller picking it would have lost the
     // cross-surface distinction #2442 added. The property it protected is kept
     // here against the typed error.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(sqlite3_exec(tdb.db, "DROP TABLE approvals", nullptr, nullptr, nullptr) == SQLITE_OK);
+    {
+        auto lease = mgr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res =
+            pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
 
     auto flat = mgr.consume_ticket(*id, "operator1", {});
     REQUIRE(!flat.has_value());
     // The property that matters is the negative: it must NOT read as spent, or
-    // an operator is told to discard a live human-approved capability. (A
-    // dropped table fails at prepare, not at step, so the text is "prepare
-    // failed" rather than get_checked's "read failed" — both are kStoreError.)
+    // an operator is told to discard a live human-approved capability. (The
+    // dropped-table query fails inside get_checked's own read, so the text is
+    // "read failed: ..." — still kStoreError either way.)
     CHECK(flat.error().message.find("not consumable") == std::string::npos);
     CHECK(flat.error().message.find("already used") == std::string::npos);
     CHECK(flat.error().message.find("failed") != std::string::npos);
@@ -1427,7 +1347,7 @@ TEST_CASE("ApprovalManager: a store failure is not reported as spent in the mess
 }
 
 TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not exempted",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // The decode used to fold anything unknown into kUnspecified. At the time
     // #2442 first shipped, kUnspecified was the value that GRANTED redemption,
     // so that fold would have made the composite fail OPEN even though the
@@ -1442,14 +1362,19 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
     CHECK(declares_non_mcp_surface(ApprovalOrigin::kUnrecognised));
 
     // End to end: a row written by a newer binary, read back by this one.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
-    REQUIRE(sqlite3_exec(tdb.db, "UPDATE approvals SET origin = 'future_surface'", nullptr, nullptr,
-                         nullptr) == SQLITE_OK);
+    {
+        auto lease = mgr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res = pg::exec_params(
+            lease.get(), "UPDATE approval_manager.approvals SET origin = 'future_surface'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
 
     auto denied = mgr.consume_ticket(*id, "operator1", {});
     REQUIRE(!denied.has_value());
@@ -1458,16 +1383,15 @@ TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not 
 }
 
 TEST_CASE("ApprovalManager: find_pending skips a ticket the recall would refuse",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // sec-F-03. The MCP mint dedups on (definition_id, submitted_by,
     // scope_expression). Since the mint-time namespace refusal was removed, a
     // ticket carrying a declared non-MCP surface can occupy that key — and
     // handing it back returns a ticket the MCP recall will refuse as
     // kForeignOrigin. The admin then reviews and approves a request that can
     // never complete, spending a human approval on a dead flow.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto foreign = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
                               ApprovalOrigin::kInstruction);
@@ -1483,17 +1407,16 @@ TEST_CASE("ApprovalManager: find_pending skips a ticket the recall would refuse"
 }
 
 TEST_CASE("ApprovalManager: find_pending walks past a foreign ticket to a usable one",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // The filter must WALK, not just reject the newest. An older MCP-origin
     // ticket under the same key is a perfectly good dedup hit; skipping it
     // mints a duplicate and re-opens the flooding this dedup exists to bound.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto usable = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(usable.has_value());
-    backdate(tdb.db, *usable, "submitted_at", 60); // older, so the foreign one sorts first
+    backdate(mgr_bundle.pool(), *usable, "submitted_at", 60); // older, so the foreign one sorts first
 
     auto foreign = mgr.submit("mcp.delete_tag", "operator1", "{}", "",
                               ApprovalOrigin::kInstruction);
@@ -1505,89 +1428,14 @@ TEST_CASE("ApprovalManager: find_pending walks past a foreign ticket to a usable
     CHECK(found->origin == ApprovalOrigin::kMcp);
 }
 
-TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
-          "[approval_manager][db][security]") {
-    // A store already at v5 or v6 never re-runs v5, so its pre-column rows keep
-    // '' — the GRANTING value — and only v7 reaches them. That is the population
-    // this fixture pins, and it is why the back-fill cannot live in v5: v5 is
-    // skipped on exactly the databases that need it most.
-    //
-    // Three rows below. Two carry origin='' and are deliberately NOT told apart
-    // from one another — an attempt to do so by submitted_at against
-    // schema_meta.upgraded_at failed, because the runner re-stamps upgraded_at
-    // after every migration; the note further down records why. The third
-    // carries a declared surface and pins that v7's WHERE clause leaves it be.
-    TestDb tdb;
-    REQUIRE(sqlite3_exec(tdb.db,
-                         "CREATE TABLE schema_meta (store TEXT PRIMARY KEY,"
-                         " version INTEGER NOT NULL, upgraded_at INTEGER NOT NULL DEFAULT 0);"
-                         "INSERT INTO schema_meta (store, version, upgraded_at)"
-                         " VALUES ('approval_manager', 5, 1000000);"
-                         "CREATE TABLE approvals ("
-                         "id TEXT PRIMARY KEY, definition_id TEXT NOT NULL,"
-                         "status TEXT NOT NULL DEFAULT 'pending',"
-                         "submitted_by TEXT NOT NULL DEFAULT '',"
-                         "submitted_at INTEGER NOT NULL DEFAULT 0,"
-                         "reviewed_by TEXT NOT NULL DEFAULT '',"
-                         "reviewed_at INTEGER NOT NULL DEFAULT 0,"
-                         "review_comment TEXT NOT NULL DEFAULT '',"
-                         "scope_expression TEXT NOT NULL DEFAULT '',"
-                         "consumed_at INTEGER NOT NULL DEFAULT 0,"
-                         "consumed_by TEXT NOT NULL DEFAULT '',"
-                         "schedule_id TEXT NOT NULL DEFAULT '',"
-                         "origin TEXT NOT NULL DEFAULT '');"
-                         // predates the column: must fail closed
-                         "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
-                         " VALUES ('pre-column', 'mcp.delete_tag', 999999, '');"
-                         // minted AFTER the column existed with no declared origin —
-                         // the live MCP mint. v7 rewrites this row TOO, so it is
-                         // refused after the upgrade. That is the deliberate cost,
-                         // asserted below; do not "fix" the sweep to spare it.
-                         "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
-                         " VALUES ('mcp-mint', 'mcp.delete_tag', 1000001, '');"
-                         // a DECLARED origin: v7's `WHERE origin = ''` must not
-                         // touch it. Without that guard every surface's tickets
-                         // are clobbered to the sentinel and refused.
-                         "INSERT INTO approvals (id, definition_id, submitted_at, origin)"
-                         " VALUES ('declared', 'inventory.audit', 1000002, 'schedule');",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
-
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
-    REQUIRE(mgr.is_open());
-
-    auto pre = mgr.get("pre-column");
-    REQUIRE(pre.has_value());
-    CHECK(pre->origin == ApprovalOrigin::kUnrecognised);
-    CHECK(declares_non_mcp_surface(pre->origin)); // refused at redemption
-
-    // A post-column undeclared mint is rewritten TOO, and that is deliberate.
-    // This assertion started life as an over-reach check — it failed, and the
-    // failure is what proved `submitted_at < upgraded_at` is not a usable
-    // discriminator: every later migration re-stamps `upgraded_at`, so by v7 it
-    // names when v6 finished. Kept, inverted, as a RECORD of why the
-    // discriminator was abandoned — NOT as a barrier against re-attempting it.
-    // A reviewer re-applied the predicate and this suite stayed GREEN: v6
-    // re-stamps `upgraded_at` to now, both fixture rows are stamped in 1970, so
-    // the predicate holds for both and the end state is identical. That is the
-    // same fact that kills the discriminator in production, which is exactly
-    // why no assertion here can catch its return.
-    //
-    // The cost is real and bounded: an undeclared MCP ticket outstanding at
-    // upgrade stops redeeming and must be re-requested. v7 is the sole back-fill
-    // and reaches both populations — a store below v5 (v5 adds the column, v7
-    // rewrites in the same run) and one already at v5 or v6 — so every upgrade
-    // path produces this same outcome.
-    auto live = mgr.get("mcp-mint");
-    REQUIRE(live.has_value());
-    CHECK(live->origin == ApprovalOrigin::kUnrecognised);
-
-    // The WHERE guard. v7 is blunt about '' and must be surgical about
-    // everything else — a declared surface is evidence, not a gap.
-    auto declared = mgr.get("declared");
-    REQUIRE(declared.has_value());
-    CHECK(declared->origin == ApprovalOrigin::kSchedule);
-}
+// "migration v7 reaches a store already at v5" is DELETED, not ported — same
+// reason as the other two SQLite migration-ladder tests above: ADR-0065's
+// single PG v1 DDL has no v5-vs-fresh distinction to reach a population
+// through. The DECODE-side property (an undeclared/unrecognised origin
+// refuses, a declared one doesn't) is pinned directly by "a pre-v5 ticket
+// cannot be redeemed" and "an unrecognised origin column value is refused,
+// not exempted" elsewhere in this file — those exercise the same code path
+// this test exercised through a migration-shaped fixture.
 
 TEST_CASE("consume_denial_reason: every kind maps to its own audit token",
           "[approval_manager][approval][security]") {
@@ -1620,67 +1468,70 @@ TEST_CASE("consume_denial_reason: every kind maps to its own audit token",
             CHECK(std::string(tokens[i]) != std::string(tokens[j]));
 }
 
-// ── is_permanent_sqlite_error (#2786 "PR 1c") ───────────────────────────────
+// ── is_permanent_pg_error (ADR-0065 port of #2786 "PR 1c") ──────────────────
 
-static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_CORRUPT));
-static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_NOTADB));
-static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_READONLY));
-static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_FULL));
-// Extended variants classify with their family — primary-code masking, not an
-// exact-code list, so a future SQLite adding a variant does not silently
-// fall through to the transient arm.
-static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_CORRUPT_VTAB));
-static_assert(yuzu::server::is_permanent_sqlite_error(SQLITE_READONLY_DBMOVED));
+static_assert(yuzu::server::is_permanent_pg_error("42P01")); // undefined_table
+static_assert(yuzu::server::is_permanent_pg_error("42501")); // insufficient_privilege
+static_assert(yuzu::server::is_permanent_pg_error("XX001")); // data_corrupted
+static_assert(yuzu::server::is_permanent_pg_error("XX002")); // index_corrupted
+static_assert(yuzu::server::is_permanent_pg_error("53100")); // disk_full
+static_assert(yuzu::server::is_permanent_pg_error("25006")); // read_only_sql_transaction
 
-static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_BUSY));
-static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_LOCKED));
-static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_ERROR));
-static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_AUTH));
-static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_IOERR));
-static_assert(!yuzu::server::is_permanent_sqlite_error(SQLITE_CANTOPEN));
-static_assert(!yuzu::server::is_permanent_sqlite_error(0)); // not a SQLite fault
+static_assert(!yuzu::server::is_permanent_pg_error("55P03")); // lock_not_available
+static_assert(!yuzu::server::is_permanent_pg_error("40001")); // serialization_failure
+static_assert(!yuzu::server::is_permanent_pg_error("40P01")); // deadlock_detected
+static_assert(!yuzu::server::is_permanent_pg_error("57014")); // query_canceled
+static_assert(!yuzu::server::is_permanent_pg_error("08006")); // connection_failure
+static_assert(!yuzu::server::is_permanent_pg_error("P0001")); // raise_exception
+static_assert(!yuzu::server::is_permanent_pg_error("")); // not a Postgres fault
 
 // ── #2786 arm 1: the origin check's own fault must not mask a forgery ──────
 
 TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is flagged, "
           "and the forgery signal fires once it clears",
-          "[approval_manager][approval][security]") {
-    // CH-5 (governance Gate 5 chaos design): fault-inject the origin check's
-    // SELECT with a real SQLITE_BUSY, on a NON-MCP-origin ticket, and confirm
-    // the flag/errcode ride along, and that redemption still correctly
-    // reports kForeignOrigin once the fault clears.
-    yuzu::test::TempDbFile dbfile("yuzu_test_2786_ch5_");
-    SqliteDb db;
-    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), db.addr()) == SQLITE_OK);
-    ApprovalManager mgr(db.get());
-    mgr.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    // CH-5 (governance Gate 5 chaos design), ported to Postgres (ADR-0065):
+    // fault-inject the origin check's SELECT with a real, deterministic
+    // SQLSTATE 55P03 (see the submitter-chaos test above for the technique),
+    // on a NON-MCP-origin ticket, and confirm the flag/sqlstate ride along,
+    // and that redemption still correctly reports kForeignOrigin once the
+    // fault clears.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::approval_manager_pg_template);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 2, .lock_timeout_ms = 100}};
+    REQUIRE(pool.valid());
+    ApprovalManager mgr{pool};
+    REQUIRE(mgr.is_open());
 
     auto forged = mgr.submit("mcp.quarantine_device", "attacker", "{}", "",
                              ApprovalOrigin::kInstruction);
     REQUIRE(forged.has_value());
     REQUIRE(mgr.approve(*forged, "admin1", "").has_value());
 
-    // A second connection to the SAME file holds an exclusive write lock, so
-    // the first connection's read inside consume_ticket's origin+submitter
-    // binding check gets a real SQLITE_BUSY (rollback-journal default, no
-    // busy_timeout set on either connection — deterministic, no sleep/retry
-    // loop needed).
-    SqliteDb locker;
-    REQUIRE(sqlite3_open(dbfile.path.string().c_str(), locker.addr()) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(locker.get(), "BEGIN EXCLUSIVE;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    // A second raw connection holds an ACCESS EXCLUSIVE table lock, so the
+    // pooled connection's read inside consume_ticket's origin+submitter
+    // binding check blocks and times out deterministically at 100ms.
+    pg::PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE approval_manager.approvals IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
 
     auto faulted = mgr.consume_ticket(*forged, "attacker", {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
-    CHECK((faulted.error().extended_errcode & 0xff) == SQLITE_BUSY);
+    CHECK(faulted.error().sqlstate == "55P03");
     CHECK(faulted.error().binding_check_unevaluated);
-    CHECK(!yuzu::server::is_permanent_sqlite_error(faulted.error().extended_errcode));
+    CHECK(!yuzu::server::is_permanent_pg_error(faulted.error().sqlstate));
     // Cannot check "untouched" here: `locker` still holds the exclusive lock,
     // so a read would fault identically to the write above. Checked below,
     // once the lock releases.
 
-    REQUIRE(sqlite3_exec(locker.get(), "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
-    locker.close();
+    REQUIRE(pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{}).status() ==
+            PGRES_COMMAND_OK);
+    locker.reset();
 
     // Untouched: the fault must not have burned the ticket.
     CHECK(mgr.get(*forged)->consumed_at == 0);
@@ -1696,29 +1547,47 @@ TEST_CASE("ApprovalManager: a genuinely transient fault at the origin check is f
 
 TEST_CASE("ApprovalManager: a CAS-step fault after a passing binding check does NOT flag "
           "the binding as unevaluated",
-          "[approval_manager][approval][security]") {
+          "[pg][approval_manager][approval][security]") {
     // Negative control: binding_check_unevaluated must be scoped to the
     // origin+submitter binding check's own read, not to "consume_ticket
     // failed for any store reason". A fault that hits only the consuming
     // UPDATE, after the binding check already passed, must not trip the
-    // masked-denial signal.
-    TestDb tdb;
-    ApprovalManager mgr(tdb.db);
-    mgr.create_tables();
+    // masked-denial signal. Ported to Postgres (ADR-0065) via a real
+    // BEFORE UPDATE trigger — the direct analogue of the SQLite
+    // `RAISE(ABORT, ...)` trigger this replaces, and unlike the two chaos
+    // tests above, works regardless of which connection issues the UPDATE
+    // (a trigger fires for every writer, not just one blocked on a lock).
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& mgr = *mgr_bundle;
 
     auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
-    REQUIRE(sqlite3_exec(tdb.db,
-                         "CREATE TRIGGER approvals_block_update BEFORE UPDATE ON approvals "
-                         "BEGIN SELECT RAISE(ABORT, 'fault injected'); END;",
-                         nullptr, nullptr, nullptr) == SQLITE_OK);
+    {
+        // PQexecParams (what pg::exec_params wraps) accepts exactly ONE SQL
+        // command per call, unlike PQexec — two statements each.
+        auto lease = mgr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult fn = pg::exec_params(
+            lease.get(),
+            "CREATE OR REPLACE FUNCTION approval_manager.block_update() RETURNS trigger AS $$ "
+            "BEGIN RAISE EXCEPTION 'fault injected'; END; $$ LANGUAGE plpgsql",
+            std::vector<std::string>{});
+        REQUIRE(fn.status() == PGRES_COMMAND_OK);
+        pg::PgResult trig = pg::exec_params(
+            lease.get(),
+            "CREATE TRIGGER approvals_block_update BEFORE UPDATE ON approval_manager.approvals "
+            "FOR EACH ROW EXECUTE FUNCTION approval_manager.block_update()",
+            std::vector<std::string>{});
+        REQUIRE(trig.status() == PGRES_COMMAND_OK);
+    }
 
     auto faulted = mgr.consume_ticket(*id, "operator1", {});
     REQUIRE(!faulted.has_value());
     CHECK(faulted.error().kind == ConsumeFailure::kStoreError);
-    CHECK(faulted.error().extended_errcode != 0);
+    CHECK(!faulted.error().sqlstate.empty());
+    CHECK(faulted.error().sqlstate == "P0001"); // plpgsql RAISE EXCEPTION
     CHECK(!faulted.error().binding_check_unevaluated); // binding check passed before the CAS ran
     CHECK(mgr.get(*id)->consumed_at == 0);
 }
@@ -1757,7 +1626,15 @@ static_assert(!yuzu::server::mcp::ApprovalA4Error<MutableOnlyProbe>);
 
 TEST_CASE("approval_store_error_body: a permanent failure is not described as temporary",
           "[approval_manager][approval][security]") {
-    ApprovalManager closed(nullptr); // store never opened - cannot recover without an operator
+    // A store that never opened, ported to Postgres (ADR-0065): an
+    // unreachable port fails construction's own connect attempt
+    // deterministically (test_engine_principal_store.cpp's #2456 precedent)
+    // — no live database needed, so this test carries no [pg] tag.
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid()); // conninfo parses; the host is just unreachable
+    ApprovalManager closed(unreachable);
     REQUIRE(!closed.is_open());
 
     int seen_code = 0;
@@ -1772,7 +1649,7 @@ TEST_CASE("approval_store_error_body: a permanent failure is not described as te
         return std::string("body");
     };
 
-    (void)yuzu::server::mcp::approval_store_error_body(closed, probe, /*extended_errcode=*/0);
+    (void)yuzu::server::mcp::approval_store_error_body(closed, probe, /*sqlstate=*/"");
 
     CHECK(seen_code == yuzu::server::mcp::kInternalError);
     CHECK(seen_message.find("temporarily") == std::string::npos);
@@ -1786,13 +1663,13 @@ TEST_CASE("approval_store_error_body: a permanent failure is not described as te
 
 TEST_CASE("approval_store_error_body: an OPEN store failing permanently is also not "
           "described as temporary",
-          "[approval_manager][approval][security]") {
-    // #2786 "PR 1c": the store handle itself is fine, but a read against it is
-    // failing in a way an unchanged retry cannot clear. Same permanent body as
-    // a never-opened store — see mcp_approval_error.hpp's discriminator.
-    TestDb tdb;
-    ApprovalManager open(tdb.db);
-    open.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    // ADR-0065 port of #2786 "PR 1c": the store handle itself is fine, but a
+    // read against it is failing in a way an unchanged retry cannot clear.
+    // Same permanent body as a never-opened store — see
+    // mcp_approval_error.hpp's discriminator.
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& open = *mgr_bundle;
     REQUIRE(open.is_open());
 
     int seen_code = 0;
@@ -1807,7 +1684,7 @@ TEST_CASE("approval_store_error_body: an OPEN store failing permanently is also 
         return std::string("body");
     };
 
-    (void)yuzu::server::mcp::approval_store_error_body(open, probe, SQLITE_CORRUPT);
+    (void)yuzu::server::mcp::approval_store_error_body(open, probe, "42P01");
 
     CHECK(seen_code == yuzu::server::mcp::kInternalError);
     CHECK(seen_message.find("temporarily") == std::string::npos);
@@ -1816,10 +1693,9 @@ TEST_CASE("approval_store_error_body: an OPEN store failing permanently is also 
 }
 
 TEST_CASE("approval_store_error_body: a transient failure carries a machine-readable retry",
-          "[approval_manager][approval][security]") {
-    TestDb tdb;
-    ApprovalManager open(tdb.db);
-    open.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& open = *mgr_bundle;
     REQUIRE(open.is_open());
 
     std::string seen_message, seen_remediation;
@@ -1832,7 +1708,7 @@ TEST_CASE("approval_store_error_body: a transient failure carries a machine-read
         return std::string("body");
     };
 
-    (void)yuzu::server::mcp::approval_store_error_body(open, probe, /*extended_errcode=*/0);
+    (void)yuzu::server::mcp::approval_store_error_body(open, probe, /*sqlstate=*/"");
 
     CHECK(seen_message.find("temporarily") != std::string::npos);
     CHECK(seen_remediation.find("do NOT request a fresh one") != std::string::npos);
@@ -1842,14 +1718,14 @@ TEST_CASE("approval_store_error_body: a transient failure carries a machine-read
     CHECK(seen_retry == 5000);
 }
 
-TEST_CASE("approval_store_error_body: a genuinely transient errcode still gets the "
+TEST_CASE("approval_store_error_body: a genuinely transient sqlstate still gets the "
           "retryable arm",
-          "[approval_manager][approval][security]") {
-    // Negative control for the #2786 "PR 1c" classifier: BUSY must NOT be
-    // swept into the permanent arm alongside CORRUPT/NOTADB/READONLY/FULL.
-    TestDb tdb;
-    ApprovalManager open(tdb.db);
-    open.create_tables();
+          "[pg][approval_manager][approval][security]") {
+    // Negative control for the ADR-0065 port of the #2786 "PR 1c" classifier:
+    // a lock-contention SQLSTATE must NOT be swept into the permanent arm
+    // alongside the schema-drift/corruption/disk-full/read-only classes.
+    yuzu::test::ApprovalManagerPg mgr_bundle;
+    ApprovalManager& open = *mgr_bundle;
     REQUIRE(open.is_open());
 
     std::string seen_message, seen_remediation;
@@ -1862,7 +1738,7 @@ TEST_CASE("approval_store_error_body: a genuinely transient errcode still gets t
         return std::string("body");
     };
 
-    (void)yuzu::server::mcp::approval_store_error_body(open, probe, SQLITE_BUSY);
+    (void)yuzu::server::mcp::approval_store_error_body(open, probe, "55P03");
 
     CHECK(seen_message.find("temporarily") != std::string::npos);
     CHECK(seen_retry == 5000);
