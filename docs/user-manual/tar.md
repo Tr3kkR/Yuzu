@@ -416,6 +416,8 @@ POST /api/v1/instructions/execute
 }
 ```
 
+**Partial captures never fabricate events.** If a subprocess-backed leg (`systemctl`/`launchctl`/`smbstatus`/`journalctl`/`wevtutil`) or a procfs/`getfsstat` read fails or is truncated mid-capture, that tick's diff is skipped and the prior baseline is retained — no appeared/removed events are fabricated from a partial read. A rate-limited warning is logged; `tar.status` shows no dedicated counter for this today.
+
 ## Performance impact
 
 TAR is designed for minimal performance overhead:

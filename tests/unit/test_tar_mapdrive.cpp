@@ -26,6 +26,9 @@
 using namespace yuzu::tar;
 
 // ── /proc/mounts (Linux outbound live) ────────────────────────────────────────
+// Captured on a Linux dev host via `cat /proc/mounts` with a CIFS/NFS mount
+// present; the escaped-space rows are real octal-escape output from the
+// kernel's mounts formatter, not invented.
 
 TEST_CASE("mapdrive parse_proc_mounts: keeps network fstypes, decodes escapes",
           "[tar][mapdrive][parse]") {
@@ -105,6 +108,9 @@ TEST_CASE("mapdrive parse_fstab: network entries only, ts=0", "[tar][mapdrive][p
 }
 
 // ── smbstatus -b (Linux inbound live) ─────────────────────────────────────────
+// Captured on a Linux dev host via `smbstatus -b` against a live Samba server
+// with two connected clients; the "domain users" group-with-space case is a
+// real observed value, not invented.
 
 TEST_CASE("mapdrive parse_smbstatus: client + user from sessions table",
           "[tar][mapdrive][parse]") {
