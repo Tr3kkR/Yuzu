@@ -206,11 +206,24 @@ static void on_signal(int sig) {
         // purpose is to work when everything else is wedged became the thing that wedged. The
         // operator still gets out: the process dies immediately. BE HONEST ABOUT WHAT IS LOST —
         // the banner is not relocated anywhere, it is GONE, and exit 1 here is indistinguishable
-        // from a startup failure. A second signal therefore produces no diagnostic at all. The
-        // internal shutdown deadline that was meant to carry that diagnosis (on an ordinary
-        // thread, where logging is safe) is deferred to a separate PR; until it lands, a wedged
-        // stop is diagnosed from the supervisor's log and the absence of "Yuzu agent stopped".
-        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7; consistency, this PR.)
+        // from a startup failure. A second signal therefore produces no diagnostic at all.
+        // #2233 item 3 ("S+"): the internal shutdown deadline that was meant to carry that
+        // diagnosis has landed (agents/core/src/shutdown_deadline_guard.hpp), but it fires
+        // hard_exit(kShutdownDeadlineExitCode) from a DETACHED worker thread, not from an
+        // "ordinary thread where logging is safe" in the sense this comment originally meant —
+        // it still does not log, for the same blocking-pipe reason this handler doesn't. A
+        // wedged stop is diagnosed from the supervisor's log, the absence of "Yuzu agent
+        // stopped", and usually also the process's own exit code (4 = the deadline fired,
+        // vs. this handler's exit 1, vs. F3's exit 3) — "usually", not reliably: a genuinely
+        // wedged stop can trigger BOTH this handler (an operator sending a second signal) AND
+        // the watchdog above for the SAME wedge, and whichever one's exit call the kernel
+        // schedules first wins — governance Gate 5 chaos-injector reproduced this empirically
+        // across many repeated trials: always exactly one of the two codes, never a third
+        // value or a crash, but genuinely nondeterministic which one — see this PR's
+        // governance record for the exact trial counts. Treat the
+        // exit code as a useful hint, not a certain diagnosis, when both paths could plausibly
+        // have fired.
+        // (governance: security-guardian MEDIUM-2, unhappy-path UP-C7, chaos-injector; this PR.)
         // See hard_exit.hpp: TerminateProcess on Windows (no DllMain, no loader
         // lock), ::_exit() on POSIX (async-signal-safe, cannot block).
         yuzu::agent::hard_exit(1);
@@ -836,7 +849,10 @@ int main(int argc, char* argv[]) {
     // it. main would then return and destroy the Agent while stop() is reading its members.
     // Taking g_agent_mu (which on_signal holds ACROSS stop()) makes this BLOCK until any
     // in-flight stop() has returned. That is the barrier POSIX already gets from
-    // ~ShutdownWatcher's join(), and the one service_win.cpp has had since #1822.
+    // ~ShutdownWatcher's join(), and the one service_win.cpp has had since #1822. #2233 item 3
+    // ("S+") now bounds that in-flight stop() from the OUTSIDE too (a ShutdownDeadlineGuard
+    // hard_exit()s the whole process if it doesn't return within the grace period) - this
+    // g_agent_mu barrier is still required for the ORDINARY case where stop() returns in time.
     // (governance Gate-8 round 8 unhappy-path UP8-1.)
 #ifdef _WIN32
     {

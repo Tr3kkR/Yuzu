@@ -985,6 +985,78 @@ API response is now a hard sync failure (surfaced in
 group sync — this closes a gap the deletion behavior above would otherwise
 have introduced (a transient Graph glitch wiping every synced group).
 
+## ⚠️ Behaviour change: schedules, approvals, and execution history reset on Postgres cutover (ADR-0065)
+
+`ScheduleEngine`, `ApprovalManager`, and `ExecutionTracker` move from the
+shared SQLite `instructions.db` file (via `InstructionDbPool`) to their own
+independent PostgreSQL schemas in this release (migration-programme PR 5,
+the last of the components the postgres-migration ladder had never tracked
+— `WorkflowEngine`/ADR-0064 having already made the same move in PR 4 —
+schemas `schedule_engine`, `approval_manager`, `execution_tracker`
+respectively). This is a **fresh-start cutover with no data migration**
+(ADR-0009) — the legacy `instructions.db` is **never read** for data on
+upgrade. `InstructionDbPool` itself is deleted; `instructions.db` is retired
+and no Yuzu store writes to it again.
+
+**Before upgrading, capture what you'll lose** (none of it carries over):
+`GET /api/schedules`, `GET /api/approvals`, and `GET /api/executions` are
+safe, non-mutating reads — use them to record your active recurring
+schedules and any outstanding (pending or approved-but-unconsumed) approval
+tickets before you cut over, so you know what to re-create afterward rather
+than discovering gaps after the fact. `GET /api/executions` defaults to the
+100 most recent rows (`?limit=<N>` to raise it — there is no offset/cursor
+parameter) — for a fleet with more history than that, raise the limit
+before relying on this as a full capture. The retired `instructions.db` file is **left on disk,
+not deleted** — if you need to recover consumed-approval audit evidence
+(the `submitted_by → reviewed_by → consumed_by` chain) after upgrading,
+that file is the most complete source (the audit store also carries
+`approval.approve`/`approval.reject` and `mcp.<tool>` consume events for
+the same tickets, but not the full row); back it up separately before any
+unrelated disk cleanup removes it, since Yuzu itself never will.
+
+**What happens on first PG boot:**
+- The server logs three one-time lines — `ScheduleEngine initialized (schema
+  schedule_engine) — fresh start, no legacy backfill`, similarly for
+  `ApprovalManager`/`approval_manager`, and `ExecutionTracker`/
+  `execution_tracker` — plus a separate warning naming a row count for any
+  of `schedules`/`approvals`/`executions`/`agent_exec_status` still present
+  in the legacy `instructions.db`.
+- `GET /api/schedules` starts empty. **Operator action required:** re-create
+  any recurring schedules via `POST /api/schedules`.
+- Any MCP or REST instruction-approval ticket pending, approved-but-unconsumed,
+  or already consumed at the moment of cutover is gone. **Operator action
+  required:** a pending approval must be re-requested by whatever flow
+  originally submitted it (MCP `execute_instruction`'s approval gate, a
+  scheduled run requiring approval, or a direct REST submission) — there is
+  no way to recover an in-flight ticket across the cutover. Consumed-ticket
+  audit history (the `submitted_by → reviewed_by → consumed_by` evidence
+  chain) does not carry forward either.
+- The executions drawer, REST execution routes (`GET /api/v1/executions/{id}`,
+  `GET /api/v1/execution-statistics` + its `/agents`/`/definitions` sub-routes),
+  and MCP execution-status tools
+  (`get_execution_status`, `query_responses`'s execution-id join) all start
+  empty. No gRPC `CommandResponse` in flight at the exact moment of upgrade
+  has anywhere to land until the next dispatch. No operator action required
+  — new executions populate normally from first boot.
+- `/readyz` now lists all three stores (`ExecutionTracker` was already
+  present, re-keyed off its own `is_open()` instead of the shared pool's);
+  `/healthz` gains net-new `schedule_engine` and `execution_tracker` rows —
+  neither was ever reported there before this release (`ApprovalManager` was
+  already in both, unchanged).
+
+**Also in this release:** `advance_schedule`'s locked select-then-compute-
+then-update collapses into one atomic `UPDATE ... RETURNING`, closing a
+two-statement race an app-level lock previously covered — no operator-visible
+behavior change. `ExecutionTracker`'s one `sqlite3_changes()` call (gating
+the terminal-transition SSE event on the shared SQLite connection) is closed
+via `UPDATE ... RETURNING`, fixing a latent race under concurrent callers —
+also no operator-visible change; the executions-history SSE contract
+(progress-before-terminal event ordering) is unchanged. The MCP approval
+error envelope's permanent-vs-transient discriminator changes internally
+from a raw SQLite extended error code to a Postgres SQLSTATE string — the
+same two response shapes are still chosen by the same rule, so no client
+migration is needed.
+
 ## ⚠️ Behaviour change: buffered analytics events reset on Postgres cutover (ADR-0049)
 
 `AnalyticsEventStore` (the outbox spool behind `/api/analytics/status` and
@@ -2711,6 +2783,21 @@ Before upgrading any component:
   force-kill them; send one signal and wait instead. On Windows a second Ctrl-C
   also terminates promptly. See *Stopping a wedged agent* in
   [Server Administration](server-admin.md).
+- [ ] **New agent shutdown watchdog (#2233 item 3, "S+"):** on upgrade, both
+  `AgentImpl::stop()` and the agent's own `run()`-exit teardown arm a 20-second
+  internal deadline; if guardian/spark/DEX teardown or any other blocking step
+  hasn't returned within it, the agent self-terminates (`hard_exit`, **exit
+  code 4** — new, distinct from the existing codes 1 and 3 above) instead of
+  hanging indefinitely. You do not need to send a second signal to recover from
+  this class of wedge — sending one just makes the exit happen sooner (code 1)
+  instead of after the 20s deadline (code 4); which code is actually reported
+  is a race if both happen for the same wedge, so treat it as a hint, not a
+  certain diagnosis. On Windows, `sc stop`/service shutdown is now also bounded
+  by the same 20s watchdog; the agent's `--install-service` recovery-actions
+  configuration (#1822) auto-restarts on a watchdog fire similarly to the
+  Linux `Restart=always` unit, but the exit shows up as a generic unexpected
+  termination rather than one of the SCM's own "specific error" buckets. See
+  *Stopping a wedged agent* in [Server Administration](server-admin.md).
 - [ ] **Changed server signal handling (Linux/macOS, #3007):** the identical fix
   as above, now applied to the server — graceful shutdown runs on a dedicated
   watcher thread (fixes the same abort/hang class on `SIGTERM`, previously
