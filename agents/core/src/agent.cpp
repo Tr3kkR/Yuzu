@@ -118,14 +118,39 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // OWN guardian_->stop() re-run to <20s without firing — up to ~40s total elapsed before
 // either individually reaches its own floor, exceeding the 30s SCM hint with NEITHER
 // watchdog firing (external review, PR #3737, verified against this exact call graph).
-// Accepted, not fixed here: the process is never actually stuck (each watchdog still
-// bounds ITS OWN phase, and the SCM's own timeout, if it fires first, does not leave the
-// process running); the consequence is the SCM reporting a slow/failed stop, which the
-// agent's own --install-service recovery-actions config (below) already auto-restarts —
-// a Restart=always-equivalent, not a permanent failure. Making the two watchdogs
-// composition-aware (deriving W2's budget from elapsed-time-since-stop()-began) is
-// deliberately deferred — it needs a design and its own review, not a quick patch to an
-// externally-reviewed primitive — grouped with the other open #2233 watchdog-tuning items.
+// Accepted, not fixed here: in this specific composed-but-neither-fires case the process
+// is NOT stuck — both phases genuinely complete, just slowly, and the agent reaches a
+// normal SERVICE_STOPPED/NO_ERROR report. Per SERVICE_FAILURE_ACTIONS_FLAG's documented
+// semantics (verified directly, not re-derived from this file), --install-service's
+// recovery actions (below) fire ONLY on a process that terminates without reporting
+// SERVICE_STOPPED, or reports it with a non-zero exit code — a slow-but-clean stop
+// satisfies neither, so NO restart fires here (an earlier revision of this comment
+// wrongly claimed one always does — corrected against Microsoft's own documented flag
+// semantics). The actual consequence is milder than a restart: the service simply
+// reports STOPPED later than the SCM's hint anticipated, no automatic action either way.
+// If either watchdog instead genuinely FIRES (hard_exit(4)), the separate auto-restart
+// claim below is unaffected — a TerminateProcess exit never reports SERVICE_STOPPED,
+// which IS the recovery-actions trigger condition.
+//
+// This two-watchdog analysis does NOT cover every hang: the reconnect loop's own inline
+// final-teardown block (trigger_engine_.stop() + the per-plugin shutdown() loop, see that
+// code) runs on run()'s own thread BETWEEN stop_requested_ being noticed and the ScopeExit
+// even arming its watchdog (W2) — if a plugin's shutdown() hangs there, run() never
+// returns, W2 never arms, and NEITHER watchdog catches it (external review, PR #3737).
+// Pre-existing, not introduced by this PR; tracked as #3756 item 3 alongside the
+// composition-aware-budget design work, not fixed here.
+//
+// Also unwatched by this analysis: the OTA self-stop path can race stop_mu_ against an
+// external trigger — a caller that blocks on the mutex is still bounded by ITS OWN
+// already-armed watchdog, so purely losing that race can independently hard_exit() the
+// whole process even while the winning call was healthy (external review, PR #3737).
+// Same outcome bucket as the composition case (an extra restart, not a hang) but a
+// different trigger worth naming.
+//
+// Making the two watchdogs composition-aware (deriving W2's budget from
+// elapsed-time-since-stop()-began) is deliberately deferred — it needs a design and its
+// own review, not a quick patch to an externally-reviewed primitive — grouped with the
+// other open #2233 watchdog-tuning items as #3756.
 // That margin matters on Windows regardless: --install-service's own
 // SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 — SC_ACTION_RESTART x3, and
 // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it also fires on a clean exit with no
