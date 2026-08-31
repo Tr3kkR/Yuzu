@@ -82,10 +82,17 @@
 #include <cstdint>
 #include <cstring> // std::memcpy (spawn_errno decode below)
 
+// Unconditional (both platforms): BR-005's Windows-side inherit_parent_env
+// filter logs a withheld-var line the same way the POSIX backend does, so
+// spdlog must be visible on the Windows compile path too -- it was
+// previously nested inside the #ifndef _WIN32 block below, which built fine
+// on POSIX (where every spdlog:: call site lives) but left the later
+// Windows-side spdlog::debug() call with no declaration at all, undetected
+// locally because this TU is only actually Windows-compiled in CI.
+#include <spdlog/spdlog.h>
+
 #ifndef _WIN32
 #include <yuzu/agent/fork_lock.hpp>
-
-#include <spdlog/spdlog.h>
 
 #include <cerrno>
 #include <csignal>
@@ -137,6 +144,21 @@
 // above) for a real locale-independent Unicode ordinal comparison, so
 // neither <cctype> nor <cwctype> is needed in this branch any more.
 #include <memory> // std::unique_ptr -- BR-004 GetEnvironmentStringsW RAII owner below
+#endif
+
+#if !defined(_WIN32) && !defined(__APPLE__)
+// POSIX guarantees this variable exists but NOT that any header declares
+// it without a feature-test macro (glibc only exposes it via <unistd.h>
+// under _GNU_SOURCE; musl/other libcs vary) -- declare it explicitly rather
+// than depend on an include-order accident. Declared at TRUE FILE SCOPE,
+// outside every namespace: libc's `environ` is a plain, unmangled C global.
+// An `extern` re-declaration inside a C++ namespace -- named or anonymous --
+// mangles into that namespace's own symbol name instead of binding to the
+// real libc one, so a strict linker (mold) reports it undefined at link
+// time rather than silently resolving to garbage. Caught only on Linux CI:
+// this whole branch is `#if !defined(__APPLE__)`, so macOS never compiles
+// it locally, and Windows never reaches this leg either.
+extern char** environ;
 #endif
 
 namespace yuzu::agent {
@@ -587,20 +609,13 @@ void wait_for_activity(int read_fd, int err_read_fd, int pidfd, long nanos) {
 // (crt_externs.h, included above under __APPLE__) or risk an unresolved
 // symbol / wrong-image environ at link or load time. glibc/other POSIX
 // exposes `environ` to any translation unit that declares it extern, no
-// such indirection needed.
-#if !defined(__APPLE__)
-// POSIX guarantees this variable exists but NOT that any header declares
-// it without a feature-test macro (glibc only exposes it via <unistd.h>
-// under _GNU_SOURCE; musl/other libcs vary) -- declare it explicitly rather
-// than depend on an include-order accident.
-extern char** environ;
-#endif
-
+// such indirection needed. The `extern` declaration itself lives at true
+// file scope, above -- see that declaration's own comment for why.
 char** current_environ() {
 #if defined(__APPLE__)
     return *_NSGetEnviron();
 #else
-    return environ;
+    return ::environ;
 #endif
 }
 
