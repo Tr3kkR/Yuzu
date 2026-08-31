@@ -169,7 +169,13 @@ std::vector<ServiceInfo> enumerate_services() {
         // this one row's startup_type field to "unknown" -- the service's
         // name/status are still real and the overall snapshot is still
         // complete, so this is NOT an incomplete-capture condition (unlike
-        // the SCM-wide failures above).
+        // the SCM-wide failures above). But "unknown" from a FAILED query is
+        // not the same fact as "unknown" from a query that succeeded and
+        // genuinely reported an unrecognised start type -- only the latter
+        // is a legitimate observation. startup_type_query_failed marks the
+        // former so the diff layer (compute_service_events/
+        // compute_service_diff in tar_diff.cpp) never treats it as an
+        // authoritative value change (Finding 3, adversarial-review round 5).
         ScHandleGuard svc_guard{OpenServiceW(scm, entries[i].lpServiceName, SERVICE_QUERY_CONFIG)};
         if (svc_guard.h) {
             DWORD config_bytes = 0;
@@ -181,12 +187,15 @@ std::vector<ServiceInfo> enumerate_services() {
                     si.startup_type = startup_type_str(config->dwStartType);
                 } else {
                     si.startup_type = "unknown";
+                    si.startup_type_query_failed = true;
                 }
             } else {
                 si.startup_type = "unknown";
+                si.startup_type_query_failed = true;
             }
         } else {
             si.startup_type = "unknown";
+            si.startup_type_query_failed = true;
         }
 
         services.push_back(std::move(si));

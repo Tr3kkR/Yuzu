@@ -264,7 +264,13 @@ json services_to_json(const std::vector<yuzu::tar::ServiceInfo>& svcs) {
         arr.push_back({{"name", s.name},
                        {"display_name", s.display_name},
                        {"status", s.status},
-                       {"startup_type", s.startup_type}});
+                       {"startup_type", s.startup_type},
+                       // Finding 3: persisted across ticks so a Windows
+                       // per-service query-failure row loaded back as
+                       // "previous" next tick still suppresses the
+                       // startup_type comparison symmetrically (see
+                       // ServiceInfo::startup_type_query_failed's comment).
+                       {"startup_type_query_failed", s.startup_type_query_failed}});
     }
     return arr;
 }
@@ -281,6 +287,7 @@ std::vector<yuzu::tar::ServiceInfo> json_to_services(const std::string& s) {
             si.display_name = j.value("display_name", "");
             si.status = j.value("status", "");
             si.startup_type = j.value("startup_type", "");
+            si.startup_type_query_failed = j.value("startup_type_query_failed", false);
             result.push_back(std::move(si));
         }
     } catch (...) {}

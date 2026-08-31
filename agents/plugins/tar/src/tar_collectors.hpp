@@ -74,6 +74,21 @@ struct ServiceInfo {
     std::string display_name;
     std::string status;       // running, stopped, etc.
     std::string startup_type; // automatic, manual, disabled
+
+    // Windows-only (tar_service_collector.cpp): true when THIS service's own
+    // OpenServiceW/QueryServiceConfigW call failed (a transient per-service
+    // ACL/query hiccup -- not an SCM-wide enumeration failure, which throws
+    // IncompleteCaptureError instead). startup_type is still set to "unknown"
+    // in that case for display, but that "unknown" is NOT a legitimate
+    // observation -- it must never be diffed as an authoritative value change
+    // (compute_service_events/compute_service_diff both check this flag
+    // before comparing startup_type), or a transient query failure
+    // manufactures a false "automatic -> unknown" forensic event now and a
+    // false inverse event on the next successful read. Always false on
+    // Linux/macOS, where "unknown" from the systemctl/launchctl parsers is a
+    // genuine observation (some services really don't expose a startup
+    // type).
+    bool startup_type_query_failed{false};
 };
 
 struct UserSession {
