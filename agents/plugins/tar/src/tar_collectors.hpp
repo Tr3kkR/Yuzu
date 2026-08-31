@@ -23,8 +23,13 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#ifndef _WIN32
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::{SubprocessResult,SubprocessOptions} — enumerate_services_impl's RunFn seam
+#endif
+
 #include <algorithm>
 #include <cstdint>
+#include <functional> // enumerate_services_impl's injectable-runner RunFn (non-Windows)
 #include <string>
 #include <string_view>
 #include <vector>
@@ -69,6 +74,21 @@ struct ServiceInfo {
     std::string display_name;
     std::string status;       // running, stopped, etc.
     std::string startup_type; // automatic, manual, disabled
+
+    // Windows-only (tar_service_collector.cpp): true when THIS service's own
+    // OpenServiceW/QueryServiceConfigW call failed (a transient per-service
+    // ACL/query hiccup -- not an SCM-wide enumeration failure, which throws
+    // IncompleteCaptureError instead). startup_type is still set to "unknown"
+    // in that case for display, but that "unknown" is NOT a legitimate
+    // observation -- it must never be diffed as an authoritative value change
+    // (compute_service_events/compute_service_diff both check this flag
+    // before comparing startup_type), or a transient query failure
+    // manufactures a false "automatic -> unknown" forensic event now and a
+    // false inverse event on the next successful read. Always false on
+    // Linux/macOS, where "unknown" from the systemctl/launchctl parsers is a
+    // genuine observation (some services really don't expose a startup
+    // type).
+    bool startup_type_query_failed{false};
 };
 
 struct UserSession {
@@ -235,6 +255,25 @@ std::string_view netqual_effective_capture_method();
 /** Enumerate installed system services on the current host. */
 std::vector<ServiceInfo> enumerate_services();
 
+#ifndef _WIN32
+/**
+ * Finding 3 (Wave 5 PR5.2 round) seam: the Linux/macOS enumerate_services()
+ * bodies, parameterised over the subprocess runner
+ * (agents/core/include/yuzu/agent/subprocess_runner.hpp's
+ * run_bounded_subprocess signature) so tests/unit/test_tar_service.cpp can
+ * inject a fixture double and assert the EXACT argv/options systemctl and
+ * launchctl are invoked with, plus that a spawn-failure/timeout/output-cap/
+ * non-zero-exit fixture result throws IncompleteCaptureError through this
+ * real function -- never a hand-simulated stand-in. enumerate_services()
+ * above is the production entry point and always calls this with the real
+ * run_bounded_subprocess. Not declared on Windows: that leg uses
+ * EnumServicesStatusExW, not a subprocess.
+ */
+std::vector<ServiceInfo> enumerate_services_impl(
+    const std::function<yuzu::agent::SubprocessResult(
+        const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&)>& run);
+#endif
+
 /** Enumerate active user sessions on the current host. */
 std::vector<UserSession> enumerate_users();
 
@@ -248,9 +287,17 @@ std::vector<UserSession> enumerate_users();
 void enumerate_machine_software(std::vector<SoftwareInfo>& out);
 
 /**
- * Enumerate the host ARP / neighbour table (ADR-0015). Windows: GetIpNetTable2
- * (AF_UNSPEC). Hard-capped at kArpEntryCap entries (a `spdlog::warn` is logged on
- * truncation). Returns `{}` off Windows until the Linux/macOS follow-ups land.
+ * Enumerate the host ARP / neighbour table (ADR-0015). Implemented on Windows
+ * (GetIpNetTable2/AF_UNSPEC), Linux (/proc/net/arp), and macOS (the shared
+ * NET_RT_FLAGS/RTF_LLINFO sysctl fetch) -- see os-capability-matrix.md for the
+ * platform-specific field constraints (e.g. macOS's entry_type is always
+ * "unknown" and iface is always empty). Hard-capped at kArpEntryCap entries.
+ * Completeness contract: THROWS yuzu::tar::IncompleteCaptureError rather than returning a
+ * partial vector when the platform read failed, the kernel/parser reported a
+ * truncated read, or the cap was reached before the whole table was consumed
+ * (tar_capture_status.hpp) -- callers MUST NOT diff or persist a caught
+ * exception's snapshot as though it were a genuinely smaller/empty table; see
+ * collect_or_retain() and its call sites in tar_plugin.cpp.
  */
 std::vector<ArpEntry> enumerate_arp();
 
@@ -266,8 +313,21 @@ std::vector<DnsEntry> enumerate_dns();
  * the live snapshot-diff. Windows: outbound via WNetOpenEnumW/WNetEnumResourceW
  * (+ WNetGetUserW), inbound via NetSessionEnum (degrades to empty without
  * admin/Server-Operator). Linux: outbound via /proc/mounts network fstypes,
- * inbound via `smbstatus` (empty if Samba absent). Returns `{}` on macOS
- * (kPlanned). Hard-capped at kMapDriveEntryCap (warn on truncation).
+ * inbound via `smbstatus` (empty if Samba absent). macOS: outbound only, via
+ * getfsstat(2) (no inbound/historical visibility for an unprivileged agent).
+ * Hard-capped at kMapDriveEntryCap.
+ * Completeness contract: THROWS yuzu::tar::IncompleteCaptureError rather than returning a
+ * partial vector when the underlying capture didn't genuinely complete -- a
+ * subprocess capture that didn't run to completion (this LIVE leg's own
+ * subprocess is Linux `smbstatus` only -- Windows live outbound/inbound is
+ * native WNet/NetSessionEnum, not a subprocess; `wevtutil`/`journalctl` are
+ * enumerate_mapdrive_history()'s one-time backfill subprocesses, a separate
+ * completeness contract documented below; both legs share
+ * tar_capture_status.hpp's classify_subprocess_capture), or on macOS a
+ * getfsstat(2) failure or an over-cap snapshot (tar_mapdrive_collector.cpp).
+ * Callers MUST NOT diff or persist a caught exception's snapshot as though it were a genuinely
+ * smaller/empty mount table; see collect_or_retain() and its call sites in
+ * tar_plugin.cpp.
  */
 std::vector<MapDriveEntry> enumerate_mapdrive();
 
@@ -295,15 +355,49 @@ std::vector<MapDriveHistoryRow> dedup_history(std::vector<MapDriveHistoryRow> ro
 // the raw text to these; keeping the parse pure makes every leg testable off its
 // native OS from captured sample output.
 
+/** Result of parsing /proc/mounts text: the decoded network-mount entries
+ *  plus whether at least one row was malformed (structurally short --
+ *  fewer than 3 whitespace-separated fields -- and so dropped rather than
+ *  silently included/omitted). Mirrors tar_arp_parsers.hpp's
+ *  ProcNetArpParse{entries, malformed} shape (BR4-005) and
+ *  tar_service_parsers.hpp's ServiceParseResult: a malformed row is a
+ *  missing binding relative to a genuinely complete mount table, and the
+ *  CALLER (enumerate_mapdrive(), tar_mapdrive_collector.cpp) is the one
+ *  that turns this flag into an IncompleteCaptureError throw. A row that is
+ *  well-formed but simply not a network filesystem (is_network_fstype()
+ *  returns false) is a LEGITIMATE skip and never sets `malformed`. */
+struct ProcMountsParse {
+    std::vector<MapDriveEntry> entries;
+    bool malformed{false};
+};
+
 /** Parse `/proc/mounts` (or /proc/self/mountinfo-style) text into current
  *  outbound network mappings. Honours the kernel `\040`/`\011` octal escaping. */
-std::vector<MapDriveEntry> parse_proc_mounts(const std::string& text);
+ProcMountsParse parse_proc_mounts(const std::string& text);
 
 /** Parse `/etc/fstab` text into historical outbound network mappings (ts=0). */
 std::vector<MapDriveHistoryRow> parse_fstab(const std::string& text);
 
+/** Result of parsing `smbstatus -b`/`-S` text: the decoded inbound session
+ *  entries plus whether at least one row was malformed. Same {entries,
+ *  malformed} shape as ProcMountsParse above (BR-mapdrive-001) and
+ *  tar_arp_parsers.hpp's ProcNetArpParse (BR4-005) -- Finding 4
+ *  (adversarial-review round 5) closed the one site in this file that had
+ *  been missed. A row is malformed when it LOOKS LIKE it was attempting to
+ *  be a data row (its first token is a non-empty, purely-numeric PID) but
+ *  is structurally short (fewer than the 4 whitespace-separated fields a
+ *  real session row carries) -- a truncated/corrupt capture. A row whose
+ *  first token is not a bare PID (the header line, a blank separator, a
+ *  "No locked files" trailer, etc.) is a LEGITIMATE skip and never sets
+ *  `malformed`, exactly mirroring parse_proc_mounts's is_network_fstype
+ *  legitimate-skip-vs-malformed judgement. */
+struct SmbStatusParse {
+    std::vector<MapDriveEntry> entries;
+    bool malformed{false};
+};
+
 /** Parse `smbstatus -b`/`-S` text into current inbound (client) sessions. */
-std::vector<MapDriveEntry> parse_smbstatus(const std::string& text);
+SmbStatusParse parse_smbstatus(const std::string& text);
 
 /** Parse `wevtutil qe Security … /f:text` output into historical inbound rows:
  *  4624 events with logon_type=3 (network), ts = event time. 4634 (logoff) blocks
