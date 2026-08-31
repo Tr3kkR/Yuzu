@@ -16,15 +16,23 @@ name: ClusterFuzzLite PR fuzzing
 on:
   pull_request:
     branches: [dev, main]
-    # Only fuzz PRs that can change fuzzed behavior — the harnesses
-    # compile first-party C++ directly (no meson/vcpkg), so workflows,
-    # docs, gateway-Erlang, YAML-content or script changes can't affect
-    # them. Keep this list in sync with .clusterfuzzlite/build.sh inputs.
+    # Only fuzz PRs that can change fuzzed behavior. The harnesses compile
+    # first-party C++ directly (no meson/vcpkg), and their entire compile
+    # closure is the six parser families below plus tests/fuzz/ itself -
+    # nothing in agents/, sdk/, proto/, or the rest of server/ reaches
+    # them. Family globs (not exact files) so a sibling header/impl added
+    # to a family stays covered. KEEP IN SYNC with .clusterfuzzlite/build.sh
+    # inputs; the scheduled batch leg (cflite-batch.yml) backstops any PR
+    # this filter misses. Narrowing matters because affected-target pruning
+    # fails OPEN (an empty affected set keeps ALL targets), so this filter
+    # is the only mechanism that makes an unrelated PR free.
     paths:
-      - 'server/**'
-      - 'agents/**'
-      - 'sdk/**'
-      - 'proto/**'
+      - 'server/core/src/preflight_parse*'
+      - 'server/core/src/deployment_parse*'
+      - 'server/core/src/yaml_scan*'
+      - 'server/core/src/guardian_rule_spec*'
+      - 'server/core/src/guardian_resilience_schema*'
+      - 'server/core/src/guardian_schema_registry*'
       - 'tests/fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
@@ -42,6 +50,11 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read            # cifuzz filestore reads cross-workflow artifacts
+                               # (cifuzz-corpus-<target>, cifuzz-coverage-latest)
+                               # via the REST artifact API; unspecified scopes
+                               # in this block are none, which silently breaks
+                               # both corpus download and target pruning
       security-events: write   # SARIF upload of crash findings
     steps:
       - name: Build fuzzers
@@ -50,6 +63,11 @@ jobs:
         with:
           language: c++
           sanitizer: address
+          # Pruning of unaffected targets happens in THIS step and needs the
+          # coverage report artifact; the input has no default, so omitting
+          # it leaves the build container with an empty token and pruning
+          # silently keeps all targets.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run fuzzers
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
