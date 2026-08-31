@@ -93,6 +93,33 @@ TEST_CASE("execute_verified_payload runs a REAL staged native executable through
     ExecutionOutcome outcome =
         execute_verified_payload(payload, "hello-from-test", kIsLinux, /*is_windows=*/false);
 
+    // UNSCOPED_INFO prints unconditionally on any CHECK/REQUIRE failure
+    // below in this test case -- added after a real CI-only failure here
+    // (2026-08-31) that the bare CHECK expressions alone couldn't diagnose:
+    // outcome.rc != 0 with none of the expected lines present, but no local
+    // repro (root/non-root, plain /tmp, real code path all reproduced
+    // clean) ever reproduced the same failure, meaning something about
+    // this specific value set is the only lead into what differs on the
+    // runner that hit it.
+    UNSCOPED_INFO("outcome.rc=" << outcome.rc);
+    UNSCOPED_INFO("outcome.run.has_value()=" << outcome.run.has_value());
+    if (outcome.run) {
+        UNSCOPED_INFO("tool_ran=" << outcome.run->tool_ran);
+        UNSCOPED_INFO("run.exit_code=" << outcome.run->exit_code);
+        UNSCOPED_INFO("termination_reason=" << static_cast<int>(outcome.run->termination_reason));
+        UNSCOPED_INFO("spawn_errno=" << outcome.run->spawn_errno);
+        UNSCOPED_INFO("raw output=[" << outcome.run->output << "]");
+    }
+    {
+        std::string joined;
+        for (auto& l : outcome.lines) {
+            joined += "[";
+            joined += l;
+            joined += "] ";
+        }
+        UNSCOPED_INFO("outcome.lines=" << joined);
+    }
+
     CHECK(outcome.rc == 0);
     REQUIRE(outcome.run.has_value());
     CHECK(outcome.run->tool_ran);
