@@ -143,6 +143,24 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX idx_agent_exec_agent ON agent_exec_status(agent_id);"
          "CREATE INDEX idx_executions_dispatched ON executions(dispatched_at);"
          "CREATE INDEX idx_executions_definition ON executions(definition_id);"},
+        // HA WS-1(1b), ADR-2002 section 5: the command_id -> execution_id
+        // correlation, migrated off AgentServiceImpl's in-process map so a
+        // response landing on ANY server replica can resolve it. reap_meta
+        // is this store's own persisted-anchor table for
+        // reap_command_execution_mappings (clock-guarded-retention routed
+        // concern) — deliberately separate from `executions`/
+        // `agent_exec_status`, which carry no retention sweep of their own.
+        {2,
+         "CREATE TABLE command_execution ("
+         "  command_id    TEXT   PRIMARY KEY,"
+         "  execution_id  TEXT   NOT NULL,"
+         "  created_at    BIGINT NOT NULL"
+         ");"
+         "CREATE INDEX idx_command_execution_created ON command_execution(created_at);"
+         "CREATE TABLE reap_meta ("
+         "  key   TEXT PRIMARY KEY,"
+         "  value TEXT NOT NULL"
+         ");"},
     };
     return kMigrations;
 }
@@ -878,6 +896,167 @@ FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
     }
 
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5)
+// ---------------------------------------------------------------------------
+
+namespace {
+// Substrate-tuned to this table — do not copy from session_store's
+// constants (clock-guarded-retention routed concern: "never copy the
+// numbers"). A command's realistic in-flight lifetime is seconds to a few
+// minutes; 24h is generous headroom over any documented per-command
+// timeout, so a mapping this old is stale by construction, not merely idle.
+constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
+constexpr int kCmdExecutionReapCap = 5000;
+// A DB `now()` reading more than this far ahead of the persisted anchor is
+// an anomaly, not legitimate elapsed time between reap ticks (~ minutes).
+constexpr std::int64_t kMaxPlausibleSkewSecs = 3600;
+} // namespace
+
+void ExecutionTracker::record_command_execution(const std::string& command_id,
+                                                const std::string& execution_id) {
+    if (!open_)
+        return;
+
+    auto attempt_once = [&]() -> bool {
+        auto lease = pool_.try_acquire_for(kWriteTimeout);
+        if (!lease)
+            return false;
+        pg::PgResult res =
+            execution_id.empty()
+                ? pg::exec_params(lease.get(),
+                                  "DELETE FROM execution_tracker.command_execution "
+                                  "WHERE command_id = $1",
+                                  std::vector<std::string>{command_id})
+                : pg::exec_params(
+                      lease.get(),
+                      "INSERT INTO execution_tracker.command_execution "
+                      "(command_id, execution_id, created_at) VALUES ($1, $2, $3) "
+                      "ON CONFLICT (command_id) DO UPDATE SET "
+                      "execution_id = EXCLUDED.execution_id, created_at = EXCLUDED.created_at",
+                      std::vector<std::string>{command_id, execution_id,
+                                               std::to_string(now_epoch())});
+        return res.status() == PGRES_COMMAND_OK;
+    };
+
+    // Retry once, same rationale as update_agent_status: a lease-acquire
+    // timeout or a cancelled statement under contention is otherwise silent,
+    // and unlike refresh_counts's failure mode there is no reconciler for a
+    // correlation row that was never written — the response that would have
+    // consumed it does not re-arrive.
+    bool ok = attempt_once();
+    if (!ok)
+        ok = attempt_once();
+    if (!ok) {
+        spdlog::error("ExecutionTracker::record_command_execution: write failed twice for "
+                      "command_id={} — this command's responses will not correlate to an "
+                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
+                      "dispatch itself is unaffected)",
+                      command_id);
+    }
+}
+
+std::optional<std::string>
+ExecutionTracker::lookup_execution_id(const std::string& command_id) const {
+    if (!open_)
+        return std::nullopt;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT execution_id FROM execution_tracker.command_execution "
+                                       "WHERE command_id = $1",
+                                       std::vector<std::string>{command_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return col_str(res.get(), 0, 0);
+}
+
+std::expected<CommandExecutionReapOutcome, std::string>
+ExecutionTracker::reap_command_execution_mappings() {
+    if (!open_)
+        return std::unexpected("execution tracker not open");
+
+    // Shape mirrors SessionStore::reap_expired (clock-guarded-retention
+    // routed concern) — advisory lock as its OWN statement, one in-SQL DB
+    // `now()` read reused for the cutoff/anchor-compare/anchor-update,
+    // persisted+sanitised anchor, forward/backward-anomaly decline,
+    // unconditional cap. This table stores seconds (matching this store's
+    // own `now_epoch()` convention), not the milliseconds session_store uses
+    // — a substrate-tuning difference, not a shape deviation.
+    int deleted = 0;
+    bool clock_anomaly = false;
+    std::int64_t now_s = 0;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        if (pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext('execution_tracker:reap'))",
+                            std::vector<std::string>{})
+                .status() != PGRES_TUPLES_OK) {
+            err = "reap advisory lock failed";
+            return false;
+        }
+        {
+            pg::PgResult nr = pg::exec_params(
+                c, "SELECT extract(epoch FROM now())::bigint", std::vector<std::string>{});
+            if (nr.status() != PGRES_TUPLES_OK || PQntuples(nr.get()) == 0) {
+                err = "reap now() read failed";
+                return false;
+            }
+            now_s = to_i64(PQgetvalue(nr.get(), 0, 0));
+        }
+        pg::PgResult ar = pg::exec_params(
+            c, "SELECT value FROM execution_tracker.reap_meta WHERE key = 'cmd_exec_reap_anchor'",
+            std::vector<std::string>{});
+        if (ar.status() != PGRES_TUPLES_OK) {
+            err = "reap anchor read failed";
+            return false;
+        }
+        const bool has_anchor = PQntuples(ar.get()) > 0;
+        const std::int64_t anchor = has_anchor ? to_i64(PQgetvalue(ar.get(), 0, 0)) : 0;
+        if (has_anchor && now_s > anchor + kMaxPlausibleSkewSecs) {
+            spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: now_s {} "
+                         "implausibly ahead of anchor {}",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true; // decline, anchor unchanged
+        }
+        if (has_anchor && now_s < anchor) {
+            spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: now_s {} "
+                         "is behind anchor {} (backward clock movement or a poisoned anchor) — "
+                         "not deleting under a rewound clock",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true;
+        }
+        pg::PgResult dr = pg::exec_params(
+            c,
+            "DELETE FROM execution_tracker.command_execution WHERE command_id IN "
+            "(SELECT command_id FROM execution_tracker.command_execution "
+            " WHERE created_at < $1::bigint LIMIT $2::bigint) RETURNING command_id",
+            std::vector<std::string>{std::to_string(now_s - kCmdExecutionReapWindowSecs),
+                                     std::to_string(kCmdExecutionReapCap)});
+        if (dr.status() != PGRES_TUPLES_OK) {
+            err = std::string("reap delete failed: ") + PQerrorMessage(c);
+            return false;
+        }
+        deleted = PQntuples(dr.get());
+        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
+        pg::PgResult ur = pg::exec_params(
+            c,
+            "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+            "('cmd_exec_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{std::to_string(new_anchor)});
+        if (ur.status() != PGRES_COMMAND_OK) {
+            err = "reap anchor update failed";
+            return false;
+        }
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "reap failed" : err);
+    return CommandExecutionReapOutcome{deleted, clock_anomaly};
 }
 
 } // namespace yuzu::server

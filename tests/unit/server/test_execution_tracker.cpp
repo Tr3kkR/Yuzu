@@ -726,3 +726,129 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
 // fresh Postgres schema can ever be in. See test_approval_manager.cpp's
 // equivalent deletions for the same reasoning applied to that store's own
 // SQLite migration-ladder-specific tests.
+
+// ── Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5) ────
+//
+// WS-9 failover scenario: proves the cross-instance property this migration
+// exists to deliver — a mapping written through one ExecutionTracker
+// instance (dispatch, "replica A") is resolvable through a SEPARATE
+// ExecutionTracker instance pointed at the same database ("replica B").
+// The former in-process map could never pass this: it was populated only
+// in the writer's own process memory.
+
+TEST_CASE("ExecutionTracker: record/lookup command_execution round-trips",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-unknown").has_value());
+
+    tracker_bundle->record_command_execution("cmd-1", "exec-1");
+    auto looked_up = tracker_bundle->lookup_execution_id("cmd-1");
+    REQUIRE(looked_up.has_value());
+    CHECK(*looked_up == "exec-1");
+
+    // Last-write-wins on a repeated command_id (mirrors the former map's
+    // operator[]= semantics).
+    tracker_bundle->record_command_execution("cmd-1", "exec-2");
+    looked_up = tracker_bundle->lookup_execution_id("cmd-1");
+    REQUIRE(looked_up.has_value());
+    CHECK(*looked_up == "exec-2");
+
+    // Empty execution_id deletes the mapping (the former map's explicit-
+    // clear branch).
+    tracker_bundle->record_command_execution("cmd-1", "");
+    CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-1").has_value());
+}
+
+TEST_CASE("ExecutionTracker: lookup is non-destructive across a multi-agent "
+          "fan-out (HF-1)",
+          "[pg][execution_tracker]") {
+    // One command_id dispatched to N agents; each sends its own terminal
+    // response against the SAME command_id. A lookup must never consume the
+    // mapping, or agents 2..N would find nothing to stamp.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    tracker_bundle->record_command_execution("cmd-fanout", "exec-fanout");
+
+    for (int i = 0; i < 5; ++i) {
+        auto looked_up = tracker_bundle->lookup_execution_id("cmd-fanout");
+        REQUIRE(looked_up.has_value());
+        CHECK(*looked_up == "exec-fanout");
+    }
+}
+
+TEST_CASE("ExecutionTracker: a command_execution mapping written on one "
+          "instance resolves on a SEPARATE instance against the same "
+          "database (WS-9 failover scenario)",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle; // "replica A" — dispatches
+
+    tracker_bundle->record_command_execution("cmd-cross-replica", "exec-cross-replica");
+
+    // "replica B" — a second pool AND a second ExecutionTracker instance
+    // against the SAME database, sharing no process memory with A. The
+    // in-process map this migration replaces could never resolve this: it
+    // was populated only in A's own memory.
+    pg::PgPool pool_b{{.conninfo = tracker_bundle.dsn(), .size = 2}};
+    ExecutionTracker tracker_b{pool_b};
+    REQUIRE(tracker_b.is_open());
+
+    auto looked_up = tracker_b.lookup_execution_id("cmd-cross-replica");
+    REQUIRE(looked_up.has_value());
+    CHECK(*looked_up == "exec-cross-replica");
+}
+
+TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades "
+          "command_execution methods without crashing",
+          "[execution_tracker]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+
+    closed.record_command_execution("cmd-1", "exec-1"); // no-op, not a crash
+    CHECK_FALSE(closed.lookup_execution_id("cmd-1").has_value());
+    auto reaped = closed.reap_command_execution_mappings();
+    REQUIRE_FALSE(reaped.has_value());
+    CHECK(reaped.error() == "execution tracker not open");
+}
+
+TEST_CASE("ExecutionTracker: reap_command_execution_mappings deletes only "
+          "aged-out rows, is capped, and is clock-guarded",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    tracker_bundle->record_command_execution("cmd-fresh", "exec-fresh");
+    REQUIRE(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
+
+    // First pass: no anchor yet, nothing aged out (the fresh row's
+    // created_at is "now", far inside the 24h retention window) — proceeds
+    // (missing-anchor PROCEED decision) but deletes 0 rows.
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK(first->deleted == 0);
+    CHECK_FALSE(first->clock_anomaly);
+    CHECK(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
+
+    // Directly age the row past the retention window by rewriting
+    // created_at through a second connection on the same pool (the public
+    // API has no "backdate" hook by design — this is the test-only path,
+    // mirroring how test_session_store.cpp pokes session_meta directly).
+    {
+        pg::PgPool& pool = tracker_bundle.pool();
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.command_execution SET created_at = created_at - 90000 "
+            "WHERE command_id = 'cmd-fresh'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    } // lease released here, before the reap below acquires its own
+
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 1);
+    CHECK_FALSE(second->clock_anomaly);
+    CHECK_FALSE(tracker_bundle->lookup_execution_id("cmd-fresh").has_value());
+}

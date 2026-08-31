@@ -1257,15 +1257,11 @@ grpc::Status AgentServiceImpl::Subscribe(
                 sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
                 sr.output = resp.output();
                 sr.plugin = plugin;
-                // PR 2: stamp execution_id from the dispatch-time mapping so
-                // the executions detail drawer can correlate exactly.
-                {
-                    std::lock_guard lock(cmd_times_mu_);
-                    if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                        eit != cmd_execution_ids_.end()) {
-                        sr.execution_id = eit->second;
-                    }
-                }
+                // PR 2 / HA WS-1(1b): stamp execution_id from the PG-backed
+                // command_execution table so the executions detail drawer
+                // can correlate exactly, on any replica.
+                if (auto eid = resolve_execution_id(resp.command_id()))
+                    sr.execution_id = *eid;
                 response_store_->store(sr);
             }
 
@@ -1295,20 +1291,16 @@ grpc::Status AgentServiceImpl::Subscribe(
                 if (resp.has_error()) {
                     err_detail = resp.error().message();
                 }
-                // PR 2: resolve execution_id from the dispatch-time mapping.
-                // Do NOT erase on terminal status — a single command_id
-                // can produce N terminal responses (one per agent in
-                // fan-out); erasing on the first agent's terminal would
-                // cause agents 2..N to stamp empty execution_id (HF-1).
-                // Map entries persist until a future sweeper (PR 2.x).
+                // PR 2 / HA WS-1(1b): resolve execution_id from the
+                // PG-backed command_execution table. Do NOT delete on
+                // terminal status — a single command_id can produce N
+                // terminal responses (one per agent in fan-out); deleting on
+                // the first agent's terminal would leave agents 2..N with no
+                // execution_id to stamp (HF-1). The row ages out via
+                // ExecutionTracker::reap_command_execution_mappings instead.
                 std::string current_exec;
-                {
-                    std::lock_guard lock(cmd_times_mu_);
-                    if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                        eit != cmd_execution_ids_.end()) {
-                        current_exec = eit->second;
-                    }
-                }
+                if (auto eid = resolve_execution_id(resp.command_id()))
+                    current_exec = *eid;
                 // Terminal frame with no output: update the existing
                 // RUNNING rows in place — the data is already there.
                 // Persisting an empty-output row whose status enum reads
@@ -1460,16 +1452,32 @@ void AgentServiceImpl::record_send_time(const std::string& command_id) {
     output_row_count_.store(0, std::memory_order_relaxed);
 }
 
-// -- record_execution_id (PR 2) -----------------------------------------------
+// -- resolve_execution_id (HA WS-1(1b), ADR-2002 section 5) ------------------
+
+std::optional<std::string>
+AgentServiceImpl::resolve_execution_id(const std::string& command_id) const {
+    // Atomic snapshot — see notify_exec_tracker's identical load for the
+    // detached gateway-forward-thread rationale (governance UAT 2026-05-06
+    // Gate 7 re-review HIGH).
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    if (!tracker)
+        return std::nullopt;
+    return tracker->lookup_execution_id(command_id);
+}
+
+// -- record_execution_id (PR 2; HA WS-1(1b) — PG-backed, ADR-2002 section 5) --
 
 void AgentServiceImpl::record_execution_id(const std::string& command_id,
                                            const std::string& execution_id) {
-    std::lock_guard lock(cmd_times_mu_);
-    if (execution_id.empty()) {
-        cmd_execution_ids_.erase(command_id);
-    } else {
-        cmd_execution_ids_[command_id] = execution_id;
-    }
+    // Atomic snapshot — see notify_exec_tracker's identical load for the
+    // detached gateway-forward-thread rationale (governance UAT 2026-05-06
+    // Gate 7 re-review HIGH). A null tracker (not wired, or mid-shutdown)
+    // means the correlation is simply not recorded — same no-op posture the
+    // former in-process map had before this dispatch's first write.
+    auto* tracker = execution_tracker_.load(std::memory_order_acquire);
+    if (!tracker)
+        return;
+    tracker->record_command_execution(command_id, execution_id);
 }
 
 // -- process_gateway_response -------------------------------------------------
@@ -1514,14 +1522,10 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
             sr.output = resp.output();
             sr.plugin = plugin;
-            // PR 2: streaming response — keep the mapping until completion.
-            {
-                std::lock_guard lock(cmd_times_mu_);
-                if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                    eit != cmd_execution_ids_.end()) {
-                    sr.execution_id = eit->second;
-                }
-            }
+            // PR 2 / HA WS-1(1b): streaming response — keep the mapping
+            // until completion (PG-backed, shared across replicas).
+            if (auto eid = resolve_execution_id(resp.command_id()))
+                sr.execution_id = *eid;
             response_store_->store(sr);
         }
 
@@ -1547,18 +1551,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.has_error()) {
                 err_detail = resp.error().message();
             }
-            // PR 2: stamp execution_id from the dispatch-time mapping.
-            // Do NOT erase on terminal status (HF-1) — multi-agent
-            // fan-out produces N terminal responses; entries persist
-            // until a future sweeper (PR 2.x) lands.
+            // PR 2 / HA WS-1(1b): resolve execution_id from the
+            // PG-backed command_execution table. Do NOT delete on
+            // terminal status (HF-1) — multi-agent fan-out produces N
+            // terminal responses; the row ages out via
+            // ExecutionTracker::reap_command_execution_mappings instead.
             std::string current_exec;
-            {
-                std::lock_guard lock(cmd_times_mu_);
-                if (auto eit = cmd_execution_ids_.find(resp.command_id());
-                    eit != cmd_execution_ids_.end()) {
-                    current_exec = eit->second;
-                }
-            }
+            if (auto eid = resolve_execution_id(resp.command_id()))
+                current_exec = *eid;
             // Terminal frame with no output: update existing RUNNING row(s)
             // instead of inserting a separate empty-output sentinel that
             // operators misread as a failure (UAT 2026-05-06). Tri-state
@@ -1730,15 +1730,14 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (!tracker)
         return;
-    std::string execution_id;
-    {
-        std::lock_guard lock(cmd_times_mu_);
-        if (auto eit = cmd_execution_ids_.find(command_id); eit != cmd_execution_ids_.end()) {
-            execution_id = eit->second;
-        }
-    }
-    if (execution_id.empty())
+    // HA WS-1(1b): resolved from the PG-backed command_execution table
+    // (shared across replicas), not an in-process map — a response landing
+    // on a different server instance than the one that dispatched it now
+    // still resolves.
+    auto execution_id_opt = resolve_execution_id(command_id);
+    if (!execution_id_opt || execution_id_opt->empty())
         return; // out-of-band dispatch, nothing to publish
+    const std::string& execution_id = *execution_id_opt;
 
     // Compliance-check correlation ids ("polchk-…", minted by PolicyEvaluator)
     // are NOT operator executions: the evaluator tags responses with this id only

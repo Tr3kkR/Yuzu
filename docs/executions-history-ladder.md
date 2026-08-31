@@ -6,13 +6,20 @@ document holds the hard invariants every successor PR in the ladder must check.
 
 ## PR 2 — `command_id → execution_id` mapping
 
-`responses.execution_id` is populated at write time by an in-memory
-`cmd_execution_ids_` map inside `AgentServiceImpl` (under `cmd_times_mu_`).
-The mapping is registered at dispatch time INSIDE `cmd_dispatch` BEFORE any
-RPC is sent — closes the FAST-agent race where a sub-millisecond loopback
-agent could reply before a post-dispatch registration. The `CommandDispatchFn`
-typedef carries `execution_id` as its sixth parameter; pass empty to opt out
-(out-of-band dispatch / no-tracker callers).
+`responses.execution_id` is populated at write time by resolving the
+`command_id` against `ExecutionTracker`'s PG-backed `command_execution` table
+(HA WS-1(1b), ADR-2002 section 5 — migrated off the former in-process
+`AgentServiceImpl::cmd_execution_ids_` map, which was replica-local and could
+not resolve a response landing on a different server instance than the one
+that dispatched it). `AgentServiceImpl::record_command_execution` /
+`::lookup_execution_id` are the write/read entry points;
+`AgentServiceImpl::resolve_execution_id` is the single chokepoint every
+response-receipt read goes through. The mapping is registered at dispatch
+time INSIDE `cmd_dispatch` BEFORE any RPC is sent — closes the FAST-agent race
+where a sub-millisecond loopback agent could reply before a post-dispatch
+registration. The `CommandDispatchFn` typedef carries `execution_id` as its
+sixth parameter; pass empty to opt out (out-of-band dispatch / no-tracker
+callers).
 
 ### Known coverage gap (every PR in this ladder must check this)
 
@@ -38,11 +45,13 @@ no error or warning.
 
 A single `command_id` is dispatched to N agents; each agent sends its own
 response with the same `command_id`. Terminal-status branches in
-`agent_service_impl.cpp` do NOT erase `cmd_execution_ids_` — erasing on the
-first agent's terminal would leave agents 2..N stamping empty
-`execution_id`. Map entries persist for process lifetime; a periodic
-sweeper is filed as PR 2.x. The accepted bounded leak matches the existing
-`cmd_send_times_` / `cmd_first_seen_` shape under the same `cmd_times_mu_`.
+`agent_service_impl.cpp` do NOT delete the `command_execution` row — deleting
+on the first agent's terminal would leave agents 2..N stamping empty
+`execution_id`. The row ages out via
+`ExecutionTracker::reap_command_execution_mappings` instead (HA WS-1(1b)) — a
+clock-guarded retention sweep on a ~60m cadence
+(`yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` /
+`_store_degrade_total`), not an unbounded in-process leak.
 
 Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
 47 assertions) drives `process_gateway_response` end-to-end into a real
@@ -52,11 +61,18 @@ and the `__timing__|...` sentinel early-return. The
 `test_workflow_routes.cpp:814` sibling case covers the response-store
 level only.
 
-### Server restart caveat
+### Server restart / cross-replica behaviour
 
-The mapping is in-memory; restart loses it. In-flight commands at restart
-time produce responses tagged `execution_id=''` that use the legacy
-fallback in the drawer.
+The mapping is PG-backed (HA WS-1(1b)), so it survives a server restart and
+resolves identically regardless of which server replica's `AgentServiceImpl`
+receives the response — the property the migration off the in-process map
+exists to deliver (WS-9 scenario: `test_execution_tracker.cpp`'s
+"a command_execution mapping written on one instance resolves on a SEPARATE
+instance"). A mapping still does not survive its own retention window (see
+the fan-out section above) or a degraded/unreachable Postgres — either
+produces a response tagged `execution_id=''` that uses the legacy
+timestamp-window fallback in the drawer, the same degrade path an unmapped
+out-of-band dispatch already takes.
 
 ### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`, `deployment-`)
 

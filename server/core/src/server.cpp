@@ -2576,6 +2576,27 @@ public:
                           "DB-clock-authored, ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_local_clock_backward_total");
+        // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
+        // correlation-table retention (ExecutionTracker's PG-backed
+        // command_execution table, replacing AgentServiceImpl's former
+        // in-process cmd_execution_ids_ map). Mirrors the session-reap
+        // metric trio above — same clock-guarded-retention shape, a
+        // separate table/store, so a separate counter family.
+        metrics_.describe("yuzu_exec_correlation_reap_total",
+                          "Aged-out command_id -> execution_id correlation-table rows deleted by "
+                          "the clock-guarded retention sweep (HA WS-1(1b))",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_reap_total");
+        metrics_.describe("yuzu_exec_correlation_reap_clock_anomaly_total",
+                          "Correlation-table reap passes declined due to an implausible (forward "
+                          "or backward) PostgreSQL now() reading vs the persisted anchor",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_reap_clock_anomaly_total");
+        metrics_.describe("yuzu_exec_correlation_store_degrade_total",
+                          "Correlation-table reap passes that failed outright (pool/query "
+                          "degradation), distinct from a clock-anomaly decline",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_store_degrade_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -18848,6 +18869,11 @@ private:
                 // display_name / oidc_sub (identity/PII), so age them out on a
                 // ~15m cadence. reap_expired is clock-guarded + capped (5000/pass).
                 constexpr int kSessionReapEveryNTicks = 450; // ~15 minutes at 2s/tick
+                // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
+                // correlation-table retention. No PII (both ids are opaque),
+                // so this rides the same 60m cadence as the other non-PII
+                // stores above, not the tighter session cadence.
+                constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -19025,6 +19051,25 @@ private:
                             } else {
                                 metrics_.counter("yuzu_auth_session_store_degrade_total",
                                                  {{"op", "reap"}})
+                                    .increment();
+                            }
+                        }
+
+                        // 2e) command_id -> execution_id correlation-table
+                        // retention (HA WS-1(1b), ADR-2002 section 5). Same
+                        // clock-guarded shape as the session reap above, on
+                        // its own table/metric family (no PII, 60m cadence).
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kCmdExecutionReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_command_execution_mappings()) {
+                                if (reaped->deleted > 0)
+                                    metrics_.counter("yuzu_exec_correlation_reap_total")
+                                        .increment(static_cast<double>(reaped->deleted));
+                                if (reaped->clock_anomaly)
+                                    metrics_.counter("yuzu_exec_correlation_reap_clock_anomaly_total")
+                                        .increment();
+                            } else {
+                                metrics_.counter("yuzu_exec_correlation_store_degrade_total")
                                     .increment();
                             }
                         }
