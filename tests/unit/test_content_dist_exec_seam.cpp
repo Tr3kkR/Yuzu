@@ -56,6 +56,26 @@ bool contains_line(const std::vector<std::string>& lines, std::string_view needl
                        [&](const std::string& l) { return l.find(needle) != std::string::npos; });
 }
 
+#ifdef __linux__
+// Locate the echo_argv_fixture binary built by tests/meson.build. Same
+// candidate-path convention as test_plugin_loader.cpp's
+// find_fixture_plugin() (Meson launches tests with CWD=build root; the
+// fixture sits alongside the test executable in tests/).
+fs::path find_echo_argv_fixture() {
+    std::vector<fs::path> candidates;
+    if (auto* build_root = std::getenv("MESON_BUILD_ROOT"))
+        candidates.emplace_back(fs::path{build_root} / "tests" / "echo_argv_fixture");
+    candidates.emplace_back(fs::path{"tests"} / "echo_argv_fixture");
+    candidates.emplace_back(fs::path{"."} / "echo_argv_fixture");
+    for (const auto& p : candidates) {
+        std::error_code ec;
+        if (fs::exists(p, ec) && !ec)
+            return fs::absolute(p, ec);
+    }
+    return {};
+}
+#endif
+
 } // namespace
 
 TEST_CASE("execute_verified_payload runs a REAL staged native executable through the actual "
@@ -67,9 +87,20 @@ TEST_CASE("execute_verified_payload runs a REAL staged native executable through
 #ifdef __linux__
     // Linux: is_linux=true below means CDX-002 would reject a shebang
     // script AND B6 exec_verify (fd-exec) is live, so the payload must be a
-    // genuine native ELF -- copy one from the system.
+    // genuine native ELF -- copy the dedicated, deterministic fixture
+    // binary (tests/fixtures/echo_argv_fixture.cpp), NOT the host's /bin/echo.
+    // A prior version of this test copied /bin/echo directly and failed on
+    // real Linux CI (2026-08-31): that host's /bin/echo is a GNU coreutils
+    // multi-call binary, which dispatches by inspecting /proc/self/exe --
+    // B6's fd-based execveat(fd, "", ..., AT_EMPTY_PATH) exec presents
+    // /proc/self/exe as an fd-numbered path rather than a real one, so
+    // coreutils tried to dispatch to a utility literally named after the fd
+    // number and failed with "coreutils: unknown program '13'". The
+    // dedicated fixture has no argv[0]/exe-path-sensitive dispatch to break.
+    fs::path fixture = find_echo_argv_fixture();
+    REQUIRE_FALSE(fixture.empty());
     std::error_code copy_ec;
-    fs::copy_file("/bin/echo", payload, fs::copy_options::overwrite_existing, copy_ec);
+    fs::copy_file(fixture, payload, fs::copy_options::overwrite_existing, copy_ec);
     REQUIRE_FALSE(copy_ec);
 #else
     // macOS: copying a system binary like /bin/echo is NOT a valid fixture

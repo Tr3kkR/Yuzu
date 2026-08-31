@@ -155,6 +155,23 @@ abi4_cpp_wrapper_fixture_plugin = shared_library(
   install: false,
 )
 
+# ── Test fixture: deterministic argv-echo binary (BR-006 exec-verify test) ───
+# test_content_dist_exec_seam.cpp's real end-to-end B6 exec-verify test used
+# to stage a copy of the host's /bin/echo and assert it echoed its argv back.
+# That broke on a CI runner whose /bin/echo turned out to be a GNU coreutils
+# multi-call binary: coreutils dispatches by inspecting /proc/self/exe, and
+# B6's fd-based execveat(fd, "", ..., AT_EMPTY_PATH) exec presents
+# /proc/self/exe as an fd-numbered path rather than a real one, so coreutils
+# tried to dispatch to a utility literally named after the fd number and
+# failed. A standalone, single-purpose binary has no argv[0]/exe-path-
+# sensitive dispatch to break. No dependencies at all -- deliberately plain,
+# so it stays a stable fixture regardless of what the rest of the tree links.
+echo_argv_fixture = executable(
+  'echo_argv_fixture',
+  files('fixtures/echo_argv_fixture.cpp'),
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -482,13 +499,18 @@ agent_test_exe = executable(
   # plugin by path for the identical reason (PKG-NC).
   # content_dist_plugin_lib / script_exec_plugin_lib: same reasoning, for
   # test_content_dist_actions.cpp / test_script_exec_actions.cpp.
+  # echo_argv_fixture: test_content_dist_exec_seam.cpp's real B6 exec-verify
+  # test stages and execs this fixture binary by path -- without it in
+  # link_depends, a fresh build could leave the test executable built before
+  # the fixture exists (build-ci B3's lesson: a fixture with no consumer in
+  # the meson graph can silently stop building unnoticed).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
                 installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib,
-                content_dist_plugin_lib, script_exec_plugin_lib],
+                content_dist_plugin_lib, script_exec_plugin_lib, echo_argv_fixture],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
