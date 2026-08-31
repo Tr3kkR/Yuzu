@@ -556,69 +556,6 @@ inline constexpr std::array<CommandCapability, 40> kPluginActionCatalogueA{{
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
     },
-
-    // ── vuln_scan (agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp) ────
-    // scan/cve_scan/config_scan/summary only detect and report vulnerability/
-    // configuration findings — `Security` securable, Read. inventory returns
-    // the same raw software listing tar.query's software source and the
-    // `/inventory` REST route serve — `Inventory` securable, matching
-    // rbac_store.cpp's own note that "the /inventory software catalog
-    // remains under Inventory:Read".
-    {
-        .plugin = "vuln_scan",
-        .action = "scan",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-        .execute_gate = ExecuteGate::None,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "cve_scan",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-        .execute_gate = ExecuteGate::None,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "config_scan",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-        .execute_gate = ExecuteGate::None,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "summary",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Security",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-        .execute_gate = ExecuteGate::None,
-    },
-    {
-        .plugin = "vuln_scan",
-        .action = "inventory",
-        .dispatch_class = DispatchClass::ReadOnly,
-        .mutability = Mutability::None,
-        .securable = "Inventory",
-        .operation = authz::Operation::Read,
-        .risk_tier = authz::RiskTier::Low,
-        .system_reserved = false,
-        .execute_gate = ExecuteGate::None,
-    },
 }};
 
 // #1398: every row in kPluginActionCatalogueA must author .execute_gate — an

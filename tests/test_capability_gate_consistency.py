@@ -32,7 +32,7 @@ Three things checked against the real, integrated tree:
      named failure instead.
   3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
      an `.execute_gate` for must equal the number of rows it finds a
-     `.plugin`/`.action` pair for, and both must equal 184 (45+55+34+42+5+3
+     `.plugin`/`.action` pair for, and both must equal 179 (40+55+34+42+5+3
      across the six fragments) — architect review requirement: a regex that
      silently fails to associate a gate with its row must read as a hard
      failure, never as an absent gate.
@@ -86,9 +86,11 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_c.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
 ]
-# 3 + 5 + 45 + 55 + 34 + 42 — see command_capability.hpp's fragment doc
-# comments and the #1398 design doc's verified row-count audit.
-EXPECTED_TOTAL_ROWS = 184
+# 3 + 5 + 40 + 55 + 34 + 42 — see command_capability.hpp's fragment doc
+# comments; catalogue_a dropped from 45 to 40 rows when the vuln_scan
+# plugin was retired outright (ADR-0018/-0028), superseding the #1398
+# design doc's original 184-row audit.
+EXPECTED_TOTAL_ROWS = 179
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
