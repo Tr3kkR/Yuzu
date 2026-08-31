@@ -477,7 +477,6 @@ RUNNER_ALLOWLIST = {
 # drifted). A meson.build hit (Meson's own `host_machine.system()`) is not a
 # C/C++ source file and is excluded by SCAN_EXT below, not by this list.
 GRANDFATHERED = {
-    "agents/plugins/content_dist/src/content_dist_plugin.cpp",
     "agents/plugins/firewall/src/firewall_plugin.cpp",
     "agents/plugins/license_scan/src/licensing_linux.cpp",
     # installed_apps AND msi_packages both removed here (#3405): this PR
@@ -485,9 +484,12 @@ GRANDFATHERED = {
     # spawn primitives and their entries grandfathered nothing while masking any
     # regression that re-introduced one. Removing an entry moves the file from
     # the base-diff path onto the FULL scan, so it is strictly stricter.
-    # network_config's own entry is removed the same way by PR4.1, the
-    # remaining half of #3405 -- see that commit's message for why.
-    "agents/plugins/script_exec/src/script_exec_plugin.cpp",
+    # script_exec's own entry is removed here (this PR): it argv-ised its last
+    # raw spawn primitives onto the shared subprocess runner, so its entry
+    # grandfathered nothing while masking any regression that re-introduced one.
+    # network_config stays -- it is still rung 3 and remains a separate PR's to
+    # remove, the remaining half of #3405.
+    "agents/plugins/network_config/src/network_config_plugin.cpp",
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",
     "agents/plugins/tar/src/tar_service_collector.cpp",
