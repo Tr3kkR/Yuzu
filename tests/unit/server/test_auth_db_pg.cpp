@@ -759,43 +759,61 @@ TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orp
 // The concurrency test above proves exactly-once end-to-end, but the loser can be
 // caught by the pre-txn `mfa_status().enrolled` check before ever reaching the guarded
 // UPDATE, so it does not deterministically exercise the guard's own 0-row branch. This
-// pins the `is_active = TRUE AND mfa_enrolled_at IS NULL` predicate directly against a
-// seeded row: a provisional (NULL) row is claimed (1 row), an already-enrolled row and a
-// deactivated row are both rejected (0 rows). It mirrors the exact predicate from
-// `mfa_verify_enrollment`; a drift between the two is the thing to notice.
-TEST_CASE("AuthDB MFA: enrollment guard predicate claims a provisional row, rejects an "
-          "enrolled or deactivated one",
+// pins all three predicate clauses directly against a seeded row:
+//   `is_active = TRUE` — a deactivated row is rejected,
+//   `mfa_enrolled_at IS NULL` — an already-enrolled row is rejected,
+//   `mfa_totp_secret IS NOT NULL` — a disabled row (mfa_disable NULLs both the secret AND
+//     mfa_enrolled_at) is rejected, closing the enrol-over-disabled-secret race.
+// It mirrors the exact predicate from `mfa_verify_enrollment`; a drift between the two is
+// the thing to notice. Each `run_guard()` match stamps `mfa_enrolled_at`, so the state is
+// reset explicitly before every case.
+TEST_CASE("AuthDB MFA: enrollment guard claims a provisional-with-secret row, rejects "
+          "enrolled / deactivated / disabled-secret ones",
           "[pg][auth_db][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
     REQUIRE(h.db.upsert_user("enrollguard", "h", "s", yuzu::server::auth::Role::user).has_value());
 
+    auto set_col = [&](const char* sql) {
+        const char* v[] = {"enrollguard"};
+        PgResult r{PQexecParams(h.conn.get(), sql, 1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.ok());
+    };
+    // A provisional pending-enrollment candidate: active, enrolled_at NULL, secret present.
+    auto make_provisional = [&] {
+        set_col("UPDATE auth.users SET is_active = TRUE, mfa_enrolled_at = NULL, "
+                "mfa_totp_secret = decode('0011223344','hex') WHERE username = $1");
+    };
     // The exact guard from mfa_verify_enrollment. Returns the row count it yields.
     auto run_guard = [&]() -> int {
         const char* v[] = {"7", "enrollguard"};
         PgResult r{PQexecParams(
             h.conn.get(),
             "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
-            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL RETURNING id",
+            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
+            "AND mfa_totp_secret IS NOT NULL RETURNING id",
             2, nullptr, v, nullptr, nullptr, 0)};
         REQUIRE(r.status() == PGRES_TUPLES_OK);
         return PQntuples(r.get());
     };
-    auto set_col = [&](const char* sql) {
-        const char* v[] = {"enrollguard"};
-        PgResult r{PQexecParams(h.conn.get(), sql, 1, nullptr, v, nullptr, nullptr, 0)};
-        REQUIRE(r.ok());
-    };
 
-    // Provisional (mfa_enrolled_at NULL, active): the guard claims it.
-    CHECK(run_guard() == 1);
-    // Now enrolled (the guard just stamped it): a second run is rejected — 0 rows.
+    make_provisional();
+    CHECK(run_guard() == 1); // provisional + secret + active → claimed (stamps enrolled_at)
+    CHECK(run_guard() == 0); // now enrolled (enrolled_at set) → rejected
+
+    // Disabled mid-flight: mfa_disable leaves secret NULL + enrolled_at NULL. The
+    // `mfa_totp_secret IS NOT NULL` clause rejects it — no enrol over a NULL secret.
+    make_provisional();
+    set_col("UPDATE auth.users SET mfa_enrolled_at = NULL, mfa_totp_secret = NULL WHERE username = $1");
     CHECK(run_guard() == 0);
-    // Reset to provisional but deactivate: is_active = FALSE also rejects — 0 rows.
-    set_col("UPDATE auth.users SET mfa_enrolled_at = NULL, is_active = FALSE WHERE username = $1");
+
+    // Deactivated: is_active = FALSE rejects.
+    make_provisional();
+    set_col("UPDATE auth.users SET is_active = FALSE WHERE username = $1");
     CHECK(run_guard() == 0);
-    // Re-activate the provisional row: claimed again — 1 row.
-    set_col("UPDATE auth.users SET is_active = TRUE WHERE username = $1");
+
+    // Back to a clean provisional-with-secret row → claimed again.
+    make_provisional();
     CHECK(run_guard() == 1);
 }
 

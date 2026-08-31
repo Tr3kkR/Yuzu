@@ -1419,24 +1419,36 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
     std::vector<std::string> raw_codes;
     AuthDBError txn_error = AuthDBError::WriteFailed;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
-        // ★ TOCTOU guard (#3762): the `mfa_enrolled_at IS NULL` predicate makes the
-        // provisional→enrolled commit atomic with its own precondition, exactly as
-        // `mfa_consume_recovery_code` guards on `consumed_at IS NULL` (docs/auth-mfa-
-        // design.md "Recovery codes", "race-safe without an explicit transaction"). The
-        // pre-txn `mfa_status().enrolled` check above is a separate pooled read, so two
-        // concurrent verifies of one enrollment code otherwise BOTH pass it, BOTH stamp
-        // enrolled_at, and BOTH run regenerate_recovery_codes_locked (DELETE-all +
-        // INSERT) — the loser deletes the winner's just-issued codes, orphaning the set
-        // the winner was handed. Under READ COMMITTED the loser's UPDATE blocks on the row
-        // lock, re-evaluates its WHERE against the winner's committed row → 0 rows →
-        // returns before the regen. LOAD-BEARING two ways: (1) dropping this predicate
-        // reopens the double-regen; (2) it is safe against wedging a legitimate re-enroll
-        // ONLY because `mfa_disable` NULLs `mfa_enrolled_at` (the sole un-enroll path also
-        // clears the column), so no state has it set with a fresh verify allowed.
+        // ★ TOCTOU guard (#3762): the WHERE predicate makes the provisional→enrolled
+        // commit atomic with its own preconditions, exactly as `mfa_consume_recovery_code`
+        // guards on `consumed_at IS NULL` (docs/auth-mfa-design.md "Recovery codes",
+        // "race-safe without an explicit transaction"). The pre-txn `mfa_status()` /
+        // `load_mfa_row` reads above are separate pooled statements, so two concurrency
+        // hazards exist that this one guarded UPDATE closes under READ COMMITTED (the
+        // loser blocks on the row lock and re-evaluates its WHERE against the committed
+        // row):
+        //   (a) `mfa_enrolled_at IS NULL` — two concurrent verifies of one code would
+        //       otherwise BOTH stamp enrolled_at and BOTH run
+        //       regenerate_recovery_codes_locked (DELETE-all + INSERT), the loser deleting
+        //       the winner's just-issued codes and orphaning the set the winner was handed.
+        //   (b) `mfa_totp_secret IS NOT NULL` — a concurrent `mfa_disable` NULLs BOTH the
+        //       secret and `mfa_enrolled_at`, so predicate (a) alone would still MATCH the
+        //       post-disable row and enrol the account with a NULL secret (an unusable
+        //       second factor). Requiring the secret to still be present makes a verify
+        //       that observes the post-disable state FAIL, upholding the "mfa_disable is
+        //       atomic against in-flight verifies" hard invariant (docs/auth-mfa-design.md
+        //       §Hard invariants item 3). Post-disable → 0 rows → classify below keeps
+        //       WriteFailed/503 (fail-closed, no half-enrolled state).
+        // LOAD-BEARING: dropping (a) reopens the double-regen; dropping (b) reopens the
+        // enrol-over-disabled-secret race. Neither wedges a legitimate re-enroll: every
+        // un-enroll path (`mfa_disable`, soft-delete) NULLs `mfa_enrolled_at`, and a fresh
+        // `mfa_init_enrollment` writes a new non-NULL secret, so a post-disable re-enroll
+        // satisfies both predicates.
         pg::PgResult r = pg::exec_params(
             conn,
             "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
-            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL RETURNING id",
+            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
+            "AND mfa_totp_secret IS NOT NULL RETURNING id",
             std::vector<std::string>{std::to_string(*matched), username});
         if (r.status() != PGRES_TUPLES_OK)
             return false; // write outage → fail closed (WriteFailed → 503)
