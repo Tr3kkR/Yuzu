@@ -186,6 +186,8 @@ Approval row_to_approval(sqlite3_stmt* stmt) {
     a.consumed_by = col_text(stmt, 10);
     a.schedule_id = col_text(stmt, 11);
     a.origin = approval_origin_from_string(col_text(stmt, 12));
+    a.target_plugin = col_text(stmt, 13);
+    a.target_action = col_text(stmt, 14);
     return a;
 }
 
@@ -193,7 +195,8 @@ Approval row_to_approval(sqlite3_stmt* stmt) {
 // this constant so the column order can never drift between call sites.
 const char* kSelectAllCols = "id, definition_id, status, submitted_by, submitted_at, "
                              "reviewed_by, reviewed_at, review_comment, scope_expression, "
-                             "consumed_at, consumed_by, schedule_id, origin";
+                             "consumed_at, consumed_by, schedule_id, origin, target_plugin, "
+                             "target_action";
 
 } // namespace
 
@@ -322,6 +325,21 @@ void ApprovalManager::create_tables() {
         {7, R"(
             UPDATE approvals SET origin = 'legacy' WHERE origin = '';
         )"},
+        // v8 (#1398 hardening — governance Gate 4 unhappy-path CRITICAL
+        // finding, then re-hardened by security-guardian's re-review): see
+        // `Approval::target_plugin`'s doc comment. TWO columns, not one
+        // concatenated string — a single `plugin+"."+action` column would
+        // be collision-prone (28 shipped actions already contain a literal
+        // `.`) with nothing enforcing that no plugin name ever does.
+        // Additive, '' default on both — a pre-migration row (and every
+        // non-schedule mint, which leaves both empty deliberately) simply
+        // never matches fire_with_approval's new equality check, which is
+        // the correct fail-closed outcome (ADR-0033 §1), not a state
+        // requiring back-fill.
+        {8, R"(
+            ALTER TABLE approvals ADD COLUMN target_plugin TEXT NOT NULL DEFAULT '';
+            ALTER TABLE approvals ADD COLUMN target_action TEXT NOT NULL DEFAULT '';
+        )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
         // Fail closed (governance sre-BLOCKING-1 / HC-1): a failed v2 migration
@@ -343,7 +361,8 @@ void ApprovalManager::create_tables() {
 std::expected<std::string, std::string>
 ApprovalManager::submit(const std::string& definition_id, const std::string& submitted_by,
                         const std::string& scope_expression, const std::string& schedule_id,
-                        ApprovalOrigin origin) {
+                        ApprovalOrigin origin, std::string target_plugin,
+                        std::string target_action) {
     if (!db_)
         return std::unexpected("database not open");
     if (definition_id.empty())
@@ -447,8 +466,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     const char* sql = R"(
         INSERT INTO approvals (id, definition_id, status, submitted_by, submitted_at,
                                reviewed_by, reviewed_at, review_comment, scope_expression,
-                               schedule_id, origin)
-        VALUES (?, ?, 'pending', ?, ?, '', 0, '', ?, ?, ?)
+                               schedule_id, origin, target_plugin, target_action)
+        VALUES (?, ?, 'pending', ?, ?, '', 0, '', ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -461,6 +480,8 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
     sqlite3_bind_text(stmt, 5, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 6, schedule_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 7, to_string(origin), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, target_plugin.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, target_action.c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));

@@ -18,6 +18,7 @@
 // starts fresh and mints its OWN KEK against its OWN keys dir (mirrors
 // test_secret_codec.cpp's `secrets_tpl`).
 
+#include "acquire_retry.hpp"
 #include "key_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -130,6 +131,89 @@ struct Harness {
 
 } // namespace
 
+// #2396: StoreBusy (the bounded acquire-retry exhausted → transient pool
+// outage) MUST classify as store-unavailable, so every existing
+// is_store_unavailable()-gated 503 site keeps failing CLOSED on a pool blip.
+// This is the load-bearing mapping — a regression here would let a transient
+// acquire outage fall through to a wrong-code 401 (burning a lockout attempt)
+// or, on the MFA read, a password-only minted session. No PG needed — a pure
+// header contract, so it runs on every leg.
+TEST_CASE("is_store_unavailable classifies StoreBusy as unavailable (#2396)",
+          "[auth_db][degrade]") {
+    using yuzu::server::AuthDBError;
+    using yuzu::server::is_store_unavailable;
+    CHECK(is_store_unavailable(AuthDBError::StoreBusy));
+    // Regression guard on the rest of the store-unavailable set...
+    CHECK(is_store_unavailable(AuthDBError::QueryFailed));
+    CHECK(is_store_unavailable(AuthDBError::WriteFailed));
+    CHECK(is_store_unavailable(AuthDBError::SecretUnavailable));
+    // ...and that genuine business outcomes stay OUT of it (never a 503).
+    CHECK_FALSE(is_store_unavailable(AuthDBError::UserNotFound));
+    CHECK_FALSE(is_store_unavailable(AuthDBError::InvalidCredentials));
+    CHECK_FALSE(is_store_unavailable(AuthDBError::InvalidUsername));
+}
+
+// #2396 (adv-review CDX-P1-02 / K7): a saturated-pool test can prove fail-closed
+// EXHAUSTION but not that a transient empty acquire actually rides out to a
+// SUCCESS within the same call — the feature's primary recovery behaviour. The
+// retry loop is factored into detail::acquire_with_bounded_retry precisely so
+// that property is deterministically testable (no live pool, no timing). A
+// move-only truthy-on-success stand-in for pg::PgPool::Lease drives it.
+namespace {
+struct FakeLease {
+    bool ok{false};
+    FakeLease() = default;
+    explicit FakeLease(bool o) : ok(o) {}
+    FakeLease(FakeLease&&) = default;
+    FakeLease& operator=(FakeLease&&) = default;
+    FakeLease(const FakeLease&) = delete;
+    FakeLease& operator=(const FakeLease&) = delete;
+    explicit operator bool() const { return ok; }
+};
+} // namespace
+
+TEST_CASE("acquire_with_bounded_retry rides a transient empty acquire out to success (#2396)",
+          "[auth_db][degrade]") {
+    using yuzu::server::detail::acquire_with_bounded_retry;
+
+    // (a) THE property CDX-P1-02 wanted pinned: first two acquires come back
+    // empty, the third succeeds -> the loop returns success within one call,
+    // having retried exactly twice with a backoff before each retry.
+    int calls = 0, sleeps = 0;
+    auto v = acquire_with_bounded_retry(
+        2, [&](bool) { ++calls; return FakeLease(calls >= 3); }, [&] { ++sleeps; });
+    CHECK(bool(v));
+    CHECK(calls == 3); // 1 first attempt + 2 retries
+    CHECK(sleeps == 2);
+
+    // (b) sustained outage: every acquire empty -> exhausted, returns empty,
+    // BOUNDED at 1 + retries attempts (never a hang, never unbounded).
+    calls = 0, sleeps = 0;
+    auto v2 = acquire_with_bounded_retry(
+        2, [&](bool) { ++calls; return FakeLease(false); }, [&] { ++sleeps; });
+    CHECK_FALSE(bool(v2));
+    CHECK(calls == 3);
+    CHECK(sleeps == 2);
+
+    // (c) healthy: first acquire succeeds -> no retry, no backoff (zero added
+    // latency on the normal path).
+    calls = 0, sleeps = 0;
+    auto v3 = acquire_with_bounded_retry(
+        2, [&](bool) { ++calls; return FakeLease(true); }, [&] { ++sleeps; });
+    CHECK(bool(v3));
+    CHECK(calls == 1);
+    CHECK(sleeps == 0);
+
+    // (d) retries == 0 (the stripe-held acquires' policy): a single un-retried
+    // attempt, empty stays empty, no backoff.
+    calls = 0, sleeps = 0;
+    auto v4 = acquire_with_bounded_retry(
+        0, [&](bool) { ++calls; return FakeLease(false); }, [&] { ++sleeps; });
+    CHECK_FALSE(bool(v4));
+    CHECK(calls == 1);
+    CHECK(sleeps == 0);
+}
+
 #ifdef YUZU_TEST_ENABLE_PG
 
 // ── construction ───────────────────────────────────────────────────────────
@@ -142,7 +226,7 @@ TEST_CASE("AuthDB constructs, migrates, and opens", "[pg][auth_db]") {
 }
 
 TEST_CASE("AuthDB reports !is_open on a migration failure", "[pg][auth_db]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
@@ -704,7 +788,11 @@ TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read is not 'no secret' — i
     // live one — silently invalidating a QR the operator had already scanned.
     auto reinit = h.db.mfa_init_enrollment("qfail1", "Yuzu");
     REQUIRE_FALSE(reinit.has_value());
-    CHECK(reinit.error() == AuthDBError::WriteFailed);
+    // The reuse guard preserves the actual store-unavailable error (here
+    // QueryFailed — a failed statement, not an acquire timeout) rather than
+    // flattening to WriteFailed, so the enroll-init degrade metric labels the
+    // reason correctly (#2396 adv-review CDX-P2-03). Still fail-closed.
+    CHECK(reinit.error() == AuthDBError::QueryFailed);
     CHECK(yuzu::server::is_store_unavailable(reinit.error()));
 
     // The decisive assertion: the stored bytes are untouched.
@@ -727,6 +815,105 @@ TEST_CASE("AuthDB MFA fail-closed: a FAILED secret read surfaces as a store outa
     REQUIRE_FALSE(verify.has_value());
     CHECK(verify.error() == AuthDBError::QueryFailed);
     CHECK(yuzu::server::is_store_unavailable(verify.error()));
+}
+
+// #2396: under a transient pool outage (every connection held), every login
+// acquire fails CLOSED as StoreBusy (empty lease == StoreBusy, retry or not) —
+// never a business-outcome error, never a hang, and it recovers once
+// connections free (no permanent wedge). The retried decision read `mfa_status`
+// returns StoreBusy AFTER exhausting its bounded retry; the stripe-held reads/
+// writes (`lockout_status`/`record_failed_login`/`clear_failed_logins`) return
+// it on a single un-retried acquire (they are deliberately not retried —
+// worker-pool starvation, Gate 4 — see acquire_with_retry SCOPE). All are
+// is_store_unavailable, so all 503 fail-closed, and all label a pool-acquire
+// timeout as StoreBusy (-> reason=pool_acquire_timeout) rather than conflating
+// it with a query error.
+TEST_CASE("AuthDB login acquires fail closed as StoreBusy under pool saturation (#2396)",
+          "[pg][auth_db][degrade]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("busy1", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    // Happy path first: with the pool free the reads succeed.
+    CHECK(h.db.mfa_status("busy1").has_value());
+    CHECK(h.db.lockout_status("busy1").has_value());
+
+    // Saturate the size-4 pool by holding every connection. A 2s acquire budget
+    // absorbs any transient hold by AuthDB's own cleanup thread; once all four
+    // are held, nothing else can hold one, so the reads below deterministically
+    // find no free connection.
+    std::vector<PgPool::Lease> held;
+    for (int i = 0; i < 4; ++i) {
+        auto lease = h.pool.try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        held.push_back(std::move(lease));
+    }
+
+    // The retried decision read fails CLOSED as StoreBusy, bounded (the test
+    // returns — the retry does not hang).
+    auto st = h.db.mfa_status("busy1");
+    REQUIRE_FALSE(st.has_value());
+    CHECK(st.error() == AuthDBError::StoreBusy);
+    CHECK(yuzu::server::is_store_unavailable(st.error()));
+
+    // The stripe-held, un-retried read/writes also report an empty lease as
+    // StoreBusy (empty lease == StoreBusy) — so a pool-acquire timeout is
+    // labelled pool_acquire_timeout, never conflated with a query error.
+    auto lk = h.db.lockout_status("busy1");
+    REQUIRE_FALSE(lk.has_value());
+    CHECK(lk.error() == AuthDBError::StoreBusy);
+    CHECK(yuzu::server::is_store_unavailable(lk.error()));
+
+    auto rec = h.db.record_failed_login("busy1", 5, 900);
+    REQUIRE_FALSE(rec.has_value());
+    CHECK(rec.error() == AuthDBError::StoreBusy);
+    CHECK(yuzu::server::is_store_unavailable(rec.error()));
+    auto clr = h.db.clear_failed_logins("busy1");
+    REQUIRE_FALSE(clr.has_value());
+    CHECK(clr.error() == AuthDBError::StoreBusy);
+
+    // Releasing the connections restores normal reads — a blip is transient,
+    // not a permanent lockout.
+    held.clear();
+    CHECK(h.db.mfa_status("busy1").has_value());
+}
+
+// #2396 fail-closed regression (security-guardian Gate 2 HIGH): the enum change
+// routed a load_mfa_row acquire-timeout to StoreBusy, which the mfa_init reuse
+// guard's old `== QueryFailed` test missed — letting a transient blip fall
+// through to mint-fresh over a provisional/enrolled secret. The guard now gates
+// on is_store_unavailable (covers StoreBusy). This proves the SECURITY PROPERTY
+// end-to-end: under a store outage, mfa_init_enrollment fails CLOSED and never
+// overwrites the stored secret. (Full pool saturation is caught at the mfa_status
+// pre-read, itself a StoreBusy site post-#2396; the reuse guard's StoreBusy
+// coverage additionally rests on is_store_unavailable — the mapping test above —
+// and on the break_load_mfa_row_only QueryFailed guard test below.)
+TEST_CASE("AuthDB mfa_init_enrollment fails closed on a store outage, never overwrites the "
+          "secret (#2396)",
+          "[pg][auth_db][degrade][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("busymfa", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    // Mint a provisional secret with the pool free.
+    REQUIRE(h.db.mfa_init_enrollment("busymfa", "Yuzu").has_value());
+    const std::string before = read_secret_hex(h.conn.get(), "busymfa");
+    REQUIRE_FALSE(before.empty());
+
+    // Saturate the pool, then re-init: it must fail CLOSED as a store-unavailable
+    // outcome (never a fresh mint), leaving the provisional secret byte-identical.
+    std::vector<PgPool::Lease> held;
+    for (int i = 0; i < 4; ++i) {
+        auto lease = h.pool.try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        held.push_back(std::move(lease));
+    }
+    auto reinit = h.db.mfa_init_enrollment("busymfa", "Yuzu");
+    REQUIRE_FALSE(reinit.has_value());
+    CHECK(yuzu::server::is_store_unavailable(reinit.error()));
+
+    held.clear();
+    CHECK(read_secret_hex(h.conn.get(), "busymfa") == before);
 }
 
 TEST_CASE("AuthDB MFA: a genuinely NOT-enrolled user still verifies as a plain false",

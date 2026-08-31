@@ -45,7 +45,8 @@ CC6.6 — privileged access).
   Recovery codes share the same endpoint (heuristic: `-` separator or
   non-6-digit length).
 - **Step-up window** (PR 2). On a successful TOTP proof the session's
-  `mfa_verified_at` is bumped to `steady_clock::now()`. High-risk
+  `mfa_verified_at` is bumped to `system_clock::now()` (wall-clock since
+  HA WS-1/1a — see the corrected hard invariant #5). High-risk
   endpoints reject the session as "stale" if the gap exceeds
   `cfg.mfa_step_up_window_secs` (default 300 s) and prompt for a fresh
   code via `POST /login/mfa/stepup`.
@@ -68,9 +69,9 @@ cutover changed.**
 |---|---|---|
 | RFC 6238 TOTP + RFC 4648 base32 + otpauth URI | `server/core/src/totp.{hpp,cpp}` | Tested against RFC 6238 Appendix B SHA-1 vectors; unaffected by the Postgres cutover |
 | Schema migration v2 (SQLite era) | `server/core/src/auth_db.cpp` (`kMigrations`) | `users.mfa_*`, `sessions.mfa_verified_at`, `mfa_recovery_codes`, `auth_kv` — `sessions`/`auth_kv` were **dropped** (not carried) into the single Postgres `auth` migration; see "Schema" below |
-| MFA accessors on `AuthDB` | `server/core/{src,include}/yuzu/server/auth_db.{cpp,hpp}` | `mfa_init_enrollment` / `mfa_verify_enrollment` / `mfa_verify_login_code` / `mfa_consume_recovery_code` / `mfa_regenerate_recovery_codes` / `mfa_disable` / `mfa_status` still exist on the Postgres-backed `AuthDB`; **`mfa_mark_session_stepup` was removed** in the Postgres cutover along with the rest of the session surface (step-up state is `Session::mfa_verified_at`, in-memory only) |
+| MFA accessors on `AuthDB` | `server/core/{src,include}/yuzu/server/auth_db.{cpp,hpp}` | `mfa_init_enrollment` / `mfa_verify_enrollment` / `mfa_verify_login_code` / `mfa_consume_recovery_code` / `mfa_regenerate_recovery_codes` / `mfa_disable` / `mfa_status` still exist on the Postgres-backed `AuthDB`; **`mfa_mark_session_stepup` was removed** in the Postgres cutover along with `AuthDB`'s session surface (step-up state is `Session::mfa_verified_at`, now a durable `mfa_verified_ms` column on the `SessionStore` row for Postgres deployments — HA WS-1/1a) |
 | AuthManager glue | `server/core/{src,include}/yuzu/server/auth.{cpp,hpp}` | `verify_password`, `create_local_session(user, role, mfa_verified)`, `mark_session_mfa_verified`, `auth_db_ptr()` |
-| `Session::mfa_verified_at` | `server/core/include/yuzu/server/auth.hpp` | `steady_clock::time_point`; default-constructed = not verified |
+| `Session::mfa_verified_at` | `server/core/include/yuzu/server/auth.hpp` | `system_clock::time_point` (wall-clock since HA WS-1/1a, ADR-2002 §4 — see invariant #5); default-constructed = not verified |
 | Login flow | `server/core/src/auth_routes.{cpp,hpp}` | `POST /login` returns 202 + pending token on MFA-enrolled users; new `POST /login/mfa` route; `MfaPending` map with TTL reaper |
 | Login page | `server/core/src/login_ui.cpp` | Hidden MFA form revealed on 202 response |
 | Settings panel | `server/core/src/settings_routes.{cpp,hpp}`, `settings_ui.cpp` | `render_mfa_fragment` + four `/api/settings/mfa/*` POST routes; new "Multi-Factor Authentication" section |
@@ -115,7 +116,9 @@ was **never used** — see "At-rest protection".
 
 **Current (Postgres, schema `auth`, ADR-0006).** The single-migration
 `auth.users` table carries the same MFA columns, minus `sessions` (dropped
-entirely — sessions are in-memory-only, see `docs/auth-architecture.md`)
+from `AuthDB` — operator sessions are now durable in the separate `SessionStore`
+(HA WS-1/1a, ADR-2002 §4), not on `AuthDB`; see `docs/auth-architecture.md`
+"Durable operator sessions")
 and `auth_kv` (dropped, unused scaffolding, superseded outright by
 `SecretCodec` — never reused for anything else):
 
@@ -461,16 +464,19 @@ Entra and most OIDC IdPs assert the methods used to authenticate via the
    never wrongly admitted).
 3. `/auth/callback` seeds the new session's `mfa_verified_at` only when
    `amr_asserts_mfa(claims.amr)` is true **and `iat > 0`**. **Clock-domain
-   note:** the design originally said `mfa_verified_at = iat`, but `iat` is
-   wall-clock and `Session::mfa_verified_at` is `steady_clock` (hard
-   invariant #5, NTP-step resistance). The handler computes the
-   assertion's age (`system_now − iat`, clamped at 0 for IdP-clock-ahead
-   skew) **in the system-clock domain before** the cast to
-   `steady_clock::duration`, then sets `mfa_verified_at = steady_now −
-   age`, so a stale IdP assertion still re-prompts. A missing/zero `iat`
-   is **not** seeded (fabricating a fresh window from a timestampless
-   assertion would let a replayed `amr`-without-`iat` token look fresh —
-   governance UP-9); such a session simply falls into the "no proof"
+   note:** since HA WS-1/1a (ADR-2002 §4) `Session::mfa_verified_at` is a
+   `system_clock` (wall-clock) instant, so the handler seeds it **directly
+   from the IdP `iat`** (`mfa_verified_at = system_clock::time_point{iat}`) —
+   the earlier steady-clock age-projection algorithm (`steady_now − age`) has
+   been removed. A stale IdP assertion still re-prompts because its seeded
+   wall-clock instant is already old relative to the step-up window. A future
+   `iat` is **clamped to now** (`iat > system_now` → `mfa_verified_at =
+   system_now`) so an IdP-clock-ahead skew cannot mint a proof that stays
+   fresh past the window; the downstream step-up gate additionally fails
+   closed on any `mfa_verified_at > now` residue (see hard invariant #5). A
+   missing/zero `iat` is **not** seeded (fabricating a fresh window from a
+   timestampless assertion would let a replayed `amr`-without-`iat` token look
+   fresh — governance UP-9); such a session simply falls into the "no proof"
    branch below, which passes.
 4. `require_mfa_step_up` no longer early-exempts `oidc`. It skips the local
    `mfa_status` lookup for OIDC sessions (there is no `users` row) and:
@@ -626,9 +632,18 @@ regress:
    `reap_mfa_pending_locked`. A 5-minute window between password
    success and TOTP submission is a credential-stuffing surface — keep
    the default tight.
-5. **`Session::mfa_verified_at` is `steady_clock`, not wall clock.**
-   The step-up window math must use `steady_clock::now()` so an NTP
-   step (or operator clock fiddling) cannot extend the window.
+5. **`Session::mfa_verified_at` is `system_clock` (wall-clock), and the
+   step-up window is defended two other ways.** Since HA WS-1/1a (ADR-2002
+   §4) the session lifetime fields moved off `steady_clock` to wall-clock so
+   they survive the durable `SessionStore` round-trip (see
+   `docs/auth-architecture.md` → "Durable operator sessions (HA WS-1/1a,
+   ADR-2002 §4)"). The former monotonic NTP-step resistance is replaced by:
+   (a) `mfa_step_up.cpp` **fails closed on a future-dated proof** — a
+   `mfa_verified_at > now` value is treated as **no proof** (re-prompt),
+   never as an extended-into-the-future window; and (b) the step-up window
+   is deliberately short (`mfa_step_up_window_secs`, default 300 s), so the
+   blast radius of any residual clock movement is bounded to a few minutes.
+   DB-primary wall-clock integrity is a monitored dependency (HA WS-11).
 6. **Audit on every gate.** `audit_log` is called on success AND
    failure for `mfa.enroll`, `mfa.login`, and `mfa.step_up`. The
    CC6.6 evidence chain is the success row + the failure row together
@@ -650,5 +665,6 @@ regress:
    `optional`** — the UP-5 livelock for the default deployment; (c)
    *passing* the no-proof case **under `required`** — the CC6.6 enforcement
    gap (Hermes A4/B1). The enforcement mode must stay threaded into the
-   gate. The seeded timestamp must stay in the `steady_clock` domain (#5),
-   and `/login/mfa/stepup` must keep rejecting OIDC callers.
+   gate. The seeded timestamp is a wall-clock (`system_clock`) instant and must
+   keep its future-dated-proof fail-closed handling (#5), and `/login/mfa/stepup`
+   must keep rejecting OIDC callers.

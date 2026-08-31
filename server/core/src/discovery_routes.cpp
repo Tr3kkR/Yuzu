@@ -410,6 +410,7 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                      res.status = 400;
                      res.set_content(nlohmann::json({{"error", depl_result.error()}}).dump(),
                                      "application/json");
+                     audit_fn(req, "patch.deploy", "denied", "Patch", "", depl_result.error());
                      return;
                  }
 

@@ -395,16 +395,16 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_CERT_GROUP");
     app.add_option("--ca-cert", cfg.tls_ca_cert, "PEM CA cert (for mTLS agent verification)")
         ->envname("YUZU_CA_CERT");
-    bool deprecated_allow_one_way_tls_flag = false;
+    bool deprecated_tls_flag_used = false;
     app.add_flag("--insecure-skip-client-verify",
                  "Allow TLS without --ca-cert (disables mTLS client verification). "
                  "Requires YUZU_ALLOW_INSECURE_TLS=1.")
-        ->each([&cfg](const std::string&) { cfg.allow_one_way_tls = true; });
+        ->each([&cfg](const std::string&) { cfg.insecure_skip_client_verify = true; });
     app.add_flag("--allow-one-way-tls", "[DEPRECATED] Renamed to --insecure-skip-client-verify; "
                                         "still accepted for backward compatibility.")
-        ->each([&cfg, &deprecated_allow_one_way_tls_flag](const std::string&) {
-            cfg.allow_one_way_tls = true;
-            deprecated_allow_one_way_tls_flag = true;
+        ->each([&cfg, &deprecated_tls_flag_used](const std::string&) {
+            cfg.insecure_skip_client_verify = true;
+            deprecated_tls_flag_used = true;
         });
     app.add_option("--management-cert", cfg.mgmt_tls_server_cert,
                    "PEM management server certificate override");
@@ -861,6 +861,16 @@ int main(int argc, char* argv[]) {
     app.add_option("--saml-admin-group", cfg.saml_admin_group,
                    "SAML group value (from --saml-group-attribute) that maps to admin role")
         ->envname("YUZU_SAML_ADMIN_GROUP");
+    app.add_option("--saml-name-attribute", cfg.saml_name_attribute,
+                   "SAML <Attribute Name=\"...\"> whose first value is the user's display name "
+                   "(e.g. the Entra displayname claim URI); empty leaves the display as the raw "
+                   "NameID. Display/audit only, never an identity or authz input")
+        ->envname("YUZU_SAML_NAME_ATTRIBUTE");
+    app.add_option("--saml-email-attribute", cfg.saml_email_attribute,
+                   "SAML <Attribute Name=\"...\"> whose first value is the user's email "
+                   "(e.g. the Entra emailaddress claim URI); empty disables email parsing. "
+                   "Used only as a display fallback and logged, never stored or used for identity")
+        ->envname("YUZU_SAML_EMAIL_ATTRIBUTE");
 
     // Data infrastructure options
     app.add_option("--response-retention-days", cfg.response_retention_days,
@@ -1183,11 +1193,11 @@ int main(int argc, char* argv[]) {
     // an explicit environment variable, so that no single misconfiguration
     // (typo, copy-pasted command, leaked CLI history) can silently downgrade
     // the agent listener from mTLS to one-way TLS.
-    if (deprecated_allow_one_way_tls_flag) {
+    if (deprecated_tls_flag_used) {
         spdlog::warn("--allow-one-way-tls is deprecated; use --insecure-skip-client-verify "
                      "instead (this flag will be removed in a future release).");
     }
-    if (cfg.allow_one_way_tls && cfg.tls_enabled) {
+    if (cfg.insecure_skip_client_verify && cfg.tls_enabled) {
         if (!yuzu::server::security::insecure_tls_env_authorized()) {
             spdlog::error("--insecure-skip-client-verify requires YUZU_ALLOW_INSECURE_TLS=1 "
                           "in the environment as a second confirmation. Refusing to start.");

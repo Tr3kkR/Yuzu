@@ -102,6 +102,56 @@ struct Approval {
     /// v5); rows that predate it are rewritten by v7 and read back as
     /// kUnrecognised, NOT kUnspecified — see `to_string`'s comment.
     ApprovalOrigin origin{ApprovalOrigin::kUnspecified};
+    /// `target_plugin`/`target_action`, snapshotted at `submit()` time
+    /// (#1398 hardening, governance Gate 4 unhappy-path CRITICAL finding).
+    /// `Approval` binds a human review to `definition_id` only — but
+    /// `InstructionDefinition::plugin`/`.action` are MUTABLE
+    /// (`PUT /api/instructions/{id}`, gated on nothing stronger than
+    /// `InstructionDefinition:Write`, and NEITHER field is charset-restricted
+    /// — `InstructionStore::validate_and_prepare` only checks `plugin` is
+    /// non-empty), so a ticket approved while a definition pointed at one
+    /// action remains matchable by `definition_id` alone after the
+    /// definition is repointed at a DIFFERENT one — no human ever reviewed
+    /// the content that actually dispatches. `ScheduleRunner::
+    /// fire_with_approval` is the one redemption path this binds: it
+    /// re-fetches the definition fresh every tick and must refuse a ticket
+    /// whose `target_plugin`/`target_action` no longer match what is about
+    /// to dispatch, exactly as ADR-0033 §1 requires for any filter that
+    /// applies ("unresolvable/missing/unparseable denies") — a plain string
+    /// mismatch (including empty, for a pre-migration row) already falls out
+    /// of a strict `==` with no special-casing needed.
+    ///
+    /// TWO SEPARATE FIELDS, deliberately — NOT ONE `plugin + "." + action"`
+    /// string (governance Gate 4 security-guardian re-review, folded in
+    /// 2026-08-29). A single concatenated string is collision-prone: 28
+    /// shipped actions already contain a literal `.` as an internal
+    /// namespace separator (`workflow.list`, `policy.list`,
+    /// `product_pack.install`, all under `plugin: server`) — no ACTUAL
+    /// collision exists today (verified empirically: 226 distinct
+    /// `(plugin, action)` pairs across `capability_decls/*.hpp` +
+    /// `content/definitions/*.yaml` produce 226 distinct concatenations),
+    /// but nothing enforces that invariant, `action` isn't charset-validated
+    /// AT ALL, and `CommandCapabilityRegistry::classify` itself compares
+    /// `plugin`/`action` as independent fields — matching that shape here
+    /// eliminates the collision class structurally rather than relying on
+    /// it staying empirically true forever.
+    ///
+    /// EMPTY for an MCP-minted ticket only (`mcp_server.cpp`'s generic
+    /// multi-tool `submit()` call site has no single plugin/action in
+    /// scope) — MCP does not need these fields: it already binds redemption
+    /// to `definition_id = "mcp."+tool_name` (a code constant, not an
+    /// editable row) plus a canonical hash of the full call arguments, an
+    /// orthogonal and already-sufficient binding. Populated for BOTH
+    /// `ScheduleRunner` (the exploitable path this fixes) AND the
+    /// interactive `workflow_routes.cpp` mint, even though the latter has no
+    /// redemption flow at all today (a separate, pre-existing,
+    /// already-tracked gap — see the design doc's follow-up list) —
+    /// populated there anyway so a FUTURE interactive-redemption
+    /// implementation inherits this protection for free rather than needing
+    /// its own hardening round.
+    /// Additive columns (migration v8).
+    std::string target_plugin;
+    std::string target_action;
 };
 
 struct ApprovalQuery {
@@ -301,10 +351,18 @@ public:
     /// it is now a compile error rather than a silent `kUnspecified`, which
     /// itself refuses at redemption today, not grants (see
     /// `declares_non_mcp_surface`).
+    ///
+    /// `target_plugin`/`target_action` (#1398 hardening): see
+    /// `Approval::target_plugin`'s doc comment. Both DEFAULTED (unlike
+    /// `origin`) because they have no meaning at the generic MCP mint call
+    /// site (one shared helper across several tools, no single
+    /// plugin/action in scope) — callers that DO have one (`ScheduleRunner`,
+    /// the interactive workflow route) must pass both.
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
            const std::string& scope_expression, const std::string& schedule_id,
-           ApprovalOrigin origin);
+           ApprovalOrigin origin, std::string target_plugin = {},
+           std::string target_action = {});
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 

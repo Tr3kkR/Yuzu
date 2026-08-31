@@ -59,6 +59,13 @@ inline constexpr std::chrono::seconds kOrphanDrainGrace{3};
 /// type does not let the compiler prove that on Windows, and main.cpp's
 /// existing call sites (predating this header) rely on the same plain-void
 /// shape.
+///
+/// EXCEPTION (test harness only, #3507 AC1): tests/unit/test_runner_main.cpp
+/// calls hard_exit(result) on Windows where a passing Catch2 run means
+/// result == 0 - a deliberate, reviewed departure from the "never look like
+/// EXIT_SUCCESS" rule above, argued at that call site. This sentence remains
+/// binding for every F3/orphan-triggered call (main.cpp, service_win.cpp);
+/// it does not extend to that one test-harness use.
 inline void hard_exit(int code) noexcept {
 #ifdef _WIN32
     ::TerminateProcess(::GetCurrentProcess(), code);

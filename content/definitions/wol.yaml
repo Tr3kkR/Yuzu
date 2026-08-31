@@ -74,7 +74,7 @@ spec:
     ttlSeconds: 0
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
@@ -150,7 +150,7 @@ spec:
     ttlSeconds: 0
 
   approval:
-    mode: manual
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator]

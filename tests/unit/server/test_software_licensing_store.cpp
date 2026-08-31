@@ -143,7 +143,7 @@ void sle_reset() {
 
 TEST_CASE("SoftwareLicensingStore migrates at construction and reopens idempotently",
           "[pg][software_licensing]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {
@@ -397,7 +397,9 @@ TEST_CASE("SoftwareLicensingStore delete_agent serialises against an in-flight i
     // this test holds that EXACT lock on a peer session and proves delete_agent
     // blocks on it. A drift in the key derivation — or a missing lock — would let
     // delete race past the peer and this assertion would flip.
-    YUZU_REQUIRE_PG_DB(db);
+    // Not a migration test (uses the pre-migrated template, not a fresh
+    // migration) — kept off the Windows migration-skip list.
+    YUZU_REQUIRE_PG_DB_TPL(db, sle_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareLicensingStore store{pool};
@@ -493,7 +495,7 @@ TEST_CASE("SoftwareLicensingStore count_stale_agents keys on server-receipt last
 
 TEST_CASE("SoftwareLicensingStore reads are AUTHORITATIVE: degrade ≠ empty; writes fail soft",
           "[pg][software_licensing]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, sle_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     SoftwareLicensingStore store{pool};
@@ -550,7 +552,7 @@ TEST_CASE("SoftwareLicensingStore store_not_open: constructor failure degrades e
     // Force open_=false via the sibling-suite recipe: wipe the schema_meta
     // version record so a fresh construction re-runs v1 DDL over live tables →
     // migration fails → !is_open().
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {

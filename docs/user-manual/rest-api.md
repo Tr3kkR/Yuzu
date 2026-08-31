@@ -1267,7 +1267,7 @@ curl -s -X DELETE \
 }
 ```
 
-`revoked` is the number of in-memory session cookies wiped. `db_persisted` reports whether the AuthDB DELETE for persisted session rows succeeded; when `false`, the audit row is recorded with `result="partial"` and `detail` carries `db_error=true`. A `false` value indicates the operator should retry or restart the server — server restart will otherwise resurrect any persisted rows that were not deleted.
+`revoked` is the number of sessions wiped (the fleet-wide durable count on a Postgres-backed deployment, or the local cookie count in the config-file-only fallback). `db_persisted` reports whether the durable session delete succeeded — since HA WS-1/1a this goes through the durable `SessionStore` (`invalidate_user`), never AuthDB. When `false`, the audit row is recorded with `result="partial"` and `detail` carries `db_error=true`. **Remediation: retry** — the durable delete is idempotent, so re-issuing the request converges. **A server restart does NOT revoke the sessions:** durable sessions survive a restart by design (ADR-2002 §4), so a session that failed to be revoked stays valid until its absolute 8-hour expiry, not "resurrected" by restart. The local cache is wiped on this replica regardless (the operator's "stop NOW" intent is honoured there immediately), but the durable rows — and any other replica's cache — are only cleared once the delete actually lands.
 
 `audit_emitted` reports whether the SOC 2 CC6.6 audit row landed in the audit store. When `false` the response also sets the `Sec-Audit-Failed: true` header — SREs scraping for evidence-integrity gaps should alert on either signal. The revoke side-effect still completes when `audit_emitted=false` (operator's "stop NOW" intent is honoured); only the SOC 2 evidence chain is degraded for that request. This split was introduced in PR #883 (HIGH-2) to close a silent-failure window where a locked audit DB or disk-full condition produced a 200 OK that masqueraded as full evidence.
 
@@ -1485,13 +1485,26 @@ list entirely, not merely hidden from write access.
       "quarantined_by": "admin",
       "quarantined_at": 1710849600,
       "whitelist": "10.0.1.50,10.0.1.51",
-      "reason": "Suspicious network activity detected"
+      "reason": "Suspicious network activity detected",
+      "last_applied_at": 1710849660,
+      "last_confirmed_at": 1710849675
     }
   ],
   "pagination": { "total": 1, "start": 0, "page_size": 50 },
   "meta": { "api_version": "v1" }
 }
 ```
+
+> **`last_applied_at`/`last_confirmed_at` (#3425), both `0` = never.** Endpoint-containment
+> confirmation state written by `QuarantineContainmentReconciler`, the background component that
+> re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
+> the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
+> gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
+> a follow-up `quarantine.status` read reports `state|active` — but that read is the target
+> agent's own self-report (cert-bound to its identity, not independently corroborated by any
+> network-side signal), so treat it as strong operational evidence of containment, not proof. See
+> `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
+> boundary.
 
 ---
 
@@ -1521,7 +1534,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated IPs still allowed to communicate |
+| `whitelist` | string | No | Comma-separated IPs still allowed to communicate. Validated server-side (#3425): ≤512 characters total, each token ≤45 characters and drawn from `[0-9A-Fa-f.:]` — the same charset the reconciler and MCP's `quarantine_device` retry path require before ever dispatching a stored whitelist. Rejected with `400`, not written. |
 
 **Response (201):**
 
@@ -1533,25 +1546,52 @@ Quarantine a device.
 ```
 
 > **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
-> missing `agent_id`, or the device is already quarantined) — retrying the
-> identical request will not succeed, and `error.retry_after_ms` is
+> missing `agent_id`, the device is already quarantined, or `whitelist` fails
+> server-edge validation) — retrying the identical request will not succeed,
+> and `error.retry_after_ms` is
 > `null`. A `503` means a genuine store/pool failure — retrying is
 > reasonable, and `error.retry_after_ms` carries a concrete `5000`
 > hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
 > shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
 > its exact field path).
 
-> **This route records; it does NOT dispatch — and the twins have diverged
-> on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
-> writes the quarantine record only. The live plugin isolation is dispatched
-> by the MCP `quarantine_device` tool, which has no REST twin. Two
-> consequences for a client that treats the two transports as
+> **This route records; it does NOT itself dispatch — and the twins have
+> diverged on the already-quarantined case (#3127).** `POST /api/v1/quarantine`
+> writes the quarantine record only, synchronously. The live plugin isolation
+> is dispatched by the MCP `quarantine_device` tool, which has no REST twin.
+> Two consequences for a client that treats the two transports as
 > interchangeable:
 >
 > - A `201` here means **the record was written**, not that the device's
->   firewall is enforcing anything. To isolate a device over REST, dispatch
->   `quarantine.quarantine` through the normal execution routes as well —
->   see [Security Hardening](security-hardening.md#device-quarantine).
+>   firewall is enforcing anything **yet**. To isolate a device immediately,
+>   dispatch `quarantine.quarantine` through the normal execution routes as
+>   well — see [Security Hardening](security-hardening.md#device-quarantine).
+>   **As of #3425, "yet" is load-bearing: this route no longer leaves a
+>   record permanently unenforced.** `QuarantineContainmentReconciler`
+>   reconciles every active record regardless of which surface created it —
+>   a record written here for a device that is (or later becomes) connected
+>   is automatically dispatched the stored whitelist typically within one
+>   reconciler tick (~20s) of the device being connected, without a second
+>   call — a brand-new record isn't in the heartbeat fast path's cache until
+>   the next periodic tick populates it, so a heartbeat arriving in that
+>   narrow window doesn't shortcut the wait. A record created here for a
+>   reachable device does not stay dormant — the one exception is a stored
+>   `whitelist` the re-dispatch validator refuses. As of #3425 (`d1f71c58f`)
+>   this route validates `whitelist` at write time (`400` instead of `201`
+>   for a malformed value), the same rule MCP's `quarantine_device` already
+>   enforced — so a fresh write here can no longer land in this state. A
+>   `validation_failed` reconcile now points at a record migrated from the
+>   legacy `quarantine.db` (ADR-0047 backfill, which copies `whitelist`
+>   verbatim with no validation) or one written via this route before
+>   `d1f71c58f` shipped, not a fresh call. Either way, every reconcile
+>   attempt then counts `validation_failed` and nothing is ever dispatched.
+>   That failure is loud, not silent — the device stays in
+>   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
+>   and trips `YuzuQuarantineEndpointUnconfirmed` after 15 minutes — but it
+>   is a real way for a record to go permanently unenforced through this
+>   route. If record-only-without-live-isolation is the intent (e.g.
+>   flagging for review), enforce it at the caller/workflow level; do not
+>   rely on this route's absence of its own dispatch.
 > - The MCP tool now treats an already-active record as a **retryable
 >   re-dispatch**, not a terminal error; this route still answers `400`,
 >   because with no dispatch of its own there is nothing for it to re-drive.
@@ -2528,7 +2568,7 @@ Remove a template. Returns 400 when `template_id` is `__default__`.
 | 500 | Persist failure |
 | 503 | Service unavailable |
 
-**Audit events emitted:** `response_template.create`, `response_template.update`, `response_template.delete` — target type `InstructionDefinition`, target id = definition id, detail = template id (success) or `reason=<r>` (audit-path failure). 4xx branches emit `result=denied`; 500 persist failures emit `result=failure`. See `audit-log.md` for the full reason vocabulary.
+**Audit events emitted:** `response_template.create`, `response_template.update`, `response_template.delete` — target type `InstructionDefinition`, target id = definition id, detail = template id (success) or `reason=<r>` (audit-path failure). 4xx branches emit `result=denied`; 500 persist failures emit `result=failure`; the 503 store-unavailable branch emits `result=error` (an infra degrade is not an operator denial — ADR-0058). See `audit-log.md` for the full reason vocabulary.
 
 ---
 
@@ -2695,15 +2735,18 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
 | `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
-| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
+| `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
+| `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). |
+| `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
+| `instruction_set.delete` | Instruction set deleted via `DELETE /api/instruction-sets/{id}`. `result` ∈ {`denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). Success is not audited (`create_set`/`delete_set` predate any audit coverage on this pair — tracked separately, #3598 — the 404/503 denial branches above are new with ADR-0058 and audited from the start rather than shipped asymmetrically). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
 | `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>` bulk preload against the custom-properties store could not answer — ADR-0045; both abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
 | `policy_fragment.create` | Policy fragment created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_name` (409, fragment with the same `name` already exists). |
-| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result=success`. Detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row. |
-| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents). |
+| `policy.evaluate` | Compliance evaluation forced for a policy via `POST /api/policies/{id}/evaluate`. `result` ∈ {`success`, `error`}. Success detail format `execution_id=<id>`. Note: the `409` rejection (no check instruction / no matching agents) returns without emitting an audit row; the `503` degraded-evaluation case (`policy_evaluator_->evaluate_now` returning an error, e.g. an InstructionStore DB/lease failure per ADR-0058) DOES audit, `result=error` detail `degraded` — matches `policy.remediate`'s own `error`-vs-`denied` convention: an infra degrade is not an operator denial. |
+| `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>`; denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a remediation for this policy is already in flight); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
 | `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
@@ -3050,7 +3093,7 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (503):** Policy store not yet initialized.
+**Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body).
 
 ---
 
@@ -3134,6 +3177,10 @@ Create a new policy from YAML.
 }
 ```
 
+**Response (400):** YAML missing required fields, unknown `fragment_id`, invalid scope expression. Body is `{"error": "<reason>"}`.
+
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body.
+
 ---
 
 #### `GET /api/policies/{id}`
@@ -3202,6 +3249,10 @@ Enable a previously disabled policy.
 }
 ```
 
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
+
 ---
 
 #### `POST /api/policies/{id}/disable`
@@ -3217,6 +3268,10 @@ Disable a policy, pausing compliance checks.
   "status": "disabled"
 }
 ```
+
+**Response (400):** `policy not found`. **Response (503):** a genuine internal
+store failure on the write — safe to retry, internal error string never
+included in the body.
 
 ---
 
@@ -3235,6 +3290,9 @@ Invalidate agent-side compliance cache for a specific policy. Resets all agent s
 }
 ```
 
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
+
 ---
 
 #### `POST /api/policies/invalidate-all`
@@ -3251,6 +3309,9 @@ Invalidate compliance cache for all policies across all agents.
   "total_invalidated": 210
 }
 ```
+
+**Response (503):** a genuine internal store failure on the write — safe to
+retry, internal error string never included in the body.
 
 ---
 
@@ -3277,10 +3338,16 @@ verdicts appear a few seconds later.
 ```
 
 **Response (404):** policy not found. **Response (409):** the policy's fragment
-has no `check` instruction, or the policy matches no agents. **Response (503):**
-policy evaluation not available.
+has no `check` instruction, the policy matches no agents, or a check for this
+policy is already in flight. **Response (503):** either the policy evaluator
+isn't wired ("policy evaluation not available"), or a genuine internal store
+failure occurred while reading the policy or fragment, recording the dispatch
+claim, or (ADR-0058) resolving the check instruction against InstructionStore
+("policy store degraded" / "policy evaluation degraded") — a transient failure
+of this kind is safe to retry and is never reported as a 409.
 
-**Audit:** `policy.evaluate`.
+**Audit:** `policy.evaluate` — including on the 503 degraded-evaluation case above
+(`result=error`, detail `degraded`).
 
 ---
 
@@ -3317,10 +3384,19 @@ is remediated.
 ```
 
 **Response (404):** policy not found. **Response (409):** the fragment defines no
-`fix` instruction, or there are no non-compliant agents to remediate.
-**Response (503):** policy evaluation not available.
+`fix` instruction, there are no non-compliant agents to remediate, or a
+remediation for this policy is already in flight (dispatched but not yet past
+its `postCheck` — same-process dedup only, see the ADR-0056 Follow-ups for the
+cross-replica gap).
+**Response (503):** either the policy evaluator isn't wired ("policy evaluation
+not available"), or a genuine internal store failure occurred while resolving
+the policy or its remediation targets, including (ADR-0058) InstructionStore
+resolving the fix instruction ("policy store degraded" / "policy store
+unavailable") — safe to retry, and distinguished from the 400/409 business
+rejections above.
 
-**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`}).
+**Audit:** `policy.remediate` (`result` ∈ {`success`, `denied`, `error`} — `error`
+is a store degrade, never a business rejection).
 
 ---
 
@@ -3334,7 +3410,7 @@ Fleet compliance summary across all active policies.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3348,6 +3424,10 @@ Fleet compliance summary across all active policies.
 }
 ```
 
+**Response (503):** `policy store degraded` — a genuine internal store failure,
+distinct from a genuine 0% (no policies enabled yet reads as all-zero counts
+with `200`, never a 503).
+
 ---
 
 #### `GET /api/compliance/{policy_id}`
@@ -3356,7 +3436,7 @@ Per-policy compliance detail with per-agent statuses.
 
 **Permission:** `Policy:Read`
 
-**Response:**
+**Response (200):**
 
 ```json
 {
@@ -3379,6 +3459,9 @@ Per-policy compliance detail with per-agent statuses.
   ]
 }
 ```
+
+**Response (503):** `policy store degraded`, on either the summary or the
+per-agent-status read.
 
 ---
 
@@ -3403,15 +3486,19 @@ Returns current configuration values and any active runtime overrides.
 > returned. `PUT /api/config/oidc_client_secret` sets it, and its 200 response omits
 > the value too.
 
-**Error (503) - runtime config store unavailable.** If the store is closed or failed to open, this
-returns 503 rather than an empty `overrides`, so a degraded store is never read as "nothing is
-configured". That distinction matters here specifically: this route no longer returns a secret's
-value, so key presence and `is_set` are the only way to answer "is the OIDC secret set on this
-server?" - the question [Security hardening](security-hardening.md#oidc-hardening) sends operators to
-before deciding whether to rotate.
+**Error (503) - runtime config store unavailable.** If the store is closed, failed to open, or a
+read against an otherwise-open store fails (a transient database error), this returns 503 rather
+than an empty `overrides`, so a degraded store is never read as "nothing is configured". This
+route never decrypts `oidc_client_secret` to answer `GET` — `is_set` is derived from whether a
+secrets-table row exists for the key, not from its (never-fetched) value — so a corrupted or
+undecryptable secret cannot 503 this route; that failure mode is confined to server boot instead
+(see `docs/adr/0060-runtime-config-store-postgres-migration.md`). Key presence and `is_set` are
+still the only way to answer "is the OIDC secret set on this server?" - the question
+[Security hardening](security-hardening.md#oidc-hardening) sends operators to before deciding
+whether to rotate.
 
 ```json
-{ "error": { "code": 503, "message": "runtime configuration store unavailable" }, "meta": { "api_version": "v1" } }
+{ "error": { "code": 503, "message": "runtime config store unavailable" }, "meta": { "api_version": "v1" } }
 ```
 
 **Response** (shape corrected - the handler returns `config`, `overrides` and
@@ -3551,10 +3638,19 @@ another OIDC field, restart first so the process is not holding the old value.
 > non-`/api/v1` route, and its own errors are either a bare `error` string or a nested
 > `{"error":{"code","message"},"meta":{"api_version"}}` object with no `correlation_id` and no
 > `retry_after_ms`. Besides those shown below, the handler emits nested bodies for `400` "missing
-> 'value' in request body", `400` "invalid JSON body", and a `503` when the runtime-config store is
-> unavailable (`GET` says "runtime configuration store unavailable", `PUT` says "runtime config store
-> unavailable"). Note `503` is emitted by **both** sources, so status alone does not tell you which
-> shape you have: test for `error.correlation_id` rather than assuming it, on every status.
+> 'value' in request body", `400` "invalid JSON body", and a `503` "runtime config store unavailable"
+> when the runtime-config store is unavailable (`GET` and `PUT` now share the identical message; an
+> earlier `GET`-side wording of "runtime configuration store unavailable" was a drift, not a
+> deliberate distinction, and has been unified). Note `503` is emitted by **both** sources, so status
+> alone does not tell you which shape you have: test for `error.correlation_id` rather than assuming
+> it, on every status.
+
+**Error (503) - runtime config store unavailable.** A genuine DB/crypto write failure, distinguished
+from caller-input validation at the seam so it never returns a `400`-shaped body instead:
+
+```json
+{ "error": { "code": 503, "message": "runtime config store unavailable" }, "meta": { "api_version": "v1" } }
+```
 
 **Error (400) - key not configurable.** This one is a bare `error` string with no envelope:
 
@@ -3814,12 +3910,15 @@ List all configured webhooks.
       "id": 1,
       "url": "https://example.com/hooks/yuzu",
       "event_types": ["agent.registered", "command.completed"],
+      "has_secret": true,
       "enabled": true,
       "created_at": 1710849600
     }
   ]
 }
 ```
+
+`has_secret` reports whether a signing secret is configured — the secret itself is never returned by this or any other endpoint, encrypted or otherwise.
 
 #### `POST /api/webhooks`
 
@@ -3837,7 +3936,7 @@ Create a new webhook subscription.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `url` | string | Yes | HTTPS endpoint to receive POST notifications |
+| `url` | string | Yes | Endpoint to receive POST notifications (`http://` or `https://`; see the cleartext-HTTP warning below) |
 | `event_types` | array | Yes | Events to subscribe to (see the table below) |
 | `secret` | string | No | HMAC-SHA256 secret for payload signing |
 
@@ -3855,13 +3954,36 @@ Create a new webhook subscription.
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
+**Security — secret storage and the legacy-file retention window.** A configured signing secret
+is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database backup alone cannot
+recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
+recreate it. Deployments that upgraded from a release before the Postgres cutover retain the
+pre-cutover SQLite `webhooks.db` file for one release as a rollback net (ADR-0009); that file
+still holds signing secrets in **plaintext**. If your backup posture for that one-release window
+is unknown, rotate (delete-and-recreate) every webhook's secret once the window has closed.
+
+**Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the delivered event
+payload is transmitted in cleartext. Production deployments should use `https://` only. The
+store accepts `http://` for development convenience — same posture as Offload Targets below.
+
+**Errors.** `400` for an empty/missing `url`, invalid JSON, or a URL that isn't `http://`/`https://`.
+`503` for a store/database degradation. Every error response is audited (`webhook.create`,
+result `failure`, a distinct detail string per cause).
+
 #### `DELETE /api/webhooks/{id}`
 
-Delete a webhook by numeric ID.
+Delete a webhook by numeric ID. `200` on success, `404` if no webhook has that id, `503` on a
+store/database error. Every outcome (including `404`) is audited as `webhook.delete`; a
+successful delete's audit detail carries the webhook's URL (captured just before deletion), so
+the record of where a webhook pointed survives its removal.
 
 #### `GET /api/webhooks/{id}/deliveries`
 
-List recent delivery attempts for a webhook. Includes HTTP status code, response time, and any error message for failed deliveries.
+List recent delivery attempts for a webhook, newest first. Includes HTTP status code, response
+time, and any error message for failed deliveries. `?limit=` defaults to 50 (any non-positive
+value also falls back to 50) and is capped at 10000; no `offset`/pagination parameter exists. A
+degraded read renders an empty list rather than a `503` — delivery history is audit convenience,
+not a decision surface.
 
 **Usage guide:**
 
@@ -3880,11 +4002,11 @@ A target is identified by a unique `name` so a definition can reference it via `
 
 `agent.registered` fires on *every* gRPC reconnect, not only first enrollment — same caveat as the Webhooks section above, and the same event-type table, since both sinks fire off the identical set of events. A target wired to a low-tolerance channel should filter or debounce on the receiving end if reconnect noise matters.
 
-All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`); only the auth_type and shape leak. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
+All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`, not even as the encrypted-at-rest blob) — a `has_credential` boolean instead reports whether one is configured. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
 
 #### `GET /api/v1/offload-targets`
 
-List all configured offload targets.
+List all configured offload targets. 503 on a degraded read (distinguishable from a genuine empty list).
 
 **Response:**
 
@@ -3896,6 +4018,7 @@ List all configured offload targets.
       "name": "siem-primary",
       "url": "https://siem.example.com/ingest",
       "auth_type": "bearer",
+      "has_credential": true,
       "event_types": "execution.completed",
       "batch_size": 50,
       "enabled": true,
@@ -3907,11 +4030,11 @@ List all configured offload targets.
 
 #### `GET /api/v1/offload-targets/{id}`
 
-Fetch a single target by numeric id. `auth_credential` is redacted. 404 when no such id exists.
+Fetch a single target by numeric id. `auth_credential` is redacted (`has_credential` reports whether one is configured). 404 when no such id exists, 503 on a degraded read.
 
 #### `POST /api/v1/offload-targets`
 
-Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size < 1`, duplicate `name`).
+Create a new offload target. Returns 201 + `{id, status}` on success, 400 when validation fails (invalid URL scheme, empty `name`, `batch_size < 1`, duplicate `name`, a control byte in a free-text field, a present-but-wrong-typed field such as `batch_size` sent as a string, or an unrecognized `auth_type`).
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -4045,7 +4168,14 @@ Workflows define multi-step instruction sequences that execute in order against 
 
 #### `GET /api/workflows`
 
-List all workflows. Supports `?q=<search>` query parameter for name filtering.
+List all workflows. Supports `?name=<search>` for a substring name filter and `?limit=<n>` to cap
+the number of rows returned (default 100; `limit` must be a positive integer — `0` or negative is a
+`400`, matching the existing non-numeric-`limit` `400`). A soft-deleted workflow (see `DELETE`
+below) never appears in this list.
+
+**Response (400):** `{"error":{"code":400,"message":"limit must be a positive integer"},"meta":{"api_version":"v1"}}` — non-numeric `limit` returns the sibling `"invalid numeric query parameter"` `400` instead.
+
+**Response (503, degraded read):** `{"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}}` — `workflow_engine` is a migrated Postgres store (ADR-0064); a genuine pool/query failure surfaces as `503`, never a silently-empty list.
 
 **Response:**
 
@@ -4072,15 +4202,23 @@ Create a workflow from YAML. The request body is the raw YAML text with `Content
 
 #### `GET /api/workflows/{id}`
 
-Get a single workflow by ID, including its full step definitions.
+Get a single workflow by ID, including its full step definitions. `404` for an unknown or
+soft-deleted id; `503` on a genuine store degrade (ADR-0064).
 
 #### `DELETE /api/workflows/{id}`
 
-Delete a workflow by ID.
+Delete a workflow by ID. **Soft-delete (ADR-0064):** the workflow is retired, not physically
+removed — its execution history stays intact and remains readable via `GET
+/api/workflow-executions/{id}` indefinitely, and a deleted workflow's id can never be
+re-used. Response body is unchanged: `{"deleted": true}` on the first delete of an existing
+workflow, `{"deleted": false}` (still `200`) for an unknown id or a repeat delete of an
+already-deleted one. A genuine store-unavailable condition now returns `503` instead of the
+pre-migration `{"deleted": false}`.
 
 #### `POST /api/workflows/{id}/execute`
 
-Execute a workflow against targeted agents.
+Execute a workflow against targeted agents. Fails (workflow-not-found, `400`) if the workflow
+does not exist or was soft-deleted; a genuine store degrade returns `503` (ADR-0064).
 
 **Request body:**
 
@@ -4098,7 +4236,10 @@ Execute a workflow against targeted agents.
 
 #### `GET /api/workflow-executions/{id}`
 
-Get the status of a running or completed workflow execution, including per-step and per-agent results.
+Get the status of a running or completed workflow execution, including per-step and per-agent
+results. `404` for an unknown execution id; `503` on a genuine store degrade (ADR-0064).
+Execution history survives its workflow being deleted — this route stays readable for an
+execution whose workflow was later soft-deleted.
 
 **Usage guide:**
 
@@ -6100,6 +6241,10 @@ The one device list behind every network-quality drill: worst devices by a metri
 - **Permission:** `Patch:Read`
 - **Query params:** `agent_id`, `severity`, `status`, `limit` (default 100)
 
+> **Note:** patch inventory is populated only by `PatchManager::record_patches()`, which has no
+> production caller today — this endpoint returns an empty result in every real deployment, not
+> because the fleet has no missing patches. See `docs/capability-map.md` §8.5/§8.7 and #3676.
+
 **`POST /api/patches/deploy`** — Create a patch deployment targeting specific agents.
 
 - **Permission:** `Patch:Write`
@@ -6108,19 +6253,33 @@ The one device list behind every network-quality drill: worst devices by a metri
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `kb_id` | string | Yes | — | KB identifier (format: `KBnnnnnnn`) |
-| `agent_ids` | string[] | Yes | — | Target agent IDs |
+| `agent_ids` | string[] | Yes | — | Target agent IDs (max 5000 after de-duplication; a longer list is rejected with `too many target agents`) |
 | `reboot_if_needed` | bool | No | `false` | Reboot agents after patching |
 | `reboot_delay_seconds` | int | No | `300` | Seconds to wait before reboot (clamped to 60–86400). A desktop notification warns the user before reboot. |
 | `reboot_at` | int64 | No | `0` | Optional epoch timestamp for scheduled reboot. Must be in the future. `0` = use delay instead. |
 
 - **Response (201):** `{"deployment_id": "...", "kb_id": "...", "target_count": N, "status": "pending"}`
 
-> **Note:** Reboot orchestration requires the Yuzu agent to run with root (Linux/macOS) or Administrator (Windows) privileges. If the agent lacks these privileges, the reboot command will fail silently; the patch installation itself will still succeed.
+> **Note:** this creates a deployment record + a `pending` row per target — there is no server-side
+> scan/install/verify/reboot orchestration (`PatchManager::execute_deployment()` was removed;
+> ADR-0062, `docs/capability-map.md` §8.3/§8.4/§8.6, tracking issue #3669). Nothing advances a
+> target past `pending` except `POST /api/patches/deployments/:id/cancel` (→ `cancelled`).
+> `reboot_if_needed`/`reboot_delay_seconds`/`reboot_at` are accepted, clamped, and stored, but
+> nothing acts on them.
+
+Successful deploys are recorded in the audit log with `action=patch.deploy`, `result=success`.
+A validation rejection (invalid KB format, an oversized `agent_ids` list, or a failed
+transaction) is recorded with `result=denied` and `detail` carrying the error message — see
+`docs/user-manual/audit-log.md`'s `patch.deploy` row for the known gaps (#3705) in this
+outcome's granularity.
 
 **`GET /api/patches/deployments/:id`** — Deployment details with per-target status.
 
 - **Permission:** `Patch:Read`
-- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` (pending, scanning, downloading, installing, verifying, rebooting, completed, failed, skipped, cancelled).
+- **Response includes:** `reboot_delay_seconds`, `reboot_at`, and per-target `status` — always `pending`
+  or `cancelled` today (the fuller `scanning`/`downloading`/`installing`/`verifying`/`rebooting`/
+  `completed`/`failed`/`skipped` vocabulary is reserved by the schema but nothing currently sets
+  it). `completed_targets`/`failed_targets` are set once at creation and never recalculated.
 
 **`GET /api/patches/deployments`** — List deployments (paginated, default limit 50).
 
@@ -6474,6 +6633,36 @@ Refusals increment `yuzu_server_dispatch_target_rejected_total{route="command",r
 write a `command.dispatch` audit row with `result=denied` and `detail=reason=<reason>`. The body
 must be a JSON object; anything else is `400`.
 
+**Response (403): unauthorized dispatch.** Two distinct causes share the `403` status but carry
+different messages (#1398) — an incident review can tell them apart from the audit trail's
+`detail=reason=<reason>` field alone (`forbidden` vs `approval_required`), even without the
+response body.
+
+A plain RBAC denial (the caller holds no grant for the pair's classified securable/operation):
+
+```json
+{"error": {"code": 403, "message": "permission denied: Execution:Execute"}, "meta": {"api_version": "v1"}}
+```
+
+A caller who *does* hold the grant but is dispatching one of the ~42 `plugin.action` pairs a
+compiled `ExecuteGate` marks `AdminOrApproval`/`AlwaysApproval` (e.g. `script_exec.exec`,
+`filesystem.delete`, `registry.set_value`), with no approval provenance and no admin role:
+
+```json
+{
+  "error": {
+    "code": 403,
+    "message": "approval required for script_exec.exec — this action requires either an admin caller or an approved request; dispatch it via POST /api/instructions/{id}/execute instead, which supports the approval workflow"
+  },
+  "meta": {"api_version": "v1"}
+}
+```
+
+The governed path this message points at (`POST /api/instructions/{id}/execute`) supports the
+approval workflow this route deliberately does not — `/api/command` mints no approval ticket of
+its own (one core-owned approval primitive, ADR-1005). An admin caller, or a caller redispatching
+with a redeemed approval ticket via the governed path, is not subject to this denial.
+
 ---
 
 ### Agents
@@ -6496,11 +6685,19 @@ Returns a catalog of all available plugins and their supported actions, as repor
 
 #### `GET /api/instructions`
 
-List all instruction definitions stored in the server.
+List instruction definitions stored in the server. Query params: `name`, `plugin`, `type`,
+`set_id`, `enabled_only`, `limit`.
+
+**Response (503):** InstructionStore not yet initialized, or a genuine database/lease failure
+(ADR-0058) — the list is never silently rendered empty on a degraded store.
 
 #### `GET /api/instructions/{id}`
 
 Get a single instruction definition by ID.
+
+**Response (404):** Unknown id.
+
+**Response (503):** A genuine database/lease failure (ADR-0058), distinct from 404.
 
 #### `POST /api/instructions`
 
@@ -6538,19 +6735,51 @@ exists in the store. Body is
 Audit event recorded as `instruction.create / denied / duplicate_id`. To
 update the existing definition use `PUT /api/instructions/{id}`.
 
-**Response (503):** Instruction store not yet initialized.
+**Response (503):** Instruction store not yet initialized, or a genuine database/lease failure
+(ADR-0058) — distinct from the validation/conflict cases above, and worth a client retry.
+Audit event recorded as `instruction.create / error / db_error`.
 
 #### `PUT /api/instructions/{id}`
 
 Update an existing instruction definition.
 
+**Permission:** `InstructionDefinition:Write`
+
+**Response (400):** Validation error (same shape as `POST` above).
+
+**Response (404):** Unknown id. Body is `{"error": "not_found: definition not found: <id>"}`.
+Audit event recorded as `instruction.update / denied / not_found`.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
+a client retry. Audit event recorded as `instruction.update / error / db_error`.
+
 #### `DELETE /api/instructions/{id}`
 
 Delete an instruction definition.
 
+**Permission:** `InstructionDefinition:Delete`
+
+**Response (200):** `{"deleted": true}`.
+
+**Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
+PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404. Any
+automation keying off the old `deleted: false` shape must be updated to handle 404 instead.
+Audit event recorded as `instruction.delete / denied / not_found`.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — distinct from 404, and worth
+a client retry. Audit event recorded as `instruction.delete / error / db_error`.
+
 #### `GET /api/instructions/{id}/export`
 
 Export an instruction definition in a portable format.
+
+**Response (200) on an unknown id:** `{}` (an empty JSON object, not an error) — pre-existing
+behavior, unchanged by ADR-0058; unlike every other route on this store, an unknown id here
+returns `200 {}` rather than `404`. Callers must check for an empty body, not a status code,
+to detect not-found.
+
+**Response (503):** A genuine InstructionStore database/lease failure (ADR-0058) reading the
+definition, distinct from the empty-body not-found case above, and worth a client retry.
 
 #### `POST /api/instructions/import`
 
@@ -6578,6 +6807,9 @@ Import an InstructionDefinition (JSON envelope). Requires `InstructionDefinition
 A failed signature ALWAYS rejects, even when enforcement is off — `--allow-unsigned-definitions` only widens the unsigned-path policy, it does not skip crypto on present signatures.
 
 **Audit:** every import attempt emits `instruction.import` with `result=success` on success, `result=denied` on rejection. The `target_id` is the definition's `id` on success; empty on rejection.
+
+**Response (503):** A genuine database/lease failure (ADR-0058) — audited the same as every
+other rejection above, distinct from a signature/validation/conflict `400`/`409`.
 
 #### `POST /api/instructions/yaml`
 
@@ -6672,13 +6904,45 @@ Returned when the definition's `approval_mode` is `role-gated` or `always` and t
 
 List all instruction sets.
 
+**Response (503):** InstructionStore not yet initialized, or a genuine database/lease failure
+(ADR-0058) — the list is never silently rendered empty on a degraded store.
+
 #### `POST /api/instruction-sets`
 
 Create a new instruction set (a named collection of definitions).
 
+**Permission:** `InstructionSet:Write`
+
+**Response (200):** `{"id": "<id>"}` for the newly-created set. The id is always
+server-generated (this route does not accept a caller-supplied `id`), so the `409` case below
+is not reachable via normal use of this endpoint today — documented for API-contract
+consistency with the sibling `POST /api/instructions` route, not because it fires in practice.
+
+**Response (400):** Validation error.
+
+**Response (409):** A set with that id already exists (gov Gate 4/6, fixed to match
+`POST /api/instructions`'s equivalent branch — the response no longer leaks the raw internal
+`conflict:` prefix).
+
+**Response (503):** A genuine database/lease failure (ADR-0058).
+
 #### `DELETE /api/instruction-sets/{id}`
 
-Delete an instruction set.
+Delete an instruction set. Definitions that referenced the deleted set have their
+`instruction_set_id` cleared, not deleted.
+
+**Permission:** `InstructionSet:Delete`
+
+**Response (200):** `{"deleted": true}`.
+
+**Response (404):** Unknown id. **Breaking change (ADR-0058):** prior to this store's
+PostgreSQL migration, a missing id returned `200 {"deleted": false}`; it now returns 404.
+
+**Response (503):** A genuine database/lease failure (ADR-0058).
+
+**Audit:** `instruction_set.delete` on the 404 (`result=denied` detail `not_found`) and 503
+(`result=error` detail `db_error`) branches; the 200 success path is not audited (see the audit
+table entry above).
 
 ---
 
@@ -7726,6 +7990,7 @@ username=admin&password=secretpass
 | `401` | Invalid credentials | `{"error":{"code":401,"message":"Invalid username or password"}}` |
 | `503` | Enforcement applies but the auth store is unavailable (fail-closed; no session minted) | `{"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"}}` |
 | `503` | The in-memory pending-challenge map is at capacity (server under a `/login` flood; transient load-shed) | `{"error":{"code":503,"message":"too many pending authentications, retry shortly"}}` — retry after a short back-off; emits `yuzu_auth_mfa_pending_load_shed_total` |
+| `503` + `Retry-After: 2` | A login-path auth-store read/write was unavailable — fail-closed, **no session minted** | `{"error":{"code":503,"message":"authentication store is temporarily unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}}` — the `mfa_status` decision read first rides out a transient Postgres blip with a bounded acquire-retry (the call that otherwise denies *all* logins on a blip); a persisted 503 means the outage outlasted it, or another login-path acquire failed, so honour `Retry-After` (see `docs/auth-architecture.md` §"Availability coupling"). Increments `yuzu_auth_read_degrade_total{route="login",reason}` (reason = `pool_acquire_timeout` / `query_error` / `secret_unavailable`) |
 
 **Distinguish the two 202 variants by the `status` field**: `mfa_required` routes to `POST /login/mfa` (the user already has a secret); `mfa_enrollment_required` routes to `POST /login/mfa/enroll` (the user must enroll first). The `qr_svg` field on the enrollment variant is a server-rendered inline SVG QR code encoding `otpauth_uri` — inject it into the DOM **without** HTML-escaping (it is pure shape geometry, no user content). If `qr_svg` is the empty string, QR encoding failed; fall back to displaying `secret_base32` / `otpauth_uri` for manual entry. The `mfa_pending_token` is a 32-byte hex (64-char) opaque random; its lifetime is `cfg.mfa_login_pending_secs` (default 120 s). The pending state lives in process memory and is lost on server restart, and is not shared across HA replicas without sticky sessions.
 

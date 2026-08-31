@@ -2,16 +2,20 @@
  * test_tag_store.cpp — Unit tests for TagStore (Postgres substrate, ADR-0050).
  *
  * Covers: CRUD, validation, sync (incl. mid-transaction fault atomicity),
- * agents_with_tag, tag maps, bulk preloads, compliance gaps, degrade
- * behaviour (typed reads), and the ADR-0009 backfill decision tree incl.
- * holder-side fingerprint verification and direction-aware row conflicts.
+ * agents_with_tag, tag maps, bulk preloads, compliance gaps, and degrade
+ * behaviour (typed reads).
  *
  * Fixture layout mirrors test_custom_properties_store.cpp: a shared
  * pre-migrated clone + persistent pool, TRUNCATE-reset per CRUD test;
  * fault-injection and degrade tests take their OWN template clone (a
- * dropped table / installed trigger must not leak into the shared clone);
- * backfill tests construct their own store against their own per-test
- * database (YUZU_REQUIRE_PG_DB — they exercise fresh-database behaviour).
+ * dropped table / installed trigger must not leak into the shared clone).
+ *
+ * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
+ * TEST_CASE suite was removed as part of a fresh-start-by-default policy
+ * change (ADR-0009 amendment) -- no production fleet has ever run a
+ * pre-Postgres build. TagStore::migrate_from_sqlite() itself is UNCHANGED
+ * and still present in production code; only this file's test coverage of
+ * it was removed.
  */
 
 #include "tag_store.hpp"
@@ -21,7 +25,6 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
-#include "sqlite_raii.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -29,21 +32,14 @@
 #include "test_tag_store_pg_helper.hpp"
 
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
-#include <filesystem>
-#include <fstream>
 #include <optional>
 #include <string>
-#include <system_error>
 #include <tuple>
 #include <vector>
 
 using yuzu::server::DeviceTag;
 using yuzu::server::kTagDbErrorPrefix;
-using yuzu::server::SqliteDb;
-using yuzu::server::SqliteErrMsg;
-using yuzu::server::SqliteStmt;
 using yuzu::server::TagReadError;
 using yuzu::server::TagStore;
 using yuzu::server::get_tag_categories;
@@ -118,8 +114,8 @@ void require_ok(const std::expected<void, std::string>& r) {
 // Lifecycle
 // ============================================================================
 
-TEST_CASE("TagStore: migrates at construction and reopens idempotently", "[pg][tag_store][db]") {
-    YUZU_REQUIRE_PG_DB(db);
+TEST_CASE("TagStore: migrates at construction and reopens idempotently", "[pg][tag_store][db][pg-smoke]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {
@@ -161,7 +157,7 @@ TEST_CASE("TagStore: validate_value", "[tag_store][validation]") {
 // CRUD
 // ============================================================================
 
-TEST_CASE("TagStore: set and get", "[pg][tag_store]") {
+TEST_CASE("TagStore: set and get", "[pg][tag_store][pg-smoke]") {
     TAGS_SHARED(store);
 
     require_ok(store.set_tag("agent-1", "env", "production"));
@@ -177,7 +173,7 @@ TEST_CASE("TagStore: get nonexistent returns nullopt (not degraded)", "[pg][tag_
 }
 
 TEST_CASE("TagStore: a present tag with an empty value is engaged, distinguishable from absent",
-          "[pg][tag_store]") {
+          "[pg][tag_store][pg-smoke]") {
     TAGS_SHARED(store);
     require_ok(store.set_tag("agent-1", "note", ""));
     auto v = require_ok(store.get_tag("agent-1", "note"));
@@ -696,325 +692,8 @@ TEST_CASE("TagStore: reads and writes degrade loudly once the store is broken",
     }
 }
 
-// ============================================================================
-// Backfill (ADR-0009) — each case constructs its OWN store against its OWN
-// per-test database (YUZU_REQUIRE_PG_DB), since these exercise fresh/empty-
-// database behaviour the shared template's already-migrated clone can't.
-// ============================================================================
-
-namespace {
-
-// RAII temp SQLite file — the legacy `tags.db` a backfill reads. A successful
-// migrate_from_sqlite() moves `path` aside to `path.migrated-*` (ADR-0009
-// rollback window); the destructor sweeps the parent directory for any such
-// sibling so a passing backfill test doesn't leak files into the scratch dir.
-struct TempSqliteFile {
-    std::filesystem::path path;
-    explicit TempSqliteFile(const std::string& prefix)
-        : path(yuzu::test::unique_temp_path(prefix)) {}
-    ~TempSqliteFile() {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        const std::string stem = path.filename().string() + ".migrated-";
-        std::error_code dir_ec;
-        for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), dir_ec)) {
-            if (entry.path().filename().string().starts_with(stem))
-                std::filesystem::remove(entry.path(), ec);
-        }
-    }
-    TempSqliteFile(const TempSqliteFile&) = delete;
-    TempSqliteFile& operator=(const TempSqliteFile&) = delete;
-};
-
-struct LegacyRow {
-    std::string agent_id, key, value, source;
-    long long updated_at;
-};
-
-void write_legacy_tags_db(const std::filesystem::path& path, const std::vector<LegacyRow>& rows) {
-    SqliteDb raw;
-    REQUIRE(sqlite3_open(path.string().c_str(), raw.addr()) == SQLITE_OK);
-    SqliteErrMsg err;
-    REQUIRE(sqlite3_exec(raw.get(),
-                         "CREATE TABLE IF NOT EXISTS tags (agent_id TEXT NOT NULL, key TEXT NOT "
-                         "NULL, value TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'server', "
-                         "updated_at INTEGER NOT NULL, PRIMARY KEY (agent_id, key));",
-                         nullptr, nullptr, err.addr()) == SQLITE_OK);
-    for (const auto& r : rows) {
-        SqliteStmt stmt;
-        REQUIRE(sqlite3_prepare_v2(raw.get(),
-                                   "INSERT INTO tags (agent_id, key, value, source, updated_at) "
-                                   "VALUES (?, ?, ?, ?, ?)",
-                                   -1, stmt.addr(), nullptr) == SQLITE_OK);
-        sqlite3_bind_text(stmt.get(), 1, r.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 2, r.key.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 3, r.value.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 4, r.source.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(stmt.get(), 5, r.updated_at);
-        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
-    }
-}
-
-// Seed a Postgres-side row with a controlled updated_at (set_tag stamps the
-// wall clock, which the direction-aware conflict tests must control).
-void seed_pg_tag(PgPool& pool, const LegacyRow& r) {
-    auto lease = pool.acquire();
-    REQUIRE(lease);
-    auto ins = pg::exec_params(
-        lease.get(),
-        "INSERT INTO tag_store.tags (agent_id, key, value, source, updated_at) "
-        "VALUES ($1, $2, $3, $4, $5::bigint)",
-        std::vector<std::string>{r.agent_id, r.key, r.value, r.source,
-                                 std::to_string(r.updated_at)});
-    REQUIRE(ins.status() == PGRES_COMMAND_OK);
-}
-
-} // namespace
-
-TEST_CASE("TagStore: backfill with no legacy file marks complete (fresh install)",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    TempSqliteFile legacy("yuzu_test_tags_nofile_");
-    CHECK(store.migrate_from_sqlite(legacy.path));
-    // Idempotent: a second call against the now-set marker is a no-op skip.
-    CHECK(store.migrate_from_sqlite(legacy.path));
-}
-
-TEST_CASE("TagStore: backfill copies every source's tags from legacy SQLite",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    TempSqliteFile legacy("yuzu_test_tags_backfill_");
-    // All four live sources backfill (ADR-0050 decision: operator intent AND
-    // agent-reported state the operator may already scope on), plus an
-    // unknown source, preserved verbatim with a warning.
-    write_legacy_tags_db(legacy.path, {{"a1", "env", "prod", "server", 1700000000},
-                                       {"a1", "os.version", "11.0", "agent", 1700000001},
-                                       {"a2", "owner", "alice", "api", 1700000002},
-                                       {"a2", "ticket", "T-99", "mcp", 1700000003},
-                                       {"a3", "odd", "x", "weird-source", 1700000004}});
-
-    REQUIRE(store.migrate_from_sqlite(legacy.path));
-
-    CHECK(require_ok(store.get_tag("a1", "env")).value_or("") == "prod");
-    CHECK(require_ok(store.get_tag("a1", "os.version")).value_or("") == "11.0");
-    CHECK(require_ok(store.get_tag("a2", "owner")).value_or("") == "alice");
-    CHECK(require_ok(store.get_tag("a2", "ticket")).value_or("") == "T-99");
-    auto odd = require_ok(store.get_all_tags("a3"));
-    REQUIRE(odd.size() == 1);
-    CHECK(odd[0].source == "weird-source"); // preserved verbatim
-    CHECK(odd[0].updated_at == 1700000004); // legacy timestamp preserved
-
-    // Legacy file was moved aside (one-release rollback window, ADR-0009).
-    CHECK_FALSE(std::filesystem::exists(legacy.path));
-    // Idempotent re-run (legacy file gone, marker set) is a clean skip.
-    CHECK(store.migrate_from_sqlite(legacy.path));
-}
-
-TEST_CASE("TagStore: backfill refuses on a corrupt legacy file (fail-closed)",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    TempSqliteFile legacy("yuzu_test_tags_corrupt_");
-    {
-        // RAII stream, not fopen/fclose (governance saf-F1 policy floor —
-        // manual cleanup in new C++, even test code, even leak-free today).
-        std::ofstream junk_out{legacy.path, std::ios::binary};
-        REQUIRE(junk_out.is_open());
-        junk_out << "this is not a sqlite database";
-    }
-
-    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
-    // The legacy file must NOT have been consumed/moved on a failed backfill.
-    CHECK(std::filesystem::exists(legacy.path));
-}
-
-TEST_CASE("TagStore: backfill with legacy db missing the tags table marks complete",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    TempSqliteFile legacy("yuzu_test_tags_notable_");
-    {
-        SqliteDb raw;
-        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
-        SqliteErrMsg err;
-        REQUIRE(sqlite3_exec(raw.get(), "CREATE TABLE unrelated (x INTEGER);", nullptr, nullptr,
-                             err.addr()) == SQLITE_OK);
-    }
-
-    CHECK(store.migrate_from_sqlite(legacy.path));
-    CHECK(require_ok(store.get_all_tags("any-agent")).empty());
-}
-
-TEST_CASE("TagStore: migrate_from_sqlite verifies a matching fingerprint when this replica's "
-          "own already-migrated legacy file is still present",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    TempSqliteFile legacy("yuzu_test_tags_fpmatch_");
-    write_legacy_tags_db(legacy.path, {{"agent-1", "env", "prod", "server", 1700000000}});
-    REQUIRE(store.migrate_from_sqlite(legacy.path));
-    CHECK_FALSE(std::filesystem::exists(legacy.path)); // moved aside as usual
-
-    // Recreate a file with IDENTICAL logical content at the same path —
-    // simulating a failed move-aside on a real restart.
-    write_legacy_tags_db(legacy.path, {{"agent-1", "env", "prod", "server", 1700000000}});
-    TagStore reopened{pool};
-    REQUIRE(reopened.is_open());
-    CHECK(reopened.migrate_from_sqlite(legacy.path));
-
-    // Verified, not re-migrated; the matched-fingerprint branch retries
-    // move_legacy_aside.
-    CHECK(require_ok(reopened.get_tag("agent-1", "env")).value_or("") == "prod");
-    CHECK_FALSE(std::filesystem::exists(legacy.path));
-}
-
-TEST_CASE("TagStore: migrate_from_sqlite HOLDER-SIDE VERIFICATION FAILED on a marker stamped "
-          "from different legacy content",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-
-    // "Replica A" backfills its own real legacy content and stamps the marker.
-    TagStore replica_a{pool};
-    REQUIRE(replica_a.is_open());
-    TempSqliteFile legacy_a("yuzu_test_tags_fpa_");
-    write_legacy_tags_db(legacy_a.path, {{"agent-a", "env", "staging", "server", 1700000000}});
-    REQUIRE(replica_a.migrate_from_sqlite(legacy_a.path));
-
-    // "Replica B" holds DIFFERENT legacy content — its boot must refuse
-    // rather than silently accept a completion its tags were never part of.
-    TempSqliteFile legacy_b("yuzu_test_tags_fpb_");
-    write_legacy_tags_db(legacy_b.path, {{"agent-b", "role", "db", "server", 1700000001}});
-    TagStore replica_b{pool};
-    REQUIRE(replica_b.is_open());
-    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy_b.path));
-    CHECK(std::filesystem::exists(legacy_b.path)); // evidence not consumed
-}
-
-TEST_CASE("TagStore: migrate_from_sqlite refuses a sourceless sibling's marker when this "
-          "replica genuinely holds a legacy file",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-
-    // "Replica A" — no local legacy file, stamps the sourceless sentinel.
-    TagStore replica_a{pool};
-    REQUIRE(replica_a.is_open());
-    CHECK(replica_a.migrate_from_sqlite("/nonexistent/path/tags.db"));
-
-    // "Replica B" — holds real legacy content; the sourceless marker cannot
-    // vouch for it.
-    TempSqliteFile legacy_b("yuzu_test_tags_srcless_");
-    write_legacy_tags_db(legacy_b.path, {{"agent-b", "env", "prod", "server", 1700000000}});
-    TagStore replica_b{pool};
-    REQUIRE(replica_b.is_open());
-    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy_b.path));
-    CHECK(std::filesystem::exists(legacy_b.path));
-}
-
-// ── Direction-aware row conflicts (kickoff lesson 1 / DeploymentStore shape).
-// A conflicting row can only arise when Postgres already holds data for a PK
-// the legacy file also carries (partial prior run, concurrent replica, or a
-// rollback-then-roll-forward cycle). updated_at is the direction signal.
-
-TEST_CASE("TagStore: backfill row conflict — Postgres strictly ahead is a benign no-op",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    seed_pg_tag(pool, {"agent-1", "env", "prod-newer", "server", 1700001000});
-    TempSqliteFile legacy("yuzu_test_tags_dir_pgahead_");
-    write_legacy_tags_db(legacy.path, {{"agent-1", "env", "prod-old", "server", 1700000000},
-                                       {"agent-2", "role", "db", "server", 1700000001}});
-
-    REQUIRE(store.migrate_from_sqlite(legacy.path));
-    // Postgres's newer value kept; the non-conflicting row landed.
-    CHECK(require_ok(store.get_tag("agent-1", "env")).value_or("") == "prod-newer");
-    CHECK(require_ok(store.get_tag("agent-2", "role")).value_or("") == "db");
-    CHECK_FALSE(std::filesystem::exists(legacy.path));
-}
-
-TEST_CASE("TagStore: backfill row conflict — identical row is a benign no-op",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    seed_pg_tag(pool, {"agent-1", "env", "prod", "server", 1700000000});
-    TempSqliteFile legacy("yuzu_test_tags_dir_ident_");
-    write_legacy_tags_db(legacy.path, {{"agent-1", "env", "prod", "server", 1700000000}});
-
-    REQUIRE(store.migrate_from_sqlite(legacy.path));
-    CHECK(require_ok(store.get_tag("agent-1", "env")).value_or("") == "prod");
-}
-
-TEST_CASE("TagStore: backfill row conflict — legacy strictly ahead FAILS CLOSED",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    seed_pg_tag(pool, {"agent-1", "env", "prod-old", "server", 1700000000});
-    TempSqliteFile legacy("yuzu_test_tags_dir_legahead_");
-    write_legacy_tags_db(legacy.path, {{"agent-1", "env", "prod-progressed", "server", 1700009999}});
-
-    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
-    CHECK(std::filesystem::exists(legacy.path)); // evidence not consumed
-    // Postgres's value untouched (the refusing transaction rolled back).
-    CHECK(require_ok(store.get_tag("agent-1", "env")).value_or("") == "prod-old");
-}
-
-TEST_CASE("TagStore: backfill row conflict — tied updated_at with differing content FAILS "
-          "CLOSED",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    seed_pg_tag(pool, {"agent-1", "env", "prod-a", "server", 1700000000});
-    TempSqliteFile legacy("yuzu_test_tags_dir_tied_");
-    write_legacy_tags_db(legacy.path, {{"agent-1", "env", "prod-b", "server", 1700000000}});
-
-    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
-    CHECK(std::filesystem::exists(legacy.path));
-    CHECK(require_ok(store.get_tag("agent-1", "env")).value_or("") == "prod-a");
-}
-
 // ── Gate 7 hardening round: sync bounds + agent_id write guard (perf-F1 /
-// UP-2) and the structurally-wrong-legacy-file refusal (UP-14).
+// UP-2).
 
 TEST_CASE("TagStore: sync_agent_tags refuses an over-cap batch whole, prior set retained",
           "[pg][tag_store][bounds]") {
@@ -1074,32 +753,4 @@ TEST_CASE("TagStore: writes reject an agent_id with an embedded NUL (UP-2 identi
 
     // Nothing landed under the truncated identity libpq would have written.
     CHECK(require_ok(store.get_all_tags("agent")).empty());
-}
-
-TEST_CASE("TagStore: backfill refuses a structurally-wrong legacy db (updated_at not INTEGER)",
-          "[pg][tag_store][backfill]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    TagStore store{pool};
-    REQUIRE(store.is_open());
-
-    TempSqliteFile legacy("yuzu_test_tags_badtype_");
-    {
-        SqliteDb raw;
-        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
-        SqliteErrMsg err;
-        // updated_at TEXT — sqlite3_column_int64 would coerce "yesterday" to
-        // 0, silently making every migrated row "oldest" for the
-        // direction-aware conflict compare (governance UP-14).
-        REQUIRE(sqlite3_exec(raw.get(),
-                             "CREATE TABLE tags (agent_id TEXT, key TEXT, value TEXT, source "
-                             "TEXT, updated_at TEXT, PRIMARY KEY (agent_id, key));"
-                             "INSERT INTO tags VALUES ('a1','env','prod','server','yesterday');",
-                             nullptr, nullptr, err.addr()) == SQLITE_OK);
-    }
-
-    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
-    CHECK(std::filesystem::exists(legacy.path)); // evidence not consumed
-    CHECK(require_ok(store.get_all_tags("a1")).empty());
 }
