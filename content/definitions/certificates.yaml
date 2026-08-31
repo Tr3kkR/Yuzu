@@ -42,8 +42,12 @@ spec:
         description: >
           Filter by store name. On Windows: MY, ROOT, CA, Trust, or "all"
           for all stores. On macOS: "login" (the current console user's
-          login keychain -- returns not_available|no console session if
-          nobody is logged in at the console), "System"
+          login keychain -- returns not_available|no console session
+          when nobody is logged in at the console, or
+          not_available|<reason> when the console user could not be
+          determined, e.g. the directory lookup timed out; the two are
+          deliberately distinct, a degraded lookup is never reported as
+          an empty console), "System"
           (/Library/Keychains/System.keychain), "root"
           (SystemRootCertificates.keychain), or "all" (System and root,
           plus login when a console user is present). Ignored on Linux,
@@ -151,8 +155,11 @@ spec:
         description: >
           On macOS, restrict the search to one store: "login" (the
           current console user's login keychain -- returns
-          not_available|no console session if nobody is logged in at
-          the console), "System" (/Library/Keychains/System.keychain),
+          not_available|no console session when nobody is logged in at
+          the console, or not_available|<reason> when the console user
+          could not be determined; in the latter case the search result
+          is PARTIAL and never a definitive status|not_found, because
+          the login keychain was not opened), "System" (/Library/Keychains/System.keychain),
           "root" (SystemRootCertificates.keychain), or "all" (System
           and root, plus login when a console user is present). Ignored
           on Windows and Linux, which always search every store.
