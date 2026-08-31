@@ -5954,7 +5954,7 @@ public:
                                   "content after a late install() failure (final persist or "
                                   "duplicate-item-id), by result (ok = every already-installed "
                                   "item was compensated; partial = at least one was not and "
-                                  "requires manual/operator cleanup — see rest-api.md's "
+                                  "requires manual/operator cleanup - see rest-api.md's "
                                   "POST /api/product-packs 503 note). Only emitted when a "
                                   "compensate_fn was supplied, i.e. on the real HTTP route; a "
                                   "direct ProductPackStore::install() caller that omits it leaves "
