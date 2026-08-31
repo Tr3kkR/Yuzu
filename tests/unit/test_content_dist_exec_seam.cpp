@@ -30,6 +30,8 @@
 #include "content_dist_exec_seam.hpp"
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/runner_status.hpp>
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -163,6 +165,75 @@ TEST_CASE("execute_verified_payload rejects args containing shell metacharacters
     CHECK_FALSE(outcome.run.has_value()); // never reached the runner
     REQUIRE(outcome.lines.size() == 1);
     CHECK(outcome.lines[0].find("forbidden characters") != std::string::npos);
+}
+
+// ── ABI4 result-status forwarding (finding: content_dist's do_execute
+// forward_runner_failure call has zero end-to-end coverage) ────────────────
+//
+// GENUINE WALL, not a shortcut: content_dist_plugin.cpp's do_execute reads
+// the #808 hash-verification KV entry via `yuzu::PluginContext pctx{g_ctx};`,
+// and `g_ctx` is set ONLY by the plugin's real `init()` -- which
+// LocalDispatcher never calls (agent.cpp's dispatch_with_capture invokes
+// `descriptor->execute` directly, per local_dispatcher.cpp's own header
+// comment; there is no init-call step, unlike a plugin that needs none).
+// do_stage (the only other action that could seed that KV entry) has the
+// IDENTICAL g_ctx dependency PLUS a real network download, so there is no
+// way to legitimately seed a real KV row through LocalDispatcher either.
+// The result: content_dist's do_execute cannot be driven end-to-end through
+// LocalDispatcher at all -- not just its post-hash-verification tail, which
+// is exactly why content_dist_exec_seam.hpp/execute_verified_payload()
+// exists (BR-006, this file's own header comment) -- the KV gate is BEFORE
+// that extraction point, not inside it. A real integration/UAT-level test
+// (a live agent process, real init()) is the only place this specific call
+// site (`if (outcome.run) yuzu::agent::forward_runner_failure(ctx,
+// *outcome.run);` in do_execute) can be driven with a real
+// yuzu::CommandContext -- there is no unit-level construction path for a
+// live CommandContextImpl outside agent.cpp's dispatch_with_capture shim
+// (it carries gRPC-typed streaming fields, local_dispatcher.cpp's own
+// comment), and asserting on it here would require exactly the kind of
+// stand-in this task rules out.
+//
+// What IS provably closable at this level, and is added below: the DATA
+// forward_runner_failure receives at content_dist's real call site is
+// correct. execute_verified_payload's `outcome.run` (populated by a REAL
+// run_bounded_subprocess spawn against a REAL nonexistent staged path, not
+// a fixture-constructed SubprocessResult like test_runner_status.cpp uses)
+// classifies through the SAME classify_runner_failure() forward_runner_
+// failure calls internally to the SAME UNAVAILABLE/PARTIAL/"subprocess_
+// runner:spawn_error" triplet script_exec's own spawn_error case already
+// proves reaches a live CommandContextImpl end to end (test_script_exec_
+// actions.cpp, "a runner-level spawn_error reaches the ABI4 result-status
+// seam") via the byte-identical one-line `forward_runner_failure(ctx, run)`
+// pattern every migrated mutating plugin uses (this file's own do_execute
+// comment names services_plugin.cpp / network_actions_plugin.cpp /
+// interaction_plugin.cpp / script_exec_plugin.cpp as the same shape). This
+// closes the gap down to "does content_dist's own do_execute actually make
+// the call" -- a one-line, always-executed statement immediately downstream
+// of `outcome.run` being populated, gated only on the same `if (outcome.run)`
+// this test already exercises via execute_verified_payload's own return
+// value.
+TEST_CASE("execute_verified_payload's real spawn_error outcome classifies through the SAME "
+          "chokepoint forward_runner_failure uses at content_dist's do_execute call site "
+          "(UNAVAILABLE/PARTIAL/subprocess_runner:spawn_error)",
+          "[agent][content_dist][exec_seam][abi4]") {
+    yuzu::test::TempDir dir("yuzu_test_content_dist_exec_seam_abi4_");
+    fs::path payload = dir.path / "never-staged"; // deliberately never created
+
+    ExecutionOutcome outcome =
+        execute_verified_payload(payload, "", kIsLinux, /*is_windows=*/false);
+
+    REQUIRE(outcome.run.has_value());
+    CHECK_FALSE(outcome.run->tool_ran);
+    CHECK(outcome.run->termination_reason == yuzu::agent::TerminationReason::spawn_error);
+
+    // The exact call classify_runner_failure() makes inside
+    // forward_runner_failure(ctx, *outcome.run) at content_dist's real
+    // do_execute call site.
+    auto classified = yuzu::agent::classify_runner_failure(*outcome.run);
+    REQUIRE(classified.has_value());
+    CHECK(classified->status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(classified->completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(std::string(classified->provenance) == "subprocess_runner:spawn_error");
 }
 
 #endif // !_WIN32
