@@ -168,9 +168,10 @@ inline constexpr std::array<std::string_view, 6> kRouteRejectReasons{
 /// of either array above: it is not a targeting-SHAPE violation
 /// (`kTargetingShapeReasons` — the request named nothing reachable) and not
 /// one of the specific route-owned shapes `kRouteRejectReasons` binds by
-/// test (`test_dispatch_target_shape.cpp` hand-lists exactly five, and this
-/// reason is emitted from the shared dispatch chokepoint, not a route body
-/// check). It reuses the same `yuzu_server_dispatch_target_rejected_total`
+/// test (`test_dispatch_target_shape.cpp` hand-lists exactly six as of
+/// #3685, and this reason is emitted from the shared dispatch chokepoint,
+/// not a route body check). It reuses the same
+/// `yuzu_server_dispatch_target_rejected_total`
 /// series its siblings use rather than mint a fourth metric for a third
 /// kind of refusal.
 inline constexpr std::string_view kReasonQuarantined{"quarantined"};

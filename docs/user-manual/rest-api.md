@@ -6635,9 +6635,14 @@ must be a JSON object; anything else is `400`.
 
 **Destructive-class capabilities require explicit, non-empty `agent_ids` — broadcast and `scope`
 fan-out are refused (#3685).** The command catalogue currently classifies 17 `plugin.action` pairs
-`Destructive` (e.g. `tar.purge_source`, `filesystem.delete`, `registry.delete_key`); dispatching
-any of them with `agent_ids` omitted or empty, or with `scope` (including `"__all__"`) instead of
-`agent_ids`, is refused **before** the command reaches an agent:
+`Destructive` (e.g. `tar.purge_source`, `filesystem.delete_lines`, `registry.delete_key`); dispatching
+any of them with `agent_ids` omitted or empty, or with `scope` present at all — including
+`"__all__"` — is refused **before** the command reaches an agent. This is a narrower carve-out
+than the general targeting rule two paragraphs above: for an ordinary (non-Destructive) row,
+`"scope": "__all__"` supplied alongside `agent_ids` is the one case where the explicit id list
+wins and the call proceeds; for a Destructive row, supplying `scope` at all is refused even when
+`agent_ids` is also present and non-empty — the `__all__`-alongside-`agent_ids` exemption does
+not apply here.
 
 ```json
 {"error": {"code": 400, "message": "destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}}
@@ -6645,8 +6650,8 @@ any of them with `agent_ids` omitted or empty, or with `scope` (including `"__al
 
 The elevated securable/operation this row's catalogue entry names (per-row, e.g.
 `Infrastructure:Delete` for `tar.purge_source`) is checked via `require_permission` **before**
-this refusal — a caller lacking the grant gets the ordinary `403` first, never a `400` that would
-leak whether the row is Destructive. A caller who *is* authorized but named explicit `agent_ids`
+this refusal — a caller lacking the grant gets the ordinary `403` first, preserving the
+pre-#3685 403-before-400 ordering. A caller who *is* authorized but named explicit `agent_ids`
 is then confined to their currently visible agents (management-group scope); an id list that
 confines to nothing returns:
 
