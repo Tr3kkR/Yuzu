@@ -2520,17 +2520,29 @@ public:
                           "retention sweep",
                           "counter");
         metrics_.counter("yuzu_auth_session_reap_total");
-        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a)): incremented
-        // when a session reap pass is DECLINED because the wall clock read is
-        // implausibly ahead of, or behind, the persisted anchor — i.e. a DB/host
-        // clock anomaly (a backward step un-expires sessions). Pre-seeded to 0 so
+        // DB-PRIMARY clock-integrity monitor (ADR-2002 §4 mitigation (a)):
+        // incremented when a session reap pass is DECLINED because the DB `now()`
+        // read (the same clock that authors expires_at) is implausibly ahead of,
+        // or behind, the persisted anchor — i.e. a DB-primary clock anomaly (a
+        // backward step un-expires sessions). Pre-seeded to 0 so
         // YuzuSessionReapClockAnomaly's `increase() > 0` alert is meaningful.
         metrics_.describe("yuzu_auth_session_reap_clock_anomaly_total",
                           "Session reap passes declined due to an implausible (forward or backward) "
-                          "wall-clock reading vs the persisted anchor - the DB-clock-integrity "
-                          "signal for durable sessions (ADR-2002 section 4)",
+                          "PostgreSQL now() reading vs the persisted anchor - the DB-primary "
+                          "clock-integrity signal for durable sessions (ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total");
+        // LOCAL host-clock drift (design-review M6): incremented when THIS
+        // replica's wall clock falls behind monotonic time. DISTINCT from the
+        // DB-primary series above - with DB-clock authority session adjudication no
+        // longer rides this host's wall clock, so this is a host-health signal, not
+        // a session-integrity one. Pre-seeded to 0 for a meaningful increase() alert.
+        metrics_.describe("yuzu_auth_local_clock_backward_total",
+                          "Times this replica's local wall clock was observed to fall behind "
+                          "monotonic time (host-clock-integrity signal; session adjudication is "
+                          "DB-clock-authored, ADR-2002 section 4)",
+                          "counter");
+        metrics_.counter("yuzu_auth_local_clock_backward_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -18591,13 +18603,17 @@ private:
                         const bool rs_ok = result_set_store_ && result_set_store_->is_open();
                         ++tick;
 
-                        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
-                        // C1): compare the wall clock against a monotonic reference
-                        // via ClockDriftMonitor, which ACCUMULATES sub-threshold
-                        // backward drift — so a stopped / slowly-slewed-back wall
-                        // clock (each ~2s sample diverging by less than the
-                        // tolerance) is still caught, unlike a per-sample delta.
-                        // Runs every ~2s tick, independent of the 15m reap anchor.
+                        // LOCAL host-clock drift monitor (design-review M6): compare
+                        // this replica's wall clock against a monotonic reference via
+                        // ClockDriftMonitor, which ACCUMULATES sub-threshold backward
+                        // drift — so a stopped / slowly-slewed-back wall clock (each
+                        // ~2s sample diverging by less than the tolerance) is still
+                        // caught, unlike a per-sample delta. Runs every ~2s tick.
+                        // DISTINCT counter from the reap's DB-clock series: with
+                        // DB-clock authority (ADR-2002 §4) session adjudication no
+                        // longer rides THIS host's wall clock, so a local wobble here
+                        // is a host-health signal, not a session-integrity one, and
+                        // must not conflate with yuzu_auth_session_reap_clock_anomaly.
                         if (session_store_ && session_store_->is_open()) {
                             const int64_t wall_ms =
                                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -18608,11 +18624,11 @@ private:
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count();
                             if (session_clock_monitor.observe(wall_ms, steady_ms)) {
-                                spdlog::warn("session clock monitor: wall clock has fallen behind "
-                                             "monotonic time (backward step / stall / slow negative "
-                                             "slew) — un-expires sessions / extends JIT+MFA windows");
-                                metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
-                                    .increment();
+                                spdlog::warn("local clock monitor: this replica's wall clock has "
+                                             "fallen behind monotonic time (backward step / stall / "
+                                             "slow negative slew) — a host-clock-integrity signal "
+                                             "(session adjudication is DB-clock-authored, ADR-2002 §4)");
+                                metrics_.counter("yuzu_auth_local_clock_backward_total").increment();
                             }
                         }
 
@@ -18705,23 +18721,25 @@ private:
                         // them out on a ~15m cadence. reap_expired is clock-guarded
                         // (advisory-lock own-statement + persisted anchor +
                         // implausible-skew decline + 5000/pass cap) and single-writer-
-                        // safe. now_ms is this server's wall clock; the guard sanitises
-                        // it. A returned count>0 is counted for retention auditability.
+                        // safe. It reads the DB clock (`now()`) itself now — the same
+                        // clock that authors expires_at (ADR-2002 §4 DB-clock
+                        // authority) — so its clock_anomaly IS the DB-primary clock
+                        // signal. A returned count>0 is counted for auditability.
                         if (session_store_ && session_store_->is_open() &&
                             tick % kSessionReapEveryNTicks == 0) {
-                            const std::int64_t now_ms =
-                                std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            if (auto reaped = session_store_->reap_expired(now_ms)) {
+                            if (auto reaped = session_store_->reap_expired()) {
                                 if (reaped->deleted > 0)
                                     metrics_.counter("yuzu_auth_session_reap_total")
                                         .increment(static_cast<double>(reaped->deleted));
-                                // DB-clock-integrity monitor (ADR-2002 §4 mitigation
-                                // (a)): a declined pass due to a forward/backward
-                                // clock anomaly is the "monitor for backward
-                                // movement; alert" signal. Surfaced as a counter so
-                                // YuzuSessionReapClockAnomaly can fire on it.
+                                // DB-primary clock-integrity signal (ADR-2002 §4
+                                // mitigation (a) — "monitor for backward movement;
+                                // alert"). A reap decline on a backward/forward DB
+                                // now() lands here; YuzuSessionReapClockAnomaly fires
+                                // on it. DISTINCT from the LOCAL host-clock drift
+                                // monitor below (design-review M6): a local host
+                                // wall-clock wobble no longer affects session
+                                // adjudication (steady-based), so it must not muddy
+                                // this DB-clock series.
                                 if (reaped->clock_anomaly)
                                     metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
                                         .increment();
