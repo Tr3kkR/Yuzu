@@ -132,8 +132,8 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
         // hard_exit()s the whole process before the SCM's own timeout would matter, rather than
         // needing a live checkpoint to survive it. --install-service's own
         // SERVICE_CONFIG_FAILURE_ACTIONS (main.cpp, #1822 - SC_ACTION_RESTART x3, with
-        // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it fires on a clean exit with a non-zero
-        // code too, not just a crash) DOES auto-restart a watchdog-fired TerminateProcess,
+        // SERVICE_CONFIG_FAILURE_ACTIONS_FLAG=TRUE so it fires on a clean exit with no
+        // SERVICE_STOPPED report too, not just a crash) DOES auto-restart a watchdog-fired TerminateProcess,
         // similar to the Linux systemd Restart=always path (an earlier revision of this comment
         // claimed NO auto-restart existed at all - governance Gate 6 sre finding, corrected at
         // Gate 8 re-verify after direct code read; the SEPARATE correction above is about which

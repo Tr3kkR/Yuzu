@@ -137,8 +137,8 @@ constexpr const char* kSessionMetadataKey = "x-yuzu-session-id";
 // code) runs on run()'s own thread BETWEEN stop_requested_ being noticed and the ScopeExit
 // even arming its watchdog (W2) — if a plugin's shutdown() hangs there, run() never
 // returns, W2 never arms, and NEITHER watchdog catches it (external review, PR #3737).
-// Pre-existing, not introduced by this PR; tracked as #3756 item 3 alongside the
-// composition-aware-budget design work, not fixed here.
+// Pre-existing, not introduced by this PR; tracked as #3756 item 5 (item 3 on that same
+// issue is the separate composition-aware-budget design work above), not fixed here.
 //
 // Also unwatched by this analysis: the OTA self-stop path can race stop_mu_ against an
 // external trigger — a caller that blocks on the mutex is still bounded by ITS OWN
