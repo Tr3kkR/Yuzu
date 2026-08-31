@@ -61,43 +61,51 @@ yuzu::test::PgTestTemplate jit_elevation_audit_tpl{"jitaudit", [](const std::str
 // ── Pure helpers ─────────────────────────────────────────────────────────────
 
 TEST_CASE("effective_role: a session is admin only while elevated", "[jit][auth]") {
+    // Since HA WS-1/1a DB-clock authority (ADR-2002 §4), is_elevated adjudicates
+    // against the local monotonic `steady_elevated_until` derived by
+    // AuthManager::derive_session_deadlines — which is where the future-issued
+    // rejection, the kMaxElevationWindow authored-width ceiling, and the H2
+    // backward-`now` clamp now live. Set up each scenario through it (from ms +
+    // an authority `now`), rather than hand-stamping the wall fields.
+    using auth::AuthManager;
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+    const std::int64_t life = now + 8LL * 3600 * 1000; // 8h session
+    const std::int64_t kMaxMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(auth::kMaxElevationWindow).count();
+
     auth::Session s;
     s.username = "alice";
     s.role = Role::user;
 
     // Not elevated → base role.
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, /*elev_until*/ 0, /*issued*/ 0, now);
     CHECK_FALSE(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::user);
 
-    // Elevated into the future → effective admin. The issued-at anchor must be
-    // stamped alongside elevated_until (HA WS-1/1a, ADR-2002 §4): is_elevated
-    // rejects an elevation whose window exceeds kMaxElevationWindow, and an
-    // absent anchor reads as an epoch-anchored (enormous) window.
-    const auto now = std::chrono::system_clock::now();
-    s.elevated_until = now + std::chrono::seconds(60);
-    s.elevation_issued_at = now;
+    // Elevated 60s into the future → effective admin.
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now + 60'000, now, now);
     CHECK(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::admin);
 
-    // Ceiling: elevated_until far in the future WITHOUT a matching anchor (or
-    // with a window wider than kMaxElevationWindow) is NOT honored — the
-    // defense-in-depth wall-clock bound against a forward clock corruption.
-    s.elevation_issued_at = {}; // epoch anchor → window == elevated_until - epoch
-    CHECK_FALSE(auth::is_elevated(s));
-    s.elevation_issued_at = now;
-    s.elevated_until = now + auth::kMaxElevationWindow + std::chrono::hours(1);
+    // Epoch anchor (issued=0) → authored width ~= elevated_until (enormous) > kMax
+    // → REJECTED (a corrupted/anchor-less grant confers zero admin).
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now + 60'000, /*issued*/ 0, now);
     CHECK_FALSE(auth::is_elevated(s));
 
-    // An elapsed window → reverts to base (checked before the ceiling).
-    s.elevated_until = now - std::chrono::seconds(1);
-    s.elevation_issued_at = now - std::chrono::seconds(61);
+    // Window wider than kMaxElevationWindow → REJECTED (forward-corruption bound).
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now + kMaxMs + 3600'000, now, now);
+    CHECK_FALSE(auth::is_elevated(s));
+
+    // An elapsed window → not elevated.
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, now - 1000, now - 61'000, now);
     CHECK_FALSE(auth::is_elevated(s));
     CHECK(auth::effective_role(s) == Role::user);
 
     // A base-admin is admin regardless of elevation.
     s.role = Role::admin;
-    s.elevated_until = {};
-    s.elevation_issued_at = {};
+    AuthManager::derive_session_deadlines(s, now, life, now, 0, 0, 0, now);
     CHECK(auth::effective_role(s) == Role::admin);
 }
 
