@@ -146,8 +146,9 @@ groups:
       - alert: YuzuRbacReadDegraded
         # An authorization read against the PostgreSQL rbac_store (ADR-0041)
         # could not resolve and therefore DENIED (reads fail closed —
-        # deny-on-degrade). Because require_permission / authorize_list_read all
-        # route through this store, a degrade denies authorization FLEET-WIDE —
+        # deny-on-degrade). Because require_permission / authorize_list_read /
+        # require_fleet_read all route through this store, a degrade denies
+        # authorization FLEET-WIDE —
         # it is an availability event, not a silent partial outage. /readyz stays
         # green under pure pool saturation (it trips only on connection failure,
         # to avoid false LB evictions), so this is otherwise dashboard-invisible.
@@ -183,8 +184,8 @@ groups:
             non-zero: authorization reads against the PostgreSQL rbac_store are
             failing and therefore DENYING (fail-closed / deny-on-degrade,
             ADR-0041). Because require_permission / require_scoped_permission /
-            authorize_list_read all resolve through this store, operators and
-            agentic callers are being denied fleet-wide. pool_acquire_timeout /
+            authorize_list_read / require_fleet_read all resolve through this
+            store, operators and agentic callers are being denied fleet-wide. pool_acquire_timeout /
             query_error correlate with yuzu_pg_* saturation or outage;
             generation_refresh_failed means the cross-replica cache-coherence
             token could not be re-read PAST the bounded ~5s stale-serve window

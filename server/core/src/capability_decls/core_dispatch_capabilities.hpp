@@ -42,6 +42,7 @@ inline constexpr std::array<CommandCapability, 3> kCoreDispatchCapabilities{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .system_reserved = true,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "__guard__",
@@ -52,6 +53,7 @@ inline constexpr std::array<CommandCapability, 3> kCoreDispatchCapabilities{{
         .operation = authz::Operation::Push,
         .risk_tier = authz::RiskTier::High,
         .system_reserved = true,
+        .execute_gate = ExecuteGate::None,
     },
     {
         .plugin = "asset_tags",
@@ -62,8 +64,17 @@ inline constexpr std::array<CommandCapability, 3> kCoreDispatchCapabilities{{
         .operation = authz::Operation::Write,
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = true,
+        .execute_gate = ExecuteGate::None,
     },
 }};
+
+// #1398: every row in kCoreDispatchCapabilities must author .execute_gate — an
+// omission would value-initialize to ExecuteGate::Unspecified (the zero
+// enumerator), which is a genuine compile failure here rather than a
+// silent runtime gap. See ExecuteGate's doc comment in
+// command_capability.hpp.
+static_assert(::yuzu::server::detail::all_gates_specified(kCoreDispatchCapabilities),
+              "every row in kCoreDispatchCapabilities must author .execute_gate");
 
 } // namespace detail
 

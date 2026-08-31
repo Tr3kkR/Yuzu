@@ -1324,7 +1324,7 @@ public:
                           "distinct from the `forbidden` authorization verdict.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
-                            "kill_switched"}) {
+                            "approval_required", "kill_switched"}) {
             metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", reason}});
         }
         metrics_.describe("yuzu_server_dispatch_tag_invalid_total",
@@ -5885,12 +5885,36 @@ public:
             }
         }
 
-        // Phase 7: Workflow Engine
-        {
-            auto wf_db = cfg_.db_dir() / "workflows.db";
-            workflow_engine_ = std::make_unique<WorkflowEngine>(wf_db);
-            if (workflow_engine_ && workflow_engine_->is_open()) {
-                spdlog::info("WorkflowEngine initialized at {}", wf_db.string());
+        // Phase 7: Workflow Engine — Migrated Postgres store (ADR-0006/0009/0064, schema
+        // `workflow_engine`). Construction fail-CLOSED per ADR-0012 §1 — a posture UPGRADE from
+        // the SQLite era, where construction was unconditional/best-effort and is_open() was
+        // never checked by any caller. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment): the legacy workflows.db is never copied; the detect-and-warn obligation
+        // still applies (this store holds real operator-authored workflow definitions + their
+        // execution history), so legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds rows.
+        if (pg_pool_ && !startup_failed_) {
+            workflow_engine_ = std::make_unique<WorkflowEngine>(*pg_pool_);
+            if (!workflow_engine_->is_open()) {
+                spdlog::error("[PG] Refusing to start: workflow engine migration/open failed "
+                              "(database reachable but the workflow_engine schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                workflow_engine_->set_metrics(&metrics_);
+                metrics_.describe("yuzu_server_workflow_engine_writes_total",
+                                  "WorkflowEngine create_workflow/delete_workflow/execute/"
+                                  "cancel_execution outcomes, by op and result. ADR-0064.",
+                                  "counter");
+                for (const auto op :
+                    {"create_workflow", "delete_workflow", "execute", "cancel_execution"})
+                    for (const auto result : {"success", "failed"})
+                        metrics_.counter("yuzu_server_workflow_engine_writes_total",
+                                         {{"op", op}, {"result", result}});
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "workflows.db", "WorkflowEngine",
+                    {"workflows", "workflow_steps", "workflow_executions",
+                     "workflow_step_results"});
             }
         }
 
@@ -6382,12 +6406,26 @@ public:
             }
         }
 
-        // Phase 7: Directory Sync (AD/Entra integration)
-        {
-            auto dirsync_db = cfg_.db_dir() / "directory-sync.db";
-            directory_sync_ = std::make_unique<DirectorySync>(dirsync_db);
-            if (directory_sync_ && directory_sync_->is_open()) {
-                spdlog::info("DirectorySync initialized at {}", dirsync_db.string());
+        // Phase 7: Directory Sync (AD/Entra integration) — migrated to
+        // Postgres (ADR-0063, migration-programme PR 3, schema
+        // `directory_sync`). Fail-CLOSED per ADR-0012 §1 (posture upgrade —
+        // the SQLite era was fail-OPEN here, never checking is_open()).
+        if (pg_pool_ && !startup_failed_) {
+            directory_sync_ = std::make_unique<DirectorySync>(*pg_pool_);
+            if (!directory_sync_->is_open()) {
+                spdlog::error("[PG] Refusing to start: directory sync store migration/open "
+                              "failed (database reachable but the directory_sync schema could "
+                              "not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                // Detect-and-warn (docs/postgres-store-playbook.md's Backfill
+                // bullet): silent unless the legacy file actually holds real
+                // rows this cutover will not carry over — see the store's
+                // own doc comment. Never read for data, never blocks boot.
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "directory-sync.db", "DirectorySync",
+                    {"directory_users", "directory_groups", "directory_memberships",
+                     "directory_group_role_mappings", "directory_sync_status"});
             }
         }
 
@@ -10315,6 +10353,10 @@ private:
             .principal_role = auth::role_to_string(sess.role),
             .exec_visible = derive_exec_visible(sess),
             .system = false,
+            // #1398: JIT-elevation-aware, matching the governed
+            // POST /api/instructions/:id/execute path's own role-gated
+            // bypass (workflow_routes.cpp).
+            .principal_is_admin = auth::effective_role(sess) == auth::Role::admin,
         };
     }
 
@@ -10349,10 +10391,16 @@ private:
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
         bool principal_resolves = false;
         std::string role_label;
+        // #1398: resolved from the SAME auth-store read as role_label, at
+        // fire time — never cached from schedule-creation time — and fails
+        // closed (stays false) on any resolution failure below, matching
+        // principal_resolves's own fail-closed contract.
+        bool principal_is_admin = false;
         if (auth_db_ && !username.empty()) {
             if (auto user = auth_db_->get_user(username)) {
                 principal_resolves = true;
                 role_label = auth::role_to_string(user->role);
+                principal_is_admin = user->role == auth::Role::admin;
             } else {
                 spdlog::warn("schedule fire: creator '{}' no longer resolves ({}); denying "
                              "fail-closed rather than firing on a stale identity",
@@ -10381,7 +10429,7 @@ private:
         }
         return yuzu::server::caller_for_stored_username(
             username, true, std::move(role_label),
-            yuzu::server::authz::compose_exec_visible(facts));
+            yuzu::server::authz::compose_exec_visible(facts), principal_is_admin);
     }
 
     /// PR1.9c: a stable string label for `DispatchArm`, fed into
@@ -10483,24 +10531,10 @@ private:
 
         if (!decision) {
             const auto& denial = decision.error();
-            std::string_view reason_label;
-            switch (denial.reason) {
-            case yuzu::server::detail::DispatchDenialReason::Unclassified:
-                reason_label = "unclassified";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::Ambiguous:
-                reason_label = "ambiguous";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::AnonymousOperator:
-                reason_label = "anonymous_operator";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::Forbidden:
-                reason_label = "forbidden";
-                break;
-            case yuzu::server::detail::DispatchDenialReason::KillSwitched:
-                reason_label = "kill_switched";
-                break;
-            }
+            // #1398: the ONE label mapping — see to_string(DispatchDenialReason)'s
+            // doc comment (agent_registry.hpp) for why this is no longer a
+            // hand-duplicated switch here.
+            const std::string_view reason_label = yuzu::server::detail::to_string(denial.reason);
             metrics_
                 .counter("yuzu_server_dispatch_denied_total",
                          {{"reason", std::string(reason_label)}})
@@ -10551,8 +10585,13 @@ private:
         if (!finalized) {
             // The only denial `finalize_classified_command` can produce is
             // KillSwitched — classification/authorization already succeeded
-            // above.
-            metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
+            // above. #1398 hardening (Gate 4 consistency-auditor, INFO): route
+            // through the shared to_string() rather than a hand-duplicated
+            // literal — the exact drift this helper exists to prevent.
+            metrics_
+                .counter("yuzu_server_dispatch_denied_total",
+                         {{"reason", std::string(yuzu::server::detail::to_string(
+                                        yuzu::server::detail::DispatchDenialReason::KillSwitched))}})
                 .increment();
             spdlog::warn("dispatch denied: {}:{} reason=kill_switched caller={}", plugin, action,
                          caller.system ? std::string("system")
@@ -10756,14 +10795,18 @@ private:
     /// WorkflowRoutes::CommandDispatchFn); every fake dispatch lambda in
     /// test_mcp_server.cpp / test_dashboard_tar_fragments.cpp /
     /// test_workflow_routes.cpp was updated for the signature-only change.
-    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is left as the
-    /// original CDX-P1-03/K-3 comment found it — a SEPARATE, REST-shared
-    /// typedef with no role concept on its REST side; mcp_server.cpp now
-    /// adapts the widened DispatchFn down to it at construction rather than
-    /// touch that shared type. `principal`/`principal_role` are empty for a
-    /// caller not yet wired to identify itself (present-empty `exec_visible`
-    /// still denies); `DispatchCaller::system` marks a genuine
-    /// background/system dispatcher (no Session at all) explicitly.
+    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is signature-identical
+    /// to `McpServer::DispatchFn` — PR1.9c removed the old adapter, and its
+    /// `dispatch()` (bundle_orchestrator.hpp/.cpp) accepts and threads the
+    /// caller's `principal_is_admin`/`approval_provenance` too (#1398,
+    /// adversarial-review finding: those two fields used to be dropped
+    /// between the wrapper's already-correct caller derivation and the
+    /// per-step `DispatchCaller` this orchestrator reconstructs — fixed by
+    /// widening `dispatch()`'s own signature, not by touching this shared
+    /// typedef). `principal`/`principal_role` are empty for a caller not yet
+    /// wired to identify itself (present-empty `exec_visible` still denies);
+    /// `DispatchCaller::system` marks a genuine background/system dispatcher
+    /// (no Session at all) explicitly.
     ///
     /// Original CDX-P1-03/K-3 (adv-fix11) rationale, preserved for context: a
     /// prior wave attempted widening McpServer::DispatchFn by one param for
@@ -12864,6 +12907,15 @@ private:
             // "reported at /readyz and /healthz" contract. is_session_store_ok()
             // is true on legacy config-file-only deployments (no store wired).
             bool session_store_ok = auth_mgr_.is_session_store_ok();
+            // ADR-0063 (migration-programme PR 3) — same readyz-vs-healthz
+            // drift class the rows above document; wired into both from the
+            // start rather than shipping the gap. Construction is fail-closed,
+            // so this is belt-and-braces against a runtime is_open() flip.
+            bool directory_sync_ok = directory_sync_ && directory_sync_->is_open();
+            // ADR-0064 (Wave 4 non-`*Store` migration) — same readyz-vs-healthz drift class:
+            // workflow_engine was already in /readyz's StoreCheck vector (below) but absent
+            // here in the SQLite era.
+            bool workflow_engine_ok = workflow_engine_ && workflow_engine_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -12874,7 +12926,7 @@ private:
                 device_inventory_ok && inventory_ok && approval_ok && rbac_ok && result_set_ok &&
                 mgmt_group_ok && discovery_ok && deployment_ok && quarantine_ok &&
                 notification_ok && upload_grant_ok && tag_ok && runtime_config_ok &&
-                patch_manager_ok && session_store_ok;
+                patch_manager_ok && session_store_ok && directory_sync_ok && workflow_engine_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -12920,7 +12972,9 @@ private:
                   {"tag_store", tag_ok ? "ok" : "error"},
                   {"runtime_config_store", runtime_config_ok ? "ok" : "error"},
                   {"patch_manager", patch_manager_ok ? "ok" : "error"},
-                  {"session_store", session_store_ok ? "ok" : "error"}}},
+                  {"session_store", session_store_ok ? "ok" : "error"},
+                  {"directory_sync", directory_sync_ok ? "ok" : "error"},
+                  {"workflow_engine", workflow_engine_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -13030,6 +13084,11 @@ private:
                 {"runtime_config_store", runtime_config_store_ && runtime_config_store_->is_open()},
                 {"inventory_store", inventory_store_ && inventory_store_->is_open()},
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
+                // ADR-0063 (migration-programme PR 3): DirectorySync became a
+                // fail-closed Postgres store (was fail-open SQLite, never
+                // checked here before) — load-bearing for /api/directory/*
+                // and the access-review export's optional email enrichment.
+                {"directory_sync", directory_sync_ && directory_sync_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
                 {"guaranteed_state_store",
@@ -14629,17 +14688,37 @@ private:
                 const bool is_classification_error =
                     denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
                     denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+                // #1398: a gated-but-unapproved pair gets its own message,
+                // naming the gate and pointing at the governed alternative —
+                // distinct from a bare RBAC "permission denied" (Decision 7,
+                // deny+redirect, no new ticket-mint surface on this route).
+                const bool is_approval_required =
+                    denial.reason ==
+                    yuzu::server::detail::DispatchDenialReason::ApprovalRequired;
                 const int status = is_classification_error ? 400 : 403;
                 const std::string message =
                     is_classification_error
                         ? std::string{"unknown or ambiguous plugin.action"}
-                        : "permission denied: " + denial.securable + ":" +
-                              std::string(yuzu::server::authz::to_string(denial.operation));
-                const bool audit_ok =
-                    audit_log(req, "command.dispatch", "denied", "command", "",
-                             std::string("reason=dispatch_denied ") +
-                                 onbehalf::sanitize_for_log(plugin, 128) + ":" +
-                                 onbehalf::sanitize_for_log(action, 128));
+                        : is_approval_required
+                              ? "approval required for " + plugin + "." + action +
+                                    " — this action requires either an admin caller or an "
+                                    "approved request; dispatch it via "
+                                    "POST /api/instructions/{id}/execute instead, which "
+                                    "supports the approval workflow"
+                              : "permission denied: " + denial.securable + ":" +
+                                    std::string(yuzu::server::authz::to_string(denial.operation));
+                // #1398 (governance security-guardian F3): the SPECIFIC denial
+                // reason, not a flat "dispatch_denied" — an incident review
+                // needs to tell `forbidden` apart from `approval_required`
+                // from the audit trail alone, the same way the metric label
+                // already does (yuzu::server::detail::to_string, shared with
+                // build_classified_command's metric emission above).
+                const bool audit_ok = audit_log(
+                    req, "command.dispatch", "denied", "command", "",
+                    std::string("reason=") +
+                        std::string(yuzu::server::detail::to_string(denial.reason)) + " " +
+                        onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                        onbehalf::sanitize_for_log(action, 128));
                 if (!audit_ok)
                     res.set_header("Sec-Audit-Failed", "true");
                 res.status = status;
@@ -19716,6 +19795,11 @@ private:
         // handlers capture `this` at registration and read the member per
         // request, so setting it afterwards would never reach a live route.
         dashboard_routes_->set_csrf_trusted_origins(cfg_.csrf_trusted_origins);
+        // #1712 / #3290 Phase 2 — same conversion lambda already wired into
+        // McpServer's query_installed_software (fleet_read_fn, defined
+        // above); wiring it here too so /fragments/results migrates onto
+        // require_fleet_read as its sole gate.
+        dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
         dashboard_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
@@ -19819,6 +19903,10 @@ private:
         WorkflowRoutes::Deps wf_deps;
         wf_deps.auth_fn = auth_fn;
         wf_deps.perm_fn = perm_fn;
+        // #1712 / #3290 Phase 2 — same conversion lambda already wired into
+        // McpServer's query_installed_software and DashboardRoutes above;
+        // used only by the executions-drawer detail route.
+        wf_deps.fleet_read_fn = fleet_read_fn;
         wf_deps.audit_fn = audit_fn;
         wf_deps.emit_fn = [this](const std::string& event_type, const httplib::Request& req) {
             emit_event(event_type, req);
@@ -21442,10 +21530,50 @@ private:
         // build_classified_command.
         auto classified = build_classified_command(caller, plugin, action, command_id);
         if (!classified) {
-            res.status = 403;
-            res.set_content(
-                R"({"error":{"code":403,"message":"command denied"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // #1398 (governance Gate 6 sre finding, HIGH/BLOCKING): mirror
+            // the /api/command denial block exactly (server.cpp, ~line
+            // 14343) — this route was named explicitly in-scope by the
+            // design doc's Decision 7 ("REST (/api/command,
+            // forward_legacy_command): 403 ... with the specific denial
+            // reason in the audit detail") but was never actually touched
+            // by the diff. `chargen.chargen_start` (this route's live,
+            // dispatchable pair) is compiled ExecuteGate::AdminOrApproval,
+            // so an unaudited ApprovalRequired denial here was a real,
+            // reachable SOC 2 CC7.2 evidence-chain gap
+            // (docs/observability-conventions.md: "Denied operations MUST
+            // emit an audit event"), not a hypothetical one.
+            const auto& denial = classified.error();
+            const bool is_classification_error =
+                denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
+                denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+            const bool is_approval_required =
+                denial.reason == yuzu::server::detail::DispatchDenialReason::ApprovalRequired;
+            const int status = is_classification_error ? 400 : 403;
+            const std::string message =
+                is_classification_error
+                    ? std::string{"unknown or ambiguous plugin.action"}
+                    : is_approval_required
+                          ? "approval required for " + plugin + "." + action +
+                                " — this action requires either an admin caller or an "
+                                "approved request; dispatch it via "
+                                "POST /api/instructions/{id}/execute instead, which "
+                                "supports the approval workflow"
+                          : "permission denied: " + denial.securable + ":" +
+                                std::string(yuzu::server::authz::to_string(denial.operation));
+            const bool audit_ok = audit_log(
+                req, "command.dispatch", "denied", "command", "",
+                std::string("reason=") +
+                    std::string(yuzu::server::detail::to_string(denial.reason)) + " " +
+                    onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                    onbehalf::sanitize_for_log(action, 128));
+            if (!audit_ok)
+                res.set_header("Sec-Audit-Failed", "true");
+            res.status = status;
+            nlohmann::json err{{"error", {{"code", status}, {"message", message}}},
+                               {"meta", {{"api_version", "v1"}}}};
+            if (audit_store_)
+                err["audit_emitted"] = audit_ok;
+            res.set_content(err.dump(), "application/json");
             return;
         }
 

@@ -711,6 +711,7 @@ if build_server
       'unit/server/test_dashboard_tar_retention.cpp',
       'unit/server/test_dashboard_tar_fragments.cpp',
       'unit/server/test_dashboard_results_columns.cpp', # PR1.7 remediation: resolve_render_columns/render_results
+      'unit/server/test_dashboard_results_fragment.cpp', # #1712 / #3290 Phase 2: /fragments/results fleet-read gate
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
@@ -833,6 +834,7 @@ if build_server
       'unit/server/test_mcp_transport.cpp',
       'unit/server/test_process_health.cpp',
       'unit/server/test_patch_manager.cpp',
+      'unit/server/test_workflow_engine.cpp',
       'unit/server/test_inventory_eval.cpp',
       'unit/server/test_execution_statistics.cpp',
       'unit/server/test_device_token_store.cpp',
@@ -874,6 +876,7 @@ if build_server
       'unit/server/test_rest_response_templates.cpp',
       'unit/server/test_offload_target_store.cpp',
       'unit/server/test_rest_offload_targets.cpp',
+      'unit/server/test_directory_sync.cpp', # ADR-0063: directory_sync Postgres migration
       'unit/server/test_fleet_topology_store.cpp',
       'unit/server/test_viz_routes.cpp',
       'unit/server/test_product_pack_store.cpp',
@@ -1760,6 +1763,18 @@ test('changelog order',
 test('capability catalogue completeness',
   _python3_test,
   args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# #1398 data-gate: every capability-catalogue row's authored ExecuteGate
+# matches the strictest approval.mode any shipped InstructionDefinition
+# declares for that plugin.action pair, and a content-declared pair with no
+# catalogue row is exempt from gating only when it is server-side (never
+# agent-dispatched). Hermetic — parses sources, builds nothing.
+test('capability gate consistency',
+  _python3_test,
+  args: [files('test_capability_gate_consistency.py')],
   suite: 'docs',
   timeout: 30,
 )
