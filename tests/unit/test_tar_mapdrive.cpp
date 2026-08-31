@@ -764,3 +764,34 @@ TEST_CASE("mapdrive argv re-home: parse_smbstatus/parse_win_security_logons/pars
     CHECK(samba[0].entry.username == "carol");
     CHECK(samba[0].entry.local_mount == "srv");
 }
+
+// ── enumerate_mapdrive(): real macOS getfsstat leg (Finding 4) ──────────────
+//
+// Everything above exercises only the pure text/mount-record parsers and
+// classify_macos_mounts/run_getfsstat_with_retry fed synthetic records.
+// Nothing called the real macOS enumerate_mapdrive() itself, so a
+// regression in the actual getfsstat(2) size-then-fill wiring
+// (read_getfsstat, tar_mapdrive_collector.cpp) -- a wrong flag, a broken
+// retry loop, a buffer-sizing bug -- would still pass every test in this
+// file. Live-host smoke test: calls the REAL enumerate_mapdrive() against
+// this machine's actual live mount table and asserts only that it returns
+// without throwing and the shape is sane -- no timing assumption, no
+// process spawn (getfsstat is a local syscall). Same established exception
+// as test_tar_arp.cpp's enumerate_arp() live smoke test; kept minimal so it
+// stays fast and non-flaky regardless of what's actually mounted on the
+// host at test time (empty/no network mounts is the common, legitimate
+// case on a dev machine).
+#ifdef __APPLE__
+TEST_CASE("enumerate_mapdrive (macOS getfsstat leg): runs against the live "
+          "host without throwing, entries are internally consistent",
+          "[tar][mapdrive][macos][live]") {
+    std::vector<MapDriveEntry> entries;
+    REQUIRE_NOTHROW(entries = enumerate_mapdrive());
+
+    for (const auto& e : entries) {
+        CHECK(e.direction == "outbound");
+        CHECK_FALSE(e.local_mount.empty());
+        CHECK_FALSE(e.provider.empty());
+    }
+}
+#endif // __APPLE__

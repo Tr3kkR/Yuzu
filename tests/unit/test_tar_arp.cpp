@@ -21,6 +21,7 @@
  */
 
 #include "tar_arp_parsers.hpp"
+#include "tar_collectors.hpp" // yuzu::tar::enumerate_arp (Finding 4 live smoke test, __APPLE__ only)
 
 #ifdef __APPLE__
 #include <route_sysctl_arp.hpp>
@@ -280,6 +281,39 @@ TEST_CASE("arp_entry_from_route_record maps every record independently, order pr
     CHECK(mapped[0].mac_address == "00:11:22:33:44:55");
     CHECK(mapped[1].ip_address == "10.0.0.2");
     CHECK(mapped[1].mac_address == "aa:aa:aa:aa:aa:aa");
+}
+
+// ── enumerate_arp(): real macOS route-sysctl leg (Finding 4) ────────────────
+//
+// Everything above exercises only the pure parsers/mappers. No test called
+// the real enumerate_arp() itself, so a regression in the native
+// NET_RT_FLAGS/RTF_LLINFO sysctl leg (tar_arp_collector.cpp's __APPLE__
+// branch) -- a wrong sysctl MIB, a broken rt_msghdr walk, a mishandled ENOMEM
+// retry -- would still pass every test in this file. This is a live-host
+// smoke test: it calls the REAL enumerate_arp() against this machine's
+// actual kernel ARP/neighbour table and asserts only that it returns without
+// throwing and the shape is sane -- no timing assumption, no process spawn,
+// no network access (a route sysctl is a local kernel query, not a network
+// call). This is the established exception in this codebase for real-OS-
+// primitive verification (see this file's own header note on why the
+// syscall itself isn't otherwise exercised, and tar_mapdrive.cpp's
+// getfsstat-adjacent precedent) -- kept intentionally minimal so it stays
+// fast and non-flaky regardless of what's actually in the host's ARP table
+// at test time (empty is a legitimate, common result on a quiet host).
+TEST_CASE("enumerate_arp (macOS route-sysctl leg): runs against the live "
+          "host without throwing, entries are internally consistent",
+          "[tar][arp][live]") {
+    std::vector<ArpEntry> entries;
+    REQUIRE_NOTHROW(entries = enumerate_arp());
+
+    for (const auto& e : entries) {
+        // macOS leg fixes entry_type == "unknown" and iface == "" (see
+        // arp_entry_from_route_record above) -- a real capture must match
+        // that contract, and every entry must carry at least an IP.
+        CHECK_FALSE(e.ip_address.empty());
+        CHECK(e.entry_type == "unknown");
+        CHECK(e.iface.empty());
+    }
 }
 
 #endif // __APPLE__
