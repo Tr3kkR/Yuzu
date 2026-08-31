@@ -41,6 +41,7 @@
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+#include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
@@ -3881,6 +3882,21 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
+            // #3685: classify_fn_ unset (never wired, or the production wiring at
+            // server.cpp regressed) — execute_instruction cannot determine whether
+            // ANY plugin.action pair is Destructive, so it fails CLOSED at BOTH
+            // gate sites (C8 pre-mint below, and the main handler further down)
+            // rather than silently falling through to the pre-#3685 unconfined
+            // behaviour. Distinguishable, on purpose, from an honest classify-miss
+            // (a WIRED fn returning Unclassified/Ambiguous), which stays Policy B
+            // fall-through — see McpServer::ClassifyFn's doc comment
+            // (mcp_server.hpp) for the two-outcomes rationale.
+            constexpr std::string_view kClassifierUnavailableMessage =
+                "capability classification is unavailable; execute_instruction is "
+                "refused until it is restored";
+            constexpr std::string_view kClassifierUnavailableRemediation =
+                "this is a server configuration/wiring fault, not a caller error; "
+                "contact an administrator";
             // retry_after_ms: pass a non-negative value on a TRANSIENT failure (a
             // store degrade / transient outage) so an agentic worker backs off and
             // retries rather than treating the error as terminal; leave the default
@@ -4341,6 +4357,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                          "reduce the argument and re-call; no approval "
                                          "ticket was created or consumed",
                                          -1, cid),
+                                "application/json");
+                            return;
+                        }
+                        // #3685 (checkpoint 2, commit 4): fail closed if the
+                        // Destructive-targeting classifier was never wired (or the
+                        // production wiring regressed) — BEFORE a ticket is
+                        // minted or consumed. The actual Destructive-targeting
+                        // refusal (a WIRED classifier reporting a Destructive,
+                        // untargeted call) is added in commit 5; this arm alone
+                        // covers only the "cannot even ask the question" case.
+                        if (!classify_fn_) {
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            mcp_audit("denied", std::string("capability classifier "
+                                                           "unavailable correlation_id=") +
+                                                    cid);
+                            res.set_content(
+                                a4_error(kInternalError, kClassifierUnavailableMessage,
+                                         kClassifierUnavailableRemediation, -1, cid),
                                 "application/json");
                             return;
                         }
@@ -7527,6 +7562,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!dispatch_fn) {
                     res.set_content(
                         error_response(id, kInternalError, "Command dispatch unavailable"),
+                        "application/json");
+                    return;
+                }
+                // #3685 (checkpoint 2, commit 4): the SAME fail-closed check as the
+                // C8 pre-mint site above — necessary here too because operator-tier
+                // calls (and any tool whose tier does not require_approval) skip
+                // the C8 approval block entirely and reach this handler directly.
+                // See that site's comment for what commit 5 adds on top.
+                if (!classify_fn_) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    mcp_audit("denied",
+                              std::string("capability classifier unavailable correlation_id=") +
+                                  cid);
+                    res.set_content(
+                        a4_error(kInternalError, kClassifierUnavailableMessage,
+                                 kClassifierUnavailableRemediation, -1, cid),
                         "application/json");
                     return;
                 }

@@ -21197,6 +21197,19 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // #3685 — the SAME CommandCapabilityRegistry::classify the /api/command
+            // Destructive gate consults (server.cpp's own Destructive block above),
+            // wired UNCONDITIONALLY exactly like set_kek_ops immediately above:
+            // capability_registry_ is a plain ServerImpl member, never conditional
+            // on another store's presence, so gating this wiring behind an
+            // unrelated conditional would be the same ADR-1005 A1 drift the KEK
+            // comment warns about — and, per McpServer::ClassifyFn's fail-closed
+            // contract (mcp_server.hpp), omitting this call is not merely a
+            // degraded tool but every execute_instruction call refusing outright.
+            mcp_server_->set_capability_classify_fn(
+                [this](std::string_view p, std::string_view a) {
+                    return capability_registry_.classify(p, a);
+                });
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit

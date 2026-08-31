@@ -22,6 +22,8 @@
 #include "agent_registry.hpp"
 #include "analytics_event_store.hpp" // real-AuthRoutes integration test (C1)
 #include "api_token_store.hpp"
+#include "command_capability.hpp" // #3685: CommandCapability / ClassificationError for classify_fn_for_test
+#include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting / kDestructive*Message
 #include "engine_principal_store.hpp"   // EngineLookupStatus — #2384 MCP pin test
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
@@ -756,6 +758,26 @@ struct McpTestServer {
             return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{}};
         }};
 
+    /// #3685: the Destructive-targeting classifier `execute_instruction` now
+    /// consults at both gate sites. `McpServer::ClassifyFn`'s contract is
+    /// FAIL-CLOSED-WHEN-UNWIRED (mcp_server.hpp) — the OPPOSITE default
+    /// posture from every other `_for_test` seam in this fixture, which
+    /// default to nullptr/degraded-but-harmless. Left unset here, EVERY
+    /// existing execute_instruction test in this file would start refusing
+    /// with "classifier unavailable". The harness DEFAULT therefore wires a
+    /// classifier that is WIRED (satisfies the fail-closed gate) but
+    /// classifies everything Unclassified — a real answer, not an absence,
+    /// so Policy B's fall-through applies and every pre-#3685 test keeps its
+    /// exact prior behaviour with zero fixture churn. A Destructive-specific
+    /// test overrides this with a classifier that returns a real Destructive
+    /// `CommandCapability` for the pair it cares about; a fail-closed test
+    /// sets this to `{}` (genuinely unwired) to prove the gate itself.
+    yuzu::server::mcp::McpServer::ClassifyFn classify_fn_for_test{
+        [](std::string_view, std::string_view)
+            -> std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError> {
+            return std::unexpected(yuzu::server::ClassificationError::Unclassified);
+        }};
+
     /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
     /// real ExecutionTracker so the create_execution / set_agents_targeted
     /// / mark_cancelled lifecycle is exercised end-to-end on the MCP path.
@@ -1088,6 +1110,15 @@ private:
         // predicate's "legacy-open" posture, so this is a no-op change of
         // shape for every pre-existing test that never touches it.
         mcp.set_fleet_read_fn(fleet_read_fn_for_test);
+
+        // #3685: the Destructive-targeting classifier ALSO rides a setter,
+        // same pattern as the two above — wire before the handlers are
+        // built. UNCONDITIONAL, but NOT a no-op default like its siblings:
+        // classify_fn_for_test's own default is a WIRED (non-empty)
+        // classifier (see its doc comment above) precisely so this call
+        // preserves every pre-#3685 test's behaviour instead of tripping
+        // the new fail-closed-when-unwired gate.
+        mcp.set_capability_classify_fn(classify_fn_for_test);
 
         // M5 remediation: the plugin-config/upload-grant stores ALSO ride
         // setters, same pattern as the two above — wire before the handlers
@@ -6041,6 +6072,84 @@ TEST_CASE("MCP Integration: execute_instruction null dispatch_fn", "[mcp][integr
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["message"].get<std::string>().find("Command dispatch unavailable") !=
           std::string::npos);
+}
+
+// ── 24b. #3685: unwired Destructive-targeting classifier fails CLOSED ──────
+//
+// McpServer::ClassifyFn's contract (mcp_server.hpp) is the OPPOSITE default
+// posture from every other injected seam: unset means execute_instruction
+// cannot determine whether ANY pair is Destructive, so it refuses EVERY call
+// with a distinguishable "classifier unavailable" denial rather than falling
+// through silently. These two cases genuinely UNWIRE it
+// (classify_fn_for_test = {}) — every OTHER test in this file relies on the
+// fixture's non-empty default (see classify_fn_for_test's own doc comment)
+// to keep the pre-#3685 fall-through behaviour, so this is the one place
+// that default is deliberately overridden to {}.
+
+TEST_CASE("MCP #3685: operator-tier execute_instruction refuses with "
+          "classifier-unavailable when the classifier is genuinely unwired",
+          "[mcp][integration][execute][3685]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = {}; // genuinely unwired, not "wired but Unclassified"
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("classification is unavailable") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(dispatched); // refused before any dispatch, even for an explicitly-targeted call
+}
+
+TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8 pre-mint site "
+          "when the classifier is unwired — no ticket minted",
+          "[mcp][integration][execute][3685][approval]") {
+    yuzu::test::TempDbFile db{std::string_view{"mcp-3685-clsunavail-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(db.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.classify_fn_for_test = {};
+    ts.approval_manager_for_test = &appr;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — the gate must refuse BEFORE a ticket is minted,
+    // not mint one and then let a later step deny it.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("classification is unavailable") !=
+          std::string::npos);
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK_FALSE(dispatched);
+    sqlite3_close(raw);
 }
 
 // ── 25. Missing plugin ───────────────────────────────────────────────────

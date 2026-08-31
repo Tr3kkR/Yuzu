@@ -8,6 +8,7 @@
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
+#include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 // ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
 // mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
@@ -45,6 +46,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -251,6 +253,37 @@ public:
     /// between an MCP write and a dangling owner reference).
     using OwnerExistsFn = std::function<bool(const std::string& username)>;
 
+    /// #3685: classifies a `plugin.action` pair the SAME way `/api/command`
+    /// does — the production wiring (server.cpp) wraps the shared
+    /// `CommandCapabilityRegistry::classify` this tool's REST twin already
+    /// consults, so the two surfaces cannot disagree about what a pair IS,
+    /// only about what to DO with a miss (see below).
+    ///
+    /// FAIL-CLOSED contract, matching `OwnerExistsFn` immediately above: an
+    /// unset (`{}`) fn means `execute_instruction` cannot determine whether
+    /// ANY pair is Destructive, so it refuses EVERY call at both gate sites
+    /// with a distinguishable "classifier unavailable" denial — never
+    /// silent fall-through indistinguishable from an honest classify-miss.
+    /// This is deliberately a STRONGER posture than most `*Fn` seams in this
+    /// file (which degrade a single tool to "unavailable" when unwired): a
+    /// silently-unwired classifier would silently revert MCP's Destructive
+    /// targeting confinement to its pre-#3685 state while every other test
+    /// stayed green — precisely the `ContainmentGate{}` class of regression
+    /// `dispatch_confined_arms.hpp` warns about. Production always wires
+    /// this (server.cpp, unconditionally, next to `set_kek_ops`); an unset
+    /// fn reaching a live request means the wiring itself regressed.
+    ///
+    /// A WIRED fn returning `Unclassified`/`Ambiguous` (an honest classify
+    /// miss, not an absent fn) is the DIFFERENT, unchanged Policy-B case:
+    /// `execute_instruction` falls through and the existing dispatch
+    /// chokepoint denies a real miss on its own terms, exactly as before
+    /// this fn existed — see `dispatch_destructive_gate.hpp`'s
+    /// `DestructiveTargetingVerdict::ClassifyMiss`.
+    using ClassifyFn =
+        std::function<std::expected<yuzu::server::CommandCapability,
+                                    yuzu::server::ClassificationError>(
+            std::string_view plugin, std::string_view action)>;
+
     /// Injects the engine-principal + engine-credential store pointers and
     /// the owner-FK predicate via SETTERS rather than growing the already
     /// 30-parameter build_handler()/register_routes() trailing-parameter
@@ -273,6 +306,11 @@ public:
     /// `revoke_for_principal`.
     void set_engine_credential_store(ApiTokenStore* store) { engine_credential_store_ = store; }
     void set_owner_exists_fn(OwnerExistsFn fn) { owner_exists_fn_ = std::move(fn); }
+    /// #3685: see `ClassifyFn`'s doc comment above for the fail-closed
+    /// contract. Same setter idiom as `set_owner_exists_fn` immediately
+    /// above (the handler's `[=]` lambda captures `this`, so the injection
+    /// is a live read on the next request).
+    void set_capability_classify_fn(ClassifyFn fn) { classify_fn_ = std::move(fn); }
 
     /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
     /// set_engine_principal_store above (the handler's `[=]` lambda captures
@@ -546,6 +584,10 @@ private:
     EnginePrincipalStore* engine_principal_store_{nullptr};
     ApiTokenStore* engine_credential_store_{nullptr};
     OwnerExistsFn owner_exists_fn_;
+    // #3685 — see ClassifyFn's doc comment above: unset means
+    // execute_instruction fails closed at BOTH gate sites (mcp_server.cpp),
+    // never a silent fall-through to the pre-#3685 unconfined behaviour.
+    ClassifyFn classify_fn_;
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
