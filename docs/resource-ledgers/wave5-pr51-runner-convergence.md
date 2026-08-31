@@ -47,21 +47,25 @@ exactly the listed resource.
 
 ---
 
-### `int` fd — B6 verified-exec's `open()` of the payload, consumed by `execveat`
+### `int` fd — B6 verified-exec's `open()` of the payload, transferred by `execveat`
 - **Site:** `agents/core/src/subprocess_runner.cpp`, `toctou_verified_exec`
   (the async-signal-safe post-`fork()` path taken when
   `LaunchSpec::ExecVerification::enabled`; `content_dist`'s
   `execute_verified_payload` is the in-tree caller, Linux leg only).
 - **Allocated by:** `open(c_argv[0], O_RDONLY | O_NOFOLLOW)`.
-- **Released by:** a successful `execveat(fd, "", c_argv, c_envp, AT_EMPTY_PATH)` —
-  the exec transition replaces the process image, which tears down every fd
-  the outgoing image held, this one included; there is no explicit `close()`
-  after a successful exec because there is no "after" in this process image.
-  Every OTHER path closes it explicitly: a failed `fstat`, a failed
-  verification check (`!regular || !root_owned || !not_group_other_writable
-  || !size_ok`), an `ETXTBSY` retry (closed before the bounded backoff sleep,
-  reopened fresh next attempt), and the final `errno` path when `execveat`
-  itself fails or retries are exhausted.
+- **Released by:** every FAILURE path closes it explicitly — a failed
+  `fstat`, a failed verification check (`!regular || !root_owned ||
+  !not_group_other_writable || !size_ok`), an `ETXTBSY` retry (closed before
+  the bounded backoff sleep, reopened fresh next attempt), and the final
+  `errno` path when `execveat` itself fails or retries are exhausted. The
+  SUCCESS path is deliberately different and does NOT release the fd: a
+  successful `execveat(fd, "", c_argv, c_envp, AT_EMPTY_PATH)` replaces the
+  process image but, absent `O_CLOEXEC`, carries the fd forward into that
+  new image rather than closing it — there is no `close()` after a
+  successful exec because this code never runs again in that process
+  (the call is `[[noreturn]]`), and the fd's actual lifetime from this point
+  is the exec'd child's to manage. See the transfer note below for why that
+  is accepted rather than fixed.
 - **Deliberately NOT `O_CLOEXEC`, and this is a transfer, not a leak:** this
   is the exact fd meant to be exec'd, not one that should be hidden from the
   child, so it is intentionally left open across the exec so the kernel can
@@ -76,12 +80,17 @@ exactly the listed resource.
   `content_dist_exec_seam.hpp` in the same change that added this entry, so
   operator-facing text and this ledger now agree with the runner's actual
   behavior.
-- **All paths covered:** successful `execveat` (fd consumed by the exec
-  transition, not leaked into the new image as a stray inheritable handle —
-  no `O_CLOEXEC` needed for this because nothing survives past the exec to
-  inherit it) ✓ · `fstat` failure ✓ · any verification-check failure ✓ ·
-  `ETXTBSY` retry (closed, reopened) ✓ · final `execveat` failure after
-  retries exhausted ✓.
+- **All paths covered:** successful `execveat` — the fd is NOT closed by the
+  exec transition; without `O_CLOEXEC` it transfers into the new process
+  image and survives there, inheritable, exactly as the "deliberate
+  transfer" framing above says (reproduced directly: the exec'd child's
+  `/proc/self/fd` lists it as still open). This is accepted, not
+  overlooked — the child already has an equally-capable path to the same
+  file via `/proc/self/exe`, and the fd is read-only and `O_NOFOLLOW`, so a
+  surviving handle to its own executable discloses nothing the child
+  couldn't already reach ✓ · `fstat` failure (closed) ✓ · any
+  verification-check failure (closed) ✓ · `ETXTBSY` retry (closed,
+  reopened) ✓ · final `execveat` failure after retries exhausted (closed) ✓.
 - **Platform note:** Linux-only (`#if defined(__linux__) && defined(SYS_execveat)`);
   runtime-verified on this branch's own CI (the comment above the function
   records this was "the first Linux CI run of this code path to ever
