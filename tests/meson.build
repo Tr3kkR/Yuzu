@@ -519,8 +519,8 @@ agent_test_exe = executable(
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
                 installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib,
-                wifi_plugin_lib],
-                content_dist_plugin_lib, script_exec_plugin_lib, echo_argv_fixture],
+                wifi_plugin_lib, content_dist_plugin_lib, script_exec_plugin_lib,
+                echo_argv_fixture],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
