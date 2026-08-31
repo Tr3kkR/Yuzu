@@ -155,6 +155,51 @@ fi
 # can find packages installed by vcpkg.
 MESON_ARGS+=(-Dcmake_prefix_path="$VCPKG_INSTALLED")
 
+# Also pass pkg_config_path: spdlog/fmt resolve via pkg-config first, and with
+# the cmake prefix alone a system spdlog in pkg-config's default search path
+# shadows the vcpkg one — configure succeeds, the link then dies on
+# `undefined reference to fmt::v12::...` (#3725; CLAUDE.md "Manual configure").
+# The vcpkg dir goes first so it wins; the platform's system dir is appended so
+# distro deps keep resolving, and any caller-exported PKG_CONFIG_PATH is folded
+# in after that (the Meson option REPLACES the env var, it does not extend it).
+# Linux/macOS only: the Windows MSVC build hand-wires its deps (#375) and
+# pkg-config behaviour under MSYS2+MSVC is unverified — do not guess there.
+# Precedence: skipped entirely when the native/cross file sets pkg_config_path
+# (a command-line -D would silently override the file); an explicit
+# -Dpkg_config_path after `--` still wins because a later -D beats an earlier
+# one on the meson command line.
+MACHINE_FILE_SETS_PKGCONF=false
+for MF in "$NATIVE_FILE" "$CROSS_FILE"; do
+  [[ -z "$MF" ]] && continue
+  [[ ! -f "$MF" ]] && MF="$PROJECT_ROOT/$MF"
+  if [[ -f "$MF" ]] && grep -Eq '^[[:space:]]*pkg_config_path[[:space:]]*=' "$MF"; then
+    MACHINE_FILE_SETS_PKGCONF=true
+  fi
+done
+if [[ "$HOST_OS" != "windows" ]] && ! $MACHINE_FILE_SETS_PKGCONF; then
+  PKG_CONFIG_DIRS="$VCPKG_INSTALLED/lib/pkgconfig"
+  if [[ "$HOST_OS" == "linux" && -z "$CROSS_FILE" ]]; then
+    # Debian-family multiarch layout first (gcc is a build prerequisite),
+    # then the RHEL-family lib64 layout. Host dirs are wrong for a cross
+    # target, so cross builds get the vcpkg dir only.
+    MULTIARCH="$(gcc -print-multiarch 2>/dev/null || true)"
+    if [[ -z "$MULTIARCH" ]] && command -v dpkg-architecture >/dev/null 2>&1; then
+      MULTIARCH="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null || true)"
+    fi
+    if [[ -n "$MULTIARCH" && -d "/usr/lib/$MULTIARCH/pkgconfig" ]]; then
+      PKG_CONFIG_DIRS+=",/usr/lib/$MULTIARCH/pkgconfig"
+    elif [[ -d /usr/lib64/pkgconfig ]]; then
+      PKG_CONFIG_DIRS+=",/usr/lib64/pkgconfig"
+    fi
+  fi
+  # macOS needs no system dir: Homebrew's pkgconfig dir is on pkg-config's
+  # built-in path, which is always searched after PKG_CONFIG_PATH.
+  if [[ -n "${PKG_CONFIG_PATH:-}" ]]; then
+    PKG_CONFIG_DIRS+=",${PKG_CONFIG_PATH//:/,}"
+  fi
+  MESON_ARGS+=(-Dpkg_config_path="$PKG_CONFIG_DIRS")
+fi
+
 # Options
 if $TESTS; then
   MESON_ARGS+=(-Dbuild_tests=true)
