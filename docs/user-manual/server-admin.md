@@ -3169,9 +3169,27 @@ deliberate and has **no grace window** — the second signal always force-exits,
 even if the first stop was progressing normally — so double-signalling stop
 tooling will force-kill healthy agents; send one signal and wait. You no longer
 need `SIGKILL` to recover a stuck agent. SQLite state is WAL crash-safe across
-the hard exit. On Windows, a second Ctrl-C also terminates promptly (via the
+the hard exit. Separately (#2233 item 3), a stuck teardown is now also caught
+automatically: `AgentImpl::stop()` and the agent's own `run()`-exit teardown
+each arm a 20-second internal watchdog, and self hard-exit (**code 4** — new,
+distinct from this section's exit 1 and the crash-loop-backstop's exit 3
+below) if guardian/spark/DEX teardown or any other blocking step hasn't
+returned within it. You do not need to send a second signal to recover from
+this class of wedge — doing so just makes the exit happen sooner (code 1)
+instead of after the 20s deadline (code 4). If a wedge triggers both at once
+(an operator's second signal racing the watchdog for the same hang), which
+code is actually reported is a race — treat it as a hint, not a certain
+diagnosis. On Windows, a second Ctrl-C also terminates promptly (via the
 escalation or the CRT's default disposition); the service path (`sc stop`) is
-unchanged. If the agent logs `shutdown watcher unavailable` at boot (thread/fd
+now also bounded by the same 20s watchdog. The agent's own `--install-service`
+path (see below) does configure automatic service recovery — 3 restarts, 60s
+apart, resetting after 24h, firing on both a crash and a clean exit that never
+reported `SERVICE_STOPPED` (#1822) — so a watchdog fire there behaves similarly
+to the Linux `Restart=always` unit, not as a permanent stop. What it does
+change: `TerminateProcess` bypasses `report_status`, so a code-4 exit
+does not land in the `sc query`/Event Viewer "specific error" buckets
+described further down — it surfaces as a generic unexpected termination. If
+the agent logs `shutdown watcher unavailable` at boot (thread/fd
 exhaustion), a hard-exit handler is installed instead: the agent exits promptly
 on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.
 (A default signal disposition would be discarded by PID 1 in a container, so
@@ -3208,8 +3226,10 @@ silently ignored).
 
 **Crash-loop backstop (systemd).** The `yuzu-agent` unit sets `Restart=always` +
 `RestartSec=10`, but also `StartLimitIntervalSec=300` + `StartLimitBurst=5` (ADR-0021
-rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`;
-against a *permanently* wedged target (a dead NFS mount, a hung service query) that would
+rung 7.7a). A Guardian I/O worker wedged past its grace period triggers a `hard_exit()`
+(exit 3); the shutdown-teardown watchdog above (#2233 item 3) triggers the same
+`hard_exit()` mechanism at exit 4. Either way, against
+a *permanently* wedged target (a dead NFS mount, a hung service query) that would
 otherwise restart-loop every 10s forever. Instead, after 5 restarts within 300s systemd
 puts the unit into `failed` and stops retrying (the device goes dark rather than looping
 silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent`
@@ -3296,7 +3316,7 @@ Re-running `--install-service` is idempotent — it updates an existing registra
 
 > **Fleet-upgrade gotcha:** because `--install-service` always resets binPath to the bare minimal form, a silent/unattended re-run of the shipped installer (e.g. an SCCM/Intune package upgrade) that does **not** re-supply the original `/SERVER=`/`/TOKEN=`/`/NOTLS` parameters on that specific invocation will reconfigure the agent back to `localhost:50051` with TLS on — and because the SCM protocol now actually works (post-#1822), the service **starts successfully** against that wrong address instead of failing loudly the way it always did before this fix. The agent goes dark from the fleet with no installer-visible error. Always replay the same install-time parameters on every upgrade run, not just the first install.
 
-**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code — the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on — **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives.
+**If `sc start YuzuAgent` still fails after this fix:** check the log file first (`{app}\logs\yuzu-agent.log` via the installer; `<data-dir>\yuzu-agent.log` if you configured `--service` manually without `--log-file`) — it has the actual reason. `sc query YuzuAgent`/Event Viewer only distinguish which of three generic buckets: **specific error 1** covers three distinct causes that land on the same code — the agent failed to construct (bad `agent.db`, SQLite/config problem), **or** startup completed but the gRPC channel couldn't be built under the fail-closed TLS posture (missing/unreadable CA or client cert/key, #1303) — including, notably, the exact misconfiguration the fleet-upgrade gotcha above can introduce by silently flipping TLS back on — **or** a mid-life failure: the dispatch thread pool could not be re-created on a reconnect (host out of threads), which previously ended the service silently as a clean stop; **specific error 2** (the agent stopped on its own without a stop/shutdown request — unexpected, check the log for what `run()` returned early on); **specific error 3** (an unhandled exception reached the service dispatcher — check the log for the exception message). None of these three codes carry more detail on their own; the log file is where the actual cause lives. These SCM "specific error" buckets are a **separate namespace** from the agent's own process exit codes (1/3/4) described under *Stopping a wedged agent* above — they cover why `sc start` failed to bring the service up in the first place, not why a running service later stopped. In particular, a code-4 shutdown-watchdog exit (#2233 item 3) happens via `TerminateProcess`, which bypasses `report_status` entirely, so it does not land in any of these three buckets — Event Viewer shows it as a generic unexpected termination, not "specific error N".
 
 ### Server: sc.exe (native wrapper not yet available)
 

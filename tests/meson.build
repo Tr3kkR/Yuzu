@@ -155,6 +155,23 @@ abi4_cpp_wrapper_fixture_plugin = shared_library(
   install: false,
 )
 
+# ── Test fixture: deterministic argv-echo binary (BR-006 exec-verify test) ───
+# test_content_dist_exec_seam.cpp's real end-to-end B6 exec-verify test used
+# to stage a copy of the host's /bin/echo and assert it echoed its argv back.
+# That broke on a CI runner whose /bin/echo turned out to be a GNU coreutils
+# multi-call binary: coreutils dispatches by inspecting /proc/self/exe, and
+# B6's fd-based execveat(fd, "", ..., AT_EMPTY_PATH) exec presents
+# /proc/self/exe as an fd-numbered path rather than a real one, so coreutils
+# tried to dispatch to a utility literally named after the fd number and
+# failed. A standalone, single-purpose binary has no argv[0]/exe-path-
+# sensitive dispatch to break. No dependencies at all -- deliberately plain,
+# so it stays a stable fixture regardless of what the rest of the tree links.
+echo_argv_fixture = executable(
+  'echo_argv_fixture',
+  files('fixtures/echo_argv_fixture.cpp'),
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -244,6 +261,7 @@ agent_test_exe = executable(
     'unit/test_thread_pool.cpp',
     'unit/test_shutdown_pipe.cpp',
     'unit/test_hard_exit.cpp',
+    'unit/test_shutdown_deadline_guard.cpp',
     'unit/test_spark_disk.cpp',
     'unit/test_spark_engine.cpp',
     'unit/test_spark_key_rule_index.cpp',
@@ -327,6 +345,20 @@ agent_test_exe = executable(
     'unit/test_users_posix_actions.cpp',      # Wave 2 WP-A remediation: real users.dylib/.so driven
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_script_exec_actions.cpp',       # Wave 5 PR5.1: script_exec exec/bash dispatch via LocalDispatcher (POSIX-only TU guard)
+    'unit/test_script_exec_win_actions.cpp',   # Wave 5 PR5.1 round-3 remediation (BR3-003): script_exec
+                                                # exec/powershell dispatch via LocalDispatcher, real
+                                                # script_exec.dll (Windows-only TU guard; proves BR3-001's
+                                                # windows_system_directory() PowerShell resolution end to end)
+    'unit/test_script_exec_parsers.cpp',       # Wave 5 PR5.1: pure argv-assembly / PATH-resolution helpers (no I/O)
+    'unit/test_content_dist_actions.cpp',      # Wave 5 PR5.1: content_dist dispatch gates via LocalDispatcher (POSIX-only TU guard)
+    'unit/test_content_dist_exec_parsers.cpp', # Wave 5 PR5.1: pure SubprocessResult -> wire mapping + options builder (no I/O)
+    'unit/test_content_dist_exec_seam.cpp',    # Wave 5 PR5.1 round-2 remediation (BR-006): real staged-file
+                                                # execute_verified_payload() end to end (real chmod, real
+                                                # runner spawn, no KV/g_ctx wall; POSIX-only TU guard)
+    'unit/test_content_dist_exec_seam_win.cpp', # Wave 5 PR5.1 round-3 remediation (BR3-003): Windows twin of
+                                                # the above -- real staged/copied executable payload, real
+                                                # runner spawn (Windows-only TU guard)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
     'unit/test_quarantine_parsers.cpp',       # Wave 2 WP-F: pure netsh/iptables/pfctl output parsers
     'unit/test_quarantine_argv.cpp',          # Wave 2 WP-F remediation: pure mutating-argv construction (FN-03)
@@ -420,6 +452,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/quarantine/src'),    # quarantine_parsers.hpp (Wave 2 WP-F)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
+    include_directories('../agents/plugins/script_exec/src'),   # script_exec_parsers.hpp (Wave 5 PR5.1 pure helpers)
     include_directories('../agents/plugins/network_actions/src'), # network_actions_parsers.hpp (Wave 2 WP-D)
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
@@ -475,14 +508,21 @@ agent_test_exe = executable(
   # network_config_plugin_lib (agents/plugins/network_config/meson.build):
   # test_network_config_local_dispatcher.cpp loads the real network_config
   # plugin by path for the identical reason (PKG-NC).
+  # content_dist_plugin_lib / script_exec_plugin_lib: same reasoning, for
+  # test_content_dist_actions.cpp / test_script_exec_actions.cpp.
+  # echo_argv_fixture: test_content_dist_exec_seam.cpp's real B6 exec-verify
+  # test stages and execs this fixture binary by path -- without it in
+  # link_depends, a fresh build could leave the test executable built before
+  # the fixture exists (build-ci B3's lesson: a fixture with no consumer in
+  # the meson graph can silently stop building unnoticed).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
-                installed_apps_plugin_lib, msi_packages_plugin_lib,
+                installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib,
+                content_dist_plugin_lib, script_exec_plugin_lib, echo_argv_fixture,
                 software_actions_plugin_lib, license_scan_plugin_lib],
-                installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -761,6 +801,7 @@ if build_server
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
       'unit/server/test_session_store.cpp',
+      'unit/server/test_session_dbclock.cpp',
       'unit/server/test_auth_session_store.cpp',
       'unit/server/test_clock_drift_monitor.cpp',
       'unit/server/test_dispatch_chokepoint.cpp',
@@ -1621,8 +1662,31 @@ if build_server
   test('server pg unit tests shard K', server_test_exe,
        args: ['[pg][policy_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][instruction_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][ca_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][device_token]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][tag_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][bundle]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][pki]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][offload_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][webhook_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar],[pg][baseline_store]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 95)
+  # server pg unit tests shard L — carved from shard C 2026-08-30 (ADR-0065
+  # instruction-cluster migration, PR 5): seven tags newly heavy after
+  # ExecutionTracker/ApprovalManager/ScheduleEngine moved to Postgres and
+  # ~200 formerly non-pg cases across their dependent test files became
+  # [pg]. Measured live (this box, warm cache, YUZU_TEST_POSTGRES_DSN set):
+  # shard C's old filter matched 584 cases / 116.8s; the exact-tag-plus-
+  # exclusion-suffix scoped shard L filter below matches 202 cases / 14.3s,
+  # the new C filter (same additions to its own exclusion list) matches
+  # 382 cases / 101.6s — an exact partition (202 + 382 = 584). The
+  # exclusion suffix is shard C's own (same one shard K reuses) rather than
+  # a bespoke list: [rest_api_t2] is a whole-file tag in test_rest_api_t2.cpp
+  # also carried by 9 device_token/software_deployment cases already
+  # claimed by shard K, and [events] is shared with 5 discovery-tagged
+  # cases already claimed by shard J's [pg][discovery] positive branch —
+  # reusing the identical suffix here excludes exactly those already-homed
+  # cases from shard L instead of duplicating them, which a naive
+  # `[pg][tag]` OR-list without the suffix would have done (verified: the
+  # naive form matched 258, not 202). A DSN-less run of L exits 0 (some
+  # cases assert before reaching a PG-requiring line), matching shard C/K's
+  # own precedent.
+  test('server pg unit tests shard L', server_test_exe,
+       args: ['[pg][approval_manager]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_tracker]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][execution_statistics]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule_engine]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][schedule]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][events]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store],[pg][rest_api_t2]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]'],
+       suite: ['server', 'server-pg'], timeout: 700, priority: 92)
   test('server pg unit tests shard C', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]'],
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]~[policy_store]~[instruction_store]~[ca_store]~[device_token]~[tag_store]~[bundle]~[pki]~[offload_store]~[webhook_store]~[baseline_store]~[approval_manager]~[execution_tracker]~[execution_statistics]~[schedule_engine]~[schedule]~[events]~[rest_api_t2]'],
        suite: ['server', 'server-pg'], timeout: 700, priority: 100)
 
   # #3443 Phase 2: PG portability smoke subset - runs INSTEAD of the 11 shards
