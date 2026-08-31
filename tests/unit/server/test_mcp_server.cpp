@@ -6118,24 +6118,14 @@ TEST_CASE("MCP #3685: operator-tier execute_instruction refuses with "
 
 TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8 pre-mint site "
           "when the classifier is unwired — no ticket minted",
-          "[mcp][integration][execute][3685][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-3685-clsunavail-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(db.path.string().c_str(), &raw) == SQLITE_OK);
-    // #3685 fix round (adversarial review C1): TempDbFile owns the FILE, not
-    // the open handle — ApprovalManager is non-owning (~ApprovalManager() =
-    // default), so a REQUIRE/CHECK failure between here and a trailing
-    // close used to leak `raw`. Same local-Guard shape already used
-    // elsewhere in this file for the db_path-direct sites (e.g. line ~7326).
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{raw};
-    yuzu::server::ApprovalManager appr(raw);
-    appr.create_tables();
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // ADR-0065 rebase: ApprovalManager moved SQLite -> Postgres; this test's
+    // sqlite3_open/TempDbFile/Guard scaffolding is replaced by the shared PG
+    // fixture (ApprovalManagerPg self-provisions + migrates an ephemeral DB,
+    // SKIPs without YUZU_TEST_POSTGRES_DSN) — same pattern as the 100+ other
+    // ApprovalManager/ExecutionTracker fixtures in this file.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
 
     McpTestServer ts;
     ts.classify_fn_for_test = {};
@@ -7153,21 +7143,11 @@ TEST_CASE("MCP #3685: Destructive + explicit valid agent_ids dispatches normally
 
 TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-mint — NO approval "
           "ticket created",
-          "[mcp][integration][execute][3685][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-3685-premint-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(db.path.string().c_str(), &raw) == SQLITE_OK);
-    // #3685 fix round (adversarial review C1): see the identical Guard note
-    // on the previous #3685 test above.
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{raw};
-    yuzu::server::ApprovalManager appr(raw);
-    appr.create_tables();
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // ADR-0065 rebase: see the identical ApprovalManagerPg note on the first
+    // #3685 test above.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
 
     McpTestServer ts;
     ts.classify_fn_for_test = destructive_classify_stub;
@@ -7198,21 +7178,11 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
 TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive ticket is refused on "
           "recall WITHOUT being consumed — proves the C8 gate runs before consume_ticket, not "
           "just before mint",
-          "[mcp][integration][execute][3685][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-3685-preseed-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(db.path.string().c_str(), &raw) == SQLITE_OK);
-    // #3685 fix round (adversarial review C1): see the identical Guard note
-    // on the first #3685 test above.
-    struct Guard {
-        sqlite3* h;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-        }
-    } guard{raw};
-    yuzu::server::ApprovalManager appr(raw);
-    appr.create_tables();
+          "[mcp][pg][integration][execute][3685][approval]") {
+    // ADR-0065 rebase: see the identical ApprovalManagerPg note on the first
+    // #3685 test above.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
 
     McpTestServer ts;
     ts.classify_fn_for_test = destructive_classify_stub;
@@ -7273,26 +7243,13 @@ TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive tick
 
 TEST_CASE("MCP #3685: operator-tier Destructive refusal happens BEFORE execution-row creation and "
           "dispatch",
-          "[mcp][integration][execute][3685]") {
-    auto db_path = yuzu::test::unique_temp_path("test-mcp-3685-exec-tracker-");
-    std::filesystem::remove(db_path);
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &db) == SQLITE_OK);
-    struct Guard {
-        sqlite3* h;
-        std::filesystem::path p;
-        ~Guard() {
-            if (h)
-                sqlite3_close(h);
-            std::error_code ec;
-            std::filesystem::remove(p, ec);
-            std::filesystem::remove(p.string() + "-wal", ec);
-            std::filesystem::remove(p.string() + "-shm", ec);
-        }
-    } guard{db, db_path};
-
-    yuzu::server::ExecutionTracker tracker(db);
-    tracker.create_tables();
+          "[mcp][pg][integration][execute][3685]") {
+    // ADR-0065 rebase: ExecutionTracker moved SQLite -> Postgres; same
+    // ExecutionTrackerPg fixture the other ExecutionTracker tests in this
+    // file already use (e.g. line ~5236) replaces the sqlite3_open/Guard
+    // scaffolding.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
 
     McpTestServer ts;
     ts.classify_fn_for_test = destructive_classify_stub;
