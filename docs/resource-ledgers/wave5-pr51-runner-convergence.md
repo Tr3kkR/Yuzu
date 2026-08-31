@@ -42,3 +42,27 @@ early exit, and exception unwind) releases exactly the listed resource.
 - **Platform note:** this code path is Windows-only (`#else // _WIN32` block,
   `agents/core/src/subprocess_runner.cpp`); verified by compile only on this
   host (macOS) — no Windows runtime evidence was collected for this fix.
+
+---
+
+## Known limitations
+
+### `no_window=true` makes `soft_terminate_grace` ineffective on Windows (BR-006)
+- **Sites:** `content_dist_exec_parsers.hpp::build_execution_options` (30s
+  grace) and `script_exec_plugin.cpp`'s Windows leg (10s grace), the only two
+  callers that set both `no_window=true` and a nonzero
+  `soft_terminate_grace`.
+- **Cause:** `CREATE_NO_WINDOW` gives the child no console at all (not merely
+  a hidden window) — Microsoft's own documented contract for
+  `GenerateConsoleCtrlEvent` requires the target process group to share a
+  console with the caller, which a `no_window=true` child never has. Every
+  deadline/cancel against these two call sites therefore skips CTRL_BREAK
+  delivery entirely and goes straight to `TerminateJobObject`, silently
+  discarding the configured grace.
+- **Status:** confirmed by the documented Win32 API contract (adversarial
+  review, HIGH); not runtime-verified — no Windows host available to this
+  branch's authoring session. No in-scope fix: a soft-unwind channel that
+  works against a console-less child is a separate, larger design (a
+  dedicated IPC/event mechanism), not an extension of CTRL_BREAK delivery.
+  Documented at `SubprocessOptions::no_window`'s doc comment
+  (`subprocess_runner.hpp`) and both call sites above.

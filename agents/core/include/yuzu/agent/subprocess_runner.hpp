@@ -298,6 +298,24 @@ struct SubprocessOptions {
     // its console, and xplat-A2's existing caveat (GenerateConsoleCtrlEvent
     // is already unreliable for a console-less agent SERVICE) is unchanged
     // by this flag either way.
+    // BR-006 (adversarial review, HIGH -- corrects the paragraph above,
+    // which is WRONG about the Win32 contract and must not be re-derived
+    // from): CREATE_NO_WINDOW does not merely hide the new console WINDOW's
+    // visibility -- per Microsoft's own documented contract, a process
+    // created with this flag gets NO CONSOLE AT ALL (it is not attached to
+    // any console, new or inherited). GenerateConsoleCtrlEvent's contract
+    // requires the target process group to SHARE a console with the
+    // caller; a no_window=true child has none, so CTRL_BREAK_EVENT can
+    // never reach it. Concretely: for any caller that sets BOTH
+    // no_window=true AND a nonzero soft_terminate_grace, the "soft"
+    // termination step is a guaranteed no-op on Windows -- every
+    // deadline/cancel goes straight to TerminateJobObject, silently
+    // skipping the configured grace. This is a KNOWN LIMITATION with no
+    // in-scope fix (a genuinely separate soft-IPC channel compatible with a
+    // no-console child would be a new, separately-designed mechanism, not
+    // an extension of CTRL_BREAK delivery) -- see the call-site comments in
+    // content_dist_exec_parsers.hpp and script_exec_plugin.cpp, the two
+    // callers that combine both fields today.
     bool no_window = false;
 
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --

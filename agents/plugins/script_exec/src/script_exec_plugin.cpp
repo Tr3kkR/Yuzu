@@ -359,6 +359,19 @@ int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& ar
     // windows_runner_overrides() (script_exec_parsers.hpp) so the pairing of
     // these two Windows-only flags is testable from a pure, OS-call-free
     // header even though this call site itself only compiles on Windows.
+    //
+    // BR-006 (adversarial review, HIGH): KNOWN LIMITATION -- win_overrides
+    // defaults no_window=true (script_exec_parsers.hpp), which combined
+    // with the nonzero opts.soft_terminate_grace set above makes that grace
+    // INEFFECTIVE on Windows. This is a STRICTER version of the xplat-A2
+    // caveat already noted at the soft_terminate_grace assignment (which
+    // only covers the console-less SERVICE deployment shape) -- a
+    // no_window=true child has no console AT ALL regardless of deployment
+    // shape, so GenerateConsoleCtrlEvent can never reach it even for an
+    // interactively run agent. Every deadline/cancel goes straight to
+    // TerminateJobObject, silently skipping the configured 10s grace. See
+    // SubprocessOptions::no_window's doc comment (subprocess_runner.hpp)
+    // for the full Win32 contract. No in-scope fix -- see that comment.
     auto win_overrides = yuzu::script_exec::windows_runner_overrides();
     opts.inherit_parent_env = win_overrides.inherit_parent_env;
     opts.no_window = win_overrides.no_window;

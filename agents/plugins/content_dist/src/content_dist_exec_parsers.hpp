@@ -245,6 +245,17 @@ namespace yuzu::content_dist::exec {
     // bit for a caller with no pre-existing behaviour to preserve) silently
     // dropped it. Windows-only significance -- see
     // SubprocessOptions::no_window's doc comment.
+    //
+    // BR-006 (adversarial review, HIGH): KNOWN LIMITATION -- on Windows,
+    // combining this with the nonzero opts.soft_terminate_grace set above
+    // makes the grace INEFFECTIVE. CREATE_NO_WINDOW gives the child no
+    // console at all, and GenerateConsoleCtrlEvent (the runner's CTRL_BREAK
+    // soft-termination step) can only reach a process group that shares a
+    // console with the caller -- so a deadline/cancel against a staged
+    // installer on Windows goes straight to TerminateJobObject, skipping
+    // the configured 30s grace entirely. See SubprocessOptions::no_window's
+    // doc comment (subprocess_runner.hpp) for the full Win32 contract this
+    // is derived from. No in-scope fix -- see that comment.
     opts.no_window = is_windows;
 
     return opts;
