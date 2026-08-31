@@ -181,18 +181,16 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
         }
     }
 
-    // Compute proof age. A default-constructed `mfa_verified_at`
-    // (time_since_epoch() == 0) signals "no MFA proof on this
-    // session yet" — treat as infinitely stale.
-    const auto now = std::chrono::system_clock::now();
-    // Wall-clock (system_clock) since HA WS-1/1a (durable sessions, ADR-2002
-    // §4). A proof timestamped AFTER `now` — a backward clock step on the DB
-    // primary / issuing replica — is treated as NO proof: fail CLOSED, never a
-    // spurious-fresh window a backward step would otherwise hold open. This is
-    // the wall-clock replacement for the monotonic-clock resistance the former
-    // steady_clock gave.
-    const bool no_proof = session.mfa_verified_at.time_since_epoch().count() == 0 ||
-                          session.mfa_verified_at > now;
+    // Compute proof age against the LOCAL MONOTONIC anchor derived at
+    // cache-populate from the DB clock (ADR-2002 §4 DB-clock authority, WS-1/1a):
+    // `steady_mfa_verified` is set to `steady_now - (db_now - mfa_verified_ms)` in
+    // derive_session_deadlines, immune to local wall skew/steps. Its {} sentinel
+    // means "no usable MFA proof" — derive sets it {} for BOTH an absent proof AND
+    // a FUTURE-DATED proof (`mfa_verified_ms > db_now`, a backward DB step below
+    // the proof instant → fail CLOSED, never a spurious-fresh window). So the
+    // future-dated rejection is already applied; this just reads the sentinel.
+    const auto now = std::chrono::steady_clock::now();
+    const bool no_proof = session.steady_mfa_verified.time_since_epoch().count() == 0;
 
     // OIDC sessions whose IdP did not attest MFA carry no seeded proof
     // (no `amr` → `/auth/callback` never set `mfa_verified_at`). Whether
@@ -220,7 +218,7 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 
     const auto age = no_proof ? std::chrono::seconds::max()
                               : std::chrono::duration_cast<std::chrono::seconds>(
-                                    now - session.mfa_verified_at);
+                                    now - session.steady_mfa_verified);
     // Hard wall-clock ceiling on the step-up window (ADR-2002 §4 mitigation (b),
     // parity with JIT elevation's kMaxElevationWindow). The effective freshness
     // window is min(configured window_secs, kMaxMfaStepUpWindowSecs): a proof
@@ -234,7 +232,17 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
     constexpr std::int64_t kMaxMfaStepUpWindowSecs = 24 * 3600; // 24h backstop
     const auto effective_window =
         std::chrono::seconds((std::min<std::int64_t>)(window_secs, kMaxMfaStepUpWindowSecs));
-    if (!no_proof && age <= effective_window) {
+    // Suspend backstop (parity with is_elevated / validate, ADR-2002 §4 / design-
+    // review H5 + LOW-1): the freshness age above is on steady_clock, which pauses
+    // across host/VM suspend — so a stale proof could read fresh after a resume.
+    // Also require the ABSOLUTE (wall) proof age not be grossly past the window,
+    // consulted only with the generous auth::kWallSanitySkew slack so a merely
+    // clock-SKEWED (non-suspended) replica is never affected (only a long suspend,
+    // where wall advanced far past the window while steady froze, trips it).
+    const auto wall_age = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now() - session.mfa_verified_at);
+    const bool wall_stale = wall_age > effective_window + auth::kWallSanitySkew;
+    if (!no_proof && age <= effective_window && !wall_stale) {
         return true;
     }
 

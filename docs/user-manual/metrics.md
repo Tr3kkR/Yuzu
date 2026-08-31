@@ -115,6 +115,19 @@ the total. Four more
 (#3072)" for the honest split between what the login-time signals and the
 deprovision-time tripwire can each attribute.
 
+### Durable session-store metrics (HA WS-1/1a, ADR-2002 §4)
+
+Operator sessions are durable Postgres rows (`SessionStore`), authored and
+adjudicated against the DB clock (Postgres `now()`, #3715). All four families are
+pre-seeded to 0 at boot so `increase()` alerting is meaningful.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_auth_session_store_degrade_total{op}` | counter | A genuine Postgres read/write failure on the durable-session auth hot path, labelled by `op` (`validate`/`create`/`touch`/`generation_refresh`/`reap`/`invalidate`/`invalidate_user`/`mark_mfa`/`elevate`). A `validate` degrade for an uncached token fails the request **closed** (401); `create`/`elevate`/`mark_mfa`/`invalidate*` fail the privileged op closed; `generation_refresh`/`touch`/`reap` are best-effort. Operational (ordinary PG contention/failover), not a security signal — correlate with `yuzu_pg_acquire_*` and the paired `spdlog` line. |
+| `yuzu_auth_session_reap_total` | counter, no labels | Expired durable-session rows deleted by the ~15-minute clock-guarded retention sweep — the storage-limitation evidence artifact; belongs alongside the `Yuzu*Retention*` series on a retention dashboard. |
+| `yuzu_auth_session_reap_clock_anomaly_total` | counter, no labels | The **DB-PRIMARY** clock-integrity monitor (ADR-2002 §4 mitigation (a)): a reap pass was declined because Postgres `now()` (read in-SQL — the same clock that authors `expires_at`) was implausibly ahead of/behind the persisted anchor, i.e. a backward/forward DB-primary clock step. A backward step is what would un-expire sessions / extend elevation & MFA windows toward their authored max. `YuzuSessionReapClockAnomaly` alerts on it — investigate the **database primary's** clock first. |
+| `yuzu_auth_local_clock_backward_total` | counter, no labels | The **LOCAL host-clock** drift monitor (#3715): a replica's own wall clock was observed falling behind monotonic time. DISTINCT from the reap series — under DB-clock authority session adjudication no longer rides this host's wall clock, so a local wobble is a host-health signal, NOT a session-integrity one (do not conflate the two during a clock incident). Observe-only today; no dedicated alert. |
+
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_scim_deprovision_role_refused_with_active_link_total` | counter, no labels | D1: a deprovision was refused (the slug's role is not `user`, per the #2021 provenance guard) for a slug with an active linked federated identity — that identity's tokens were deliberately **not** auto-revoked (auto-revoking on an IdP's unilateral say-so would reopen the #2021 hazard). A human must terminate the linked identity's credentials manually. |

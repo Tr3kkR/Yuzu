@@ -47,6 +47,15 @@ constexpr std::int64_t kSessionGenRefreshMs = 1000;
 // cannot ride a stale cache up to its 8h absolute expiry during a PG brownout.
 constexpr std::int64_t kSessionGenStaleServeBoundMs = 30'000; // 30s
 
+// Defense-in-depth authored-width ceiling on a durable session's base lifetime
+// (adversarial-review K1 / unhappy-path UP-12), mirroring is_elevated's
+// kMaxElevationWindow. The authored lifetime is a fixed 8h (kSessionDuration) at
+// every mint site; this bound is generous (7d) so every legitimate session passes
+// while a corrupted far-future expires_at is REJECTED in derive_session_deadlines.
+// Per the clock-guarded-retention rule's "per-store bound must exceed the store's
+// own max legitimate horizon": 7d >> 8h. Not copied from another store's constant.
+constexpr std::int64_t kMaxSessionLifetimeMs = 7LL * 24 * 3600 * 1000;
+
 std::int64_t steady_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -449,7 +458,96 @@ bool AuthManager::is_session_store_ok() const noexcept {
     return session_store_ == nullptr || session_store_->is_open();
 }
 
-Session AuthManager::session_from_row(const yuzu::server::SessionRow& row) {
+bool AuthManager::derive_session_deadlines(Session& s, std::int64_t created_ms,
+                                           std::int64_t expires_ms, std::int64_t last_activity_ms,
+                                           std::int64_t mfa_verified_ms,
+                                           std::int64_t elevated_until_ms,
+                                           std::int64_t elevation_issued_ms, std::int64_t now_ms) {
+    using namespace std::chrono;
+    // Authored ABSOLUTE wall instants — display/audit and the suspend backstop
+    // (is_elevated / validate consult these with a generous slack). A stored 0
+    // (no proof / not elevated) maps to the epoch sentinel.
+    s.expires_at = tp_from_ms(expires_ms);
+    s.mfa_verified_at = tp_from_ms(mfa_verified_ms);
+    s.elevated_until = tp_from_ms(elevated_until_ms);
+    s.elevation_issued_at = tp_from_ms(elevation_issued_ms);
+    s.last_activity_at = tp_from_ms(last_activity_ms);
+    s.last_activity_persisted_at = s.last_activity_at;
+
+    // Fail-closed sentinels FIRST, so an early return below leaves EVERY steady
+    // field in the defined {} state — even when re-deriving a LIVE cached session
+    // (mark_mfa / elevate re-derive `it->second` in place), where a partially-set
+    // false path would otherwise leave a stale steady_elevated_until/mfa live
+    // (adversarial-review K2). A false return means "do not honor / do not cache".
+    s.steady_expires = {};
+    s.steady_elevated_until = {};
+    s.steady_last_activity = {};
+    s.steady_mfa_verified = {};
+    s.steady_last_persisted = {};
+
+    const auto steady = steady_clock::now();
+    // Base-lifetime authored-width ceiling (adversarial-review K1 / unhappy-path
+    // UP-12, mirroring the elevation §4(b) width REJECT below): a corrupted
+    // far-future `expires_at` — the same partial-row-corruption class §4(b)
+    // defends `elevated_until` against, and which the wall backstop cannot catch
+    // because it is anchored to that same corrupted instant — is REJECTED, not
+    // honored for its claimed width. kMaxSessionLifetime is generous vs the fixed
+    // 8h authored default (kSessionDuration), so every legitimate session passes.
+    if (expires_ms - created_ms > kMaxSessionLifetimeMs)
+        return false;
+    // Base lifetime. Clamp `now_ms` up to created_at so a backward DB step (now
+    // below creation) cannot inflate the remaining past the authored lifetime
+    // (H2); a signed remaining <= 0 means already expired at populate — fail
+    // closed (H4). The caller must not cache/honor a false return.
+    const std::int64_t rem_session = expires_ms - std::max(now_ms, created_ms);
+    if (rem_session <= 0)
+        return false;
+    s.steady_expires = steady + milliseconds(rem_session);
+
+    // Idle slide anchor: age since last activity in the DB domain, clamped >= 0.
+    // A future-dated last_activity (a backward DB step below the last
+    // GREATEST-clamped touch) clamps idle_age to 0 (treated active-now) — the
+    // deliberate availability-preserving choice (K3): idle is defense-in-depth
+    // UNDER the absolute expiry, which steady_expires + the ceiling above bound.
+    const std::int64_t idle_age = std::max<std::int64_t>(0, now_ms - last_activity_ms);
+    s.steady_last_activity = steady - milliseconds(idle_age);
+    // The durable-touch throttle starts from how stale the durable row already is
+    // (same age), so the first post-populate touch persists iff the row is older
+    // than the persist granularity. Steady-domain — never wall (CDX-P1-001).
+    s.steady_last_persisted = s.steady_last_activity;
+
+    // Elevation. {} (not elevated) unless ALL hold:
+    //   - a grant is set and is not future-issued (now < issued = a backward step
+    //     below the grant instant → treat as not elevated, fail closed);
+    //   - the AUTHORED width `elevated_until - elevation_issued` is within the hard
+    //     kMaxElevationWindow ceiling — a wider window (a forward-corrupted
+    //     elevated_until, or an epoch-anchored enormous one) is REJECTED outright,
+    //     the ADR §4(b) defense-in-depth bound (NOT clamped — a corrupted grant
+    //     confers zero admin, not a capped 24h);
+    //   - the remaining, computed against `max(now, issued)`, is positive — the H2
+    //     clamp: a backward `now_ms` (below issued) cannot inflate the LIVED window
+    //     past its authored width, because remaining is bounded by the width.
+    s.steady_elevated_until = {};
+    if (elevated_until_ms != 0 && now_ms >= elevation_issued_ms) {
+        const std::int64_t kMaxElevMs = duration_cast<milliseconds>(kMaxElevationWindow).count();
+        const std::int64_t width = elevated_until_ms - elevation_issued_ms;
+        if (width > 0 && width <= kMaxElevMs) {
+            const std::int64_t rem_elev = elevated_until_ms - std::max(now_ms, elevation_issued_ms);
+            if (rem_elev > 0)
+                s.steady_elevated_until = steady + milliseconds(rem_elev);
+        }
+    }
+
+    // MFA proof. {} unless a proof exists and is not future-dated (a proof stamped
+    // after `now_ms` is a backward step → treated as absent, matching the legacy
+    // guard). mfa_step_up ages against this steady anchor.
+    s.steady_mfa_verified = {};
+    if (mfa_verified_ms != 0 && mfa_verified_ms <= now_ms)
+        s.steady_mfa_verified = steady - milliseconds(now_ms - mfa_verified_ms);
+    return true;
+}
+
+Session AuthManager::session_from_row(const yuzu::server::SessionRow& row, std::int64_t db_now_ms) {
     Session s;
     s.username = row.username;
     s.display_name = row.display_name;
@@ -459,41 +557,13 @@ Session AuthManager::session_from_row(const yuzu::server::SessionRow& row) {
     s.token_scope_service = row.token_scope_service;
     s.mcp_tier = row.mcp_tier;
     s.principal_kind = row.principal_kind.empty() ? "human" : row.principal_kind;
-    // ms→time_point; a stored 0 (no proof / not elevated) maps to the epoch
-    // sentinel that is_elevated()/mfa_step_up read as "absent" (auth.hpp).
-    s.expires_at = tp_from_ms(row.expires_at_ms);
-    s.mfa_verified_at = tp_from_ms(row.mfa_verified_ms);
-    s.elevated_until = tp_from_ms(row.elevated_until_ms);
-    s.elevation_issued_at = tp_from_ms(row.elevation_issued_ms);
-    s.last_activity_at = tp_from_ms(row.last_activity_ms);
-    s.last_activity_persisted_at = s.last_activity_at;
+    // Adjudicate against the DB clock at read time and derive the local monotonic
+    // deadlines. A false return (already expired at db_now) leaves the steady
+    // sentinels {}; callers check that where it matters (validate rejects).
+    (void)derive_session_deadlines(s, row.created_at_ms, row.expires_at_ms, row.last_activity_ms,
+                                   row.mfa_verified_ms, row.elevated_until_ms,
+                                   row.elevation_issued_ms, db_now_ms);
     return s;
-}
-
-yuzu::server::SessionRow AuthManager::row_from_session(const std::string& raw_token,
-                                                       const Session& s) const {
-    yuzu::server::SessionRow row;
-    row.token_hash = hash_token(raw_token);
-    row.username = s.username;
-    row.display_name = s.display_name;
-    row.role = role_to_string(s.role);
-    row.auth_source = s.auth_source;
-    row.oidc_sub = s.oidc_sub;
-    row.token_scope_service = s.token_scope_service;
-    row.mcp_tier = s.mcp_tier;
-    row.principal_kind = s.principal_kind;
-    // created_at anchor — Session carries no separate creation field; every
-    // creation site sets expires_at = created + kSessionDuration, so recover it
-    // by subtraction. Informational column only (validation keys on expires_at).
-    row.expires_at_ms = ms_from_tp(s.expires_at);
-    row.created_at_ms =
-        row.expires_at_ms -
-        std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
-    row.last_activity_ms = ms_from_tp(s.last_activity_at);
-    row.mfa_verified_ms = ms_from_tp(s.mfa_verified_at);
-    row.elevated_until_ms = ms_from_tp(s.elevated_until);
-    row.elevation_issued_ms = ms_from_tp(s.elevation_issued_at);
-    return row;
 }
 
 bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
@@ -509,17 +579,44 @@ bool AuthManager::wipe_user_sessions_durable(const std::string& username) {
     return true;
 }
 
-bool AuthManager::persist_new_session(const std::string& raw_token, const Session& s) {
+bool AuthManager::persist_new_session(const std::string& raw_token,
+                                      const yuzu::server::SessionWriteParams& params) {
+    // The cached Session's non-time fields come straight from params; its
+    // adjudication deadlines are derived from the AUTHORED times (DB clock for a
+    // durable store; this host's wall clock for the legacy path) so the cache
+    // matches the durable row exactly.
+    Session s;
+    s.username = params.username;
+    s.display_name = params.display_name;
+    s.role = string_to_role(params.role);
+    s.auth_source = params.auth_source;
+    s.oidc_sub = params.oidc_sub;
+    s.token_scope_service = params.token_scope_service;
+    s.mcp_tier = params.mcp_tier;
+    s.principal_kind = params.principal_kind.empty() ? "human" : params.principal_kind;
+
     std::string key = raw_token;
     if (session_store_) {
-        auto row = row_from_session(raw_token, s);
-        key = row.token_hash;
-        if (auto r = session_store_->create(row); !r) {
+        auto p = params;
+        p.token_hash = hash_token(raw_token);
+        key = p.token_hash;
+        auto r = session_store_->create(p);
+        if (!r) {
             spdlog::error("AuthManager: durable session create failed for '{}': {}", s.username,
                           r.error().message);
             note_session_store_degrade("create");
             return false; // fail closed — login not honored (ADR-0007)
         }
+        const auto& a = *r;
+        derive_session_deadlines(s, a.created_at_ms, a.expires_at_ms, a.last_activity_ms,
+                                 a.mfa_verified_ms, a.elevated_until_ms, a.elevation_issued_ms,
+                                 a.db_now_ms);
+    } else {
+        // Legacy no-store path: this host's wall clock IS the authority.
+        const std::int64_t now_ms = wall_now_ms();
+        const std::int64_t mfa_ms = params.mfa_verified_now ? now_ms : params.mfa_verified_ms_abs;
+        derive_session_deadlines(s, now_ms, now_ms + params.session_lifetime_ms, now_ms, mfa_ms,
+                                 /*elevated_until*/ 0, /*elevation_issued*/ 0, now_ms);
     }
     std::unique_lock lock(mu_);
     sessions_[key] = s;
@@ -635,22 +732,22 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     }
 
     auto token = generate_session_token();
-    Session s;
-    s.username = username;
-    s.display_name = username; // local auth: username IS the human label
-    s.role = it->second.role;
-    s.expires_at = std::chrono::system_clock::now() + kSessionDuration;
-    s.auth_source = "local";
-    s.last_activity_at = std::chrono::system_clock::now();
-    s.last_activity_persisted_at = s.last_activity_at;
+    yuzu::server::SessionWriteParams params;
+    params.username = username;
+    params.display_name = username; // local auth: username IS the human label
+    params.role = role_to_string(it->second.role);
+    params.auth_source = "local";
+    params.session_lifetime_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
+    // password login carries no MFA proof yet — a step-up stamps it later.
     // Release the map lock before the write-through: persist_new_session does
     // durable PG I/O and re-takes mu_ to cache (non-recursive) — never hold mu_
-    // across it. `s` and its captured fields stay valid after unlock.
+    // across it. `params` stays valid after unlock.
     lock.unlock();
-    if (!persist_new_session(token, s))
+    if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
 
-    spdlog::info("User '{}' authenticated (role={})", username, role_to_string(s.role));
+    spdlog::info("User '{}' authenticated (role={})", username, params.role);
     if (metrics_) {
         const auto elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -719,18 +816,15 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
 std::string AuthManager::create_local_session(const std::string& username, Role role,
                                               bool mfa_verified) {
     auto token = generate_session_token();
-    Session s;
-    s.username = username;
-    s.display_name = username; // local auth: username IS the human label
-    s.role = role;
-    s.expires_at = std::chrono::system_clock::now() + kSessionDuration;
-    s.auth_source = "local";
-    s.last_activity_at = std::chrono::system_clock::now();
-    s.last_activity_persisted_at = s.last_activity_at;
-    if (mfa_verified) {
-        s.mfa_verified_at = std::chrono::system_clock::now();
-    }
-    if (!persist_new_session(token, s)) {
+    yuzu::server::SessionWriteParams params;
+    params.username = username;
+    params.display_name = username; // local auth: username IS the human label
+    params.role = role_to_string(role);
+    params.auth_source = "local";
+    params.session_lifetime_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
+    params.mfa_verified_now = mfa_verified; // local step-up → stamp now() in the store
+    if (!persist_new_session(token, params)) {
         // Durable-write failure (store configured but unreachable) → no session.
         // An empty token degrades to "not authenticated" at the caller's cookie
         // set / next validate (fail-safe), never a false success (ADR-0007).
@@ -756,22 +850,24 @@ bool AuthManager::mark_session_mfa_verified(const std::string& token) {
         return false;
     if (session_store_) {
         const std::string key = hash_token(token);
-        const std::int64_t now_ms = wall_now_ms();
-        // Durable write FIRST (bumps the generation → every replica's cache
-        // drops the stale copy on its next refresh). The store's `existed` bool
-        // is authoritative — the session may live only on another replica.
-        auto r = session_store_->mark_mfa(key, now_ms);
+        // Durable write FIRST (bumps the generation → every replica's cache drops
+        // the stale copy on its next refresh); the store authors mfa_verified =
+        // now() and RETURNs every time field, so the cache re-derives exactly.
+        auto r = session_store_->mark_mfa(key);
         if (!r) {
             spdlog::error("mark_session_mfa_verified: durable write failed ({})",
                           r.error().message);
             note_session_store_degrade("mark_mfa");
             return false;
         }
-        if (!*r)
+        if (!r->has_value())
             return false; // no such durable session
+        const auto& a = r->value();
         std::unique_lock lock(mu_);
         if (auto it = sessions_.find(key); it != sessions_.end())
-            it->second.mfa_verified_at = tp_from_ms(now_ms); // same instant as durable
+            derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
+                                     a.last_activity_ms, a.mfa_verified_ms, a.elevated_until_ms,
+                                     a.elevation_issued_ms, a.db_now_ms);
         return true;
     }
     std::unique_lock lock(mu_);
@@ -779,6 +875,7 @@ bool AuthManager::mark_session_mfa_verified(const std::string& token) {
     if (it == sessions_.end())
         return false;
     it->second.mfa_verified_at = std::chrono::system_clock::now();
+    it->second.steady_mfa_verified = std::chrono::steady_clock::now();
     return true;
 }
 
@@ -788,41 +885,31 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
         return std::nullopt;
     if (session_store_) {
         const std::string key = hash_token(token);
-        // Need the session's absolute expiry to clamp against. Cache-first, then
-        // authoritative store. A degraded/absent read → nullopt (the route maps
-        // it to 401 — the correct fail-closed outcome for a privileged op).
-        std::optional<Session> s;
-        {
-            std::shared_lock lock(mu_);
-            if (auto it = sessions_.find(key); it != sessions_.end())
-                s = it->second;
-        }
-        if (!s) {
-            auto found = session_store_->find(key);
-            if (!found || !found->has_value())
-                return std::nullopt;
-            s = session_from_row(**found);
-        }
-        const auto now = std::chrono::system_clock::now();
-        const auto until = (std::min)(now + duration, s->expires_at);
-        if (until <= now)
-            return std::nullopt; // dead-window guard (UP-1/UP-4)
-        // Durable write FIRST (bumps the generation). `existed` false ⇒ the
-        // session vanished durably between the read and the write → nullopt.
-        auto r = session_store_->set_elevation(key, ms_from_tp(until), ms_from_tp(now));
+        // The store authors the grant in the DB clock domain and does the
+        // "never past absolute expiry" clamp (LEAST) + dead-window guard in SQL,
+        // atomically against the row's own expiry — no read-then-clamp TOCTOU
+        // here (design-review S4). nullopt ⇒ absent OR the grant would already be
+        // expired; either way the route maps it to 401 (fail-closed for a
+        // privileged op). A degraded write ⇒ nullopt too.
+        const std::int64_t dur_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+        auto r = session_store_->set_elevation(key, dur_ms);
         if (!r) {
             spdlog::error("elevate_session: durable set_elevation failed ({})", r.error().message);
             note_session_store_degrade("elevate");
             return std::nullopt;
         }
-        if (!*r)
+        if (!r->has_value())
             return std::nullopt;
+        const auto& a = r->value();
+        // Re-derive the cached session (best-effort — it may live only on another
+        // replica, which picks up the grant on its next generation refresh).
         std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end()) {
-            it->second.elevated_until = until;
-            it->second.elevation_issued_at = now;
-        }
-        return until;
+        if (auto it = sessions_.find(key); it != sessions_.end())
+            derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
+                                     a.last_activity_ms, a.mfa_verified_ms, a.elevated_until_ms,
+                                     a.elevation_issued_ms, a.db_now_ms);
+        return tp_from_ms(a.elevated_until_ms);
     }
     std::unique_lock lock(mu_);
     auto it = sessions_.find(token);
@@ -849,9 +936,14 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     // Stamp the max-delta anchor together with elevated_until (auth.hpp
     // is_elevated ceiling, ADR-2002 §4): the granted window `until - now` is
     // already ≤ the caller-clamped duration, so it passes kMaxElevationWindow;
-    // the anchor lets that ceiling re-check the invariant on every read,
-    // including after a durable round-trip on another replica.
+    // the anchor lets that ceiling re-check the invariant on every read.
     it->second.elevation_issued_at = now;
+    // The steady deadline is what is_elevated adjudicates against (auth.hpp);
+    // set it from the same window (legacy no-store path — this host's clock is
+    // the authority, so steady_now + the granted duration).
+    it->second.steady_elevated_until =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(until - now);
     return until;
 }
 
@@ -881,7 +973,7 @@ std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string
             }
             if (!found->has_value())
                 return false; // definitively no such session → genuine no-op
-            s = session_from_row(**found);
+            s = session_from_row(found->value().row, found->value().db_now_ms);
         }
         const bool was_elevated = is_elevated(*s);
         auto r = session_store_->clear_elevation(key);
@@ -896,6 +988,7 @@ std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string
         if (auto it = sessions_.find(key); it != sessions_.end()) {
             it->second.elevated_until = {};
             it->second.elevation_issued_at = {};
+            it->second.steady_elevated_until = {}; // the field is_elevated reads
         }
         return was_elevated;
     }
@@ -904,8 +997,9 @@ std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string
     if (it == sessions_.end())
         return false;
     const bool was_elevated = is_elevated(it->second);
-    it->second.elevated_until = {};     // clear → effective role reverts to base
-    it->second.elevation_issued_at = {}; // clear the anchor together (auth.hpp)
+    it->second.elevated_until = {};        // clear → effective role reverts to base
+    it->second.elevation_issued_at = {};   // clear the anchor together (auth.hpp)
+    it->second.steady_elevated_until = {}; // the field is_elevated reads
     return was_elevated;
 }
 
@@ -923,7 +1017,7 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
             auto it = sessions_.find(key);
             if (it == sessions_.end() ||
                 it->second.elevated_until.time_since_epoch().count() == 0 ||
-                std::chrono::system_clock::now() < it->second.elevated_until)
+                is_elevated(it->second))
                 return std::nullopt;
         }
         std::string username;
@@ -932,11 +1026,12 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
             auto it = sessions_.find(key);
             if (it == sessions_.end() ||
                 it->second.elevated_until.time_since_epoch().count() == 0 ||
-                std::chrono::system_clock::now() < it->second.elevated_until)
+                is_elevated(it->second))
                 return std::nullopt; // TOCTOU recheck (single-replica exactly-once)
             username = it->second.username;
             it->second.elevated_until = {};
             it->second.elevation_issued_at = {};
+            it->second.steady_elevated_until = {};
         }
         // Mirror the clear durably (bumps the generation → other replicas drop
         // the stale elevation on refresh). Cross-replica exactly-once is NOT
@@ -964,7 +1059,7 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
         // Sentinel (epoch) means "never elevated" OR "already reaped/revoked"
         // — nothing to report. Still-live means nothing to report yet either.
         if (it->second.elevated_until.time_since_epoch().count() == 0 ||
-            std::chrono::system_clock::now() < it->second.elevated_until)
+            is_elevated(it->second))
             return std::nullopt;
     }
 
@@ -978,39 +1073,30 @@ std::optional<std::string> AuthManager::reap_expired_elevation(const std::string
     auto it = sessions_.find(token);
     if (it == sessions_.end())
         return std::nullopt;
-    if (it->second.elevated_until.time_since_epoch().count() != 0 &&
-        std::chrono::system_clock::now() >= it->second.elevated_until) {
+    if (it->second.elevated_until.time_since_epoch().count() != 0 && !is_elevated(it->second)) {
         it->second.elevated_until = {};
         it->second.elevation_issued_at = {}; // clear the anchor together (auth.hpp)
+        it->second.steady_elevated_until = {};
         return it->second.username;
     }
     return std::nullopt;
 }
 
 void AuthManager::expire_session_for_test(const std::string& token, std::chrono::seconds offset) {
+    // CACHE-ONLY (both current callers use the legacy no-store AuthManager). Push
+    // back BOTH the absolute wall instant (the suspend-backstop / display value)
+    // and the steady deadline that validate/is_elevated actually adjudicate
+    // against (ADR-2002 §4). A store-backed durable-expiry scenario is exercised
+    // by the real reap tests instead, not by re-authoring here (create() authors
+    // from now() and cannot stamp an absolute past-expiry).
     const std::string key = session_store_ ? hash_token(token) : token;
-    // Snapshot the adjusted row UNDER the lock, then release mu_ BEFORE the
-    // durable upsert — never hold mu_ across PG I/O, matching every production
-    // write-through path (cpp-safety SHOULD; keeps this test helper from
-    // modelling a lock-discipline the rest of the class forbids).
-    std::optional<yuzu::server::SessionRow> row;
-    {
-        std::unique_lock lock(mu_);
-        auto it = sessions_.find(key);
-        if (it == sessions_.end())
-            return;
-        it->second.expires_at -= offset;
-        if (session_store_)
-            row = row_from_session(token, it->second);
-    }
-    if (row) {
-        // Mirror the pushed-back expiry durably (test-only) via an upsert, so a
-        // store-backed test observes the adjusted lifetime on a cache-cleared
-        // re-read too.
-        if (auto r = session_store_->create(*row); !r)
-            spdlog::debug("expire_session_for_test: durable upsert failed ({})",
-                          r.error().message);
-    }
+    std::unique_lock lock(mu_);
+    auto it = sessions_.find(key);
+    if (it == sessions_.end())
+        return;
+    it->second.expires_at -= offset;
+    it->second.steady_expires -=
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(offset);
 }
 
 std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::string& username) {
@@ -1031,6 +1117,7 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
             if (s.username == username) {
                 s.elevated_until = {};
                 s.elevation_issued_at = {};
+                s.steady_elevated_until = {}; // the field is_elevated reads
             }
         }
         return *r;
@@ -1040,7 +1127,8 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
     for (auto& [token, s] : sessions_) {
         if (s.username == username && is_elevated(s)) {
             s.elevated_until = {};
-            s.elevation_issued_at = {}; // clear the anchor together (auth.hpp)
+            s.elevation_issued_at = {};    // clear the anchor together (auth.hpp)
+            s.steady_elevated_until = {}; // the field is_elevated reads
             ++cleared;
         }
     }
@@ -1197,14 +1285,28 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         }
         if (!found->has_value())
             return std::nullopt; // definitively absent
-        session_copy = session_from_row(**found);
+        // Adjudicate against the DB clock at read time (db_now) — session_from_row
+        // derives the local monotonic deadlines from it, so a backward-skewed
+        // replica cannot accept an expired session on a cache miss (design-review
+        // B1). An already-expired-at-db_now row derives a {} steady_expires,
+        // rejected by step 3.
+        session_copy = session_from_row(found->value().row, found->value().db_now_ms);
         from_store = true;
     }
 
-    const auto now = std::chrono::system_clock::now();
+    // Adjudication uses the LOCAL MONOTONIC deadlines derived at populate (immune
+    // to local wall skew/steps), with the generous wall ceiling as the suspend
+    // backstop (steady_clock pauses across host suspend; ADR-2002 §4 / H5).
+    const auto steady_now = std::chrono::steady_clock::now();
+    const auto wall_now = std::chrono::system_clock::now();
+    const auto expired_now = [&](const Session& sc) {
+        // A {} steady_expires (expired at populate, or underived) reads as expired.
+        return steady_now >= sc.steady_expires ||
+               wall_now > sc.expires_at + kWallSanitySkew;
+    };
 
     // 3. Absolute lifetime — always enforced.
-    if (now > session_copy->expires_at) {
+    if (expired_now(*session_copy)) {
         if (!from_store) { // drop a stale cache entry
             std::unique_lock wlock(mu_);
             sessions_.erase(key);
@@ -1212,23 +1314,26 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         return std::nullopt;
     }
 
-    // 4. Idle (inactivity) timeout: a sliding window under the absolute expiry.
+    // 4. Idle (inactivity) timeout: a sliding window under the absolute expiry,
+    // aged on the monotonic idle anchor.
     bool idle_expired =
-        idle_enabled && (now - session_copy->last_activity_at > session_inactivity_);
+        idle_enabled && (steady_now - session_copy->steady_last_activity > session_inactivity_);
     if (idle_expired && !from_store) {
-        // A cache-hit last_activity can lag a touch that landed on another
-        // replica (touch does NOT bump the generation, so the cache is not
-        // cleared for it). Re-check the authoritative row before evicting, so an
+        // A cache-hit idle anchor can lag a touch that landed on another replica
+        // (touch does NOT bump the generation, so the cache is not cleared for
+        // it). Re-check the authoritative row before evicting, so an
         // active-elsewhere session is not falsely idled out. On a degraded
         // re-check keep the cache-derived verdict (fail-safe: a spurious 401 →
         // re-auth, never a false keep-alive).
         if (auto found = session_store_->find(key); found && found->has_value()) {
-            session_copy = session_from_row(**found);
+            session_copy = session_from_row(found->value().row, found->value().db_now_ms);
             from_store = true;
-            if (now > session_copy->expires_at)
+            if (expired_now(*session_copy))
                 return std::nullopt;
-            idle_expired = idle_enabled &&
-                           (now - session_copy->last_activity_at > session_inactivity_);
+            idle_expired =
+                idle_enabled &&
+                (std::chrono::steady_clock::now() - session_copy->steady_last_activity >
+                 session_inactivity_);
         }
     }
     if (idle_expired) {
@@ -1245,26 +1350,28 @@ std::optional<Session> AuthManager::validate_session_durable(const std::string& 
         idle_enabled ? (std::min)(session_inactivity_ / 4, std::chrono::seconds(30))
                      : std::chrono::seconds(0);
     const bool need_touch =
-        idle_enabled && (now - session_copy->last_activity_at >= touch_granularity);
+        idle_enabled && (steady_now - session_copy->steady_last_activity >= touch_granularity);
     if (need_touch) {
-        session_copy->last_activity_at = now;
+        session_copy->steady_last_activity = steady_now; // activity is now (monotonic)
+        session_copy->last_activity_at = wall_now;       // keep the wall value in sync
         // Durable mirror, throttled to kActivityPersistGranularity. touch_activity
         // deliberately does NOT bump the generation, so it never invalidates any
-        // replica's cache — the whole point of a sliding update being cheap.
-        //
-        // C5/K10: the durable row can lag real activity by at most this throttle,
-        // so a cache-COLD replica (that reads the row on a miss) could otherwise
-        // idle-evict a still-active session when the configured idle window is
-        // SHORTER than the throttle. Clamp the durable-persist interval strictly
-        // below the idle window (half it) so the durable row is never staler than
-        // the window a cold replica ages it against — keeping the "an active
-        // session is never wrongly evicted" contract on any replica.
+        // replica's cache — the whole point of a sliding update being cheap. It
+        // stamps now() in the store (the DB clock). The throttle rides the LOCAL
+        // MONOTONIC clock (steady_last_persisted), NOT wall vs a DB-authored
+        // timestamp: that cross-domain comparison let host skew suppress every
+        // touch, idling out an actively-used session on another replica / after
+        // failover (adversarial-review CDX-P1-001) — the exact cross-host-skew
+        // contract WS-1/1a exists to close. Clamp the interval strictly below the
+        // idle window (half it) so the durable row is never staler than the window
+        // a cache-cold replica ages it against (C5/K10).
         const auto durable_persist_gran =
             idle_enabled ? (std::min)(kActivityPersistGranularity, session_inactivity_ / 2)
                          : kActivityPersistGranularity;
-        if (now - session_copy->last_activity_persisted_at >= durable_persist_gran) {
-            session_copy->last_activity_persisted_at = now;
-            if (auto r = session_store_->touch_activity(key, ms_from_tp(now)); !r) {
+        if (steady_now - session_copy->steady_last_persisted >= durable_persist_gran) {
+            session_copy->steady_last_persisted = steady_now;
+            session_copy->last_activity_persisted_at = wall_now; // display only
+            if (auto r = session_store_->touch_activity(key); !r) {
                 spdlog::debug("validate_session: durable touch_activity failed ({})",
                               r.error().message);
                 note_session_store_degrade("touch");
@@ -1638,17 +1745,18 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     const std::string resolved_display = display_name.empty() ? email : display_name;
 
     auto token = generate_session_token();
-    Session s;
-    s.username = stable_username;
-    s.display_name = resolved_display;
-    s.role = role;
-    s.expires_at = std::chrono::system_clock::now() + kSessionDuration;
-    s.auth_source = "oidc";
-    s.oidc_sub = oidc_sub;
-    s.last_activity_at = std::chrono::system_clock::now();
-    s.last_activity_persisted_at = s.last_activity_at;
-    s.mfa_verified_at = mfa_verified_at;
-    if (!persist_new_session(token, s)) {
+    yuzu::server::SessionWriteParams params;
+    params.username = stable_username;
+    params.display_name = resolved_display;
+    params.role = role_to_string(role);
+    params.auth_source = "oidc";
+    params.oidc_sub = oidc_sub;
+    params.session_lifetime_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
+    // The MFA proof is the IdP's asserted instant (an absolute, not a local
+    // authoring) — pass it through; the epoch sentinel maps to 0 (no proof).
+    params.mfa_verified_ms_abs = ms_from_tp(mfa_verified_at);
+    if (!persist_new_session(token, params)) {
         spdlog::error("create_oidc_session: durable persist failed for '{}'", stable_username);
         return {}; // fail-safe empty token (ADR-0007)
     }
@@ -1729,15 +1837,14 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
                                    : (!saml_email.empty() ? saml_email : name_id);
 
     auto token = generate_session_token();
-    Session s;
-    s.username                   = stable_username;
-    s.display_name               = resolved_display;
-    s.role                       = role;
-    s.expires_at                 = std::chrono::system_clock::now() + kSessionDuration;
-    s.auth_source                = "saml";
-    s.last_activity_at           = std::chrono::system_clock::now();
-    s.last_activity_persisted_at = s.last_activity_at;
-    if (!persist_new_session(token, s)) {
+    yuzu::server::SessionWriteParams params;
+    params.username = stable_username;
+    params.display_name = resolved_display;
+    params.role = role_to_string(role);
+    params.auth_source = "saml";
+    params.session_lifetime_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
+    if (!persist_new_session(token, params)) {
         spdlog::error("create_saml_session: durable persist failed for '{}'", stable_username);
         return {}; // fail-safe empty token (ADR-0007)
     }
