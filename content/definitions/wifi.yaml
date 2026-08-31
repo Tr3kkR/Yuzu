@@ -19,9 +19,9 @@ metadata:
     Scans for visible WiFi networks and reports each network's SSID,
     signal strength (0-100%), security type (WPA2-PSK, Open, etc.),
     network type or channel, and BSSID or connection status.
-    On Windows uses WlanGetAvailableNetworkList, on Linux uses
-    nmcli device wifi list, on macOS uses `airport -s` (legacy) or
-    system_profiler.
+    On Windows uses WlanGetAvailableNetworkList, on Linux reads
+    NetworkManager over D-Bus and falls back to nmcli then iw/iwlist,
+    on macOS uses `airport -s` (legacy) or system_profiler.
   tags: [wifi, network, wireless, inventory, security]
 
 spec:
