@@ -693,9 +693,18 @@ TEST_CASE("create-group-form route: a JIT-elevated session sees the "
         s.username = "elevated-admin";
         s.role = auth::Role::user;
         {
-            const auto now = std::chrono::system_clock::now();
-            s.elevated_until = now + std::chrono::minutes(5);
-            s.elevation_issued_at = now;
+            // Since HA WS-1/1a DB-clock authority (ADR-2002 §4), is_elevated
+            // adjudicates against the local monotonic steady_elevated_until
+            // derived by AuthManager::derive_session_deadlines -- hand-stamping
+            // elevated_until/elevation_issued_at alone no longer elevates
+            // (those wall fields are now only a suspend backstop).
+            const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+            const std::int64_t life_ms = now_ms + 8LL * 3600 * 1000;
+            REQUIRE(auth::AuthManager::derive_session_deadlines(
+                s, now_ms, life_ms, now_ms, /*mfa_verified_ms=*/0,
+                /*elevated_until_ms=*/now_ms + 5 * 60000, /*elevation_issued_ms=*/now_ms, now_ms));
         }
         return s;
     };
@@ -755,9 +764,18 @@ TEST_CASE("render_filter_bar route: a JIT-elevated session sees every agent's "
         s.username = "elevated-admin";
         s.role = auth::Role::user; // base role holds nothing; elevation carries it
         {
-            const auto now = std::chrono::system_clock::now();
-            s.elevated_until = now + std::chrono::minutes(5);
-            s.elevation_issued_at = now;
+            // Since HA WS-1/1a DB-clock authority (ADR-2002 §4), is_elevated
+            // adjudicates against the local monotonic steady_elevated_until
+            // derived by AuthManager::derive_session_deadlines -- hand-stamping
+            // elevated_until/elevation_issued_at alone no longer elevates
+            // (those wall fields are now only a suspend backstop).
+            const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+            const std::int64_t life_ms = now_ms + 8LL * 3600 * 1000;
+            REQUIRE(auth::AuthManager::derive_session_deadlines(
+                s, now_ms, life_ms, now_ms, /*mfa_verified_ms=*/0,
+                /*elevated_until_ms=*/now_ms + 5 * 60000, /*elevation_issued_ms=*/now_ms, now_ms));
         }
         return s;
     };
