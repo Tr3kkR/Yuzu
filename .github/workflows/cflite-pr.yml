@@ -80,7 +80,15 @@ jobs:
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 300
+          # Total wall budget split across the retained targets (sequential).
+          # 180s keeps the whole job under ~5.5 min (measured fixed costs:
+          # ~35s image pull + ~68s build + ~37s run-step overhead) - the
+          # operator ceiling is 6 min. parallel-fuzzing runs libFuzzer with
+          # one worker per vCPU inside each target's slice, so total
+          # executions EXCEED the old 300s single-worker budget (~720
+          # core-seconds vs 300 on the 4-vCPU public runners).
+          fuzz-seconds: 180
+          parallel-fuzzing: true
           mode: code-change
           sanitizer: address
           output-sarif: true
