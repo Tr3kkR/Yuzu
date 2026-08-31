@@ -53,7 +53,7 @@ void ScheduleRunner::tick() {
         // once shutdown begins — a schedule already firing below still
         // completes cleanly, this only stops the next one from starting.
         if (d_.should_stop && d_.should_stop()) {
-            spdlog::info("ScheduleRunner: tick() stopping early on shutdown - "
+            spdlog::info("schedule_runner: tick stopping early on shutdown - "
                          "remaining schedule(s) deferred");
             break;
         }

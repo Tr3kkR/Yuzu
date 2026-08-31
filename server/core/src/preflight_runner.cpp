@@ -38,7 +38,7 @@ void PreflightRunner::tick() {
         // shutdown begins — a run already in progress still finishes its own
         // dispatch + persist below cleanly, this only stops the next one.
         if (d_.should_stop && d_.should_stop()) {
-            spdlog::info("PreflightRunner: tick() stopping early on shutdown - "
+            spdlog::info("preflight_runner: tick stopping early on shutdown - "
                          "remaining run(s) deferred");
             break;
         }

@@ -675,7 +675,7 @@ void PolicyEvaluator::collect_ready() {
         // fleet-wide-skips checking the way an equivalent break in
         // dispatch_due() would.
         if (d_.should_stop && d_.should_stop()) {
-            spdlog::info("PolicyEvaluator: collect_ready() stopping early on shutdown - "
+            spdlog::info("policy_evaluator: collect_ready stopping early on shutdown - "
                          "remaining ready item(s) deferred");
             break;
         }
