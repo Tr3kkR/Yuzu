@@ -7,9 +7,11 @@ workflow's `paths:`) — and fuzzes **what the PR changed** for a short budget
 (code-change mode, ASan). Findings surface as the workflow's SARIF / crash
 artifacts — file them as issues; don't fix them inside unrelated PRs.
 
-`cflite-batch.yml` (push-to-dev on the same paths, or manual dispatch) grows
-a persistent corpus in batch mode, publishes the coverage report the PR job
-prunes against, and (dispatch-only) prunes the corpus. State lives in GHA
+`cflite-batch.yml` (push-to-dev on the same paths; manual dispatch once the
+file reaches `main` — GitHub only offers `workflow_dispatch` for workflows on
+the default branch, so the dispatch-only prune is unavailable until then)
+grows a persistent corpus in batch mode, publishes the coverage report the
+PR job prunes against, and (dispatch-only) prunes the corpus. State lives in GHA
 artifacts (`cifuzz-corpus-<target>`, `cifuzz-coverage-latest`, 90-day
 retention); a red run auto-files a `cflite-batch-broken` issue. Two accepted
 limits, both candidly load-bearing: artifact consumption trusts NAMES
@@ -60,5 +62,5 @@ in `tests/fuzz/corpus/`.
   the Dockerfile once the harness set has soaked.
 - Dependabot watch on this Dockerfile's `base-builder` digest.
 
-(The scheduled batch-fuzzing + corpus-pruning leg shipped as
-`cflite-batch.yml` — see above.)
+(The batch-fuzzing + corpus-pruning leg shipped as `cflite-batch.yml` —
+see above.)

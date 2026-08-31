@@ -4,6 +4,7 @@
   `server/`/`agents/`/`sdk/`/`proto/`, and its build step is wired with the token
   and `actions: read` permission that corpus download and affected-target pruning
   silently required. A new `cflite-batch.yml` workflow (push-to-dev on the same
-  paths, plus manual dispatch and a weekly cron for when it reaches `main`) grows a
-  persistent corpus in batch mode, publishes the coverage report the PR job prunes
-  against, and prunes the corpus on a slower cadence.
+  paths; manual dispatch once the file reaches `main`) grows a persistent corpus in
+  batch mode, publishes the coverage report the PR job prunes against, offers
+  corpus pruning as an explicit manual dispatch, and auto-files a
+  `cflite-batch-broken` issue on a red run.

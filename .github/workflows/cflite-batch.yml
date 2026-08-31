@@ -1,4 +1,4 @@
-# ClusterFuzzLite - scheduled/batch fuzzing of the in-tree libFuzzer
+# ClusterFuzzLite - batch fuzzing of the in-tree libFuzzer
 # harnesses (tests/fuzz/, built by .clusterfuzzlite/build.sh; PR-scoped
 # twin: cflite-pr.yml). Three modes, one pipeline:
 #
@@ -14,9 +14,13 @@
 #              dispatch only, run sparingly.
 #
 # Triggers: push to dev, gated on the same fuzzed-closure paths as
-# cflite-pr.yml (KEEP the two lists identical), plus workflow_dispatch.
-# Deliberate: a push trigger runs the pushed ref's own workflow file, so
-# this leg is live as soon as it lands on dev. There is deliberately NO
+# cflite-pr.yml (KEEP the two lists in lockstep - identical except each
+# names its own workflow file), plus workflow_dispatch. A push trigger
+# runs the pushed ref's own workflow file, so that leg is live as soon as
+# this lands on dev; workflow_dispatch (and with it the prune job) only
+# becomes available once this file reaches the DEFAULT branch (main) -
+# until then push-to-dev is the only live trigger and the corpus goes
+# unminimized. There is deliberately NO
 # cron: schedule only fires from the DEFAULT branch (main), which lags dev
 # by months - a cron run would build main's stale tree, its coverage
 # upload would then be the freshest cifuzz-coverage-latest most weeks and
@@ -133,7 +137,9 @@ jobs:
     # Explicit dispatch only - prune REPLACES the stored corpus wholesale
     # (a prune against a broken/flaky target sheds corpus permanently once
     # prior artifact versions expire), so it never runs unattended and only
-    # after a fresh batch upload.
+    # after a fresh batch upload. Dispatch requires this file on main (see
+    # header); once available, an occasional (roughly quarterly) prune is
+    # plenty at this corpus size.
     if: github.event_name == 'workflow_dispatch' && inputs.prune
     needs: batch
     runs-on: ubuntu-24.04
