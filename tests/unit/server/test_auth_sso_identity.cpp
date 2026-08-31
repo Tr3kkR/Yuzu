@@ -226,8 +226,8 @@ struct SsoJitHarness {
                                                       const std::string& iss =
                                                           "https://idp.example.com/",
                                                       bool amr_mfa = true) {
-        auto mfa_at = amr_mfa ? std::chrono::steady_clock::now()
-                              : std::chrono::steady_clock::time_point{};
+        auto mfa_at = amr_mfa ? std::chrono::system_clock::now()
+                              : std::chrono::system_clock::time_point{};
         auto token = auth_mgr.create_oidc_session("Display Name", "user@example.com", sub, iss,
                                                    /*groups=*/{}, /*admin_group_id=*/{}, mfa_at);
         return {token, "oidc:" + iss + "#" + sub};

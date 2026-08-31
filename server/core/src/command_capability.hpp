@@ -50,6 +50,36 @@ enum class Mutability : uint8_t {
     Irreversible,
 };
 
+/// Whether raw dispatch of this pair requires proof of an approval decision
+/// beyond the base RBAC grant (#1398 — `InstructionDefinition`-declared
+/// `approval.mode` was enforced only on the governed `POST
+/// /api/instructions/:id/execute` path; this is the same control, derived
+/// strictest-wins from every shipped definition targeting the pair, applied
+/// at the ONE chokepoint every dispatch surface — REST, MCP, dashboard,
+/// schedule, deployment — already funnels through). Approval-class-shaped,
+/// deliberately NOT role-shaped: this enum never names a role, matching the
+/// `CapabilityDeclaration` doctrine (`authz_model.hpp`: "this schema
+/// classifies a capability, it never grants one").
+///
+/// `Unspecified` is the value-initialized default for an omitted
+/// `.execute_gate` designated initializer — deliberately NOT `None`, so a
+/// future row that forgets to author this field cannot be silently mistaken
+/// for an authored "no gate" decision. Two independent enforcement layers
+/// keep `Unspecified` from ever reaching a live dispatch decision: (1) every
+/// `capability_decls/*.hpp` fragment's own `constexpr` array is swept by a
+/// `static_assert(detail::all_gates_specified(...))` immediately after its
+/// definition — a build with an omitted field fails to compile; (2) the
+/// dispatch chokepoint (`classify_and_authorize_dispatch`,
+/// `agent_registry.hpp`) treats `Unspecified` as a classify-miss (deny, same
+/// as `Unclassified`/`Ambiguous`) as defense in depth, in case a future
+/// fragment source is composed into the registry without its own sweep.
+enum class ExecuteGate : uint8_t {
+    Unspecified,
+    None,
+    AdminOrApproval,
+    AlwaysApproval,
+};
+
 /// One classified `plugin.action` row — view/enum over static storage only,
 /// so a `std::span<const CommandCapability>` fragment can live in a
 /// `constexpr` array with no static-init-order or heap concern.
@@ -67,7 +97,28 @@ struct CommandCapability {
     /// caller-attributable RBAC decision) — see
     /// `capability_decls/core_dispatch_capabilities.hpp`.
     bool system_reserved{false};
+    /// See `ExecuteGate`'s doc comment above. No default member initializer
+    /// distinct from `Unspecified` — an omitted `.execute_gate` in a
+    /// designated-initializer row value-initializes to `Unspecified` (the
+    /// zero enumerator), which every fragment's compile-time sweep rejects.
+    ExecuteGate execute_gate{ExecuteGate::Unspecified};
 };
+
+namespace detail {
+/// The per-fragment compile-time sweep every `capability_decls/*.hpp` file
+/// must invoke via `static_assert` immediately after its `constexpr` array —
+/// see `ExecuteGate`'s doc comment above. `std::span`'s constructor from a
+/// contiguous constexpr range is itself constexpr (C++20), so this is a
+/// genuine compile-time check, not a runtime one that merely looks like it.
+[[nodiscard]] inline consteval bool
+all_gates_specified(std::span<const CommandCapability> rows) {
+    for (const auto& row : rows) {
+        if (row.execute_gate == ExecuteGate::Unspecified)
+            return false;
+    }
+    return true;
+}
+} // namespace detail
 
 /// `CommandCapabilityRegistry::classify`'s failure modes. A miss is
 /// `Unclassified`, never a permissive default (ADR-0033 §2: "a missing or

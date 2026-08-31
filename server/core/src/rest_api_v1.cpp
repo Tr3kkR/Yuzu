@@ -22,6 +22,7 @@
 #include "inventory_eval.hpp"
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
@@ -886,7 +887,7 @@ const std::string& openapi_spec() {
         R"json(,
     "/quarantine": {
       "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list. Two distinct causes, distinguished by message: store/pool/query failure only increments yuzu_server_quarantine_read_degrade_total; a per-record admit-then-filter anomaly (e.g. transient engine-principal-store outage) does not"}}},
-      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, or the device is already quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, the device is already quarantined, or whitelist fails server-edge validation (>512 chars, or a token outside [0-9A-Fa-f.:], <=45 chars/token)"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
       "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
@@ -1595,6 +1596,9 @@ void RestApiV1::register_routes(
         if (sess) {
             caller.principal = sess->username;
             caller.principal_role = auth::role_to_string(sess->role);
+            // #1398: JIT-elevation-aware, matching every other session-derived
+            // caller.
+            caller.principal_is_admin = auth::effective_role(*sess) == auth::Role::admin;
         }
         caller.exec_visible = (exec_visible_fn && sess) ? exec_visible_fn(*sess)
                                                         : yuzu::server::authz::deny_all();
@@ -1749,6 +1753,13 @@ void RestApiV1::register_routes(
                   }
                   auto session = auth_fn(req, res);
                   const std::string principal = session ? session->username : std::string{};
+                  // #1398: JIT-elevation-aware, matching every other session-derived
+                  // caller — threaded into bundle_orch->dispatch() below so an
+                  // admin's bundle step on an AdminOrApproval-gated pair is not
+                  // unconditionally denied (adversarial-review finding: this value
+                  // used to be dropped entirely between here and the orchestrator).
+                  const bool principal_is_admin =
+                      session && auth::effective_role(*session) == auth::Role::admin;
                   // A bundle is owned by its dispatcher (collate gates on it). An
                   // empty principal would be un-attributable and collatable by any
                   // other empty-principal caller — refuse it, matching the
@@ -1808,7 +1819,15 @@ void RestApiV1::register_routes(
                           exec_visible_fn && session
                               ? exec_visible_fn(*session)
                               : yuzu::server::authz::deny_all();
-                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible);
+                      // #1398: thread principal_is_admin (derived above) so an
+                      // admin's bundle step on a gated pair is not unconditionally
+                      // denied. approval_provenance stays the default None — REST
+                      // execute_bundle has no ticket-consumption flow (that is an
+                      // MCP-tier-specific mechanism); a non-admin REST caller
+                      // reaches a gated pair only via the governed instruction-
+                      // execute path, same as before this diff.
+                      r = bundle_orch->dispatch(agent_id, *specs, principal, audit, exec_visible,
+                                                principal_is_admin);
                   } catch (const std::exception& e) {
                       audit_fn(req, "bundle.dispatch", "failure", "Execution", "",
                                std::string("agent=") + agent_id + " error=" + e.what());
@@ -4574,7 +4593,17 @@ void RestApiV1::register_routes(
                             .add("quarantined_by", r.quarantined_by)
                             .add("quarantined_at", r.quarantined_at)
                             .add("whitelist", r.whitelist)
-                            .add("reason", r.reason));
+                            .add("reason", r.reason)
+                            // #3425: endpoint-containment confirmation state
+                            // (schema v2) — 0 = never, matching
+                            // quarantined_at's own never-happened shape.
+                            // last_applied_at: a system re-dispatch of the
+                            // stored whitelist was accepted (agents_reached
+                            // > 0), NOT proof of containment.
+                            // last_confirmed_at: a follow-up quarantine.status
+                            // read reported state|active.
+                            .add("last_applied_at", r.last_applied_at)
+                            .add("last_confirmed_at", r.last_confirmed_at));
                 ++visible;
             }
             res.set_content(list_json(arr.str(), visible), "application/json");
@@ -4631,6 +4660,30 @@ void RestApiV1::register_routes(
         }
         if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
             return;
+
+        // #3425 gate3-rest-whitelist-validation-gap: this write is the ONLY
+        // creation path that skipped the charset/length check the reconciler
+        // and MCP's already_active retry both apply before ever dispatching
+        // a stored whitelist (quarantine_reapply.hpp — the single validator
+        // chokepoint, reused here rather than forked). Before #3425's
+        // reconciler shipped, a record written with an unsafe whitelist was
+        // merely permanently undispatchable; now it also fails validation on
+        // every tick/heartbeat, forever, until replaced — reject it at write
+        // time instead so the operator finds out immediately, not via a
+        // repeating background counter.
+        if (whitelist.size() > kQuarantineWhitelistMaxLen ||
+            !quarantine_whitelist_tokens_safe(whitelist)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "whitelist rejected: total exceeds " +
+                                                 std::to_string(kQuarantineWhitelistMaxLen) +
+                                                 " characters, a token exceeds 45 characters, "
+                                                 "or a token contains a character outside "
+                                                 "[0-9A-Fa-f.:]"),
+                            "application/json");
+            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id,
+                     "whitelist rejected by server-edge validation");
+            return;
+        }
 
         auto session = auth_fn(req, res);
         std::string by = session ? session->username : "system";
@@ -5064,7 +5117,15 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 auto defs = instruction_store->query_definitions();
+                 // ADR-0058: query_definitions now returns std::expected — a genuine
+                 // DB error 503s rather than silently rendering an empty list.
+                 auto defs_result = instruction_store->query_definitions();
+                 if (!defs_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 const auto& defs = *defs_result;
                  JArr arr;
                  for (size_t i = 0; i < defs.size(); ++i) {
                      const auto& d = defs[i];
@@ -5120,15 +5181,34 @@ void RestApiV1::register_routes(
         [instruction_store](
             const std::string& definition_id,
             const std::vector<ResponseTemplate>& templates) -> std::optional<std::string> {
-        auto def = instruction_store->get_definition(definition_id);
-        if (!def)
-            return std::string("definition not found");
+        // ADR-0058: get_definition now returns std::expected<optional<...>, string> —
+        // distinguish a genuine DB error from "no such definition". The returned string
+        // carries the store's own classification prefixes (kInstructionStoreDbErrorPrefix /
+        // "not_found: ") so callers can map to 503/404 the same way every sibling instruction
+        // route in this migration does (gov Gate 4/6 finding — this used to collapse both to a
+        // flat 500).
+        auto def_result = instruction_store->get_definition(definition_id);
+        if (!def_result)
+            return def_result.error();
+        if (!*def_result)
+            return std::string("not_found: definition not found");
+        auto def = **def_result;
         ResponseTemplatesEngine engine;
-        def->response_templates_spec = engine.serialise(templates);
-        auto upd = instruction_store->update_definition(*def);
+        def.response_templates_spec = engine.serialise(templates);
+        auto upd = instruction_store->update_definition(def);
         if (!upd)
             return upd.error();
         return std::nullopt;
+    };
+    // Classifies persist_templates' returned error the same way every sibling instruction
+    // route in this migration does: db_error -> 503, not_found -> 404, else -> 500 (gov Gate
+    // 4/6 finding — this used to collapse every case to a flat 500).
+    auto persist_status = [](const std::string& err) -> int {
+        if (err.rfind(kInstructionStoreDbErrorPrefix, 0) == 0)
+            return 503;
+        if (err.rfind("not_found:", 0) == 0)
+            return 404;
+        return 500;
     };
 
     // GET /api/v1/definitions/{id}/response-templates ─ list
@@ -5148,14 +5228,22 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
+                 const auto& def = **def_result;
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse(def.response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5169,7 +5257,7 @@ void RestApiV1::register_routes(
                      }
                  JArr arr;
                  if (!operator_has_default) {
-                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     auto synth = engine.synthesise_default(def.result_schema, def.plugin);
                      arr.add_raw(engine.to_json(synth).dump());
                  }
                  for (const auto& t : templates) {
@@ -5198,14 +5286,22 @@ void RestApiV1::register_routes(
                      res.set_content(detail::a4_error(res, "malformed id"), "application/json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      return;
                  }
+                 const auto& def = **def_result;
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse(def.response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5217,7 +5313,7 @@ void RestApiV1::register_routes(
                      // dashboard shows when nothing is configured", and
                      // operators introspecting it shouldn't have to know
                      // which path they're on.
-                     auto synth = engine.synthesise_default(def->result_schema, def->plugin);
+                     auto synth = engine.synthesise_default(def.result_schema, def.plugin);
                      res.set_content(ok_json(engine.to_json(synth).dump()), "application/json");
                      return;
                  }
@@ -5233,7 +5329,7 @@ void RestApiV1::register_routes(
 
     // POST /api/v1/definitions/{id}/response-templates ─ create
     sink.Post(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates)",
-              [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+              [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
                                                                         httplib::Response& res) {
                   if (!perm_fn(req, res, "InstructionDefinition", "Write"))
                       return;
@@ -5267,16 +5363,28 @@ void RestApiV1::register_routes(
                                def_id, "reason=invalid_json");
                       return;
                   }
-                  auto def = instruction_store->get_definition(def_id);
-                  if (!def) {
+                  // ADR-0058: get_definition now returns std::expected — distinguish a
+                  // genuine DB error (503) from "no such definition" (404, unchanged).
+                  auto def_result = instruction_store->get_definition(def_id);
+                  if (!def_result) {
+                      res.status = 503;
+                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                      // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                      // infra degrade is not an operator denial.
+                      audit_fn(req, "response_template.create", "error", "InstructionDefinition",
+                               def_id, "reason=store_unavailable");
+                      return;
+                  }
+                  if (!*def_result) {
                       res.status = 404;
                       res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                       audit_fn(req, "response_template.create", "denied", "InstructionDefinition",
                                def_id, "reason=definition_not_found");
                       return;
                   }
+                  const auto& def = **def_result;
                   ResponseTemplatesEngine engine;
-                  auto parsed = engine.parse(def->response_templates_spec);
+                  auto parsed = engine.parse(def.response_templates_spec);
                   std::vector<ResponseTemplate> templates;
                   if (parsed)
                       templates = std::move(*parsed);
@@ -5294,8 +5402,10 @@ void RestApiV1::register_routes(
                   if (auto err = persist_templates(def_id, templates); err) {
                       spdlog::error("response_template.create persist failed: def={} err={}",
                                     def_id, *err);
-                      res.status = 500;
-                      res.set_content(detail::a4_error(res, "persist failure"), "application/json");
+                      res.status = persist_status(*err);
+                      res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
+                                                                              : "persist failure"),
+                                      "application/json");
                       audit_fn(req, "response_template.create", "failure", "InstructionDefinition",
                                def_id, "reason=persist_failure");
                       return;
@@ -5308,7 +5418,7 @@ void RestApiV1::register_routes(
 
     // PUT /api/v1/definitions/{id}/response-templates/{tid} ─ replace
     sink.Put(R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-             [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+             [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
                                                                        httplib::Response& res) {
                  if (!perm_fn(req, res, "InstructionDefinition", "Write"))
                      return;
@@ -5352,8 +5462,19 @@ void RestApiV1::register_routes(
                               def_id, "reason=invalid_json");
                      return;
                  }
-                 auto def = instruction_store->get_definition(def_id);
-                 if (!def) {
+                 // ADR-0058: get_definition now returns std::expected — distinguish a
+                 // genuine DB error (503) from "no such definition" (404, unchanged).
+                 auto def_result = instruction_store->get_definition(def_id);
+                 if (!def_result) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                     // "error", not "denied" (gov Gate 6 compliance-officer finding): an
+                     // infra degrade is not an operator denial.
+                     audit_fn(req, "response_template.update", "error", "InstructionDefinition",
+                              def_id, "reason=store_unavailable");
+                     return;
+                 }
+                 if (!*def_result) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                      audit_fn(req, "response_template.update", "denied", "InstructionDefinition",
@@ -5361,7 +5482,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  ResponseTemplatesEngine engine;
-                 auto parsed = engine.parse(def->response_templates_spec);
+                 auto parsed = engine.parse((*def_result)->response_templates_spec);
                  std::vector<ResponseTemplate> templates;
                  if (parsed)
                      templates = std::move(*parsed);
@@ -5397,8 +5518,10 @@ void RestApiV1::register_routes(
                  if (auto err = persist_templates(def_id, templates); err) {
                      spdlog::error("response_template.update persist failed: def={} tid={} err={}",
                                    def_id, tid, *err);
-                     res.status = 500;
-                     res.set_content(detail::a4_error(res, "persist failure"), "application/json");
+                     res.status = persist_status(*err);
+                     res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
+                                                                             : "persist failure"),
+                                     "application/json");
                      audit_fn(req, "response_template.update", "failure", "InstructionDefinition",
                               def_id, "reason=persist_failure");
                      return;
@@ -5411,7 +5534,7 @@ void RestApiV1::register_routes(
     // DELETE /api/v1/definitions/{id}/response-templates/{tid}
     sink.Delete(
         R"(/api/v1/definitions/([A-Za-z0-9._-]+)/response-templates/([A-Za-z0-9_-]+))",
-        [perm_fn, audit_fn, instruction_store, persist_templates](const httplib::Request& req,
+        [perm_fn, audit_fn, instruction_store, persist_templates, persist_status](const httplib::Request& req,
                                                                   httplib::Response& res) {
             if (!perm_fn(req, res, "InstructionDefinition", "Write"))
                 return;
@@ -5439,8 +5562,19 @@ void RestApiV1::register_routes(
                          "reason=reserved_id");
                 return;
             }
-            auto def = instruction_store->get_definition(def_id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store->get_definition(def_id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                // "error", not "denied" (gov Gate 6 compliance-officer finding): an infra
+                // degrade is not an operator denial.
+                audit_fn(req, "response_template.delete", "error", "InstructionDefinition", def_id,
+                         "reason=store_unavailable");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "definition not found"), "application/json");
                 audit_fn(req, "response_template.delete", "denied", "InstructionDefinition", def_id,
@@ -5448,7 +5582,7 @@ void RestApiV1::register_routes(
                 return;
             }
             ResponseTemplatesEngine engine;
-            auto parsed = engine.parse(def->response_templates_spec);
+            auto parsed = engine.parse((*def_result)->response_templates_spec);
             std::vector<ResponseTemplate> templates;
             if (parsed)
                 templates = std::move(*parsed);
@@ -5466,8 +5600,10 @@ void RestApiV1::register_routes(
             if (auto err = persist_templates(def_id, templates); err) {
                 spdlog::error("response_template.delete persist failed: def={} tid={} err={}",
                               def_id, tid, *err);
-                res.status = 500;
-                res.set_content(detail::a4_error(res, "persist failure"), "application/json");
+                res.status = persist_status(*err);
+                res.set_content(detail::a4_error(res, res.status == 404 ? "definition not found"
+                                                                        : "persist failure"),
+                                "application/json");
                 audit_fn(req, "response_template.delete", "failure", "InstructionDefinition",
                          def_id, "reason=persist_failure");
                 return;
@@ -6875,15 +7011,25 @@ void RestApiV1::register_routes(
                 }
             }
 
-            auto def = instruction_store->get_definition(definition_id);
-            if (!def) {
+            // ADR-0058: get_definition now returns std::expected — distinguish a genuine
+            // DB error (503) from "no such definition" (404, unchanged).
+            auto def_result = instruction_store->get_definition(definition_id);
+            if (!def_result) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=store_unavailable");
+                return;
+            }
+            if (!*def_result) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "instruction definition not found"), "application/json");
                 audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
                          definition_id + " reason=definition_not_found");
                 return;
             }
-            int chart_count = VisualizationEngine::count(def->visualization_spec);
+            const auto& def = **def_result;
+            int chart_count = VisualizationEngine::count(def.visualization_spec);
             if (chart_count == 0) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "no visualization configured for this definition"),
@@ -6960,7 +7106,7 @@ void RestApiV1::register_routes(
 
             VisualizationEngine engine;
             auto result =
-                engine.transform_at(def->visualization_spec, chart_index, def->plugin, responses);
+                engine.transform_at(def.visualization_spec, chart_index, def.plugin, responses);
             if (!result.ok) {
                 res.status = 500;
                 auto parsed = nlohmann::json::parse(result.json, nullptr, false);
@@ -7827,11 +7973,18 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
                           return;
                       }
-                      auto def = instruction_store->get_definition(instruction_id);
-                      if (!def) {
+                      // ADR-0058: get_definition now returns std::expected — distinguish a
+                      // genuine DB error (503) from "no such instruction" (404, unchanged).
+                      auto def_result = instruction_store->get_definition(instruction_id);
+                      if (!def_result) {
+                          rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      if (!*def_result) {
                           rs_err(res, 404, "INSTRUCTION_NOT_FOUND: unknown instruction_id");
                           return;
                       }
+                      const auto& def = **def_result;
                       std::unordered_map<std::string, std::string> params;
                       if (body.contains("params") && body["params"].is_object())
                           for (auto& [k, v] : body["params"].items())
@@ -7848,7 +8001,7 @@ void RestApiV1::register_routes(
                           payload["matcher"] = body["matcher"];
                       if (body.contains("parent_id") && body["parent_id"].is_string())
                           payload["scope_input_id"] = body["parent_id"];
-                      run_async(req, res, *session, def->plugin, def->action, params,
+                      run_async(req, res, *session, def.plugin, def.action, params,
                                 source_kind::kInstructionResult, payload.dump(), matcher, body,
                                 body.value("name", ""));
                   });
@@ -7908,9 +8061,18 @@ void RestApiV1::register_routes(
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
                           std::string instruction_id =
                               sp.is_object() ? sp.value("instruction_id", "") : "";
-                          auto def = instruction_store && instruction_store->is_open()
-                                         ? instruction_store->get_definition(instruction_id)
-                                         : std::nullopt;
+                          // ADR-0058: get_definition now returns std::expected — a genuine DB
+                          // error 503s distinctly; a not-found/store-unavailable/empty-id
+                          // condition keeps the pre-migration 400 collapse.
+                          std::optional<InstructionDefinition> def;
+                          if (instruction_store && instruction_store->is_open()) {
+                              auto def_result = instruction_store->get_definition(instruction_id);
+                              if (!def_result) {
+                                  rs_err(res, 503, "instruction store not available");
+                                  return;
+                              }
+                              def = *def_result;
+                          }
                           if (instruction_id.empty() || !def) {
                               rs_err(res, 400,
                                      "RESULT_SET_BAD_REQUEST: original instruction unavailable");

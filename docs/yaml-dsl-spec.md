@@ -197,14 +197,26 @@ Each column object:
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `mode` | string | No | `auto` | Approval mode. `auto` -- no approval required. `role-gated` -- requires approval from a user with an approved role. `always` -- every execution requires explicit approval. |
+| `mode` | string | No | `auto` | Approval mode. `auto` -- no approval required. `role-gated` -- requires approval from a user with an approved role. `always` -- every execution requires explicit approval. Enforced on the governed `POST /api/instructions/:id/execute` path directly, and on every raw-dispatch surface (`POST /api/command`, MCP `execute_instruction`, and any future dispatch caller) via a compiled, per-`plugin.action` `ExecuteGate` derived strictest-wins from every shipped definition targeting that pair (#1398) -- see `docs/mcp-server.md` and `command_capability.hpp`. |
 
 #### `spec.permissions`
 
+**Advisory content metadata, not enforced by the server.** Neither field has a
+server-side representation: `executeRoles`' labels (`endpoint-admin`,
+`security-admin`, ...) are a content-authoring convention that matches no
+seeded RBAC role (`Administrator`/`PlatformEngineer`/`Operator`/
+`ApiTokenManager`/`ITServiceOwner`/`Viewer`/`Reviewer`), and `embed_content.py`
+drops the entire `permissions` block at build time -- it never reaches the
+running server. Actual execute-time enforcement is `spec.approval.mode` (see
+above); actual author-time enforcement is the `InstructionDefinition:Write`
+RBAC permission on the create/update route, unrelated to `authorRoles`. Both
+fields may still be authored for human-readable documentation of intent, but
+neither controls anything at runtime.
+
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `executeRoles` | list of string | No | `[]` | Roles permitted to execute this definition. Empty list means no restriction. |
-| `authorRoles` | list of string | No | `[]` | Roles permitted to create or modify this definition. |
+| `executeRoles` | list of string | No | `[]` | **Advisory only (unenforced) -- see note above.** Documents which roles a content author intends to permit; actual enforcement is `spec.approval.mode`. |
+| `authorRoles` | list of string | No | `[]` | **Advisory only (unenforced) -- see note above.** Documents which roles a content author intends to permit to create or modify this definition; actual enforcement is the `InstructionDefinition:Write` RBAC permission. |
 
 #### `spec.compatibility`
 
@@ -467,11 +479,15 @@ The grouping unit and permission boundary. Sets aggregate definitions, policy fr
 
 #### `metadata.permissions`
 
+**Advisory content metadata, not enforced by the server** -- same status as
+`spec.permissions` above (#1398); none of the three fields below has a
+server-side representation or reads through to any RBAC check.
+
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `executeRoles` | list of string | No | `[]` | Roles permitted to execute definitions in this set. |
-| `authorRoles` | list of string | No | `[]` | Roles permitted to author or modify definitions in this set. |
-| `approveRoles` | list of string | No | `[]` | Roles permitted to approve executions of definitions in this set. |
+| `executeRoles` | list of string | No | `[]` | **Advisory only (unenforced).** Documents which roles a content author intends to permit to execute definitions in this set; member definitions' own `spec.approval.mode` is what's actually enforced. |
+| `authorRoles` | list of string | No | `[]` | **Advisory only (unenforced).** Documents which roles a content author intends to permit to author or modify definitions in this set; actual enforcement is the `InstructionDefinition:Write` RBAC permission. |
+| `approveRoles` | list of string | No | `[]` | **Advisory only (unenforced).** Documents which roles a content author intends to permit to approve executions; actual enforcement is the `Approval:Approve` RBAC permission on the approvals route. |
 
 #### `metadata.contents`
 
@@ -1602,7 +1618,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `network.config.get` | `network_config` | Y | Y | Y | Verified |
 | `network.route.list` | `network_config` | Y | Y | Y | Verified |
 | `network.connection.list` | `netstat` | Y | Y | Y | Verified |
-| `network.socket.owner` | `sockwho` | Y | Y | Y | Verified |
+| `network.socket.owner` | `netstat` (`attribution` action) | Y | Y | Y | Verified |
 | `network.dns.flush` | `network_actions` | Y | Y | Y | Verified |
 | `network.diagnostics.run` | `network_diag` | Y | Y | Y | Verified |
 | `network.probe.icmp` | `netprobe` | Y | Y | Y | Verified |

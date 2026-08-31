@@ -108,7 +108,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 // store's schema with no schema_meta row: the migration runner's schema-drift
 // guard refuses (version 0 but tables exist), so run() returns false.
 TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][offline]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     // Pre-seed: create the endpoint_state schema + a conflicting table, but no
     // public.schema_meta row for the store — the drift guard will refuse.

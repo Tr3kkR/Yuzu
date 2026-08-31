@@ -10,9 +10,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <chrono>
+#include <random>
 #include <string>
 #include <thread>
 
@@ -183,4 +185,62 @@ TEST_CASE("stop is idempotent and safe before start", "[spark][convergence]") {
     sched.stop();
     sched.stop(); // idempotent
     SUCCEED();
+}
+
+TEST_CASE("jittered stays within the shared jitter-span bound at nonzero jitter_pct",
+          "[spark][convergence]") {
+    // Every OTHER test in this file runs jitter_pct = 0, so nothing else exercises
+    // this arithmetic. #3531: a future edit that re-inlines or subtly changes
+    // jittered()'s formula must not be able to pass every test in the suite.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    ConvergenceScheduler::Config cfg;
+    cfg.jitter_pct = kGuardianLaneJitterPct;
+    ConvergenceScheduler sched{*rt, cfg};
+
+    const std::uint64_t base_ms = kGuardianServiceLaneCadenceMs;
+    // Independently computed via the SAME shared formula jittered() itself calls -
+    // not re-derived inline, which is the whole point of the extraction (#3388).
+    const std::uint64_t span = guardian_jitter_span_ms(base_ms, cfg.jitter_pct);
+    // Pins guardian_jitter_span_ms's OWN output for these constants, so a future
+    // change to the formula (or the constants) that silently shifts this test's
+    // bound fails loudly here. This does NOT close the separate boundary-value gap
+    // in jittered()'s own dist(-span, span) construction (a different translation
+    // unit) - a +/-1 there would still pass every REQUIRE below undetected; that
+    // residual gap needs a directly-testable {lo, hi} seam to close, not this
+    // assert (#3531, quality-engineer Gate 8).
+    static_assert(guardian_jitter_span_ms(kGuardianServiceLaneCadenceMs, kGuardianLaneJitterPct) ==
+                      12'000,
+                  "this test's bound depends on this exact span - re-derive both if "
+                  "the lane cadence or jitter percentage constants ever change");
+    REQUIRE(span > 0);
+
+    std::mt19937 rng{0x5eed};
+    std::int64_t min_ms = static_cast<std::int64_t>(base_ms + span);
+    std::int64_t max_ms = static_cast<std::int64_t>(base_ms - span);
+    for (int i = 0; i < 1000; ++i) {
+        const auto ms = sched.jittered(base_ms, rng).count();
+        REQUIRE(ms >= static_cast<std::int64_t>(base_ms - span));
+        REQUIRE(ms <= static_cast<std::int64_t>(base_ms + span));
+        min_ms = std::min(min_ms, ms);
+        max_ms = std::max(max_ms, ms);
+    }
+    // Demonstrates jitter is actually applied, not silently collapsed to a constant.
+    REQUIRE(min_ms < static_cast<std::int64_t>(base_ms));
+    REQUIRE(max_ms > static_cast<std::int64_t>(base_ms));
+}
+
+TEST_CASE("jittered returns base_ms unchanged when jitter_pct is zero",
+          "[spark][convergence]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    ConvergenceScheduler::Config cfg;
+    cfg.jitter_pct = 0;
+    ConvergenceScheduler sched{*rt, cfg};
+
+    std::mt19937 rng{0x5eed};
+    REQUIRE(sched.jittered(kGuardianServiceLaneCadenceMs, rng).count() ==
+            static_cast<std::int64_t>(kGuardianServiceLaneCadenceMs));
 }

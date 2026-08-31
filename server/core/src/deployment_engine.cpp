@@ -57,6 +57,24 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
     if (deps.store == nullptr || deployment_id.empty())
         return;
 
+    // #1398: content_dist.{stage,execute_staged} are role-gated content —
+    // ExecuteGate::AdminOrApproval at the dispatch chokepoint. The `/auto`
+    // Deploy pipeline (this function: creator-authority go-cohort computed
+    // upstream, guarded one-way transitions, execute-once CAS via
+    // claim_for_stage/claim_for_exec below, full audit) is accepted as the
+    // governing control in place of a per-dispatch ApprovalManager ticket
+    // (#1398 design doc, Decision 5) — a SEPARATE, explicitly-typed
+    // provenance value from a real consumed ticket, never conflated with
+    // one. Per-dispatch attribution comes from `execution_id`
+    // ("deployment-<id>-stage"/"...-exec", stage_execution_id/
+    // exec_execution_id below) rather than a new audit call: it is already
+    // the canonical per-dispatch correlation id this codebase threads
+    // through the whole dispatch chain (matching the preflight-/polchk-/
+    // bundle- id-prefix siblings), so an incident review can already trace
+    // any dispatch back to the exact deployment run that authorized it.
+    yuzu::server::DispatchCaller pipeline_caller = caller;
+    pipeline_caller.approval_provenance = yuzu::server::ApprovalProvenance::GovernedPipeline;
+
     auto grid = deps.store->get_devices(deployment_id);
 
     // ── 1. Poll the stage + execute responses (no store lease held) ──────────
@@ -121,7 +139,7 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
             const auto [cmd, sent] = deps.dispatch_fn(
                 "content_dist", "stage", claimed, "",
                 {{"url", cfg.url}, {"filename", cfg.filename}, {"sha256", cfg.sha256}},
-                stage_execution_id(deployment_id), caller);
+                stage_execution_id(deployment_id), pipeline_caller);
             // #3133 round-2 review MEDIUM: the claim used to be uncondition-
             // ally left in 'staging' with the dispatch result discarded — a
             // chokepoint-denied dispatch (caller lacks the classified
@@ -167,7 +185,7 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
                 params["args"] = cfg.args;
             const auto [cmd, sent] =
                 deps.dispatch_fn("content_dist", "execute_staged", claimed, "", params,
-                                 exec_execution_id(deployment_id), caller);
+                                 exec_execution_id(deployment_id), pipeline_caller);
             // Same settle-on-refusal as the stage claim above. The execute-once
             // property is PRESERVED, not weakened: claim_for_exec still claims
             // each row exactly once, and a row settled to 'failed' here was

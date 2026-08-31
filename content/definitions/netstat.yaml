@@ -1,6 +1,9 @@
 ## Netstat Definitions
 ## Enumerates active network connections and listening sockets.
 ## Plugin: netstat | Actions: netstat_list
+## (see also netstat_attribution.yaml for the `attribution` action, which
+## additionally resolves the owning process -- folds the retired `sockwho`
+## plugin into netstat, #3403)
 ##
 ## Sources by platform:
 ##   Windows: IP Helper API (GetExtendedTcpTable, GetExtendedUdpTable)

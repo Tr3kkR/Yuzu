@@ -65,6 +65,8 @@ Plugins for querying operating system details, hardware inventory, device identi
 | `disks` | Physical disk model, size, interface type, and health status. |
 | `drivers` | Installed device drivers: name, version, date, provider, and device class. Uses `Win32_PnPSignedDriver` on Windows (the query takes several seconds — the `device.hardware.drivers` definition gathers it with a daily TTL); loaded kernel modules via `/proc/modules` on Linux (module name only — version/date not available). Not supported on macOS. |
 
+**Sentinel rows.** Any field the underlying probe cannot read (WMI/DMI/`sysctl` call failed, or ran on an unsupported platform) is emitted as the literal string `unknown` rather than being omitted — this applies to `manufacturer`, `model`, `bios`, `processors`, `memory`, and `disks`. `drivers` additionally emits a `__truncated__` sentinel in the driver-name field on Windows when the WMI enumeration hit its row cap (`agents/shared/wmi_bounded.hpp`, 512 rows) — the reached count rides in the row-index column, and `__truncated__` cannot collide with a real `DeviceName`, so a consumer can distinguish "no more drivers" from "the list was cut short."
+
 ### device_identity
 
 | | |
@@ -216,31 +218,21 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | `adapters` | List network adapters with type, MAC address, and link status. |
 | `ip_addresses` | IPv4 and IPv6 addresses per adapter, including subnet mask and gateway. |
 | `dns_servers` | Configured DNS servers per adapter. |
-| `proxy` | System proxy settings (HTTP, HTTPS, SOCKS, PAC URL). |
-| `dns_cache` | Resolver cache entries (`cache_entry\|name\|type\|…`). **Windows only.** Backs the device page's **DNS cache** live card. |
-| `arp` | Host ARP / IPv6-neighbour table via `GetIpNetTable2` (`arp\|iface\|ip\|mac\|type`, capped at 20k entries). **Windows only** — Linux (`/proc/net/arp`) and macOS (route sysctl) are planned. Backs the device page's **ARP** live card. |
+| `proxy` | System proxy settings. Windows reports the WinHTTP/IE configuration (proxy, PAC URL, bypass list). Linux reports the `http_proxy`/`https_proxy`/`all_proxy`/`no_proxy` environment variables. macOS reports the HTTP proxy and PAC URL across the primary network service and each scoped per-interface service, plus a bypass list; HTTPS, SOCKS and FTP proxies are **not** reported on macOS, so a Mac configured with only those reads as `none`. |
+| `dns_cache` | Resolver cache entries (`cache_entry\|name\|type\|…`). Windows reads `DnsGetCacheDataTable`; Linux reads `resolvectl cache`, falling back to `systemd-resolve --statistics` and reporting unavailable when neither is present. **Not available on macOS** — the OS exposes no resolver-cache contents (`dscacheutil -cachedump` was gutted upstream), so the action returns an honest `dns_cache\|unsupported` sentinel. Backs the device page's **DNS cache** live card. |
+| `arp` | Host ARP / neighbour table (`arp\|iface\|ip\|mac\|type`). Windows reads `GetIpNetTable2` — IPv4 ARP **and** IPv6 neighbours, including incomplete entries, capped at 20k rows. Linux reads `/proc/net/arp`: **IPv4 ARP only** — IPv6 neighbours live in the `RTM_GETNEIGH` table and are not reported, and non-Ethernet and incomplete (non-`ATF_COM`) entries are skipped. macOS reads a PF_ROUTE `RTF_LLINFO` sysctl and de-duplicates: the dump carries no interface name and no static/dynamic type, so both fields are emitted as `-`. Linux and macOS share Windows' 20000-row cap. Backs the device page's **ARP** live card. |
 
 ### netstat
 
 | | |
 |---|---|
 | **Platforms** | W L M |
-| **Description** | Active network connections (similar to the `netstat` command-line tool). |
+| **Description** | Active network connections (similar to the `netstat` command-line tool), and socket-to-process attribution. |
 
 | Action | Description |
 |---|---|
 | `netstat_list` | List all TCP and UDP connections with local/remote address, port, state, and owning PID. |
-
-### sockwho
-
-| | |
-|---|---|
-| **Platforms** | W L M |
-| **Description** | Maps open sockets to the processes that own them. |
-
-| Action | Description |
-|---|---|
-| `sockwho_list` | For each listening or established socket, returns the owning process name and PID alongside connection details. |
+| `attribution` | Same enumeration, plus the owning process's name and executable path for each socket. Folds the retired `sockwho` plugin's functionality into netstat (#3403). On macOS, a socket shared across a fork (multiple processes holding the same fd) is deduplicated to one owner row, matching `netstat_list` — unlike the retired `sockwho`, which emitted one row per (pid, fd). |
 
 ### network_diag
 
@@ -333,9 +325,9 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list` | All installed applications with name, version, publisher, and install date. Windows machine-scope only — the `HKCU` read is the agent's own service-account hive, never a logged-in user's; see `list_per_user` for per-user apps. |
-| `query` | Search installed applications by name pattern. |
-| `list_per_user` | Available on all three platforms as an alternative to the machine-scope `list` path, but only Windows is a genuine per-local-profile walk — see each platform's actual scope below. **Windows**: walks each local profile's registry hive via the shared ladder in `agents/shared/win_profiles.hpp` (#2771) — loaded `HKU\<SID>` hives read live, logged-out profiles mounted offline. Rows: `user_app\|<username>\|<name>\|<version>\|<publisher>\|<install_date>`; `username` is the resolved profile name or `-` when unresolvable (never the SID, ADR-0024 D11). May also emit `error\|profile_list_unreadable`, `warning\|profile_list_truncated at 512 entries`, `warning\|privilege_missing: …` (a logged-out profile's apps could not be read because the offline-mount privileges could not be enabled), and `warning\|hive_unload_failed: …` (a leaked offline mount). **Linux**: system-wide packages (dpkg/rpm/pacman), reported with `username=system` since Linux package managers have no per-user install concept. **macOS**: system apps (`system_profiler`) reported with `username=system`, plus per-user Homebrew formulae (`brew list --versions`, run as the calling account) reported with `username=brew`. |
+| `list` | All installed applications with name, version, publisher, and install date. Windows machine-scope only — the `HKCU` read is the agent's own service-account hive, never a logged-in user's; see `list_per_user` for per-user apps. On Linux/macOS, if the underlying enumeration (dpkg-query/rpm/pacman/apk/system_profiler) does not complete on its own terms — timeout, kill, spawn failure, truncation, or a nonzero exit — the action emits a single `error\|installed_apps: acquisition degraded (...)` row and returns nonzero rather than reporting an empty or partial list as complete (Wave 4 PR4.3a). Windows has no such signal today: a partial registry walk still reports success. |
+| `query` | Search installed applications by name pattern. Same degraded-acquisition `error\|...` behaviour as `list` on Linux/macOS. |
+| `list_per_user` | Available on all three platforms as an alternative to the machine-scope `list` path, but only Windows is a genuine per-local-profile walk — see each platform's actual scope below. **Windows**: walks each local profile's registry hive via the shared ladder in `agents/shared/win_profiles.hpp` (#2771) — loaded `HKU\<SID>` hives read live, logged-out profiles mounted offline. Rows: `user_app\|<username>\|<name>\|<version>\|<publisher>\|<install_date>`; `username` is the resolved profile name or `-` when unresolvable (never the SID, ADR-0024 D11). May also emit `error\|profile_list_unreadable`, `warning\|profile_list_truncated at 512 entries`, `warning\|privilege_missing: …` (a logged-out profile's apps could not be read because the offline-mount privileges could not be enabled), and `warning\|hive_unload_failed: …` (a leaked offline mount). **Linux**: system-wide packages (dpkg/rpm/pacman), reported with `username=system` since Linux package managers have no per-user install concept; same degraded-acquisition `error\|installed_apps: acquisition degraded (...)` behaviour as `list`. **macOS**: system apps (`system_profiler`) reported with `username=system`, plus per-user Homebrew formulae (`brew list --versions`, run as the calling account) reported with `username=brew`; either leg degrading emits the same `error\|installed_apps: acquisition degraded (...)` row. |
 
 ### msi_packages
 
@@ -346,8 +338,8 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list` | All installed packages with name, version, and location. On macOS, `pkgutil` receipts (reverse-domain identifier, derived name, version, install location). |
-| `product_codes` | Package identifiers — MSI product code GUIDs (Windows) or reverse-domain `pkgutil` identifiers (macOS). Useful for silent uninstall automation. |
+| `list` | All installed packages with name, version, and location. On macOS, `pkgutil` receipts (reverse-domain identifier, derived name, version, install location). On macOS, if `pkgutil` does not complete on its own terms (timeout, kill, spawn failure, truncation, or a nonzero exit — on either the initial enumeration or any per-receipt lookup) the action emits a single `error\|msi_packages: acquisition degraded (...)` row and returns nonzero rather than reporting an empty or partial list as complete (Gate-8 governance remediation, Wave 4 PR4.3a). |
+| `product_codes` | Package identifiers — MSI product code GUIDs (Windows) or reverse-domain `pkgutil` identifiers (macOS). Useful for silent uninstall automation. Same degraded-acquisition `error\|...` behaviour as `list` on macOS. |
 
 ### windows_updates
 
@@ -416,7 +408,7 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 | Action | Description |
 |---|---|
 | `state` | Whether the firewall is enabled, per profile (domain, private, public on Windows). On macOS, reports the Application Firewall global state (`backend\|appfirewall` + `state\|…`, plus `mode\|block_all` when block-all is set) and a secondary `pf\|<state>` row for the pf packet filter. `state\|unknown` means the check output was unreadable or unrecognised — never assumed safe; `pf\|unknown` is expected on agents not running as root (reading `/dev/pf` needs root) and is not a fault. |
-| `rules` | List firewall rules with direction, action, port, and protocol. |
+| `rules` | List firewall rules with direction, action, port, and protocol. On Linux, the nftables backend (probed before ufw/iptables) reports only base-chain hook/policy and per-rule table/chain/handle — no per-rule action/port/protocol (expression-level decoding is out of scope); the ufw/iptables fallback rows do carry action. |
 
 ### bitlocker
 
@@ -434,9 +426,9 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 
 | | |
 |---|---|
-| **Version** | v1.0.0 |
+| **Version** | v1.1.0 |
 | **Platforms** | W L M |
-| **Description** | Query OS event logs. Uses Windows Event Log API, `journalctl` on Linux, and macOS unified log. |
+| **Description** | Query OS event logs. Reads in-process via the Windows Event Log API (wevtapi) on Windows and `sd_journal` on Linux — falling back to a bounded `journalctl` invocation where libsystemd is unavailable or the journal cannot be read — and the unified log (`log show`) on macOS. A read that fails, is denied, or is cut short by its bound reports a typed status rather than an empty result. |
 
 | Action | Description |
 |---|---|
@@ -492,10 +484,16 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 > (`SystemRootCertificates.keychain`), `login` (the current console user's
 > login keychain), or `all` (the default — System and root, plus login when a
 > console user is present). The `login` store is read from the console user's
-> per-user session via a `launchctl asuser <uid> sudo -n -u <user> security
-> find-certificate` hop, because the LaunchDaemon has no login keychain of its
-> own; with nobody logged in at the console it returns
-> `not_available|no console session`. `delete` accepts only `MY`/`System`
+> per-user session via a `launchctl asuser <uid> sudo -n -u <user> --
+> security find-certificate` hop (a pre-split argv through the bounded runner,
+> no shell), because the LaunchDaemon has no login keychain of its own. With
+> nobody logged in at the console it returns `not_available|no console
+> session`. If the console user cannot be DETERMINED — the directory lookup
+> timed out or failed, the account has no passwd record, or the name/uid
+> failed validation — it instead returns `not_available|<reason>` naming which,
+> and the result is marked PARTIAL. That distinction is deliberate: a degraded
+> lookup is never reported as an empty console, and `details` will not answer
+> `status|not_found` for a keychain it never opened. `delete` accepts only `MY`/`System`
 > (both target `System.keychain`, matching prior behaviour); `root` is
 > rejected as unsupported (SystemRootCertificates.keychain is sealed by System
 > Integrity Protection and cannot be modified), and `login`/`all`/any other
@@ -852,11 +850,11 @@ Every non-success outcome is reported as its own line rather than an empty resul
 |---|---|
 | **Version** | v0.1.0 |
 | **Platforms** | W |
-| **Description** | Enable, disable, and report the Remote Desktop (RDP) posture of a Windows endpoint. Manages three gates: the `fDenyTSConnections` value under `HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server`, the built-in Remote Desktop firewall rule group (addressed locale-independently via `@FirewallAPI.dll,-28752` through `INetFwPolicy2`), and the `TermService` start state. Built for change-gated remote access — an ITSM system enables RDP for an approved change window and disables it afterward. **Prerequisite:** the agent service account must be a member of the local `Administrators` group. In the **intended** least-privilege model (`NT SERVICE\YuzuAgent`, not in `Administrators`) this requires an out-of-band grant; **today the service registers as LocalSystem (#1442), so this succeeds with no extra grant.** `scripts/install-agent-user.ps1` does **not** perform this grant either way (it only adds Event Log / Performance groups). Grant it out of band via GPO Restricted Groups / Intune, or `Add-LocalGroupMember Administrators 'NT SERVICE\YuzuAgent'`, and verify with `Get-LocalGroupMember Administrators`. A non-elevated agent returns `reg_status\|error:5` on every `set_state`. **Dispatch gate:** only `Execution:Execute` is enforced on every path; the definition's role-gated approval and `executeRoles` apply solely on `POST /api/instructions/{id}/execute`, not on raw `/api/command` or MCP dispatch — restrict `Execution:Execute`/MCP token scope and keep a Guardian `fDenyTSConnections=1` backstop. |
+| **Description** | Enable, disable, and report the Remote Desktop (RDP) posture of a Windows endpoint. Manages three gates: the `fDenyTSConnections` value under `HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server`, the built-in Remote Desktop firewall rule group (addressed locale-independently via `@FirewallAPI.dll,-28752` through `INetFwPolicy2`), and the `TermService` start state. Built for change-gated remote access — an ITSM system enables RDP for an approved change window and disables it afterward. **Prerequisite:** the agent service account must be a member of the local `Administrators` group. In the **intended** least-privilege model (`NT SERVICE\YuzuAgent`, not in `Administrators`) this requires an out-of-band grant; **today the service registers as LocalSystem (#1442), so this succeeds with no extra grant.** `scripts/install-agent-user.ps1` does **not** perform this grant either way (it only adds Event Log / Performance groups). Grant it out of band via GPO Restricted Groups / Intune, or `Add-LocalGroupMember Administrators 'NT SERVICE\YuzuAgent'`, and verify with `Get-LocalGroupMember Administrators`. A non-elevated agent returns `reg_status\|error:5` on every `set_state`. **Dispatch gate (#1398):** enforced identically on every path, including raw `/api/command` and MCP dispatch — RBAC requires `Security:Write` (this pair's classified securable/operation, not the generic `Execution:Execute`), and the definition's role-gated approval is enforced via a compiled per-pair gate at the one dispatch chokepoint every surface funnels through, not only on `POST /api/instructions/{id}/execute`. `executeRoles` remains advisory only (unenforced). Keep a Guardian `fDenyTSConnections=1` backstop deployed regardless. |
 
 | Action | Description |
 |---|---|
-| `set_state` | Enable or disable RDP. Parameter: `state` (`enable` or `disable`). Enable sets `fDenyTSConnections=0`, enables the firewall rule group, and starts `TermService`. Disable sets `fDenyTSConnections=1` and disables the firewall rule group (the service is left running; the registry and firewall gates block new connections). Emits per-step columns `reg_status`, `firewall_status`, `service_status`, and an `overall` verdict; `overall=ok` only when every step succeeded — callers should retry until `overall=ok`, especially on disable. `service_status=running` is reported only after polling the SCM to a confirmed `SERVICE_RUNNING` (not at start-dispatch); `firewall_status=error:group_not_found` if the built-in Remote Desktop group is absent (never a silent no-op). Disable blocks *new* connections only; it does not terminate an already-established session. Gated by `Execution:Execute` on raw dispatch (see the Description's dispatch-gate note; the definition advertises role-gated approval, enforced only on the governed instruction-execute path). |
+| `set_state` | Enable or disable RDP. Parameter: `state` (`enable` or `disable`). Enable sets `fDenyTSConnections=0`, enables the firewall rule group, and starts `TermService`. Disable sets `fDenyTSConnections=1` and disables the firewall rule group (the service is left running; the registry and firewall gates block new connections). Emits per-step columns `reg_status`, `firewall_status`, `service_status`, and an `overall` verdict; `overall=ok` only when every step succeeded — callers should retry until `overall=ok`, especially on disable. `service_status=running` is reported only after polling the SCM to a confirmed `SERVICE_RUNNING` (not at start-dispatch); `firewall_status=error:group_not_found` if the built-in Remote Desktop group is absent (never a silent no-op). Disable blocks *new* connections only; it does not terminate an already-established session. Gated on raw dispatch by `Security:Write` RBAC plus the definition's role-gated approval, both enforced at the dispatch chokepoint (see the Description's dispatch-gate note, #1398) — no longer just the generic `Execution:Execute` permission the governed instruction-execute path alone used to require. |
 | `status` | Read the current RDP posture. Returns `deny_ts_connections` (registry value), `firewall_group` (rule-group enabled state), `term_service` (service state), and a derived `rdp` verdict: `on` only when all three gates are readable and open; `unknown` when any gate could not be read (e.g. a non-elevated agent); `off` when all gates are readable but at least one is closed. A non-zero exit code also signals an unreadable gate — verify a state change by the exit code and per-gate rows, not the `rdp` summary alone. |
 
 ---

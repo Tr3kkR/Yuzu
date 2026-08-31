@@ -454,7 +454,7 @@ TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
     }
 }
 
-TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][secrets]") {
+TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][secrets][pg-smoke]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
     yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);

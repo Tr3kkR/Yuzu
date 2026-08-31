@@ -425,7 +425,6 @@ if build_agent
     subdir('agents/plugins/procfetch')
     subdir('agents/plugins/netstat')
     subdir('agents/plugins/netprobe')
-    subdir('agents/plugins/sockwho')
     subdir('agents/plugins/status')
     subdir('agents/plugins/device_identity')
     subdir('agents/plugins/os_info')

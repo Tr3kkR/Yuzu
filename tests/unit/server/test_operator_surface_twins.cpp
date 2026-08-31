@@ -103,6 +103,13 @@ yuzu::test::PgTestTemplate twins_rbac_tpl{"optwinsrbac", [](const std::string& d
     if (!store.is_open())
         throw std::runtime_error("optwins rbac template: store failed to migrate");
 }};
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate twins_instr_tpl{"optwinsinstr", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    InstructionStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("optwins instruction template: store failed to migrate");
+}};
 } // namespace
 
 #define TWINS_RBAC(store_var)                                                                      \
@@ -111,6 +118,11 @@ yuzu::test::PgTestTemplate twins_rbac_tpl{"optwinsrbac", [](const std::string& d
     REQUIRE(twins_pool_fx_.valid());                                                               \
     RbacStore store_var{twins_pool_fx_};                                                           \
     REQUIRE(store_var.is_open())
+
+#define TWINS_INSTR(pool_var)                                                                      \
+    YUZU_REQUIRE_PG_DB_TPL(twins_instr_db_fx_, twins_instr_tpl);                                   \
+    yuzu::server::pg::PgPool pool_var{{.conninfo = twins_instr_db_fx_.dsn(), .size = 4}};          \
+    REQUIRE(pool_var.valid())
 
 // ═════════════════════════════════════════════════════════════════════════
 // compose_arming_check — the composed decision in isolation
@@ -227,12 +239,12 @@ struct TestDb {
 // RbacStore) through a real ScheduleRunner end to end.
 struct Harness {
     TestDb db;
-    yuzu::test::TempDbFile insdb{std::string_view("yuzu_test_optwins_ins_")};
+    yuzu::server::pg::PgPool& instr_pool;
 
     ScheduleEngine engine{db.db};
     ExecutionTracker tracker{db.db};
     ApprovalManager approvals{db.db};
-    InstructionStore is{insdb.path};
+    InstructionStore is;
 
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
     // Postgres-backed (ADR-0041): the store is constructed by the TEST_CASE
@@ -244,8 +256,8 @@ struct Harness {
 
     ScheduleRunner runner;
 
-    explicit Harness(RbacStore& rbac_store)
-        : rbac(rbac_store),
+    explicit Harness(yuzu::server::pg::PgPool& instr_pool_ref, RbacStore& rbac_store)
+        : instr_pool(instr_pool_ref), is(instr_pool), rbac(rbac_store),
           runner(ScheduleRunner::Deps{
               .schedule_engine = &engine,
               .instruction_store = &is,
@@ -319,7 +331,8 @@ TEST_CASE("arming_check (auto path): a schedule whose creator lost the required 
           "does not fire, and re-fires once permission is restored",
           "[server][routes][mcp][schedule][pg]") {
     TWINS_RBAC(rbac);
-    Harness h{rbac};
+    TWINS_INSTR(instr_pool);
+    Harness h{instr_pool, rbac};
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "carol", "Administrator"}).has_value());
     auto id = h.make_due("carol", /*requires_approval=*/false);
 
@@ -346,7 +359,8 @@ TEST_CASE("arming_check (approval path): a schedule whose creator lost the requi
           "permission does not submit an approval ticket and does not fire",
           "[server][routes][mcp][schedule][pg]") {
     TWINS_RBAC(rbac);
-    Harness h{rbac};
+    TWINS_INSTR(instr_pool);
+    Harness h{instr_pool, rbac};
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "dave", "Administrator"}).has_value());
     auto id = h.make_due("dave", /*requires_approval=*/true);
 

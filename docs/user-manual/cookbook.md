@@ -855,7 +855,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.network.netstat_list` | netstat | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32 |
 | `device.network_diag.listening` | listening | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, pid:int32 |
 | `device.network_diag.connections` | connections | Q | WLM | *(none)* | proto:string, local_addr:string, remote_addr:string, remote_port:int32, pid:int32 |
-| `device.network.sockwho_list` | sockwho | Q | WLM | *(none)* | pid:int32, process_name:string, proto:string, local_addr:string, remote_addr:string, state:string |
+| `device.network.netstat_attribution` | attribution | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32, process_name:string, process_path:string |
 | `device.network_actions.flush_dns` | flush_dns | A | WLM | *(none)* | status:string, output:string |
 | `device.network_actions.ping` | ping | A | WLM | host:string (req) | output:string |
 | `device.wifi.list_networks` | wifi scan | Q | WLM | *(none)* | ssid:string, signal:string, security:string |

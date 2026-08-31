@@ -1,4 +1,5 @@
 #include "product_pack_store.hpp"
+#include "store_errors.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -1206,7 +1207,7 @@ std::expected<std::string, std::string> ProductPackStore::install(
                 documents[i].find("plugin:") != std::string::npos) {
                 kind = "InstructionDefinition";
             } else {
-                errors.push_back("document " + std::to_string(i) + " has no kind");
+                errors.push_back("document " + std::to_string(i) + ": " + kind_missing_error());
                 continue;
             }
         }
@@ -1225,6 +1226,17 @@ std::expected<std::string, std::string> ProductPackStore::install(
             item.yaml_source = documents[i];
             items_to_store.push_back(std::move(item));
             ++installed_count;
+        } else if (is_generic_db_error(result.error())) {
+            // Governance finding: a genuine origin-store DB/lease failure must abort the whole
+            // install immediately, not fall into `errors` — the aggregation below prepends
+            // "<kind>: "/"no items installed: " text ahead of the error, which strips the
+            // kDbErrorPrefix byte-0 marker the REST layer's is_generic_db_error()/
+            // product_pack_error_status() rely on (turning a 503 into a misclassified 400), and
+            // in a multi-document bundle where an earlier item already installed, continuing the
+            // loop would let the pack persist with this item silently missing. Mirrors
+            // uninstall()'s identical origin-store-DB-error-aborts-immediately shape below.
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) + "failed to install " +
+                                   kind + " item: " + result.error());
         } else {
             errors.push_back(kind + ": " + result.error());
         }
@@ -1632,14 +1644,23 @@ std::expected<void, std::string> ProductPackStore::uninstall(const std::string& 
     ProductPack pack = std::move(**pack_result);
 
     // Remove each contained item from its origin store. No pool_ lease of ours held here — same
-    // rationale as install() (see file header).
+    // rationale as install() (see file header). A genuine origin-store DB error aborts the whole
+    // uninstall (never delete/tombstone the pack while a contained item may still be live) —
+    // not-found/unsupported-kind failures from origin stores that don't yet distinguish the two
+    // stay tolerated+logged, matching pre-ADR-0058 behaviour.
     int removed = 0;
     for (const auto& item : pack.items) {
-        if (uninstall_fn(item.kind, item.item_id))
+        auto item_result = uninstall_fn(item.kind, item.item_id);
+        if (item_result) {
             ++removed;
-        else
-            spdlog::warn("ProductPackStore: failed to remove {} item '{}'", item.kind,
-                         item.item_id);
+        } else if (item_result.error().starts_with(kProductPackDbErrorPrefix)) {
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                    "failed to remove " + item.kind + " item '" + item.item_id +
+                                    "': " + item_result.error());
+        } else {
+            spdlog::warn("ProductPackStore: failed to remove {} item '{}': {}", item.kind,
+                         item.item_id, item_result.error());
+        }
     }
 
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
