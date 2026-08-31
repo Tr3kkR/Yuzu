@@ -70,6 +70,20 @@ TEST_CASE("build_execution_options never sets expected_size -- that is the calle
     CHECK_FALSE(opts.exec_verify.expected_size.has_value());
 }
 
+// BR4-007 (whole-branch review round 4): the deleted Windows launcher passed
+// CREATE_NO_WINDOW to CreateProcessW; this pins that build_execution_options
+// restores it ONLY when is_windows is true, and never on a non-Windows
+// build combination -- the OS effect itself is unobservable from macOS (the
+// flag only affects Windows CreateProcessW creation flags), but the OPTION
+// SELECTION build_execution_options makes is a pure decision this header
+// already exposes, so it is fully testable here regardless of host OS.
+TEST_CASE("build_execution_options sets no_window true only when is_windows is true (BR4-007)",
+         "[agent][content_dist][exec][no_window]") {
+    CHECK(build_execution_options(/*is_linux=*/false, /*is_windows=*/true).no_window);
+    CHECK_FALSE(build_execution_options(/*is_linux=*/false, /*is_windows=*/false).no_window);
+    CHECK_FALSE(build_execution_options(/*is_linux=*/true, /*is_windows=*/false).no_window);
+}
+
 // ── map_execution_result: exited ─────────────────────────────────────────
 
 TEST_CASE("map_execution_result: exited with rc==0 reports status|ok", "[agent][content_dist][exec]") {

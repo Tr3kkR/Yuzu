@@ -351,13 +351,17 @@ int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& ar
     // contract; this is scoped to script_exec's Windows leg specifically
     // (the one caller with a pre-existing full-inheritance behaviour to
     // preserve), never a general default.
-    opts.inherit_parent_env = true;
     // BR4-007 (whole-branch review round 4): the deleted CreateProcessA
     // call also passed CREATE_NO_WINDOW -- restore it so an interactively
     // run agent invoking exec/powershell doesn't flash a console window a
     // pre-migration caller never saw. See SubprocessOptions::no_window's
-    // doc comment for the full contract.
-    opts.no_window = true;
+    // doc comment for the full contract. Sourced from
+    // windows_runner_overrides() (script_exec_parsers.hpp) so the pairing of
+    // these two Windows-only flags is testable from a pure, OS-call-free
+    // header even though this call site itself only compiles on Windows.
+    auto win_overrides = yuzu::script_exec::windows_runner_overrides();
+    opts.inherit_parent_env = win_overrides.inherit_parent_env;
+    opts.no_window = win_overrides.no_window;
 #endif
 
     // on_line delivers every line regardless of any runner-side cap

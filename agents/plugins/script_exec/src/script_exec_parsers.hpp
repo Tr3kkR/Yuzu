@@ -412,4 +412,22 @@ resolve_executable(std::string_view cmd, std::string_view cwd,
     return {};
 }
 
+/// The two Windows-only SubprocessOptions overrides run_via_runner
+/// (script_exec_plugin.cpp) layers on top of the base options whenever it is
+/// compiled for Windows -- see that function's A2-002/BR4-007 comments for
+/// the full pre-migration-preservation rationale. Both fields are
+/// UNCONDITIONALLY true there (a plain `#ifdef _WIN32` block, no runtime
+/// branch), so there is no decision for a Windows-only test to observe.
+/// Extracted here, into this OS-call-free header, so the PAIRING itself is
+/// portably testable on any host -- a regression that flips either default
+/// away from true is caught without needing a Windows CI leg to run it.
+struct WindowsRunnerOverrides {
+    bool inherit_parent_env = true;
+    bool no_window = true;
+};
+
+[[nodiscard]] inline WindowsRunnerOverrides windows_runner_overrides() {
+    return WindowsRunnerOverrides{};
+}
+
 } // namespace yuzu::script_exec

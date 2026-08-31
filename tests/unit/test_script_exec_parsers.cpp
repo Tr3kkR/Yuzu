@@ -359,3 +359,23 @@ TEST_CASE("split_args_windows: round-trips quote_windows_arg's own encoding for 
     REQUIRE(args.size() == 1);
     CHECK(args[0] == original);
 }
+
+// ── windows_runner_overrides (no_window / inherit_parent_env pairing) ──────
+//
+// run_via_runner (script_exec_plugin.cpp) only compiles its Windows-only
+// `#ifdef _WIN32` block -- which sets opts.inherit_parent_env/opts.no_window
+// -- on an actual Windows build, so neither flag is directly observable from
+// a macOS/Linux test host. windows_runner_overrides() extracts the PAIRING
+// of the two literals into this pure, OS-call-free header instead: it is
+// portably testable on every host, and pins the CREATE_NO_WINDOW
+// restoration (BR4-007) and the full-environment inheritance (A2-002) this
+// plugin's Windows leg preserves from the deleted CreateProcessA call, so a
+// future edit that silently flips either default away from `true` is caught
+// here rather than only ever failing on the Windows CI leg.
+TEST_CASE("windows_runner_overrides pins no_window and inherit_parent_env both true "
+          "(BR4-007 / A2-002)",
+          "[script_exec][parsers][windows][no_window]") {
+    auto overrides = yuzu::script_exec::windows_runner_overrides();
+    CHECK(overrides.no_window);
+    CHECK(overrides.inherit_parent_env);
+}
