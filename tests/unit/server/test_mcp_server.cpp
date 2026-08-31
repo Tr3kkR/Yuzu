@@ -7201,6 +7201,15 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
           std::string(yuzu::server::kDestructiveUntargetedMessage));
     CHECK(appr.pending_count() == 0);
     CHECK_FALSE(dispatched);
+    // Gate 8 round 3 (residual B, coordinator follow-up): this is the C8
+    // pre-mint RefuseUntargeted arm specifically — the audit-detail test at
+    // line ~7111 above exercises the OPERATOR-tier main-handler backstop's
+    // RefuseUntargeted arm instead, so it cannot see this arm's "reason="
+    // prefix (added in the prior commit for parity with the adjacent
+    // ClassifyMiss arm). Assert it here so the prefix ships with coverage.
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=destructive_untargeted") != std::string::npos);
 }
 
 namespace {
