@@ -674,8 +674,11 @@ void PolicyEvaluator::collect_ready() {
         // Check re-establishes the true state. Neither case silently
         // fleet-wide-skips checking the way an equivalent break in
         // dispatch_due() would.
-        if (d_.should_stop && d_.should_stop())
+        if (d_.should_stop && d_.should_stop()) {
+            spdlog::info("PolicyEvaluator: collect_ready() stopping early on shutdown - "
+                         "remaining ready item(s) deferred");
             break;
+        }
         // Degrade → empty (ADR-0039 deny-or-benign): a transient read failure
         // reads as "no terminal response yet", the same as a genuinely slow
         // agent — verdict_for() below already treats an unmatched target as

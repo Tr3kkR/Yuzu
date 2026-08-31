@@ -4,6 +4,8 @@
 #include "preflight_parse.hpp"
 #include "preflight_run_store.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <chrono>
 
 namespace yuzu::server {
@@ -35,8 +37,11 @@ void PreflightRunner::tick() {
         // #3495: bounds how many MORE runs a single tick() call starts once
         // shutdown begins — a run already in progress still finishes its own
         // dispatch + persist below cleanly, this only stops the next one.
-        if (d_.should_stop && d_.should_stop())
+        if (d_.should_stop && d_.should_stop()) {
+            spdlog::info("PreflightRunner: tick() stopping early on shutdown - "
+                         "remaining run(s) deferred");
             break;
+        }
         const auto cfg = preflight::config_from_json(run.config_json);
         auto targets = d_.run_store->get_targets(run.run_id);
         if (targets.empty()) {
