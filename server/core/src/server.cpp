@@ -116,6 +116,7 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
+#include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
@@ -525,6 +526,19 @@ public:
         }
         metrics_.describe("yuzu_commands_dispatched_total",
                           "Total number of commands dispatched to agents", "counter");
+        metrics_.describe(
+            "yuzu_server_shutdown_dispatch_reach_zero_total",
+            "#3495: dispatches that reached zero agents while a shutdown was in progress - a "
+            "correlated signal (may reflect Shutdown(deadline) forcibly cancelling a stream "
+            "write mid-dispatch, or an ordinary zero-reach dispatch that happened to land "
+            "during the shutdown window; this metric cannot distinguish the two)",
+            "counter");
+        // Pre-seed so the series is present-at-0 on a healthy boot rather than
+        // absent until it first fires (enterprise-readiness governance
+        // finding, 2026-08-30 — `describe()` alone only registers HELP/TYPE
+        // text, not the series itself; `serialize()` emits only families that
+        // exist in `counters_`, populated solely by a `.counter(name)` call).
+        metrics_.counter("yuzu_server_shutdown_dispatch_reach_zero_total");
         metrics_.describe("yuzu_commands_completed_total",
                           "Total number of completed commands by status", "counter");
         metrics_.describe("yuzu_command_duration_seconds", "Command execution latency in seconds",
@@ -1163,10 +1177,12 @@ public:
         // is emitted-but-unseeded: it passes its own test while the dashboard reads
         // zero and the alert never fires.
         metrics_.describe("yuzu_server_dispatch_target_rejected_total",
-                          "REST dispatch calls refused because a supplied targeting argument "
+                          "Dispatch calls refused because a supplied targeting argument "
                           "named no device, plus dispatch-closure calls that named no target at "
-                          "all (#2500). Both labels are closed sets; every reachable pair is "
-                          "pre-seeded at boot so absent() stays meaningful.",
+                          "all (#2500), plus Destructive-class capabilities targeted without "
+                          "explicit agent_ids on REST (route=command) or MCP execute_instruction "
+                          "(route=mcp, #3685). Both labels are closed sets; every reachable pair "
+                          "is pre-seeded at boot so absent() stays meaningful.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
         // (dispatch_target_shape.hpp). They are spelled out here rather than
@@ -1189,6 +1205,19 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonBodyType)}});
         }
+        // #3685: Destructive-class targeting refusal. Seeded on `command`
+        // (REST `/api/command`) and `mcp` (MCP `execute_instruction`, both
+        // the C8 pre-mint gate and the main-handler backstop share this one
+        // label — mutually exclusive per request, so no double-count) —
+        // deliberately NOT `instruction_execute`: that route has no
+        // Destructive gate yet (tracked as a residual parity follow-up), and
+        // seeding it here would publish a series claiming a reachability
+        // that does not exist, which is exactly what the per-route seeding
+        // above exists to avoid.
+        for (const char* route : {"command", "mcp"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
         for (const auto reason : {yuzu::server::kReasonParentIdType,
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
@@ -1305,7 +1334,11 @@ public:
         // on today.
         metrics_.describe("yuzu_server_dispatch_denied_total",
                           "Dispatches refused by the classification/authorization chokepoint "
-                          "(`build_classified_command`), labelled by which gate refused. "
+                          "(`build_classified_command`) or, for `unclassified`/`ambiguous` on "
+                          "MCP's `execute_instruction` specifically, by the C8 pre-mint gate "
+                          "(`mcp_server.cpp`) denying a classify-miss locally before an "
+                          "approval ticket is minted (#3685) - a second, independent emitter "
+                          "on the same series, labelled by which gate refused. "
                           "`kill_switched` is an operator-thrown emergency stop, deliberately "
                           "distinct from the `forbidden` authorization verdict.",
                           "counter");
@@ -2520,17 +2553,29 @@ public:
                           "retention sweep",
                           "counter");
         metrics_.counter("yuzu_auth_session_reap_total");
-        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a)): incremented
-        // when a session reap pass is DECLINED because the wall clock read is
-        // implausibly ahead of, or behind, the persisted anchor — i.e. a DB/host
-        // clock anomaly (a backward step un-expires sessions). Pre-seeded to 0 so
+        // DB-PRIMARY clock-integrity monitor (ADR-2002 §4 mitigation (a)):
+        // incremented when a session reap pass is DECLINED because the DB `now()`
+        // read (the same clock that authors expires_at) is implausibly ahead of,
+        // or behind, the persisted anchor — i.e. a DB-primary clock anomaly (a
+        // backward step un-expires sessions). Pre-seeded to 0 so
         // YuzuSessionReapClockAnomaly's `increase() > 0` alert is meaningful.
         metrics_.describe("yuzu_auth_session_reap_clock_anomaly_total",
                           "Session reap passes declined due to an implausible (forward or backward) "
-                          "wall-clock reading vs the persisted anchor - the DB-clock-integrity "
-                          "signal for durable sessions (ADR-2002 section 4)",
+                          "PostgreSQL now() reading vs the persisted anchor - the DB-primary "
+                          "clock-integrity signal for durable sessions (ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total");
+        // LOCAL host-clock drift (design-review M6): incremented when THIS
+        // replica's wall clock falls behind monotonic time. DISTINCT from the
+        // DB-primary series above - with DB-clock authority session adjudication no
+        // longer rides this host's wall clock, so this is a host-health signal, not
+        // a session-integrity one. Pre-seeded to 0 for a meaningful increase() alert.
+        metrics_.describe("yuzu_auth_local_clock_backward_total",
+                          "Times this replica's local wall clock was observed to fall behind "
+                          "monotonic time (host-clock-integrity signal; session adjudication is "
+                          "DB-clock-authored, ADR-2002 section 4)",
+                          "counter");
+        metrics_.counter("yuzu_auth_local_clock_backward_total");
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -5999,6 +6044,22 @@ public:
                     metrics_.counter("yuzu_server_product_pack_backfill_total",
                                      {{"result", result}});
                 }
+                metrics_.describe("yuzu_server_product_pack_install_compensation_total",
+                                  "#3481: best-effort rollback of already-installed sibling-store "
+                                  "content after a late install() failure (final persist or "
+                                  "duplicate-item-id), by result (ok = every already-installed "
+                                  "item was compensated; partial = at least one was not and "
+                                  "requires manual/operator cleanup - see rest-api.md's "
+                                  "POST /api/product-packs 503 note). Only emitted when a "
+                                  "compensate_fn was supplied, i.e. on the real HTTP route; a "
+                                  "direct ProductPackStore::install() caller that omits it leaves "
+                                  "this counter untouched, same as omitting compensate_fn always "
+                                  "has.",
+                                  "counter");
+                for (auto result : {"ok", "partial"}) {
+                    metrics_.counter("yuzu_server_product_pack_install_compensation_total",
+                                     {{"result", result}});
+                }
                 auto pack_db = cfg_.db_dir() / "product-packs.db";
                 if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
                     spdlog::error(
@@ -8408,17 +8469,70 @@ public:
             health_recompute_thread_.join();
         }
 
-        // Join the policy evaluation thread (uses policy_evaluator_ + stores,
-        // so it must stop before any of them are torn down)
+        // Join the app-perf roll-up thread (borrows app_perf_rollup_ +
+        // app_perf_fleet_store_ — must stop before they / the pool are torn down).
+        // Pure PG I/O (roll_window/prune) — no AgentRegistry/dispatch
+        // involvement, so unlike the four threads below it does not need to
+        // sit after Shutdown(deadline) (verified governance Gate 3
+        // cpp-safety, 2026-08-30: grepped for dispatch_fn/send_to/
+        // AgentRegistry in this thread's body, none found).
+        if (app_perf_rollup_thread_.joinable()) {
+            app_perf_rollup_thread_.join();
+        }
+        // #3495: Shutdown gRPC with a deadline BEFORE joining the four
+        // background threads below (policy evaluation, pre-flight runner,
+        // quarantine containment reconciler, schedule tick) — all four
+        // synchronously call into AgentRegistry::send_to() ->
+        // stream->Write(), which can block indefinitely on an HTTP/2
+        // flow-control window with no bound of its own (PolicyEvaluator via
+        // dispatch_instruction() -> the same shared command_dispatch_fn
+        // closure the other three use — governance Gate 3 architect,
+        // 2026-08-30: the original #3495 fix moved this call ahead of only
+        // three of command_dispatch_fn's four production consumers, missing
+        // policy_eval_thread_; that gap derived the same BLOCKING band as
+        // the original bug and is closed here, not deferred). Previously
+        // this call ran AFTER these joins (see the "now safe" block further
+        // down, where the drain-then-null sequence for execution_tracker_
+        // etc. still lives): a thread blocked inside such a write had no
+        // path to unblock, because stop_requested_ (and each
+        // Deps::should_stop it's wired into, where these threads are
+        // started) only stops the NEXT dispatch from starting, not one
+        // already in flight — and Shutdown(deadline), the one thing that
+        // forcibly cancels an in-flight RPC, hadn't run yet. Calling it
+        // here first means a blocked write is forcibly cancelled within
+        // `deadline`, so every join below is now bounded by `deadline` plus
+        // whatever fast-fail unwind/store-call tail follows cancellation
+        // (same shape as the fn-null-wait's bound, further down) instead of
+        // unbounded (governance #3495: chaos-injector
+        // HIGH + codex external tie-break, 2026-08-24; found on the
+        // three-thread shape while reviewing #3425's addition of the third
+        // one; the fourth found in Gate 3 re-review).
+        //
+        // Safe against #1867's lesson (drain producers before nulling the
+        // borrowed pointers they use — see the "now safe" block below,
+        // unchanged): every pointer that drain protects is still nulled
+        // AFTER both this call and the four joins below. Moving this call
+        // earlier only widens that margin; it does not narrow it.
+        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
+        if (agent_server_)
+            agent_server_->Shutdown(deadline);
+        if (mgmt_server_)
+            mgmt_server_->Shutdown(deadline);
+
+        // #3495 (sre governance finding, 2026-08-30): a bare join gives an
+        // operator watching a slow shutdown no breadcrumb distinguishing
+        // "these four threads are still finishing up" from "stop() is
+        // wedged somewhere else entirely" — each thread's own start/stop
+        // lines (below, at construction) narrow it further once this fires.
+        spdlog::info("Shutting down server: joining policy-eval/pre-flight/"
+                     "quarantine/schedule background threads...");
+
+        // Join the policy evaluation thread (uses policy_evaluator_ +
+        // stores + the dispatch path — stop before teardown).
         if (policy_eval_thread_.joinable()) {
             policy_eval_thread_.join();
         }
 
-        // Join the app-perf roll-up thread (borrows app_perf_rollup_ +
-        // app_perf_fleet_store_ — must stop before they / the pool are torn down).
-        if (app_perf_rollup_thread_.joinable()) {
-            app_perf_rollup_thread_.join();
-        }
         // Join the pre-flight runner thread (uses preflight_run_store_ +
         // response_store_ + the dispatch path — stop before teardown), then drop
         // the runner so its borrowed pointers can't be ticked again.
@@ -8557,12 +8671,14 @@ public:
             }
         }
 
-        // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
-        // ManagementService streams drain before we drop the stores they
-        // reference. Without a deadline, Shutdown() waits indefinitely for
-        // all RPCs to finish, and the Subscribe RPC is a long-lived
-        // bidirectional stream that never completes on its own. With a
-        // deadline, RPCs are forcibly cancelled at expiry.
+        // agent_server_/mgmt_server_->Shutdown(deadline) already ran above
+        // (#3495), immediately before the policy-eval/pre-flight/quarantine/
+        // schedule joins — moved there so its forced-cancellation reaches
+        // those threads' in-flight dispatch writes too, not just the direct
+        // Subscribe/ManagementService streams. In-flight Subscribe and
+        // ManagementService streams have therefore already drained or been
+        // forcibly cancelled by this point, same as before the move — only
+        // WHEN that happens changed, not the deadline or its 5s bound.
         //
         // Governance round (UAT 2026-05-06 architect Gate 3 B-1):
         // AgentServiceImpl borrows execution_tracker_ via a raw pointer
@@ -8571,12 +8687,8 @@ public:
         // CommandResponse frame. Resetting execution_tracker_ before the
         // gRPC drain race-windowed a use-after-free during graceful
         // shutdown. Drain producers first, null the borrowed pointer
-        // explicitly, then release the tracker.
-        auto deadline = std::chrono::system_clock::now() + std::chrono::seconds(5);
-        if (agent_server_)
-            agent_server_->Shutdown(deadline);
-        if (mgmt_server_)
-            mgmt_server_->Shutdown(deadline);
+        // explicitly, then release the tracker — still true here: the drain
+        // (and now the four joins too) both precede this section.
 
         // Now safe: gRPC streams have either completed or been cancelled,
         // so no thread is inside notify_exec_tracker holding the borrowed
@@ -8666,6 +8778,17 @@ public:
         // The reconciler's own background thread is already joined above;
         // this closes the OTHER caller (the heartbeat fast path, driven by
         // gRPC handler threads already quiesced by the drains above).
+        //
+        // #3495 re-verification: this wait (quarantine_reconcile_mu_'s
+        // exclusive lock, heartbeat_ingestion.hpp) stays sequenced AFTER
+        // agent_server_->Shutdown(deadline) even though that call moved
+        // earlier in this function — it did not move past this point, only
+        // to before the four joins above it. So this wait's bound is
+        // unchanged (still Shutdown's 5s deadline plus whatever store-call
+        // timeout was already in flight when forced cancellation landed),
+        // not regressed to unbounded by the reorder above (#3495 acceptance
+        // criterion: this bound must be re-verified, not assumed, against any
+        // new ordering).
         if (heartbeat_ingestion_)
             heartbeat_ingestion_->set_quarantine_reconcile_fn(nullptr);
         quarantine_reconciler_.reset();
@@ -10905,6 +11028,25 @@ private:
         forward_gateway_pending();
         if (outcome.sent > 0)
             metrics_.counter("yuzu_commands_dispatched_total").increment();
+        // #3495 (sre governance finding, 2026-08-30): before this PR, a
+        // dispatch cancelled mid-write by ServerImpl::stop()'s newly-earlier
+        // agent_server_->Shutdown(deadline) call left zero trace anywhere —
+        // PreflightRunner discards this return value entirely, and only
+        // ScheduleRunner logs (misleadingly, "reached no agents", with no
+        // shutdown context) on a total-reach-zero dispatch. This is a
+        // CORRELATED signal, not a precise one: `stop_requested_` true and
+        // `outcome.sent == 0` together may mean Shutdown(deadline) forcibly
+        // cancelled the underlying stream write, or may just be an ordinary
+        // zero-reach dispatch (every target offline, quarantine denial) that
+        // happened to land during the shutdown window — this metric cannot
+        // tell the two apart, and does not try to.
+        if (outcome.sent == 0 && stop_requested_.load(std::memory_order_acquire)) {
+            metrics_.counter("yuzu_server_shutdown_dispatch_reach_zero_total").increment();
+            spdlog::warn("dispatch {}:{} reached 0 agents while a shutdown was in progress "
+                         "(command_id={}) — may reflect a forced stream cancellation, not "
+                         "necessarily a routine zero-reach dispatch",
+                         plugin, norm_action, command_id);
+        }
         return {command_id, outcome.sent};
     }
 
@@ -13606,7 +13748,14 @@ private:
         // GET /api/agents/:id/properties
         web_server_->Get(R"(/api/agents/([^/]+)/properties)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
+            auto agent_id = req.matches[1].str();
+            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Read
+            // gate. The old require_permission("Infrastructure","Read") admitted
+            // a global-permission holder with no target check, disclosing
+            // custom-properties data for agents outside a management-group-
+            // confined caller's scope (World A gap, ADR-0017). Same pattern as
+            // the Tag routes' require_scoped_permission (see /api/tags/set).
+            if (!require_scoped_permission(req, res, "Infrastructure", "Read", agent_id))
                 return;
             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                 res.status = 503;
@@ -13616,7 +13765,6 @@ private:
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             auto props = custom_properties_store_->get_properties(agent_id);
             if (!props) {
                 res.status = 503;
@@ -13644,7 +13792,15 @@ private:
                                                                                      httplib::
                                                                                          Response&
                                                                                              res) {
-            if (!require_permission(req, res, "Infrastructure", "Write"))
+            auto agent_id = req.matches[1].str();
+            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
+            // gate. The old require_permission("Infrastructure","Write") admitted
+            // any global-permission holder with no target check, letting a
+            // caller mutate custom-properties data for any agent regardless of
+            // their otherwise-confined visibility elsewhere (World A gap,
+            // ADR-0017). Same pattern as the Tag routes' require_scoped_permission
+            // (see /api/tags/set).
+            if (!require_scoped_permission(req, res, "Infrastructure", "Write", agent_id))
                 return;
             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                 res.status = 503;
@@ -13654,7 +13810,6 @@ private:
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
 
             std::string value;
@@ -13683,6 +13838,8 @@ private:
 
             auto result = custom_properties_store_->set_property(agent_id, key, value, type);
             if (!result) {
+                (void)audit_log(req, "custom_property.set", "failure", "Agent", agent_id,
+                                key + ": " + result.error());
                 if (is_custom_properties_db_error(result.error())) {
                     spdlog::error("PUT /api/agents/{}/properties/{}: {}", agent_id, key,
                                   result.error());
@@ -13716,7 +13873,15 @@ private:
                                                                                         httplib::
                                                                                             Response&
                                                                                                 res) {
-            if (!require_permission(req, res, "Infrastructure", "Write"))
+            auto agent_id = req.matches[1].str();
+            // #3700: per-TARGET authorization -- NOT a global Infrastructure:Write
+            // gate. The old require_permission("Infrastructure","Write") admitted
+            // any global-permission holder with no target check, letting a
+            // caller delete custom-properties data for any agent regardless of
+            // their otherwise-confined visibility elsewhere (World A gap,
+            // ADR-0017). Same pattern as the Tag routes' require_scoped_permission
+            // (see /api/tags/delete).
+            if (!require_scoped_permission(req, res, "Infrastructure", "Write", agent_id))
                 return;
             if (!custom_properties_store_ || !custom_properties_store_->is_open()) {
                 res.status = 503;
@@ -13726,11 +13891,12 @@ private:
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
 
             bool deleted = custom_properties_store_->delete_property(agent_id, key);
             if (!deleted) {
+                (void)audit_log(req, "custom_property.delete", "not_found", "Agent", agent_id,
+                                "key=" + key);
                 res.status = 404;
                 res.set_content(
                     R"({"error":{"code":404,"message":"property not found"},"meta":{"api_version":"v1"}})",
@@ -14532,44 +14698,129 @@ private:
             // `registry.delete_key`) rather than silently exempting them from
             // the same targeting-safety treatment `tar.purge_source` alone used
             // to get.
+            //
+            // #3685: routed through the pure `evaluate_destructive_targeting` /
+            // `confine_destructive_targets` (`dispatch_destructive_gate.hpp`)
+            // instead of the inline `if (classified_for_gate && ...)` guard that
+            // used to live here — that guard collapsed "classified and not
+            // Destructive" and "failed to classify at all" into the same skipped
+            // branch. `ClassifyMiss` is now an explicit switch arm below
+            // (Policy B: fall through to `build_classified_command`, which
+            // denies a real miss unconditionally with its own taxonomy/metric/
+            // audit shape) — this commit is externally byte-identical to the
+            // block it replaces except the two refusal strings now come from
+            // `dispatch_destructive_gate.hpp`'s named constants instead of
+            // inline literals.
             {
-                const auto classified_for_gate = capability_registry_.classify(plugin, action);
-                if (classified_for_gate &&
-                    classified_for_gate->dispatch_class == yuzu::server::DispatchClass::Destructive) {
-                    const auto& cap = *classified_for_gate;
+                const auto gate = yuzu::server::evaluate_destructive_targeting(
+                    capability_registry_.classify(plugin, action),
+                    /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                    /*scope_key_present=*/!extract_json_string(body, "scope").empty());
+                switch (gate.verdict) {
+                case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                    break;
+                case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                    // Policy B (#3685 decision, revised after external review):
+                    // explicit fall-through, not a new denial site. The SAME
+                    // registry/classifier `build_classified_command` consults
+                    // below denies a real miss unconditionally with its own
+                    // taxonomy/metric/audit shape — an independent early denial
+                    // here would only duplicate, and risk drifting from, that
+                    // evidence.
+                    break;
+                case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
+                    const auto& cap = *gate.capability;
+                    // Elevation FIRST — preserves the pre-#3685 403-before-400
+                    // ordering. This stays the JIT-elevation-aware
+                    // `require_permission`, deliberately distinct from the
+                    // dispatch chokepoint's base-grants-only `has_permission`
+                    // callback (`agent_registry.hpp`) — see
+                    // `dispatch_destructive_gate.hpp`'s D3/D4 doc comment for
+                    // why the two are never collapsed.
                     if (!require_permission(req, res, std::string(cap.securable),
                                             std::string(yuzu::server::authz::to_string(cap.operation))))
                         return;
-                    // Destructive dispatch must be explicitly targeted + in scope.
-                    if (agent_ids.empty() || !extract_json_string(body, "scope").empty()) {
+                    if (gate.verdict ==
+                        yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
+                        // #3685: counted like every other refusal in this
+                        // family (#2500 precedent above) — an uncounted
+                        // refusal on a P1 security control cannot reach the
+                        // dashboard/alert this observability commit ships.
+                        // #3685 governance round: guarded the same way MCP's
+                        // two equivalent increments already are in this PR
+                        // (mcp_server.cpp, both #3685 gate sites) — an
+                        // increment failure must never skip the audit write
+                        // or the response below it.
+                        try {
+                            metrics_
+                                .counter("yuzu_server_dispatch_target_rejected_total",
+                                         {{"route", "command"},
+                                          {"reason",
+                                           std::string(
+                                               yuzu::server::kReasonDestructiveUntargeted)}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                        // #3685 fix round (adversarial review F2): audited like
+                        // the check_targeting_shape refusal ~100 lines above in
+                        // this same function, and like MCP's twin refusal
+                        // (mcp_audit, this same PR) — an incident review of a
+                        // near-miss broadcast-Destructive attempt must find a
+                        // row here, not just a counter increment.
+                        const bool audit_ok =
+                            audit_log(req, "command.dispatch", "denied", "command", "",
+                                      std::string("reason=") +
+                                          std::string(
+                                              yuzu::server::kReasonDestructiveUntargeted) +
+                                          " " + onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                          onbehalf::sanitize_for_log(action, 128));
+                        if (!audit_ok)
+                            res.set_header("Sec-Audit-Failed", "true");
                         res.status = 400;
-                        res.set_content(
-                            R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
-                            "application/json");
+                        // #3685 governance round: same nlohmann::json +
+                        // `audit_emitted` shape as this handler's three
+                        // sibling denial arms (body-type,
+                        // check_targeting_shape, build_classified_command) —
+                        // this row is now documented as audited, so its
+                        // response must not be the one denial arm that
+                        // silently omits the caller-visible evidence-gap
+                        // signal.
+                        nlohmann::json err{
+                            {"error",
+                             {{"code", 400},
+                              {"message",
+                               std::string(yuzu::server::kDestructiveUntargetedMessage)}}},
+                            {"meta", {{"api_version", "v1"}}}};
+                        if (audit_store_)
+                            err["audit_emitted"] = audit_ok;
+                        res.set_content(err.dump(), "application/json");
                         return;
                     }
-                    // Confine to the operator's visible agents (fail-closed: an absent
-                    // mgmt-group store filters to empty → 404, same posture as the
-                    // dashboard fragment). Out-of-scope ids are silently dropped.
-                    std::vector<std::string> filtered;
-                    if (mgmt_group_store_) {
-                        // ADR-0042: nullopt (store degraded) → empty visible set → 404.
-                        auto vis = mgmt_group_store_->get_visible_agents(sess->username);
-                        std::unordered_set<std::string> visible;
-                        if (vis)
-                            visible.insert(vis->begin(), vis->end());
-                        for (const auto& aid : agent_ids)
-                            if (visible.count(aid))
-                                filtered.push_back(aid);
-                    }
-                    agent_ids = std::move(filtered);
+                    // Confine to the operator's visible agents (fail-closed: an
+                    // absent or degraded mgmt-group read → empty → 404, same
+                    // posture as the dashboard fragment). Out-of-scope ids are
+                    // silently dropped. `DestructiveVisibleAgents`'s nullopt
+                    // means fail-closed-empty — the OPPOSITE of
+                    // `authz::VisibleSet`'s nullopt (unfiltered) — see that
+                    // type's doc comment (`dispatch_destructive_gate.hpp`).
+                    std::optional<std::vector<std::string>> vis;
+                    if (mgmt_group_store_)
+                        vis = mgmt_group_store_->get_visible_agents(
+                            sess->username); // ADR-0042: nullopt (degraded) → fail-closed
+                    agent_ids = yuzu::server::confine_destructive_targets(
+                        agent_ids, yuzu::server::DestructiveVisibleAgents{std::move(vis)});
                     if (agent_ids.empty()) {
                         res.status = 404;
                         res.set_content(
-                            R"({"error":{"code":404,"message":"no reachable in-scope agent"},"meta":{"api_version":"v1"}})",
+                            R"({"error":{"code":404,"message":")" +
+                                std::string(yuzu::server::kDestructiveNoVisibleAgentMessage) +
+                                R"("},"meta":{"api_version":"v1"}})",
                             "application/json");
                         return;
                     }
+                    break;
+                }
                 }
             }
 
@@ -18200,6 +18451,11 @@ private:
             .mgmt_group_store = mgmt_group_store_.get(),
             .metrics = &metrics_,
             .dispatch_fn = command_dispatch_fn,
+            // #3495: lets a shutdown request stop tick() from starting
+            // further dispatch_instruction() calls once stop_requested_
+            // flips — same field and wiring as the other three background
+            // engines' Deps.
+            .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         policy_eval_thread_ = std::thread([this]() {
             spdlog::info("Policy evaluation thread started (cadence=10s, grace=15s)");
@@ -18225,6 +18481,11 @@ private:
                     }
                 }
             }
+            // #3495 (sre governance finding, 2026-08-30): mirrors the
+            // quarantine reconciler's exit log — an operator watching a slow
+            // shutdown otherwise sees silence after the last progress line
+            // with no way to tell whether this thread already finished.
+            spdlog::info("Policy evaluation thread stopped");
         });
 
         // App-perf B1->B2 roll-up thread (DEX app-perf-over-time). Re-rolls the
@@ -18279,6 +18540,10 @@ private:
             .dispatch_fn = command_dispatch_fn,
             .now_ms_fn = {},
             .retention_days = 14,
+            // #3495: lets a shutdown request stop tick() from starting
+            // further runs once stop_requested_ flips — same field and
+            // wiring as QuarantineContainmentReconciler::Deps below.
+            .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         preflight_runner_thread_ = std::thread([this]() {
             spdlog::info("Pre-flight runner thread started (cadence=60s, retention=14d)");
@@ -18322,6 +18587,10 @@ private:
                     }
                 }
             }
+            // #3495 (sre governance finding, 2026-08-30): mirrors the
+            // quarantine reconciler's exit log — see policy_eval_thread_'s
+            // matching line for the full rationale.
+            spdlog::info("Pre-flight runner thread stopped");
         });
 
         // QuarantineContainmentReconciler (#3425) — re-applies endpoint
@@ -18476,6 +18745,10 @@ private:
                                                                rbac_store_.get(), principal,
                                                                plugin, action);
             },
+            // #3495: lets a shutdown request stop tick() from firing further
+            // due schedules once stop_requested_ flips — same field and
+            // wiring as QuarantineContainmentReconciler::Deps above.
+            .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
         });
         schedule_tick_thread_ = std::thread([this]() {
             spdlog::info("Schedule runner thread started (cadence=30s)");
@@ -18501,6 +18774,10 @@ private:
                     }
                 }
             }
+            // #3495 (sre governance finding, 2026-08-30): mirrors the
+            // quarantine reconciler's exit log — see policy_eval_thread_'s
+            // matching line for the full rationale.
+            spdlog::info("Schedule runner thread stopped");
         });
 
         // Result-set maintenance thread (capability §30) — materialises pending
@@ -18575,13 +18852,17 @@ private:
                         const bool rs_ok = result_set_store_ && result_set_store_->is_open();
                         ++tick;
 
-                        // DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
-                        // C1): compare the wall clock against a monotonic reference
-                        // via ClockDriftMonitor, which ACCUMULATES sub-threshold
-                        // backward drift — so a stopped / slowly-slewed-back wall
-                        // clock (each ~2s sample diverging by less than the
-                        // tolerance) is still caught, unlike a per-sample delta.
-                        // Runs every ~2s tick, independent of the 15m reap anchor.
+                        // LOCAL host-clock drift monitor (design-review M6): compare
+                        // this replica's wall clock against a monotonic reference via
+                        // ClockDriftMonitor, which ACCUMULATES sub-threshold backward
+                        // drift — so a stopped / slowly-slewed-back wall clock (each
+                        // ~2s sample diverging by less than the tolerance) is still
+                        // caught, unlike a per-sample delta. Runs every ~2s tick.
+                        // DISTINCT counter from the reap's DB-clock series: with
+                        // DB-clock authority (ADR-2002 §4) session adjudication no
+                        // longer rides THIS host's wall clock, so a local wobble here
+                        // is a host-health signal, not a session-integrity one, and
+                        // must not conflate with yuzu_auth_session_reap_clock_anomaly.
                         if (session_store_ && session_store_->is_open()) {
                             const int64_t wall_ms =
                                 std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -18592,11 +18873,11 @@ private:
                                     std::chrono::steady_clock::now().time_since_epoch())
                                     .count();
                             if (session_clock_monitor.observe(wall_ms, steady_ms)) {
-                                spdlog::warn("session clock monitor: wall clock has fallen behind "
-                                             "monotonic time (backward step / stall / slow negative "
-                                             "slew) — un-expires sessions / extends JIT+MFA windows");
-                                metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
-                                    .increment();
+                                spdlog::warn("local clock monitor: this replica's wall clock has "
+                                             "fallen behind monotonic time (backward step / stall / "
+                                             "slow negative slew) — a host-clock-integrity signal "
+                                             "(session adjudication is DB-clock-authored, ADR-2002 §4)");
+                                metrics_.counter("yuzu_auth_local_clock_backward_total").increment();
                             }
                         }
 
@@ -18689,23 +18970,25 @@ private:
                         // them out on a ~15m cadence. reap_expired is clock-guarded
                         // (advisory-lock own-statement + persisted anchor +
                         // implausible-skew decline + 5000/pass cap) and single-writer-
-                        // safe. now_ms is this server's wall clock; the guard sanitises
-                        // it. A returned count>0 is counted for retention auditability.
+                        // safe. It reads the DB clock (`now()`) itself now — the same
+                        // clock that authors expires_at (ADR-2002 §4 DB-clock
+                        // authority) — so its clock_anomaly IS the DB-primary clock
+                        // signal. A returned count>0 is counted for auditability.
                         if (session_store_ && session_store_->is_open() &&
                             tick % kSessionReapEveryNTicks == 0) {
-                            const std::int64_t now_ms =
-                                std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::system_clock::now().time_since_epoch())
-                                    .count();
-                            if (auto reaped = session_store_->reap_expired(now_ms)) {
+                            if (auto reaped = session_store_->reap_expired()) {
                                 if (reaped->deleted > 0)
                                     metrics_.counter("yuzu_auth_session_reap_total")
                                         .increment(static_cast<double>(reaped->deleted));
-                                // DB-clock-integrity monitor (ADR-2002 §4 mitigation
-                                // (a)): a declined pass due to a forward/backward
-                                // clock anomaly is the "monitor for backward
-                                // movement; alert" signal. Surfaced as a counter so
-                                // YuzuSessionReapClockAnomaly can fire on it.
+                                // DB-primary clock-integrity signal (ADR-2002 §4
+                                // mitigation (a) — "monitor for backward movement;
+                                // alert"). A reap decline on a backward/forward DB
+                                // now() lands here; YuzuSessionReapClockAnomaly fires
+                                // on it. DISTINCT from the LOCAL host-clock drift
+                                // monitor below (design-review M6): a local host
+                                // wall-clock wobble no longer affects session
+                                // adjudication (steady-based), so it must not muddy
+                                // this DB-clock series.
                                 if (reaped->clock_anomaly)
                                     metrics_.counter("yuzu_auth_session_reap_clock_anomaly_total")
                                         .increment();
@@ -21157,6 +21440,19 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // #3685 — the SAME CommandCapabilityRegistry::classify the /api/command
+            // Destructive gate consults (server.cpp's own Destructive block above),
+            // wired UNCONDITIONALLY exactly like set_kek_ops immediately above:
+            // capability_registry_ is a plain ServerImpl member, never conditional
+            // on another store's presence, so gating this wiring behind an
+            // unrelated conditional would be the same ADR-1005 A1 drift the KEK
+            // comment warns about — and, per McpServer::ClassifyFn's fail-closed
+            // contract (mcp_server.hpp), omitting this call is not merely a
+            // degraded tool but every execute_instruction call refusing outright.
+            mcp_server_->set_capability_classify_fn(
+                [this](std::string_view p, std::string_view a) {
+                    return capability_registry_.classify(p, a);
+                });
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP
             // query_installed_software twins cannot observe a different admit

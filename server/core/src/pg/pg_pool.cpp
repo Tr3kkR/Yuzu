@@ -356,6 +356,10 @@ bool PgPool::with_txn_for(std::chrono::milliseconds timeout,
     return run_in_txn(try_acquire_for(timeout), fn);
 }
 
+bool PgPool::with_txn_on(Lease lease, const std::function<bool(PGconn*)>& fn) {
+    return run_in_txn(std::move(lease), fn);
+}
+
 bool PgPool::run_in_txn(Lease lease, const std::function<bool(PGconn*)>& fn) {
     if (!lease)
         return false;

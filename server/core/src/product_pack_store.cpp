@@ -343,6 +343,14 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE TABLE deleted_pack_ids ("
          "  pack_id    TEXT PRIMARY KEY,"
          "  deleted_at BIGINT NOT NULL);"},
+        // F033/#3481: optional client-supplied Idempotency-Key dedup. NULL for every install that
+        // doesn't supply one — a plain (non-partial) unique index would work identically here
+        // (Postgres already treats every NULL as distinct in a unique index), but the partial
+        // form skips indexing the common keyless case.
+        {2,
+         "ALTER TABLE product_packs ADD COLUMN idempotency_key TEXT;"
+         "CREATE UNIQUE INDEX idx_product_packs_idempotency_key ON product_packs(idempotency_key) "
+         "WHERE idempotency_key IS NOT NULL;"},
     };
     return kMigrations;
 }
@@ -458,6 +466,25 @@ std::string ProductPackStore::extract_yaml_value(const std::string& yaml, const 
         return val;
     }
     return {};
+}
+
+TransactionOutcome ProductPackStore::check_transaction_outcome(pg::PgPool& pool,
+                                                                const std::string& xact_id) {
+    auto lease = pool.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return TransactionOutcome::kUnknown;
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT pg_xact_status($1::xid8)",
+                                       std::vector<std::string>{xact_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return TransactionOutcome::kUnknown;
+    if (PQgetisnull(res.get(), 0, 0))
+        return TransactionOutcome::kUnknown; // xid too old for the commit log — genuinely unknown
+    auto status = text_col(res.get(), 0, 0);
+    if (status == "committed")
+        return TransactionOutcome::kCommitted;
+    if (status == "aborted")
+        return TransactionOutcome::kAborted;
+    return TransactionOutcome::kUnknown; // "in progress" — still unresolved, or an unrecognized value
 }
 
 std::vector<std::string> ProductPackStore::split_yaml_documents(const std::string& bundle) {
@@ -1016,8 +1043,9 @@ bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
 
 // ── Install ─────────────────────────────────────────────────────────────────
 
-std::expected<std::string, std::string> ProductPackStore::install(const std::string& yaml_bundle,
-                                                                  ItemInstallFn install_fn) {
+std::expected<std::string, std::string> ProductPackStore::install(
+    const std::string& yaml_bundle, ItemInstallFn install_fn, ItemUninstallFn compensate_fn,
+    const std::string& idempotency_key, InstallPartialResult* partial_result) {
     if (!open_)
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "database not open");
     if (!install_fn)
@@ -1118,6 +1146,44 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
                      sanitize_for_log(pack_name));
     }
 
+    // F033/#3481: idempotency pre-check, BEFORE install_fn touches any sibling store. A dedup
+    // check only at the final persist step would still re-run install_fn against every sibling
+    // store on every retry — this is what actually stops that. A prior install with the SAME key
+    // and an IDENTICAL bundle is a replay: return its pack id, no sibling-store calls at all. The
+    // same key with a DIFFERENT bundle is a plain validation error (never
+    // kProductPackDbErrorPrefix — 400, not 503). Fail-closed: any lookup failure here returns
+    // before install_fn is ever reached.
+    if (!idempotency_key.empty()) {
+        auto lease = pool_.try_acquire_for(kReadTimeout);
+        if (!lease)
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                   "database unavailable — try again");
+        pg::PgResult res = pg::exec_params(
+            lease.get(),
+            "SELECT id, yaml_source FROM product_pack_store.product_packs "
+            "WHERE idempotency_key = $1",
+            std::vector<std::string>{sanitize_pg_text(idempotency_key)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            // Gate 2 review (docs-writer/#3481): unlike list()/get() (read paths, never
+            // audited), this failure reaches workflow_routes.cpp's audit_fn as a RAW,
+            // unfiltered `detail` — install()'s OTHER db_error messages ("database not
+            // open", "failed to persist pack '<name>'") were deliberately kept clean of
+            // PQerrorMessage() for exactly this reason; this one wasn't. Log the specific
+            // driver detail server-side instead of embedding it in the returned string.
+            spdlog::error("ProductPackStore: idempotency lookup failed: {}",
+                         PQerrorMessage(lease.get()));
+            return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                   "idempotency lookup failed");
+        }
+        if (PQntuples(res.get()) > 0) {
+            std::string existing_id = text_col(res.get(), 0, 0);
+            std::string existing_yaml = text_col(res.get(), 0, 1);
+            if (existing_yaml == sanitize_pg_text(yaml_bundle))
+                return existing_id;
+            return std::unexpected("idempotency key already used with a different request body");
+        }
+    }
+
     auto pack_id = gen_id();
     auto now = now_epoch();
 
@@ -1176,10 +1242,130 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
         }
     }
 
+    // #3479: populates the caller-supplied out-param, if any, with per-document detail —
+    // called at every return point below that carries an install_fn outcome (total failure or
+    // either success path), so a caller always sees which documents failed and why, not just a
+    // bare pack id or the first of potentially several failure reasons.
+    auto populate_partial_result = [&]() {
+        if (partial_result) {
+            partial_result->errors = errors;
+            partial_result->total_items = installed_count + static_cast<int>(errors.size());
+            partial_result->installed_count = installed_count;
+        }
+    };
+
     if (installed_count == 0 && !errors.empty()) {
         // Nothing was ever written to Postgres — no rollback needed.
-        return std::unexpected("no items installed: " + errors[0]);
+        // Every document's failure reason, not just the first — a bundle with several
+        // independently-wrong documents previously only ever told the caller about one.
+        std::string joined;
+        for (std::size_t i = 0; i < errors.size(); ++i) {
+            if (i > 0)
+                joined += "; ";
+            joined += errors[i];
+        }
+        populate_partial_result();
+        return std::unexpected("no items installed: " + joined);
     }
+
+    // F031/#3481 (gov Gate 2 finding, security-guardian): factored out so every failure path
+    // reachable AFTER install_fn has already committed real content into sibling stores —
+    // not just the final persist-transaction failure below, but ALSO the duplicate-item-id
+    // check immediately following — best-effort compensates every already-installed item, in
+    // REVERSE install order (a Policy must be compensated before the PolicyFragment it
+    // references, since PolicyStore::delete_fragment refuses while a Policy still references
+    // it — forward order would spuriously fail to clean up the fragment). A single item's
+    // compensation failing is logged and does not abort compensating the rest. The original
+    // (pre-compensation) duplicate-item-id early return orphaned items_to_store just like the
+    // bug F031 was written to close — that gap was caught in Gate 2 review of this very PR.
+    //
+    // Gate 4 review (#3481, unhappy-path, R2): compensate_fn is caller-supplied (same as
+    // uninstall_fn) and gets no exception boundary anywhere else in this file either — but
+    // unlike uninstall_fn (#3482, deferred, pre-existing), this specific call site is new in
+    // this PR and pre-PR the failure paths below always reached workflow_routes.cpp's audit_fn
+    // uninterrupted. A throw here must not skip that: caught, logged, and counted the same as
+    // an ordinary `false` return so the rest of the reverse-order loop keeps running and
+    // install() still returns its normal std::unexpected.
+    //
+    // Gate 6 review (#3481, architect): items_to_store can carry the SAME item_id twice (the
+    // duplicate-item-id case this lambda is called from IS that scenario) — compensate each
+    // item_id only once, so a second, already-deleted compensate_fn call doesn't manufacture a
+    // false "partial" result/metric for content that was never actually left orphaned.
+    //
+    // Gate 8 review (#3481, security-guardian — verified with a live repro): keying the dedup
+    // set on item_id ALONE is wrong. PolicyStore::create_fragment/create_policy (and the other
+    // sibling create_* methods) honor a caller-supplied `id:` YAML field verbatim, so an
+    // attacker-controlled bundle can assign the SAME item_id to two documents of DIFFERENT
+    // kind (e.g. a PolicyFragment and a Policy) — both install_fn calls succeed (no PK
+    // collision, different tables), the duplicate-item-id check below fires, and the item_id-
+    // only dedup silently skipped compensating the second one: a real orphan, reported as
+    // "compensated 1/1" / metric result="ok". Keyed on (kind, item_id) instead — compensate_fn
+    // already dispatches on that same pair, so this matches its actual identity.
+    auto compensate_and_fail = [&](const std::string& log_context,
+                                   std::string error_message) -> std::unexpected<std::string> {
+        // Gate 3 finding (#3479/#3481, cpp-safety): both call sites (duplicate-item-id,
+        // final-persist failure) are a "total failure" outcome for #3479's purposes just like
+        // the installed_count==0 early return above — populate here so a caller always sees
+        // every install_fn error, not just the ones surfaced via the OTHER early return.
+        populate_partial_result();
+        std::size_t compensated = 0;
+        std::size_t attempted = 0;
+        if (compensate_fn) {
+            std::unordered_set<std::string> already_compensated;
+            for (auto it = items_to_store.rbegin(); it != items_to_store.rend(); ++it) {
+                if (!already_compensated.insert(it->kind + '\x1f' + it->item_id).second)
+                    continue;
+                ++attempted;
+                bool ok = false;
+                try {
+                    ok = compensate_fn(it->kind, it->item_id).has_value();
+                } catch (const std::exception& e) {
+                    spdlog::error(
+                        "ProductPackStore: install compensation THREW for {} '{}' after {} "
+                        "for pack '{}': {} — orphaned sibling content requires "
+                        "manual/operator cleanup",
+                        it->kind, sanitize_for_log(it->item_id), log_context,
+                        sanitize_for_log(pack_name), sanitize_for_log(e.what()));
+                } catch (...) {
+                    spdlog::error(
+                        "ProductPackStore: install compensation THREW (unknown) for {} '{}' "
+                        "after {} for pack '{}' — orphaned sibling content requires "
+                        "manual/operator cleanup",
+                        it->kind, sanitize_for_log(it->item_id), log_context,
+                        sanitize_for_log(pack_name));
+                }
+                if (ok) {
+                    ++compensated;
+                } else {
+                    spdlog::error(
+                        "ProductPackStore: install compensation FAILED for {} '{}' after {} "
+                        "for pack '{}' — orphaned sibling content requires manual/operator "
+                        "cleanup",
+                        it->kind, sanitize_for_log(it->item_id), log_context,
+                        sanitize_for_log(pack_name));
+                }
+            }
+            if (metrics_)
+                metrics_
+                    ->counter("yuzu_server_product_pack_install_compensation_total",
+                              {{"result", compensated == attempted ? "ok" : "partial"}})
+                    .increment();
+        }
+        spdlog::error("ProductPackStore: {} for pack '{}' — compensated {}/{} item(s)",
+                     log_context, sanitize_for_log(pack_name), compensated, attempted);
+        // Gate 6 finding (#3481, compliance-officer): workflow_routes.cpp's audit_fn call
+        // passes this returned message straight into the audit `detail` field — without this,
+        // an auditor reconstructing a denied install from the audit store alone had no way to
+        // tell whether compensation fully succeeded, partially succeeded, or was never
+        // attempted (compensate_fn omitted). The kind/item_id of a specific FAILED item stays
+        // in the spdlog::error line above only — appending it here would put attacker-supplied
+        // YAML content into the audit trail's `detail`, which the not_found/validation-message
+        // passthrough above already accepts for OTHER reasons but a raw item_id should not be
+        // added to gratuitously.
+        if (attempted > 0)
+            error_message += std::format(" (compensated {}/{} item(s))", compensated, attempted);
+        return std::unexpected(std::move(error_message));
+    };
 
     // Gate 8 review (Fable, external): a bundle whose documents assign the same item id
     // twice would otherwise reach the persist transaction below, violate
@@ -1196,22 +1382,73 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
         std::unordered_set<std::string> seen_item_ids;
         for (const auto& item : items_to_store) {
             if (!seen_item_ids.insert(item.item_id).second)
-                return std::unexpected("duplicate item id in bundle: '" + item.item_id + "'");
+                // Gate 4 finding (#3481, unhappy-path, UP-3): item.item_id can be
+                // attacker-controlled arbitrary text for PolicyFragment/Policy documents
+                // (unlike InstructionStore, PolicyStore applies no charset check to a
+                // caller-supplied `id:` field) — this message reaches BOTH the client
+                // response body (no kProductPackDbErrorPrefix, so product_pack_client_message
+                // never genericizes it) and the audit `detail` unfiltered. json_escape (the
+                // hand-rolled A4-envelope serializer) passes bytes >=0x20 through without
+                // UTF-8 validation (pre-existing, documented gap — see on_behalf_guard.hpp's
+                // truncation-helper comment, #2500) — invalid UTF-8 in an unsanitized id
+                // would ship an invalid-UTF-8 JSON response. sanitize_pg_text (already used
+                // throughout this file) fixes both this and the "gratuitous raw content in
+                // the audit trail" concern compensate_and_fail's own doc comment raises.
+                return compensate_and_fail(
+                    "duplicate item id detected",
+                    "duplicate item id in bundle: '" + sanitize_pg_text(item.item_id) + "'");
         }
     }
 
     // Now persist the pack row + its successfully-installed item rows in ONE transaction
     // (parent-before-child for the product_pack_items -> product_packs FK).
-    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+    //
+    // Gov Gate 5 CHAOS-1/CHAOS-1b (#3481, verified): acquire the write lease OURSELVES first,
+    // via try_acquire_for + with_txn_on, rather than the one-call with_txn_for — this is what
+    // lets the failure branch below tell apart "the lease was never acquired, the transaction
+    // never started" (nothing ambiguous, safe to compensate exactly as before) from "the lease
+    // was held and the transaction itself reported failure" (ambiguous — the client-observed
+    // failure is not ordered relative to the backend's own commit progress, so it could be a
+    // genuine rollback, a still-in-flight commit, OR a lost COMMIT-response ack after Postgres
+    // already committed — with_txn_for's single bool return cannot distinguish any of these,
+    // and compensating on anything but a genuine rollback would ACTIVELY DELETE real,
+    // already-persisted sibling-store content). The existing pool-starvation compensation tests
+    // pin the pool's only connection BEFORE calling install() — that failure mode is caught here
+    // as a with_txn_lease acquire failure and compensates exactly as before; those tests are
+    // unaffected.
+    std::string current_xact_id; // captured inside the txn body; empty = no write could have landed
+    auto with_txn_lease = pool_.try_acquire_for(kWriteTimeout);
+    bool write_lease_acquired = static_cast<bool>(with_txn_lease);
+    bool ok = pool_.with_txn_on(std::move(with_txn_lease), [&](PGconn* conn) -> bool {
+        // Captured FIRST, before any write: if THIS statement fails, nothing in this
+        // transaction could have been written yet, so current_xact_id stays empty and the
+        // failure path below treats it as unambiguous without needing a server-side outcome
+        // check at all. If it succeeds, the id lets that path ask Postgres the transaction's
+        // true fate (committed/aborted/still-unresolved) rather than inferring it from a
+        // row-visibility side effect, which CHAOS-1b showed is not a reliable proxy.
+        pg::PgResult xid_res = pg::exec_params(conn, "SELECT pg_current_xact_id()::text",
+                                               std::vector<std::string>{});
+        if (xid_res.status() != PGRES_TUPLES_OK || PQntuples(xid_res.get()) == 0)
+            return false;
+        current_xact_id = text_col(xid_res.get(), 0, 0);
+
+        // idempotency_key binds via the std::optional<std::string> overload — NOT the plain
+        // std::string overload, which would bind an empty key as "" rather than SQL NULL and
+        // break the partial unique index's NULL-exemption for every keyless install after the
+        // first (F033/#3481).
         pg::PgResult pres = pg::exec_params(
             conn,
             "INSERT INTO product_pack_store.product_packs "
-            "(id, name, version, description, yaml_source, installed_at, verified) "
-            "VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::boolean)",
-            std::vector<std::string>{
+            "(id, name, version, description, yaml_source, installed_at, verified, "
+            "idempotency_key) "
+            "VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::boolean,$8)",
+            std::vector<std::optional<std::string>>{
                 pack_id, sanitize_pg_text(pack_name), sanitize_pg_text(pack_version),
                 sanitize_pg_text(pack_description), sanitize_pg_text(yaml_bundle),
-                std::to_string(now), pack_verified ? "true" : "false"});
+                std::to_string(now), pack_verified ? "true" : "false",
+                idempotency_key.empty() ? std::nullopt
+                                        : std::optional<std::string>(
+                                              sanitize_pg_text(idempotency_key))});
         if (pres.status() != PGRES_COMMAND_OK)
             return false;
 
@@ -1230,13 +1467,61 @@ std::expected<std::string, std::string> ProductPackStore::install(const std::str
         return true;
     });
     if (!ok) {
-        return std::unexpected(std::string(kProductPackDbErrorPrefix) +
-                               "failed to persist pack '" + pack_name + "'");
+        if (write_lease_acquired && !current_xact_id.empty()) {
+            // The lease was held and this transaction's own id was captured before it failed —
+            // this is the ambiguous case. Ask Postgres itself for that xact's true fate rather
+            // than inferring it from row visibility (CHAOS-1b: absence alone can't distinguish
+            // "aborted" from "not yet committed").
+            switch (check_transaction_outcome(pool_, current_xact_id)) {
+            case TransactionOutcome::kCommitted:
+                // The commit landed; only the ack was lost. Do NOT compensate — that would
+                // delete real, already-persisted sibling-store content. Report success.
+                spdlog::error(
+                    "ProductPackStore: install for pack '{}' ({}) reported a transaction "
+                    "failure but Postgres confirms xact {} actually COMMITTED — an ambiguous "
+                    "COMMIT-acknowledgment loss, not a real failure. Treating as success; no "
+                    "compensation run.",
+                    sanitize_for_log(pack_name), pack_id, current_xact_id);
+                populate_partial_result();
+                return pack_id;
+            case TransactionOutcome::kUnknown:
+                // Still in progress, too old for the commit log, or the check itself couldn't
+                // run. The only safe read is "do not compensate" — never risk deleting content
+                // that might actually be there.
+                spdlog::error(
+                    "ProductPackStore: install for pack '{}' failed to persist AND xact {}'s "
+                    "outcome could not be confirmed (still in progress, or the status check "
+                    "itself failed) — cannot rule out an eventual commit. Skipping compensation "
+                    "as unsafe; this pack id may be a residual orphan requiring manual/operator "
+                    "verification.",
+                    sanitize_for_log(pack_name), current_xact_id);
+                // Gate 3 finding (#3481, cpp-expert): gated on compensate_fn, matching
+                // compensate_and_fail's own gating — a direct caller that never supplied
+                // compensate_fn never attempted compensation, so this counter (whose own
+                // description says it's only emitted when an attempt was possible) should
+                // stay untouched for that caller, same as every other emission site.
+                if (metrics_ && compensate_fn)
+                    metrics_
+                        ->counter("yuzu_server_product_pack_install_compensation_total",
+                                  {{"result", "partial"}})
+                        .increment();
+                populate_partial_result();
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "failed to persist pack '" + pack_name + "'");
+            case TransactionOutcome::kAborted:
+                break; // Genuinely rolled back — fall through to compensate as before.
+            }
+        }
+        return compensate_and_fail(
+            "failed to persist pack transaction",
+            std::string(kProductPackDbErrorPrefix) + "failed to persist pack '" + pack_name +
+                "'");
     }
 
     spdlog::info("ProductPackStore: installed '{}' v{} ({}), {} items, {} errors",
                  sanitize_for_log(pack_name), pack_version, pack_id, installed_count,
                  errors.size());
+    populate_partial_result();
     return pack_id;
 }
 
@@ -1406,8 +1691,20 @@ std::expected<void, std::string> ProductPackStore::uninstall(const std::string& 
             return false;
         return true;
     });
-    if (!ok)
+    if (!ok) {
+        // F032/#3481: uninstall_fn already removed real sibling-store content (see the file
+        // header — no lease of ours was held across that loop, and this txn is what's failing
+        // NOW, after that already happened). Accepted, store-scoped residual: no compensating
+        // action is possible (nothing to restore), but a retried DELETE self-heals — re-running
+        // uninstall_fn against already-gone items is idempotent-ish, then this transaction runs
+        // again.
+        spdlog::error(
+            "ProductPackStore: uninstall failed to persist metadata delete for pack '{}' AFTER "
+            "{}/{} sibling item(s) were already removed — pack remains listed as installed, "
+            "pointing at deleted/partially-deleted content; retry this DELETE to complete cleanup",
+            sanitize_for_log(id), removed, pack.items.size());
         return std::unexpected(std::string(kProductPackDbErrorPrefix) + "uninstall failed");
+    }
 
     spdlog::info("ProductPackStore: uninstalled '{}', removed {} items",
                  sanitize_for_log(pack.name), removed);

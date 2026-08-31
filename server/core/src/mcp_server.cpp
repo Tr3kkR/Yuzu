@@ -41,6 +41,7 @@
 #include "web_utils.hpp"                // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "bundle_orchestrator.hpp"      // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"           // validate_bundle_steps / aggregate_to_json
+#include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
@@ -803,7 +804,9 @@ static const ToolDef kTools[] = {
      "for actions with a published definition) or discover_instructions - do not guess action "
      "names. "
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
-     "agents.",
+     "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
+     "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
+     "ticket is minted or consumed, matching REST POST /api/command.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
      // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the
@@ -819,8 +822,8 @@ static const ToolDef kTools[] = {
      R"j("plugin":{"type":"string","maxLength":128,"description":"Plugin name (e.g. os_info, hardware)"},)j"
      R"j("action":{"type":"string","maxLength":128,"description":"Action name (e.g. version, list)"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"Key-value parameters"},)j"
-     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__."},)j"
-     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet."})j"
+     R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__. EXCEPTION (#3685): for a Destructive-classified plugin.action pair, supplying scope AT ALL - including __all__ alongside agent_ids - is refused; explicit agent_ids is the only way to target one."},)j"
+     R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires this field, non-empty - omitting it is refused rather than treated as target-all."})j"
      R"j(},"required":["plugin","action"]})j",
      // #2712: two fully self-contained, mutually-exclusive branches - each
      // declares its OWN complete properties/required/additionalProperties:false
@@ -3881,6 +3884,21 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
+            // #3685: classify_fn_ unset (never wired, or the production wiring at
+            // server.cpp regressed) — execute_instruction cannot determine whether
+            // ANY plugin.action pair is Destructive, so it fails CLOSED at BOTH
+            // gate sites (C8 pre-mint below, and the main handler further down)
+            // rather than silently falling through to the pre-#3685 unconfined
+            // behaviour. Distinguishable, on purpose, from an honest classify-miss
+            // (a WIRED fn returning Unclassified/Ambiguous), which stays Policy B
+            // fall-through — see McpServer::ClassifyFn's doc comment
+            // (mcp_server.hpp) for the two-outcomes rationale.
+            constexpr std::string_view kClassifierUnavailableMessage =
+                "capability classification is unavailable; execute_instruction is "
+                "refused until it is restored";
+            constexpr std::string_view kClassifierUnavailableRemediation =
+                "this is a server configuration/wiring fault, not a caller error; "
+                "contact an administrator";
             // retry_after_ms: pass a non-negative value on a TRANSIENT failure (a
             // store degrade / transient outage) so an agentic worker backs off and
             // retries rather than treating the error as terminal; leave the default
@@ -3889,7 +3907,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // 503 store-degrade of the sibling /sle/agents/{id} drill.
             auto a4_error = [&id](int code, std::string_view message,
                                   std::string_view remediation = {}, long retry_after_ms = -1,
-                                  std::string_view cid_override = {}) {
+                                  std::string_view cid_override = {}, bool audit_ok = true) {
                 // cid_override lets a caller mint the correlation id FIRST and
                 // stamp it into its log/audit records before building the
                 // envelope (#2423 review F4); default preserves mint-here.
@@ -3912,6 +3930,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // json_quoted_string returns a fully-quoted, escaped JSON string.
                     data += json_quoted_string(remediation);
                 }
+                // #3685 governance round: trailing default-true param, so every
+                // existing call site is byte-unchanged. MCP has no response-header
+                // channel like REST's Sec-Audit-Failed (documented elsewhere in
+                // this file), so a caller that wants to surface a dropped denial
+                // audit row on an ERROR envelope — the same evidence-gap signal
+                // `revoke_certificate`'s error_response(...) call already puts in
+                // its own error.data, and the same fact `audit_persisted:false`
+                // already surfaces on every SUCCESS result in this file — passes
+                // its own audit_fn/mcp_audit return here instead.
+                if (!audit_ok)
+                    data += R"(,"audit_persisted":false)";
                 data += "}";
                 return error_response(id, code, message, data);
             };
@@ -4343,6 +4372,198 @@ McpServer::HandlerFn McpServer::build_handler(
                                          -1, cid),
                                 "application/json");
                             return;
+                        }
+                        // #3685 (checkpoint 2, commit 4): fail closed if the
+                        // Destructive-targeting classifier was never wired (or the
+                        // production wiring regressed) — BEFORE a ticket is
+                        // minted or consumed. The actual Destructive-targeting
+                        // refusal (a WIRED classifier reporting a Destructive,
+                        // untargeted call) follows immediately below (commit 5).
+                        if (!classify_fn_) {
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            mcp_audit("denied", std::string("capability classifier "
+                                                           "unavailable correlation_id=") +
+                                                    cid);
+                            res.set_content(
+                                a4_error(kInternalError, kClassifierUnavailableMessage,
+                                         kClassifierUnavailableRemediation, -1, cid),
+                                "application/json");
+                            return;
+                        }
+                        // #3685 (checkpoint 2, commit 5): C8 PRE-MINT parity —
+                        // refuse a Destructive, untargeted execute_instruction
+                        // BEFORE a ticket is minted (supplied_id.empty() below) or
+                        // consumed (supplied_id non-empty, the recall arm). Reads
+                        // `args` directly rather than the handler's own locals
+                        // (which do not exist yet at this point in the request) —
+                        // `check_exec_instruction_shape` above already guarantees
+                        // `agent_ids`/`scope`, if present, are shape-valid, so
+                        // `args.contains(...)` is the same post-shape-check
+                        // precondition evaluate_destructive_targeting's contract
+                        // requires (dispatch_destructive_gate.hpp). No omitted-
+                        // target normalisation is needed here: an omitted
+                        // agent_ids alone already forces RefuseUntargeted
+                        // (!valid_nonempty_agent_ids), independent of scope_key_
+                        // present — provably the SAME verdict the handler site
+                        // reaches after its own __all__ normalisation, for every
+                        // one of the four (ids, scope, both, neither) shapes.
+                        {
+                            const auto p = param_str(args, "plugin");
+                            const auto a = param_str(args, "action");
+                            const auto gate = yuzu::server::evaluate_destructive_targeting(
+                                classify_fn_(p, a),
+                                /*valid_nonempty_agent_ids=*/args.contains("agent_ids"),
+                                /*scope_key_present=*/args.contains("scope"));
+                            // #3685 governance round: exhaustive switch, no
+                            // `default:` arm — matches REST's `/api/command`
+                            // switch over the SAME enum (server.cpp) and the
+                            // header's own doc comment intent
+                            // (dispatch_destructive_gate.hpp). A future 5th
+                            // `DestructiveTargetingVerdict` now forces a
+                            // compile-time decision at BOTH surfaces; the
+                            // prior `if (... == RefuseUntargeted) {...}` shape
+                            // let every other verdict fall through silently,
+                            // which is exactly the fail-open shape #3685
+                            // itself fixed on REST.
+                            switch (gate.verdict) {
+                            case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                            case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                                break;
+                            case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss: {
+                                // #3685 governance-round-2 (Doomgoose colleague review,
+                                // item 3): C8-ONLY deviation from Policy B. REST's
+                                // `/api/command` switch (server.cpp) and this same
+                                // handler's main-handler backstop switch below (~7896)
+                                // both keep Policy B UNCHANGED — explicit fall-through
+                                // to the shared dispatch chokepoint's own unconditional
+                                // classify-miss denial — because an independent early
+                                // denial there would only DUPLICATE evidence the
+                                // chokepoint already produces (it denies a classify-miss
+                                // unconditionally either way; there is no escape to
+                                // close, only evidence to not duplicate).
+                                //
+                                // C8 is different: it runs BEFORE a supervised-tier
+                                // approval ticket is minted. Falling through here does
+                                // not merely duplicate evidence — it lets a
+                                // classify-miss call MINT a ticket, wait on a human
+                                // approval, and only THEN be denied by the downstream
+                                // chokepoint on actual dispatch: a real admin approval
+                                // burned on a call that was always going to be refused,
+                                // undercutting this gate's own stated purpose (this PR's
+                                // earlier commit message: "a Destructive call on the
+                                // supervised tier never wastes an admin's approval or
+                                // burns a ticket on a call that was always going to be
+                                // refused" — that guarantee held only for
+                                // RefuseUntargeted until now). So C8 denies a
+                                // classify-miss locally and mints NO ticket — reusing
+                                // the EXISTING classify-miss denial vocabulary
+                                // (`yuzu::server::detail::DispatchDenialReason::
+                                // {Unclassified,Ambiguous}`, agent_registry.hpp) rather
+                                // than inventing a fourth taxonomy, so this reads as
+                                // "the same denial, surfaced earlier" in
+                                // logs/metrics/audit, not a new denial kind. Closes
+                                // #3685 AC1 ("fail closed on the block itself") for the
+                                // ticket-sensitive path specifically.
+                                const auto reason =
+                                    gate.miss == yuzu::server::ClassificationError::Ambiguous
+                                        ? yuzu::server::detail::DispatchDenialReason::Ambiguous
+                                        : yuzu::server::detail::DispatchDenialReason::
+                                              Unclassified;
+                                // Counted on the SAME series the shared chokepoint's own
+                                // denial uses (yuzu_server_dispatch_denied_total{reason},
+                                // NOT yuzu_server_dispatch_target_rejected_total — a
+                                // classify-miss is not a targeting-shape mistake).
+                                // Pre-seeded at boot for every DispatchDenialReason
+                                // already (server.cpp), so no new pre-seed line is
+                                // needed for this MCP-origin increment.
+                                if (metrics != nullptr) {
+                                    try {
+                                        metrics
+                                            ->counter(
+                                                "yuzu_server_dispatch_denied_total",
+                                                {{"reason",
+                                                  std::string(yuzu::server::detail::to_string(
+                                                      reason))}})
+                                            .increment();
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                    }
+                                }
+                                const std::string cid =
+                                    yuzu::server::detail::make_correlation_id();
+                                const bool audit_ok = mcp_audit(
+                                    "denied",
+                                    std::string("reason=") +
+                                        std::string(yuzu::server::detail::to_string(reason)) +
+                                        " " + yuzu::server::detail::sanitize_detail_value(p) +
+                                        ":" + yuzu::server::detail::sanitize_detail_value(a) +
+                                        " correlation_id=" + cid);
+                                res.set_content(
+                                    a4_error(kInvalidParams, "unknown or ambiguous plugin.action",
+                                             "confirm the plugin/action name via "
+                                             "discover_plugins or discover_instructions and "
+                                             "re-call; no approval ticket was created or "
+                                             "consumed",
+                                             -1, cid, audit_ok),
+                                    "application/json");
+                                return;
+                            }
+                            case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
+                                // #3685 (checkpoint 3, commit 6): counted on the SAME
+                                // series REST's `/api/command` 400 arm uses
+                                // (`yuzu_server_dispatch_target_rejected_total`,
+                                // `route="mcp"`) — #881's `quarantined` reason already
+                                // crosses this series into MCP-origin traffic via the
+                                // shared dispatch closure, so this is not a new
+                                // precedent. `metrics` is nullable here (as in
+                                // `count_denial` above); guarded the same way so
+                                // observability can never fail the refusal itself.
+                                if (metrics != nullptr) {
+                                    try {
+                                        metrics
+                                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                                      {{"route", "mcp"},
+                                                       {"reason",
+                                                        std::string(yuzu::server::
+                                                                        kReasonDestructiveUntargeted)}})
+                                            .increment();
+                                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                                    }
+                                }
+                                const std::string cid =
+                                    yuzu::server::detail::make_correlation_id();
+                                // #3685 governance round: capture and surface a
+                                // dropped denial-audit row, matching this file's
+                                // OWN established convention (the audit_persisted
+                                // doc comment ~3763, the denied_ok = mcp_audit(...)
+                                // working example ~5424) — a dropped row on this
+                                // P1 security refusal's evidence chain is the more
+                                // security-relevant gap, not less.
+                                // Gate 8 round 3 (consistency-auditor SHOULD item 2):
+                                // prefixed with "reason=" so this arm's audit detail
+                                // is byte-shape-identical to the adjacent ClassifyMiss
+                                // arm's above (`reason=<value> <plugin>:<action>
+                                // correlation_id=<cid>`) — genuine parity, not just a
+                                // shared mechanism, so audit-log tooling can rely on
+                                // one convention across both arms of this switch.
+                                const bool audit_ok = mcp_audit(
+                                    "denied",
+                                    std::string("reason=destructive_untargeted ") +
+                                        yuzu::server::detail::sanitize_detail_value(p) + ":" +
+                                        yuzu::server::detail::sanitize_detail_value(a) +
+                                        " correlation_id=" + cid);
+                                res.set_content(
+                                    a4_error(kInvalidParams,
+                                             yuzu::server::kDestructiveUntargetedMessage,
+                                             "this plugin.action is classified Destructive: "
+                                             "name explicit agent_ids (no scope, no broadcast) "
+                                             "and re-call; no approval ticket was created or "
+                                             "consumed",
+                                             -1, cid, audit_ok),
+                                    "application/json");
+                                return;
+                            }
+                            }
                         }
                     }
 
@@ -7530,6 +7751,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #3685 (checkpoint 2, commit 4): the SAME fail-closed check as the
+                // C8 pre-mint site above — necessary here too because operator-tier
+                // calls (and any tool whose tier does not require_approval) skip
+                // the C8 approval block entirely and reach this handler directly.
+                // See that site's comment for what commit 5 adds on top.
+                if (!classify_fn_) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    mcp_audit("denied",
+                              std::string("capability classifier unavailable correlation_id=") +
+                                  cid);
+                    res.set_content(
+                        a4_error(kInternalError, kClassifierUnavailableMessage,
+                                 kClassifierUnavailableRemediation, -1, cid),
+                        "application/json");
+                    return;
+                }
 
                 auto plugin = param_str(args, "plugin");
                 auto action = param_str(args, "action");
@@ -7714,6 +7951,80 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     scope = std::string(yuzu::server::kBroadcastScope);
+                }
+
+                // #3685 (checkpoint 2, commit 5): Destructive-class targeting
+                // parity with /api/command — a DispatchClass::Destructive pair
+                // must name explicit agent_ids; broadcast (including the
+                // omitted-target __all__ normalisation just above) and scope
+                // fan-out are refused. Confinement to the caller's visible set
+                // is already downstream (#1788 arms, via dispatch_confined);
+                // what MCP lacked was the refusal itself — a chokepoint denial
+                // surfaces only as the ambiguous sent=0/no_agents_reached
+                // envelope. This is the BACKSTOP site: it runs for every tier,
+                // including operator (which skips the C8 block entirely) and a
+                // supervised call that already passed the C8 gate below (the
+                // same pure function on the same shape-checked inputs cannot
+                // disagree between the two sites, so this never double-refuses
+                // a call C8 already allowed through).
+                {
+                    const auto gate = yuzu::server::evaluate_destructive_targeting(
+                        classify_fn_(plugin, action),
+                        /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                        /*scope_key_present=*/!scope.empty());
+                    // #3685 governance round: exhaustive switch, no `default:`
+                    // arm — matches REST's `/api/command` switch over the SAME
+                    // enum (server.cpp), the C8 pre-mint site above, and the
+                    // header's own doc comment intent
+                    // (dispatch_destructive_gate.hpp).
+                    switch (gate.verdict) {
+                    case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                    case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                        // Both proceed to dispatch unchanged.
+                        break;
+                    case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                        // Policy B: defers to the existing dispatch chokepoint,
+                        // which denies a real miss on its own terms.
+                        break;
+                    case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
+                        // #3685 (checkpoint 3, commit 6): same series + label as
+                        // the C8 pre-mint site above and REST's /api/command 400
+                        // arm. C8 and this backstop are mutually exclusive per
+                        // request (see the comment above this block), so a
+                        // supervised call refused at C8 is never also counted
+                        // here.
+                        if (metrics != nullptr) {
+                            try {
+                                metrics
+                                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                                              {{"route", "mcp"},
+                                               {"reason",
+                                                std::string(yuzu::server::
+                                                                kReasonDestructiveUntargeted)}})
+                                    .increment();
+                            } catch (...) { // NOLINT(bugprone-empty-catch)
+                            }
+                        }
+                        const std::string cid = yuzu::server::detail::make_correlation_id();
+                        // #3685 governance round: capture and surface a dropped
+                        // denial-audit row — same convention as the C8 pre-mint
+                        // site above (audit_persisted doc comment ~3763, the
+                        // denied_ok = mcp_audit(...) working example ~5424).
+                        const bool audit_ok = mcp_audit(
+                            "denied",
+                            std::string("destructive_untargeted ") +
+                                yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
+                                yuzu::server::detail::sanitize_detail_value(action) +
+                                " correlation_id=" + cid);
+                        res.set_content(
+                            a4_error(kInvalidParams, yuzu::server::kDestructiveUntargetedMessage,
+                                     "this plugin.action is classified Destructive: name "
+                                     "explicit agent_ids (no scope, no broadcast) and re-call",
+                                     -1, cid, audit_ok),
+                            "application/json");
+                        return;
+                    }
+                    }
                 }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────

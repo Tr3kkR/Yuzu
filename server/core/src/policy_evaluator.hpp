@@ -112,6 +112,31 @@ public:
         // minutes) is not false-positive reset mid-flight; short enough that
         // a truly stranded fix does not sit invisible indefinitely.
         int64_t fixing_stale_seconds{1800};
+        // #3495 (Gate 3 architect, governance re-review; scope narrowed at
+        // Gate 4 unhappy-path, 2026-08-30 — see below): lets a shutdown
+        // request stop collect_ready() from processing further in-flight
+        // items once stop_requested_ flips, checked once per item in that
+        // loop. Ports the same field QuarantineContainmentReconciler::Deps /
+        // PreflightRunner::Deps / ScheduleRunner::Deps already carry.
+        // PolicyEvaluator was the fourth production consumer of the shared
+        // command_dispatch_fn closure and was missed in the original #3495
+        // fix — its dispatch_instruction() calls the identical blocking
+        // dispatch_fn the other three do; the join-ordering half of that fix
+        // (policy_eval_thread_ now joins after agent_server_->
+        // Shutdown(deadline)) still applies and is what actually bounds this
+        // engine's shutdown-time wall clock.
+        //
+        // DELIBERATELY NOT checked in dispatch_due()'s loop (unlike the
+        // sibling engines' single loop each) — claim_due_policies durably
+        // stamps EVERY due policy's dispatch claim in one transaction before
+        // that loop even starts, so a should_stop break there would leave
+        // the un-processed tail claimed-but-never-checked, silently
+        // skipping up to a full `default_interval_seconds` of compliance
+        // checking instead of deferring one tick. See dispatch_due()'s own
+        // comment for the full reasoning. Unset (default) = never stop,
+        // matching every existing production/test Deps that predates this
+        // field.
+        std::function<bool()> should_stop;
     };
 
     explicit PolicyEvaluator(Deps deps);

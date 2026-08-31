@@ -38,14 +38,13 @@
  * forgets to take it silently reopens the race for itself and for every
  * other launcher it can collide with. Sites covered as of BR-001:
  *   - agents/core/src/subprocess_runner.cpp   (run_bounded_subprocess)
- *   - agents/plugins/script_exec/src/script_exec_plugin.cpp (run_process_posix)
- *   - agents/plugins/content_dist/src/content_dist_plugin.cpp (safe_execute)
  *   - agents/core/src/trigger_engine.cpp (query_service_status, macOS popen)
  * (filesystem_plugin.cpp's compute_hash_unix no longer forks directly -- it
  * now routes through the shared bounded runner, which is the first site above.
- * The bitlocker, msi_packages, services, users, network_config, interaction,
- * wifi, certificates, and event_logs plugins likewise route ALL of their POSIX
- * shell-outs through run_bounded_subprocess, so they are covered transitively
+ * The bitlocker, content_dist, msi_packages, script_exec, services, users,
+ * network_config, interaction, wifi, certificates, and event_logs plugins
+ * likewise route ALL of their POSIX shell-outs through run_bounded_subprocess,
+ * so they are covered transitively
  * via the first site -- their only remaining popen() calls are Windows _popen(),
  * which does not fork and so cannot race this lock. This ledger is verified
  * against the code: an earlier revision listed `services` here while

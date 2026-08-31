@@ -3060,6 +3060,49 @@ groups:
             Read the server BOOT log for the exact pack/item id and repair or
             move the losing replica's legacy file aside before restarting.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+      - alert: YuzuProductPackCompensationPartial
+        # #3481: install()'s best-effort compensating rollback (undoing
+        # already-installed sibling-store content after a late persist or
+        # duplicate-item-id failure) did not fully succeed at least once — a
+        # sibling delete itself failed (referential-integrity refusal outside
+        # the bundle's own dependency chain) or compensate_fn threw. Either
+        # way this is a KNOWN, NOT auto-retried gap (see the changelog
+        # fragment and product_pack_store.hpp) — a residual orphan needs
+        # manual/operator cleanup via that sibling store's own DELETE route
+        # (no bulk reconciliation sweep exists). RELIES ON THE PRE-SEED in
+        # server.cpp (describe() + zero-loop over ok/partial) so a single
+        # partial event is visible as a step, not lost inside an
+        # already-nonzero series. A single event is a cleanup task, not an
+        # incident — this fires on ANY occurrence (>0, not a rate threshold)
+        # because a residual orphan does not self-heal and does not age out.
+        expr: |
+          increase(yuzu_server_product_pack_install_compensation_total{result="partial"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "ProductPack install compensation left residual orphaned sibling content"
+          description: >-
+            yuzu_server_product_pack_install_compensation_total{result="partial"}
+            increased: install() failed after already committing sibling-store
+            content, and best-effort compensation either could not fully undo
+            it OR was never attempted because the transaction's true outcome
+            couldn't be confirmed. READ THE PAIRED spdlog::error LINE FIRST —
+            it distinguishes the two shapes. If it names a specific kind/item
+            id ("compensation FAILED for <kind> '<item_id>'"), that item is a
+            confirmed orphan: delete it directly through that sibling store's
+            own route (DELETE /api/instructions/{id}, /api/policies/{id} or
+            /api/policy-fragments/{id}, /api/workflows/{id}). If it instead
+            says "outcome could not be confirmed" (no item named), do NOT
+            delete anything by guessing ids from the submitted bundle — first
+            confirm via GET /api/product-packs/{id} whether the pack actually
+            committed (a live, successfully-installed pack looks identical to
+            an orphan from this alert alone). This alert AUTO-RESOLVES ~1h
+            after the event ages out of the increase() window even if nothing
+            is resolved — resolved alert state here is NOT confirmation of
+            remediation. The raw counter (never decreases) is the durable
+            tracking signal, not alert state.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInstructionBundledContentNotClean
         # Same absent-success shape as YuzuProductPackBackfillNotCompleted above, adapted
         # for an EVERY-BOOT (not one-time) outcome (gov Gate 4 UP-4/Gate 8 fix): the
@@ -3741,15 +3784,19 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Durable-session reap declined on a wall-clock anomaly (DB/host clock integrity)"
+          summary: "Durable-session reap declined on a DB-primary clock anomaly (ADR-2002 §4 integrity)"
           description: >-
-            A durable-session reap pass was declined because the server's
-            wall-clock reading was implausibly ahead of or behind the persisted
-            reap anchor — the DB-clock-integrity signal ADR-2002 §4 requires be
-            monitored. A backward clock step un-expires sessions and extends live
-            JIT-elevation / MFA step-up windows beyond their authored maximums
-            (the residual the per-window ceilings deliberately do not resist).
-            Investigate NTP / DB-host / server-host clock health; correlate with
+            A durable-session reap pass was declined because the DB-PRIMARY clock
+            reading (Postgres now(), read in-SQL — the same clock that authors
+            session expires_at since #3715) was implausibly ahead of or behind the
+            persisted reap anchor — the DB-primary clock-integrity signal ADR-2002
+            §4 mitigation (a) requires be monitored. A backward step un-expires
+            sessions and extends live JIT-elevation / MFA step-up windows toward
+            their authored maximums (the residual the per-window clamps/ceilings
+            bound but do not eliminate). Investigate the DATABASE primary's NTP /
+            clock health first (not the app host — a local app-host wobble is the
+            separate yuzu_auth_local_clock_backward_total signal, which does NOT
+            affect session adjudication under DB-clock authority); correlate with
             yuzu_auth_session_store_degrade_total.
       - alert: YuzuSessionStoreDegraded
         expr: |
