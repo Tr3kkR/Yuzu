@@ -112,7 +112,11 @@ public:
         // If `fired` already committed (the worker observed the deadline and is at or
         // past `state->fired = true;` above), this cancel() is deliberately a no-op: once
         // firing has started there is nothing left to cancel — the worker has already
-        // unlocked and may already be inside action(). Documented, not a bug.
+        // unlocked and may already be inside action(). Documented, not a bug. This includes
+        // the microseconds-before-the-deadline boundary case: a call that genuinely returned
+        // just before `cancel()` runs can still lose that race and get hard_exit(4)'d anyway
+        // (external review, PR #3737) — indistinguishable from an ordinary firing, so it
+        // costs an unnecessary exit/restart cycle but nothing worse.
     }
 
     /// Test seam only.
