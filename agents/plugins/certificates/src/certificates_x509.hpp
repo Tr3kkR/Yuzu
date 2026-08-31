@@ -15,7 +15,8 @@
 // file's own comments). It deliberately does NOT touch the macOS
 // login-keychain path, which stays on its existing `security
 // find-certificate` + certificates_macos_parsers.hpp combined-output parse
-// (a Decision-7 governed-shell exception, registered as sinks
+// (a rung-2 pre-split argv through the bounded subprocess runner since
+// #3406 -- no shell; registered as Decision-1 sinks
 // `certificates/list_certs_macos#1` / `certificates/details_cert_macos#1` in
 // docs/agent-spawn-sink-manifest.md).
 //

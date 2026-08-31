@@ -484,10 +484,16 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 > (`SystemRootCertificates.keychain`), `login` (the current console user's
 > login keychain), or `all` (the default — System and root, plus login when a
 > console user is present). The `login` store is read from the console user's
-> per-user session via a `launchctl asuser <uid> sudo -n -u <user> security
-> find-certificate` hop, because the LaunchDaemon has no login keychain of its
-> own; with nobody logged in at the console it returns
-> `not_available|no console session`. `delete` accepts only `MY`/`System`
+> per-user session via a `launchctl asuser <uid> sudo -n -u <user> --
+> security find-certificate` hop (a pre-split argv through the bounded runner,
+> no shell), because the LaunchDaemon has no login keychain of its own. With
+> nobody logged in at the console it returns `not_available|no console
+> session`. If the console user cannot be DETERMINED — the directory lookup
+> timed out or failed, the account has no passwd record, or the name/uid
+> failed validation — it instead returns `not_available|<reason>` naming which,
+> and the result is marked PARTIAL. That distinction is deliberate: a degraded
+> lookup is never reported as an empty console, and `details` will not answer
+> `status|not_found` for a keychain it never opened. `delete` accepts only `MY`/`System`
 > (both target `System.keychain`, matching prior behaviour); `root` is
 > rejected as unsupported (SystemRootCertificates.keychain is sealed by System
 > Integrity Protection and cannot be modified), and `login`/`all`/any other
