@@ -345,6 +345,13 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
 - An **authoritative** store that returns an empty result on a DB error (fail-open). Surface it.
 - Unbounded `acquire()` on a runtime path. Bound it.
 - Holding a lease across an HTTP call, file I/O, or a second store call (deadlock / starvation).
+- Calling `PgPool::with_txn_on(lease, fn)` with a lease from the blocking `acquire()`, or with
+  ANY work between the acquire and the call. Unlike `with_txn_for`, this overload takes an
+  already-acquired lease and has no timeout of its own — it exists specifically so a caller can
+  tell "the acquire itself failed" from "a held connection's transaction body failed" (needed
+  when failure-handling includes a destructive step that must not run on an ambiguous signal —
+  `ProductPackStore::install`'s compensating rollback, gov Gate 5 CHAOS-1, #3481, is the worked
+  example), so the bounded-acquire discipline is on the CALLER, not baked into the call.
 - Unqualified runtime table names (works in a migration, breaks on a pooled connection).
 - `sqlite3_changes()`-style mutate-then-count. Use `RETURNING`.
 - Trusting `PQresultStatus() == PGRES_COMMAND_OK` on an `INSERT ... ON CONFLICT DO NOTHING` to mean

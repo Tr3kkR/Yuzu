@@ -5999,6 +5999,22 @@ public:
                     metrics_.counter("yuzu_server_product_pack_backfill_total",
                                      {{"result", result}});
                 }
+                metrics_.describe("yuzu_server_product_pack_install_compensation_total",
+                                  "#3481: best-effort rollback of already-installed sibling-store "
+                                  "content after a late install() failure (final persist or "
+                                  "duplicate-item-id), by result (ok = every already-installed "
+                                  "item was compensated; partial = at least one was not and "
+                                  "requires manual/operator cleanup - see rest-api.md's "
+                                  "POST /api/product-packs 503 note). Only emitted when a "
+                                  "compensate_fn was supplied, i.e. on the real HTTP route; a "
+                                  "direct ProductPackStore::install() caller that omits it leaves "
+                                  "this counter untouched, same as omitting compensate_fn always "
+                                  "has.",
+                                  "counter");
+                for (auto result : {"ok", "partial"}) {
+                    metrics_.counter("yuzu_server_product_pack_install_compensation_total",
+                                     {{"result", result}});
+                }
                 auto pack_db = cfg_.db_dir() / "product-packs.db";
                 if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
                     spdlog::error(

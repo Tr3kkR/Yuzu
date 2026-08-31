@@ -28,11 +28,54 @@
 /// sibling stores draw from the SAME shared `PgPool`, so holding our own lease while they try to
 /// acquire theirs risks starving a saturated pool). This was never a genuine cross-store
 /// transaction even pre-migration: `install_fn`'s callees write to THEIR OWN `db_`/pool, never
-/// ours, so a rollback of our own txn never undid an already-succeeded sibling install either.
-/// The new shape preserves that same atomicity boundary explicitly: `install_fn` is called with
-/// no lease of ours held; once every document has been resolved, the pack row + its successfully-
-/// installed item rows are written in ONE `pool_` transaction (parent-before-child, satisfying the
-/// FK). A total-failure install (zero items installed) never touches Postgres at all.
+/// ours. The new shape preserves that same atomicity boundary explicitly: `install_fn` is called
+/// with no lease of ours held; once every document has been resolved, the pack row + its
+/// successfully-installed item rows are written in ONE `pool_` transaction (parent-before-child,
+/// satisfying the FK). A total-failure install (zero items installed) never WRITES to Postgres —
+/// gov Gate 3 (cpp-expert, #3481): a keyed install's F033 idempotency pre-check runs one
+/// read-only `SELECT` before `install_fn` is ever reached, so "never touches Postgres at all"
+/// stopped being literally true once that pre-check landed.
+///
+/// **Update (F031/#3481, 2026-08-24): a late failure of that final persist transaction — AFTER
+/// `install_fn` already committed one or more documents into sibling stores — is no longer a
+/// silent orphan.** `install()` now accepts `compensate_fn` (see its doc comment below) and, on
+/// that failure, walks every already-installed item in REVERSE install order, calling
+/// `compensate_fn(kind, item_id)` on each as a best-effort undo. Reverse order matters: a bundle
+/// can install a `PolicyFragment` followed by a `Policy` that references it (bundle order is
+/// dependency order — `PolicyStore::create_policy` validates the fragment exists at creation
+/// time), and `PolicyStore::delete_fragment` refuses while any `Policy` still references it —
+/// compensating forward would spuriously fail to clean up the fragment. **This safety argument
+/// is `PolicyStore`-specific and holds only when the bundle itself respects dependency order**
+/// (gov Gate 5 CHAOS-4) — `WorkflowEngine::create_workflow` performs NO existence check on the
+/// `InstructionDefinition` ids its steps reference at creation time, so a bundle placing a
+/// `Workflow` document BEFORE the `InstructionDefinition` it references produces a brief window,
+/// scoped to the remaining length of the SAME compensation loop, where the `Workflow` row (not
+/// yet reached by the reverse walk) points at an already-compensated `InstructionDefinition` —
+/// self-heals when the loop reaches it moments later, but is a real, undocumented-until-now gap
+/// in the "reverse order is always safe" framing. This is best-effort, not
+/// a guarantee: a sibling store's own delete can itself fail for a reason unrelated to ordering
+/// (a `PolicyFragment` referenced by some OTHER, unrelated policy is the same tolerated exception
+/// documented for `uninstall()` below) — a residual orphan from a failed compensation is logged
+/// at `spdlog::error` (naming the exact kind/item id) and counted in
+/// `yuzu_server_product_pack_install_compensation_total{result}`, for operator follow-up, not
+/// automatically retried.
+///
+/// **Gate 6 review (#3481, sre): the metric/log/audit trail for a compensation attempt is
+/// written only after the reverse-order loop completes** — a process crash or forced restart
+/// DURING the loop (including immediately after its last, successful iteration but before the
+/// trailing emit) leaves that install attempt with NO metric sample, NO summary log line, and
+/// NO audit row at all — the request handler never resumes to call `audit_fn`. This is not a
+/// regression versus pre-#3481 behavior (every late failure silently orphaned content
+/// unconditionally, with the same absent observability) — it degrades to exactly the bug F031
+/// exists to close, in the rare window a crash coincides with an already-rare late-install
+/// failure. Operator guidance: a restart around the time of a large pack install, with no
+/// matching `YuzuProductPackCompensationPartial` alert or `spdlog::error` line for that attempt,
+/// is not proof compensation ran cleanly — check the submitted bundle against sibling-store
+/// content manually in that specific window. Not closed here; a fast-follow could increment the
+/// metric at the FIRST failed item rather than after the loop (never pre-increment — Prometheus
+/// counters can't decrement, so a pre-increment-then-correct pattern would false-alarm on every
+/// clean compensation), but that changes exactly the emission-point semantics Gate 8 verified
+/// with `promtool test rules` and would need its own re-verification, not a casual patch.
 ///
 /// **No `mtx_` (the pre-migration `shared_mutex` is dropped).** Postgres's MVCC + the pool's own
 /// connection-level concurrency replace the SQLite single-writer mutex, matching every other
@@ -44,6 +87,25 @@
 /// (harmless if the row is already gone). A small race window, not a security boundary —
 /// `ResultSetStore`'s per-owner quota/pin-limit soft-enforcement is the ladder's precedent for
 /// recording this class of trade explicitly rather than silently.
+///
+/// **Update (F032/#3481, 2026-08-24): `uninstall()`'s final metadata-delete transaction can
+/// likewise fail AFTER `uninstall_fn` has already removed the real sibling-store content** — the
+/// pack stays listed as installed, pointing at content that no longer exists. Unlike F031 above,
+/// this gap is accepted as a store-scoped residual risk rather than closed, because there is no
+/// symmetric fix: the sibling content is already gone, and re-creating deleted content to satisfy
+/// a rollback would itself be a hazard (resurrecting content an operator explicitly asked to
+/// remove, from no fresh operator input). Accepted on two grounds: (1) a plain client retry
+/// self-heals it — re-issuing the DELETE re-runs `uninstall_fn` against items that are already
+/// gone (idempotent no-ops for every sibling store's delete-by-id), then the metadata-delete
+/// transaction runs again and, absent a repeat failure, succeeds; (2) the blast radius is the same
+/// operator-authored-catalog-metadata classification ADR-0009's `ProductPackStore`/ADR-0054 update
+/// note already applies to this store, not personal or regulated subject/device data. **What this
+/// does NOT close:** between the failure and a successful retry, `get()`/`list()` show a pack
+/// pointing at deleted content, and a lookup that follows one of its item ids into another
+/// endpoint 404s — expected during that window, not a new fault, but genuinely visible to a caller
+/// that doesn't retry. This reasoning is store-scoped and MUST be re-derived, not copied, by any
+/// future store whose own uninstall path can leave metadata dangling over content that cannot be
+/// safely restored.
 ///
 /// No secrets (ADR-0010 N/A): `yaml_source` is pack content — verified against
 /// `docs/Instruction-Engine.md` / `docs/yaml-dsl-spec.md`, neither of which defines a
@@ -114,6 +176,64 @@ struct ProductPackQuery {
     int limit{100};
 };
 
+/// #3479: per-document outcome detail from `install()`, optionally requested via its trailing
+/// `partial_result` out-param. `install_fn` tolerates a single document failing without failing
+/// the whole bundle — this is how a caller learns WHICH documents failed and why, instead of
+/// only a bare pack id (success) or the first of potentially several failure reasons (total
+/// failure). Populated at every `install()` return point that carries an `install_fn` outcome —
+/// a total failure after the document loop ran, or a success (clean or partial). Gov Gate 4
+/// finding (consistency-auditor, #3481): NOT populated on a return BEFORE the document loop
+/// runs (store-not-open, missing `install_fn`, a malformed bundle, a signature rejection, an
+/// idempotency-key conflict/replay) — there is no install_fn outcome to report yet, and
+/// structurally can't be: the populating lambda and its captured locals don't exist at that
+/// point in `install()`. A caller reading only this comment should not assume "always
+/// populated on any `unexpected`" — see `install()`'s own `partial_result` doc for the precise
+/// carve-out.
+struct InstallPartialResult {
+    std::vector<std::string> errors; ///< One entry per document install_fn rejected, in
+                                     ///< document order — kind + install_fn's own error string.
+    int total_items{0};              ///< Item documents in the bundle (excludes the ProductPack
+                                     ///< metadata document itself).
+    int installed_count{0};          ///< `total_items - errors.size()`, restated for callers
+                                     ///< that only have this struct, not the raw counts.
+};
+
+/// Server-authoritative outcome of a post-failure transaction-status re-check (gov Gate 5
+/// CHAOS-1/CHAOS-1b, #3481) — see `ProductPackStore::check_transaction_outcome`'s doc comment.
+/// Deliberately NOT based on row visibility: a row's absence from a fresh read cannot
+/// distinguish "aborted" from "not yet committed" (the client-observed connection failure that
+/// triggers this check is not ordered relative to the backend's own commit progress — a
+/// middlebox/pooler can sever the client's connection at any point independent of whether the
+/// backend has finished, or even started, applying the commit), so `pg_xact_status()` — the
+/// question of that xact's true fate, answered by Postgres itself — is the mechanism instead.
+enum class TransactionOutcome {
+    kCommitted, ///< The backend confirms the transaction committed — the ack was merely lost.
+    kAborted,   ///< The backend confirms the transaction genuinely aborted — safe to compensate.
+    kUnknown    // Could not determine either way — the ONLY safe read is "do not compensate".
+};
+
+/// Gov Gate 4 (unhappy-path UP-2, UP-5), on `kUnknown` specifically: if the underlying
+/// transaction had in fact genuinely ABORTED (not merely undetermined), the sibling-store
+/// content install_fn already wrote in THIS attempt is now an unlinked orphan — no pack_id was
+/// ever persisted to reference it, and — unlike the confirmed-orphan `kAborted` shape — nothing
+/// was compensated. A keyed retry's pre-check finds no committed row and re-runs install_fn for
+/// the WHOLE bundle: a document with an explicit, retry-stable `id:` collides against attempt
+/// 1's already-created row (surfaces as a new errors[] entry); an auto-id document silently
+/// creates a full second copy under a NEW pack_id, orphaning attempt 1's content with no
+/// pack_id, no audit row, and no metric distinguishing it from an ordinary kUnknown. Also:
+/// `check_transaction_outcome` leases from the SAME pool_ as the write step whose failure it's
+/// diagnosing — but this reaches `check_transaction_outcome` ONLY when `write_lease_acquired`
+/// was true (the write lease WAS obtained, then the txn body failed); under a SUSTAINED full
+/// outage the write lease's own `try_acquire_for` fails first for nearly every caller, routing
+/// straight to the unambiguous, safe direct-compensate path — NOT through kUnknown at all (gov
+/// Gate 6, sre, correcting an earlier overstatement in this same note). The real window is
+/// narrower: a BRIEF flap/failover, where a write lease is granted just before the backend
+/// drops and collides with pool exhaustion on the immediately-following outcome check. Rare and
+/// narrow, not "every in-flight install during an outage" — but each occurrence still carries
+/// the retry-collision hazard above. Neither is fixed here — the fail-toward-`kUnknown` design
+/// is still the correct, safe choice (never guess `kAborted`); this documents the residual so
+/// an operator investigating a kUnknown event during a flap knows what it can compound into.
+
 // ── Callbacks for delegating item install/uninstall to existing stores ────────
 
 /// Called for each YAML document during install.
@@ -143,9 +263,11 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_product_pack_backfill_total{result}`) and `list`/`get`'s read-degrade
-    /// counter (`yuzu_server_product_pack_read_degrade_total{reason}`), matching
-    /// `CustomPropertiesStore`/`DiscoveryStore`'s #1675 convention. Set ONCE during
+    /// (`yuzu_server_product_pack_backfill_total{result}`), `list`/`get`'s read-degrade counter
+    /// (`yuzu_server_product_pack_read_degrade_total{reason}`), matching
+    /// `CustomPropertiesStore`/`DiscoveryStore`'s #1675 convention, and `install`'s F031/#3481
+    /// compensation-outcome counter (`yuzu_server_product_pack_install_compensation_total{result}`).
+    /// Set ONCE during
     /// single-threaded startup — BEFORE `migrate_from_sqlite()`, so the backfill counter is
     /// live on the one pass that matters (the #3261/#3294 wiring-order class; see the
     /// construction-site comment in server.cpp). A null registry (the default, e.g. in unit
@@ -222,8 +344,54 @@ public:
     ///
     /// `install_fn` is invoked with NO `pool_` lease of ours held (see the file header) — it is
     /// free to call into its own sibling stores without risking pool starvation.
+    ///
+    /// `compensate_fn` (F031/#3481): if the final persist transaction fails AFTER one or more
+    /// documents were already installed via `install_fn`, this callback is invoked once per
+    /// already-installed item, in REVERSE install order, to best-effort undo it — same
+    /// `bool(kind, item_id)` shape as `uninstall_fn` (in practice callers pass the identical
+    /// per-kind delete dispatch). A single item's compensation failing is logged and does not
+    /// abort compensating the rest. Defaults to an empty callback (no compensation attempted) —
+    /// existing callers are unaffected until they opt in. See the file header for the full
+    /// rationale and the reverse-order requirement.
+    ///
+    /// `idempotency_key` (F033/#3481): when non-empty, a prior successful install with the SAME
+    /// key and an IDENTICAL `yaml_bundle` short-circuits before `install_fn` is invoked at all,
+    /// returning the original pack id — this is what stops a client retry from re-running
+    /// `install_fn` against every sibling store again (a dedup check only at the final persist
+    /// step would not: `install_fn` would still re-run on every attempt). The same key reused
+    /// with a DIFFERENT bundle is rejected as a plain validation error (never
+    /// `kProductPackDbErrorPrefix` — a 400, not a 503) EXCEPT inside the narrow race window
+    /// documented below: the LOSER of two concurrent installs racing the same not-yet-used key
+    /// (with genuinely different bodies) never reaches the pre-check's differing-body branch at
+    /// all — it hits the persist INSERT's unique-violation instead, which IS
+    /// `kProductPackDbErrorPrefix`/503 (retryable), and only converges to the documented 400 on
+    /// a subsequent retry once the pre-check can see the winner's committed row (gov Gate 5
+    /// CHAOS-3). Defaults to empty (no dedup) — preserves
+    /// today's behavior exactly; a caller that never sends a key gets no idempotency protection,
+    /// same as before this parameter existed. Namespaced globally (the key alone, not scoped to a
+    /// caller/principal) — `POST /api/product-packs` is `ProductPack:Write`-gated, effectively
+    /// operator-only against one fleet-wide catalog, unlike e.g. ADR-0032's per-credential
+    /// admission-protocol dedupe, which exists for a different, multi-principal threat model. A
+    /// narrow race remains (two concurrent installs, same key, both pass the pre-check) — left to
+    /// surface as an ordinary unique-violation on the persist INSERT, which the loser's own F031
+    /// compensation path already handles; see the CHAOS-3 note above for exactly where a client
+    /// retry converges to (the winner's id if the retried body matches the winner's, the
+    /// documented 400 if it differs — NOT unconditionally the winner's id). Same class of
+    /// accepted race already documented for concurrent `uninstall()` above.
+    ///
+    /// `partial_result` (#3479): when non-null, populated with per-document failure detail —
+    /// on EITHER outcome, a total failure (every document's error, not just the first) or a
+    /// partial success (which documents failed and why, alongside the ones that installed).
+    /// Defaults to null — preserves existing callers' behavior exactly. NOT populated on ANY
+    /// return that happens BEFORE the document loop runs — not just the idempotency pre-check's
+    /// short-circuit replay, but also the store-not-open/missing-install_fn/malformed-bundle/
+    /// signature-rejection/idempotency-conflict checks: `install_fn` never ran on any of those
+    /// calls, so there is no per-document outcome yet to report.
     std::expected<std::string, std::string> install(const std::string& yaml_bundle,
-                                                    ItemInstallFn install_fn);
+                                                    ItemInstallFn install_fn,
+                                                    ItemUninstallFn compensate_fn = {},
+                                                    const std::string& idempotency_key = {},
+                                                    InstallPartialResult* partial_result = nullptr);
 
     /// List installed product packs, newest-installed first. `unexpected(msg)` (prefixed
     /// `kProductPackDbErrorPrefix`) is a genuine read failure — never treat it as "no packs
@@ -245,6 +413,29 @@ public:
 
     // Minimal YAML value extraction — public so install callbacks can use it
     static std::string extract_yaml_value(const std::string& yaml, const std::string& key);
+
+    /// Gov Gate 5 CHAOS-1/CHAOS-1b (#3481, verified): a fault landing between Postgres
+    /// processing COMMIT and the client reading `PGRES_COMMAND_OK` is indistinguishable, at the
+    /// `with_txn_on` call site, from a genuine transaction failure — the client-observed
+    /// connection failure is not ordered relative to the backend's own commit progress, so
+    /// "check whether the row exists now" (an earlier version of this method) is ALSO not
+    /// reliable: absence could mean genuinely aborted, or could mean the backend simply hasn't
+    /// finished applying an already-in-flight commit yet. `pg_xact_status()` asks Postgres
+    /// itself the true fate of that specific transaction id instead of inferring it from a
+    /// side effect — it is documented for exactly this ("commit status of transactions whose
+    /// outcome is in doubt due to a lost connection"). Before `install()`'s compensating
+    /// rollback runs on a final-persist failure, it uses this to tell "the transaction genuinely
+    /// aborted" (safe to compensate — the pre-#3481 behavior) from "it actually committed and
+    /// only the ack was lost" (compensating would ACTIVELY DELETE real, already-persisted
+    /// content — worse than the orphan #3481 exists to close) from "still in progress, or
+    /// unknown" (`kUnknown` — the ONLY safe read when doubt remains; never guess `kAborted`).
+    /// Public (not file-local) specifically so this exact decision seam is unit-testable
+    /// deterministically (no fault injection needed): open a transaction on one connection,
+    /// query its status from a second while still open (`kInProgress`... i.e. `kUnknown`), then
+    /// after `COMMIT` (`kCommitted`) and after `ROLLBACK` (`kAborted`) on a fresh transaction —
+    /// all three real server-confirmed outcomes are directly producible.
+    static TransactionOutcome check_transaction_outcome(pg::PgPool& pool,
+                                                        const std::string& xact_id);
 
     /// Verify an Ed25519 signature over content.
     /// Uses OpenSSL EVP_DigestVerify on every platform (see the .cpp file header for the
