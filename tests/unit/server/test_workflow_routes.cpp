@@ -1555,7 +1555,7 @@ TEST_CASE("SSE handler: mark_cancelled publishes terminal execution-completed",
     std::vector<ExecutionEvent> seen;
     h.event_bus->subscribe(exec_id, [&](const ExecutionEvent& ev) { seen.push_back(ev); });
 
-    h.tracker->mark_cancelled(exec_id, "tester");
+    REQUIRE(h.tracker->mark_cancelled(exec_id, "tester"));
 
     REQUIRE(seen.size() == 1);
     CHECK(seen[0].event_type == "execution-completed");

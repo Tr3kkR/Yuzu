@@ -179,7 +179,11 @@ public:
     /// (governance PR review, 2026-08-31) — the row never learns its real
     /// agent count and can never reach refresh_counts's all-responded
     /// threshold, wedging it at "running"; callers should log/surface this.
-    bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
+    /// `[[nodiscard]]` (scoped re-review, cpp-expert) matches this
+    /// codebase's own convention for a must-check success signal
+    /// (`AuditStore::log`) — a future call site silently discarding this
+    /// return would reintroduce the exact bug this fix closes.
+    [[nodiscard]] bool set_agents_targeted(const std::string& execution_id, int agents_targeted);
 
     std::expected<std::string, std::string> create_rerun(const std::string& original_id,
                                                          const std::string& user, bool failed_only);
@@ -187,8 +191,9 @@ public:
     /// Returns false on a pool/query failure (governance PR review,
     /// 2026-08-31) — the execution was NOT actually cancelled; callers must
     /// not report success (an audit "success" row or an HTTP 200) on a
-    /// false return.
-    bool mark_cancelled(const std::string& id, const std::string& user);
+    /// false return. `[[nodiscard]]` for the same reason as
+    /// `set_agents_targeted` above.
+    [[nodiscard]] bool mark_cancelled(const std::string& id, const std::string& user);
 
     // Statistics (capability 1.9)
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;

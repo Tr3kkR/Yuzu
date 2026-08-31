@@ -396,6 +396,22 @@ grants leases but the contended row's lock queue is saturated — folded into #3
 rather than reworked here, since the reconciler sweep resolves it structurally by not holding a
 request-path connection across any lock wait at all.
 
+**Why `update_agent_status` retries but `set_agents_targeted`/`mark_cancelled` only report failure
+(scoped re-review, 2026-08-31, consistency-auditor point 7):** the two failure modes are not the
+same shape. A dropped `update_agent_status` upsert means the `agent_exec_status` row was never
+written at all — #3729's future reconciler recomputes FROM those rows, so a missing one has
+nothing to reconcile from (the agent does not re-send), which is why that path gets the retry. A
+dropped `set_agents_targeted`/`mark_cancelled` instead leaves the `executions` row visibly wedged
+at `running` with a stale `agents_targeted`/`status` — exactly the state #3729's reconciler is
+designed to find and correct, so reporting the failure (rather than retrying in place) is
+sufficient there. **One gap in that reasoning found by the same re-review (security-guardian):**
+of `set_agents_targeted`'s four call sites, only `schedule_runner.cpp`'s actually recovers
+(marks the execution cancelled and audits the failure) — `workflow_routes.cpp`, `rest_api_v1.cpp`,
+and `mcp_server.cpp` log and then still report the overall dispatch as a success. The audit row
+stays truthful (dispatch genuinely reached N agents), but the execution row itself wedges with no
+operator-visible signal beyond the log line — the same class of gap #3729 already exists to close.
+Folded into #3729's scope rather than reworked here.
+
 **`InstructionDbPool` deletion.** `instruction_db_pool.{hpp,cpp}` is deleted along with its
 `server.cpp` member (`instr_db_pool_`), its dedicated construction block, and its teardown line
 — verified beforehand by a repo-wide grep that `server.cpp` was its only consumer. The

@@ -911,8 +911,17 @@ std::expected<void, std::string> ApprovalManager::set_review_status(const std::s
         "RETURNING 1",
         std::vector<std::string>{status, reviewer, std::to_string(now_epoch()), comment, id});
 
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string("update failed: ") + PQresultErrorMessage(res.get()));
+    if (res.status() != PGRES_TUPLES_OK) {
+        // Scrubbed generic string (governance PR review, 2026-08-31,
+        // Doomgoose + scoped re-review, consistency-auditor: this branch
+        // was missed when the SELECT failure four lines above it was fixed
+        // to the same shape — both reach the HX-Trigger toast and the MCP
+        // error body via mcp_server.cpp's approve_request/reject_request
+        // and server.cpp's /api/approvals/{id}/approve|reject).
+        spdlog::error("ApprovalManager::set_review_status: update failed for id={}: {}", id,
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected("approval store temporarily unavailable (update failed)");
+    }
 
     if (PQntuples(res.get()) > 0) {
         spdlog::info("ApprovalManager: {} approval {} by {}", status, redact_id(id), reviewer);

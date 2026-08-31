@@ -132,7 +132,7 @@ TEST_CASE("ExecutionTracker: query by status", "[pg][execution_tracker]") {
     auto id2_result = tracker.create_execution(make_execution());
     REQUIRE(id1_result.has_value());
     REQUIRE(id2_result.has_value());
-    tracker.mark_cancelled(*id1_result, "admin");
+    REQUIRE(tracker.mark_cancelled(*id1_result, "admin"));
 
     ExecutionQuery q;
     q.status = "cancelled";

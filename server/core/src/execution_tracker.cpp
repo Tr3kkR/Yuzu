@@ -430,7 +430,7 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     if (!open_)
         return;
 
-    // Retry once on failure, same rationale and shape as refresh_counts's
+    // Retry once on failure, same rationale as refresh_counts's
     // own retry (governance adversarial review, PR review 2026-08-31,
     // Doomgoose): a lease-acquire timeout or a cancelled statement under
     // row-lock contention here is silent by default and, unlike
