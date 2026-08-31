@@ -116,6 +116,7 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
+#include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
@@ -14532,44 +14533,83 @@ private:
             // `registry.delete_key`) rather than silently exempting them from
             // the same targeting-safety treatment `tar.purge_source` alone used
             // to get.
+            //
+            // #3685: routed through the pure `evaluate_destructive_targeting` /
+            // `confine_destructive_targets` (`dispatch_destructive_gate.hpp`)
+            // instead of the inline `if (classified_for_gate && ...)` guard that
+            // used to live here — that guard collapsed "classified and not
+            // Destructive" and "failed to classify at all" into the same skipped
+            // branch. `ClassifyMiss` is now an explicit switch arm below
+            // (Policy B: fall through to `build_classified_command`, which
+            // denies a real miss unconditionally with its own taxonomy/metric/
+            // audit shape) — this commit is externally byte-identical to the
+            // block it replaces except the two refusal strings now come from
+            // `dispatch_destructive_gate.hpp`'s named constants instead of
+            // inline literals.
             {
-                const auto classified_for_gate = capability_registry_.classify(plugin, action);
-                if (classified_for_gate &&
-                    classified_for_gate->dispatch_class == yuzu::server::DispatchClass::Destructive) {
-                    const auto& cap = *classified_for_gate;
+                const auto gate = yuzu::server::evaluate_destructive_targeting(
+                    capability_registry_.classify(plugin, action),
+                    /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                    /*scope_key_present=*/!extract_json_string(body, "scope").empty());
+                switch (gate.verdict) {
+                case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                    break;
+                case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                    // Policy B (#3685 decision, revised after external review):
+                    // explicit fall-through, not a new denial site. The SAME
+                    // registry/classifier `build_classified_command` consults
+                    // below denies a real miss unconditionally with its own
+                    // taxonomy/metric/audit shape — an independent early denial
+                    // here would only duplicate, and risk drifting from, that
+                    // evidence.
+                    break;
+                case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
+                    const auto& cap = *gate.capability;
+                    // Elevation FIRST — preserves the pre-#3685 403-before-400
+                    // ordering. This stays the JIT-elevation-aware
+                    // `require_permission`, deliberately distinct from the
+                    // dispatch chokepoint's base-grants-only `has_permission`
+                    // callback (`agent_registry.hpp`) — see
+                    // `dispatch_destructive_gate.hpp`'s D3/D4 doc comment for
+                    // why the two are never collapsed.
                     if (!require_permission(req, res, std::string(cap.securable),
                                             std::string(yuzu::server::authz::to_string(cap.operation))))
                         return;
-                    // Destructive dispatch must be explicitly targeted + in scope.
-                    if (agent_ids.empty() || !extract_json_string(body, "scope").empty()) {
+                    if (gate.verdict ==
+                        yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted) {
                         res.status = 400;
                         res.set_content(
-                            R"({"error":{"code":400,"message":"destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"},"meta":{"api_version":"v1"}})",
+                            R"({"error":{"code":400,"message":")" +
+                                std::string(yuzu::server::kDestructiveUntargetedMessage) +
+                                R"("},"meta":{"api_version":"v1"}})",
                             "application/json");
                         return;
                     }
-                    // Confine to the operator's visible agents (fail-closed: an absent
-                    // mgmt-group store filters to empty → 404, same posture as the
-                    // dashboard fragment). Out-of-scope ids are silently dropped.
-                    std::vector<std::string> filtered;
-                    if (mgmt_group_store_) {
-                        // ADR-0042: nullopt (store degraded) → empty visible set → 404.
-                        auto vis = mgmt_group_store_->get_visible_agents(sess->username);
-                        std::unordered_set<std::string> visible;
-                        if (vis)
-                            visible.insert(vis->begin(), vis->end());
-                        for (const auto& aid : agent_ids)
-                            if (visible.count(aid))
-                                filtered.push_back(aid);
-                    }
-                    agent_ids = std::move(filtered);
+                    // Confine to the operator's visible agents (fail-closed: an
+                    // absent or degraded mgmt-group read → empty → 404, same
+                    // posture as the dashboard fragment). Out-of-scope ids are
+                    // silently dropped. `DestructiveVisibleAgents`'s nullopt
+                    // means fail-closed-empty — the OPPOSITE of
+                    // `authz::VisibleSet`'s nullopt (unfiltered) — see that
+                    // type's doc comment (`dispatch_destructive_gate.hpp`).
+                    std::optional<std::vector<std::string>> vis;
+                    if (mgmt_group_store_)
+                        vis = mgmt_group_store_->get_visible_agents(
+                            sess->username); // ADR-0042: nullopt (degraded) → fail-closed
+                    agent_ids = yuzu::server::confine_destructive_targets(
+                        agent_ids, yuzu::server::DestructiveVisibleAgents{std::move(vis)});
                     if (agent_ids.empty()) {
                         res.status = 404;
                         res.set_content(
-                            R"({"error":{"code":404,"message":"no reachable in-scope agent"},"meta":{"api_version":"v1"}})",
+                            R"({"error":{"code":404,"message":")" +
+                                std::string(yuzu::server::kDestructiveNoVisibleAgentMessage) +
+                                R"("},"meta":{"api_version":"v1"}})",
                             "application/json");
                         return;
                     }
+                    break;
+                }
                 }
             }
 
