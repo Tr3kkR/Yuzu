@@ -20,6 +20,7 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include "authz_gates.hpp" // yuzu::server::authz::FleetReadGate (#1712 / #3290 Phase 2)
 #include "authz_model.hpp" // yuzu::server::authz::VisibleSet (#1788 / CDX-R7-02)
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 
@@ -143,10 +144,30 @@ public:
         csrf_trusted_origins_ = std::move(origins);
     }
 
+    /// #1712 / #3290 Phase 2 — the injected-callback twin of
+    /// `AuthRoutes::require_fleet_read`, backing `/fragments/results`'
+    /// real per-agent/service confinement (same shape as
+    /// `McpServer::FleetReadFn`/`RestApiV1::FleetReadFn` — server.cpp wires
+    /// the SAME conversion lambda into all three surfaces so they cannot
+    /// drift). Same setter idiom as `set_csrf_trusted_origins` above (both
+    /// `register_routes` overloads already take fourteen parameters). MUST
+    /// be `/fragments/results`' SOLE authorization gate — never stacked
+    /// with `perm_fn_` for the same `(securable_type, operation)` (the
+    /// BLOCKING defect `require_fleet_read`'s own doc comment warns
+    /// against). Unset (default-constructed) ⇒ the route fails CLOSED
+    /// (503 "unwired"), mirroring `McpServer`'s own unwired contract for
+    /// the identical seam.
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+    void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
+
 private:
     std::vector<std::string> csrf_trusted_origins_;
     AuthFn auth_fn_;
     PermFn perm_fn_;
+    FleetReadFn fleet_read_fn_;
     AuditFn audit_fn_;
     ResponseStore* response_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
@@ -206,6 +227,13 @@ private:
     /// the listed plugin column names are rendered (the "Agent" pseudo-
     /// column is always shown). @p template_id is propagated through pager
     /// / sort URLs so that switching pages doesn't drop the chosen template.
+    /// @p scope — #1712 / #3290 Phase 2: the fleet-read gate's composed
+    /// meet(management-group, service-scope) VisibleSet. nullopt (TOP) ⇒
+    /// unfiltered — a global grant or RBAC-off, byte-identical to the
+    /// pre-#1712 no-op filter path for that caller class. Defaults to
+    /// nullopt so the existing DashboardResultsColumnsTestAccess friend
+    /// seam (test_dashboard_results_columns.cpp) keeps testing the
+    /// unfiltered path unchanged.
     std::string render_results(const std::string& command_id, const std::string& plugin,
                                const std::string& sort_col, const std::string& sort_dir,
                                int page, int per_page,
@@ -213,7 +241,8 @@ private:
                                const std::string& text_query,
                                const std::string& definition_id = {},
                                const std::string& template_id = {},
-                               const std::vector<std::string>& visible_columns = {});
+                               const std::vector<std::string>& visible_columns = {},
+                               const authz::VisibleSet& scope = std::nullopt);
 
     /// Render filter controls for a plugin schema. When @p definition_id is
     /// non-empty it's emitted as a hidden form input so subsequent

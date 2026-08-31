@@ -4,7 +4,7 @@ set -euo pipefail
 # Build Yuzu .deb packages from pre-compiled binaries.
 # Usage: build-deb.sh --bin-dir DIR --version VERSION [--output DIR]
 #
-# Expects bin-dir to contain: yuzu-server, yuzu-agent, plugins/, content/
+# Expects bin-dir to contain: yuzu-server, yuzu-agent, plugins/
 
 BIN_DIR=""
 VERSION=""

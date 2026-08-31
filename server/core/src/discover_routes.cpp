@@ -156,7 +156,15 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
                            // no visible flag would be the misleading option here.
     q.limit = 5000;        // generous ceiling for a catalog read, not a paged list.
 
-    auto defs = instruction_store.query_definitions(q);
+    // ADR-0058: query_definitions now returns std::expected — a genuine DB error is
+    // surfaced as a thrown exception, which the sole caller (discover_routes.cpp's
+    // /api/v1/discover/instructions handler) already catches and turns into a 503
+    // (discover_503), matching this file's established degrade idiom (see
+    // build_plugins_catalog's identical pattern below).
+    auto defs_result = instruction_store.query_definitions(q);
+    if (!defs_result)
+        throw std::runtime_error(defs_result.error());
+    const auto& defs = *defs_result;
 
     json arr = json::array();
     for (const auto& d : defs) {
@@ -351,16 +359,21 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
     int enriched = 0;
     if (instruction_store) {
         std::unordered_map<std::string, json> schema_by_action;
-        // Enrichment is BEST-EFFORT: a store read that throws (SQLite/PG error)
-        // degrades to name+description only rather than failing the whole catalog,
-        // so the MCP tool path — which has no route-level try/catch — cannot 500
-        // on it (UP-6). query_definitions returns {} on a closed handle without
-        // throwing; this guards the genuine-error case.
+        // Enrichment is BEST-EFFORT: a store read that throws (ADR-0058: a genuine
+        // std::expected DB error is turned into a throw immediately below) degrades to
+        // name+description only rather than failing the whole catalog, so the MCP tool
+        // path — which has no route-level try/catch — cannot 500 on it (UP-6).
         try {
             InstructionQuery q;
             q.enabled_only = true;
             q.limit = 5000;
-            for (const auto& d : instruction_store->query_definitions(q)) {
+            // ADR-0058: query_definitions now returns std::expected; a genuine DB error
+            // throws (caught immediately below), matching the pre-migration comment's
+            // already-stated intent for this exact best-effort enrichment path.
+            auto defs_result = instruction_store->query_definitions(q);
+            if (!defs_result)
+                throw std::runtime_error(defs_result.error());
+            for (const auto& d : *defs_result) {
                 if (d.plugin.empty() || d.action.empty())
                     continue;
                 auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);

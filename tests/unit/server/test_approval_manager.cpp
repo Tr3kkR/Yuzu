@@ -923,8 +923,9 @@ TEST_CASE("ApprovalManager: migration v6 applies to an existing v5 store",
     // And that migration SIX is what put them there: index existence alone
     // would also hold if v6 were folded back into an earlier migration. Pinned
     // to the current head rather than to 6 — folding v6 away would renumber the
-    // tail and this still catches it.
-    CHECK(MigrationRunner::current_version(tdb.db, "approval_manager") == 7);
+    // tail and this still catches it. Bumped to 8 (#1398 hardening — the
+    // target_action content-binding column, migration v8).
+    CHECK(MigrationRunner::current_version(tdb.db, "approval_manager") == 8);
     auto row = mgr.get("v5-row");
     REQUIRE(row.has_value());
     CHECK(row->definition_id == "inventory.audit");

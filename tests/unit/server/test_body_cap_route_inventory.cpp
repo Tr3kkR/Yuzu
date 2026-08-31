@@ -145,13 +145,10 @@ struct RegisteredRoute {
 /// has a `pg/` subdirectory today; nothing forbids a route file landing
 /// under a future one) and return `{basename, contents}` pairs. `.inc` is
 /// scanned alongside `.cpp` because a route registration living in a
-/// textually-`#include`d fragment (as of this writing: two dead/orphaned
-/// files, `deployment_discovery_routes.inc` and `directory_patch_routes.inc`
-/// — both superseded by discovery_routes.cpp per that file's own header
-/// comment, and neither is `#include`d or listed in meson.build today) is
-/// still source text this scan must not silently skip; a `.inc` file that
-/// IS live in a future refactor must not regress this guard back to
-/// invisible. No other extension under server/core/src carries a route
+/// textually-`#include`d fragment is still source text this scan must not
+/// silently skip; no `.inc` file exists under server/core/src today, but a
+/// future one that IS live must not regress this guard back to invisible.
+/// No other extension under server/core/src carries a route
 /// registration (verified: `.cpp`/`.hpp`/`.inc` are the only three
 /// extensions present, and no `.hpp` matches the route-registration regex).
 ///

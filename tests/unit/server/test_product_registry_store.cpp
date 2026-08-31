@@ -89,7 +89,7 @@ void prod_reset() {
 
 TEST_CASE("ProductRegistryStore migrates at construction and reopens idempotently",
           "[pg][product_registry]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {
@@ -253,7 +253,7 @@ TEST_CASE("ProductRegistryStore alias upsert/resolve round-trip + re-point seman
 
 TEST_CASE("ProductRegistryStore reads are AUTHORITATIVE: degrade ≠ empty, and writes fail soft",
           "[pg][product_registry]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, prod_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     ProductRegistryStore store{pool};
@@ -319,7 +319,7 @@ TEST_CASE("ProductRegistryStore store_not_open: constructor failure degrades rea
     // version record so a fresh construction re-runs v1 DDL over the live
     // tables → migration fails → !is_open(), and every authoritative read
     // degrades (store_not_open reason).
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     {

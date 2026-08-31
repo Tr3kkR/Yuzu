@@ -14,24 +14,33 @@ cadences.
   the `installed_apps` plugin via its `list_inventory` action (Windows: `HKLM` +
   the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
   macOS: `system_profiler`). The operator-facing `list` action keeps its
-  original 4-column output — automation built on it is unaffected.
+  original 4-column `app|...` row shape for every successful acquisition —
+  automation built on parsing that shape is unaffected. On Linux/macOS, a
+  degraded acquisition (timeout, kill, spawn failure, truncation, or a
+  nonzero exit) now emits a single `error|installed_apps: acquisition
+  degraded (...)` row and a nonzero result instead of an empty or partial
+  `app|` list — see "Degraded collections are skipped, not published" below.
+  Automation that only parses `app|` rows and ignores `error|` is
+  unaffected; automation that assumed `list` always succeeds needs an
+  update. See `docs/user-manual/agent-plugins.md`'s `installed_apps`/
+  `msi_packages` entries for the exact per-action wording.
 - **The honest-empty contract:** a field the ecosystem does not store is the
   empty string, **never synthesised** (no `-` placeholders, no guessed `0`
   epoch). Per-ecosystem availability:
 
-  | Field | rpm | deb | apk | pacman | Windows | macOS |
-  |---|---|---|---|---|---|---|
-  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` |
-  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` |
-  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — |
-  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — |
-  | `arch` | ✓ | ✓ | — | — | — | — |
-  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | — |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified |
-  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | — |
-  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — |
+  | Field | rpm | deb | apk | pacman | Windows | macOS apps | macOS pkgutil |
+  |---|---|---|---|---|---|---|---|
+  | `kind` | `package` | `package` | `package` | `package` | `app` | `app` | `pkg` |
+  | `ecosystem` | `rpm` | `deb` | `apk` | `pacman` | `windows` | `macos` | `macos_pkgutil` |
+  | `name` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (receipt id) |
+  | `version` (upstream, release stripped) | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+  | `epoch` | ✓ (empty if none) | ✓ (empty if none) | — | ✓ (empty if none) | — | — | — |
+  | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — |
+  | `arch` | ✓ | ✓ | — | — | — | — | — |
+  | `publisher` | PACKAGER | Maintainer | — | — | Publisher | signing leaf CN | — |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds |
+  | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — |
+  | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — |
 
   Notes: rpm `signature_status` reflects the **stored** signature header tags in
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
@@ -39,6 +48,61 @@ cadences.
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
   packages (they are installed). `homebrew` is a reserved `ecosystem` value —
   not collected yet (brew is per-user; the sync is machine-scope).
+
+  **macOS `app` rows** carry `publisher` and `signature_status` read natively
+  through CoreFoundation + Security.framework (`CFBundleCreate`,
+  `SecStaticCodeCreateWithPath`, `SecCodeCopySigningInformation`) — no
+  `codesign` subprocess, and no deep `SecStaticCodeCheckValidity` verify. Like
+  rpm's, the field records that a signature is **present**, not that it is
+  valid. `signed` means signing metadata was found; it does **not** mean the
+  signature verifies. An ad-hoc or self-signed bundle reads `signed`, and so
+  does a bundle whose signature has since been **broken** — deleting a bundle's
+  `_CodeSignature` directory or modifying its executable leaves the recorded
+  identifier and certificates in place, so such a bundle still reads `signed`
+  and still reports the original vendor's Common Name as `publisher`. Treat
+  `publisher` as unverified attribution, never proof of origin, and do **not**
+  use `signature_status` as tamper detection or as a Gatekeeper/notarization
+  result. (Deep verification — `SecStaticCodeCheckValidity` — is not performed;
+  adding it would turn this into a validity verdict and need a third state, an
+  open contract decision.) `publisher` is empty for ad-hoc-signed and unsigned
+  apps. Enrichment covers up to 5000 located apps per collection; that guard is
+  a runaway bound rather than a routine limit, and reaching it makes the agent
+  report the collection degraded (see below) instead of publishing rows whose
+  signature fields silently went blank.
+
+  **macOS `pkg` rows** are `pkgutil` receipts — system installer packages
+  (Command Line Tools, XProtect payloads, vendor `.pkg` installs) that never
+  appear in `system_profiler`'s GUI-app enumeration. `name` is the receipt's
+  reverse-domain identifier (`com.apple.pkg.CLTools_Executables`), not a
+  display name. `install_date` is the receipt's raw **UNIX epoch seconds**,
+  the only form `pkgutil --pkg-info` reports — deliberately carried through
+  verbatim under the honest-empty contract rather than reformatted into a
+  precision the receipt never recorded. Bounded at 5000 receipts per collection,
+  again a runaway guard rather than a routine limit.
+
+  **On Linux and macOS, degraded collections are skipped, not published.** If
+  any acquisition step does not complete on its own terms — a timeout, a spawn
+  failure, a killed child, a capture truncation, a nonzero exit from a
+  top-level enumerator, exhaustion of the 120-second whole-collection budget
+  mid-enrichment or mid-receipt-walk, either runaway guard above, or (macOS
+  only) `system_profiler` or `pkgutil` running successfully and reporting
+  nothing at all — the agent reports the whole collection as degraded and the
+  daily sync SKIPS that cycle. The previous inventory is retained. This is
+  deliberate: an incomplete snapshot is indistinguishable from a complete one
+  once it reaches the server, so the omissions would be read as uninstalls. A
+  stale inventory is recoverable; a confidently wrong one is not. Degraded
+  cycles are logged as warnings, and a host that degrades every day will stop
+  updating — treat repeated warnings as actionable.
+
+  The "ran but reported nothing" trigger is macOS-only by design: every Mac has
+  GUI applications and installer receipts, so zero means the tool failed. On
+  Linux an empty result is often honest — a host may legitimately have `rpm`
+  installed and no rpm packages — so that check is not applied there.
+
+  **Windows has no degraded signal today.** Its inventory is collected natively
+  from the registry rather than through the subprocess runner, so none of the
+  above applies: a partial registry walk publishes as complete. Tracked as a
+  known gap, not closed by this release.
 - **Changes for rpm fleets vs the v1 (4-field) contract:** `publisher` is now
   the rpm **PACKAGER** tag (was VENDOR), and `version` is the upstream version
   only — the release moved to its own `release` column (was fused

@@ -62,7 +62,9 @@ void BundleOrchestrator::maybe_sweep_locked(std::int64_t now) {
 BundleOrchestrator::DispatchResult
 BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<BundleStepSpec>& steps,
                              const std::string& principal, const AuditSink& audit,
-                             const yuzu::server::authz::VisibleSet& exec_visible) {
+                             const yuzu::server::authz::VisibleSet& exec_visible,
+                             bool principal_is_admin,
+                             yuzu::server::ApprovalProvenance approval_provenance) {
     const std::string correlation = std::string(kCorrelationPrefix) + mint_();
     // Time the synchronous fan-out so the cost of holding the HTTP worker through
     // N gRPC writes is observable BEFORE it becomes a thread-pool-starvation
@@ -103,9 +105,20 @@ BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<Bund
                 // fail `AnonymousOperator`. `principal_role` stays empty: the
                 // chokepoint requires only a non-empty principal, and the
                 // orchestrator has no role to report without re-deriving one.
+                //
+                // #1398 (adversarial-review finding): `principal_is_admin` and
+                // `approval_provenance` are this method's own parameters now,
+                // for the same reason `principal`/`exec_visible` are — a
+                // per-step reconstruction that drops them silently defeats the
+                // gate for every legitimate admin/ticket-holding caller
+                // dispatching a bundle at an `AdminOrApproval`/`AlwaysApproval`
+                // pair (see this method's own doc comment in
+                // bundle_orchestrator.hpp).
                 dispatch_(s.plugin, s.action, {agent_id}, /*scope=*/"", params, correlation,
                           yuzu::server::DispatchCaller{.principal = principal,
-                                                       .exec_visible = exec_visible});
+                                                       .exec_visible = exec_visible,
+                                                       .principal_is_admin = principal_is_admin,
+                                                       .approval_provenance = approval_provenance});
             ok = sent > 0 && !command_id.empty();
         } catch (const std::exception& e) {
             spdlog::warn("BundleOrchestrator: dispatch threw for step {}.{} ({}): {}", s.plugin,

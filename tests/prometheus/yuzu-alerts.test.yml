@@ -1751,6 +1751,75 @@ tests:
         eval_time: 20m
         exp_samples: []
 
+  # ── YuzuRuntimeConfigReadDegraded (ADR-0060) ────────────────────────────
+  #
+  # `sum(rate(yuzu_server_runtime_config_read_degrade_total[5m])) by (reason)
+  # > 0`, for: 5m, warning. Two failure families share one metric: ordinary
+  # substrate trouble (store_not_open/pool_acquire_timeout/query_error) and
+  # crypto_error (the OIDC client secret cannot be decrypted).
+
+  # CASE 67 -- a sustained substrate-trouble reason pages, carrying its
+  # reason label.
+  - interval: 1m
+    name: runtime config read degraded - a sustained substrate reason pages
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0+1x20"
+    promql_expr_test:
+      # for: 5m pinned both sides (the file's bracketing convention): the
+      # rate is non-zero from t=1m, so firing begins ~t=6m -- still quiet
+      # at 5m, firing by 15m. A for: regression in either direction reds
+      # one of these two evals.
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
+            value: 1
+
+  # CASE 68 -- exercises the rule mechanically for the crypto_error reason,
+  # keyed by its own label under the SAME rule (no separate alert for the
+  # crypto failure family). NOTE: this synthetic "sustained" shape is not how
+  # crypto_error can actually arise in production -- see the alert's own
+  # comment in docs/prometheus/yuzu-alerts.yml (correction, docs-writer,
+  # Gate 8): its one production call site is boot-time-only and a failure
+  # there exits the process before /metrics ever binds, so this reason is not
+  # actually scrapeable today. This case still proves the rule fires
+  # correctly IF the metric ever carries this value (a future non-boot call
+  # site, or a manual/test scrape), which is what it is testing.
+  - interval: 1m
+    name: runtime config read degraded - a sustained crypto_error pages
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="crypto_error"}'
+        values: "0+1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded", alertstate="firing", reason="crypto_error", severity="warning"}'
+            value: 1
+
+  # CASE 69 -- the boot-time pre-seed alone (all reasons present at zero,
+  # never incremented) must stay quiet: present-at-zero is the HEALTHY
+  # steady state, not a degrade.
+  - interval: 1m
+    name: runtime config read degraded - pre-seeded flat counters stay quiet
+    input_series:
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="store_not_open"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="pool_acquire_timeout"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="query_error"}'
+        values: "0x30"
+      - series: 'yuzu_server_runtime_config_read_degrade_total{job="yuzu",instance="s1",reason="crypto_error"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded"}'
+        eval_time: 20m
+        exp_samples: []
+
   # ── YuzuTagStoreBackfillNotCompleted (ADR-0050) ─────────────────────────
   #
   # `absent_over_time(..._backfill_total{result=~"success|fresh"}[15m])`,
@@ -1970,3 +2039,95 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuQuarantineGateServingStaleState", alertstate="firing", severity="warning"}'
             value: 1
+
+  # ── YuzuQuarantineEndpointUnconfirmed (#3425) ─────────────────────────────
+  #
+  # `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"} > 0`,
+  # for: 15m, warning. A GAUGE, unlike every other rule in this group — no
+  # increase()/sum() needed, `for:` alone provides the sustain requirement.
+
+  # CASE 67 -- the flagship case: a connected, quarantined device stays
+  # unconfirmed past the 15m hold. `for:` is pinned on both sides: quiet
+  # before the hold elapses, firing after.
+  - interval: 1m
+    name: quarantine endpoint unconfirmed - a sustained connected divergence fires warning
+    input_series:
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing", instance="s1", job="yuzu", reachability="connected", severity="warning"}'
+            value: 1
+
+  # CASE 68 -- reachability="offline" NEVER fires, no matter how long or how
+  # high. A device quarantined while off is legitimately unconfirmed for its
+  # whole offline duration — paging on it would be paging on correct
+  # behaviour, the same self-defeating shape CASE 65's comment warns about
+  # for yuzu_server_system_reserved_push_total.
+  - interval: 1m
+    name: quarantine endpoint unconfirmed - offline reachability never fires, at any volume or duration
+    input_series:
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="offline"}'
+        values: "5x90"
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="connected"}'
+        values: "0x90"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE 69 -- resolution: the divergence clears (a confirm lands) and the
+  # alert un-fires, pinning the gauge shape's recovery behaviour distinct
+  # from the counter-based rules above (which only ever accumulate).
+  - interval: 1m
+    name: quarantine endpoint unconfirmed - resolves once the gauge returns to 0
+    input_series:
+      - series: 'yuzu_server_quarantine_endpoint_unconfirmed{job="yuzu",instance="s1",reachability="connected"}'
+        values: "1x20 0x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing", instance="s1", job="yuzu", reachability="connected", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuQuarantineEndpointUnconfirmed", alertstate="firing"}'
+        eval_time: 55m
+        exp_samples: []
+
+  # ── YuzuSessionReapClockAnomaly (HA WS-1/1a, ADR-2002 §4) ─────────────────
+  #
+  # The DB-clock-integrity monitor: a durable-session reap pass declines on an
+  # implausible (forward/backward) wall-clock reading and increments
+  # yuzu_auth_session_reap_clock_anomaly_total. The alert must FIRE on any
+  # increase over [1h] (the counter is zero-seeded at boot) and stay quiet while
+  # it is flat.
+
+  # CASE — a single clock anomaly (0 → 1) fires after the 5m `for:`.
+  - interval: 1m
+    name: session reap clock anomaly - a single decline fires
+    input_series:
+      - series: 'yuzu_auth_session_reap_clock_anomaly_total{job="yuzu",instance="s1"}'
+        values: "0x5 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSessionReapClockAnomaly"}'
+        eval_time: 60m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuSessionReapClockAnomaly", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE — a flat (never-anomalous) counter stays quiet: RED against dropping the
+  # `> 0` (an `absent()`/`>= 0` form would fire on the healthy zero-seeded series).
+  - interval: 1m
+    name: session reap clock anomaly - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_auth_session_reap_clock_anomaly_total{job="yuzu",instance="s1"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuSessionReapClockAnomaly"}'
+        eval_time: 90m
+        exp_samples: []

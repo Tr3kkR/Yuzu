@@ -240,6 +240,51 @@ TEST_CASE("POST /api/v1/bundles dispatches each step and returns 202 + execution
     CHECK(h.last_scoped_agent == "agent-1"); // per-target scoped gate ran on the parsed agent
 }
 
+// #1398 (quality-engineer, governance Gate 3): the MCP twin of this test
+// (test_mcp_server.cpp, "MCP execute_bundle threads the caller's
+// principal_is_admin into DispatchFn") was added when the adversarial review
+// caught BundleOrchestrator::dispatch() silently dropping principal_is_admin/
+// approval_provenance per step. The REST handler got the same fix
+// (rest_api_v1.cpp:1761/1830) but had no test of its own — same defect
+// class, same surface pair (REST/MCP) as #1398's own PLAN-006 precedent
+// (principal-threading), just caught on only one twin. This is that missing
+// falsifier: an admin caller's bundle step must carry
+// caller.principal_is_admin == true all the way to DispatchFn, and a
+// non-admin caller's must carry false — either polarity silently reverting
+// would readmit the original bug (admin refused) or open the gate for
+// everyone (non-admin admitted) on every AdminOrApproval-gated bundle step.
+TEST_CASE("POST /api/v1/bundles threads the caller's principal_is_admin into DispatchFn (#1398)",
+          "[pg][bundle][rest][1398]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    h.is_admin = true;
+    int status = 0;
+    auto j = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].caller.principal_is_admin);
+    (void)j;
+}
+
+TEST_CASE("POST /api/v1/bundles: a non-admin caller's principal_is_admin stays false (#1398)",
+          "[pg][bundle][rest][1398]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    h.is_admin = false;
+    int status = 0;
+    auto j = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    CHECK_FALSE(h.calls[0].caller.principal_is_admin);
+    (void)j;
+}
+
 TEST_CASE("POST /api/v1/bundles denies an out-of-scope target agent, no dispatch (K-R6-01)",
           "[pg][bundle][rest][scope]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

@@ -24,6 +24,18 @@
 /// instead of merely filtering on `exec_visible`.
 namespace yuzu::server {
 
+/// #1398: whether a dispatch is provably covered by an existing approval
+/// decision — see `DispatchCaller::approval_provenance`'s doc comment below
+/// for the full contract (the three closed stamping sites). A free enum,
+/// not nested in `DispatchCaller`, so `ApprovalProvenance::Ticket` reads the
+/// same way `ExecuteGate::AdminOrApproval` (`command_capability.hpp`) does
+/// at every comparison site.
+enum class ApprovalProvenance : uint8_t {
+    None,
+    Ticket,
+    GovernedPipeline,
+};
+
 /// The caller behind a confined dispatch. `principal`/`principal_role` are
 /// EMPTY for a call site that has no caller at all — see `system` below —
 /// and for one that has a caller but has not yet been wired to identify it
@@ -53,6 +65,51 @@ struct DispatchCaller {
     /// dispatch is a deliberate, greppable statement rather than a value
     /// that merely looks the same as an unwired one.
     bool system = false;
+
+    /// #1398: mirrors `auth::effective_role(session) == auth::Role::admin`
+    /// — JIT-elevation-aware, matching the SAME check the governed
+    /// `POST /api/instructions/:id/execute` path already uses for its
+    /// `role-gated` bypass (`workflow_routes.cpp`). Consulted by
+    /// `classify_and_authorize_dispatch`'s `ExecuteGate::AdminOrApproval`
+    /// arm. Deliberately NOT derived from `principal_role` (a string,
+    /// unaffected by elevation) — computed once per caller derivation, not
+    /// re-derived from `principal_role` at the chokepoint, so the chokepoint
+    /// never has to parse a role string back into a decision.
+    bool principal_is_admin = false;
+
+    /// #1398: whether THIS dispatch is provably covered by an existing
+    /// approval decision, consulted by `classify_and_authorize_dispatch`'s
+    /// `ExecuteGate::AdminOrApproval`/`AlwaysApproval` arms. `Ticket` means a
+    /// real `ApprovalManager` ticket was consumed for this exact dispatch;
+    /// `GovernedPipeline` means the caller is a pipeline whose OWN
+    /// independent governance (re-authorization, guarded transitions, full
+    /// audit) is accepted as the substitute control (#1398 design doc,
+    /// Decision 5) — deliberately a DISTINCT value from `Ticket` so neither
+    /// an audit reader nor a future maintainer can mistake one for the
+    /// other. Trust-by-construction, exactly like `system` above: set ONLY
+    /// at these three production sites, closed list —
+    ///   1. `ScheduleRunner::dispatch_tracked` (`schedule_runner.cpp`) —
+    ///      `Ticket` when the fire carries a non-empty `approval_id`
+    ///      (an approved ticket), `None` on a direct `auto`-mode fire.
+    ///   2. MCP `execute_instruction` / `quarantine_device` handlers
+    ///      (`mcp_server.cpp`) — `Ticket`, stamped only after
+    ///      `approval_ticket_just_consumed` is true (supervised tier).
+    ///   3. `DeploymentEngine` / `DeploymentRoutes` (`deployment_engine.cpp`
+    ///      / `deployment_routes.cpp`) — `GovernedPipeline` on their
+    ///      content_dist dispatches.
+    /// `BundleOrchestrator::dispatch()` (`bundle_orchestrator.cpp`) is NOT a
+    /// fourth stamping site — it is a pass-through conduit: REST/MCP
+    /// `execute_bundle` derive provenance at one of the three sites above
+    /// (site 2, via `approval_ticket_just_consumed`) and thread it in as a
+    /// parameter, same as `principal`/`exec_visible`. `ServerImpl::
+    /// derive_dispatch_caller_for_username` stamps ONLY `principal_is_admin`
+    /// (see that field's comment above), never this one — do not confuse the
+    /// two; a caller can be admin-stamped there and still reach the gate
+    /// with `approval_provenance == None`.
+    /// A fifth stamping site (or a new pass-through conduit) is a diff
+    /// against this stated list, not a silent addition — if you are adding
+    /// one, update this comment too.
+    ApprovalProvenance approval_provenance = ApprovalProvenance::None;
 };
 
 /// Build the `DispatchCaller` for a STORED username with no live session —
@@ -77,13 +134,15 @@ struct DispatchCaller {
 [[nodiscard]] inline DispatchCaller caller_for_stored_username(const std::string& username,
                                                                bool principal_resolves,
                                                                std::string principal_role,
-                                                               authz::VisibleSet exec_visible) {
+                                                               authz::VisibleSet exec_visible,
+                                                               bool principal_is_admin = false) {
     if (!principal_resolves)
         return DispatchCaller{.exec_visible = authz::deny_all()};
     return DispatchCaller{.principal = username,
                           .principal_role = std::move(principal_role),
                           .exec_visible = std::move(exec_visible),
-                          .system = false};
+                          .system = false,
+                          .principal_is_admin = principal_is_admin};
 }
 
 } // namespace yuzu::server

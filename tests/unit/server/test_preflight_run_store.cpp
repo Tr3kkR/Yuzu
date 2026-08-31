@@ -236,7 +236,7 @@ TEST_CASE("persist_and_maybe_complete: completes only when settled; complete gri
 // Force the failure by pre-seeding the store's schema with a conflicting table
 // and no schema_meta row: the migration runner's drift guard refuses.
 TEST_CASE("PreflightRunStore reports !is_open on a migration failure", "[pg][preflight][store]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
     {
         PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);

@@ -36,7 +36,7 @@ struct Config {
     std::filesystem::path tls_server_cert; // PEM server certificate
     std::filesystem::path tls_server_key;  // PEM server private key
     std::filesystem::path tls_ca_cert;     // For mTLS agent verification
-    bool allow_one_way_tls{false};         // Permit TLS without client cert verification
+    bool insecure_skip_client_verify{false}; // Permit TLS without client cert verification
 
     // PKI default certs (PR2). With no operator cert flags and without
     // --no-default-certs, the server generates a per-install CA + server-side
@@ -215,6 +215,8 @@ struct Config {
                                      // empty means AuthnRequests are unsigned (backward-compatible)
     std::string saml_group_attribute; // <Attribute Name="..."> carrying group values
     std::string saml_admin_group;     // Group value (from saml_group_attribute) that maps to admin
+    std::string saml_name_attribute;  // <Attribute Name="..."> carrying the display name (else NameID)
+    std::string saml_email_attribute; // <Attribute Name="..."> carrying the email (display fallback)
 
     // Response persistence
     int response_retention_days{90};

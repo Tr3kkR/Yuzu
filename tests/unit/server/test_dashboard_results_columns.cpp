@@ -40,6 +40,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -54,6 +55,14 @@ yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::stri
     if (!store.is_open())
         throw std::runtime_error("responsestore template: store failed to migrate");
 }};
+// InstructionStore is now a migrated Postgres store (ADR-0058).
+yuzu::test::PgTestTemplate dashboard_cols_instr_tpl{
+    "dashcolsinstr", [](const std::string& dsn) {
+        PgPool pool{{.conninfo = dsn, .size = 1}};
+        InstructionStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("dashboard_cols_instr template: store failed to migrate");
+    }};
 } // namespace
 
 // Test-only accessor for the private schema-aware column resolution +
@@ -86,6 +95,17 @@ struct DashboardResultsColumnsTestAccess {
                                    const std::string& username = {}) {
         return routes.render_filter_bar(command_id, plugin, /*definition_id=*/{},
                                         /*template_id=*/{}, username);
+    // #1712 / #3290 Phase 2 — the fleet-read gate's composed
+    // meet(management-group, service-scope) VisibleSet.
+    std::string render_scoped(const std::string& command_id, const std::string& plugin,
+                              const yuzu::server::authz::VisibleSet& scope) {
+        return routes.render_results(command_id, plugin, /*sort_col=*/"agent",
+                                     /*sort_dir=*/"asc", /*page=*/1, /*per_page=*/50,
+                                     /*filters=*/{}, /*text_query=*/"", /*definition_id=*/"",
+                                     /*template_id=*/"", /*visible_columns=*/{}, scope);
+    }
+    std::string render_filter_bar(const std::string& command_id, const std::string& plugin) {
+        return routes.render_filter_bar(command_id, plugin);
     }
 };
 
@@ -174,7 +194,9 @@ void store_two_agent_facet_responses(ResponseStore& rs, const std::string& comma
 TEST_CASE("render_results: a schema-only definition (no visualization) resolves "
           "real columns instead of the plugin-only fallback (PR1.7 remediation)",
           "[pg][server][dashboard][render_results]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
     auto created = is.create_definition(make_list_profiles_definition());
     REQUIRE(created.has_value());
@@ -221,7 +243,9 @@ TEST_CASE("render_results: a schema-only definition (no visualization) resolves 
 TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
           "unchanged (regression pin for every other plugin/action)",
           "[pg][server][dashboard][render_results]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -247,13 +271,76 @@ TEST_CASE("render_results: no definition_id falls back to columns_for_plugin "
     CHECK_FALSE(contains(html, "profile_name"));
 }
 
+// #1712 / #3290 Phase 2: the fleet-read gate's scope filter is applied
+// BEFORE total_agent_count is computed — a confined caller must see neither
+// the out-of-scope agent's row NOR a fleet-wide count that reveals it exists.
+TEST_CASE("render_results: scope filter drops out-of-scope agents from both "
+          "the rows and the agent count",
+          "[pg][server][dashboard][render_results]") {
+    // Rebase hazard, found via /governance re-review (quality-engineer):
+    // this test was written when InstructionStore(":memory:") was still a
+    // valid SQLite-backed constructor; ADR-0058 (migrated to PostgreSQL)
+    // removed it upstream while this branch was rebasing, and since this
+    // test is a pure ADDITION (not a modification of pre-existing lines),
+    // git found no textual conflict to flag the break. Same
+    // dashboard_cols_instr_tpl pattern the sibling tests in this file
+    // already use.
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
+    REQUIRE(is.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore rs{pool};
+    const std::string command_id = "cmd-scope-filter-1";
+    StoredResponse in_resp;
+    in_resp.instruction_id = command_id;
+    in_resp.agent_id = "agent-in";
+    in_resp.received_at_ms = 1000;
+    in_resp.status = 0;
+    in_resp.output = "in-scope output line";
+    rs.store(in_resp);
+    StoredResponse out_resp;
+    out_resp.instruction_id = command_id;
+    out_resp.agent_id = "agent-out";
+    out_resp.received_at_ms = 1000;
+    out_resp.status = 0;
+    out_resp.output = "out-of-scope output line";
+    rs.store(out_resp);
+
+    DashboardResultsColumnsTestAccess acc;
+    acc.set_stores(&is, &rs);
+
+    // Unfiltered (nullopt = TOP) — both agents visible, sanity baseline.
+    const std::string unfiltered = acc.render_scoped(command_id, "registry", std::nullopt);
+    CHECK(contains(unfiltered, "agent-in"));
+    CHECK(contains(unfiltered, "agent-out"));
+    CHECK(contains(unfiltered, "2 agents"));
+
+    // Scoped to agent-in only.
+    const std::string scoped = acc.render_scoped(
+        command_id, "registry",
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}});
+    CHECK(contains(scoped, "agent-in"));
+    CHECK_FALSE(contains(scoped, "agent-out"));
+    CHECK_FALSE(contains(scoped, "out-of-scope output line"));
+    // The count must be recomputed from the filtered set, not the pre-filter
+    // fleet-wide total — else a confined caller learns an out-of-scope agent
+    // exists via the "N agents" summary even with its row hidden.
+    CHECK(contains(scoped, "1 agent"));
+    CHECK_FALSE(contains(scoped, "2 agents"));
+}
+
 // #2691 (Doomgoose finding #7): a degraded response-store read must render
 // distinguishably from a genuine zero-match answer — "No results match your
 // filters" is a false claim when the store just couldn't be read.
 TEST_CASE("render_results: a degraded store read renders the degrade banner "
           "not \"no results match your filters\"",
           "[server][dashboard][render_results]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
@@ -276,7 +363,9 @@ TEST_CASE("render_results: a degraded store read renders the degrade banner "
 TEST_CASE("render_filter_bar: a degraded facet read disables the dropdown "
           "instead of rendering an empty All",
           "[server][dashboard][render_filter_bar]") {
-    InstructionStore is{":memory:"};
+    YUZU_REQUIRE_PG_DB_TPL(db_instr, dashboard_cols_instr_tpl);
+    PgPool instr_pool{{.conninfo = db_instr.dsn(), .size = 2}};
+    InstructionStore is{instr_pool};
     REQUIRE(is.is_open());
 
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
