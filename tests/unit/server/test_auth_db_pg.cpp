@@ -799,6 +799,47 @@ TEST_CASE("AuthDB MFA: enrollment guard predicate claims a provisional row, reje
     CHECK(run_guard() == 1);
 }
 
+// ── #3762: the enrollment guard must NOT wedge a legitimate re-enroll ───────
+//
+// The `mfa_enrolled_at IS NULL` guard is safe against blocking a post-disable
+// re-enroll ONLY because every un-enroll path NULLs `mfa_enrolled_at` (mfa_disable +
+// soft-delete). This pins that coupling: enroll → disable → re-enroll must yield a fresh
+// 10-code set. A future un-enroll variant that forgot to clear the column would wedge
+// re-enrollment into a permanent MfaAlreadyEnrolled, and this test is what catches it.
+TEST_CASE("AuthDB MFA: disable then re-enroll succeeds — the guard does not wedge re-enroll",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("reenroll", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto enroll_once = [&]() {
+        auto init = h.db.mfa_init_enrollment("reenroll", "Yuzu");
+        REQUIRE(init.has_value());
+        auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
+        REQUIRE(raw.has_value());
+        auto sv = std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size());
+        auto code = yuzu::server::mfa::generate(
+            sv, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+        auto verify = h.db.mfa_verify_enrollment("reenroll", code);
+        REQUIRE(verify.has_value());
+        CHECK(verify->size() == 10);
+    };
+
+    enroll_once();
+    REQUIRE(h.db.mfa_disable("reenroll").has_value());
+    auto disabled = h.db.mfa_status("reenroll");
+    REQUIRE(disabled.has_value());
+    CHECK_FALSE(disabled->enrolled); // mfa_disable NULLed mfa_enrolled_at
+
+    // Re-enroll from scratch: a fresh secret + code must be accepted, proving the guard
+    // did not permanently latch on the prior enrollment.
+    enroll_once();
+    auto reenrolled = h.db.mfa_status("reenroll");
+    REQUIRE(reenrolled.has_value());
+    CHECK(reenrolled->enrolled);
+    CHECK(reenrolled->recovery_codes_remaining == 10);
+}
+
 // ── #2399: a single valid TOTP code is consumed AT MOST ONCE, even under two
 //    concurrent submissions ─────────────────────────────────────────────────
 //
