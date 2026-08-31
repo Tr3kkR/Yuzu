@@ -82,15 +82,24 @@ struct PropsScopeRig {
     yuzu::test::ManagementGroupStorePg mgmt_bundle;
     ManagementGroupStore& mgmt = *mgmt_bundle;
     yuzu::test::ApiTokenStorePg api_tokens;
+    // Real AuditStore (not nullptr) so a denial-path audit_log call is
+    // regression-testable — mirrors GatesRig's rationale in
+    // test_authz_gates.cpp (governance Gate 8 re-review, cc93f499c arg-order
+    // bug had zero coverage until a real store was wired in). Shares the rbac
+    // clone's database via a second pool, its own `audit_store` schema.
+    PgPool audit_pool;
+    AuditStore audit_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     std::unique_ptr<AuthRoutes> ar;
     std::string gP, gC1, gS;
 
     explicit PropsScopeRig(const std::string& dsn)
-        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool} {
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool},
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
         REQUIRE(pool.valid());
         REQUIRE(rbac.is_open());
+        REQUIRE(audit_store.is_open());
         rbac.set_rbac_enabled(true); // enforcement in effect, not legacy-open
 
         REQUIRE(rbac.create_role({"InfraReader", "", false, 0}).has_value());
@@ -111,8 +120,8 @@ struct PropsScopeRig {
         REQUIRE(auth_mgr.upsert_user("operator", "correct-horse-battery-staple",
                                      auth::Role::admin));
 
-        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
-                                          /*audit_store=*/nullptr, &mgmt,
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(), &audit_store,
+                                          &mgmt,
                                           /*tag_store=*/nullptr,
                                           /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
     }
@@ -169,6 +178,22 @@ TEST_CASE("require_scoped_permission(Infrastructure,Read): group-confined operat
 
     CHECK_FALSE(r.ar->require_scoped_permission(req, res, "Infrastructure", "Read", "a_s"));
     CHECK(res.status == 403);
+
+    // A real denial audit row IS written (was unverifiable with the
+    // nullptr audit_store the first version of this rig used). NOT
+    // asserting target_type/target_id field placement here: the ordinary-
+    // RBAC denial branch (auth_routes.cpp ~:1124) passes agent_id
+    // positionally into the audit_log wrapper's target_type slot and its
+    // reason string into target_id, leaving detail empty -- the same
+    // slot-swap class cc93f499c fixed for confine_agent_target, but this
+    // call site was never fixed. Pre-existing, not touched by #3700's
+    // diff (auth_routes.cpp is unmodified here) -- tracked as a follow-up
+    // issue rather than asserted (right or wrong) by this test.
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].action == "auth.scoped_permission_required");
+    CHECK((*rows)[0].result == "denied");
 }
 
 TEST_CASE("require_scoped_permission(Infrastructure,Write): group-confined operator "
