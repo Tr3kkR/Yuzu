@@ -151,8 +151,9 @@ the corpus and publishes the coverage report the PR job uses for
 affected-target pruning. State is GHA artifacts on 90-day retention and
 self-heals: if it expires or a download fails, PR runs degrade OPEN to
 seed corpora + keep-all pruning (slower, never a false green skip on that
-degraded path — a stale-but-unexpired coverage report can still prune an
-affected target, a tracked follow-up), and the next batch run regrows it.
+fully-expired path; short of expiry, though, a stale-but-unexpired coverage
+report can still prune an affected target — a tracked follow-up), and the
+next batch run regrows it.
 Expiry-by-inactivity files no issue — only a RED run alerts, so a long
 quiet period degrades silently. `prune` is dispatch-only — it replaces the
 corpus wholesale, so it never runs unattended. A red batch run auto-files
