@@ -14604,6 +14604,21 @@ private:
                                        std::string(
                                            yuzu::server::kReasonDestructiveUntargeted)}})
                             .increment();
+                        // #3685 fix round (adversarial review F2): audited like
+                        // the check_targeting_shape refusal ~100 lines above in
+                        // this same function, and like MCP's twin refusal
+                        // (mcp_audit, this same PR) — an incident review of a
+                        // near-miss broadcast-Destructive attempt must find a
+                        // row here, not just a counter increment.
+                        const bool audit_ok =
+                            audit_log(req, "command.dispatch", "denied", "command", "",
+                                      std::string("reason=") +
+                                          std::string(
+                                              yuzu::server::kReasonDestructiveUntargeted) +
+                                          " " + onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                          onbehalf::sanitize_for_log(action, 128));
+                        if (!audit_ok)
+                            res.set_header("Sec-Audit-Failed", "true");
                         res.status = 400;
                         res.set_content(
                             R"({"error":{"code":400,"message":")" +

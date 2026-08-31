@@ -6122,6 +6122,18 @@ TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8
     yuzu::test::TempDbFile db{std::string_view{"mcp-3685-clsunavail-"}};
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(db.path.string().c_str(), &raw) == SQLITE_OK);
+    // #3685 fix round (adversarial review C1): TempDbFile owns the FILE, not
+    // the open handle — ApprovalManager is non-owning (~ApprovalManager() =
+    // default), so a REQUIRE/CHECK failure between here and a trailing
+    // close used to leak `raw`. Same local-Guard shape already used
+    // elsewhere in this file for the db_path-direct sites (e.g. line ~7326).
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{raw};
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
 
@@ -6150,7 +6162,6 @@ TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8
           std::string::npos);
     CHECK(appr.pending_count() == 0); // no ticket minted
     CHECK_FALSE(dispatched);
-    sqlite3_close(raw);
 }
 
 // ── 25. Missing plugin ───────────────────────────────────────────────────
@@ -7146,6 +7157,15 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
     yuzu::test::TempDbFile db{std::string_view{"mcp-3685-premint-"}};
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(db.path.string().c_str(), &raw) == SQLITE_OK);
+    // #3685 fix round (adversarial review C1): see the identical Guard note
+    // on the previous #3685 test above.
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{raw};
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
 
@@ -7173,7 +7193,6 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
           std::string(yuzu::server::kDestructiveUntargetedMessage));
     CHECK(appr.pending_count() == 0);
     CHECK_FALSE(dispatched);
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive ticket is refused on "
@@ -7183,6 +7202,15 @@ TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive tick
     yuzu::test::TempDbFile db{std::string_view{"mcp-3685-preseed-"}};
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(db.path.string().c_str(), &raw) == SQLITE_OK);
+    // #3685 fix round (adversarial review C1): see the identical Guard note
+    // on the first #3685 test above.
+    struct Guard {
+        sqlite3* h;
+        ~Guard() {
+            if (h)
+                sqlite3_close(h);
+        }
+    } guard{raw};
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
 
@@ -7241,7 +7269,6 @@ TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive tick
     REQUIRE(after.has_value());
     CHECK(after->status == "approved");
     CHECK(after->consumed_at == 0);
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP #3685: operator-tier Destructive refusal happens BEFORE execution-row creation and "
