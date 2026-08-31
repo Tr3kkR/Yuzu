@@ -19,8 +19,8 @@ if host_machine.system() == 'darwin'
   # (read_keychain_secitem() compiles to a no-op returning
   # SecItemKeychainResult{.ok = false}) instead of failing configure. The
   # login-keychain read stays on its existing `security` subprocess path
-  # either way (Decision-7 governed-shell exception -- see
-  # build_login_keychain_read_command()).
+  # either way (rung-2 pre-split argv since #3406 -- see
+  # build_login_keychain_read_argv()).
   security_dep = dependency('appleframeworks', modules: ['Security', 'CoreFoundation'],
                             required: false, include_type: 'system')
   if security_dep.found()

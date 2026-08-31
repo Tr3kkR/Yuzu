@@ -13,16 +13,24 @@
  * behaviour every migrated plugin had via its private `sudo_prefix()` helper:
  * a root agent invokes the tool directly.
  *
- * Pure argv construction — no spawn, no environment, no policy. POSIX-only.
+ * Pure argv construction — no spawn, no environment, no policy.
+ *
+ * The two-argument `sudo_wrap` is PORTABLE (pure string work, no syscall), so
+ * it is available on every platform. Only the one-argument convenience needs
+ * POSIX, because only it calls `geteuid()`. That split exists so a header
+ * which must compile under MSVC — `agents/shared/macos_console_user.hpp`, whose
+ * pure argv builders are unit-tested on all three platforms — can still use
+ * THE canonical form instead of hand-rolling a second copy of it (#3406).
  */
 #pragma once
 
-#ifndef _WIN32
-
 #include <string>
-#include <unistd.h>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace yuzu::shared {
 
@@ -45,11 +53,12 @@ inline std::vector<std::string> sudo_wrap(std::vector<std::string> tool_argv,
     return argv;
 }
 
-// Thin default: live euid.
+#ifndef _WIN32
+// Thin default: live euid. POSIX-only — `geteuid()` has no Windows analogue,
+// and no Windows site is sudo-governed.
 inline std::vector<std::string> sudo_wrap(std::vector<std::string> tool_argv) {
     return sudo_wrap(std::move(tool_argv), ::geteuid() == 0);
 }
+#endif // !_WIN32
 
 } // namespace yuzu::shared
-
-#endif // !_WIN32

@@ -31,7 +31,6 @@
 #include "agent_service_impl.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <sqlite3.h>
 
 #include "agent_registry.hpp"
 #include "audit_store.hpp"
@@ -1421,34 +1420,28 @@ TEST_CASE("Register (direct): a THROWING signer cannot crash the handler either 
 
 namespace {
 
-/// MEMBER ORDER LOAD-BEARING: members below are declared in the topological
-/// order required by the dtor's three-phase shutdown — `db` is the raw
-/// sqlite handle owned outright, `tracker` borrows it (via the
-/// `ExecutionTracker(sqlite3*)` ctor), `svc` borrows `tracker.get()` (via
+/// MEMBER ORDER LOAD-BEARING: `tracker` is owned outright (against the
+/// caller-supplied pool), `svc` borrows `tracker.get()` (via
 /// `set_execution_tracker`). The dtor MUST run set_execution_tracker(nullptr)
-/// → tracker.reset() → sqlite3_close(db), in that exact order, so the
-/// borrowed-pointer chain is unwound from the outside in. Reordering the
-/// member declarations or replacing the user-defined dtor with `= default`
-/// would silently break the contract — there is no compile-time guard.
-/// Mirrors the production ServerImpl "drain gRPC → null setter → reset"
-/// shutdown sequence at agent_service_impl.hpp:113.
+/// → tracker.reset(), in that exact order, so the borrowed-pointer chain is
+/// unwound from the outside in. Reordering the member declarations or
+/// replacing the user-defined dtor with `= default` would silently break the
+/// contract — there is no compile-time guard. Mirrors the production
+/// ServerImpl "drain gRPC → null setter → reset" shutdown sequence at
+/// agent_service_impl.hpp:113.
 struct TrackerScope {
-    sqlite3* db{nullptr};
     std::unique_ptr<yuzu::server::ExecutionTracker> tracker;
     AgentServiceImpl* svc{nullptr};
 
-    explicit TrackerScope(AgentServiceImpl& s) : svc(&s) {
-        REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-        tracker = std::make_unique<yuzu::server::ExecutionTracker>(db);
-        tracker->create_tables();
+    TrackerScope(AgentServiceImpl& s, yuzu::server::pg::PgPool& pool) : svc(&s) {
+        tracker = std::make_unique<yuzu::server::ExecutionTracker>(pool);
+        REQUIRE(tracker->is_open());
         svc->set_execution_tracker(tracker.get());
     }
     ~TrackerScope() {
         if (svc)
             svc->set_execution_tracker(nullptr);
         tracker.reset();
-        if (db)
-            sqlite3_close(db);
     }
 
     TrackerScope(const TrackerScope&) = delete;
@@ -1483,7 +1476,7 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    TrackerScope ts{h.svc};
+    TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
@@ -1505,7 +1498,7 @@ TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    TrackerScope ts{h.svc};
+    TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
@@ -1526,7 +1519,7 @@ TEST_CASE("notify_exec_tracker: FAILURE preserves error_detail and exit_code",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    TrackerScope ts{h.svc};
+    TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
@@ -1548,7 +1541,7 @@ TEST_CASE("notify_exec_tracker: TIMEOUT maps to status='timeout'",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    TrackerScope ts{h.svc};
+    TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
@@ -1581,7 +1574,7 @@ TEST_CASE("notify_exec_tracker: REJECTED maps to status='rejected'",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    TrackerScope ts{h.svc};
+    TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
     h.svc.record_execution_id("cmd-A", exec_id);
 
@@ -1616,7 +1609,7 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
-    TrackerScope ts{h.svc};
+    TrackerScope ts{h.svc, pool};
     auto exec_id = ts.make_exec();
     // Deliberately do NOT call record_execution_id — cmd-orphan is unmapped.
 
@@ -1639,7 +1632,7 @@ TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contra
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
     {
-        TrackerScope ts{h.svc};
+        TrackerScope ts{h.svc, pool};
         // ~TrackerScope calls set_execution_tracker(nullptr) before destroying
         // the tracker, leaving svc.execution_tracker_ at nullptr.
     }

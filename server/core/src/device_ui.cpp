@@ -410,8 +410,11 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("services", "Services", "", "run state");
     h += card("users", "Logged-in users", "", "sessions");
     h += card("netconfig", "Adapters &amp; IP", "", "addresses");
-    h += card("arp", "ARP / neighbours", "Win", "neighbour table");
-    h += card("dns_cache", "DNS cache", "Win", "resolver cache");
+    // arp is live on all three platforms; the Linux and macOS legs are
+    // constrained (Linux: IPv4 ARP only; macOS: no interface name or entry
+    // type), so no OS badge but the limit is stated in the preview.
+    h += card("arp", "ARP / neighbours", "", "neighbour table &middot; limited on Linux/macOS");
+    h += card("dns_cache", "DNS cache", "Win &middot; Linux", "resolver cache");
     h += card("listening", "Listening ports", "", "sockets");
     h += card("connections", "Active connections", "", "established");
     h += card("capture_sources", "Capture sources", "", "TAR local capture");
