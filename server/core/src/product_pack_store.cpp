@@ -1318,7 +1318,7 @@ std::expected<std::string, std::string> ProductPackStore::install(
                 ++attempted;
                 bool ok = false;
                 try {
-                    ok = compensate_fn(it->kind, it->item_id);
+                    ok = compensate_fn(it->kind, it->item_id).has_value();
                 } catch (const std::exception& e) {
                     spdlog::error(
                         "ProductPackStore: install compensation THREW for {} '{}' after {} "

@@ -59,24 +59,43 @@ static std::string product_pack_client_message(const char* op, const std::string
 }
 
 // F031/#3481: the same per-kind delete dispatch is needed in two places now — DELETE
-// /api/product-packs/:id's uninstall_fn (unchanged behavior), and POST /api/product-packs's new
-// compensate_fn (best-effort undo of items install_fn already committed, on a late persist
-// failure). Factored out so the two call sites can't drift.
+// /api/product-packs/:id's uninstall_fn, and POST /api/product-packs's new compensate_fn
+// (best-effort undo of items install_fn already committed, on a late persist failure).
+// Factored out so the two call sites can't drift.
+//
+// ADR-0058/ADR-0064: InstructionDefinition and Workflow pass through their store's real
+// db_error/not_found split (kProductPackDbErrorPrefix) — a null/unopen store is a genuine
+// unavailability, not "this item doesn't exist"; using the tolerated not_found prefix here
+// would let the caller (ProductPackStore::uninstall()/install()'s compensation path) proceed
+// as if the item were already gone while it's still live underneath. PolicyFragment/Policy's
+// origin stores are still bool-only — `false` there maps to a tolerated not_found, matching
+// pre-ADR-0058 behaviour for those kinds.
 static ItemUninstallFn make_item_delete_fn(InstructionStore* instruction_store,
                                            PolicyStore* policy_store,
                                            WorkflowEngine* workflow_engine) {
     return [instruction_store, policy_store, workflow_engine](
-               const std::string& kind, const std::string& item_id) -> bool {
+               const std::string& kind,
+               const std::string& item_id) -> std::expected<void, std::string> {
         if (kind == "InstructionDefinition") {
-            return instruction_store && instruction_store->delete_definition(item_id);
+            if (!instruction_store)
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "instruction store unavailable");
+            return instruction_store->delete_definition(item_id);
         } else if (kind == "PolicyFragment") {
-            return policy_store && policy_store->delete_fragment(item_id);
+            if (policy_store && policy_store->delete_fragment(item_id))
+                return {};
+            return std::unexpected("not_found: policy fragment '" + item_id + "'");
         } else if (kind == "Policy") {
-            return policy_store && policy_store->delete_policy(item_id);
+            if (policy_store && policy_store->delete_policy(item_id))
+                return {};
+            return std::unexpected("not_found: policy '" + item_id + "'");
         } else if (kind == "Workflow") {
-            return workflow_engine && workflow_engine->delete_workflow(item_id);
+            if (!workflow_engine)
+                return std::unexpected(std::string(kProductPackDbErrorPrefix) +
+                                       "workflow engine unavailable");
+            return workflow_engine->delete_workflow(item_id);
         }
-        return false;
+        return std::unexpected("not_found: unsupported item kind '" + kind + "'");
     };
 }
 
@@ -2417,49 +2436,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
 
-        // Uninstall callback: delegate to the appropriate store
+        // Uninstall callback: delegate to the appropriate store (same dispatch install's
+        // compensate_fn uses — see make_item_delete_fn's doc comment for the per-kind
+        // db_error/not_found split, currently unreachable here since instruction_store_ and
+        // product_pack_store_ share one boot latch, kept as defense-in-depth).
         auto uninstall_fn = make_item_delete_fn(instruction_store, policy_store, workflow_engine);
-        // Uninstall callback: delegate to the appropriate store. InstructionDefinition passes
-        // through InstructionStore's real db_error/not_found split (ADR-0058) so a genuine DB
-        // failure aborts the whole pack uninstall instead of being silently tolerated as a
-        // removed item (product_pack_store.cpp's uninstall() checks the prefix). PolicyFragment/
-        // Policy/Workflow's origin stores are still bool-only — `false` there maps to a tolerated
-        // not_found, matching pre-ADR-0058 behaviour for those kinds.
-        auto uninstall_fn = [instruction_store, policy_store,
-                             workflow_engine](const std::string& kind, const std::string& item_id)
-            -> std::expected<void, std::string> {
-            if (kind == "InstructionDefinition") {
-                // db_error, not not_found (gov Gate 3/4 finding): a null instruction_store is
-                // a genuine unavailability, not "this item doesn't exist" — using the tolerated
-                // prefix here would let ProductPackStore::uninstall delete the pack row while
-                // the (never-touched) instruction definition stays live. Currently unreachable
-                // (instruction_store_ and product_pack_store_ share one boot latch — cpp-expert
-                // Gate 3), kept correct as defense-in-depth against that invariant changing.
-                if (!instruction_store)
-                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
-                                           "instruction store unavailable");
-                return instruction_store->delete_definition(item_id);
-            } else if (kind == "PolicyFragment") {
-                if (policy_store && policy_store->delete_fragment(item_id))
-                    return {};
-                return std::unexpected("not_found: policy fragment '" + item_id + "'");
-            } else if (kind == "Policy") {
-                if (policy_store && policy_store->delete_policy(item_id))
-                    return {};
-                return std::unexpected("not_found: policy '" + item_id + "'");
-            } else if (kind == "Workflow") {
-                // Mirrors the InstructionDefinition arm above (ADR-0064): a null
-                // workflow_engine is a genuine unavailability, not "this item doesn't
-                // exist" — the tolerated-not-found prefix here would let
-                // ProductPackStore::uninstall delete the pack row while a still-live
-                // workflow stays undeleted underneath it.
-                if (!workflow_engine)
-                    return std::unexpected(std::string(kProductPackDbErrorPrefix) +
-                                           "workflow engine unavailable");
-                return workflow_engine->delete_workflow(item_id);
-            }
-            return std::unexpected("not_found: unsupported item kind '" + kind + "'");
-        };
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);
         if (!result) {
