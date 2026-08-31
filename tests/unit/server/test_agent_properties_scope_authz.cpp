@@ -366,8 +366,10 @@ TEST_CASE("route wiring: GET/PUT/DELETE /api/agents/:id/properties[/:key] still 
     for (const auto& route :
          {Route{get_pos, "Read"}, Route{put_pos, "Write"}, Route{delete_pos, "Write"}}) {
         auto block = collapse_ws(route_block_at(src, route.marker_pos));
-        CHECK(block.find(std::string(R"(require_scoped_permission(req, res, "Infrastructure", ")") +
-                          route.op + "\",") != std::string::npos);
-        CHECK(block.find(R"(require_permission(req, res, "Infrastructure",)") == std::string::npos);
+        const std::string scoped_needle = "require_scoped_permission(req, res, \"Infrastructure\", \"" +
+                                          std::string(route.op) + "\",";
+        const std::string bare_needle = "require_permission(req, res, \"Infrastructure\",";
+        CHECK(block.find(scoped_needle) != std::string::npos);
+        CHECK(block.find(bare_needle) == std::string::npos);
     }
 }
