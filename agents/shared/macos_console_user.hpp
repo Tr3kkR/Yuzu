@@ -11,8 +11,8 @@
 // either. `security` invoked directly therefore only ever sees the SYSTEM
 // keychains, never the interactively-logged-in user's login keychain --
 // that requires running the read INSIDE that user's per-user launchd/Aqua
-// session: `[sudo -n ]launchctl asuser <uid> sudo -n -u <user> security ...`
-// (see build_login_keychain_read_command()'s own comment for exactly when
+// session: `[sudo -n -- ]launchctl asuser <uid> sudo -n -u <user> -- security ...`
+// (see build_login_keychain_read_argv()'s own comment for exactly when
 // the outer sudo applies).
 //
 // Every function here is pure (string parsing/validation/formatting only --
@@ -22,21 +22,27 @@
 // console session, `security`, or even to run on macOS at all -- same
 // header-for-testability pattern as
 // agents/plugins/installed_apps/src/installed_apps_inventory.hpp. The
-// certificates_plugin.cpp .cpp file keeps the bounded-runner calls (stat/id/
+// certificates_plugin.cpp .cpp file keeps the bounded-runner calls (stat/
 // launchctl/sudo/security, all routed through
 // yuzu::agent::run_bounded_subprocess -- see run_bounded_checked()) and the
-// console-user RESOLUTION (which does need a subprocess); this header only
-// ever sees strings it's handed.
+// console-user RESOLUTION (whose device-owner half does need a subprocess;
+// its uid/home half is a bounded passwd lookup since #3406, no longer the
+// `id -u` spawn this line used to list); this header only ever sees strings
+// it's handed.
 //
 // Deliberately framework-free: no SystemConfiguration
 // (SCDynamicStoreCopyConsoleUser), so a CLT-only box still compiles this
 // (matches the batch's no-new-framework convention).
 //
-// Shell-injection guard: every value that ends up interpolated into the
-// command line run_bounded_subprocess later execs via a single trusted
-// "/bin/sh -c <cmd>" argv element -- console username, uid -- MUST pass
-// is_valid_username / is_valid_uid here BEFORE use. build_login_keychain_
-// read_command() re-validates defensively and returns an empty string on
+// Injection guard: every value that ends up in the pre-split argv vector
+// run_bounded_subprocess execs directly (no shell anywhere since #3406
+// argv-ized this leg) -- console username, uid, home directory -- MUST pass
+// is_valid_username / is_valid_uid / is_valid_home_dir here BEFORE use.
+// With no shell there is no shell-metacharacter surface, but the allowlists
+// are kept as ARGUMENT-injection defence (an option-shaped username like
+// "-G" must never be read as a flag by sudo) and as defence in depth
+// should a future caller regress the transport. build_login_keychain_
+// read_argv() re-validates defensively and returns an empty vector on
 // failure, so a missed guard upstream can never manufacture an executable
 // command from unsafe input; the caller must treat an empty return as "do
 // not run this."
@@ -58,6 +64,9 @@
 #include <string_view>
 #include <memory>
 #include <type_traits>
+#include <vector>
+
+#include <sudo_argv.hpp> // yuzu::shared::sudo_wrap -- THE canonical sudo argv form
 
 // SystemConfiguration is pulled in ONLY for console_user() below, and ONLY when the
 // consuming plugin's meson defines YUZU_HAVE_SYSTEMCONFIGURATION (users plugin does; the
@@ -79,6 +88,13 @@ namespace yuzu::macos {
 struct ConsoleUser {
     std::string username;
     std::string uid;
+    // The account's home directory, from the SAME passwd lookup that produced
+    // `uid` (#3406). EMPTY means the lookup succeeded but returned a pw_dir
+    // that is not a usable absolute path -- the console user is still validly
+    // identified (username + uid are good), only the login-keychain leg is
+    // unavailable, and the caller must emit an honest sentinel for that leg
+    // rather than guessing a path. Never treat empty as "use the default".
+    std::string home_dir;
 };
 
 namespace detail {
@@ -115,13 +131,15 @@ inline bool is_no_console_user(std::string_view username) {
     return username.empty() || username == "root";
 }
 
-// Shell-injection guard for the console username: a safe-identifier
+// Injection guard for the console username: a safe-identifier
 // allowlist, NOT a full macOS-username-spec validator (macOS usernames
-// technically allow a broader POSIX set) -- narrower is safer here, since
-// this value is interpolated into the "/bin/sh -c <cmd>" command line
-// run_bounded_subprocess execs (`sudo -u <username> ...`) and every
-// character outside this allowlist is either a shell metacharacter or
-// otherwise unnecessary for any username this mechanism needs to support.
+// technically allow a broader POSIX set) -- narrower is safer here. The
+// value lands in a pre-split argv element (`sudo -u <username> ...`)
+// execed directly with no shell (#3406), so the load-bearing half today is
+// the leading-'-' argument-injection check below; the metacharacter
+// allowlist is kept because every character outside it is otherwise
+// unnecessary for any username this mechanism needs to support, and it
+// stays defence in depth should a future caller regress the transport.
 inline bool is_valid_username(std::string_view username) {
     if (username.empty())
         return false;
@@ -145,10 +163,15 @@ inline bool is_valid_username(std::string_view username) {
     return true;
 }
 
-// Shell-injection guard for `id -u <username>` output: numeric-only,
-// non-empty. (uid 0 would mean the console user is root, which
-// is_no_console_user() already excludes upstream via the username check --
-// this function is purely a SYNTACTIC guard, not a semantic one.)
+// Injection guard for the console user's uid: numeric-only, non-empty.
+// (uid 0 would mean the console user is root, which is_no_console_user()
+// already excludes upstream via the username check -- this function is
+// purely a SYNTACTIC guard, not a semantic one.) Since #3406 the uid is a
+// decimal format of getpwnam_r's pw_uid rather than the output of an
+// `/usr/bin/id -u <username>` subprocess, so it is digits by construction
+// and this guard is defensive; it is kept deliberately, because it is the
+// shared gate every value entering the argv must pass and a future change
+// to how the uid is sourced must not silently bypass it.
 inline bool is_valid_uid(std::string_view uid) {
     if (uid.empty())
         return false;
@@ -169,28 +192,45 @@ inline std::string root_keychain_path() {
     return "/System/Library/Keychains/SystemRootCertificates.keychain";
 }
 
-// The console user's login keychain path, built directly from the
-// (caller-validated) username via the shell's `~username` (tilde-USERNAME)
-// expansion -- deliberately NOT a bare `~/Library/Keychains/
-// login.keychain-db`: the full command line is handed to
-// run_bounded_subprocess as a single trusted "/bin/sh -c <cmd>" argv
-// element, which runs it through `/bin/sh -c` as the INVOKING (agent)
-// process before launchctl/sudo/security ever start, so a BARE `~` would
-// expand against the invoking daemon's own home directory (root's, or
-// `_yuzu`'s -- see the file banner), not the target console user's.
-// `~username` is a different,
-// well-defined expansion: POSIX shells resolve it via a getpwnam(username)
-// -style directory-services lookup for THAT specific account, independent
-// of the invoking process's own identity or $HOME -- so it correctly
-// resolves a relocated/mobile/network-home account too, not just the
-// standard /Users/<username> layout. Still expanded exactly once, by the
-// OUTER (invoking) shell, before launchctl/sudo/security ever start -- the
-// resulting real path is what actually reaches `security` as a literal
-// argv, not a second, differently-scoped expansion. `username` MUST
-// already be validated (is_valid_username) before reaching here, same as
-// every other value this header interpolates into a command line.
-inline std::string login_keychain_path(std::string_view username) {
-    return std::format("~{}/Library/Keychains/login.keychain-db", username);
+// Guard for a caller-resolved home directory: absolute and non-empty.
+// There is no shell anywhere downstream (the value lands in one pre-split
+// argv element execed directly), so this is not a metacharacter allowlist
+// -- it rejects only values that could never be a real macOS home
+// directory (empty / relative), which would otherwise make `security`
+// resolve a path against the daemon's own cwd.
+inline bool is_valid_home_dir(std::string_view home_dir) {
+    return !home_dir.empty() && home_dir.front() == '/';
+}
+
+// The console user's login keychain path, built from that user's HOME
+// DIRECTORY as resolved by the caller (getpwnam_r -- see the certificates
+// plugin's resolve_login_home()). That is the SAME directory-services
+// lookup a POSIX shell performs for `~username` tilde expansion, so a
+// relocated/mobile/network-home account resolves to the identical path the
+// previous mechanism produced. (Historical note, #3406: this used to
+// return a literal `~<username>/...` string and rely on an outer
+// `/bin/sh -c` hop to expand it -- tilde expansion was the ONE feature the
+// shell was retained for, and resolving the home in-process is what let
+// the whole read become a pre-split rung-2 argv.) `home_dir` MUST already
+// be validated (is_valid_home_dir) before reaching here, same as every
+// other value this header places into an argv element.
+//
+// Returns std::nullopt -- never a string -- when `home_dir` fails
+// is_valid_home_dir, so this FAILS CLOSED like every other guard in this
+// header rather than handing back a path built from a rejected value. The
+// optional return is also deliberate API hygiene: #3406 changed this
+// function's PARAMETER MEANING (it took a USERNAME before, and built a
+// `~username/...` string for a shell to expand) without changing its
+// arity or its string_view type, so a stale caller still passing a
+// username would otherwise have compiled silently and produced the
+// RELATIVE path "alice/Library/Keychains/login.keychain-db" -- resolved
+// against the daemon's own cwd, exactly the failure is_valid_home_dir
+// exists to prevent. Returning an optional breaks any such caller at
+// compile time instead.
+inline std::optional<std::string> login_keychain_path(std::string_view home_dir) {
+    if (!is_valid_home_dir(home_dir))
+        return std::nullopt;
+    return std::format("{}/Library/Keychains/login.keychain-db", home_dir);
 }
 
 // What a `list`/`details` request should query, resolved from the
@@ -286,21 +326,60 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 
 // ── Command construction ─────────────────────────────────────────────────────
 
-// Build the `[sudo -n ]launchctl asuser <uid> sudo -n -u <username> security
-// find-certificate -a -p <login keychain>` command that reads the console
+// Build the `[sudo -n -- ]launchctl asuser <uid> sudo -n -u <username> -- security
+// find-certificate -a -p <login keychain>` invocation that reads the console
 // user's login keychain from inside their per-user launchd/Aqua session
-// (see the file banner). Defensively re-validates uid/username even though
-// callers are expected to have already validated them via
-// is_valid_uid/is_valid_username (e.g. through a successful
-// resolve_console_user()) -- returns an empty string on failure so a
-// missed guard upstream can never produce an executable command; the
-// caller must treat an empty return as "do not run this" (never fall back
-// to running it anyway, never treat it as an empty-but-safe command).
+// (see the file banner) -- as a PRE-SPLIT argv vector for
+// yuzu::agent::run_bounded_subprocess, no shell anywhere (#3406, rung 2
+// under ADR-3002). This replaces the former single-string `/bin/sh -c`
+// form (rung 3, Decision-7 governed-shell exception), whose shell did
+// exactly two jobs, both now performed without it: `~username` tilde
+// expansion (the caller resolves the home via getpwnam_r and passes
+// `home_dir`) and a `2>/dev/null` redirect (the runner's default,
+// merge_stderr=false, already sends child stderr to /dev/null).
+// Defensively re-validates every interpolated value even though callers
+// are expected to have already validated them (uid/username via a
+// successful resolve_console_user(), home_dir at resolution) -- returns an
+// EMPTY vector on failure so a missed guard upstream can never produce an
+// executable command; the caller must treat an empty return as "do not run
+// this" (never fall back to running it anyway, never treat it as an
+// empty-but-safe command).
+//
+// `--` END-OF-OPTIONS TERMINATOR on both sudo invocations, per ADR-3002
+// Decision 8's canonical privileged-argv form. History worth keeping, because
+// the reasoning was corrected twice (#3406 adversarial review): this site
+// originally OMITTED `--` on the theory that inserting an argument the dormant
+// #1455 sudoers grant does not name might silently stop that grant matching.
+// That theory is WRONG, on two independently verified grounds:
+//   * For the OUTER sudo, `--` is sudo's OWN option and is consumed during its
+//     option parsing -- `man sudo`: "The -- is used to delimit the end of the
+//     sudo options." What sudoers matches is the COMMAND after it, so the
+//     grant string never sees the terminator at all.
+//   * For the INNER sudo, `--` DOES sit inside the command string the outer
+//     grant is matched against -- but sudoers wildcards are fnmatch-based and
+//     `man sudoers` is explicit that `*` "Matches any set of zero or more
+//     characters (including white space)", so `-u *` absorbs `<user> --`
+//     regardless. (The grant text below is nonetheless written with the
+//     terminators spelled out, so matching does not RELY on that subtlety.)
+// Verified empirically on this host: `sudo -n -- <cmd>` and
+// `sudo -n -u <user> -- <cmd>` both parse and reach the credential check
+// exactly as the bare forms do.
+//
+// Note what `--` does and does not buy here, so a later reader does not
+// over-credit it: the only values it protects are the COMMAND NAMES that
+// follow it (`/bin/launchctl`, `/usr/bin/security`), and both are
+// compile-time literals. Every caller-derived value on this line sits in an
+// option-ARGUMENT slot (`asuser <uid>`, `-u <username>`, `-p <path>`) that a
+// terminator cannot guard. Those are guarded instead by ADR-3002 Decision 6's
+// named alternative, which this header satisfies independently: is_valid_uid
+// (digits only), is_valid_username (rejects a leading '-'), and
+// is_valid_home_dir (forces a leading '/'). So `--` is defence in depth and
+// canonical-form conformance, NOT the control that closes option injection.
 //
 // `caller_is_root` mirrors the sudo_prefix() idiom already established in
 // quarantine_plugin.cpp (geteuid() == 0 -> no sudo round-trip needed) --
 // passed in rather than queried here via geteuid() so this function stays a
-// PURE string builder the unit test can exercise with a literal true/false
+// PURE argv builder the unit test can exercise with a literal true/false
 // fixture, matching every other function in this header (the .cpp does the
 // actual geteuid() call -- see the certificates plugin's caller_is_root()).
 // `launchctl asuser` itself requires root privileges (`man launchctl`), so
@@ -311,7 +390,7 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 // this branch is dormant until #1455 lands) MUST escalate through its own
 // outer `sudo -n` first -- without it, the sudoers grant this needs
 // (`_yuzu ALL=(root) NOPASSWD: /bin/launchctl asuser * /usr/bin/sudo -n -u *
-// /usr/bin/security find-certificate -a -p *` -- handed to
+// -- /usr/bin/security find-certificate -a -p *` -- handed to
 // F-pf-provisioning as this package's provisioning note, to add when #1455
 // narrows the macOS agent off root; not required for this package's
 // acceptance criteria today) could never be exercised, because the command
@@ -334,18 +413,30 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
 // illustrative grant exactly, which simplifies writing the eventual
 // sudoers rule if/when #1455 narrows the macOS agent off root (see the
 // exact grant text in the comment above, on the `caller_is_root` paragraph).
-inline std::string build_login_keychain_read_command(std::string_view uid,
-                                                      std::string_view username,
-                                                      bool caller_is_root) {
+inline std::vector<std::string> build_login_keychain_read_argv(std::string_view uid,
+                                                               std::string_view username,
+                                                               std::string_view home_dir,
+                                                               bool caller_is_root) {
     if (!is_valid_uid(uid) || !is_valid_username(username))
         return {};
-    auto asuser_and_below =
-        std::format("/bin/launchctl asuser {} /usr/bin/sudo -n -u {} /usr/bin/security "
-                    "find-certificate -a -p {} 2>/dev/null",
-                    uid, username, login_keychain_path(username));
-    if (caller_is_root)
-        return asuser_and_below;
-    return std::format("/usr/bin/sudo -n {}", asuser_and_below);
+    auto keychain = login_keychain_path(home_dir); // re-validates home_dir, fails closed
+    if (!keychain)
+        return {};
+    // The OUTER hop goes through yuzu::shared::sudo_wrap -- THE single builder
+    // for every sudo-governed rung-2 site in the tree (quarantine, services,
+    // network_actions), whose exact form is pinned by its own unit test and
+    // matched by the sudoers grants install-agent-user.sh writes. Hand-rolling
+    // a second copy here would be the drift class CLAUDE.md warns about: a
+    // later change to the canonical form would update sudo_argv.hpp and its
+    // pinning test while this site silently fell out of grant-match.
+    // The INNER `sudo -n -u <user> --` is NOT sudo_wrap's shape (it targets a
+    // non-root user and is unconditional), so it stays explicit.
+    std::vector<std::string> inner{"/bin/launchctl", "asuser",     std::string(uid),
+                                   "/usr/bin/sudo",  "-n",         "-u",
+                                   std::string(username), "--",    "/usr/bin/security",
+                                   "find-certificate", "-a",       "-p",
+                                   *keychain};
+    return yuzu::shared::sudo_wrap(std::move(inner), caller_is_root);
 }
 
 
