@@ -5,8 +5,9 @@
 #
 # mode: code-change — fuzzes only what the PR touches, short budget
 # (fuzz-seconds below), so this is a fast regression net, not a soak.
-# Deep exploration belongs to a future scheduled batch leg (deferred
-# until the harness set stabilizes). NOT a required status check.
+# Deep exploration is cflite-batch.yml's job (batch + coverage + prune;
+# it also feeds this job's corpus and pruning data). NOT a required
+# status check.
 #
 # This also satisfies the OpenSSF Scorecard Fuzzing check (0/10 before
 # this workflow existed — the check detects the .clusterfuzzlite/ config).

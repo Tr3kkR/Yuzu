@@ -1,0 +1,151 @@
+# ClusterFuzzLite - scheduled/batch fuzzing of the in-tree libFuzzer
+# harnesses (tests/fuzz/, built by .clusterfuzzlite/build.sh; PR-scoped
+# twin: cflite-pr.yml). Three modes, one pipeline:
+#
+#   batch    - fuzzes ALL targets on a longer budget and UPLOADS the evolved
+#              corpus as repository artifacts (cifuzz-corpus-<target>).
+#              Later PR runs download these by name - the artifact search is
+#              repository-wide, so cross-workflow sharing works on the
+#              built-in GITHUB_TOKEN alone.
+#   coverage - replays that corpus under a coverage build and publishes
+#              cifuzz-coverage-latest, which cflite-pr.yml's build step uses
+#              for affected-target pruning.
+#   prune    - minimizes the stored corpus (replaces it wholesale); run
+#              sparingly, and never concurrently with batch.
+#
+# Triggers: push to dev, gated on the same fuzzed-closure paths as
+# cflite-pr.yml. Deliberate: cron and workflow_dispatch only fire from the
+# DEFAULT branch (main), which lags dev by months - a cron-only version of
+# this workflow would stay dormant until the next dev->main merge and would
+# then fuzz main's stale tree. A push trigger runs the pushed ref's own
+# workflow file, so this leg is live as soon as it lands on dev. The weekly
+# cron below is the eventual steady state for when main catches up.
+#
+# Corpus durability = artifact retention (default 90 days). Acceptable while
+# batch runs at least that often. A dedicated storage repo was considered
+# and rejected: it needs admin (new repo + PAT + secret), and the cifuzz git
+# filestore full-clones the storage repo in both action containers on every
+# PR run.
+#
+# upload-build is deliberately NOT set on the batch job: with prior builds
+# available, PR runs switch to reporting only crashes they judge NEW, and
+# pre-existing crashes then surface only in this workflow's crash artifacts,
+# which nobody watches. Do not add it without naming a consumer for those
+# artifacts.
+
+name: ClusterFuzzLite batch fuzzing
+
+on:
+  push:
+    branches: [dev]
+    # KEEP IN SYNC with cflite-pr.yml's paths (and .clusterfuzzlite/build.sh).
+    paths:
+      - 'server/core/src/preflight_parse*'
+      - 'server/core/src/deployment_parse*'
+      - 'server/core/src/yaml_scan*'
+      - 'server/core/src/guardian_rule_spec*'
+      - 'server/core/src/guardian_resilience_schema*'
+      - 'server/core/src/guardian_schema_registry*'
+      - 'tests/fuzz/**'
+      - '.clusterfuzzlite/**'
+      - '.github/workflows/cflite-batch.yml'
+  workflow_dispatch:
+    inputs:
+      prune:
+        description: 'Also run corpus prune after batch'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '30 2 * * 1'   # weekly; dormant until this file is on main
+
+# Never cancel a batch mid-corpus-upload, and never let two writers race
+# on the corpus artifacts: queue instead.
+concurrency:
+  group: cflite-batch
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  batch:
+    name: Batch fuzz (address sanitizer)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read   # download the previous corpus artifacts to continue from
+    steps:
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: c++
+          sanitizer: address
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Batch must fuzz every target regardless of what the triggering
+          # push touched; the build-action default prunes.
+          keep-unaffected-fuzz-targets: true
+
+      - name: Run fuzzers (batch)
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mode: batch
+          sanitizer: address
+          # Total budget split across the 4 targets (~450s each);
+          # parallel-fuzzing multiplies throughput within each slice.
+          fuzz-seconds: 1800
+          parallel-fuzzing: true
+
+  coverage:
+    name: Coverage report (for PR-side pruning)
+    needs: batch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read   # download the corpus the batch job just uploaded
+    steps:
+      - name: Build fuzzers (coverage)
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: c++
+          sanitizer: coverage
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          keep-unaffected-fuzz-targets: true
+
+      - name: Run fuzzers (coverage)
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mode: coverage
+          sanitizer: coverage
+          fuzz-seconds: 600
+
+  prune:
+    name: Corpus prune
+    # Weekly (once live on main) or explicit dispatch only - prune REPLACES
+    # the stored corpus, so it runs less often than batch and only after a
+    # fresh batch upload.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.prune)
+    needs: batch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Build fuzzers
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          language: c++
+          sanitizer: address
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          keep-unaffected-fuzz-targets: true
+
+      - name: Run fuzzers (prune)
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          mode: prune
+          sanitizer: address
+          fuzz-seconds: 600
