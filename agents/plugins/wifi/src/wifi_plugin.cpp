@@ -972,6 +972,12 @@ int do_connected(yuzu::CommandContext& ctx) {
     }
 
     bool found = false;
+    // A connected-state interface whose detail query failed is not a
+    // disconnected station either -- same fabricated-negative class as
+    // WlanOpenHandle/WlanEnumInterfaces above. If no interface's query
+    // succeeds, this stays true and the final "not found" branch reports
+    // unknown rather than a definitive negative.
+    bool connected_iface_query_failed = false;
     for (DWORD i = 0; i < iface_list->dwNumberOfItems; ++i) {
         auto& iface = iface_list->InterfaceInfo[i];
         if (iface.isState != wlan_interface_state_connected)
@@ -984,8 +990,10 @@ int do_connected(yuzu::CommandContext& ctx) {
         result = WlanQueryInterface(client, &iface.InterfaceGuid,
                                     wlan_intf_opcode_current_connection, nullptr, &attr_size,
                                     reinterpret_cast<PVOID*>(&conn_attrs), &opcode_type);
-        if (result != ERROR_SUCCESS || !conn_attrs)
+        if (result != ERROR_SUCCESS || !conn_attrs) {
+            connected_iface_query_failed = true;
             continue;
+        }
 
         // Extract SSID
         std::string ssid(
@@ -1011,7 +1019,15 @@ int do_connected(yuzu::CommandContext& ctx) {
     }
 
     if (!found) {
-        ctx.write_output("connected|none|Not connected|0|none|none");
+        if (connected_iface_query_failed) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "wifi:wlan_query_interface_failed");
+            ctx.write_output("connected|unknown|Wi-Fi connection state could not be determined "
+                             "(WlanQueryInterface failed)|0|none|none");
+        } else {
+            ctx.write_output("connected|none|Not connected|0|none|none");
+        }
     }
 
     WlanFreeMemory(iface_list);
