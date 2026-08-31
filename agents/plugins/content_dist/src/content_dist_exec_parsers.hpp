@@ -255,8 +255,17 @@ namespace yuzu::content_dist::exec {
     // installer on Windows goes straight to TerminateJobObject, skipping
     // the configured 30s grace entirely. See SubprocessOptions::no_window's
     // doc comment (subprocess_runner.hpp) for the full Win32 contract this
-    // is derived from. No in-scope fix -- see that comment.
+    // is derived from. A real fix -- a cooperative-termination channel that
+    // works against a console-less child -- is out of scope (a separate,
+    // larger IPC/event design, not an extension of CTRL_BREAK delivery).
+    // What IS in scope: the configuration must not claim a grace it cannot
+    // deliver. Zero it on the no_window path so opts.soft_terminate_grace
+    // honestly reflects what this call site actually gets on Windows --
+    // an immediate hard kill on deadline/cancel, same as the zero default
+    // everywhere soft_terminate_grace is never set.
     opts.no_window = is_windows;
+    if (opts.no_window)
+        opts.soft_terminate_grace = std::chrono::seconds(0);
 
     return opts;
 }

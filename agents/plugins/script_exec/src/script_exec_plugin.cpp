@@ -371,10 +371,15 @@ int run_via_runner(yuzu::CommandContext& ctx, const std::vector<std::string>& ar
     // interactively run agent. Every deadline/cancel goes straight to
     // TerminateJobObject, silently skipping the configured 10s grace. See
     // SubprocessOptions::no_window's doc comment (subprocess_runner.hpp)
-    // for the full Win32 contract. No in-scope fix -- see that comment.
+    // for the full Win32 contract. The cooperative-termination channel a
+    // real fix needs is out of scope; zeroing the grace below when
+    // no_window is set is the in-scope fix -- the configuration must not
+    // arm a grace this deployment shape can never deliver.
     auto win_overrides = yuzu::script_exec::windows_runner_overrides();
     opts.inherit_parent_env = win_overrides.inherit_parent_env;
     opts.no_window = win_overrides.no_window;
+    if (opts.no_window)
+        opts.soft_terminate_grace = std::chrono::seconds(0);
 #endif
 
     // on_line delivers every line regardless of any runner-side cap

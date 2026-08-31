@@ -310,12 +310,18 @@ struct SubprocessOptions {
     // no_window=true AND a nonzero soft_terminate_grace, the "soft"
     // termination step is a guaranteed no-op on Windows -- every
     // deadline/cancel goes straight to TerminateJobObject, silently
-    // skipping the configured grace. This is a KNOWN LIMITATION with no
-    // in-scope fix (a genuinely separate soft-IPC channel compatible with a
-    // no-console child would be a new, separately-designed mechanism, not
-    // an extension of CTRL_BREAK delivery) -- see the call-site comments in
-    // content_dist_exec_parsers.hpp and script_exec_plugin.cpp, the two
-    // callers that combine both fields today.
+    // skipping the configured grace. A genuinely separate soft-IPC channel
+    // compatible with a no-console child would be a new, separately-
+    // designed mechanism, not an extension of CTRL_BREAK delivery, and
+    // stays out of scope here. What IS in scope, and now done: a caller
+    // must not CONFIGURE a grace it cannot deliver -- content_dist_exec_
+    // parsers.hpp and script_exec_plugin.cpp, the two callers that set
+    // no_window=true, both zero soft_terminate_grace on that path so the
+    // options struct honestly reflects what Windows actually delivers.
+    // This doc comment is the standing warning for any FUTURE
+    // no_window=true caller: zero soft_terminate_grace alongside it, or
+    // the two fields silently lie about each other. See the call-site
+    // comments in content_dist_exec_parsers.hpp and script_exec_plugin.cpp.
     bool no_window = false;
 
     // B3: optional per-invocation resource caps, OFF (nullopt) by default --
