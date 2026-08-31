@@ -6645,8 +6645,13 @@ wins and the call proceeds; for a Destructive row, supplying `scope` at all is r
 not apply here.
 
 ```json
-{"error": {"code": 400, "message": "destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}}
+{"error": {"code": 400, "message": "destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
 ```
+
+`audit_emitted` follows this file's usual convention (see `DELETE /api/v1/sessions?username=<name>` above):
+present and `false` only when the paired `command.dispatch` audit row failed to persist (the response also
+sets `Sec-Audit-Failed: true` in that case), and omitted entirely when no audit store is configured — absent
+means no claim, not `false`.
 
 The elevated securable/operation this row's catalogue entry names (per-row, e.g.
 `Infrastructure:Delete` for `tar.purge_source`) is checked via `require_permission` **before**

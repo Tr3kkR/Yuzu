@@ -107,15 +107,22 @@ supervised-tier pre-mint gate and the operator-tier handler).
 
 **MCP `execute_instruction` had no Destructive-targeting gate at all before this release** — a
 scope-targeted or broadcast call to one of the 17 rows above dispatched normally and succeeded.
-On REST `/api/command`, a classify-miss shape defect in the prior gate meant a scope-targeted or
-broadcast dispatch to one of these rows could, in some cases, also go through rather than being
-refused — this release closes that gate to an exhaustive, no-default-arm decision over every
-possible outcome so a future miscategorisation fails to compile rather than falling open silently.
+
+**REST `/api/command`'s outcome for these 17 rows is unchanged** — the prior guard already denied
+a scope-targeted or broadcast dispatch to any of them, both before and after this release. What
+changed on REST is the guard's shape, not its outcome: the prior code was an `if` that collapsed
+"classified and not Destructive" and "failed to classify at all" (a classify-miss) into the same
+skipped branch, relying on a classify-miss being denied unconditionally further downstream
+(`build_classified_command`) rather than proving that locally. This release replaces it with an
+exhaustive switch with no default arm, so a future change to the verdict enum forces a
+compile-time decision here too, instead of silently falling through to a guard shape that was
+correct only because of a downstream backstop.
 
 **Who this affects:** any operator or automation dispatching one of the 17 rows above via MCP
-`execute_instruction` with `scope` or an omitted/empty target, or via REST `/api/command` the same
-way. Explicit `agent_ids` dispatches to these rows, and any dispatch to a row NOT on this list, are
-unaffected.
+`execute_instruction` with `scope` or an omitted/empty target — this is the surface whose outcome
+actually changes. A REST `/api/command` caller doing the same was already refused before this
+release and sees no behavior change. Explicit `agent_ids` dispatches to these rows, and any
+dispatch to a row NOT on this list, are unaffected on either surface.
 
 **What to do:** switch any such call to explicit, non-empty `agent_ids`. `POST
 /api/instructions/{id}/execute`, the dashboard execute surface, and MCP `execute_bundle` do not yet
