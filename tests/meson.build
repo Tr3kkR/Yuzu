@@ -341,6 +341,11 @@ agent_test_exe = executable(
     'unit/test_services_parsers.cpp',         # Wave 2 WP-G: pure systemctl/launchctl output parsers
     'unit/test_discovery_parsers.cpp',        # Wave 2 WP-C: pure /proc/net/arp parser
     'unit/test_discovery_scan_plan.cpp',      # Wave 2 WP-C: pure sweep bounds + honest-degrade decisions
+    'unit/test_network_config_parsers.cpp',   # PKG-NC: pure /proc/net/arp, dns_cache line filters,
+                                                # rtnetlink + PF_ROUTE default-route binary decoders
+    'unit/test_network_config_local_dispatcher.cpp', # PKG-NC: real network_config.dylib/.so driven
+                                                # end to end via LocalDispatcher (POSIX-only; a no-op
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
     'unit/test_route_sysctl_arp.cpp',         # Wave 2 WP-C: pure sysctl NET_RT_FLAGS/RTF_LLINFO binary parser
     'unit/test_bounded_wait.cpp',             # Wave 2 WP-C remediation: uncancellable-call timeout wrapper
     'unit/agent/test_socket_walk.cpp',        # Wave 3 PR3.1: macos_socket_walk.hpp libproc walk (Darwin-only, self-gated)
@@ -409,6 +414,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/network_actions/src'), # network_actions_parsers.hpp (Wave 2 WP-D)
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
+    include_directories('../agents/plugins/network_config/src'), # network_config_parsers.hpp (PKG-NC pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
     include_directories('../agents/plugins/netstat/src'),        # netstat_parsers.hpp (gate-2 remediation pure parser)
@@ -456,12 +462,15 @@ agent_test_exe = executable(
   # (agents/plugins/{installed_apps,msi_packages}/meson.build):
   # test_installed_apps_actions.cpp / test_msi_packages_actions.cpp load both
   # real plugins by path for the identical reason (Wave 4 PR4.3a remediation).
+  # network_config_plugin_lib (agents/plugins/network_config/meson.build):
+  # test_network_config_local_dispatcher.cpp loads the real network_config
+  # plugin by path for the identical reason (PKG-NC).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
                 network_diag_plugin_lib, ioc_plugin_lib,
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
-                installed_apps_plugin_lib, msi_packages_plugin_lib],
+                installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it

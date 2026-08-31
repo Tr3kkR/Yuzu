@@ -218,9 +218,9 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | `adapters` | List network adapters with type, MAC address, and link status. |
 | `ip_addresses` | IPv4 and IPv6 addresses per adapter, including subnet mask and gateway. |
 | `dns_servers` | Configured DNS servers per adapter. |
-| `proxy` | System proxy settings (HTTP, HTTPS, SOCKS, PAC URL). |
-| `dns_cache` | Resolver cache entries (`cache_entry\|name\|type\|…`). **Windows only.** Backs the device page's **DNS cache** live card. |
-| `arp` | Host ARP / IPv6-neighbour table via `GetIpNetTable2` (`arp\|iface\|ip\|mac\|type`, capped at 20k entries). **Windows only** — Linux (`/proc/net/arp`) and macOS (route sysctl) are planned. Backs the device page's **ARP** live card. |
+| `proxy` | System proxy settings. Windows reports the WinHTTP/IE configuration (proxy, PAC URL, bypass list). Linux reports the `http_proxy`/`https_proxy`/`all_proxy`/`no_proxy` environment variables. macOS reports the HTTP proxy and PAC URL across the primary network service and each scoped per-interface service, plus a bypass list; HTTPS, SOCKS and FTP proxies are **not** reported on macOS, so a Mac configured with only those reads as `none`. |
+| `dns_cache` | Resolver cache entries (`cache_entry\|name\|type\|…`). Windows reads `DnsGetCacheDataTable`; Linux reads `resolvectl cache`, falling back to `systemd-resolve --statistics` and reporting unavailable when neither is present. **Not available on macOS** — the OS exposes no resolver-cache contents (`dscacheutil -cachedump` was gutted upstream), so the action returns an honest `dns_cache\|unsupported` sentinel. Backs the device page's **DNS cache** live card. |
+| `arp` | Host ARP / neighbour table (`arp\|iface\|ip\|mac\|type`). Windows reads `GetIpNetTable2` — IPv4 ARP **and** IPv6 neighbours, including incomplete entries, capped at 20k rows. Linux reads `/proc/net/arp`: **IPv4 ARP only** — IPv6 neighbours live in the `RTM_GETNEIGH` table and are not reported, and non-Ethernet and incomplete (non-`ATF_COM`) entries are skipped. macOS reads a PF_ROUTE `RTF_LLINFO` sysctl and de-duplicates: the dump carries no interface name and no static/dynamic type, so both fields are emitted as `-`. Linux and macOS share Windows' 20000-row cap. Backs the device page's **ARP** live card. |
 
 ### netstat
 
