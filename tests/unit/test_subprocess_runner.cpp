@@ -1440,7 +1440,13 @@ TEST_CASE("run_bounded_subprocess (Windows) store_line delivers a blank complete
           "[subprocess][windows][streaming]") {
     std::vector<std::string> streamed;
     SubprocessResult result = run_bounded_subprocess(
-        {kCmdExe, "/d", "/c", "echo row1 & echo. & echo row2"},
+        // NOTE: no space directly before `&` -- cmd.exe's echo prints its
+        // entire argument LITERALLY, trailing whitespace included, up to the
+        // (unescaped) command separator, so "echo row1 &" would actually
+        // print "row1 " (trailing space) rather than "row1". Caught live on
+        // Windows CI (2026-08-31): the first CI run of this test to ever
+        // actually execute past compile time failed on exactly this.
+        {kCmdExe, "/d", "/c", "echo row1& echo.& echo row2"},
         SubprocessOptions{.deadline = 10000ms,
                            .on_line = [&](const std::string& line) { streamed.push_back(line); }});
 
@@ -1484,7 +1490,8 @@ TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true forwards the
     (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", "parent_value");
     SubprocessResult result = run_bounded_subprocess(
         {kCmdExe, "/d", "/c",
-         "echo %YUZU_TEST_INHERIT_ENV_MARKER% & echo %YUZU_TEST_OVERRIDE_MARKER%"},
+         // No space directly before `&` -- see the A2-006 test's comment above.
+         "echo %YUZU_TEST_INHERIT_ENV_MARKER%& echo %YUZU_TEST_OVERRIDE_MARKER%"},
         SubprocessOptions{.deadline = 10000ms,
                            .extra_env = {{"YUZU_TEST_OVERRIDE_MARKER", "extra_value"}},
                            .inherit_parent_env = true});
@@ -1516,7 +1523,8 @@ TEST_CASE("run_bounded_subprocess (Windows) inherit_parent_env=true withholds th
     (void)_putenv_s("IFS", "broken");
     SubprocessResult result = run_bounded_subprocess(
         {kCmdExe, "/d", "/c",
-         "echo %YUZU_TEST_INHERIT_ENV_MARKER% & echo [%LD_PRELOAD%] & echo [%IFS%]"},
+         // No space directly before `&` -- see the A2-006 test's comment above.
+         "echo %YUZU_TEST_INHERIT_ENV_MARKER%& echo [%LD_PRELOAD%]& echo [%IFS%]"},
         SubprocessOptions{.deadline = 10000ms, .inherit_parent_env = true});
     (void)_putenv_s("YUZU_TEST_INHERIT_ENV_MARKER", ""); // best-effort cleanup
     (void)_putenv_s("LD_PRELOAD", "");
