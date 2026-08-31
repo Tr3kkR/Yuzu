@@ -638,6 +638,32 @@ TEST_CASE("parse_rtnetlink_link_chunk reports truncation, never a crash, on malf
     }
 }
 
+TEST_CASE("parse_rtnetlink_link_chunk flags truncation on a short-fixed-payload RTM_NEWLINK "
+         "instead of silently skipping it and believing a later NLMSG_DONE",
+         "[network_config][rtnetlink]") {
+    // A well-formed nlmsghdr (passes NLMSG_OK) whose nlmsg_len is shorter than
+    // the fixed ifinfomsg every real RTM_NEWLINK must carry -- a malformed
+    // dump, not a record that is safe to skip and move past. Before the fix
+    // this `continue`d to the NLMSG_DONE that follows and returned
+    // done=true/truncated=false over a silently smaller result.
+    struct nlmsghdr nlh {};
+    nlh.nlmsg_type = RTM_NEWLINK;
+    nlh.nlmsg_flags = NLM_F_MULTI;
+    nlh.nlmsg_seq = 1;
+    nlh.nlmsg_len = static_cast<std::uint32_t>(sizeof(nlh) + 4); // < NLMSG_LENGTH(sizeof(ifinfomsg))
+    std::vector<unsigned char> blob;
+    append_bytes(blob, &nlh, sizeof(nlh));
+    blob.resize(nlh.nlmsg_len, 0); // pad out to the (short) claimed length
+
+    auto done = build_done_message(1);
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_link_chunk(std::span{blob}, 1);
+    CHECK(parsed.records.empty());
+    CHECK(parsed.truncated);
+    CHECK_FALSE(parsed.done); // must not walk past the short record to the DONE
+}
+
 TEST_CASE("parse_rtnetlink_addr_chunk prefers IFA_LOCAL and captures IFA_LABEL",
          "[network_config][rtnetlink]") {
     constexpr std::uint32_t kSeq = 7;
@@ -670,6 +696,29 @@ TEST_CASE("parse_rtnetlink_addr_chunk decodes an IPv6 address without a label",
     CHECK(parsed.records[0].address == "2001:db8::1");
     CHECK(parsed.records[0].label.empty());
     CHECK(parsed.records[0].is_ipv6);
+}
+
+TEST_CASE("parse_rtnetlink_addr_chunk flags truncation on a short-fixed-payload RTM_NEWADDR "
+         "instead of silently skipping it and believing a later NLMSG_DONE",
+         "[network_config][rtnetlink]") {
+    // See parse_rtnetlink_link_chunk's identical fixture above -- same bug,
+    // same fix, the other message type.
+    struct nlmsghdr nlh {};
+    nlh.nlmsg_type = RTM_NEWADDR;
+    nlh.nlmsg_flags = NLM_F_MULTI;
+    nlh.nlmsg_seq = 1;
+    nlh.nlmsg_len = static_cast<std::uint32_t>(sizeof(nlh) + 4); // < NLMSG_LENGTH(sizeof(ifaddrmsg))
+    std::vector<unsigned char> blob;
+    append_bytes(blob, &nlh, sizeof(nlh));
+    blob.resize(nlh.nlmsg_len, 0);
+
+    auto done = build_done_message(1);
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_addr_chunk(std::span{blob}, 1);
+    CHECK(parsed.records.empty());
+    CHECK(parsed.truncated);
+    CHECK_FALSE(parsed.done);
 }
 
 // Builds a default route with NO top-level RTA_GATEWAY, carrying an
@@ -1047,6 +1096,29 @@ TEST_CASE("parse_rtnetlink_route_chunk rejects an rtnh_len of zero", "[network_c
     const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, kSeq);
     REQUIRE(parsed.records.size() == 1);
     CHECK(parsed.records[0].gateway.empty());
+}
+
+TEST_CASE("parse_rtnetlink_route_chunk flags truncation on a short-fixed-payload RTM_NEWROUTE "
+         "instead of silently skipping it and believing a later NLMSG_DONE",
+         "[network_config][rtnetlink]") {
+    // See parse_rtnetlink_link_chunk's identical fixture further up -- same
+    // bug, same fix, the third message type.
+    struct nlmsghdr nlh {};
+    nlh.nlmsg_type = RTM_NEWROUTE;
+    nlh.nlmsg_flags = NLM_F_MULTI;
+    nlh.nlmsg_seq = 1;
+    nlh.nlmsg_len = static_cast<std::uint32_t>(sizeof(nlh) + 4); // < NLMSG_LENGTH(sizeof(rtmsg))
+    std::vector<unsigned char> blob;
+    append_bytes(blob, &nlh, sizeof(nlh));
+    blob.resize(nlh.nlmsg_len, 0);
+
+    auto done = build_done_message(1);
+    blob.insert(blob.end(), done.begin(), done.end());
+
+    const auto parsed = parse_rtnetlink_route_chunk(std::span{blob}, 1);
+    CHECK(parsed.records.empty());
+    CHECK(parsed.truncated);
+    CHECK_FALSE(parsed.done);
 }
 
 #endif // __linux__

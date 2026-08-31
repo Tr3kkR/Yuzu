@@ -490,8 +490,15 @@ inline RtLinkParse parse_rtnetlink_link_chunk(std::span<const unsigned char> blo
         }
         if (h->nlmsg_type != RTM_NEWLINK)
             continue;
-        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifinfomsg)))
-            continue; // truncated payload — skip this record, not the whole chunk
+        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifinfomsg))) {
+            // Payload shorter than the fixed ifinfomsg this record must carry
+            // — a malformed dump, not a record we can safely skip. Matching
+            // agents/shared/route_sysctl_arp.hpp's discipline: flag truncation
+            // and stop the walk rather than silently continuing past it and
+            // reporting done=true/truncated=false over a smaller result.
+            out.truncated = true;
+            break;
+        }
 
         struct ifinfomsg ifi {};
         std::memcpy(&ifi, NLMSG_DATA(h), sizeof(ifi));
@@ -571,8 +578,11 @@ inline RtAddrParse parse_rtnetlink_addr_chunk(std::span<const unsigned char> blo
         }
         if (h->nlmsg_type != RTM_NEWADDR)
             continue;
-        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifaddrmsg)))
-            continue;
+        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct ifaddrmsg))) {
+            // See parse_rtnetlink_link_chunk()'s identical short-payload guard.
+            out.truncated = true;
+            break;
+        }
 
         struct ifaddrmsg ifa {};
         std::memcpy(&ifa, NLMSG_DATA(h), sizeof(ifa));
@@ -650,8 +660,11 @@ inline RtRouteParse parse_rtnetlink_route_chunk(std::span<const unsigned char> b
         }
         if (h->nlmsg_type != RTM_NEWROUTE)
             continue;
-        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct rtmsg)))
-            continue;
+        if (h->nlmsg_len < NLMSG_LENGTH(sizeof(struct rtmsg))) {
+            // See parse_rtnetlink_link_chunk()'s identical short-payload guard.
+            out.truncated = true;
+            break;
+        }
 
         struct rtmsg rtm {};
         std::memcpy(&rtm, NLMSG_DATA(h), sizeof(rtm));
