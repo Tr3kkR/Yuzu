@@ -69,6 +69,11 @@ struct VizHarness {
     std::unique_ptr<ResponseStore> response_store;
 
     bool perm_grant{true};
+    // #1634: the route's sole scope source is now the fleet-read gate's
+    // VisibleSet, not response_scope_fn (kept below only for source-stable
+    // call sites elsewhere). nullopt = unrestricted, matching FleetReadGate's
+    // own TOP convention.
+    authz::VisibleSet fleet_read_scope{std::nullopt};
     std::vector<AuditRecord> audit_log;
 
     RestApiV1 api;
@@ -100,6 +105,21 @@ struct VizHarness {
                 return false;
             }
             return true;
+        };
+        // #1634: the visualization route's sole gate is now fleet_read_fn
+        // (perm_fn above is retained only for the older negative-case wiring
+        // pattern below and is no longer called by the route itself). Mirror
+        // RestEventsHarness's default: unrestricted admit, or a 403 denial
+        // when a test flips perm_grant.
+        auto fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
+                                    const std::string&,
+                                    const std::string&) -> authz::FleetReadGate {
+            if (!perm_grant) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            return {true, fleet_read_scope};
         };
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>.
         auto audit_fn = [this](const httplib::Request&, const std::string& a, const std::string& r,
@@ -141,7 +161,16 @@ struct VizHarness {
                             /*baseline_store=*/nullptr,
                             /*scoped_perm_fn=*/{},
                             /*software_inventory_store=*/nullptr,
-                            /*response_scope_fn=*/std::move(scope_fn));
+                            /*response_scope_fn=*/std::move(scope_fn),
+                            /*app_perf_providers=*/{},
+                            /*engine_principal_store=*/nullptr,
+                            /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr,
+                            /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr,
+                            /*exec_visible_fn=*/{},
+                            /*list_read_fn=*/{},
+                            /*fleet_read_fn=*/std::move(fleet_read_fn));
     }
 
     ~VizHarness() {
@@ -216,7 +245,7 @@ TEST_CASE("REST visualization: malformed definition_id → 400",
     CHECK(h.audit_log[0].detail.find("malformed_definition_id") != std::string::npos);
 }
 
-TEST_CASE("REST visualization: perm_fn denies → 403, no audit emission",
+TEST_CASE("REST visualization: fleet_read_fn denies → 403, no audit emission",
           "[pg][rest][visualization][rbac]") {
     // Closes governance qe-1: 403 path was untested. A future change that
     // accidentally inverts the permission check would silently expose an
@@ -540,14 +569,13 @@ TEST_CASE("REST visualization: management-group scope drops out-of-scope agents'
           "[pg][rest][visualization][scope]") {
     // The flat Response:Read gate is not a per-agent ownership check, so without
     // the scope filter an operator charts another operator's execution by id.
-    // Same fixture as the pie round-trip, but the injected scope predicate admits
-    // only agent-1 — agent-2's rows (sshd) must never reach the chart transform.
-    auto scope_fn = [](const std::string& /*username*/, const std::string& agent_id) -> bool {
-        return agent_id == "agent-1";
-    };
+    // Same fixture as the pie round-trip, but the fleet-read gate's VisibleSet
+    // admits only agent-1 — agent-2's rows (sshd) must never reach the chart
+    // transform.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    VizHarness h(pool, scope_fn);
+    VizHarness h(pool);
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-1"}};
     auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
                     "title":"Top procs"})";
     auto def_id = h.make_def(spec, "procfetch");
@@ -582,10 +610,10 @@ TEST_CASE("REST visualization: management-group scope drops out-of-scope agents'
 
 TEST_CASE("REST visualization: every agent out of scope → empty chart, no leak (#1634)",
           "[pg][rest][visualization][scope]") {
-    auto scope_fn = [](const std::string&, const std::string&) -> bool { return false; };
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    VizHarness h(pool, scope_fn);
+    VizHarness h(pool);
+    h.fleet_read_scope = authz::deny_all();
     auto spec = R"({"type":"pie","processor":"single_series","labelField":1,"title":"t"})";
     auto def_id = h.make_def(spec, "procfetch");
     h.push_response("cmd-S2", "agent-1", "1|chrome|/usr/bin/chrome|d");

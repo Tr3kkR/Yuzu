@@ -27,7 +27,7 @@
 namespace yuzu::test {
 
 inline PgTestTemplate response_execution_authz_tpl{
-    "rbacstore_response_execution_scope", [](const std::string& dsn) {
+    "resp_exec_scope_1634", [](const std::string& dsn) {
         server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
         server::RbacStore store{pool};
         if (!store.is_open())
