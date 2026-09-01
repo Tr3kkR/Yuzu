@@ -17687,19 +17687,25 @@ private:
                     return;
                 }
                 const auto& exec_opt = *exec_r;
-                bool admitted = false;
-                if (exec_opt) {
-                    auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
-                    if (!statuses_opt) {
-                        res.status = 503;
-                        res.set_content(detail::a4_error(res, "execution tracker degraded",
-                                                        {.retry_after_ms = 5000}),
-                                        "application/json");
-                        return;
-                    }
-                    admitted = admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
-                                                      username);
+                // #3789 (adversarial review, Kimi+Codex): fetch statuses
+                // UNCONDITIONALLY here, not only when exec_opt exists — an
+                // id-conditional second query is a timing/work oracle that
+                // lets a confined caller distinguish "nonexistent" from
+                // "exists but hidden" by DB round-trip count, even though
+                // the HTTP response is identical. The GET routes already
+                // fetch unconditionally under gate.scope for the same
+                // reason; mirror that shape here.
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
                 }
+                const bool admitted = exec_opt.has_value() &&
+                                     admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
+                                                            username);
                 if (!admitted) {
                     // #3789: uniform deny shape — nonexistent, zero-visible,
                     // partial, and incomplete-target-ledger all collapse to
@@ -17765,20 +17771,18 @@ private:
                 return;
             }
             const auto& exec_opt = *exec_r;
-            // #3789: `mark_cancelled` reports PGRES_COMMAND_OK (success) on
-            // an UPDATE that matched zero rows — without an explicit
-            // existence check here, ANY caller hitting an unknown id would
-            // get a false "cancelled" 200 (Sol/gpt-5.6-sol adversarial
-            // review). This check applies uniformly regardless of
-            // confinement — existence is orthogonal to scope, and already
-            // disclosed via the GET routes.
-            if (!exec_opt) {
-                res.status = 404;
-                res.set_content(detail::a4_error(res, "not found"), "application/json");
-                return;
-            }
 
             if (gate.scope) {
+                // #3789 (adversarial review, Kimi+Codex): fetch statuses and
+                // audit UNIFORMLY for a nonexistent id and a
+                // hidden-but-existing/incomplete-cohort id — the earlier
+                // shape short-circuited on `!exec_opt` before this fetch,
+                // which was both a timing/work oracle (one DB round-trip
+                // less for a nonexistent id) and an audit-trail asymmetry
+                // (only the hidden-but-existing case wrote a `denied` row) —
+                // breaking the documented "identical 404 + non-distinguishing
+                // audit detail" guarantee for the two cases a caller sees as
+                // the same response.
                 auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
                 if (!statuses_opt) {
                     res.status = 503;
@@ -17787,13 +17791,26 @@ private:
                                     "application/json");
                     return;
                 }
-                if (!admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope, username)) {
+                const bool admitted = exec_opt.has_value() &&
+                                     admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
+                                                            username);
+                if (!admitted) {
                     (void)audit_log(req, "execution.cancel", "denied", "Execution", id,
                                     "not found or outside caller's fleet-read scope cid=" + cid);
                     res.status = 404;
                     res.set_content(detail::a4_error(res, "not found"), "application/json");
                     return;
                 }
+            } else if (!exec_opt) {
+                // #3789: `mark_cancelled` reports PGRES_COMMAND_OK (success)
+                // on an UPDATE that matched zero rows — without this
+                // existence check an UNCONFINED caller hitting an unknown id
+                // would get a false "cancelled" 200 (Sol/gpt-5.6-sol
+                // adversarial review). A confined caller's existence check
+                // is folded into the unified branch above.
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
             }
 
             // governance PR review (2026-08-31): mark_cancelled now reports
