@@ -180,7 +180,12 @@ TEST_CASE("walk_delete lazy match: MatchFn never called for structurally-rejecte
 
     DeleteResult result = walk_delete<FakeOps>(root, ops, counting, kOpenLimits);
 
-    REQUIRE(result.stop_reason == Reason::None);
+    // NOT None: the fixture includes a stat_error entry, which is a Failed
+    // outcome -- the walker could not examine it, so it was not visited and not
+    // deliberately skipped. Under the stop_reason contract that is incompleteness
+    // and the caller must be told. A Skipped(InvalidName)/Symlink/Reparse entry
+    // would NOT set it: those are deliberate policy refusals, i.e. completed visits.
+    REQUIRE(result.stop_reason == Reason::OsError);
     REQUIRE(match_calls == 0);
     // NameFilteredOut aside, every entry above is structurally decided
     // without ever needing the match result.

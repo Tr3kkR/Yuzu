@@ -163,13 +163,28 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
     DeleteResult result{};
     result.stop_reason = Reason::None;
 
-    // C001: a directory we could not enumerate or open leaves a subtree
-    // UNVISITED. Recording a Failed entry for it is useful diagnostics but does
-    // not repair the top-level signal: callers are entitled to read
-    // stop_reason == None as "the tree was exhaustively visited", so a walk that
-    // skipped a subtree must not report None. The first such reason is retained
-    // here and applied at the end if nothing more specific stopped the walk.
+    // `stop_reason == None` is a CONTRACT: the caller is entitled to read it as
+    // "every entry was visited and every action either succeeded or was a
+    // deliberate policy skip". Six separate defects in this file were the same
+    // shape -- some path left work undone while None was still reported -- so
+    // this is derived from the OUTCOMES rather than from a list of causes that
+    // has to be extended every time a new one appears:
+    //   * any Failed outcome            -- an action did not happen
+    //   * a DepthCap skip               -- a subtree was never visited
+    //   * enumerate/open_dir OsError    -- a subtree was never visited
+    // A Skipped outcome for any OTHER reason IS a completed visit: the walker
+    // looked at the entry and deliberately declined it, which is what a policy
+    // refusal means. Recording `incomplete` centrally, at the one place outcomes
+    // are appended, is what stops a seventh instance.
     Reason incomplete = Reason::None;
+    const auto note_outcome = [&incomplete](const EntryOutcome& o) {
+        if (incomplete != Reason::None)
+            return; // first cause wins
+        if (o.status == EntryStatus::Failed)
+            incomplete = o.reason == Reason::None ? Reason::OsError : o.reason;
+        else if (o.status == EntryStatus::Skipped && o.reason == Reason::DepthCap)
+            incomplete = Reason::DepthCap;
+    };
 
     try {
         // B005: saturate rather than overflow. `now() + max_wall` is signed
@@ -203,8 +218,12 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                 return result;
             }
             if (enum_result.reason == Reason::OsError) {
-                result.entries.push_back(EntryOutcome{frame.rel_prefix, EntryStatus::Failed,
-                                                        Reason::OsError, enum_result.os_error});
+                {
+                        const EntryOutcome oc = EntryOutcome{frame.rel_prefix, EntryStatus::Failed,
+                                                        Reason::OsError, enum_result.os_error};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                 if (incomplete == Reason::None)
                     incomplete = Reason::OsError; // subtree unvisited -- see C001 above
                 continue; // move on to sibling directories still on the stack
@@ -228,14 +247,21 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                 const std::string rel_path = detail::join_rel(frame.rel_prefix, dir_entry.name);
 
                 if (dir_entry.stat_error != 0) {
-                    result.entries.push_back(EntryOutcome{
-                        rel_path, EntryStatus::Failed, Reason::OsError, dir_entry.stat_error});
+                    {
+                        const EntryOutcome oc = EntryOutcome{
+                        rel_path, EntryStatus::Failed, Reason::OsError, dir_entry.stat_error};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                     ++result.tally.entries_seen;
                     continue;
                 }
                 if (dir_entry.name_invalid) {
-                    result.entries.push_back(
-                        EntryOutcome{rel_path, EntryStatus::Skipped, Reason::InvalidName, 0});
+                    {
+                        const EntryOutcome oc = EntryOutcome{rel_path, EntryStatus::Skipped, Reason::InvalidName, 0};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                     ++result.tally.entries_seen;
                     continue;
                 }
@@ -280,8 +306,11 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                                                        UnlinkKind::File, budget_left);
                     if (outcome.status == EntryStatus::Deleted)
                         result.tally.bytes_deleted += outcome.bytes;
-                    result.entries.push_back(
-                        EntryOutcome{rel_path, outcome.status, outcome.reason, outcome.os_error});
+                    {
+                        const EntryOutcome oc = EntryOutcome{rel_path, outcome.status, outcome.reason, outcome.os_error};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                     ++result.tally.entries_seen;
                     break;
                 }
@@ -293,13 +322,20 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                             std::move(*opened.handle), rel_path,
                             frame.depth + 1});
                     } else if (opened.reason == Reason::OsError) {
-                        result.entries.push_back(EntryOutcome{
-                            rel_path, EntryStatus::Failed, Reason::OsError, opened.os_error});
+                        {
+                        const EntryOutcome oc = EntryOutcome{
+                            rel_path, EntryStatus::Failed, Reason::OsError, opened.os_error};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                         if (incomplete == Reason::None)
                             incomplete = Reason::OsError; // subtree unvisited -- C001
                     } else if (detail::is_policy_refusal(opened.reason)) {
-                        result.entries.push_back(
-                            EntryOutcome{rel_path, EntryStatus::Skipped, opened.reason, 0});
+                        {
+                        const EntryOutcome oc = EntryOutcome{rel_path, EntryStatus::Skipped, opened.reason, 0};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                     } else {
                         // NOT a policy refusal -- the subtree was never traversed for
                         // a reason that is not "we deliberately declined this entry"
@@ -308,9 +344,12 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                         // continuing would let the walk finish with stop_reason None,
                         // which a caller reads as exhaustively visited. Whitelist the
                         // real refusals and stop on everything else.
-                        result.entries.push_back(
-                            EntryOutcome{rel_path, EntryStatus::Failed, opened.reason,
-                                         opened.os_error});
+                        {
+                        const EntryOutcome oc = EntryOutcome{rel_path, EntryStatus::Failed, opened.reason,
+                                         opened.os_error};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                         result.stop_reason = opened.reason;
                         return result;
                     }
@@ -319,8 +358,11 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                 case Action::SkipEntry:
                     ++result.tally.entries_seen;
                     if (decision.reason != Reason::NameFilteredOut) {
-                        result.entries.push_back(
-                            EntryOutcome{rel_path, EntryStatus::Skipped, decision.reason, 0});
+                        {
+                        const EntryOutcome oc = EntryOutcome{rel_path, EntryStatus::Skipped, decision.reason, 0};
+                        note_outcome(oc);
+                        result.entries.push_back(oc);
+                    }
                     }
                     break;
                 case Action::StopWalk:
