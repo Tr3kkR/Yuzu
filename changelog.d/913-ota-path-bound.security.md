@@ -45,6 +45,19 @@
   `yuzu_ota_download_deadline_exceeded_total{phase}`. A transfer that trips a
   server-imposed deadline REFUNDS its rate token, so a slow or flapping agent
   cannot spend itself into a lockout.
+- **A certificate reserve on the server-wide OTA ceiling (#913).**
+  `--ota-max-concurrent-total`/`YUZU_OTA_MAX_CONCURRENT_TOTAL` (default 64)
+  bounds concurrent transfers across the whole fleet, and
+  `--ota-cert-reserve-pct`/`YUZU_OTA_CERT_RESERVE_PCT` (default 50) splits it:
+  peers admitted on a certificate identity may use the whole ceiling, peers
+  keyed on source IP only the remainder. Without the split the ceiling is one
+  shared resource, so on any deployment where the identity gate is inert a
+  caller commanding a range of addresses can hold all of it and lock the
+  enrolled fleet out of updates — the per-peer cap does not help, because each
+  address is its own peer. Refusals increment
+  `yuzu_ota_download_admission_total{decision="rejected_total"}` and alert as
+  `YuzuOtaServerCapacityRejections`; the rejection log's `cert_keyed` field
+  separates a genuine rollout from a denial attempt.
 - **Server-wide gRPC resource bounds (#913).** The single `ServerBuilder`
   previously set keepalive/ping arguments and nothing else — no
   `ResourceQuota` and no stream cap existed anywhere on the server, which is
@@ -54,7 +67,8 @@
   128) and a `ResourceQuota` memory ceiling
   (`--grpc-max-resource-memory-mb`/`YUZU_GRPC_MAX_RESOURCE_MEMORY_MB`, default
   512), plus a thread ceiling
-  (`--grpc-max-threads`/`YUZU_GRPC_MAX_THREADS`, default 256) applied via
+  (`--grpc-max-threads`/`YUZU_GRPC_MAX_THREADS`, default 8192 — a fleet-size
+  ceiling, since `Subscribe` pins one sync thread per connected agent) applied via
   `ResourceQuota::SetMaxThreads`. The thread ceiling is the one that bounds
   concurrent handlers globally — the stream cap is per-CONNECTION and connections
   are uncapped, so on its own it bounds nothing fleet-wide. All reject at capacity

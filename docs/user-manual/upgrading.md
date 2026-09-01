@@ -54,10 +54,22 @@ minute for the entire site, after an initial burst of 20.
 Watch `yuzu_ota_download_admission_total{decision="rejected_rate"}` during the
 rollout, and see the "Agent OTA pull bounds" runbook in `server-admin.md`.
 
-Also new and worth a look before upgrading: `--grpc-max-threads` (default 256) now
-caps the gRPC sync server's thread pool. Previously nothing did. If you run an
-unusually large fleet with many long-lived `Subscribe` streams, confirm 256 is
-above your steady-state concurrent-handler count.
+Also new, and **check this one before you upgrade a large fleet**:
+`--grpc-max-threads` (default 8192) now caps the gRPC sync server's thread pool.
+Previously nothing did. It is a fleet-size ceiling rather than a tuning dial —
+`AgentService` is synchronous and `Subscribe` holds one thread for the life of
+each connected agent's command stream, so the value must exceed your
+concurrently-connected agent count. Below it, gRPC answers `RESOURCE_EXHAUSTED`
+to every RPC on every service sharing the quota, which is a fleet-wide outage
+rather than back-pressure. 8192 covers the fleets this release targets; if you
+run more than ~5,000 concurrent agents, raise it (`expected_agents x 1.5`)
+in the same change as the upgrade.
+
+`--ota-cert-reserve-pct` (default 50) reserves half of `--ota-max-concurrent-total`
+for peers admitted on a certificate identity. If your fleet is largely
+unenrolled — no client certificates, so admission keys on source IP — the
+remaining half is the whole capacity those agents can use, and you may want to
+lower the reserve or raise the total for the rollout window.
 
 ## ⚠️ Security: rotate `oidc_client_secret` if it was ever set on this install
 
