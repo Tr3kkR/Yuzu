@@ -124,9 +124,12 @@ actually changes. A REST `/api/command` caller doing the same was already refuse
 release and sees no behavior change. Explicit `agent_ids` dispatches to these rows, and any
 dispatch to a row NOT on this list, are unaffected on either surface.
 
-**What to do:** switch any such call to explicit, non-empty `agent_ids`. `POST
-/api/instructions/{id}/execute`, the dashboard execute surface, and MCP `execute_bundle` do not yet
-enforce this gate for these same 17 rows — a tracked follow-up, not a gap this release closes.
+**What to do:** switch any such call to explicit, non-empty `agent_ids`. The **dashboard execute
+surface** (`POST /api/dashboard/execute`) now enforces this gate too, counted as
+`yuzu_server_dispatch_target_rejected_total{route="dashboard"}`: console automation that posts
+`scope=__all__` or `scope=group:<id>` for one of these 17 rows is refused and must name its targets.
+`POST /api/instructions/{id}/execute` and MCP `execute_bundle` do not yet enforce it — a tracked
+follow-up, not a gap this release closes.
 
 **Verify:** re-run the affected dispatch with explicit `agent_ids` and confirm it succeeds as
 before; a scope/broadcast call to one of the 17 rows should now return the refusal above rather

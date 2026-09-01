@@ -1,6 +1,7 @@
 #include "dashboard_routes.hpp"
 
 #include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
+#include "on_behalf_guard.hpp"              // sanitize_for_log
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
 
 #include <algorithm>
@@ -1005,9 +1006,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              } catch (...) { // NOLINT(bugprone-empty-catch)
                              }
                          }
+                         // scope_expr is operator-supplied and percent-decoded, so a
+                         // %0a would inject a line break into the server log. The
+                         // sibling /api/command refusal sanitises its logged fields
+                         // for exactly this reason; match it rather than deviate.
                          spdlog::warn("dashboard execute: refusing {}:{} — Destructive actions "
                                       "require explicit agent_ids (scope='{}')",
-                                      plugin, action, scope_expr);
+                                      plugin, action,
+                                      onbehalf::sanitize_for_log(scope_expr, 128));
                          // Audited under this surface's own command.dispatch
                          // verb, with the same `reason=` detail prefix
                          // /api/command's twin refusal writes.
