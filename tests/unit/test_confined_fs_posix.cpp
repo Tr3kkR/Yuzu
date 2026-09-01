@@ -15,17 +15,33 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
 
 using namespace yuzu::agent::confined_fs;
 namespace fs = std::filesystem;
+
+// Forward declarations for the POSIX-only fstat/fstatat TEST SEAM defined in
+// confined_fs_posix.cpp (mirrors the Windows leg's
+// detail::set_ntcreatefile_for_test declared in confined_fs.hpp -- this one
+// has no header declaration since it is not part of the exported platform
+// contract, only linked directly by this test TU).
+namespace yuzu::agent::confined_fs::detail {
+using FstatFn = int (*)(int, struct stat*);
+using FstatatFn = int (*)(int, const char*, struct stat*, int);
+void set_fstat_for_test(FstatFn fn, bool enable) noexcept;
+void set_fstatat_for_test(FstatatFn fn, bool enable) noexcept;
+} // namespace yuzu::agent::confined_fs::detail
 
 namespace {
 
@@ -50,6 +66,34 @@ MatchFn suffix_match(std::string suffix) {
                rel_path.compare(rel_path.size() - suffix.size(), suffix.size(), suffix) == 0;
     };
 }
+
+/// Fake fstat/fstatat that always fails with EIO -- used to exercise the
+/// real POSIX metadata-failure recovery paths (root identity capture,
+/// per-entry fstatat) deterministically, without racing a live TOCTOU
+/// window.
+int failing_fstat(int, struct stat*) {
+    errno = EIO;
+    return -1;
+}
+int failing_fstatat(int, const char*, struct stat*, int) {
+    errno = EIO;
+    return -1;
+}
+
+/// RAII installers for the seams above -- guarantee restoration even if a
+/// REQUIRE/CHECK inside the guarded scope throws.
+struct FstatSeamGuard {
+    explicit FstatSeamGuard(detail::FstatFn fn) { detail::set_fstat_for_test(fn, true); }
+    ~FstatSeamGuard() { detail::set_fstat_for_test(nullptr, false); }
+    FstatSeamGuard(const FstatSeamGuard&) = delete;
+    FstatSeamGuard& operator=(const FstatSeamGuard&) = delete;
+};
+struct FstatatSeamGuard {
+    explicit FstatatSeamGuard(detail::FstatatFn fn) { detail::set_fstatat_for_test(fn, true); }
+    ~FstatatSeamGuard() { detail::set_fstatat_for_test(nullptr, false); }
+    FstatatSeamGuard(const FstatatSeamGuard&) = delete;
+    FstatatSeamGuard& operator=(const FstatatSeamGuard&) = delete;
+};
 
 constexpr DeleteLimits generous_limits() {
     return DeleteLimits{
@@ -188,9 +232,11 @@ TEST_CASE("delete_matching deletes matched files and leaves the rest", "[confine
     CHECK(entries[0].rel_path == "a.tmp");
     CHECK(entries[0].status == EntryStatus::Deleted);
     CHECK(entries[0].reason == Reason::None);
+    CHECK(entries[0].os_error == 0);
     CHECK(entries[1].rel_path == "sub/b.tmp");
     CHECK(entries[1].status == EntryStatus::Deleted);
     CHECK(entries[1].reason == Reason::None);
+    CHECK(entries[1].os_error == 0);
 
     CHECK(fs::exists(tmp.path / "keep.txt"));
     CHECK(fs::exists(tmp.path / "sub" / "keep2.txt"));
@@ -218,6 +264,33 @@ TEST_CASE("open_root refuses a symlinked root and a file root", "[confined_fs]")
     CHECK(file_result.reason == Reason::RootInvalid);
 }
 
+TEST_CASE("a real root fstat failure closes the fd and reports RootInvalid, no leak",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_rootfstatfail_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+
+    const int probe1 = ::open("/dev/null", O_RDONLY);
+    REQUIRE(probe1 >= 0);
+    ::close(probe1);
+
+    {
+        FstatSeamGuard guard(failing_fstat);
+        OpenRootResult result = open_root(root_dir);
+        CHECK_FALSE(result.root.has_value());
+        CHECK(result.reason == Reason::RootInvalid);
+        CHECK(result.os_error == EIO);
+    }
+
+    // If open_root's ScopedFd had failed to close the root fd on the fstat
+    // failure path above, the next lowest-numbered fd would land one higher
+    // than probe1 instead of reusing the exact same number.
+    const int probe2 = ::open("/dev/null", O_RDONLY);
+    REQUIRE(probe2 >= 0);
+    ::close(probe2);
+    CHECK(probe2 == probe1);
+}
+
 // ── (3) In-tree symlink entry ────────────────────────────────────────────
 
 TEST_CASE("a symlink entry inside the root is skipped and its target survives", "[confined_fs]") {
@@ -240,6 +313,186 @@ TEST_CASE("a symlink entry inside the root is skipped and its target survives", 
     CHECK(result.entries[0].status == EntryStatus::Skipped);
     CHECK(result.entries[0].reason == Reason::SymlinkRejected);
     CHECK(fs::exists(victim));
+}
+
+// ── Direct primitive fault coverage (open_dir_at / enumerate_at / unlink_at,
+//    called directly rather than through delete_matching, so a fault in the
+//    primitive itself can't be masked by walker-level checks) ─────────────
+
+TEST_CASE("open_dir_at refuses a directory swapped for a symlink before the open",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_odaswap_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir / "child");
+    const fs::path outside_dir = tmp.path / "outside";
+    fs::create_directories(outside_dir);
+    write_file(outside_dir / "victim.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+    const FileIdentity root_id = opened.root->identity();
+
+    fs::remove(root_dir / "child");
+    fs::create_directory_symlink(outside_dir, root_dir / "child");
+
+    // Direct call: if open_dir_at ever lost O_NOFOLLOW, this would silently
+    // follow the symlink into `outside` instead of refusing it.
+    OpenDirResult r = open_dir_at(opened.root->fd_.get(), "child", root_id);
+    CHECK_FALSE(r.fd.valid());
+    CHECK(r.reason == Reason::SymlinkRejected);
+    CHECK(fs::exists(outside_dir / "victim.tmp"));
+}
+
+TEST_CASE("open_dir_at refuses a child that crosses the root's device", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_devbound_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir / "child");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+    const FileIdentity real_id = opened.root->identity();
+
+    // A deliberately WRONG root identity -- same inode space, a fabricated
+    // different `dev` -- exercises the post-open device re-verify without
+    // needing a second real filesystem/mount.
+    const FileIdentity fake_id{real_id.dev + 1, real_id.ino};
+
+    OpenDirResult r = open_dir_at(opened.root->fd_.get(), "child", fake_id);
+    CHECK_FALSE(r.fd.valid());
+    CHECK(r.reason == Reason::DeviceBoundary);
+}
+
+TEST_CASE("open_dir_at refuses invalid names before touching the filesystem", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_odainvalidname_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir / "real");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+    const FileIdentity root_id = opened.root->identity();
+    const int fd = opened.root->fd_.get();
+
+    const std::vector<std::string> bad_names{
+        "../x",
+        "a/b",
+        std::string("a\0b", 3),
+    };
+    for (const auto& bad : bad_names) {
+        OpenDirResult r = open_dir_at(fd, bad, root_id);
+        CHECK_FALSE(r.fd.valid());
+        CHECK(r.reason == Reason::InvalidName);
+    }
+
+    CHECK(fs::exists(root_dir / "real"));
+}
+
+TEST_CASE("enumerate_at uses an independent description across two direct calls on one fd",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_enumreuse_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "a.tmp");
+    write_file(root_dir / "b.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+    const int fd = opened.root->fd_.get();
+    const FileIdentity root_id = opened.root->identity();
+    const EnumBudget budget{1000, std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+
+    // Two direct calls on the SAME held fd, bypassing delete_matching's own
+    // independent root frame entirely: if enumerate_at shared the directory
+    // read offset (e.g. via dup(dir_fd) instead of its own fresh
+    // openat(dir_fd, ".")), the second call would resume from wherever the
+    // first call's readdir cursor stopped and see nothing.
+    EnumerateResult first = enumerate_at(fd, root_id, budget);
+    CHECK(first.reason == Reason::None);
+    CHECK(first.entries.size() == 2);
+
+    EnumerateResult second = enumerate_at(fd, root_id, budget);
+    CHECK(second.reason == Reason::None);
+    CHECK(second.entries.size() == 2);
+}
+
+TEST_CASE("enumerate_at itself stops with WallTimeCap on an already-past deadline",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_enumwall_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "a.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    const EnumBudget budget{1000, std::chrono::steady_clock::now() - std::chrono::seconds{1}};
+    EnumerateResult result = enumerate_at(opened.root->fd_.get(), opened.root->identity(), budget);
+
+    CHECK(result.reason == Reason::WallTimeCap);
+    CHECK(result.entries.empty());
+}
+
+TEST_CASE(
+    "enumerate_at itself truncates with EntryCap when the budget is smaller than the directory",
+    "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_enumentrycap_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    for (int i = 0; i < 5; ++i)
+        write_file(root_dir / ("f" + std::to_string(i) + ".tmp"));
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    const EnumBudget budget{2, std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    EnumerateResult result = enumerate_at(opened.root->fd_.get(), opened.root->identity(), budget);
+
+    CHECK(result.reason == Reason::EntryCap);
+    CHECK(result.entries.size() == 2);
+}
+
+TEST_CASE("a real fstatat failure surfaces as DirEntry.stat_error and Failed(OsError)",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_statatfail_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "f.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    DeleteResult result = [&] {
+        FstatatSeamGuard guard(failing_fstatat);
+        return delete_matching(*opened.root, match_all(), generous_limits());
+    }();
+
+    REQUIRE(result.entries.size() == 1);
+    CHECK(result.entries[0].rel_path == "f.tmp");
+    CHECK(result.entries[0].status == EntryStatus::Failed);
+    CHECK(result.entries[0].reason == Reason::OsError);
+    CHECK(result.entries[0].os_error == EIO);
+    CHECK(fs::exists(root_dir / "f.tmp"));
+}
+
+TEST_CASE("unlink_at removes only the symlink entry itself, never its target", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_unlinklink_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    const fs::path outside_dir = tmp.path / "outside";
+    fs::create_directories(outside_dir);
+    const fs::path target = outside_dir / "target.tmp";
+    write_file(target);
+    fs::create_symlink(target, root_dir / "link.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    UnlinkOutcome outcome = unlink_at(opened.root->fd_.get(), "link.tmp", UnlinkKind::File);
+    CHECK(outcome.status == EntryStatus::Deleted);
+
+    std::error_code ec;
+    const auto st = fs::symlink_status(root_dir / "link.tmp", ec);
+    CHECK(st.type() == fs::file_type::not_found);
+    CHECK(fs::exists(target));
 }
 
 // ── (4) Adversarial swap at depths 1, 2, 3 -- pre-walk and mid-walk ──────
@@ -274,9 +527,22 @@ TEST_CASE("entry cap stops the walk with StopWalk(EntryCap)", "[confined_fs]") {
                                /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/32};
     DeleteResult result = delete_matching(*opened.root, match_all(), limits);
 
+    // A directory of 5 with a cap of 3 is a NON-EMPTY truncated batch: it
+    // must be processed (3 deletions), not silently dropped just because
+    // the directory as a whole wasn't fully enumerated.
     CHECK(result.stop_reason == Reason::EntryCap);
-    CHECK(result.entries.size() <= 3);
-    CHECK(result.tally.entries_seen <= 3);
+    REQUIRE(result.entries.size() == 3);
+    CHECK(result.tally.entries_seen == 3);
+    for (const auto& e : result.entries) {
+        CHECK(e.status == EntryStatus::Deleted);
+        CHECK(e.reason == Reason::None);
+    }
+    int remaining = 0;
+    for (int i = 0; i < 5; ++i) {
+        if (fs::exists(root_dir / ("f" + std::to_string(i) + ".tmp")))
+            ++remaining;
+    }
+    CHECK(remaining == 2);
 }
 
 TEST_CASE("byte cap skips an oversized file but a following smaller one still deletes",
@@ -457,6 +723,44 @@ TEST_CASE("a throwing MatchFn stops the walk with MatchError, consistent with th
     // z_throws.tmp itself is never acted on -- the throw happens inside the
     // match call, before any decision that could delete it.
     CHECK(fs::exists(root_dir / "z_throws.tmp"));
+}
+
+TEST_CASE("a MatchFn that throws on its first invocation stops before any deletion",
+          "[confined_fs]") {
+    // Distinguishes "the walk stopped at the first entry" from "the walk
+    // caught the throw and kept going": the throwing entry is whichever one
+    // readdir happens to visit FIRST (order-independent -- a stateful
+    // closure throws only on invocation #1, never by matching a name), and
+    // every later invocation returns true. A walker that faultily continued
+    // past the throw would delete every remaining fixture file; a correct
+    // one stops immediately, leaving all three untouched and reporting no
+    // outcomes at all.
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_matcherrorfirst_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "a.tmp");
+    write_file(root_dir / "b.tmp");
+    write_file(root_dir / "c.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    bool first_call = true;
+    MatchFn throw_once_first = [&first_call](std::string_view) -> bool {
+        if (first_call) {
+            first_call = false;
+            throw std::runtime_error("boom");
+        }
+        return true;
+    };
+
+    DeleteResult result = delete_matching(*opened.root, throw_once_first, generous_limits());
+
+    CHECK(result.stop_reason == Reason::MatchError);
+    CHECK(result.entries.empty());
+    CHECK(fs::exists(root_dir / "a.tmp"));
+    CHECK(fs::exists(root_dir / "b.tmp"));
+    CHECK(fs::exists(root_dir / "c.tmp"));
 }
 
 #endif // !_WIN32

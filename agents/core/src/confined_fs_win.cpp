@@ -43,6 +43,8 @@
 
 #include <win_str.hpp> // yuzu::win::to_wide / from_wide (agents/shared/win_str.hpp)
 
+#include <spdlog/spdlog.h>
+
 #include <winternl.h> // UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK, NTSTATUS
 
 #include <cstddef>
@@ -151,6 +153,17 @@ bool structurally_invalid_name(const std::string& name) {
 // input yields an EMPTY wstring -- PLAN-007. An empty ObjectName with a
 // RootDirectory set opens the parent itself, so this must never reach
 // NtCreateFile). Returns nullopt and fills `out_wide` on success.
+// NOTE on the out_wide.empty() branch below: win_str.hpp's to_wide() calls
+// MultiByteToWideChar(CP_UTF8, 0, ...) -- flags=0, no MB_ERR_INVALID_CHARS --
+// which Microsoft documents as lenient for CP_UTF8: malformed byte sequences
+// are substituted (U+FFFD-equivalent), not rejected, so a non-empty `name`
+// realistically never yields an empty `out_wide` on a real Windows host (only
+// `name.empty()` does, already refused above by structurally_invalid_name).
+// The check is kept anyway because it is PLAN-007's explicit contract and is
+// a one-line defensive backstop against a `to_wide` behaviour change; it is
+// not exercisable with a hand-crafted invalid-UTF-8 test today, which is why
+// no such test exists for this specific branch (see confined_fs_win.cpp's
+// other InvalidName cases, which ARE exercisable and ARE tested).
 std::optional<Reason> validate_name(const std::string& name, std::wstring& out_wide) {
     if (structurally_invalid_name(name))
         return Reason::InvalidName;
@@ -383,10 +396,11 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
     // updater.cpp:568's delete-by-handle mechanism, on a handle WE opened
     // parent-relative. Aggregate-initialized (never `.DeleteFile = TRUE`):
     // FILE_DISPOSITION_INFO's only field is literally named `DeleteFile`,
-    // which collides with winbase.h's `#define DeleteFile DeleteFileW`
-    // macro (WIN32_LEAN_AND_MEAN does not suppress it) -- a member-access
-    // spelling would macro-expand to the nonexistent `.DeleteFileW` and
-    // fail to compile. Positional init sidesteps the identifier entirely.
+    // which collides with the winbase.h macro that renames that same
+    // identifier to its wide-string sibling (WIN32_LEAN_AND_MEAN does not
+    // suppress it) -- a member-access spelling would macro-expand to a
+    // member that does not exist and fail to compile. Positional init
+    // sidesteps the identifier entirely.
     FILE_DISPOSITION_INFO disposition{TRUE};
     if (!SetFileInformationByHandle(opened.handle.get(), FileDispositionInfo, &disposition,
                                      sizeof(disposition))) {
@@ -541,6 +555,14 @@ DeleteResult delete_matching(const ConfinedRoot& root, const MatchFn& match,
     HANDLE dup_raw = INVALID_HANDLE_VALUE;
     if (!DuplicateHandle(GetCurrentProcess(), root.h_.get(), GetCurrentProcess(), &dup_raw, 0,
                           FALSE, DUPLICATE_SAME_ACCESS)) {
+        // DeleteResult carries no top-level os_error (see confined_fs_rules.hpp:
+        // only EntryOutcome::os_error, and the walk never started so there is no
+        // entry to attach one to) -- this is a deliberate limit of the shared
+        // result type, not a dropped value: log it here so a real occurrence is
+        // still diagnosable.
+        const DWORD err = GetLastError();
+        spdlog::debug("confined_fs::delete_matching: DuplicateHandle failed: {}",
+                      static_cast<unsigned long>(err));
         DeleteResult result;
         result.stop_reason = Reason::OsError;
         return result;

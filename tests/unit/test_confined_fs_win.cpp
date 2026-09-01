@@ -388,6 +388,63 @@ TEST_CASE("delete_matching can run twice against the same ConfinedRoot (root reu
     CHECK_FALSE(std::filesystem::exists(root_dir.path / "b.txt"));
 }
 
+TEST_CASE("open_dir_at and unlink_at refuse a spoofed root_id (DeviceBoundary)",
+          "[confined_fs]") {
+    yuzu::test::TempDir root_dir{"yuzu_test_confined_win_devbound_"};
+    std::filesystem::create_directories(root_dir.path);
+    std::filesystem::create_directories(root_dir.path / "sub");
+    write_file(root_dir.path / "a.txt", "x");
+
+    OpenRootResult opened = open_root(root_dir.path);
+    REQUIRE(opened.root.has_value());
+    const HANDLE root_handle = opened.root->h_.get();
+    // Same volume, deliberately wrong serial: open_dir_at/unlink_at must
+    // refuse on the root_id comparison alone, with no second physical
+    // volume needed to exercise it.
+    const FileIdentity wrong_id{opened.root->identity().volume_serial + 1,
+                                 opened.root->identity().file_index};
+
+    OpenDirResult dir_r = open_dir_at(root_handle, "sub", wrong_id);
+    CHECK_FALSE(dir_r.h.valid());
+    CHECK(dir_r.reason == Reason::DeviceBoundary);
+
+    UnlinkOutcome unlink_r = unlink_at(root_handle, "a.txt", UnlinkKind::File, wrong_id);
+    CHECK(unlink_r.status == EntryStatus::Failed);
+    CHECK(unlink_r.reason == Reason::DeviceBoundary);
+    CHECK(std::filesystem::exists(root_dir.path / "a.txt"));
+}
+
+TEST_CASE("enumerate_at flags a lone-surrogate on-disk name as name_invalid, "
+          "and delete_matching skips it without deleting",
+          "[confined_fs]") {
+    yuzu::test::TempDir root_dir{"yuzu_test_confined_win_surrogate_"};
+    std::filesystem::create_directories(root_dir.path);
+
+    // A lone high surrogate cannot round-trip through UTF-8 (win_str.hpp
+    // substitutes U+FFFD on the way back out); NTFS itself does not validate
+    // UTF-16 well-formedness, so a file with this on-disk name is
+    // constructible without admin. Composed as a std::filesystem::path (its
+    // native representation on Windows IS std::wstring) so the raw code unit
+    // survives untouched -- no UTF-8 round-trip happens on the way in.
+    const std::wstring bad_component = L"x" + std::wstring(1, static_cast<wchar_t>(0xD800));
+    write_file(root_dir.path / std::filesystem::path(bad_component), "x");
+
+    OpenRootResult opened = open_root(root_dir.path);
+    REQUIRE(opened.root.has_value());
+
+    EnumBudget budget{100, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
+    EnumerateResult enumerated =
+        enumerate_at(opened.root->h_.get(), opened.root->identity(), budget);
+    REQUIRE(enumerated.reason == Reason::None);
+    REQUIRE(enumerated.entries.size() == 1);
+    CHECK(enumerated.entries[0].name_invalid);
+
+    DeleteResult deleted = delete_matching(*opened.root, always_match, open_limits());
+    REQUIRE(deleted.entries.size() == 1);
+    CHECK(deleted.entries[0].status == EntryStatus::Skipped);
+    CHECK(deleted.entries[0].reason == Reason::InvalidName);
+}
+
 TEST_CASE("Unsupported fail-closed path via the ntdll injection seam deletes nothing",
           "[confined_fs]") {
     yuzu::test::TempDir root_dir{"yuzu_test_confined_win_unsupported_"};
