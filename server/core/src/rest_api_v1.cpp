@@ -16,6 +16,7 @@
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "execution_event_scope.hpp"
 #include "guardian_rule_spec.hpp"
 #include "guardian_schema_registry.hpp"
 #include "http_route_sink.hpp"
@@ -983,7 +984,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List recent offload delivery attempts", "tags": ["Offload"], "description": "Requires Infrastructure:Read. limit query parameter is clamped to [1, 1000]; default 50.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 50}}], "responses": {"200": {"description": "List of delivery records"}, "404": {"description": "Target not found (deleted, never created, or numeric overflow on id)"}, "503": {"description": "Offload store unavailable"}}}
     },
     "/executions/{id}/visualization": {
-      "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Requires Response:Read. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows; when the cap is hit the payload includes rows_capped:true and rows_cap:10000. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
+      "get": {"summary": "Render execution responses as chart-ready JSON", "tags": ["Executions"], "description": "Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read). A management-group-confined caller sees chart data built only from their in-scope agents' responses; the row cap and rows_capped signal reflect the caller's own scoped result, not the raw fleet-wide one. The definition_id query parameter is required and must match [A-Za-z0-9._-]+. Returns chart data shaped by the spec.visualization (or spec.visualizations) block on the InstructionDefinition (see yaml-dsl-spec.md). When a definition declares multiple charts, use the optional index query parameter to select among them; default 0. The response payload includes chart_index and chart_count fields so callers can iterate. Caps the underlying response read at 10000 rows; when the cap is hit the payload includes rows_capped:true and rows_cap:10000. Emits an execution.visualization.fetch audit event on every invocation.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "definition_id", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "index", "in": "query", "required": false, "schema": {"type": "integer", "minimum": 0, "default": 0}, "description": "Chart index when the definition declares multiple visualizations."}], "responses": {"200": {"description": "Chart data payload"}, "400": {"description": "definition_id not provided or index is not a non-negative integer"}, "404": {"description": "Definition not found, no visualization configured, or index out of range"}, "500": {"description": "Visualization spec is invalid"}, "503": {"description": "Service unavailable"}}}
     },
     "/definitions/{id}/response-templates": {
       "get": {"summary": "List response templates for an InstructionDefinition", "tags": ["Definitions"], "description": "Requires InstructionDefinition:Read. Returns the operator-authored templates plus a synthesised __default__ template (auto-prepended when no operator template is marked default). The synthesised default lists columns from spec.result.columns when populated, otherwise from the plugin's column schema (issue #254, Phase 8.2).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,128}$"}}], "responses": {"200": {"description": "List of response templates"}, "400": {"description": "Malformed definition id"}, "404": {"description": "Definition not found"}, "503": {"description": "Service unavailable"}}},
@@ -1035,10 +1036,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
     },
     "/events": {
-      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Requires Execution:Read. Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions/{id}": {
-      "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Requires Execution:Read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted — the execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) before the A4 approvals row.
         R"json(,
@@ -6822,14 +6823,25 @@ void RestApiV1::register_routes(
     // /api/v1/events startup-window behavior.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128}))",
-        [auth_fn, perm_fn, execution_tracker](const httplib::Request& req, httplib::Response& res) {
+        [auth_fn, fleet_read_fn, audit_fn, execution_tracker](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/executions/{{id}}: fleet_read_fn unwired; cid={}", cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            // The fleet-read gate already authenticated the request. Re-read the
+            // resolved session only to apply dispatcher ownership below.
             auto session = auth_fn(req, res);
             if (!session)
                 return;
-            if (!perm_fn(req, res, "Execution", "Read"))
-                return;
-            const auto cid = detail::make_correlation_id();
-            res.set_header("X-Correlation-Id", cid);
             if (!execution_tracker) {
                 res.status = 503;
                 res.set_content(
@@ -6842,35 +6854,131 @@ void RestApiV1::register_routes(
             }
             auto exec_id = req.matches[1].str();
             auto exec_opt = execution_tracker->get_execution(exec_id);
-            if (!exec_opt) {
+            // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+            // statuses when confined — an unrestricted caller (gate.scope ==
+            // nullopt, the common RBAC-off/global-permission case) is always
+            // visible regardless, so this indexed lookup would be pure waste
+            // on every single-execution read. Fetch and scan the same status
+            // set for a missing id and an invisible id when confined. Do not
+            // stop on the first visible row: #1634 collapses both cases to
+            // one 404 without a scan-length existence oracle.
+            std::vector<AgentExecStatus> agents;
+            bool has_visible_agent = false;
+            if (gate.scope) {
+                // #1634 (Doomgoose review finding, important): a plain
+                // vector cannot distinguish "genuinely zero agent rows"
+                // from "a transient PG pool/query degrade" — the old
+                // get_agent_statuses collapsed both to empty, which could
+                // false-404 a genuine owner/visible caller AND permanently
+                // record a false CC7.2 `denied` audit row for a non-owner
+                // during a transient degrade. Fail closed (503) instead.
+                auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                if (!agents_opt) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::error_json_a4(503, "execution tracker degraded", cid,
+                                              /*retry_after_ms=*/5000,
+                                              "retry shortly; the agent-status read failed "
+                                              "transiently"),
+                        "application/json");
+                    return;
+                }
+                agents = std::move(*agents_opt);
+                for (const auto& a : agents)
+                    has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+            }
+            const bool owns_execution =
+                exec_opt && exec_opt->dispatched_by == session->username;
+            const bool visible = !gate.scope || owns_execution || has_visible_agent;
+            if (!exec_opt || !visible) {
+                // #1634 (governance Gate 4 consistency-auditor finding): a
+                // suppressed cross-operator read attempt is CC7.2-evidence-worthy
+                // the same way the sibling MCP get_execution_status treats it —
+                // audit it distinctly, even though the caller-visible response
+                // stays identical to a nonexistent execution_id (no oracle).
+                (void)audit_fn(req, "execution.detail.fetch", "denied", "Execution", exec_id,
+                               "not found or outside caller's fleet-read scope cid=" + cid);
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "execution not found", cid),
                                 "application/json");
                 return;
             }
             const auto& e = *exec_opt;
-            // Mirrors the Execution struct field-for-field (per
-            // execution_tracker.hpp). `last_error_detail` is PII-
-            // adjacent (agent stderr) — the perm_fn(Execution:Read)
-            // gate above is the same one mcp_server.cpp:get_execution_status
-            // uses to protect this field; if those policies ever diverge,
-            // sibling-handler parity needs revisiting.
+            int agents_targeted = e.agents_targeted;
+            int agents_responded = e.agents_responded;
+            int agents_success = e.agents_success;
+            int agents_failure = e.agents_failure;
+            std::string last_error_detail = e.last_error_detail;
+            std::string scope_expression = e.scope_expression;
+            std::string parameter_values = e.parameter_values;
+            // #1634 adversarial-review finding (blocker): `owns_execution` above exists
+            // ONLY to admit a dispatcher to their own execution before any response has
+            // landed (the visibility check has no other way to avoid a false 404 on a
+            // just-dispatched, zero-status-row execution) — it must never also bypass
+            // this projection. `dispatched_by` is historical provenance, not a current
+            // authorization axis: an operator later confined out of a management group
+            // (or reading an execution dispatched before they were ever confined) must
+            // not retain durable full-fidelity access to another agent's counts/errors
+            // just because they happened to be the one who fired the dispatch. Apply the
+            // confined projection whenever `gate.scope` is engaged, dispatcher or not.
+            if (gate.scope) {
+                // #1634 residual: agent status rows are response-arrival seeded, not
+                // dispatch-time target seeded. A confined non-dispatcher can therefore
+                // see a teammate's execution only after an in-scope response lands.
+                // These projections intentionally undercount pending in-scope targets.
+                agents_targeted = 0;
+                agents_responded = 0;
+                agents_success = 0;
+                agents_failure = 0;
+                last_error_detail.clear();
+                int64_t newest_error_at = 0;
+                for (const auto& a : agents) {
+                    if (!authz::in_scope(gate.scope, a.agent_id))
+                        continue;
+                    ++agents_targeted;
+                    // #1634 (Doomgoose review finding, important): only a
+                    // TERMINAL status counts as "responded" — matches
+                    // execution_tracker.cpp's canonical refresh_counts_once
+                    // recompute (agents_responded = COUNT(status IN
+                    // ('success','failure','timeout','rejected'))). This
+                    // loop previously incremented agents_responded for
+                    // EVERY in-scope row including 'running', so a confined
+                    // caller could see responded==targeted (100% progress)
+                    // while an agent was still executing.
+                    if (a.status == "success") {
+                        ++agents_responded;
+                        ++agents_success;
+                    } else if (a.status == "failure" || a.status == "timeout" ||
+                               a.status == "rejected") {
+                        ++agents_responded;
+                        ++agents_failure;
+                    }
+                    if (!a.error_detail.empty() && a.completed_at >= newest_error_at) {
+                        newest_error_at = a.completed_at;
+                        last_error_detail = a.error_detail;
+                    }
+                }
+                scope_expression = "(redacted - confined view)";
+                parameter_values = "(redacted - confined view)";
+            }
+            // Deliberately keep status, completion time, dispatcher, and lineage
+            // truthful for this narrower #1634 slice; none directly names another agent.
             auto data = JObj()
                             .add("id", e.id)
                             .add("definition_id", e.definition_id)
                             .add("status", e.status)
-                            .add("scope_expression", e.scope_expression)
-                            .add("parameter_values", e.parameter_values)
+                            .add("scope_expression", scope_expression)
+                            .add("parameter_values", parameter_values)
                             .add("dispatched_by", e.dispatched_by)
                             .add("dispatched_at", static_cast<int64_t>(e.dispatched_at))
-                            .add("agents_targeted", e.agents_targeted)
-                            .add("agents_responded", e.agents_responded)
-                            .add("agents_success", e.agents_success)
-                            .add("agents_failure", e.agents_failure)
+                            .add("agents_targeted", agents_targeted)
+                            .add("agents_responded", agents_responded)
+                            .add("agents_success", agents_success)
+                            .add("agents_failure", agents_failure)
                             .add("completed_at", static_cast<int64_t>(e.completed_at))
                             .add("parent_id", e.parent_id)
                             .add("rerun_of", e.rerun_of)
-                            .add("last_error_detail", e.last_error_detail)
+                            .add("last_error_detail", last_error_detail)
                             .str();
             res.set_content(ok_json(data), "application/json");
         });
@@ -6952,13 +7060,17 @@ void RestApiV1::register_routes(
     // all read response_store on the same gate. Governance gate C-1.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9._-]+)/visualization)",
-        [auth_fn, perm_fn, audit_fn, response_store, instruction_store, response_scope_fn](
+        [fleet_read_fn, audit_fn, response_store, instruction_store](
             const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "Response", "Read"))
+            if (!fleet_read_fn) {
+                spdlog::error("execution.visualization.fetch: fleet_read_fn unwired");
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
-            auto session = auth_fn(req, res);
-            if (!session)
-                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
             if (!response_store || !instruction_store || !response_store->is_open() ||
                 !instruction_store->is_open()) {
                 res.status = 503;
@@ -7054,7 +7166,41 @@ void RestApiV1::register_routes(
             // governance C-2 row-cap drift.
             static constexpr int kRowCap = 10000;
             q.limit = kRowCap;
-            auto responses_opt = response_store->query(execution_id, q);
+
+            // #1634 / ADR-0017 INV-3 (CRITICAL, governance Gate 2 follow-up): this
+            // route was missed by the first #1634 fix round AND by an independent
+            // two-model adversarial review — both caught the identical post-fetch-
+            // filter defect in server.cpp/mcp_server.cpp but neither flagged this
+            // route, which has the exact same shape: resolve the in-scope agent set
+            // and push it into the SQL WHERE clause BEFORE LIMIT, not as a post-fetch
+            // filter — a post-fetch filter on a capped read can hand a confined
+            // caller a truncated/empty chart even though visible rows exist past the
+            // hidden ones the cap already excluded.
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t scope_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids(execution_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    audit_fn(req, "execution.visualization.fetch", "failure", "execution",
+                             execution_id, definition_id + " reason=response_store_degraded");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++scope_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto responses_opt = response_store->query(execution_id, q, scope_arg);
             if (!responses_opt) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "response store degraded",
@@ -7065,43 +7211,14 @@ void RestApiV1::register_routes(
                 return;
             }
             auto responses = std::move(*responses_opt);
-            // rows_capped is computed on the RAW (pre-scope-filter) result, so it
-            // still signals "more rows existed past the 10000 cap" independent of
-            // the scope drop below (#1634 keyset follow-up). NOTE (#1634): the scope
-            // filter below is INERT under the current global Response:Read gate (a
-            // global holder admits every agent → nothing dropped); effective scoping
-            // needs the admit-then-filter gate (remaining #1634 work). Its only active
-            // effect today is failing closed on a corrupt rbac.db.
+            // The scoped query's own LIMIT now bounds the IN-SCOPE result directly,
+            // so hitting it means THIS caller's own visible chart data was truncated
+            // — more precise than the old raw-then-filtered signal, which could fire
+            // on a cap hit entirely inside another operator's out-of-scope rows.
             bool rows_capped = static_cast<int>(responses.size()) >= kRowCap;
             if (rows_capped) {
                 spdlog::warn("visualization row cap hit ({} rows): execution={} definition={}",
                              kRowCap, execution_id, definition_id);
-            }
-
-            // #1634: management-group scope — drop out-of-scope agents' rows BEFORE
-            // the chart transform, mirroring MCP query_responses. The flat
-            // Response:Read gate is not a per-agent ownership check, so without this
-            // an operator could chart ANOTHER operator's execution by id. Filter
-            // per-agent through the injected predicate (production:
-            // check_scoped_permission, the same chokepoint the per-device routes
-            // use), memoised per distinct agent_id, passing the already-resolved
-            // principal. Unwired / RBAC-off → no filter (legacy-open), matching
-            // require_scoped_permission.
-            std::size_t scope_dropped = 0;
-            if (response_scope_fn) {
-                std::unordered_map<std::string, bool> memo;
-                std::vector<StoredResponse> visible;
-                visible.reserve(responses.size());
-                for (auto& r : responses) {
-                    auto [m, inserted] = memo.try_emplace(r.agent_id, false);
-                    if (inserted)
-                        m->second = response_scope_fn(session->username, r.agent_id);
-                    if (m->second)
-                        visible.push_back(std::move(r));
-                    else if (inserted) // count each DISTINCT dropped agent once
-                        ++scope_dropped;
-                }
-                responses.swap(visible);
             }
 
             VisualizationEngine engine;
@@ -7132,14 +7249,19 @@ void RestApiV1::register_routes(
                 final_json += "}";
             }
             res.set_content(ok_json(final_json), "application/json");
-            // Record the out-of-scope drop count on the success audit detail (#1634)
-            // so an operator charting outside their groups leaves a trail, without
-            // changing the single-row audit shape this endpoint already emits.
-            std::string audit_detail = definition_id + " index=" + std::to_string(chart_index);
+            // #1634 (governance Gate 4 consistency-auditor finding): a scope-drop
+            // is a security-relevant event — emit the SAME paired denied+success
+            // audit shape server.cpp's legacy responses routes and MCP
+            // query_responses/aggregate_responses already use, rather than folding
+            // scope_dropped only into the success detail. A SIEM rule keyed on
+            // `result=denied` now sees this route's drops too, and a mid-request
+            // 503 after scope resolution no longer loses the CC7.2 evidence.
             if (scope_dropped > 0)
-                audit_detail += " scope_dropped=" + std::to_string(scope_dropped);
+                (void)audit_fn(req, "execution.visualization.fetch", "denied", "execution",
+                               execution_id,
+                               definition_id + " scope_dropped=" + std::to_string(scope_dropped));
             audit_fn(req, "execution.visualization.fetch", "success", "execution", execution_id,
-                     audit_detail);
+                     definition_id + " index=" + std::to_string(chart_index));
         });
 
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────
@@ -11992,43 +12114,40 @@ void RestApiV1::register_routes(
     //     `yuzu_server_sse_api_queue_overflow_total` (counter),
     //     `yuzu_server_sse_api_replay_gap_total` (counter).
     //
-    // **Known race window (governance unhappy-R10):** `replay_since`
-    // and `subscribe` run under separate locks. A publish that fires
-    // between the two is neither replayed (it post-dates the buffer
-    // snapshot) nor delivered live (the listener is not yet
-    // installed). The bus-side fix now EXISTS - track 2f PR 3a landed
-    // `ExecutionEventBus::subscribe_and_replay` (atomic install-then-
-    // replay under one channel-mutex hold; the 2f MCP progress bridge
-    // uses it). Only the migration of THIS surface + the dashboard
-    // sibling remains; tracked in issue #2410.
-    //
     // Parity with the dashboard sibling at `workflow_routes.cpp` —
     // both consume the same per-execution channel from
-    // `ExecutionEventBus` and apply identical preflight ordering
-    // (auth → perm → tracker → bus → execution → terminal → audit →
-    // headers → replay → subscribe → chunked provider). The wire
+    // `ExecutionEventBus`, use the fleet-read gate as their sole
+    // auth+authz gate, establish execution visibility before terminal
+    // state or streaming side effects, and atomically subscribe+replay.
+    // The wire
     // shapes differ on purpose: this surface emits the A3-mandated
     // JSON envelope with `execution_id` baked into every event so an
     // agentic worker subscribed to one channel can still discriminate
     // events; the dashboard sibling emits raw `ev.data` because the
     // browser already knows the channel from the URL path.
-    sink.Get("/api/v1/events", [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
-                                metrics_registry, stream_budget](const httplib::Request& req,
-                                                                 httplib::Response& res) {
-        auto session = auth_fn(req, res);
-        if (!session) {
-            // auth_fn already set 401 + body. Nothing to do.
-            return;
-        }
-        if (!perm_fn(req, res, "Execution", "Read")) {
-            // perm_fn already set 403 + body.
-            return;
-        }
-
+    sink.Get("/api/v1/events", [auth_fn, fleet_read_fn, audit_fn, execution_tracker,
+                                execution_event_bus, metrics_registry,
+                                stream_budget](const httplib::Request& req,
+                                               httplib::Response& res) {
         // A4 correlation id binds every error / audit row / spdlog
         // line on this request to a single grep token. Generated
         // once up-front so 4xx branches and the audit row share it.
         const auto cid = detail::make_correlation_id();
+        if (!fleet_read_fn) {
+            spdlog::error("api.v1.events.subscribe: fleet_read_fn unwired cid={}", cid);
+            res.status = 503;
+            res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                            "application/json");
+            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Execution", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the response.
+        // The fleet-read gate already authenticated the request. Re-read the
+        // resolved session only for ownership, audit, and stream budgeting.
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
 
         // execution_id is mandatory for the W5.1 skeleton — see
         // sprint plan §2 R-4. Unfiltered subscription expands the
@@ -12083,10 +12202,45 @@ void RestApiV1::register_routes(
         }
 
         auto exec_opt = execution_tracker->get_execution(exec_id);
-        if (!exec_opt) {
-            spdlog::warn("api.v1.events.subscribe denied: unknown execution cid={} "
-                         "principal={} exec_id={}",
-                         cid, session->username, exec_id);
+        // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+        // statuses when confined — an unrestricted subscriber is always
+        // visible regardless, so this indexed lookup would be pure waste on
+        // every SSE subscribe.
+        bool has_visible_agent = false;
+        if (gate.scope) {
+            // #1634 (Doomgoose review finding, important): fail closed on a
+            // transient tracker degrade rather than silently treat it as
+            // "zero agents" — see get_agent_statuses_checked's doc comment.
+            auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+            if (!agents_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "execution tracker degraded", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry shortly; the agent-status read failed "
+                                          "transiently"),
+                    "application/json");
+                return;
+            }
+            for (const auto& a : *agents_opt)
+                has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+        }
+        const bool owns_execution =
+            exec_opt && exec_opt->dispatched_by == session->username;
+        const bool visible = !gate.scope || owns_execution || has_visible_agent;
+        if (!exec_opt || !visible) {
+            // Keep nonexistent and outside-scope cases caller-identical. The
+            // distinction stays only in this server-side debug line.
+            spdlog::debug("api.v1.events.subscribe: {} cid={} principal={} exec_id={}",
+                          exec_opt ? "outside caller fleet-read scope" : "execution not found",
+                          cid, session->username, exec_id);
+            // #1634 (governance Gate 4 consistency-auditor finding): a suppressed
+            // cross-operator subscribe attempt is CC7.2-evidence-worthy the same
+            // way the sibling MCP get_execution_status treats it — audit it
+            // distinctly from a genuine 401/403, even though the caller-visible
+            // response stays identical to a nonexistent execution_id.
+            (void)audit_fn(req, "api.v1.events.subscribe", "denied", "Execution", exec_id,
+                           "not found or outside caller's fleet-read scope cid=" + cid);
             res.status = 404;
             res.set_content(detail::error_json_a4(404, "execution not found", cid),
                             "application/json");
@@ -12219,7 +12373,7 @@ void RestApiV1::register_routes(
         // cannot distinguish from "not yet emitted". governance
         // round unhappy-R1 / R2.
         //
-        // The snapshot is taken BEFORE replay_since walks the
+        // The snapshot is taken BEFORE subscribe_and_replay walks the
         // buffer — `snapshot()` already serialises on the channel
         // mutex, so the lowest id we observe is a valid lower
         // bound. A concurrent publish can widen the buffer at the
@@ -12259,39 +12413,32 @@ void RestApiV1::register_routes(
             }
         }
 
-        // Replay then subscribe. Note: a `publish` arriving
-        // between the two calls is NOT delivered to this
-        // connection — it post-dates the replay walk but
-        // pre-dates the listener attach. See the per-route
-        // header block above; bus-level fix is tracked as a
-        // follow-up.
         std::string exec_id_for_capture = exec_id;
-        // Cap enforcement lives in `detail::enqueue_capped`
-        // (event_bus.hpp) so it's unit-testable without driving
-        // the handler. Both the replay walker and the live
-        // subscriber go through it.
-        execution_event_bus->replay_since(
-            exec_id, since_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
-                detail::SseEvent sse;
-                sse.event_type = ev.event_type;
-                // Frame the per-bus event into <id>\n<JSON
-                // envelope> so the content provider can split and
-                // emit `id:` + `event:` + `data:` lines without
-                // re-touching the bus.
-                sse.data = std::to_string(ev.id) + "\n" +
-                           detail::make_event_envelope(exec_id_for_capture, ev);
-                detail::enqueue_capped(sink_state, std::move(sse));
-            });
-
         auto* bus = execution_event_bus;
-        sink_state->sub_id =
-            bus->subscribe(exec_id, [sink_state, exec_id_for_capture](const ExecutionEvent& ev) {
-                detail::SseEvent sse;
-                sse.event_type = ev.event_type;
-                sse.data = std::to_string(ev.id) + "\n" +
-                           detail::make_event_envelope(exec_id_for_capture, ev);
-                detail::enqueue_capped(sink_state, std::move(sse));
-                sink_state->cv.notify_one();
+        // Install the listener and replay atomically. The same scope projection
+        // therefore applies to buffered and live events with no split-call race.
+        sink_state->sub_id = bus->subscribe_and_replay(
+            exec_id, since_id,
+            [sink_state, exec_id_for_capture, scope = gate.scope](const ExecutionEvent& ev) noexcept {
+                try {
+                    const auto verdict = classify_execution_event_for_scope(ev, scope);
+                    if (verdict == ExecutionEventVerdict::kDrop)
+                        return;
+                    ExecutionEvent sanitized;
+                    const ExecutionEvent* served = &ev;
+                    if (verdict == ExecutionEventVerdict::kSanitize) {
+                        sanitized = sanitize_execution_event_for_scope(ev);
+                        served = &sanitized;
+                    }
+                    detail::SseEvent sse;
+                    sse.event_type = served->event_type;
+                    sse.data = std::to_string(served->id) + "\n" +
+                               detail::make_event_envelope(exec_id_for_capture, *served);
+                    detail::enqueue_capped(sink_state, std::move(sse));
+                    sink_state->cv.notify_one();
+                } catch (...) {
+                    // A projection failure drops the event for this confined stream.
+                }
             });
 
         // UP-1: adopt any pending engine QuotaSlot into this stream's

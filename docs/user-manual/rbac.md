@@ -144,6 +144,20 @@ enabled = true
 > per-agent filter is real and effective under normal RBAC operation, not inert:
 > a management-group-confined or correctly service-scoped caller genuinely sees only
 > their in-scope agents' data on those two readers today.
+>
+> **Update (#1634, closed):** the "inert" `response_scope_fn` filter described in
+> both notes above is retired. `query_responses`, `aggregate_responses`, REST
+> `/executions/{id}/visualization`, and the legacy `/api/responses/{id}`
+> (`GET`/`/aggregate`/`/export`) are all now on `require_fleet_read`, the same
+> real, effective primitive as `/fragments/results` and the workflow
+> executions-drawer — a management-group-confined caller genuinely sees only
+> their in-scope agents' data on every response reader on this page, not just
+> the two named above. `GET /api/v1/executions/{id}`, `GET /api/v1/events`, and
+> the dashboard `GET /sse/executions/{id}` migrated in the same round. See
+> `docs/auth-architecture.md`'s "Third migration (#1634)" section for the full
+> account, including the residuals it left open (a weaker own-dispatches-only
+> confinement for MCP `list_executions`, since execution rows carry no single
+> `agent_id` to filter by).
 
 ## The authorization topology floor (#2376)
 
