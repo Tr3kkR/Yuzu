@@ -100,6 +100,24 @@ required.
 > metric-is-the-signal / no-per-rejection-audit-row pattern for the same
 > anti-flood reason.
 
+> **Agent OTA admission rejections (#913) are deliberately NOT audited, but
+> OTA identity rejections ARE.** The two halves of the OTA gate are treated
+> differently on purpose. When a peer exceeds its per-peer concurrency or rate
+> bound, `DownloadUpdate` returns gRPC `RESOURCE_EXHAUSTED` and increments
+> `yuzu_ota_download_admission_total{decision}`
+> (`docs/user-manual/metrics.md`) with **no** audit row — the same
+> fail-visibility reasoning as the per-principal quota block above: a peer
+> running hot against its own bound is expected steady-state behaviour during
+> a fleet-wide update, and auditing every rejection would flood the store
+> during exactly the event it is least useful for. By contrast, a rejection
+> from the **identity** half — no usable client certificate, a certificate
+> from a foreign CA, or an `agent_id` that does not match the certificate —
+> writes a `session.ota_identity_rejected` row, because that is an
+> authentication failure against a specific enrolled identity and is
+> forensically interesting exactly once. Metric is the signal; the audit row
+> is the evidence.
+
+
 | Action | Target type | When |
 |---|---|---|
 | `auth.login` | Session | Operator logs in via the dashboard or API |
@@ -123,6 +141,7 @@ required.
 | `session.revoke_all.self` | User | A user wiped all their own sessions via `DELETE /api/v1/sessions/me`, OR an admin supplied their own username to the admin path. The `/me` flow also revokes API tokens; `detail=count=<N> api_tokens_revoked=<M>`. `result=denied` if a non-interactive credential (MCP token, service-scoped token) attempted self-revoke. |
 | `session.peer_mismatch` | Session | A gRPC Subscribe whose agent peer IP did not match the IP recorded at Register time. **Two outcomes share this action.** *Rejected* (`result=denied`, #1059 — a stolen-session signal): `detail` carries `agent_id=<id> register_ip=<ip> subscribe_ip=<ip> gateway_mode=<bool>` (plus `raw_peer=<peer>` when the presented peer was malformed and `subscribe_ip` is empty); the SIEM signal is `yuzu_grpc_subscribe_peer_mismatch_total{event="security"}`. *Tolerated* (`result=ok`, #1128 — a NAT-aware relaxation downgraded it): `detail` carries `agent_id=<id> outcome=advisory reason=<mtls_identity_match\|trusted_nat_cidr> register_ip=<ip> subscribe_ip=<ip>`; the SIEM signal is `yuzu_grpc_subscribe_peer_advisory_total{event="security",reason=…}`. `principal=agent:<agent_id>`; `target_id` is the `session_id`. SOC 2 CC7.2: the *denied* form is a high-signal security event; the *advisory* form is expected operational telemetry in NAT-traversal deployments (a spike there alone is benign; correlated with a *denied* spike it warrants investigation — see `docs/observability-conventions.md`). Security events route to the SIEM via Prometheus, not by tailing the audit store; this row is the paired forensic evidence. If the audit-store write fails, the gRPC response carries trailing metadata `x-yuzu-audit-failed: true` (see **gRPC audit-failure signal** below). |
 | `session.identity_mismatch` | Session | A gRPC Subscribe was rejected because the mTLS client identity (cert CN/SAN) did not overlap the identity bound at Register time (#1118 — a stolen-session signal, the mTLS sibling of `session.peer_mismatch`). `principal=agent:<agent_id>`; `target_id` is the `session_id`; `detail` carries `agent_id=<id> reason=mtls_identity_mismatch presented=[<cert CN/SANs at Subscribe>] bound=[<cert CN/SANs at Register>]` so an auditor can identify the cert used in the attempt. `result=denied`. SOC 2 CC7.2: high-signal security event. **The SIEM signal is the Prometheus counter** `yuzu_grpc_subscribe_identity_mismatch_total{event="security"}`; this audit row is the paired forensic evidence. On audit-store write failure the gRPC response carries `x-yuzu-audit-failed: true` (see **gRPC audit-failure signal** below). |
+| `session.ota_identity_rejected` | AgentCertificate | An agent-initiated OTA RPC (`CheckForUpdate` or `DownloadUpdate`) was rejected because the peer presented no usable client-certificate identity, or the `agent_id` in the request body did not match the certificate's CN/SAN (#416). `principal=agent:<cert identity, or the claimed agent_id when no cert was presented>`; `target_id` is the cert identity; `detail` carries `reason=<no_client_identity\|foreign_ca\|agent_id_mismatch> rpc=<check_for_update\|download_update>`. `result=denied`. Distinct from `session.identity_mismatch` above, which covers the Subscribe binding check and carries a different `detail` shape. Emitted **only** where the agent listener actually requires a client certificate — on a default-certificate deployment the OTA identity gate is inert so unenrolled agents can still bootstrap. SOC 2 CC7.2: the SIEM signal is `yuzu_grpc_ota_identity_rejected_total{event="security",rpc,reason}`; this row is the paired forensic evidence. On audit-store write failure the gRPC response carries `x-yuzu-audit-failed: true`. |
 | `tag.set` | Tag | A tag is created or updated on an agent |
 | `tag.delete` | Tag | A tag is removed from an agent |
 | `instruction.execute` | Instruction | An instruction is dispatched to one or more agents |

@@ -35,6 +35,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -117,6 +118,20 @@ struct PrincipalQuotaConfig {
     double rate_per_second{20.0};          // per-principal token-bucket refill
     double burst{40.0};                    // bucket capacity
     std::int64_t idle_evict_seconds{300};  // purge_stale threshold
+
+    /// Hard ceiling on tracked keys; 0 = unlimited, which is the historical
+    /// behaviour and stays correct for the engine-principal path (its keys are an
+    /// operator-provisioned set that no unauthenticated caller can inflate — see
+    /// purge_stale's comment).
+    ///
+    /// A caller whose key space is ATTACKER-INFLUENCED must set this. The OTA
+    /// admission gate is the motivating case: it keys on the peer's certificate
+    /// identity when one is presented and falls back to peer IP when none is, and
+    /// the agent listener does not always require a client certificate, so a NAT'd
+    /// peer rotating source ports would otherwise grow the map without bound
+    /// (issue #935). At the ceiling a new key evicts the least-recently-seen entry
+    /// that holds no in-flight reservation.
+    std::size_t max_tracked{0};
 };
 
 /// Thread-safe per-principal quota tracker. One mutex guards a
@@ -150,6 +165,45 @@ class PrincipalQuota {
     /// concurrency slot (see the SSE note in the file header). Returns a
     /// QuotaDecision — never reserves or releases a concurrency slot.
     QuotaDecision try_rate_only(const std::string& principal_id, QuotaSide side);
+
+    /// Injectable steady clock — the token-bucket refill clock ONLY (`last_seen`,
+    /// purge_stale's idle-eviction clock, stays wall-clock; see UP-4 in the .cpp).
+    /// Defaults to `std::chrono::steady_clock::now`. Mirrors the ClockFn idiom in
+    /// `engine_principal_store.hpp` so a test can step time arithmetically instead
+    /// of sleeping: this class's own test previously observed refill by waiting on
+    /// a real `std::this_thread::sleep_for(30ms)`, which is both slow and racy on a
+    /// loaded shared runner.
+    using ClockFn = std::function<std::chrono::steady_clock::time_point()>;
+
+    /// TEST ONLY. An empty fn restores the real steady clock (same contract as
+    /// `EnginePrincipalStore::set_clock_for_test`). Not synchronised against
+    /// concurrent `try_acquire`/`refund` calls — the clock is read before `mu_` is
+    /// taken, deliberately (see try_acquire), so a test must install the fn before
+    /// putting the quota under load, not while it is serving.
+    void set_clock_for_test(ClockFn fn);
+
+    /// Return one token to `principal_id`'s bucket, capped at `burst`.
+    ///
+    /// For a caller that charges up-front but then fails for a reason that is the
+    /// SERVER's fault rather than the peer's: a server-imposed deadline, an
+    /// unavailable backend, or a failure before any real work was done. Charging
+    /// those meters failures instead of usage, and lets a genuinely slow-but-honest
+    /// client spend itself into a lockout — the pathology recorded on issues #934
+    /// (7.5h) and #941 (75min). Refunding keeps the bucket a measure of work done.
+    ///
+    /// Deliberately does NOT create an entry: refunding an untracked principal (one
+    /// the sweeper or the `max_tracked` ceiling already reclaimed) is a no-op, so a
+    /// late refund can never resurrect state that was just evicted, nor mint a
+    /// full-burst entry for a key that is no longer tracked.
+    ///
+    /// Refunds the RATE dimension only. Concurrency is released by ~QuotaSlot and
+    /// must not be double-released here.
+    void refund(const std::string& principal_id);
+
+    /// Keys evicted by the `max_tracked` ceiling since construction. Always 0 when
+    /// `max_tracked == 0`. Surfaced as a counter so an operator can see the cap
+    /// biting rather than inferring it from a flat `principal_count()`.
+    std::uint64_t evicted_count() const;
 
     /// Purge principals idle for longer than `idle_evict_seconds`, as of
     /// `now_epoch_seconds`. A principal with a live in-flight reservation
@@ -213,9 +267,24 @@ class PrincipalQuota {
     /// httplib's response-teardown path. See QuotaSlot::reset's comment.
     void release(const std::string& principal_id) noexcept;
 
+    // Caller holds mu_. Enforces cfg_.max_tracked BEFORE an insert, so the map is
+    // never transiently over the ceiling: evicts the least-recently-seen entry that
+    // holds no in-flight reservation.
+    //
+    // If every tracked entry is in-flight, the insert is allowed through rather
+    // than denied. That is a deliberate fail-open on CARDINALITY, and it is bounded:
+    // an in-flight entry corresponds to a request actually executing, so the
+    // overshoot can never exceed the server's concurrent-request ceiling (the gRPC
+    // stream cap for the OTA caller). Denying instead would turn a memory-shape
+    // concern into a refusal to serve legitimate callers, which is the worse trade —
+    // the resource that actually matters is already bounded by max_concurrency.
+    void enforce_cap_locked();
+
     PrincipalQuotaConfig cfg_;
     mutable std::mutex mu_;
     std::unordered_map<std::string, PerPrincipal> principals_;
+    ClockFn clock_{[] { return std::chrono::steady_clock::now(); }};
+    std::uint64_t evicted_{0};
 };
 
 }  // namespace yuzu::server

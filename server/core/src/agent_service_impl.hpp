@@ -28,6 +28,8 @@
 #include "agent_registry.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
+#include "ota_transfer_watchdog.hpp"
+#include "principal_quota.hpp"
 
 // Forward declarations to avoid pulling in full store headers
 namespace yuzu::server {
@@ -69,6 +71,53 @@ public:
                      UpdateRegistry* update_registry = nullptr);
 
     void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
+
+    /// Bounds on the agent OTA pull path (issue #913 + #911). Defaults are the
+    /// SHIPPED defaults, not placeholders: the path is bounded even when an
+    /// operator configures nothing and when a test constructs this service
+    /// without calling the setter below.
+    ///
+    /// The CONCURRENCY cap is the primary defence and the rate bucket is
+    /// deliberately loose. #913's attack is N parallel streams, which a
+    /// per-peer semaphore stops exactly; a tight bucket would instead meter
+    /// RETRIES, which is what produced the lockout pathologies recorded on
+    /// #934 (7.5h) and #941 (75min). At capacity 20 / refill 1-per-minute a
+    /// flapping mobile agent reconnecting five times spends five tokens and
+    /// recovers them in five minutes, so neither lockout is reachable.
+    struct OtaBoundConfig {
+        int max_concurrent_per_peer{2};
+        double rate_capacity{20.0};
+        double rate_refill_per_min{1.0};
+        /// Whole-transfer bound, enforced by cancelling the RPC from the
+        /// watchdog thread — the only thing that unblocks a `ServerWriter::Write`
+        /// stalled on a zero receive window (#911 UP-101).
+        std::chrono::seconds transfer_deadline{900};
+        /// Per-chunk bound. Catches the slow-drip peer, whose every Write
+        /// completes but slowly, before the whole-transfer deadline would.
+        std::chrono::seconds chunk_stall_deadline{30};
+        /// #935: the admission key falls back to peer IP when no client
+        /// certificate is presented, so the key space is attacker-influenced
+        /// and MUST be capped.
+        std::size_t max_peers_tracked{50000};
+    };
+
+    /// Set-before-traffic, like the store setters below. Rebuilds the quota, so
+    /// calling it while requests are in flight would drop their accounting.
+    void set_ota_bound_config(const OtaBoundConfig& cfg);
+
+    /// #416: require a POSITIVE peer identity on the two agent-initiated OTA
+    /// RPCs, and bind the client-supplied `agent_id` to the certificate.
+    ///
+    /// Gated on the LISTENER being strict (`tls_enabled && !using_default_agent_certs`),
+    /// NOT on `require_client_identity_`. The two differ exactly where it matters:
+    /// on default agent certs the listener deliberately relaxes to
+    /// request-but-do-not-require so an unenrolled agent can bootstrap
+    /// (see server.cpp's agent-listener credential block), while
+    /// `require_client_identity_` is `tls_enabled && !tls_ca_cert.empty()` and is
+    /// TRUE there. Gating on the latter would reject every bootstrapping agent's
+    /// OTA pull. Default false = inert, which is also what a plain-TLS or
+    /// no-TLS deployment gets.
+    void set_require_positive_ota_identity(bool v) { require_positive_ota_identity_ = v; }
     /// #1128: operator-declared multi-egress NAT/proxy CIDRs for the NAT-aware
     /// Subscribe binding relaxation. Empty (default) keeps strict exact-match.
     void set_trusted_nat_cidrs(std::vector<std::string> cidrs) {
@@ -328,6 +377,30 @@ private:
     // affirms per-agent certs. See Config::nat_trust_mtls_identity.
     bool nat_trust_mtls_identity_{false};
     UpdateRegistry* update_registry_{nullptr};
+
+    // ── OTA pull bounds (#913 / #911 / #416) ────────────────────────────────
+    OtaBoundConfig ota_cfg_{};
+    // unique_ptr because PrincipalQuota holds a mutex and so is neither movable
+    // nor assignable; set_ota_bound_config rebuilds it.
+    std::unique_ptr<PrincipalQuota> ota_quota_;
+    OtaTransferWatchdog ota_watchdog_;
+    bool require_positive_ota_identity_{false};
+
+    /// The admission key for one OTA call, plus which keying produced it.
+    ///
+    /// Certificate identity when the peer presented one, else the peer IP. The
+    /// fallback is load-bearing, not a convenience: the agent listener does not
+    /// always require a client certificate, and keying every certless peer on a
+    /// single empty string would collapse the whole unenrolled fleet onto ONE
+    /// bucket, where one agent's pulls lock out every other (issue #935). Peer
+    /// IP is the same keying the HTTP-side RateLimiter already uses.
+    std::pair<std::string, const char*> ota_admission_key(const grpc::ServerContext& ctx) const;
+
+    /// #416 — see set_require_positive_ota_identity. Returns OK when the gate is
+    /// off. `claimed_agent_id` is the request-body value, which is unverified
+    /// until this binds it to the certificate.
+    grpc::Status require_positive_ota_identity(grpc::ServerContext* context, std::string_view rpc,
+                                               const std::string& claimed_agent_id);
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;

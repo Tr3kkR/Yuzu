@@ -1,0 +1,136 @@
+#include "ota_transfer_watchdog.hpp"
+
+#include <utility>
+
+namespace yuzu::server {
+
+OtaTransferWatchdog::OtaTransferWatchdog(std::chrono::milliseconds sweep_interval)
+    : sweep_interval_(sweep_interval) {
+    if (sweep_interval_.count() <= 0)
+        return;  // test mode: no thread, sweep_once() driven directly
+
+    sweeper_ = std::thread([this] {
+        std::unique_lock lock(mu_);
+        while (!stop_) {
+            // wait_for on the same mutex the sweep needs: the destructor's
+            // notify_one wakes us immediately rather than after a full interval.
+            cv_.wait_for(lock, sweep_interval_, [this] { return stop_; });
+            if (stop_)
+                return;
+            lock.unlock();
+            sweep_once();
+            lock.lock();
+        }
+    });
+}
+
+OtaTransferWatchdog::~OtaTransferWatchdog() {
+    {
+        std::lock_guard lock(mu_);
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (sweeper_.joinable())
+        sweeper_.join();
+}
+
+OtaTransferWatchdog::Registration
+OtaTransferWatchdog::register_transfer(CancelFn cancel,
+                                       std::chrono::steady_clock::time_point deadline) {
+    std::lock_guard lock(mu_);
+    const std::uint64_t id = next_id_++;
+    live_.emplace(id, Entry{std::move(cancel), deadline, false});
+    return Registration(this, id);
+}
+
+std::size_t OtaTransferWatchdog::sweep_once() {
+    const auto now = clock_();
+
+    // The cancel callbacks run UNDER mu_ — deliberately. See the LIFETIME note in
+    // the header: a handler's Registration erases its entry under this same mutex,
+    // so holding it across the callback is what prevents the sweeper from calling
+    // into a frame that has already returned. TryCancel does not block, so this is
+    // a short critical section despite invoking a callback inside it.
+    std::lock_guard lock(mu_);
+    std::size_t cancelled = 0;
+    for (auto& [id, entry] : live_) {
+        if (entry.cancelled || entry.deadline > now)
+            continue;
+        entry.cancelled = true;
+        if (entry.cancel)
+            entry.cancel();
+        ++cancelled;
+    }
+    return cancelled;
+}
+
+void OtaTransferWatchdog::set_clock_for_test(ClockFn fn) {
+    std::lock_guard lock(mu_);
+    if (fn)
+        clock_ = std::move(fn);
+    else
+        clock_ = [] { return std::chrono::steady_clock::now(); };
+}
+
+std::size_t OtaTransferWatchdog::in_flight_count() const {
+    std::lock_guard lock(mu_);
+    return live_.size();
+}
+
+void OtaTransferWatchdog::erase(std::uint64_t id) noexcept {
+    // noexcept for the same structural reason PrincipalQuota::release is: this runs
+    // from ~Registration, and a throw escaping a destructor is std::terminate that
+    // no caller-side catch can intercept. Containment has to be here.
+    try {
+        std::lock_guard lock(mu_);
+        live_.erase(id);
+    } catch (...) {
+        // A mutex that cannot be locked means the watchdog is already unreliable.
+        // Leaking one map entry is strictly better than aborting the process; the
+        // entry's CancelFn is the only thing at risk and the sweeper re-checks
+        // `cancelled` before invoking it.
+    }
+}
+
+bool OtaTransferWatchdog::was_cancelled(std::uint64_t id) const {
+    std::lock_guard lock(mu_);
+    auto it = live_.find(id);
+    return it != live_.end() && it->second.cancelled;
+}
+
+OtaTransferWatchdog::Registration::Registration(Registration&& other) noexcept
+    : owner_(other.owner_), id_(other.id_) {
+    other.owner_ = nullptr;
+    other.id_ = 0;
+}
+
+OtaTransferWatchdog::Registration&
+OtaTransferWatchdog::Registration::operator=(Registration&& other) noexcept {
+    if (this != &other) {
+        reset();
+        owner_ = other.owner_;
+        id_ = other.id_;
+        other.owner_ = nullptr;
+        other.id_ = 0;
+    }
+    return *this;
+}
+
+OtaTransferWatchdog::Registration::~Registration() { reset(); }
+
+void OtaTransferWatchdog::Registration::reset() noexcept {
+    if (owner_) {
+        // Null the owner FIRST so idempotence does not depend on erase() succeeding.
+        auto* owner = owner_;
+        const auto id = id_;
+        owner_ = nullptr;
+        id_ = 0;
+        owner->erase(id);
+    }
+}
+
+bool OtaTransferWatchdog::Registration::cancelled() const {
+    return owner_ != nullptr && owner_->was_cancelled(id_);
+}
+
+} // namespace yuzu::server

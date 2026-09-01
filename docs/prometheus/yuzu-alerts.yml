@@ -3815,6 +3815,93 @@ groups:
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
 
+  - name: yuzu-ota
+    # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416
+    # identity). Every series here is zero-seeded at boot, so increase() > 0 is
+    # meaningful and absent() stays a real signal.
+    #
+    # Deliberately NOT alerted: yuzu_ota_download_admission_total
+    # {decision="rejected_rate"} on its own. The rate bucket is the loose,
+    # secondary bound and is expected to reject during a fleet-wide update; a
+    # page on it would be noise. The concurrency rejection is the one that means
+    # a peer is actually trying to monopolise capacity.
+    rules:
+      - alert: YuzuOtaConcurrencyRejections
+        expr: |
+          increase(yuzu_ota_download_admission_total{decision="rejected_concurrency"}[15m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A peer is repeatedly hitting the per-peer OTA concurrency cap"
+          description: >-
+            One or more agents are being refused DownloadUpdate because they
+            already hold --ota-max-concurrent-per-peer parallel transfers. This
+            is the primary bound from issue #913 and it firing sustained means
+            a peer is opening more concurrent OTA streams than any healthy
+            agent needs. Investigate which identity: correlate with
+            yuzu_ota_admission_key_mode_total to see whether admission is
+            keyed on certificates or has fallen back to peer IP, and check the
+            audit store for that agent. A single short burst during a
+            fleet-wide rollout is benign; a sustained signal is not.
+
+      - alert: YuzuOtaIdentityRejections
+        expr: |
+          increase(yuzu_grpc_ota_identity_rejected_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent OTA RPCs rejected for a missing or mismatched certificate identity"
+          description: >-
+            CheckForUpdate or DownloadUpdate was rejected because the peer
+            presented no usable client certificate, presented one from a
+            foreign CA, or claimed an agent_id that does not match its
+            certificate (issue #416). On a fleet where every agent is enrolled
+            this should be flat at zero, so any sustained signal is either a
+            misconfigured agent or an identity being spoofed. The reason label
+            says which. Paired forensic evidence is the
+            session.ota_identity_rejected audit row.
+
+      - alert: YuzuOtaRefundDivergence
+        expr: |
+          sum by (job, instance) (
+            increase(yuzu_ota_download_deadline_exceeded_total[30m])
+          )
+            > sum by (job, instance) (
+                increase(yuzu_ota_download_admission_total{decision="refunded"}[30m])
+              )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTA deadline aborts exceed rate-token refunds — lockout regression suspected"
+          description: >-
+            Every transfer aborted by a SERVER-imposed deadline must refund the
+            rate token it was charged at admission; that invariant is what stops
+            a genuinely slow-link or flapping agent from spending itself into a
+            lockout (the failure mode recorded on issues #934 and #941). Charges
+            running ahead of refunds means a code path is aborting without
+            refunding, which silently re-opens that lockout. Check recent changes
+            to the DownloadUpdate deadline branches in agent_service_impl.cpp.
+
+      - alert: YuzuOtaPeerMapNearCapacity
+        expr: |
+          yuzu_ota_download_peers_tracked > 40000
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "OTA per-peer admission map is approaching its cardinality ceiling"
+          description: >-
+            The per-peer OTA admission map is nearing --ota-max-peers-tracked
+            (issue #935). The map is bounded and evicts the least-recently-seen
+            idle entry, so this is not a memory-exhaustion risk — but on a fleet
+            far smaller than this number it indicates admission has fallen back
+            to peer-IP keying for many peers (check
+            yuzu_ota_admission_key_mode_total{mode="peer_ip"}), which is what a
+            NAT'd peer rotating source ports looks like.
+
   - name: yuzu-executions
     # HA WS-1(1b) (ADR-2002 §5) — the command_id -> execution_id correlation
     # (ExecutionTracker::command_execution, PG-backed, replacing the former

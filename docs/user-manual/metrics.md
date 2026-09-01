@@ -850,6 +850,78 @@ activity (own audit rows: `access_review.exported`, `.campaign_opened`,
 convention in `docs/observability-conventions.md`, so `absent()`-style
 alerts stay meaningful.
 
+## Agent OTA pull metrics (#913, #911, #416)
+
+```
+# HELP yuzu_ota_download_admission_total Agent OTA DownloadUpdate admission decisions by outcome
+# TYPE yuzu_ota_download_admission_total counter
+yuzu_ota_download_admission_total{decision="admitted"} 0
+yuzu_ota_download_admission_total{decision="rejected_concurrency"} 0
+yuzu_ota_download_admission_total{decision="rejected_rate"} 0
+yuzu_ota_download_admission_total{decision="refunded"} 0
+
+# HELP yuzu_ota_download_deadline_exceeded_total Agent OTA DownloadUpdate transfers aborted by a server-imposed deadline, by phase
+# TYPE yuzu_ota_download_deadline_exceeded_total counter
+yuzu_ota_download_deadline_exceeded_total{phase="transfer"} 0
+yuzu_ota_download_deadline_exceeded_total{phase="write"} 0
+
+# HELP yuzu_ota_admission_key_mode_total Agent OTA admission keying actually used, by mode
+# TYPE yuzu_ota_admission_key_mode_total counter
+yuzu_ota_admission_key_mode_total{mode="cert"} 0
+yuzu_ota_admission_key_mode_total{mode="peer_ip"} 0
+yuzu_ota_admission_key_mode_total{mode="unknown"} 0
+
+# HELP yuzu_grpc_ota_identity_rejected_total Agent OTA RPCs rejected for a missing or mismatched client certificate identity, by rpc and reason
+# TYPE yuzu_grpc_ota_identity_rejected_total counter
+yuzu_grpc_ota_identity_rejected_total{event="security",rpc="download_update",reason="agent_id_mismatch"} 0
+...
+
+# HELP yuzu_ota_download_peers_tracked Peers currently tracked by the OTA admission map
+# TYPE yuzu_ota_download_peers_tracked gauge
+yuzu_ota_download_peers_tracked 0
+```
+
+Every closed series is pre-seeded to `0` at startup so `absent()` alerts stay
+meaningful. Labels are bounded by construction — a peer identity or IP is
+**never** a label value.
+
+**Operational vs security.** The admission, deadline and keying counters are
+**operational**: a concurrency or rate rejection is expected steady-state
+behaviour during a fleet-wide update, not an attack signal (the same reasoning
+that keeps the per-principal quota counters off `event="security"`).
+`yuzu_grpc_ota_identity_rejected_total` is the exception and carries
+`event="security"`, because a failed certificate bind on an already-enrolled
+agent's OTA pull is an authentication event; it mirrors
+`yuzu_grpc_revoked_cert_total` and is paired with a
+`session.identity_mismatch` audit row (the metric is the signal, the audit row
+is the evidence).
+
+**Reading `decision`.** `rejected_concurrency` means the peer already held
+`--ota-max-concurrent-per-peer` parallel downloads — the primary bound, and the
+one that should fire under an actual monopolisation attempt.
+`rejected_rate` means the peer drained its token bucket, which is a much looser
+secondary bound; sustained `rejected_rate` without `rejected_concurrency`
+usually indicates the rate knobs are tuned too tightly for the fleet's retry
+behaviour rather than an attack. `refunded` counts tokens returned after a
+**server-attributable** failure (a deadline the server imposed, an unavailable
+registry, or a failure before any bytes were streamed) — it is why a slow-link
+or flapping agent cannot spend itself into a lockout. In steady state
+`refunded` should track
+`yuzu_ota_download_deadline_exceeded_total` closely; a large and growing gap
+between charges and refunds means a code path is failing without refunding.
+
+**Reading `mode`.** `cert` is the healthy case: admission is keyed on the
+peer's certificate identity. `peer_ip` means the peer presented no client
+certificate, so admission fell back to source IP — expected on a
+default-certificate deployment where unenrolled agents are still bootstrapping,
+but a sustained high `peer_ip` share on a fleet you believe is fully enrolled
+is worth investigating. `unknown` should never appear; it means neither a
+certificate nor a parseable peer address was available.
+
+**Caveat — per-process.** These counters describe one server process. Behind a
+load balancer the per-peer bounds they report are per-replica, not fleet-wide
+(see `docs/user-manual/server-admin.md`).
+
 ## Histogram buckets
 
 Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom

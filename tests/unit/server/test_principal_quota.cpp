@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <latch>
+#include <cstdint>
 #include <string>
 #include <thread>
 #include <vector>
@@ -173,8 +174,13 @@ TEST_CASE("PrincipalQuota rate: burst exhausts, rejects with kRate and a refill-
 }
 
 TEST_CASE("PrincipalQuota rate: tokens replenish after elapsed time", "[quota][primitive]") {
+    // `fake_now` is declared BEFORE `q` so it outlives every call that reads the
+    // injected clock, including anything on q's teardown path.
+    auto fake_now = std::chrono::steady_clock::now();
     PrincipalQuota q(
         PrincipalQuotaConfig{.max_concurrency = 1000, .rate_per_second = 1000.0, .burst = 2.0});
+    q.set_clock_for_test([&fake_now] { return fake_now; });
+
     // Drain the burst via try_rate_only (streaming-style — no concurrency
     // slot involved, isolating the rate dimension).
     CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
@@ -183,13 +189,134 @@ TEST_CASE("PrincipalQuota rate: tokens replenish after elapsed time", "[quota][p
     CHECK_FALSE(exhausted.admitted);
     CHECK(exhausted.limit == QuotaLimit::kRate);
 
-    // At 1000 tokens/sec a 30ms sleep refills far more than the single
-    // token needed — the primitive reads wall-clock internally (no
-    // injectable clock), so this is a real wait with generous margin over
-    // the ~1ms theoretical refill time, not a tight timing assertion.
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    auto replenished = q.try_rate_only("p1", QuotaSide::kEngine);
-    CHECK(replenished.admitted);
+    // Refill is asserted by STEPPING the injected clock, so not one microsecond
+    // of real time passes: at 1000 tokens/sec, 2ms of stepped time is 2 tokens.
+    // This case previously waited on a real std::this_thread::sleep_for(30ms)
+    // because the primitive had no clock seam — slow, and racy on a loaded
+    // shared runner where the two reads can straddle a scheduling gap.
+    fake_now += std::chrono::milliseconds(2);
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+
+    // Restore the real clock before `fake_now` goes out of scope.
+    q.set_clock_for_test({});
+}
+
+TEST_CASE("PrincipalQuota clock: an empty fn restores the real steady clock",
+          "[quota][primitive]") {
+    auto frozen = std::chrono::steady_clock::now();
+    PrincipalQuota q(
+        PrincipalQuotaConfig{.max_concurrency = 1000, .rate_per_second = 1000.0, .burst = 1.0});
+    q.set_clock_for_test([&frozen] { return frozen; });
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK_FALSE(q.try_rate_only("p1", QuotaSide::kEngine).admitted);  // frozen: no refill
+
+    q.set_clock_for_test({});
+    // DELIBERATE real wait — the only one in this file, and the assertion itself
+    // is "real time is being read again", which no injected clock can prove. At
+    // 1000 tokens/sec, 5ms refills 5 tokens where 1 is needed, so the margin is
+    // 5x and this is not a tight timing assertion. Every OTHER case here steps an
+    // injected clock instead; do not copy this pattern to assert ordinary refill.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+}
+
+// ── Refund (issues #934 / #941 — a failure must not meter as usage) ───────
+
+TEST_CASE("PrincipalQuota refund: returns one token to the bucket", "[quota][primitive]") {
+    auto fake_now = std::chrono::steady_clock::now();
+    // rate_per_second = 0 isolates the refund: nothing replenishes on its own,
+    // so any token that reappears came from refund() and nowhere else.
+    PrincipalQuota q(
+        PrincipalQuotaConfig{.max_concurrency = 1000, .rate_per_second = 0.0, .burst = 2.0});
+    q.set_clock_for_test([&fake_now] { return fake_now; });
+
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK_FALSE(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+
+    q.refund("p1");
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK_FALSE(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+
+    q.set_clock_for_test({});
+}
+
+TEST_CASE("PrincipalQuota refund: never takes a principal above its burst",
+          "[quota][primitive]") {
+    auto fake_now = std::chrono::steady_clock::now();
+    PrincipalQuota q(
+        PrincipalQuotaConfig{.max_concurrency = 1000, .rate_per_second = 0.0, .burst = 2.0});
+    q.set_clock_for_test([&fake_now] { return fake_now; });
+
+    // Bucket starts full at burst=2. Three refunds on a full bucket must not
+    // bank credit — otherwise a refund-heavy failure mode would mint quota.
+    q.refund("p1");
+    q.refund("p1");
+    q.refund("p1");
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK_FALSE(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+
+    q.set_clock_for_test({});
+}
+
+TEST_CASE("PrincipalQuota refund: refunding an untracked principal never creates an entry",
+          "[quota][primitive]") {
+    PrincipalQuota q(PrincipalQuotaConfig{.max_concurrency = 4, .rate_per_second = 1.0,
+                                          .burst = 1.0});
+    REQUIRE(q.principal_count() == 0);
+    // A refund arriving after the sweeper (or the max_tracked ceiling) reclaimed
+    // the entry must be dropped, not resurrect a fresh full-burst bucket.
+    q.refund("never-seen");
+    CHECK(q.principal_count() == 0);
+}
+
+// ── max_tracked cardinality ceiling (issue #935) ─────────────────────────
+
+TEST_CASE("PrincipalQuota max_tracked: the ceiling bounds an attacker-influenced key space",
+          "[quota][primitive]") {
+    PrincipalQuota q(PrincipalQuotaConfig{
+        .max_concurrency = 1000, .rate_per_second = 1000.0, .burst = 8.0, .max_tracked = 2});
+
+    // Five distinct keys — the shape a NAT'd peer rotating source ports produces
+    // once the admission key falls back to peer IP.
+    for (int i = 0; i < 5; ++i)
+        CHECK(q.try_rate_only("peer-" + std::to_string(i), QuotaSide::kEngine).admitted);
+
+    CHECK(q.principal_count() <= 2);
+    CHECK(q.evicted_count() == 3);
+}
+
+TEST_CASE("PrincipalQuota max_tracked: an in-flight reservation is never evicted",
+          "[quota][primitive]") {
+    PrincipalQuota q(PrincipalQuotaConfig{
+        .max_concurrency = 1000, .rate_per_second = 1000.0, .burst = 8.0, .max_tracked = 2});
+
+    // Both tracked keys hold a live concurrency slot.
+    auto a = q.try_acquire("p1", QuotaSide::kEngine);
+    auto b = q.try_acquire("p2", QuotaSide::kEngine);
+    REQUIRE(a.admitted());
+    REQUIRE(b.admitted());
+
+    // A third key at the ceiling finds no evictable victim. The documented trade
+    // is a BOUNDED overshoot rather than denying a legitimate caller — evicting
+    // either live entry would orphan the QuotaSlot that accounts to it.
+    CHECK(q.try_acquire("p3", QuotaSide::kEngine).admitted());
+    CHECK(q.principal_count() == 3);
+    CHECK(q.evicted_count() == 0);
+    CHECK(q.in_flight("p1") == 1);
+    CHECK(q.in_flight("p2") == 1);
+}
+
+TEST_CASE("PrincipalQuota max_tracked: 0 means unlimited (the engine-principal default)",
+          "[quota][primitive]") {
+    PrincipalQuota q(
+        PrincipalQuotaConfig{.max_concurrency = 1000, .rate_per_second = 1000.0, .burst = 8.0});
+    REQUIRE(q.principal_count() == 0);
+    for (int i = 0; i < 32; ++i)
+        CHECK(q.try_rate_only("p" + std::to_string(i), QuotaSide::kEngine).admitted);
+    CHECK(q.principal_count() == 32);
+    CHECK(q.evicted_count() == 0);
 }
 
 // ── Isolation (the #1973 property) ───────────────────────────────────────

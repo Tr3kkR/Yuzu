@@ -262,6 +262,21 @@ std::string SettingsRoutes::render_server_config_fragment() {
     html += "<tr><td>Login Rate Limit</td><td><code>" + std::to_string(cfg_->login_rate_limit) +
             "</code> req/s per IP</td></tr>";
 
+    // Agent OTA pull bounds (#913 / #911). Read-only, like every row here.
+    html += "<tr><td>OTA Concurrency (per peer)</td><td><code>" +
+            std::to_string(cfg_->ota_max_concurrent_per_peer) +
+            "</code> parallel downloads</td></tr>";
+    html += "<tr><td>OTA Rate (per peer)</td><td><code>" +
+            std::to_string(cfg_->ota_rate_refill_per_min) + "</code>/min, burst <code>" +
+            std::to_string(cfg_->ota_rate_capacity) + "</code></td></tr>";
+    html += "<tr><td>OTA Transfer Deadline</td><td><code>" +
+            std::to_string(cfg_->ota_transfer_deadline_secs) + "</code> s (chunk <code>" +
+            std::to_string(cfg_->ota_chunk_write_deadline_secs) + "</code> s)</td></tr>";
+    html += "<tr><td>gRPC Stream Cap</td><td><code>" +
+            std::to_string(cfg_->grpc_max_concurrent_streams) +
+            "</code> streams/connection, quota <code>" +
+            std::to_string(cfg_->grpc_max_resource_memory_mb) + "</code> MiB</td></tr>";
+
     html += "</tbody></table>";
     return html;
 }

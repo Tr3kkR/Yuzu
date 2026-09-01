@@ -471,6 +471,59 @@ int main(int argc, char* argv[]) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_PRINCIPAL_RATE_LIMIT");
 
+    // Agent OTA pull bounds — issue #913 (per-peer limit) + #911 (deadlines).
+    // The concurrency cap is the primary defence; the rate knobs are
+    // deliberately loose (a tight bucket meters retries and locks out honest
+    // slow/flapping agents — #934, #941). See docs/user-manual/server-admin.md.
+    app.add_option("--ota-max-concurrent-per-peer", cfg.ota_max_concurrent_per_peer,
+                   "Max parallel DownloadUpdate streams per peer (default: 2)")
+        ->default_val(2)
+        // 0/negative would reject every OTA pull fleet-wide with no clear signal
+        // why — the same footgun as --principal-max-concurrency above.
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_OTA_MAX_CONCURRENT_PER_PEER");
+    app.add_option("--ota-rate-capacity", cfg.ota_rate_capacity,
+                   "Per-peer OTA token-bucket burst (default: 20)")
+        ->default_val(20.0)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_OTA_RATE_CAPACITY");
+    app.add_option("--ota-rate-refill-per-min", cfg.ota_rate_refill_per_min,
+                   "Per-peer OTA tokens restored per minute (default: 1)")
+        ->default_val(1.0)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_OTA_RATE_REFILL_PER_MIN");
+    app.add_option("--ota-transfer-deadline-secs", cfg.ota_transfer_deadline_secs,
+                   "Whole-transfer bound for one OTA download (default: 900)")
+        ->default_val(900)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_OTA_TRANSFER_DEADLINE_SECS");
+    app.add_option("--ota-chunk-write-deadline-secs", cfg.ota_chunk_write_deadline_secs,
+                   "Single-chunk stall bound for an OTA download (default: 30). Raise "
+                   "on fleets with genuinely slow links (satellite, congested WAN) — a "
+                   "deadline-tripped transfer refunds its rate token, so raising this "
+                   "trades a longer held thread for fewer aborted updates.")
+        ->default_val(30)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS");
+    app.add_option("--ota-max-peers-tracked", cfg.ota_max_peers_tracked,
+                   "Cardinality ceiling on the per-peer OTA admission map (default: 50000)")
+        ->default_val(50000)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_OTA_MAX_PEERS_TRACKED");
+
+    // gRPC server-wide resource bounds. Before these the one ServerBuilder set
+    // keepalive/ping args and nothing else.
+    app.add_option("--grpc-max-concurrent-streams", cfg.grpc_max_concurrent_streams,
+                   "Max concurrent HTTP/2 streams per gRPC connection (default: 128)")
+        ->default_val(128)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_GRPC_MAX_CONCURRENT_STREAMS");
+    app.add_option("--grpc-max-resource-memory-mb", cfg.grpc_max_resource_memory_mb,
+                   "gRPC ResourceQuota memory ceiling in MiB (default: 512)")
+        ->default_val(512)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_GRPC_MAX_RESOURCE_MEMORY_MB");
+
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
                    "MFA enforcement (default: optional). \"optional\" = self-service "

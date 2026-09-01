@@ -54,7 +54,12 @@ AgentServiceImpl::AgentServiceImpl(AgentRegistry& registry, EventBus& bus,
                                    UpdateRegistry* update_registry)
     : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
       metrics_(metrics), require_client_identity_(require_client_identity),
-      gateway_mode_(gateway_mode), update_registry_(update_registry) {}
+      gateway_mode_(gateway_mode), update_registry_(update_registry) {
+    // Build the OTA quota from the DEFAULT bounds so the DownloadUpdate path is
+    // bounded even when no operator config is applied and in every test that
+    // constructs this service directly. set_ota_bound_config() replaces it.
+    set_ota_bound_config(ota_cfg_);
+}
 
 // -- Register -----------------------------------------------------------------
 
@@ -1952,6 +1957,13 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
     if (auto s = reject_revoked_peer(context, "check_for_update"); !s.ok())
         return s;
 
+    // #416: positive identity + agent_id/certificate binding. Inert unless the
+    // agent listener requires a client certificate. agent_id matters here even
+    // though this RPC streams nothing: it selects rollout eligibility below.
+    if (auto s = require_positive_ota_identity(context, "check_for_update", request->agent_id());
+        !s.ok())
+        return s;
+
     if (!update_registry_) {
         response->set_update_available(false);
         return grpc::Status::OK;
@@ -1997,17 +2009,66 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     if (auto s = onbehalf::enforce(context); !s.ok()) return s;
 
     // PR3: a revoked agent must not be able to pull the agent binary over the OTA
-    // path. (Requiring a *positive* identity here — not just non-revocation — is a
-    // tracked follow-up that pairs with the centralised identity interceptor.)
+    // path.
     if (auto s = reject_revoked_peer(context, "download_update"); !s.ok())
         return s;
 
+    // #416: positive identity + agent_id/certificate binding. Inert unless the
+    // agent listener requires a client certificate.
+    if (auto s = require_positive_ota_identity(context, "download_update", request->agent_id());
+        !s.ok())
+        return s;
+
+    // ── Per-peer admission (#913) ───────────────────────────────────────────
+    const auto key_pair = ota_admission_key(*context);
+    const std::string& ota_key = key_pair.first;
+    metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", key_pair.second}}).increment();
+
+    auto slot = ota_quota_->try_acquire(ota_key, QuotaSide::kEngine);
+    if (!slot.admitted()) {
+        const bool by_concurrency = slot.decision().limit == QuotaLimit::kConcurrency;
+        metrics_
+            .counter("yuzu_ota_download_admission_total",
+                     {{"decision", by_concurrency ? "rejected_concurrency" : "rejected_rate"}})
+            .increment();
+        spdlog::warn("DownloadUpdate: rejected by per-peer {} bound (retry_after_ms={})",
+                     by_concurrency ? "concurrency" : "rate", slot.decision().retry_after_ms);
+        // One wire status for both dimensions, and a REJECT rather than a queue:
+        // queueing at capacity would hold the very thread the cap exists to free.
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                            "per-peer OTA download limit exceeded");
+    }
+    metrics_.counter("yuzu_ota_download_admission_total", {{"decision", "admitted"}}).increment();
+    metrics_.gauge("yuzu_ota_download_peers_tracked")
+        .set(static_cast<double>(ota_quota_->principal_count()));
+
+    // The concurrency slot is held by `slot` for the rest of this function and
+    // released by its destructor on EVERY exit path, including the early returns
+    // below — that is the whole reason it is an RAII reservation.
+    //
+    // The rate token is charged at admission and given back on SERVER-attributable
+    // failure only. Metering our own failures would let an honest but unlucky
+    // agent spend itself into a lockout, which is exactly the pathology recorded
+    // on #934 (7.5h) and #941 (75min). Idempotent: several exit paths refund, and
+    // a double refund would mint quota.
+    bool refunded = false;
+    auto refund_token = [&] {
+        if (refunded)
+            return;
+        refunded = true;
+        ota_quota_->refund(ota_key);
+        metrics_.counter("yuzu_ota_download_admission_total", {{"decision", "refunded"}})
+            .increment();
+    };
+
     if (!update_registry_) {
+        refund_token(); // server misconfiguration — nothing streamed, not the peer's doing
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
     }
 
     auto pkg = update_registry_->latest_for(request->platform().os(), request->platform().arch());
     if (!pkg || pkg->version != request->version()) {
+        refund_token(); // nothing streamed
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
     }
 
@@ -2015,8 +2076,18 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     std::ifstream file(file_path, std::ios::binary);
     if (!file) {
         spdlog::error("DownloadUpdate: binary file missing: {}", file_path.string());
+        refund_token(); // server-side artifact problem
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "binary file missing");
     }
+
+    // ── Transfer deadline (#911 UP-101) ─────────────────────────────────────
+    // Scoped to exactly this function body: the watchdog can only ever TryCancel a
+    // context whose handler frame is still live, because this registration erases
+    // itself before the frame returns. See ota_transfer_watchdog.hpp's LIFETIME
+    // note — the agent hit the equivalent use-after-free in cancel_ctx().
+    auto transfer_guard = ota_watchdog_.register_transfer(
+        [context] { context->TryCancel(); },
+        std::chrono::steady_clock::now() + ota_cfg_.transfer_deadline);
 
     constexpr std::size_t kChunkSize = 64 * 1024; // 64KB
     std::vector<char> buffer(kChunkSize);
@@ -2029,9 +2100,42 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         chunk.set_offset(offset);
         chunk.set_total_size(pkg->file_size);
 
-        if (!writer->Write(chunk)) {
+        // Time the Write. A peer whose receive window is open but tiny completes
+        // every Write slowly; the whole-transfer deadline would eventually catch
+        // that, but this bails at the first clearly-stalled chunk instead of
+        // holding the thread for the entire budget.
+        const auto write_started = std::chrono::steady_clock::now();
+        const bool wrote = writer->Write(chunk);
+        const auto write_elapsed = std::chrono::steady_clock::now() - write_started;
+
+        if (!wrote) {
+            // A Write unblocked by the watchdog's TryCancel and a Write that
+            // failed because the peer hung up are INDISTINGUISHABLE at this
+            // return value — so ask the watchdog which happened. They get
+            // different treatment: our deadline refunds, the peer's disconnect
+            // does not.
+            if (transfer_guard.cancelled()) {
+                metrics_
+                    .counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", "transfer"}})
+                    .increment();
+                spdlog::warn("DownloadUpdate: transfer deadline exceeded at offset {}", offset);
+                refund_token();
+                return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                    "OTA transfer deadline exceeded");
+            }
             spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
             return grpc::Status::CANCELLED;
+        }
+
+        if (write_elapsed > ota_cfg_.chunk_stall_deadline) {
+            metrics_.counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", "write"}})
+                .increment();
+            spdlog::warn("DownloadUpdate: chunk write stalled {}s at offset {}, aborting",
+                         std::chrono::duration_cast<std::chrono::seconds>(write_elapsed).count(),
+                         offset);
+            refund_token();
+            return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                "OTA chunk write deadline exceeded");
         }
 
         offset += file.gcount();
@@ -2043,6 +2147,109 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
 }
 
 // -- Private helpers ----------------------------------------------------------
+
+void AgentServiceImpl::set_ota_bound_config(const OtaBoundConfig& cfg) {
+    ota_cfg_ = cfg;
+    ota_quota_ = std::make_unique<PrincipalQuota>(PrincipalQuotaConfig{
+        .max_concurrency = cfg.max_concurrent_per_peer,
+        // PrincipalQuota refills per SECOND; the OTA knob is per MINUTE because
+        // that is the scale an operator reasons about for a fleet-update pull.
+        .rate_per_second = cfg.rate_refill_per_min / 60.0,
+        .burst = cfg.rate_capacity,
+        .idle_evict_seconds = 3600,
+        .max_tracked = cfg.max_peers_tracked,
+    });
+}
+
+std::pair<std::string, const char*>
+AgentServiceImpl::ota_admission_key(const grpc::ServerContext& ctx) const {
+    const auto idents = extract_peer_identities(ctx);
+    if (!idents.empty())
+        return {idents.front(), "cert"};
+
+    // No client certificate. Fall back to peer IP rather than an empty shared
+    // key — see the header comment on this function (#935).
+    std::string ip = extract_peer_ip(ctx.peer());
+    if (!ip.empty())
+        return {std::move(ip), "peer_ip"};
+
+    // Neither a certificate nor a parseable peer. gRPC always populates peer()
+    // for a real connection, so this is defensive; it is kept distinguishable in
+    // the metric so a deployment that somehow lands here is visible rather than
+    // silently sharing one bucket.
+    return {std::string("unknown"), "unknown"};
+}
+
+grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext* context,
+                                                             std::string_view rpc,
+                                                             const std::string& claimed_agent_id) {
+    if (!require_positive_ota_identity_ || !context)
+        return grpc::Status::OK;
+
+    auto deny = [&](const char* reason, const char* message) {
+        // event=security: unlike an admission rejection (expected steady state,
+        // operational), a failed identity bind on an already-enrolled agent's OTA
+        // pull is an authentication signal. Mirrors yuzu_grpc_revoked_cert_total.
+        metrics_
+            .counter("yuzu_grpc_ota_identity_rejected_total",
+                     {{"event", "security"}, {"rpc", std::string(rpc)}, {"reason", reason}})
+            .increment();
+        spdlog::warn("{} rejected: {}", rpc, reason);
+        if (audit_store_ && audit_store_->is_open()) {
+            const auto ids = extract_peer_identities(*context);
+            const std::string cert_id = ids.empty() ? std::string{} : ids.front();
+            AuditEvent ev;
+            ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+            ev.principal = "agent:" + (cert_id.empty() ? claimed_agent_id : cert_id);
+            ev.principal_role = "agent";
+            // session.* keeps this inside the CC7.2 auth-sample export, which
+            // filters on that prefix (see AuditQuery::action_prefixes).
+            //
+            // Deliberately NOT session.identity_mismatch: that verb is already
+            // taken by the Subscribe mTLS binding check and carries a different
+            // detail shape (presented=[...] bound=[...]). Reusing it would put
+            // two different detail formats under one action, which breaks any
+            // consumer parsing that field.
+            ev.action = "session.ota_identity_rejected";
+            ev.target_type = "AgentCertificate";
+            ev.target_id = cert_id;
+            ev.detail = std::string("reason=").append(reason).append(" rpc=").append(rpc);
+            ev.source_ip = extract_peer_ip(context->peer());
+            ev.result = "denied";
+            if (!audit_store_->log(ev))
+                signal_grpc_audit_failed(context);
+        }
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, message);
+    };
+
+    const auto idents = extract_peer_identities(*context);
+    if (idents.empty()) {
+        // The listener requires a client certificate, so a peer without an
+        // identity here is anomalous rather than a bootstrap case. Register keeps
+        // its bootstrap exemption; an OTA pull has none, because an agent pulling
+        // an update is by definition already enrolled.
+        return deny("no_client_identity", "client certificate required");
+    }
+
+    // Hermes CRITICAL-1, same reasoning as Register: in a multi-CA trust bundle a
+    // foreign certificate carrying a spoofed CN=<agent_id> must not be accepted
+    // as a Yuzu agent identity. When no recognizer is wired (operator-supplied
+    // single trust root) every authenticated cert is an agent — legacy behaviour.
+    const std::string peer_pem = extract_peer_cert_pem(*context);
+    if (peer_cert_recognizer_ && !peer_cert_recognizer_(peer_pem))
+        return deny("foreign_ca", "client certificate was not issued by this server's CA");
+
+    // Bind the request-body agent_id to the certificate. Until this, agent_id was
+    // client-supplied and unverified, yet it drives rollout eligibility
+    // (UpdateRegistry::is_eligible) and is logged as the acting identity.
+    if (!claimed_agent_id.empty() && !peer_identity_matches_agent_id(*context, claimed_agent_id))
+        return deny("agent_id_mismatch",
+                    "agent_id must match client certificate identity (CN/SAN)");
+
+    return grpc::Status::OK;
+}
 
 std::vector<std::string>
 AgentServiceImpl::extract_peer_identities(const grpc::ServerContext& context) {

@@ -48,6 +48,84 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
+  # ── YuzuOtaRefundDivergence (#913 / #911) ────────────────────────────────
+  #
+  # The invariant this pins is the one that keeps issues #934 and #941 closed:
+  # a transfer aborted by a SERVER-imposed deadline must refund the rate token
+  # it was charged at admission. If a future refactor drops a refund_token()
+  # call from one of the DownloadUpdate deadline branches, charges outrun
+  # refunds and a slow-link agent can spend itself into a lockout again --
+  # silently, because nothing else observes it.
+
+  # CASE A -- divergence fires: deadlines abort but nothing refunds. This is
+  # exactly the shape a dropped refund_token() produces.
+  #
+  # This case also pins the AGGREGATION. The two sides of the rule carry
+  # different labels (phase= on the deadline counter, decision= on the
+  # admission counter), so an unaggregated vector comparison matches nothing
+  # and the rule silently never fires no matter how far the two diverge. The
+  # first draft of this rule shipped exactly that bug and this case is what
+  # caught it -- it goes RED again if the sum by (job, instance) is removed.
+  - interval: 1m
+    name: ota refund divergence - deadline aborts with no refunds fires
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+1x60"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="refunded"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+
+  # CASE B -- the healthy path must stay quiet: every deadline abort refunds,
+  # one for one. RED if the rule were written with the comparison inverted or
+  # with a `>=`, which would fire on a correctly-behaving server forever.
+  - interval: 1m
+    name: ota refund divergence - matched charges and refunds stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+1x60"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="refunded"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # ── YuzuOtaConcurrencyRejections (#913) ──────────────────────────────────
+
+  # CASE C -- the primary bound firing: a peer repeatedly refused for holding
+  # too many parallel transfers. RED if the rule were pointed at
+  # decision="rejected_rate" instead, which is the loose secondary bound and
+  # deliberately NOT alerted.
+  - interval: 1m
+    name: ota concurrency - sustained rejections fire
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_concurrency"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing", decision="rejected_concurrency", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE D -- rate-only rejections must NOT wake anyone. This is the
+  # deliberate non-alert recorded in the rule group's comment: the bucket is
+  # expected to reject during a fleet-wide rollout.
+  - interval: 1m
+    name: ota concurrency - rate-only rejections stay quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_rate"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
   # ── YuzuServerRestartLoop ─────────────────────────────────────────────────
   #
   # #2854 rung C: the crash-loop signal in its own right, previously only a
