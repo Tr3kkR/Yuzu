@@ -127,15 +127,20 @@ run falls to the prefix restore-key and then saves a fresh multi-GB entry —
 the canary's copies alone ran the repo 7x over GitHub's 10 GB cache quota,
 and the resulting LRU eviction degraded the canary itself and starved every
 other cache (measured 2026-09-01; fixed in the same change that rewrote this
-recipe). Bucket by ISO week — one saved entry per week per scope; later
-same-week runs exact-hit and skip the save:
+recipe). Bucket by TIME — one saved entry per bucket per scope; later
+same-bucket runs exact-hit and skip the save. Pick the bucket width from the
+trade: shorter = fresher cache (hit-rate decay is capped at the bucket width)
+but more live entries against the 10 GB repo quota. The canary uses a rolling
+3-day bucket (~2-3 live entries; a weekly bucket risked heavy-week Thu/Fri
+decay, daily would hold up to 7 entries):
 
 ```yaml
-- name: Compute ccache week bucket
-  run: echo "CCACHE_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
-# %G (ISO year) pairs with %V (ISO week) — %Y mispairs at year boundaries.
+- name: Compute ccache time bucket
+  run: echo "CCACHE_BUCKET=$(( $(date -u +%s) / 259200 ))" >> "$GITHUB_ENV"
+# 259200 s = 3 days. (If you prefer a calendar week: date -u +%G-W%V —
+# %G ISO year pairs with %V ISO week; %Y mispairs at year boundaries.)
 ...
-key: ccache-<leg>-${{ env.CCACHE_WEEK }}
+key: ccache-<leg>-${{ env.CCACHE_BUCKET }}
 restore-keys: |
   ccache-<leg>-
 ```

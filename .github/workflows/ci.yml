@@ -2313,7 +2313,7 @@ jobs:
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
             vcpkg-canary-x64-linux-
 
-      - name: Compute ccache week bucket (canary)
+      - name: Compute ccache time bucket (canary)
         # The ccache key deliberately does NOT hash sources any more. The
         # source-hash key (previous design, #3270) never exact-hit on a repo
         # doing ~75 commits/day, so EVERY canary run fell to the prefix
@@ -2327,32 +2327,37 @@ jobs:
         # wrong object, only a smaller hit rate. (That guarantee is
         # load-bearing on CCACHE_SLOPPINESS staying unset and compiler_check
         # at its default for this job — a future sloppiness edit voids it,
-        # and the key design with it.) An ISO-week bucket gives
-        # roughly one saved entry per week: the week's first completed run
-        # saves, subsequent runs exact-hit (skip the save) and absorb
-        # source drift via ccache's own internal hashing.
-        run: echo "CCACHE_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+        # and the key design with it.) A rolling 3-DAY bucket (epoch days
+        # div 3 — no calendar alignment needed, the boundary is arbitrary):
+        # the bucket's first completed run saves, later runs exact-hit
+        # (skip the save) and absorb source drift via ccache's internal
+        # hashing. 3 days caps hit-rate decay at ~3 days of dev drift
+        # (operator call over a weekly bucket, whose Thu/Fri decay on a
+        # heavy week was the residual risk) while keeping live entries to
+        # ~2-3 per scope (<= ~6 GB at the 2G cap) — daily buckets would
+        # re-crowd the quota this change frees.
+        run: echo "CCACHE_BUCKET=$(( $(date -u +%s) / 259200 ))" >> "$GITHUB_ENV"
 
       - name: Restore ccache (canary)
         # ccache is `apt-get install`-ed and used as the compiler wrapper
         # below, but the GHA-hosted runner is fresh-disk per job — without
         # this cache step every TU compiles cold every run. Mirrors the
-        # macOS pattern; weekly-bucket key per the step above. Closes the
+        # macOS pattern; 3-day-bucket key per the step above. Closes the
         # canary's biggest unforced-loss perf hole (#743).
         #
         # #3269 (thin-entry occupancy) trade, decided deliberately: a run
-        # whose Build fails EARLY in a fresh week saves a thin entry that
-        # occupies the week's key until Monday. Accepted because (a) the
+        # whose Build fails EARLY in a fresh bucket saves a thin entry that
+        # occupies the bucket's key until it rolls. Accepted because (a) the
         # save gate below already excludes cancellations, the routine thin
         # producer, (b) an early hard Build failure on the canary is rare
         # (it builds merge refs that compile on the required legs), and
-        # (c) the blast radius is bounded to one week — the source-hash
+        # (c) the blast radius is bounded to 3 days — the source-hash
         # design this replaces had the unbounded-growth failure instead.
         id: cache-ccache-canary
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
-          key: ccache-canary-x64-linux-${{ env.CCACHE_WEEK }}
+          key: ccache-canary-x64-linux-${{ env.CCACHE_BUCKET }}
           restore-keys: |
             ccache-canary-x64-linux-
 
@@ -2472,17 +2477,18 @@ jobs:
       # the vcpkg tree above, a partial save is not a correctness problem. But key
       # OCCUPANCY bites both classes: `cache-hit != 'true'` means a thin entry,
       # once written, is exact-hit by every later run on the same key, which then
-      # skips its own save. The key is immutable and now WEEKLY (see the restore
-      # step), so a thin entry occupies the whole week — worse in duration than
-      # the old source-hash key, which #3269 tracked. Under `cancel-in-progress`
-      # on PRs, cancelled runs are the routine producer of thin entries.
+      # skips its own save. The key is immutable and now a 3-DAY BUCKET (see the
+      # restore step), so a thin entry occupies its bucket until it rolls —
+      # longer-lived than under the old source-hash key, which #3269 tracked.
+      # Under `cancel-in-progress` on PRs, cancelled runs are the routine
+      # producer of thin entries.
       #
       # So: save when Build RAN, pass or fail — a failed build still produced
       # objects worth keeping, which is why this is not `== 'success'`. Skip when
       # Build was cancelled or never started. The cost is that a run cancelled
-      # after a long compile loses its cache; a superseding same-week push then
-      # exact-hits nothing (no entry was saved) and writes the week's entry
-      # itself, so the loss is one run's warmth, not the week's.
+      # after a long compile loses its cache; a superseding same-bucket push then
+      # exact-hits nothing (no entry was saved) and writes the bucket's entry
+      # itself, so the loss is one run's warmth, not the bucket's.
       - name: Save ccache (canary)
         # Same CWE-349 gate as "Save vcpkg installed packages (canary)" above
         # — a trusted-fork-ci dispatch must never write fork-built objects

@@ -5,6 +5,6 @@
   grew monotonically. The resulting pool (measured 7x over GitHub's 10 GB repo
   quota) LRU-evicted the canary's own freshest entries - bimodal 8-20 min
   degraded rebuilds - and starved every other cache in the repo. The key is now
-  an ISO-week bucket (roughly one saved entry per week; ccache's own
+  a rolling 3-day bucket (roughly one saved entry per bucket; ccache's own
   preprocessed-input hashing absorbs source drift) and the canary job caps
   `CCACHE_MAXSIZE` at 2G.
