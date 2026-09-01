@@ -7357,6 +7357,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 - **Content-Type:** `text/event-stream`
 - **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
 
+**Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. RBAC-off → unrestricted (legacy-open).
+
 **Reconnect / replay:** the server keeps a per-execution ring buffer of up to 1000 events covering ~30 seconds of activity. Browsers' `EventSource` automatically sends `Last-Event-ID` on reconnect; the server replays events whose monotonic id is greater than that value before resuming live publication.
 
 **Event types:**
@@ -7367,6 +7369,14 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | `execution-progress` | Every `refresh_counts` recompute | counts snapshot — `total`, `succeeded`, `failed`, `running`, `pending` |
 | `execution-completed` | Crossing the all-agents-responded threshold OR `mark_cancelled` | terminal status — `{"status":"succeeded"\|"completed"\|"cancelled"}`. Client should close the EventSource after this event. |
 
+**Confined-subscriber event projection (#1634).** A management-group-confined subscriber (not the execution's dispatcher) does not receive the raw event stream verbatim — a shared projector (`execution_event_scope.hpp`) applies one of three treatments per event, so a subscriber can never learn about agents outside their visible set:
+
+| Event | Confined treatment |
+|---|---|
+| `agent-transition` | Filtered by `agent_id` — only transitions for agents in the caller's visible set are forwarded; others are silently dropped. |
+| `execution-progress` | Dropped entirely — the counts snapshot is execution-wide and carries no `agent_id` to filter by, so it cannot be safely narrowed. |
+| `execution-completed` | Sanitized, not dropped — the real terminal `status` is preserved (so the client still knows to close its stream) but nothing else is added. |
+
 **Status-code map:**
 
 | HTTP status | Condition |
@@ -7374,7 +7384,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | 200 | Stream attached; events follow |
 | 401 | No session / token |
 | 403 | RBAC `Execution:Read` denied |
-| 404 | `{id}` does not exist in the execution tracker |
+| 404 | `{id}` does not exist in the execution tracker, **or exists but is not visible within the caller's management-group scope** — the two are deliberately indistinguishable (no existence oracle, #1634) |
 | 410 | Execution is already in a terminal status (succeeded / completed / cancelled / failed). Tells `EventSource` to stop reconnecting. |
 | 429 | Shared held-open-stream budget exhausted (ADR-0034). Body is plain text (`too many live streams open — close a tab and retry`) with a `Retry-After: 5` header — note this surface predates the A4 envelope and does not use it. |
 | 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
@@ -7385,7 +7395,7 @@ from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, MCP streamed POS
 drawers — or enough traffic on any of the other surfaces — can cause a *new* drawer to be
 refused with `429`. A live stream is never evicted to make room.
 
-**Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
+**Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). A subscribe request against an execution that is genuinely nonexistent OR merely out of the caller's scope (the 404 case above) also emits a `result=denied` row on the same action, using non-distinguishing detail text — the two cases must remain audit-indistinguishable, matching the response HTTP status. Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
 **Example (curl):**
 
@@ -7435,6 +7445,8 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 **Permission:** `Execution:Read`.
 **Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
 
+**Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling — see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only).
+
 **Required query parameter:**
 
 | Parameter | Type | Description |
@@ -7476,7 +7488,7 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 | 400 | A4 envelope | Missing or malformed `execution_id` |
 | 401 | (auth layer) | No session / token |
 | 403 | (perm layer) | RBAC `Execution:Read` denied |
-| 404 | A4 envelope | Execution does not exist |
+| 404 | A4 envelope | Execution does not exist, **or exists but is not visible within the caller's management-group scope** — deliberately indistinguishable (no existence oracle, #1634) |
 | 410 | A4 envelope | Execution already terminal |
 | 429 | A4 envelope with `retry_after_ms:5000` | Shared held-open-stream budget exhausted (ADR-0034). Remediation text: `close an existing /api/v1/events stream, or raise --max-sse-streams` |
 | 503 | A4 envelope with `retry_after_ms:5000` | Tracker or event bus not initialised (server warmup window) |
@@ -7511,7 +7523,7 @@ A4 envelope shape:
 | `X-Content-Type-Options` | `nosniff` | Belt-and-braces against MIME sniffing. |
 | `Sec-Audit-Failed` | `true` (only when audit persist failed) | SOC 2 CC6.6 evidence contract: subscription proceeded even though the audit row failed to persist (matches the PR #883 / W1.1 partial-failure pattern). |
 
-**Audit:** every successful subscribe emits one `api.v1.events.subscribe` audit event (separate verb from the dashboard sibling's `execution.live_subscribe` so SIEM filters can distinguish browser vs agentic consumers). Per-session-per-execution dedup is **not** currently implemented (Deferred-5 / #700); a worker reconnecting frequently generates one row per reconnect.
+**Audit:** every successful subscribe emits one `api.v1.events.subscribe` audit event (separate verb from the dashboard sibling's `execution.live_subscribe` so SIEM filters can distinguish browser vs agentic consumers). A subscribe request against an execution that is genuinely nonexistent OR merely out of the caller's scope (the 404 case above) also emits a `result=denied` row on the same action, using non-distinguishing detail text — the two cases must remain audit-indistinguishable, matching the response HTTP status. Per-session-per-execution dedup is **not** currently implemented (Deferred-5 / #700); a worker reconnecting frequently generates one row per reconnect.
 
 **Restart behaviour:** the bus is in-process and in-memory. On server restart, every `Last-Event-ID` is invalidated — replays against an event id assigned by a previous process instance return nothing even if the execution is still active. Workers should fall back to `GET /api/v1/executions/<id>` to recover terminal state after a 503 or a long disconnect.
 

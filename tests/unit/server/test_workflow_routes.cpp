@@ -1369,8 +1369,17 @@ TEST_CASE("SSE handler: invisible terminal execution collapses to the missing-id
     CHECK(missing->status == 404);
     CHECK(invisible->body == missing->body);
     CHECK(h.event_bus->subscriber_count(exec_id) == 0);
-    for (const auto& a : h.audit_calls)
-        CHECK(a.action != "execution.live_subscribe");
+    // #1634 (governance Gate 6 compliance-officer fix): a suppressed
+    // cross-operator subscribe attempt now DOES get a distinct `denied` audit
+    // row (CC7.2 evidence, parity with the REST twin) — it must never be the
+    // `success`-shaped row a genuine admit gets.
+    bool saw_denied = false;
+    for (const auto& a : h.audit_calls) {
+        CHECK(a.result != "success");
+        if (a.action == "execution.live_subscribe" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
 }
 
 // ── ADR-0034 shared-budget admission (governance regression guards) ─────────

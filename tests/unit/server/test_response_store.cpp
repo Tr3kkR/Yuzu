@@ -929,6 +929,57 @@ TEST_CASE("ResponseStore: aggregate scope AND filter.agent_id compose — out-of
     CHECK(total == 1);
 }
 
+TEST_CASE("ResponseStore: query/aggregate scope applies past 10000 agents, no silent "
+          "truncation (#1634 sre finding)",
+          "[pg][response_store][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_agg_resp("instr-bigscope", "agent-real", 0));
+
+    // append_scope_clause previously bound one placeholder per agent behind
+    // a 10,000-agent cap: query()/query_by_execution() silently dropped rows
+    // past it, and aggregate() silently under-counted with no indicator at
+    // all (I3 wrong-result-presented-as-correct). Put the one real agent
+    // LAST, past where the old cap would have excluded it.
+    std::vector<std::string> big_scope(10001, "no-such-agent");
+    big_scope[10000] = "agent-real";
+
+    ResponseQuery q;
+    auto rows = store.query("instr-bigscope", q, AggregateScope{big_scope});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].agent_id == "agent-real");
+
+    AggregationQuery aq;
+    aq.group_by = "agent_id";
+    aq.op = AggregateOp::Count;
+    auto rs = store.aggregate("instr-bigscope", aq, {}, AggregateScope{big_scope});
+    REQUIRE(rs.has_value());
+    REQUIRE(rs->size() == 1);
+    CHECK((*rs)[0].group_value == "agent-real");
+    CHECK((*rs)[0].count == 1);
+}
+
+TEST_CASE("ResponseStore: scope agent id containing a double-quote is escaped, not "
+          "corrupted (#1634 sre follow-up)",
+          "[pg][response_store][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    const std::string tricky_agent = R"(agent-"quoted",comma)";
+    store.store(mk_agg_resp("instr-escape", tricky_agent, 0));
+    store.store(mk_agg_resp("instr-escape", "agent-other", 0)); // OUT of scope
+
+    ResponseQuery q;
+    auto rows = store.query("instr-escape", q, AggregateScope{{tricky_agent}});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].agent_id == tricky_agent);
+}
+
 TEST_CASE("ResponseStore: distinct_agent_ids / aggregate return nullopt on a closed store "
           "(#1634 UP-2)",
           "[response_store][scope]") {
@@ -1957,11 +2008,12 @@ TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count apply the WHOLE 
     resp.output = "high|net|t1|d1\nhigh|net|t2|d2";
     store.store(resp);
 
-    // kScopeAgentBindCap (response_store.cpp) bounds the *aggregate()*
-    // scope path at 10000 — the array-bind path this test exercises
-    // (ANY($n::text[])) must apply the WHOLE scope with no such cap. Put
-    // the one agent that actually has facet rows LAST, past where the old
-    // cap would have cut it off.
+    // append_scope_clause (response_store.cpp) previously bound one
+    // placeholder per agent behind a 10,000-agent cap, silently dropping
+    // rows/under-counting aggregates past it (#1634 sre finding). Now a
+    // single ANY($n::text[]) bind applies the WHOLE scope regardless of
+    // size — put the one agent that actually has facet rows LAST, past
+    // where the old cap would have cut it off.
     std::vector<std::string> big_scope(10001, "no-such-agent");
     big_scope[10000] = "agent-cap";
 

@@ -703,19 +703,19 @@ int sanitize_limit(int limit) {
     return limit > 0 ? limit : ResponseQuery{}.limit; // struct default (100)
 }
 
-// Upper bound on the management-group IN-list (#1634) — same cap as the
-// SQLite original. Shared by every scoped read below.
-constexpr std::size_t kScopeAgentBindCap = 10000;
-
-// Appends `AND agent_id IN (...)` / `AND 1=0` to `sql` (advancing `idx`/
-// `binds` past whatever it binds), or does nothing when `scope` is
+// Appends `AND agent_id = ANY($n::text[])` / `AND 1=0` to `sql` (advancing
+// `idx`/`binds` past whatever it binds), or does nothing when `scope` is
 // unrestricted (nullopt). MUST be called before `ORDER BY`/`LIMIT`/`OFFSET`
 // or `GROUP BY` — ADR-0017 INV-3 (CRITICAL): a paginated/aggregated read
 // that filters after LIMIT can hand a confined caller a short or empty page
 // even though visible rows exist past the ones a post-fetch filter dropped.
-// `caller` names the call site in the bind-cap warning only.
+// One array bind regardless of set size (mirrors `facet_values`/
+// `facet_agent_count` above) — an earlier version of this helper bound one
+// placeholder per agent behind a 10,000-agent cap and silently truncated
+// (and, for `aggregate`, silently under-counted) past it; `pg::to_text_array`
+// removes the cap rather than raising it.
 void append_scope_clause(std::string& sql, std::vector<std::string>& binds, int& idx,
-                         const AggregateScope& scope, const char* caller) {
+                         const AggregateScope& scope) {
     if (!scope.has_value())
         return;
     const auto& allowed = *scope;
@@ -723,18 +723,9 @@ void append_scope_clause(std::string& sql, std::vector<std::string>& binds, int&
         sql += " AND 1=0"; // visible to no one → exclude every row
         return;
     }
-    const std::size_t n = std::min<std::size_t>(allowed.size(), kScopeAgentBindCap);
-    if (n < allowed.size())
-        spdlog::warn("ResponseStore::{}: in-scope agent set ({}) exceeds bind cap ({}); "
-                    "results computed over the first {} agents (#1634)",
-                    caller, allowed.size(), kScopeAgentBindCap, n);
-    sql += " AND agent_id IN (";
-    for (std::size_t i = 0; i < n; ++i) {
-        sql += (i == 0) ? "$" + std::to_string(idx) : ",$" + std::to_string(idx);
-        binds.push_back(allowed[i]);
-        idx++;
-    }
-    sql += ")";
+    std::vector<std::string_view> sv(allowed.begin(), allowed.end());
+    sql += " AND agent_id = ANY($" + std::to_string(idx++) + "::text[])";
+    binds.push_back(pg::to_text_array(sv));
 }
 
 } // namespace
@@ -765,7 +756,7 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
                 binds.push_back(std::to_string(q.until));
             }
-            append_scope_clause(sql, binds, idx, scope, "query");
+            append_scope_clause(sql, binds, idx, scope);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
@@ -816,7 +807,7 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
                 binds.push_back(std::to_string(q.until));
             }
-            append_scope_clause(sql, binds, idx, scope, "query_by_execution");
+            append_scope_clause(sql, binds, idx, scope);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
@@ -896,7 +887,7 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
                 binds.push_back(filter.agent_id);
             }
             // #1634 management-group scope (filter-BEFORE-aggregate).
-            append_scope_clause(sql, binds, idx, scope, "aggregate");
+            append_scope_clause(sql, binds, idx, scope);
             if (filter.status >= 0) {
                 sql += " AND status = $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(filter.status));

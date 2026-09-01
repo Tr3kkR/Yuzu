@@ -383,6 +383,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const bool owns_execution =
                 exec_opt && exec_opt->dispatched_by == session->username;
             if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
+                // #1634 (governance Gate 6 compliance-officer finding): a
+                // suppressed cross-operator read attempt is CC7.2-evidence-worthy
+                // the same way the REST twin (GET /api/v1/executions/{id}) and
+                // MCP get_execution_status treat it — audit it distinctly, using
+                // the SAME non-distinguishing detail text so no enumeration
+                // oracle is reopened via query_audit_log.
+                (void)audit_fn(req, "execution.detail.view", "denied", "Execution", exec_id,
+                               "not found or outside caller's fleet-read scope");
                 res.status = 404;
                 res.set_content("<div class=\"empty-state\">Execution not found</div>",
                                 "text/html; charset=utf-8");
@@ -899,6 +907,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  const bool owns_execution =
                      exec_opt && exec_opt->dispatched_by == session->username;
                  if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
+                     // #1634 (governance Gate 6 compliance-officer finding): a
+                     // suppressed cross-operator subscribe attempt is
+                     // CC7.2-evidence-worthy the same way the REST twin
+                     // (GET /api/v1/events) treats it — audit it distinctly,
+                     // using the SAME non-distinguishing detail text so no
+                     // enumeration oracle is reopened via query_audit_log.
+                     (void)audit_fn(req, "execution.live_subscribe", "denied", "Execution",
+                                    exec_id, "not found or outside caller's fleet-read scope");
                      res.status = 404;
                      res.set_content("execution not found", "text/plain; charset=utf-8");
                      return;
