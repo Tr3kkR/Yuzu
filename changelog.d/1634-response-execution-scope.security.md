@@ -1,1 +1,1 @@
-- Confine response, execution-detail, visualization, and execution-event reads to the caller's visible management-group agents.
+- Confine response, execution-detail, visualization, and execution-event reads to the caller's visible management-group agents (MCP `list_executions` is confined to the caller's own dispatches instead, since execution rows carry no single agent to filter by).

@@ -401,20 +401,21 @@ static const ToolDef kTools[] = {
      "dispatch is still in flight; a result without it (even with zero rows) means "
      "no rows currently match, or (instruction_id-only queries) in-flight-ness "
      "could not be determined. "
-     "A per-agent management-group filter is applied but is INERT under the current "
-     "global Response:Read gate (a normal holder receives rows for all agents; "
-     "effective scoping needs the #1634 gate change); its active effect today is "
-     "failing closed (zero rows) when the RBAC store is corrupt.",
+     "Confined by management group: a caller admitted through a management-group "
+     "grant sees only their in-scope agents' rows, pushed into the underlying query "
+     "before the row-limit cap so a confined caller's page is never truncated by "
+     "hidden rows; a global Response:Read holder sees every agent's rows unchanged. "
+     "Fails closed (zero rows) when the RBAC store is corrupt.",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
      R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"timestamp":{"type":"integer"}},"required":["agent_id","execution_id","status","output","timestamp"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
-     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. A per-agent management-group "
-     "filter is applied before aggregation but is INERT under the current global Response:Read gate "
-     "(a normal Response:Read holder aggregates across all agents; effective scoping needs the #1634 "
-     "gate change). Active effect today: fails closed (a JSON-RPC error, never empty totals) when the "
-     "RBAC store is corrupt or the response read errors. A denied-scope audit row is emitted on a "
-     "drop.",
+     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. Confined by management group: "
+     "the caller's visible-agent set is resolved and applied to the aggregation source rows BEFORE "
+     "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "
+     "agents; a global Response:Read holder's totals are unchanged. Fails closed (a JSON-RPC error, "
+     "never empty totals) when the RBAC store is corrupt or the response read errors. A denied-scope "
+     "audit row is emitted on a drop.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})",
      R"j({"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"group_value":{"type":"string"},"count":{"type":"integer"},"aggregate_value":{"type":"number"}},"required":["group_value","count","aggregate_value"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["results"]})j"},
 
@@ -485,11 +486,19 @@ static const ToolDef kTools[] = {
      "non-terminal the result includes retry_after_ms, the minimum wait in "
      "milliseconds before polling again. Prefer the streamed execute_instruction "
      "response (or a GET resume by execution_id) when streaming is available; "
-     "poll this tool as the fallback when it is not.",
+     "poll this tool as the fallback when it is not. Confined by management group: "
+     "an execution with no agent visible to the caller returns the same error as a "
+     "nonexistent execution_id; a confined non-dispatcher's counts/progress are "
+     "computed from only their visible agents and scope_expression is redacted — "
+     "the caller who dispatched the execution always sees the true values.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
 
-    {"list_executions", "List recent command executions.",
+    {"list_executions", "List recent command executions. Confined by management group: a "
+     "caller admitted through a management-group grant (rather than a global permission) "
+     "sees only executions they themselves dispatched — a narrower interim mechanism than "
+     "the visible-agent filtering other read tools apply, since execution rows carry no "
+     "single agent_id to filter by.",
      R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})",
      R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"}},"required":["id","definition_id","status","dispatched_by","dispatched_at","agents_targeted","agents_responded"]}}},"required":["executions"]})j"},
 

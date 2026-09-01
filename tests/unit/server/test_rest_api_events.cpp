@@ -506,9 +506,17 @@ TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[pg][events][notf
     REQUIRE(res->status == 404);
     REQUIRE(res->body.find("execution not found") != std::string::npos);
     REQUIRE(res->body.find(R"("correlation_id":"req-)") != std::string::npos);
-    // 404 deliberately does NOT audit — leaking enumeration evidence
-    // into the audit log would give an attacker a side channel.
-    REQUIRE(h.audit_log.empty());
+    // #1634 (governance Gate 4 fix): a `denied` audit row is now emitted here
+    // (CC7.2 evidence, parity with MCP get_execution_status and every other
+    // migrated route's scope-drop audit). This does NOT reopen an enumeration
+    // side channel: the audited detail string is IDENTICAL for a genuinely
+    // nonexistent id and an exists-but-invisible one (no distinguishing text),
+    // matching the #1700/#3558 precedent for get_agent_details — the
+    // distinguishing fact lives only in a server-side spdlog::debug line no
+    // audited-evidence reader (including query_audit_log) can reach.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "api.v1.events.subscribe");
+    CHECK(h.audit_log[0].result == "denied");
 }
 
 TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[pg][events][terminal]") {
@@ -1170,8 +1178,18 @@ TEST_CASE("GET /api/v1/events: real fleet-read gate collapses an invisible "
     missing_json["error"].erase("correlation_id");
     CHECK(invisible_json == missing_json);
     CHECK(h.event_bus->subscribers_total() == 0);
-    for (const auto& a : h.audit_log)
-        CHECK(a.action != "api.v1.events.subscribe");
+    // #1634 (governance Gate 4 consistency-auditor fix): a suppressed
+    // cross-operator subscribe attempt now DOES get a distinct `denied` audit
+    // row (CC7.2 evidence, parity with MCP get_execution_status) — it must
+    // never be the `success`-shaped `execution.live_subscribe`/subscribe row a
+    // genuine admit gets.
+    bool saw_denied = false;
+    for (const auto& a : h.audit_log) {
+        CHECK(a.result != "success");
+        if (a.action == "api.v1.events.subscribe" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retry_after_ms",

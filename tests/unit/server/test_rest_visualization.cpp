@@ -602,10 +602,22 @@ TEST_CASE("REST visualization: management-group scope drops out-of-scope agents'
     CHECK(d["meta"]["responses_total"] == 1);
     // sshd never appears anywhere in the body.
     CHECK(res->body.find("sshd") == std::string::npos);
-    // The out-of-scope drop is recorded on the success audit detail.
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].result == "success");
-    CHECK(h.audit_log[0].detail.find("scope_dropped=1") != std::string::npos);
+    // #1634 (governance Gate 4 fix): the out-of-scope drop is a distinct
+    // `denied` audit row (CC7.2 evidence), paired with the `success` row for
+    // the served set — same shape as the legacy responses routes / MCP
+    // query_responses/aggregate_responses, not folded into the success detail.
+    REQUIRE(h.audit_log.size() == 2);
+    bool saw_denied = false, saw_success = false;
+    for (const auto& a : h.audit_log) {
+        if (a.result == "denied") {
+            saw_denied = true;
+            CHECK(a.detail.find("scope_dropped=1") != std::string::npos);
+        }
+        if (a.result == "success")
+            saw_success = true;
+    }
+    CHECK(saw_denied);
+    CHECK(saw_success);
 }
 
 TEST_CASE("REST visualization: every agent out of scope → empty chart, no leak (#1634)",

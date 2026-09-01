@@ -6823,8 +6823,8 @@ void RestApiV1::register_routes(
     // /api/v1/events startup-window behavior.
     sink.Get(
         R"(/api/v1/executions/([A-Za-z0-9_-]{1,128}))",
-        [auth_fn, fleet_read_fn, execution_tracker](const httplib::Request& req,
-                                                    httplib::Response& res) {
+        [auth_fn, fleet_read_fn, audit_fn, execution_tracker](const httplib::Request& req,
+                                                              httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             if (!fleet_read_fn) {
@@ -6873,6 +6873,13 @@ void RestApiV1::register_routes(
                 exec_opt && exec_opt->dispatched_by == session->username;
             const bool visible = !gate.scope || owns_execution || has_visible_agent;
             if (!exec_opt || !visible) {
+                // #1634 (governance Gate 4 consistency-auditor finding): a
+                // suppressed cross-operator read attempt is CC7.2-evidence-worthy
+                // the same way the sibling MCP get_execution_status treats it —
+                // audit it distinctly, even though the caller-visible response
+                // stays identical to a nonexistent execution_id (no oracle).
+                (void)audit_fn(req, "execution.detail.fetch", "denied", "Execution", exec_id,
+                               "not found or outside caller's fleet-read scope cid=" + cid);
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "execution not found", cid),
                                 "application/json");
@@ -7214,14 +7221,19 @@ void RestApiV1::register_routes(
                 final_json += "}";
             }
             res.set_content(ok_json(final_json), "application/json");
-            // Record the out-of-scope drop count on the success audit detail (#1634)
-            // so an operator charting outside their groups leaves a trail, without
-            // changing the single-row audit shape this endpoint already emits.
-            std::string audit_detail = definition_id + " index=" + std::to_string(chart_index);
+            // #1634 (governance Gate 4 consistency-auditor finding): a scope-drop
+            // is a security-relevant event — emit the SAME paired denied+success
+            // audit shape server.cpp's legacy responses routes and MCP
+            // query_responses/aggregate_responses already use, rather than folding
+            // scope_dropped only into the success detail. A SIEM rule keyed on
+            // `result=denied` now sees this route's drops too, and a mid-request
+            // 503 after scope resolution no longer loses the CC7.2 evidence.
             if (scope_dropped > 0)
-                audit_detail += " scope_dropped=" + std::to_string(scope_dropped);
+                (void)audit_fn(req, "execution.visualization.fetch", "denied", "execution",
+                               execution_id,
+                               definition_id + " scope_dropped=" + std::to_string(scope_dropped));
             audit_fn(req, "execution.visualization.fetch", "success", "execution", execution_id,
-                     audit_detail);
+                     definition_id + " index=" + std::to_string(chart_index));
         });
 
     // ── Inventory Evaluation (capability 15.4) ────────────────────────────
@@ -12181,6 +12193,13 @@ void RestApiV1::register_routes(
             spdlog::debug("api.v1.events.subscribe: {} cid={} principal={} exec_id={}",
                           exec_opt ? "outside caller fleet-read scope" : "execution not found",
                           cid, session->username, exec_id);
+            // #1634 (governance Gate 4 consistency-auditor finding): a suppressed
+            // cross-operator subscribe attempt is CC7.2-evidence-worthy the same
+            // way the sibling MCP get_execution_status treats it — audit it
+            // distinctly from a genuine 401/403, even though the caller-visible
+            // response stays identical to a nonexistent execution_id.
+            (void)audit_fn(req, "api.v1.events.subscribe", "denied", "Execution", exec_id,
+                           "not found or outside caller's fleet-read scope cid=" + cid);
             res.status = 404;
             res.set_content(detail::error_json_a4(404, "execution not found", cid),
                             "application/json");
