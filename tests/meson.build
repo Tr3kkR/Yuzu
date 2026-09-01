@@ -303,6 +303,12 @@ agent_test_exe = executable(
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
     'unit/test_wifi_corewlan.cpp',
+    'unit/test_wifi_parsers.cpp',           # PKG-WIFI: pure nmcli/iw/iwlist/iwconfig/airport/
+                                              # system_profiler text parsers + NM D-Bus AP-tuple helpers
+    'unit/test_wifi_local_dispatcher.cpp',  # PKG-WIFI remediation: real wifi.dylib/.so driven
+                                              # end to end via LocalDispatcher (POSIX-only; a no-op
+                                              # TU on Windows via the file's own #ifndef _WIN32 guard),
+                                              # same pattern as test_users_posix_actions.cpp
     'unit/test_interaction_parsers.cpp',
     'unit/test_hardware_disks_macos.cpp',
     'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
@@ -425,6 +431,15 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
+    'unit/test_software_actions_parsers.cpp', # Wave 4 PR4.3b: software_actions' FIRST tests --
+                                                # pure winget/apt/yum/softwareupdate/dpkg-query parsers
+    'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so/.dll
+                                                # driven end to end via LocalDispatcher
+                                                # (installed_count only; the Windows leg covers the
+                                                # native rung-1 Uninstall-key registry read)
+    'unit/test_license_scan_actions.cpp',     # Wave 4 PR4.3b: real license_scan.dylib/.so driven
+                                                # end to end via LocalDispatcher after the Linux-leg
+                                                # runner migration (POSIX-only, a no-op TU on Windows)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -457,6 +472,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/netstat/src'),        # netstat_parsers.hpp (gate-2 remediation pure parser)
     include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
     include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
+    include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -493,6 +509,8 @@ agent_test_exe = executable(
   # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
   # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
   # (Wave 3 PR33d code-review remediation).
+  # wifi_plugin_lib (agents/plugins/wifi/meson.build): test_wifi_local_dispatcher.cpp
+  # loads the real wifi plugin by path for the same reason (PKG-WIFI).
   # event_logs_plugin_lib: same reasoning for test_event_logs_{posix,win}_actions.cpp
   # (Wave 4 PR4.2 native-acquisition migration remediation).
   # installed_apps_plugin_lib / msi_packages_plugin_lib
@@ -509,13 +527,41 @@ agent_test_exe = executable(
   # link_depends, a fresh build could leave the test executable built before
   # the fixture exists (build-ci B3's lesson: a fixture with no consumer in
   # the meson graph can silently stop building unnoticed).
-  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
-                users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
-                network_diag_plugin_lib, ioc_plugin_lib,
-                hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
-                windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
-                installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib,
-                content_dist_plugin_lib, script_exec_plugin_lib, echo_argv_fixture],
+  # One identifier per line, alphabetized: this array has been repeatedly
+  # corrupted (a stray extra closing bracket followed by more list items,
+  # breaking meson configure on every platform) by the automated dev-merge-
+  # into-open-PR-branches bot's line-based 3-way merge -- two different PRs
+  # each appending one plugin identifier to the same shared wrapped line look
+  # like non-conflicting inserts to a line-based merge, but the combined
+  # result is invalid. One-per-line makes two independent appends land as
+  # two independent inserted lines, which merges cleanly. Do not repack this
+  # onto fewer lines -- see the identical, already-safe shape in
+  # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
+  link_depends: [
+                abi3_fixture_plugin,
+                content_dist_plugin_lib,
+                device_identity_plugin_lib,
+                echo_argv_fixture,
+                event_logs_plugin_lib,
+                hardware_plugin_lib,
+                installed_apps_plugin_lib,
+                invalid_name_fixture_plugin,
+                ioc_plugin_lib,
+                license_scan_plugin_lib,
+                msi_packages_plugin_lib,
+                netstat_plugin_lib,
+                network_config_plugin_lib,
+                network_diag_plugin_lib,
+                os_info_plugin_lib,
+                processes_plugin_lib,
+                reserved_name_fixture_plugin,
+                sccm_plugin_lib,
+                script_exec_plugin_lib,
+                software_actions_plugin_lib,
+                users_plugin_lib,
+                wifi_plugin_lib,
+                windows_updates_plugin_lib,
+                ],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
@@ -758,6 +804,7 @@ if build_server
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_list_read_confinement.cpp',
+      'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',

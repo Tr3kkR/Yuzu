@@ -33,6 +33,20 @@ in one function; IDs are never reused after a site is deleted).
 Populated as the migration reaches each site (and immediately for any new or
 interim site — ADR-3002 Decisions 1 and 2).
 
+> **Limitation of the lexical CI gate — read before relying on it.**
+> `scripts/ci/check-plugin-spawn-lexical.sh` scans for raw spawn TOKENS
+> (`popen`/`system`/`fork`/`CreateProcess`). It does **not** see an interpreter
+> payload routed through the shared bounded runner: an argv vector of the shape
+> `{"/bin/sh","-c", ...}` handed to `run_bounded_subprocess` passes the gate
+> clean. This was confirmed empirically — that exact shape was injected into a
+> migrated plugin and the gate still reported no findings. So the gate enforces
+> "no raw spawn primitive", NOT ADR-3002 Decision 5's "no interpreter", and a
+> future change can silently return a plugin to rung 3 without CI noticing.
+> Until the gate is extended, the only guard is per-plugin: `wifi` pins it with
+> pure argv-builder functions plus a unit test asserting no vector invokes an
+> interpreter (`argv_invokes_interpreter`, `tests/unit/test_wifi_parsers.cpp`).
+
+
 | Site ID | Location | Mechanism | Platform | Provenance | Mutating | Shell features | Privilege | Ladder review | Rung + evidence | Registration |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `users/do_logged_on#1` | `agents/plugins/users/src/users_plugin.cpp:do_logged_on` | runner argv | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
@@ -147,8 +161,26 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `msi_packages/do_list#1` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_list` | runner argv (`pkgutil --pkgs`) | macOS | compile-time literal argv (probe_tool_path-resolved tool path) | read-only | none — the `/bin/sh -c` hop and its `shell_quote()` are gone entirely (direct argv, no shell to quote against) | none | no rung-1 API enumerates pkgutil receipts | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 | `msi_packages/do_list#2` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_list` | runner argv (`pkgutil --pkg-info <id>`), one call per receipt, bounded at `kMaxPackages` (500) | macOS | package identifier is `#1`'s own prior output (local-system enumeration, not operator input); passed as its own argv element, never shell-interpolated | read-only | none — `shell_quote()` deleted; no shell in the call path to quote against | none | no rung-1 API reads a single pkgutil receipt | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 | `msi_packages/do_product_codes#1` | `agents/plugins/msi_packages/src/msi_packages_plugin.cpp:do_product_codes` | runner argv (`pkgutil --pkgs`) | macOS | compile-time literal argv (probe_tool_path-resolved tool path) | read-only | none — `/bin/sh -c` hop gone | none | no rung-1 API enumerates pkgutil receipts | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_windows#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`winget upgrade --accept-source-agreements`), `winget.exe` path built from `%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe` and handed straight to the runner -- NOT `probe_tool_path`, whose `GetBinaryTypeW` gate rejects the zero-byte APPEXECLINK alias (verified: error 1920), which would make this leg dead code | Windows | compile-time literal argv; tool path derived from the native `GetEnvironmentVariableW` read of `%LOCALAPPDATA%`, not operator input | read-only | none — redirection eliminated (`2>nul` -> `merge_stderr=false` default) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_linux#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`apt list --upgradable`) | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_linux#2` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`yum check-update` / `dnf check-update`), tried only when `#1` (apt) produces no rows | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/list_upgradable_macos#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_list_upgradable` | runner argv (`softwareupdate -l`); a probe miss returns UNAVAILABLE before any spawn is attempted | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/installed_count_linux#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_installed_count` | runner argv (`dpkg-query -W -f=${db:Status-Abbrev}\n`; no shell quotes — a single argv element) | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/installed_count_linux#2` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_installed_count` | runner argv (`rpm -qa`), fallback when `#1` (dpkg-query) is absent | Linux | compile-time literal argv | read-only | none | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `software_actions/installed_count_macos#1` | `agents/plugins/software_actions/src/software_actions_plugin.cpp:do_installed_count` | runner argv (`pkgutil --pkgs`); a probe miss returns UNAVAILABLE before any spawn is attempted | macOS | compile-time literal argv | read-only | none — redirection+pipeline eliminated (`2>/dev/null \| wc -l` -> line count moved in-process to `count_nonempty_lines`) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_pkg_metadata_surface_linux#1` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_pkg_metadata_surface` | runner argv (`rpm -qa --queryformat %{NAME}\t%{VERSION}-%{RELEASE}\t%{VENDOR}\t%{LICENSE}\n`; no shell quotes — a single argv element) | Linux | compile-time literal queryformat argv (byte-identical to the pre-migration shell form; rpm's own queryformat engine interprets the `\t`/`\n` escapes, not a shell) | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false); shell single-quoting eliminated (no shell to quote against) | none | no rung-1 API for per-package declared-licence metadata on this OS | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_pkg_metadata_surface_linux#2` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_pkg_metadata_surface` | runner argv (`dpkg-query -W -f=${Package}\t${Version}\t${db:Status-Abbrev}\n`; no shell quotes — a single argv element), tried when `#1` (rpm) is absent | Linux | compile-time literal queryformat argv (byte-identical to the pre-migration shell form) | read-only | none — redirection eliminated; shell single-quoting eliminated | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_entitlement_certs_surface_linux#1` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_entitlement_certs_surface` | runner argv (`openssl x509 -noout -enddate -dateopt iso_8601 -in <cert>`) | Linux | `<cert>` is a path returned by `host.glob("/etc/pki/entitlement/*.pem")` — local-system, not operator input; as a plain argv element it is injection-proof by construction, no shell-quoting needed | read-only | none — redirection eliminated; the `shell_single_quote()` escaping this replaced is gone outright (no shell left to escape against) | none | no rung-1 API for X.509 notAfter parsing on this OS in this plugin (the agent has no shared in-process X509 helper) | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `license_scan/run_entitlement_certs_surface_linux#2` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_entitlement_certs_surface` | runner argv (`openssl x509 -noout -enddate -in <cert>`), fallback when `#1`'s `-dateopt iso_8601` form fails or is truncated | Linux | same as `#1` | read-only | none | none | same as `#1` | 2 — same as `#1` | n/a |
 | `network_config/do_dns_cache#1` | `agents/plugins/network_config/src/network_config_plugin.cpp:do_dns_cache` | runner argv (`resolvectl cache`), path resolved via `yuzu::agent::probe_tool_path` (no PATH search) | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated entirely | none | Reviewed — no public libsystemd/sd-bus API exposes resolved's cache contents; `resolvectl cache` is the only source | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess (was rung 3, `/bin/sh -c`, before this migration) | n/a |
 | `network_config/do_dns_cache#2` | `agents/plugins/network_config/src/network_config_plugin.cpp:do_dns_cache` | runner argv (`systemd-resolve --statistics`), path resolved via `yuzu::agent::probe_tool_path` | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated entirely | none | Reviewed — fallback for hosts where `resolvectl` is absent | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess (was rung 3) | n/a |
+| `wifi/do_list_networks#1` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`nmcli -t -f SSID,SIGNAL,SECURITY,CHAN,BSSID device wifi list`), path via `yuzu::agent::probe_tool_path` | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated | none | rung 1 (NetworkManager D-Bus) implemented in this file and tried first; this argv leg is the declared fallback | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess, reached only on sd-bus failure | n/a |
+| `wifi/do_list_networks#2` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`iw dev`), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — grep/awk pipeline replaced by pure `parse_iw_dev_interfaces` | none | tertiary fallback, reached only when D-Bus and nmcli are both unavailable | Rung 2 — direct argv; rung 1 passed over on the last-resort raw-text path | n/a |
+| `wifi/do_list_networks#3` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`iwlist <iface> scan`), path via `probe_tool_path` | Linux | iface name from local `iw dev` enumeration output, validated by `is_safe_iface_name` (rejects leading `-`, ADR-3002 Decision 6) — never operator input | read-only | none — grep replaced by pure `filter_iwlist_scan_lines` | **root for an active scan** — an unprivileged agent gets no results and the plugin reports the scan as failed, never as an empty airspace (see `docs/agent-privilege-model.md`) | same as #2 | Rung 2 — direct argv | n/a |
+| `wifi/do_list_networks#4` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`airport -s`, fixed private-framework path) | macOS | none — fixed literal argv | read-only | none | none | no Location-Services-free scan API on macOS; native scan path owned by the user-context-bridge work | Rung 2 — direct argv, up from rung 3 (`/bin/sh -c`) before this migration | n/a |
+| `wifi/do_list_networks#5` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`/usr/sbin/system_profiler SPAirPortDataType -detailLevel basic`) | macOS | none — fixed literal argv | read-only | none | none | same as #4 | Rung 2 — direct argv, up from rung 3 | n/a |
+| `wifi/do_connected#1` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_connected` | runner argv (`nmcli -t -f ACTIVE,SSID,SIGNAL,SECURITY,BSSID,DEVICE device wifi list`, ACTIVE row selected), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — line bound via the runner's max_lines | none | rung 1 (NetworkManager D-Bus) tried first; declared fallback | Rung 2 — direct argv, reached only on sd-bus failure | n/a |
+| `wifi/do_connected#2` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_connected` | runner argv (`iwconfig`), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — grep replaced by pure `filter_iwconfig_essid_signal_lines` | none | tertiary fallback | Rung 2 — direct argv | n/a |
 | `script_exec/do_exec#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_exec` | runner argv, argv[0] resolved via the pure `resolve_executable` (script_exec_parsers.hpp) against the PARENT process's own PATH (forwarded through `SubprocessOptions::extra_env`), not the runner's fixed four-directory default | Linux/macOS/Windows | operator-supplied `command`/`args` params — this action's entire contract is "execute an arbitrary admin-specified program"; the server enforces admin-only role checks before ever dispatching to this plugin | **mutating** | none — pre-split argv, no shell in between; the deleted `execvpe`/`execvp`/Win32 spawn paths never involved a shell either | none beyond the agent's existing service-account context; gated admin-only at the server, not by a sudoers grant | Reviewed — this action's contract IS "run an arbitrary caller-named binary"; no rung-1 API can answer that generically | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 not applicable, the action IS "invoke an operator-named program", same principle as `network_actions/ping#1` | n/a |
 | `script_exec/do_bash#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_bash` | runner argv (`/bin/bash -c <script>`), script as ONE argv element | Linux/macOS | operator-supplied `script` param (admin-only action, server-gated) | **mutating** | bash itself interprets the script text (pipeline/redirection/glob/etc. all live inside bash's own interpretation); the outer spawn carries it as one opaque argv element, no shell hop before bash | none beyond the agent's existing service-account context; admin-only action gate | Reviewed — bash is the interpreter this action exists to invoke; no rung-1 substitute for "run an operator-authored bash script" | Rung 3 — Decision-5 governed-interpreter site; bash is the deepest interpreter intentionally invoked, same principle as PowerShell's `-EncodedCommand` and osascript's `-e` | Decision-5 interpreter registration (`bash_c`, unchanged from the prior `kActionDescriptors` entry — now prefixed `subprocess_runner:`) |
 | `script_exec/do_powershell#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_powershell` | runner argv (`powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64>`), `powershell.exe` at its fixed well-known System32 path (same location `interaction/input_windows#1` probes) | Windows | operator-supplied `script` param, Base64/UTF-16LE-encoded before assembly (admin-only action, server-gated) | **mutating** | PowerShell itself interprets the decoded script; the outer spawn is clean argv, no `cmd.exe`; `-EncodedCommand` exists specifically to remove all outer-shell escaping/injection surface | none beyond the agent's existing service-account context; admin-only action gate | Reviewed — PowerShell is the interpreter this action exists to invoke, same principle as `interaction/input_windows#1` | Rung 3 — Decision-5 governed-interpreter site, same as `interaction/input_windows#1` | Decision-5 interpreter registration (`powershell_encodedcommand`, unchanged from the prior `kActionDescriptors` entry — now prefixed `subprocess_runner:`) |
@@ -166,14 +198,19 @@ Plugin-granularity seed from the ADR-3002 review inventory (dev @ 2026-07-23,
 private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
-**Raw `popen`/`system` helpers:**
-device_identity, hardware, installed_apps,
-device_identity, event_logs, hardware,
-ioc, license_scan,
-network_diag, os_info, processes,
-software_actions, vuln_scan, wifi, windows_updates.
-(`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
-sequence that cleanup against migrating it, tracked in #2380.)
+**Raw `popen`/`system` helpers** (one plugin per line, alphabetized — this
+list has been repeatedly corrupted into duplicate/stale entries by the
+automated dev-merge-into-open-PR-branches bot's line-based 3-way merge when
+two PRs independently touched the same wrapped line; keep it one-per-line so
+two independent edits land as two independent inserted lines instead):
+- device_identity
+- ioc
+- network_diag
+- os_info
+- processes
+- vuln_scan (carries code slated for retirement per ADR-0028/ADR-0018 —
+  sequence that cleanup against migrating it, tracked in #2380)
+- windows_updates
 
 **Migrated off raw spawn (Wave 4, PR4.2):** `event_logs` (Windows
 PowerShell `Get-WinEvent` via raw `_popen` promoted to rung-1 wevtapi
@@ -313,6 +350,26 @@ enumeration + plain `/sys/class/block/dm-*/dm/uuid` reads, rung 1, 0 spawn
 sites. macOS: `fdesetup`/`diskutil` stay on the bounded runner, promoted
 from a `/bin/sh -c` shell wrapper to direct argv, rung 2 — see Registered
 sites above).
+
+**Migrated off raw spawn (Wave 4, PR4.3b):** `software_actions` (0 **raw**
+spawn sites remaining on any OS — no `popen`/`_popen`/`std::system` left in
+the plugin. On Windows the two former raw sites diverged: `installed_count`'s
+`powershell -Command` registry-count call is gone OUTRIGHT — it is now a
+native Reg\*W subkey count, rung 1, no subprocess at all, replacing a payload
+ADR-3002 Decision 5 pins at rung 3 forever — while `list_upgradable`'s winget
+call SURVIVES as a migrated rung-2 site, registered above as
+`software_actions/list_upgradable_windows#1`. Linux/macOS moved from
+`popen()`/`_popen()` to direct runner argv for both actions — see Registered
+sites above) and a **partial** migration of
+`license_scan`: only the Linux leg (`licensing_linux.cpp`) moved off
+`popen()`/`std::system()` onto the runner (Windows/macOS were already
+rung-1 native and untouched). This is also a deliberate DEMOTION, not a
+promotion: the Linux `pkg_metadata`/`entitlement_certs` legs go from
+SUPPORTED/rung 3 to CONSTRAINED/rung 2 — the
+acquisition mechanism improved, but the underlying capability was already
+limited (declared-licence classification only, no lapse detection for
+pkg_metadata; entitlement expiry still depends on the openssl CLI), and the
+descriptor now says so honestly instead of overclaiming SUPPORTED.
 
 **Migrated off private helpers (Wave 5, PR5.1):** `script_exec` (deleted its
 private CreateProcessA and fork+execvpe/execvp spawn paths — including the

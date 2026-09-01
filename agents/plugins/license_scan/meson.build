@@ -18,7 +18,7 @@ if host_machine.system() == 'windows'
   ]
 endif
 
-shared_library(
+license_scan_plugin_lib = shared_library(
   'license_scan',
   files(
     'src/license_scan_plugin.cpp',

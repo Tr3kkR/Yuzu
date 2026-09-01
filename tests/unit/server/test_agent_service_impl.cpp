@@ -162,6 +162,64 @@ struct GatewayResponseHarness {
 
 } // namespace
 
+// ── #872 — notify_exec_tracker wiring through to ExecutionTracker ──────────
+//
+// Bare GatewayResponseHarness leaves execution_tracker_ at nullptr, so the
+// entire notify_exec_tracker body (5-status enum mapping, empty-execution_id
+// early-return, null-tracker early-return) was dead in test. TrackerScope
+// constructs a real in-memory ExecutionTracker and wires it via
+// set_execution_tracker; destruction order is managed so the borrowed pointer
+// in svc is nulled before the tracker destructs (mirrors the production
+// shutdown contract documented at agent_service_impl.hpp:113).
+
+namespace {
+
+/// MEMBER ORDER LOAD-BEARING: `tracker` is owned outright (against the
+/// caller-supplied pool), `svc` borrows `tracker.get()` (via
+/// `set_execution_tracker`). The dtor MUST run set_execution_tracker(nullptr)
+/// → tracker.reset(), in that exact order, so the borrowed-pointer chain is
+/// unwound from the outside in. Reordering the member declarations or
+/// replacing the user-defined dtor with `= default` would silently break the
+/// contract — there is no compile-time guard. Mirrors the production
+/// ServerImpl "drain gRPC → null setter → reset" shutdown sequence at
+/// agent_service_impl.hpp:113.
+struct TrackerScope {
+    std::unique_ptr<yuzu::server::ExecutionTracker> tracker;
+    AgentServiceImpl* svc{nullptr};
+
+    TrackerScope(AgentServiceImpl& s, yuzu::server::pg::PgPool& pool) : svc(&s) {
+        tracker = std::make_unique<yuzu::server::ExecutionTracker>(pool);
+        REQUIRE(tracker->is_open());
+        svc->set_execution_tracker(tracker.get());
+    }
+    ~TrackerScope() {
+        if (svc)
+            svc->set_execution_tracker(nullptr);
+        tracker.reset();
+    }
+
+    TrackerScope(const TrackerScope&) = delete;
+    TrackerScope& operator=(const TrackerScope&) = delete;
+
+    /// Create an execution row on the bound tracker, return its id. Matches
+    /// the `GatewayResponseHarness::make_response` static-factory pattern —
+    /// keeps test bodies focused on the assertion, not boilerplate. Call
+    /// sites read `auto exec_id = ts.make_exec();`.
+    std::string make_exec(int agents_targeted = 1) {
+        yuzu::server::Execution exec;
+        exec.definition_id = "def-test";
+        exec.scope_expression = "agent_id = 'agent-1'";
+        exec.dispatched_by = "tester";
+        exec.status = "running";
+        exec.agents_targeted = agents_targeted;
+        auto id = tracker->create_execution(exec);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+};
+
+} // namespace
+
 // ── record_execution_id ────────────────────────────────────────────────────
 
 TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
@@ -169,6 +227,9 @@ TEST_CASE("record_execution_id: terminal response stamps mapped execution_id",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    // HA WS-1(1b): record_execution_id now routes through ExecutionTracker
+    // (PG-backed), so this test needs one wired — mirrors the #872 tests.
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-A", "exec-42");
 
     auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS,
@@ -190,6 +251,7 @@ TEST_CASE("record_execution_id: empty execution_id removes the mapping",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-A", "exec-42");
     h.svc.record_execution_id("cmd-A", ""); // documented clear semantics
 
@@ -211,11 +273,13 @@ TEST_CASE("record_execution_id: empty execution_id removes the mapping",
 TEST_CASE("process_gateway_response: RUNNING streaming row carries execution_id",
           "[pg][agent_service][executions][pr2]") {
     // The RUNNING branch lives at agent_service_impl.cpp:597-655 — it both
-    // stores a streaming row and stamps execution_id from the same map.
-    // Pin both halves: the row exists AND it carries the tag.
+    // stores a streaming row and stamps execution_id from the same
+    // ExecutionTracker-backed correlation lookup (HA WS-1(1b)). Pin both
+    // halves: the row exists AND it carries the tag.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-stream", "exec-stream");
 
     auto running =
@@ -236,6 +300,7 @@ TEST_CASE("process_gateway_response: FAILURE preserves error_detail and executio
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-fail", "exec-fail");
 
     auto resp = GatewayResponseHarness::make_response("cmd-fail", apb::CommandResponse::FAILURE,
@@ -261,6 +326,10 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    // Tracker wired (open, no mapping recorded) so this exercises the real
+    // "no row for this command_id" degrade, not a coincidental null-tracker
+    // early-return that would pass for the wrong reason.
+    TrackerScope ts{h.svc, pool};
     auto resp = GatewayResponseHarness::make_response("cmd-orphan", apb::CommandResponse::SUCCESS);
     h.svc.process_gateway_response("agent-1", resp);
 
@@ -276,12 +345,15 @@ TEST_CASE("process_gateway_response: unmapped command_id stamps empty execution_
 TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
           "(HF-1 multi-agent fan-out invariant)",
           "[pg][agent_service][executions][pr2][hardening]") {
-    // PR-2 ladder regression. Pre-fix, the terminal branch erased
-    // cmd_execution_ids_ on the FIRST agent's response so agents 2..N
-    // stamped empty execution_id and the executions drawer dropped them.
-    // The fix at agent_service_impl.cpp:672-674 keeps the mapping live
-    // until a future sweeper. This test drives the path the test_workflow_
-    // routes pin couldn't reach (it operated on ResponseStore directly).
+    // PR-2 ladder regression. Pre-fix, the terminal branch erased the
+    // command_id -> execution_id mapping (then an in-process
+    // cmd_execution_ids_ map, now HA WS-1(1b)'s PG-backed
+    // command_execution table) on the FIRST agent's response, so agents
+    // 2..N stamped empty execution_id and the executions drawer dropped
+    // them. The fix keeps the mapping live until it ages out via
+    // ExecutionTracker::reap_command_execution_mappings. This test drives
+    // the path the test_workflow_routes pin couldn't reach (it operated on
+    // ResponseStore directly).
     //
     // Fan out across 4 agents and mix terminal statuses (SUCCESS / FAILURE /
     // TIMEOUT) to pin two distinct invariants simultaneously: (a) the
@@ -295,6 +367,7 @@ TEST_CASE("process_gateway_response: terminal branch does NOT erase mapping "
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-fan", "exec-fan");
 
     struct AgentTerminal {
@@ -335,6 +408,7 @@ TEST_CASE("process_gateway_response: __timing__ sentinel takes the early-return 
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-time", "exec-time");
 
     auto timing = GatewayResponseHarness::make_response("cmd-time", apb::CommandResponse::RUNNING,
@@ -361,6 +435,7 @@ TEST_CASE("process_gateway_response: terminal SUCCESS folds into existing RUNNIN
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-mix", "exec-mix");
 
     auto r1 = GatewayResponseHarness::make_response("cmd-mix", apb::CommandResponse::RUNNING,
@@ -391,6 +466,7 @@ TEST_CASE("process_gateway_response: terminal frame WITH output still inserts",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-direct", "exec-direct");
     auto only = GatewayResponseHarness::make_response("cmd-direct", apb::CommandResponse::SUCCESS,
                                                       /*output=*/"final-data");
@@ -419,6 +495,7 @@ TEST_CASE("process_gateway_response: re-mapping a command_id updates the stamp",
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
     h.svc.record_execution_id("cmd-re", "exec-old");
     auto first = GatewayResponseHarness::make_response("cmd-re", apb::CommandResponse::RUNNING,
                                                        /*output=*/"old");
@@ -1408,64 +1485,6 @@ TEST_CASE("Register (direct): a THROWING signer cannot crash the handler either 
     CHECK(resp.issued_certificate().empty());
 }
 
-// ── #872 — notify_exec_tracker wiring through to ExecutionTracker ──────────
-//
-// Bare GatewayResponseHarness leaves execution_tracker_ at nullptr, so the
-// entire notify_exec_tracker body (5-status enum mapping, empty-execution_id
-// early-return, null-tracker early-return) was dead in test. TrackerScope
-// constructs a real in-memory ExecutionTracker and wires it via
-// set_execution_tracker; destruction order is managed so the borrowed pointer
-// in svc is nulled before the tracker destructs (mirrors the production
-// shutdown contract documented at agent_service_impl.hpp:113).
-
-namespace {
-
-/// MEMBER ORDER LOAD-BEARING: `tracker` is owned outright (against the
-/// caller-supplied pool), `svc` borrows `tracker.get()` (via
-/// `set_execution_tracker`). The dtor MUST run set_execution_tracker(nullptr)
-/// → tracker.reset(), in that exact order, so the borrowed-pointer chain is
-/// unwound from the outside in. Reordering the member declarations or
-/// replacing the user-defined dtor with `= default` would silently break the
-/// contract — there is no compile-time guard. Mirrors the production
-/// ServerImpl "drain gRPC → null setter → reset" shutdown sequence at
-/// agent_service_impl.hpp:113.
-struct TrackerScope {
-    std::unique_ptr<yuzu::server::ExecutionTracker> tracker;
-    AgentServiceImpl* svc{nullptr};
-
-    TrackerScope(AgentServiceImpl& s, yuzu::server::pg::PgPool& pool) : svc(&s) {
-        tracker = std::make_unique<yuzu::server::ExecutionTracker>(pool);
-        REQUIRE(tracker->is_open());
-        svc->set_execution_tracker(tracker.get());
-    }
-    ~TrackerScope() {
-        if (svc)
-            svc->set_execution_tracker(nullptr);
-        tracker.reset();
-    }
-
-    TrackerScope(const TrackerScope&) = delete;
-    TrackerScope& operator=(const TrackerScope&) = delete;
-
-    /// Create an execution row on the bound tracker, return its id. Matches
-    /// the `GatewayResponseHarness::make_response` static-factory pattern —
-    /// keeps test bodies focused on the assertion, not boilerplate. Call
-    /// sites read `auto exec_id = ts.make_exec();`.
-    std::string make_exec(int agents_targeted = 1) {
-        yuzu::server::Execution exec;
-        exec.definition_id = "def-test";
-        exec.scope_expression = "agent_id = 'agent-1'";
-        exec.dispatched_by = "tester";
-        exec.status = "running";
-        exec.agents_targeted = agents_targeted;
-        auto id = tracker->create_execution(exec);
-        REQUIRE(id.has_value());
-        return *id;
-    }
-};
-
-} // namespace
-
 TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
           "completed_at=0",
           "[pg][agent_service][executions][issue872]") {
@@ -1617,6 +1636,80 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
     h.svc.process_gateway_response("agent-1", resp);
 
     CHECK(ts.tracker->get_agent_statuses(exec_id).empty());
+}
+
+TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
+          "no tracker row (adversarial review, PR #3780)",
+          "[pg][agent_service][executions][issue872]") {
+    // The four non-tracked correlation-id prefixes (polchk-/bundle-/
+    // preflight-/deployment-) are minted as the execution_id VALUE by
+    // PolicyEvaluator/BundleOrchestrator/PreflightRunner/the deployment
+    // engine, then explicitly skipped by notify_exec_tracker's
+    // starts_with(...) guards (agent_service_impl.cpp) so they never
+    // create a phantom agent_exec_status row or publish a phantom
+    // agent-transition SSE event. test_execution_tracker.cpp proves the
+    // STORE round-trips these values opaquely; THIS test proves the
+    // actual DECISION SITE (notify_exec_tracker, reached only through
+    // resolve_execution_id -> ExecutionTracker::lookup_execution_id, the
+    // PG-backed path this PR migrated) still honours the skip — the
+    // property a prior version of this PR's own test claimed to prove
+    // but didn't (it looked up an unwritten key, never exercising this
+    // decision site at all).
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+
+    for (const std::string execution_id :
+         {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
+        CAPTURE(execution_id);
+        const std::string command_id = "plugin-cmd-" + execution_id;
+        h.svc.record_execution_id(command_id, execution_id);
+
+        auto resp = GatewayResponseHarness::make_response(command_id, apb::CommandResponse::SUCCESS);
+        h.svc.process_gateway_response("agent-1", resp);
+
+        CHECK(ts.tracker->get_agent_statuses(execution_id).empty());
+    }
+}
+
+TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
+          "by reason (adversarial review, PR #3780)",
+          "[pg][agent_service][executions]") {
+    // The read-degrade counter is the only signal for a sustained lookup
+    // failure on this hot path (hit on every CommandResponse) — mirrors
+    // test_software_inventory_store.cpp's "read-degrade bumps
+    // yuzu_inventory_read_degrade_total by reason (#1675)" precedent.
+    // Dropping the command_execution table under the open store forces a
+    // genuine query_failed on the next lookup (not a coincidental
+    // pool-exhaustion path).
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+
+    h.svc.record_execution_id("cmd-A", "exec-42"); // a mapping DOES exist...
+
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto drop = pg::exec_params(lease.get(),
+                                    "DROP TABLE execution_tracker.command_execution",
+                                    std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    // ...but the lookup can no longer reach it.
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
+    h.svc.process_gateway_response("agent-1", resp);
+
+    // A terminal response resolves execution_id from TWO independent call
+    // sites (response-store stamping at agent_service_impl.cpp:1577, then
+    // again inside notify_exec_tracker at :1606) — both hit the dropped
+    // table, so the counter increments twice per response, not once.
+    CHECK(h.metrics
+              .counter("yuzu_exec_correlation_read_degrade_total", {{"reason", "query_failed"}})
+              .value() == 2.0);
 }
 
 TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contract)",

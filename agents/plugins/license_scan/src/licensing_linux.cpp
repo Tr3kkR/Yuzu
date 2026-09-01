@@ -25,65 +25,54 @@
 
 #ifdef __linux__
 
-#include "licensing_parsers.hpp"
-#include "licensing_probes.hpp"
-#include "licensing_record.hpp"
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
 
-#include <array>
-#include <cstdio>
+#include <chrono>
 #include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "licensing_parsers.hpp"
+#include "licensing_probes.hpp"
+#include "licensing_record.hpp"
+
 namespace yuzu::license_scan {
 
 namespace {
 
-// ── subprocess helpers (installed_apps precedent) ──────────────────────────
+// ── subprocess helpers (ADR-3002 rung-2 migration, Wave 4 PR4.3b) ──────────
+//
+// Replaces the prior run_command_rc() (popen -> /bin/sh -c) + command_exists()
+// (std::system) pair. argv elements are injection-proof by construction (no
+// shell in between), so the shell_single_quote() escaping this replaces is
+// gone outright -- there is no shell metacharacter surface left to escape
+// against once a value is just another argv element.
 
 struct CommandResult {
     std::string output;
-    bool ok = false; // popen succeeded AND the command exited 0
+    bool ok = false;        // tool_ran && exit_code==0 && !timed_out
+    bool truncated = false; // output_truncated -- caller must treat this as a
+                             // distinct, honest failure mode: capture stopped
+                             // early, so `output` (and hence anything parsed
+                             // from it) may be incomplete even when `ok` is
+                             // otherwise true. A truncated rpm -qa in
+                             // particular is a false-negative surface (some
+                             // installed packages silently missing from the
+                             // result) -- never treated as a quiet partial
+                             // success.
 };
 
-CommandResult run_command_rc(const char* cmd) {
+CommandResult run_argv(const std::vector<std::string>& argv) {
     CommandResult result;
-    std::array<char, 4096> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result.output += buf.data();
-    }
-    const int rc = pclose(pipe);
-    result.ok = rc == 0;
+    if (argv.empty() || argv.front().empty())
+        return result; // probe miss: honest "tool not found", no OS call attempted
+    const auto res = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    result.output = res.output;
+    result.ok = res.tool_ran && res.exit_code == 0 && !res.timed_out;
+    result.truncated = res.output_truncated;
     return result;
-}
-
-bool command_exists(const char* cmd) {
-    const auto check = std::string("command -v ") + cmd + " >/dev/null 2>&1";
-    return std::system(check.c_str()) == 0;
-}
-
-// POSIX shell single-quote escaping for a value interpolated into a run_command_rc
-// (popen → /bin/sh -c) command string. Wrap in single quotes and rewrite each
-// embedded single quote as '\'' so a crafted filename under the globbed cert dir
-// (e.g. one containing `$(...)`, `;`, or a quote) cannot break out of its argument
-// and inject shell. run_command_rc has no argv-style variant, so escaping at the
-// call site is the fix.
-std::string shell_single_quote(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 2);
-    out += '\'';
-    for (char c : s) {
-        if (c == '\'')
-            out += "'\\''";
-        else
-            out += c;
-    }
-    out += '\'';
-    return out;
 }
 
 std::vector<std::string> split_lines(const std::string& text) {
@@ -121,37 +110,77 @@ void run_pkg_metadata_surface(ProbeHost& host, std::vector<LicRecord>& records,
                               std::vector<ProbeOutcome>& outcomes) {
     std::size_t emitted = 0;
 
-    if (command_exists("rpm")) {
-        const auto res = run_command_rc(
-            "rpm -qa --queryformat '%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{VENDOR}\\t%{LICENSE}\\n' "
-            "2>/dev/null");
-        if (!res.ok) {
-            outcomes.push_back({"pkg_metadata", false, 0, "rpm_query_failed"});
+    auto rpm = yuzu::agent::probe_tool_path({"/usr/bin/rpm", "/bin/rpm"});
+    if (!rpm.empty()) {
+        // license_scan/run_pkg_metadata_surface_linux#1 (docs/agent-spawn-sink-manifest.md)
+        // Queryformat string kept byte-identical to the pre-migration shell
+        // form -- the literal backslash-t/backslash-n escapes are interpreted
+        // by rpm's own queryformat engine (not a shell), producing real
+        // tab/newline bytes in the output that split_lines/split_tabs below
+        // still parse unchanged.
+        const auto res =
+            run_argv({rpm, "-qa", "--queryformat",
+                     "%{NAME}\\t%{VERSION}-%{RELEASE}\\t%{VENDOR}\\t%{LICENSE}\\n"});
+        if (res.truncated) {
+            // A truncated rpm -qa is a false-negative surface (some installed
+            // packages silently missing) -- a distinct, honest outcome, never
+            // folded into "query failed" or a silent partial success. rpm DID
+            // run and IS the real tool here, so this stays terminal rather
+            // than falling through to a second tool that would just re-run
+            // the whole enumeration and produce a different partial result.
+            outcomes.push_back({"pkg_metadata", false, 0, "output_truncated"});
             return;
         }
-        for (const auto& line : split_lines(res.output)) {
-            const auto fields = split_tabs(line);
-            if (fields.size() < 4 || fields[0].empty())
-                continue;
-            LicRecord r;
-            r.product = fields[0];
-            r.version = fields[1];
-            r.vendor = fields[2] == "(none)" ? "" : fields[2];
-            r.license_type = classify_license_string(fields[3]); // open_source|freeware|unknown
-            r.status = "unknown"; // classification only — no lapse (stated gap)
-            r.source = "package_metadata";
-            r.confidence = "probable"; // declared by the packager
-            records.push_back(std::move(r));
-            ++emitted;
+        if (res.ok) {
+            for (const auto& line : split_lines(res.output)) {
+                const auto fields = split_tabs(line);
+                if (fields.size() < 4 || fields[0].empty())
+                    continue;
+                LicRecord r;
+                r.product = fields[0];
+                r.version = fields[1];
+                r.vendor = fields[2] == "(none)" ? "" : fields[2];
+                r.license_type = classify_license_string(fields[3]); // open_source|freeware|unknown
+                r.status = "unknown"; // classification only — no lapse (stated gap)
+                r.source = "package_metadata";
+                r.confidence = "probable"; // declared by the packager
+                records.push_back(std::move(r));
+                ++emitted;
+            }
+            outcomes.push_back({"pkg_metadata", true, emitted, {}});
+            return;
         }
-        outcomes.push_back({"pkg_metadata", true, emitted, {}});
-        return;
+        // rpm's PRESENCE on the host is not proof it is the host's real
+        // package manager -- a Debian/Ubuntu box can carry a stray/leftover
+        // `rpm` binary (pulled in transitively, e.g. by packaging tooling)
+        // whose database was never initialized for real package management
+        // and errors on every query, while dpkg-query works fine as the
+        // host's actual manager. Found live: a shared self-hosted Linux CI
+        // runner reported `rpm_query_failed` on every run despite
+        // dpkg-query succeeding immediately after. So an rpm EXECUTION
+        // failure (as opposed to rpm being simply absent) falls through to
+        // try dpkg-query rather than reporting a terminal error.
     }
 
-    if (command_exists("dpkg-query")) {
-        const auto res =
-            run_command_rc("dpkg-query -W -f='${Package}\\t${Version}\\t${db:Status-Abbrev}\\n' "
-                           "2>/dev/null");
+    auto dpkg_query = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query"});
+    if (!dpkg_query.empty()) {
+        // license_scan/run_pkg_metadata_surface_linux#2 (docs/agent-spawn-sink-manifest.md)
+        // Same byte-identical-queryformat reasoning as the rpm branch above.
+        // Format string is its OWN argv element (never "-f=<value>"): unlike a
+        // GNU long option, dpkg-query's short "-f" does not strip a joined
+        // "=" -- it is taken as a literal leading character of the format
+        // string, so every emitted row silently gained a stray "=" prefix on
+        // its first (package-name) field, which then broke the
+        // "/usr/share/doc/<pkg>/copyright" lookup below for every package
+        // (verified empirically against real dpkg-query on Ubuntu 20.04/
+        // 22.04/24.04 and Debian 11 -- exit 0 in all four, but every line
+        // prefixed with "=").
+        const auto res = run_argv(
+            {dpkg_query, "-W", "-f", "${Package}\\t${Version}\\t${db:Status-Abbrev}\\n"});
+        if (res.truncated) {
+            outcomes.push_back({"pkg_metadata", false, 0, "output_truncated"});
+            return;
+        }
         if (!res.ok) {
             outcomes.push_back({"pkg_metadata", false, 0, "dpkg_query_failed"});
             return;
@@ -189,6 +218,19 @@ void run_pkg_metadata_surface(ProbeHost& host, std::vector<LicRecord>& records,
 
 // ── entitlement_certs (surface table Linux row 2; authoritative) ───────────
 
+// Aggregate wall-clock budget for the WHOLE per-cert loop below, not the
+// per-openssl-run deadline (20s, unnamed at each run_argv call). This is a
+// START-GATE checked before each iteration, not a hard cap on the loop's
+// total cost: an iteration already admitted can still run up to two 20s
+// openssl runs (the -dateopt fallback) before the NEXT admission check, so
+// the loop's real worst case is this budget plus one cert's cost -- up to
+// ~100s, not 60s. Still bounds what would otherwise be unbounded: a
+// directory with many certs -- 512 x 2 x 20s is several hours -- could pin
+// the instruction worker on a single entitlement_certs call without it.
+// Strictly better than the pre-migration unbounded popen this replaced (no
+// budget at all), but cheap enough to add here too.
+constexpr std::chrono::seconds kEntitlementCertsScanBudget{60};
+
 void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& records,
                                    std::vector<ProbeOutcome>& outcomes) {
     auto pems = host.glob("/etc/pki/entitlement/*.pem");
@@ -203,7 +245,8 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
         outcomes.push_back({"entitlement_certs", true, 0, {}});
         return;
     }
-    if (!command_exists("openssl")) {
+    auto openssl = yuzu::agent::probe_tool_path({"/usr/bin/openssl", "/bin/openssl"});
+    if (openssl.empty()) {
         // Certs exist but cannot be parsed — a real failure, not empty.
         outcomes.push_back({"entitlement_certs", false, 0, "openssl_unavailable"});
         return;
@@ -212,20 +255,31 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
     const long long now = host.now_epoch();
     std::size_t emitted = 0;
     bool any_parse_failure = false;
+    bool budget_exhausted = false;
+    const auto scan_deadline = std::chrono::steady_clock::now() + kEntitlementCertsScanBudget;
     for (const auto& cert : certs) {
+        if (std::chrono::steady_clock::now() >= scan_deadline) {
+            // Whatever was already parsed is real data, kept -- only the
+            // remaining certs are unaccounted for, reported below via the
+            // degraded outcome rather than silently truncating the scan.
+            budget_exhausted = true;
+            break;
+        }
         // -dateopt iso_8601 where supported; parse_openssl_enddate also
         // accepts the older default date format. The cert path is globbed from
-        // /etc/pki/entitlement (attacker-influenceable filenames) → shell-escape
-        // it before interpolation (no argv-style popen variant here).
-        const std::string cert_q = shell_single_quote(cert);
-        auto res = run_command_rc(
-            ("openssl x509 -noout -enddate -dateopt iso_8601 -in " + cert_q + " 2>/dev/null")
-                .c_str());
-        if (!res.ok)
-            res = run_command_rc(
-                ("openssl x509 -noout -enddate -in " + cert_q + " 2>/dev/null").c_str());
+        // /etc/pki/entitlement (attacker-influenceable filenames) -- as a
+        // plain argv element it is injection-proof by construction, no
+        // shell-quoting needed (shell_single_quote is gone: there is no
+        // shell left to escape against).
+        // license_scan/run_entitlement_certs_surface_linux#1 (docs/agent-spawn-sink-manifest.md)
+        auto res = run_argv(
+            {openssl, "x509", "-noout", "-enddate", "-dateopt", "iso_8601", "-in", cert});
+        if (!res.ok || res.truncated) {
+            // license_scan/run_entitlement_certs_surface_linux#2 (docs/agent-spawn-sink-manifest.md)
+            res = run_argv({openssl, "x509", "-noout", "-enddate", "-in", cert});
+        }
         const std::string not_after =
-            res.ok ? parse_openssl_enddate(res.output) : std::string{};
+            (res.ok && !res.truncated) ? parse_openssl_enddate(res.output) : std::string{};
         if (not_after.empty()) {
             any_parse_failure = true;
             continue;
@@ -250,10 +304,9 @@ void run_entitlement_certs_surface(ProbeHost& host, std::vector<LicRecord>& reco
         ++emitted;
     }
 
-    if (emitted == 0 && any_parse_failure)
-        outcomes.push_back({"entitlement_certs", false, 0, "cert_parse_failed"});
-    else
-        outcomes.push_back({"entitlement_certs", true, emitted, {}});
+    // See entitlement_certs_outcome()'s doc comment (licensing_parsers.hpp)
+    // for the honest-degrade invariants this classification encodes.
+    outcomes.push_back(entitlement_certs_outcome(budget_exhausted, emitted, any_parse_failure));
 }
 
 } // namespace

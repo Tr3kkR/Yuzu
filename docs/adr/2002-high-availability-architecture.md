@@ -243,6 +243,14 @@ migrate to Postgres, and their counter updates (`agents_responded` / `agents_suc
 CLAUDE.md already flags for `sqlite3_changes()` (concurrent responses now land on multiple
 instances).
 
+**Status (WS-1(1b)): SATISFIED.** `execution_tracker` migrated to Postgres via ADR-0065
+(fresh-start, no SQLite backfill); its `agents_responded`/`agents_success`/`agents_failure` counters
+are recomputed in-transaction from `agent_exec_status` via correlated `COUNT(*)` inside
+`UPDATE ... RETURNING`, never app-side read-modify-write. `cmd_execution_ids_` moved to
+`ExecutionTracker`'s PG-backed `command_execution` table (`record_command_execution`/
+`lookup_execution_id`), closing the cross-replica hazard this prerequisite names — see
+`docs/executions-history-ladder.md`.
+
 ### 6. Background workers — fenced leader + transactional outbox (Q6)
 A single **core** instance holds the **fenced** leader lock and runs the singleton loops. The correctness
 model, corrected per review — a claim alone does **not** give exactly-once, because a crash between

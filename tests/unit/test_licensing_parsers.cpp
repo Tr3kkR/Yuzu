@@ -458,3 +458,63 @@ TEST_CASE("vocabulary helpers pin the §3.2 sets exactly", "[licensing][record]"
     CHECK_FALSE(is_valid_source("wmi"));              // ditto
     CHECK_FALSE(is_valid_confidence("certain"));      // ditto
 }
+
+// ── entitlement_certs_outcome (pure decision seam, Wave 4 PR4.3b gate-3) ───
+
+TEST_CASE("entitlement_certs_outcome: a budget-exhausted scan is never clean",
+          "[licensing][entitlement_certs]") {
+    // Whatever was parsed before the deadline is kept as real data (the
+    // `rows` count), but the outcome must never read as a completed scan --
+    // certs were left unexamined.
+    auto o = entitlement_certs_outcome(/*budget_exhausted=*/true, /*emitted=*/3,
+                                       /*any_parse_failure=*/false);
+    CHECK_FALSE(o.ok);
+    CHECK(o.rows == 3);
+    CHECK(o.error == "cert_scan_budget_exhausted");
+
+    // Budget exhaustion wins even alongside a parse failure -- one reason is
+    // reported, not both, and it's the one that stopped the scan.
+    auto o2 = entitlement_certs_outcome(true, 1, true);
+    CHECK_FALSE(o2.ok);
+    CHECK(o2.error == "cert_scan_budget_exhausted");
+}
+
+TEST_CASE("entitlement_certs_outcome: every cert failing is total failure, not partial",
+          "[licensing][entitlement_certs]") {
+    auto o = entitlement_certs_outcome(/*budget_exhausted=*/false, /*emitted=*/0,
+                                       /*any_parse_failure=*/true);
+    CHECK_FALSE(o.ok);
+    CHECK(o.rows == 0);
+    CHECK(o.error == "cert_parse_failed");
+}
+
+TEST_CASE("entitlement_certs_outcome: a mix of parsed and unreadable certs is never clean",
+          "[licensing][entitlement_certs]") {
+    // THE regression this function exists to prevent: at least one cert
+    // parsed AND at least one failed used to report a clean success, so the
+    // corrupt/lapsed cert vanished from this authoritative compliance
+    // surface with no trace.
+    auto o = entitlement_certs_outcome(/*budget_exhausted=*/false, /*emitted=*/2,
+                                       /*any_parse_failure=*/true);
+    CHECK_FALSE(o.ok);
+    CHECK(o.rows == 2);
+    CHECK(o.error == "cert_parse_partial");
+    // Distinct from the total-failure reason -- an operator needs to tell
+    // "some certs unreadable" from "couldn't read any of them".
+    CHECK(o.error != "cert_parse_failed");
+}
+
+TEST_CASE("entitlement_certs_outcome: every cert parsing cleanly is a genuine success",
+          "[licensing][entitlement_certs]") {
+    auto o = entitlement_certs_outcome(/*budget_exhausted=*/false, /*emitted=*/5,
+                                       /*any_parse_failure=*/false);
+    CHECK(o.ok);
+    CHECK(o.rows == 5);
+    CHECK(o.error.empty());
+
+    // Zero certs found (no failure, nothing to fail) is also clean --
+    // structurally a successful probe of an empty surface (ADR-0024 D3).
+    auto o2 = entitlement_certs_outcome(false, 0, false);
+    CHECK(o2.ok);
+    CHECK(o2.rows == 0);
+}

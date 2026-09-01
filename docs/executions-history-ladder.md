@@ -6,13 +6,21 @@ document holds the hard invariants every successor PR in the ladder must check.
 
 ## PR 2 — `command_id → execution_id` mapping
 
-`responses.execution_id` is populated at write time by an in-memory
-`cmd_execution_ids_` map inside `AgentServiceImpl` (under `cmd_times_mu_`).
-The mapping is registered at dispatch time INSIDE `cmd_dispatch` BEFORE any
-RPC is sent — closes the FAST-agent race where a sub-millisecond loopback
-agent could reply before a post-dispatch registration. The `CommandDispatchFn`
-typedef carries `execution_id` as its sixth parameter; pass empty to opt out
-(out-of-band dispatch / no-tracker callers).
+`responses.execution_id` is populated at write time by resolving the
+`command_id` against `ExecutionTracker`'s PG-backed `command_execution` table
+(HA WS-1(1b), ADR-2002 section 5 — migrated off the former in-process
+`AgentServiceImpl::cmd_execution_ids_` map, which was replica-local and could
+not resolve a response landing on a different server instance than the one
+that dispatched it). `ExecutionTracker::record_command_execution` /
+`::lookup_execution_id` are the store's write/read entry points;
+`AgentServiceImpl::record_execution_id` / `::resolve_execution_id` are the
+corresponding `AgentServiceImpl`-side wrappers, with `resolve_execution_id`
+the single chokepoint every response-receipt read goes through. The mapping is registered at dispatch
+time INSIDE `cmd_dispatch` BEFORE any RPC is sent — closes the FAST-agent race
+where a sub-millisecond loopback agent could reply before a post-dispatch
+registration. The `CommandDispatchFn` typedef carries `execution_id` as its
+sixth parameter; pass empty to opt out (out-of-band dispatch / no-tracker
+callers).
 
 ### Known coverage gap (every PR in this ladder must check this)
 
@@ -38,11 +46,17 @@ no error or warning.
 
 A single `command_id` is dispatched to N agents; each agent sends its own
 response with the same `command_id`. Terminal-status branches in
-`agent_service_impl.cpp` do NOT erase `cmd_execution_ids_` — erasing on the
-first agent's terminal would leave agents 2..N stamping empty
-`execution_id`. Map entries persist for process lifetime; a periodic
-sweeper is filed as PR 2.x. The accepted bounded leak matches the existing
-`cmd_send_times_` / `cmd_first_seen_` shape under the same `cmd_times_mu_`.
+`agent_service_impl.cpp` do NOT delete the `command_execution` row — deleting
+on the first agent's terminal would leave agents 2..N stamping empty
+`execution_id`. The row ages out via
+`ExecutionTracker::reap_command_execution_mappings` instead (HA WS-1(1b)) — a
+clock-guarded retention sweep on a ~60m cadence
+(`yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` /
+`_store_degrade_total`), not an unbounded in-process leak. The dispatch-time
+write (`record_command_execution`, single attempt, no retry — deliberately
+bounded to `kWriteTimeout` since it sits on the synchronous pre-RPC dispatch
+path) has its own counter on failure, `yuzu_exec_correlation_write_degrade_total`,
+distinct from the reap counters above.
 
 Regression pin: `tests/unit/server/test_agent_service_impl.cpp` (9 cases /
 47 assertions) drives `process_gateway_response` end-to-end into a real
@@ -52,11 +66,18 @@ and the `__timing__|...` sentinel early-return. The
 `test_workflow_routes.cpp:814` sibling case covers the response-store
 level only.
 
-### Server restart caveat
+### Server restart / cross-replica behaviour
 
-The mapping is in-memory; restart loses it. In-flight commands at restart
-time produce responses tagged `execution_id=''` that use the legacy
-fallback in the drawer.
+The mapping is PG-backed (HA WS-1(1b)), so it survives a server restart and
+resolves identically regardless of which server replica's `AgentServiceImpl`
+receives the response — the property the migration off the in-process map
+exists to deliver (WS-9 scenario: `test_execution_tracker.cpp`'s
+"a command_execution mapping written on one instance resolves on a SEPARATE
+instance"). A mapping still does not survive its own retention window (see
+the fan-out section above) or a degraded/unreachable Postgres — either
+produces a response tagged `execution_id=''` that uses the legacy
+timestamp-window fallback in the drawer, the same degrade path an unmapped
+out-of-band dispatch already takes.
 
 ### Non-tracked correlation-id prefixes (`polchk-`, `bundle-`, `preflight-`, `deployment-`)
 
@@ -130,24 +151,32 @@ partial-index predicate. Every query against this index must include
 scan. See `query_by_execution`'s SQL in `response_store.cpp` for the
 canonical form.
 
-**Management-group scope is applied AFTER the LIMIT, in the handler — not in the
-SQL.** The MCP `query_responses` collect path runs a per-agent
-`check_scoped_permission` filter on the returned rows (#1550), *after* the store
-has applied `ORDER BY timestamp DESC LIMIT`. **NOTE (#1634): this filter is INERT
-under the current global `Response:Read` gate** — a holder of global `Response:Read`
-(the only principal that passes the gate) admits every agent, so no rows are
-dropped, while a management-group-confined operator is 403'd at the gate before the
-filter runs. So it does **not** today provide cross-operator isolation: a normal
-caller sees all agents' rows. Its only active effect is failing **closed** on a
-corrupt/load-failed `rbac.db`. When the #1634 admit-then-filter gate makes scoping
-effective, this after-LIMIT placement means an execution that fans out wider than
-the row cap and spans both in- and out-of-scope agents can have the cap consumed by
-out-of-scope rows, truncating the in-scope caller's view (or a row present in one
-poll vanishes from the next as the window shifts) — at that point the isolation
-holds (never another operator's rows) but completeness does not. The handler flags
-truncation with `result_truncated_by_cap:true`; the durable fix (scope-aware keyset
-pagination + pushing the predicate into the WHERE clause) is part of the #1634
-follow-up. The same applies to every other operator-facing reader of this store.
+**Management-group scope is now applied BEFORE the LIMIT, in the SQL (#1634,
+ADR-0017 INV-3).** The MCP `query_responses` collect path — and the legacy REST
+`/api/responses/{id}/export` and catch-all list — resolve the caller's visible-agent
+set (`ResponseStore::distinct_agent_ids`/`distinct_agent_ids_by_execution`) and push
+it into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)`
+**before** `ORDER BY ... LIMIT`, via a new optional scope parameter (mirroring
+`aggregate()`'s existing `AggregateScope`). This closes a real defect the first
+#1634 migration pass shipped: filtering *after* `LIMIT` meant an execution that
+fans out wider than the row cap and spans both in- and out-of-scope agents could
+have the cap consumed entirely by out-of-scope rows, handing a confined caller a
+short or empty page despite visible rows existing further back — found by an
+adversarial review (Kimi + Codex) citing this exact INV-3 text. `result_truncated_by_cap:true`
+now signals that the CALLER'S OWN scoped query hit the cap, not a raw-then-filtered
+cap hit that could fire entirely inside another operator's rows. The gate itself
+(`require_fleet_read`/`fleet_read_fn_`) replaced the old flat `Response:Read` check
+these readers sat behind, so a management-group-confined operator is admitted and
+narrowed rather than 403'd outright. **NOT true of every reader (correction, PR review
+2026-09-01):** the executions-drawer detail fragment (`workflow_routes.cpp`, `limit=500`)
+and the dashboard's `/fragments/results` (`dashboard_routes.cpp`, `limit=10000`) both
+predate #1634 and still call `query_by_execution`/`query` with no scope argument,
+post-fetch-filtering the raw (capped) result instead — the same INV-3 shape this
+paragraph describes as closed elsewhere. Isolation still holds (under-display only,
+never over-disclosure: a confined caller can see fewer in-scope rows than exist past
+the cap, never an out-of-scope row), so this is not a security regression, but it is
+not migrated onto the SQL-pushdown pattern above. Not the same surfaces as #3789/#3526;
+tracked separately as #3805.
 
 ## PR 3 — SSE live updates
 

@@ -13,15 +13,23 @@
  * on every platform and trivially unit-testable.
  *
  * SHA-256 is a small local implementation: key_hint derivation must never
- * echo raw key material (ADR-0024 Decision 2) and the parsers header must
- * stay dependency-free — pinned against NIST's "abc" vector in the tests.
+ * echo raw key material (ADR-0024 Decision 2) and this file stays free of
+ * an external crypto dependency — pinned against NIST's "abc" vector in the
+ * tests. "Platform-free" (above) is the invariant this header actually
+ * protects; it DOES include licensing_record.hpp for ProbeOutcome/LicRecord
+ * (also platform-free, same plugin's own pure data layer), so a decision
+ * that classifies into those types — e.g. entitlement_certs_outcome() below
+ * — belongs here rather than duplicating the shape locally.
  */
 
 #ifndef YUZU_LICENSE_SCAN_LICENSING_PARSERS_HPP
 #define YUZU_LICENSE_SCAN_LICENSING_PARSERS_HPP
 
+#include "licensing_record.hpp" // ProbeOutcome (platform-free; entitlement_certs_outcome() below)
+
 #include <array>
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -654,6 +662,36 @@ inline std::string plist_string_value(std::string_view xml, std::string_view key
             value.replace(p, ent.size(), 1, ch);
     }
     return value;
+}
+
+// ── entitlement_certs outcome decision (pure seam) ─────────────────────────
+
+/// Classifies the outcome of the Linux `entitlement_certs` surface scan from
+/// three plain facts, so the decision is unit-testable without a real
+/// `/etc/pki/entitlement` directory or an `openssl` subprocess. Mirrors
+/// `run_entitlement_certs_surface`'s (licensing_linux.cpp) four-way branch
+/// exactly -- kept here rather than inline so a future refactor of that
+/// impure shell can't silently regress either of the two honest-degrade
+/// invariants it encodes:
+///   - a scan that stopped early (`budget_exhausted`) with certs left
+///     unexamined is NEVER reported clean, whatever was parsed before the
+///     deadline;
+///   - a scan where at least one cert parsed AND at least one failed
+///     (`any_parse_failure` with `emitted > 0`) is NEVER reported as a clean
+///     success -- a lapsed or corrupt entitlement cert must not silently
+///     vanish from this authoritative compliance surface. Kept distinct from
+///     the total-failure case (`emitted == 0`) so an operator can tell "some
+///     certs unreadable" from "couldn't read any of them".
+[[nodiscard]] inline ProbeOutcome entitlement_certs_outcome(bool budget_exhausted,
+                                                             std::size_t emitted,
+                                                             bool any_parse_failure) {
+    if (budget_exhausted)
+        return ProbeOutcome{"entitlement_certs", false, emitted, "cert_scan_budget_exhausted"};
+    if (emitted == 0 && any_parse_failure)
+        return ProbeOutcome{"entitlement_certs", false, 0, "cert_parse_failed"};
+    if (any_parse_failure)
+        return ProbeOutcome{"entitlement_certs", false, emitted, "cert_parse_partial"};
+    return ProbeOutcome{"entitlement_certs", true, emitted, {}};
 }
 
 } // namespace yuzu::license_scan

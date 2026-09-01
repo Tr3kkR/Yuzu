@@ -30,6 +30,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
+#include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
@@ -5333,6 +5334,212 @@ TEST_CASE("MCP get_execution_status: #3344 retry_after_ms present only while non
     CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
+// #1634 (adversarial-review K3/D3 follow-up): get_execution_status migrated onto
+// fleet_read_fn_, mirroring REST GET /api/v1/executions/{id}. Real RBAC/mgmt-group
+// composition via ResponseExecutionAuthzPgRig — not a fake gate callback.
+TEST_CASE("MCP get_execution_status: confined non-owner gets visible-only projection (#1634)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-scope";
+    exec.scope_expression = "agent:secret-target";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::server::AgentExecStatus bob_status;
+    bob_status.agent_id = "bob-agent";
+    bob_status.status = "success";
+    tracker.update_agent_status(exec_id, bob_status);
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "failure";
+    tracker.update_agent_status(exec_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":730,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+            exec_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["agents_targeted"] == 1);
+    CHECK(sc["agents_responded"] == 1);
+    CHECK(sc["agents_success"] == 1);
+    CHECK(sc["agents_failure"] == 0);
+    CHECK(sc["scope_expression"] == "(redacted - confined view)");
+    CHECK(res->body.find("agent:secret-target") == std::string::npos);
+}
+
+// (Doomgoose review, minor): every real-rig get_execution_status test to date
+// seeds at least one agent visible to the caller — the invisible-execution
+// 404-collapse branch (identical-error property + its denied audit row) was
+// never exercised against the real RBAC/ManagementGroupStore composition.
+TEST_CASE("MCP get_execution_status: invisible execution collapses to the same "
+          "not-found error as a nonexistent one (#1634, Doomgoose review)",
+          "[pg][mcp][integration][execution][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-invisible";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    // Only alice-agent is visible to alice; bob has NO visible agent on this
+    // execution at all (unlike the sibling test above, which seeds bob-agent).
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "success";
+    tracker.update_agent_status(exec_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto call = [&](const std::string& id) {
+        return ts.call_raw(
+            "POST",
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":733,)"
+                        R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+                id + R"("}}})",
+            {{"Authorization", "Bearer " + token}});
+    };
+    auto invisible = call(exec_id);
+    auto missing = call("exec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    // Both are JSON-RPC error responses (kInvalidParams). The message embeds
+    // the (different) requested execution_id verbatim on both branches — the
+    // no-oracle property is the shared PREFIX/code, not byte-identical text,
+    // matching the "Execution not found: <id>" format on both paths.
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    REQUIRE(invisible_json.contains("error"));
+    REQUIRE(missing_json.contains("error"));
+    CHECK(invisible_json["error"]["code"] == missing_json["error"]["code"]);
+    CHECK(invisible_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+    CHECK(missing_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+}
+
+// #1634: execution rows carry no single agent_id, so a confined caller is
+// restricted to their own dispatches (ExecutionQuery::dispatched_by) rather than
+// a full per-row visible-agent check — never another operator's execution.
+TEST_CASE("MCP list_executions: confined caller sees only own dispatches (#1634)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution bob_exec;
+    bob_exec.definition_id = "def-list-scope";
+    bob_exec.dispatched_by = "bob";
+    bob_exec.status = "running";
+    REQUIRE(tracker.create_execution(bob_exec).has_value());
+    yuzu::server::Execution alice_exec;
+    alice_exec.definition_id = "def-list-scope";
+    alice_exec.dispatched_by = "alice";
+    alice_exec.status = "running";
+    REQUIRE(tracker.create_execution(alice_exec).has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":731,"params":{"name":"list_executions","arguments":{"definition_id":"def-list-scope"}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
+    REQUIRE(sc.size() == 1);
+    CHECK(sc[0]["dispatched_by"] == "bob");
+}
+
+TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, "
+          "TERMINAL agents (Doomgoose review, important)",
+          "[pg][mcp][integration][execution][scope]") {
+    // list_executions previously served RAW agents_targeted/agents_responded
+    // unprojected for a confined caller (unlike its get_execution_status
+    // sibling), AND (a shared bug with that sibling, fixed in the same
+    // round) counted a 'running' agent as "responded". This test proves
+    // both: an in-scope 'running' agent must NOT inflate agents_responded,
+    // and an out-of-scope agent must not be counted at all.
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution bob_exec;
+    bob_exec.definition_id = "def-list-counts";
+    bob_exec.dispatched_by = "bob";
+    bob_exec.status = "running";
+    bob_exec.agents_targeted = 2;
+    bob_exec.agents_responded = 2; // raw row: both "responded" (stale/wrong if served verbatim)
+    auto created = tracker.create_execution(bob_exec);
+    REQUIRE(created.has_value());
+    const auto exec_id = *created;
+
+    yuzu::server::AgentExecStatus in_scope_running;
+    in_scope_running.agent_id = "bob-agent";
+    in_scope_running.status = "running";
+    tracker.update_agent_status(exec_id, in_scope_running);
+
+    yuzu::server::AgentExecStatus out_of_scope_success;
+    out_of_scope_success.agent_id = "alice-agent";
+    out_of_scope_success.status = "success";
+    tracker.update_agent_status(exec_id, out_of_scope_success);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":732,"params":{"name":"list_executions","arguments":{"definition_id":"def-list-counts"}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
+    REQUIRE(sc.size() == 1);
+    // Only bob-agent is in scope: targeted == 1. It is 'running', not
+    // terminal, so responded must be 0 -- never 1 (the pre-fix bug) and
+    // never 2 (alice-agent's out-of-scope success must not leak in either).
+    CHECK(sc[0]["agents_targeted"] == 1);
+    CHECK(sc[0]["agents_responded"] == 0);
+}
+
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",
           "[mcp][integration][agentic-demo][prompt-injection][review-1653]") {
     McpTestServer ts;
@@ -7870,33 +8077,34 @@ TEST_CASE("MCP query_responses: #3344 retry_after_ms confirms in-flight, absent 
 
 TEST_CASE("MCP query_responses: management-group scope filters another operator's rows (#1550)",
           "[pg][mcp][integration][response][fanout][scope]") {
-    // Bob must not collect Alice's execution rows by execution_id. exec-S fans out
-    // to two agents; the injected scope predicate (production: check_scoped_permission)
-    // admits only agent-1 (the caller's). agent-2's row is dropped and the drop is
-    // audited distinctly.
-    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    // Bob must not collect Alice's execution rows by execution_id. This drives
+    // the route through a real AuthRoutes + RbacStore + ManagementGroupStore
+    // fleet-read gate, rather than manufacturing a VisibleSet in the test.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{db.dsn()};
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
-    store.store(mk_resp("exec-S", "instr-1", "agent-1", 0, "mine", 400));
-    store.store(mk_resp("exec-S", "instr-1", "agent-2", 0, "not-mine", 401));
+    store.store(mk_resp("exec-S", "instr-1", "bob-agent", 0, "mine", 400));
+    store.store(mk_resp("exec-S", "instr-1", "alice-agent", 0, "not-mine", 401));
 
     McpTestServer ts;
     ts.response_store_for_test = &store;
-    ts.response_scope_fn_for_test = [](const std::string& /*username*/,
-                                       const std::string& agent_id) -> bool {
-        return agent_id == "agent-1"; // caller's management group contains only agent-1
-    };
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
     ts.start("operator");
 
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"query_responses","arguments":{"execution_id":"exec-S"}}})");
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":80,"params":{"name":"query_responses","arguments":{"execution_id":"exec-S"}}})",
+        {{"Authorization", "Bearer " + token}});
     REQUIRE(res);
     CHECK(res->status == 200);
     auto result = nlohmann::json::parse(res->body)["result"];
     auto rows = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0]["agent_id"] == "agent-1");
+    CHECK(rows[0]["agent_id"] == "bob-agent");
     CHECK(rows[0]["output"] == "mine");
     // not-mine never leaked into the served set
     CHECK(res->body.find("not-mine") == std::string::npos);
@@ -7913,10 +8121,56 @@ TEST_CASE("MCP query_responses: management-group scope filters another operator'
     CHECK(saw_success);
 }
 
-TEST_CASE("MCP query_responses: no filter when scope predicate is unwired (legacy-open)",
+// #1634 (adversarial-review C4/D8): retry_after_ms used to read execution_tracker
+// directly, before the scope filter, so a confined caller with zero visible
+// agents on an out-of-scope execution_id could learn "non-terminal" via the
+// hint's mere presence even though every response row was filtered out.
+TEST_CASE("MCP query_responses: retry_after_ms suppressed for confined caller with no "
+          "visible agent (#1634)",
+          "[pg][mcp][integration][response][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-oracle";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp(exec_id, "def-oracle", "alice-agent", 0, "alice-only", 0));
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.response_store_for_test = &store;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":732,)"
+                    R"("params":{"name":"query_responses","arguments":{"execution_id":")") +
+            exec_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK_FALSE(sc.contains("retry_after_ms"));
+    CHECK(res->body.find("alice-only") == std::string::npos);
+}
+
+TEST_CASE("MCP query_responses: unrestricted fleet gate preserves legacy-open rows",
           "[pg][mcp][integration][response][fanout][scope]") {
-    // RBAC-off / unwired predicate → every authenticated caller sees all rows
-    // (matches require_scoped_permission's legacy posture). No denied audit.
+    // RBAC-off produces an unrestricted fleet-read scope, so every authenticated
+    // caller sees all rows. No denied audit.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::server::ResponseStore store(pool);
@@ -7925,7 +8179,7 @@ TEST_CASE("MCP query_responses: no filter when scope predicate is unwired (legac
     store.store(mk_resp("exec-T", "instr-1", "agent-2", 0, "b", 411));
 
     McpTestServer ts;
-    ts.response_store_for_test = &store; // response_scope_fn_for_test left empty
+    ts.response_store_for_test = &store; // fixture default gate admits unrestricted
     ts.start("operator");
 
     auto res = ts.call(
@@ -8023,8 +8277,10 @@ TEST_CASE("MCP query_responses: every agent out of scope → empty result + deni
 
     McpTestServer ts;
     ts.response_store_for_test = &store;
-    ts.response_scope_fn_for_test = [](const std::string&, const std::string&) -> bool {
-        return false; // Bob sees none of Alice's agents
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()};
     };
     ts.start("operator");
 
@@ -8062,8 +8318,11 @@ TEST_CASE("MCP query_responses: scope filter applies on the instruction_id path 
 
     McpTestServer ts;
     ts.response_store_for_test = &store;
-    ts.response_scope_fn_for_test = [](const std::string&, const std::string& agent_id) -> bool {
-        return agent_id == "agent-1";
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{
+                          std::unordered_set<std::string>{"agent-1"}}};
     };
     ts.start("operator");
 
@@ -8077,11 +8336,10 @@ TEST_CASE("MCP query_responses: scope filter applies on the instruction_id path 
     CHECK(res->body.find("not-mine") == std::string::npos);
 }
 
-TEST_CASE("MCP query_responses: scope check is memoised per distinct agent_id (#1550)",
+TEST_CASE("MCP query_responses: one visible agent keeps all of that agent's rows",
           "[pg][mcp][integration][response][fanout][scope]") {
-    // Two rows for the SAME agent under one execution must trigger only ONE scope
-    // check (the memo cache-hit path), and both rows are served when that agent is
-    // in scope.
+    // The fleet-read gate resolves visibility once. Two rows for the same visible
+    // agent must both survive the post-query filter.
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     yuzu::server::ResponseStore store(pool);
@@ -8091,11 +8349,11 @@ TEST_CASE("MCP query_responses: scope check is memoised per distinct agent_id (#
 
     McpTestServer ts;
     ts.response_store_for_test = &store;
-    int calls = 0;
-    ts.response_scope_fn_for_test = [&calls](const std::string&,
-                                             const std::string& agent_id) -> bool {
-        ++calls;
-        return agent_id == "agent-1";
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{
+                          std::unordered_set<std::string>{"agent-1"}}};
     };
     ts.start("operator");
 
@@ -8105,7 +8363,6 @@ TEST_CASE("MCP query_responses: scope check is memoised per distinct agent_id (#
     auto rows = nlohmann::json::parse(
         nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
     CHECK(rows.size() == 2); // both rows for the in-scope agent served
-    CHECK(calls == 1);       // memoised: one check for the one distinct agent_id
 }
 
 TEST_CASE("MCP query_responses: result_truncated_by_cap signals a capped raw query (#1550)",
@@ -10646,8 +10903,11 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
 
     McpTestServer ts;
     ts.response_store_for_test = &store;
-    ts.response_scope_fn_for_test = [](const std::string&, const std::string& agent_id) -> bool {
-        return agent_id == "agent-1";
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{
+                          std::unordered_set<std::string>{"agent-1"}}};
     };
     ts.start("operator");
 
@@ -10691,7 +10951,43 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
     CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
-TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (legacy-open) (#1634)",
+// #1634 (governance Gate 3 quality-engineer finding): every sibling
+// (query_responses, get_execution_status, list_executions, the legacy list
+// route) has a real-rig test driving the actual AuthRoutes + RbacStore +
+// ManagementGroupStore composition; aggregate_responses only ever had the
+// fake-gate tests above, which cannot catch a wrong securable/operation
+// string or resource-type typo at this specific call site.
+TEST_CASE("MCP aggregate_responses: real fleet-read gate excludes Alice's totals (#1634)",
+          "[pg][mcp][integration][response][aggregate][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{db.dsn()};
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-1", "instr-1", "bob-agent", 0, "mine", 500));
+    store.store(mk_resp("exec-1", "instr-1", "alice-agent", 0, "not-mine", 501));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-1","group_by":"status","aggregate":"count"}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto groups = nlohmann::json::parse(
+        nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0]["group_value"] == "0");
+    CHECK(groups[0]["count"] == 1); // bob-agent only — alice-agent's row never folded in
+}
+
+TEST_CASE("MCP aggregate_responses: unrestricted fleet gate preserves legacy-open totals (#1634)",
           "[pg][mcp][integration][response][aggregate][scope]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -10701,7 +10997,7 @@ TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (l
     store.store(mk_resp("exec-2", "instr-2", "agent-2", 0, "ok", 511));
 
     McpTestServer ts;
-    ts.response_store_for_test = &store; // response_scope_fn_for_test left empty
+    ts.response_store_for_test = &store; // fixture default gate admits unrestricted
     ts.start("operator");
 
     auto res = ts.call(
@@ -10730,8 +11026,10 @@ TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + 
 
     McpTestServer ts;
     ts.response_store_for_test = &store;
-    ts.response_scope_fn_for_test = [](const std::string&, const std::string&) -> bool {
-        return false; // caller can see NONE of this instruction's agents
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::deny_all()};
     };
     ts.start("operator");
 

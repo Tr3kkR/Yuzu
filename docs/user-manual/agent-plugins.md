@@ -278,7 +278,7 @@ Plugins for network configuration, active connections, diagnostics, and administ
 |---|---|
 | **Version** | v1.0.0 |
 | **Platforms** | W L M |
-| **Description** | WiFi network scanning and connection status. Uses WlanAPI on Windows, `nmcli` on Linux, and on macOS CoreWLAN for `connected` (SSID/BSSID withheld by Location Services on 14+ → `<ssid-withheld>`) with `airport`/`system_profiler` still backing `list_networks`. |
+| **Description** | WiFi network scanning and connection status. Uses WlanAPI on Windows; on Linux NetworkManager over D-Bus, falling back to `nmcli` and then `iw`/`iwlist`/`iwconfig` via the bounded argv runner; and on macOS CoreWLAN for `connected` (SSID/BSSID withheld by Location Services on 14+ → `<ssid-withheld>`) with `airport`/`system_profiler` still backing `list_networks`. |
 
 | Action | Description |
 |---|---|
@@ -363,8 +363,8 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list_upgradable` | List packages with available upgrades (version comparison). |
-| `installed_count` | Total count of installed applications. |
+| `list_upgradable` | List packages with available upgrades (version comparison). On Windows, winget ships as a per-user App Execution Alias that can be unreachable in the agent's service context — when the alias cannot be resolved at all, the action reports `UNAVAILABLE` rather than a fabricated "up to date"; when winget runs but the result is ambiguous or partial (an unrecognised table header, dropped rows, a nonzero exit alongside real data), it reports `CONSTRAINED` instead. |
+| `installed_count` | Total count of installed applications. On Linux, held packages (`dpkg`'s `hi` status) count as installed alongside `ii`, matching `installed_apps`/`vuln_scan`'s presence filter. A query that fails or finds no supported package manager reports an honest degrade with no count line, rather than a fabricated `0`. |
 
 ### sccm
 
