@@ -2004,13 +2004,19 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
             // signature and must never be read into a response.
             std::error_code size_ec;
             const auto sig_size = std::filesystem::file_size(sig_path, size_ec);
-            std::ifstream sig_in(sig_path, std::ios::binary);
+            // NOTHING is opened until the size check passes. Constructing the
+            // ifstream first would defeat the check entirely: open(2) on a FIFO
+            // blocks until a writer appears, so the handler thread would wedge
+            // before ever reaching this branch — one wedged thread per agent
+            // check, which is pool exhaustion rather than a slow response.
             if (size_ec || sig_size > kMaxSignatureBytes) {
-                spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (size {} "
-                              "bytes, cap {}, stat: {}); serving the package as unsigned",
-                              latest->filename, sig_size, kMaxSignatureBytes,
-                              size_ec ? size_ec.message() : "ok");
-            } else if (sig_in) {
+                spdlog::error("CheckForUpdate: signature sidecar for {} is unusable ({}, cap {} "
+                              "bytes); serving the package as unsigned",
+                              latest->filename,
+                              size_ec ? "size undeterminable: " + size_ec.message()
+                                      : std::to_string(sig_size) + " bytes",
+                              kMaxSignatureBytes);
+            } else if (std::ifstream sig_in(sig_path, std::ios::binary); sig_in) {
                 std::string sig((std::istreambuf_iterator<char>(sig_in)),
                                 std::istreambuf_iterator<char>());
                 response->set_update_signature(std::move(sig));

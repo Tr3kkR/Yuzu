@@ -2161,11 +2161,17 @@ There is no capability handshake on this RPC, so an agent cannot tell "this serv
 is too old to sign" from "the signature was stripped in transit"; both look like
 an absent signature and both are accepted. Keep the window short.
 
-**Before you enable enforcement, know that a failing agent is silent.** There is
-no status-report RPC on the update path: an agent that refuses a package logs
-locally, keeps its current version, and retries every six hours indefinitely. The
-server cannot tell you how many agents are in that state. Verify on a pilot group
-before a fleet-wide flip.
+**Watch `yuzu_fleet_ota_signature_refusing_agents`.** The server derives this
+gauge from the agents' heartbeats: it counts how many endpoints are currently
+reporting at least one refused update. Any sustained non-zero reading means those
+machines have stopped patching. It counts AGENTS rather than refusals on purpose
+— one wedged endpoint retrying every six hours would otherwise dominate a
+refusal count and hide how much of the fleet is affected.
+
+**A refusing agent still cannot tell you WHY.** There is no status-report RPC on the update path, so the reason (missing,
+untrusted chain, or invalid signature) appears only in that endpoint's own log —
+the gauge tells you how many are affected, not what to fix. Verify on a pilot
+group before a fleet-wide flip.
 
 Signature verification runs after the hash check and before anything irreversible
 — before the execute bit is set on POSIX and before the live binary is moved

@@ -1907,6 +1907,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         return os.empty() ? "unknown" : "other";
     };
 
+    int ota_signature_refusing = 0;
+
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
 
@@ -1914,6 +1916,13 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             auto it = snap.status_tags.find(key);
             return it != snap.status_tags.end() ? it->second : "";
         };
+
+        // Read via find() rather than get(): the comment below explains that get()
+        // memcpy's every value it touches, on every agent, on every sweep. We need
+        // only "is this non-zero", so compare in place and copy nothing.
+        if (auto it = snap.status_tags.find("yuzu.ota_signature_refused");
+            it != snap.status_tags.end() && !it->second.empty() && it->second != "0")
+            ++ota_signature_refusing;
 
         // Non-copying accessor. Every tag VALUE is fully agent-controlled and bounded only
         // by the 4 MB gRPC frame, so `get()` above memcpy's it on every lookup, on every
@@ -2204,6 +2213,15 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             ++gh_reporting;
     }
 
+    // OTA signature refusals (#416/#3807). Counts AGENTS currently reporting a
+    // non-zero refusal total, not the refusals themselves — one wedged agent
+    // retrying every six hours would otherwise dominate the number and hide how
+    // many endpoints are affected, which is the question an operator actually
+    // has. This is the only server-side surface for that state: the update path
+    // has no status-report RPC and the agent has no /metrics endpoint, so
+    // without this the refusal is invisible outside a per-endpoint log.
+    metrics.gauge("yuzu_fleet_ota_signature_refusing_agents")
+        .set(static_cast<double>(ota_signature_refusing));
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
     metrics.gauge("yuzu_fleet_agents_dex_observer_disarmed")
         .set(static_cast<double>(dex_observer_disarmed));

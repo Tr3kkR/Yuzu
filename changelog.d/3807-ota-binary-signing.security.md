@@ -28,6 +28,9 @@
   anchor; on macOS and Windows it runs as root and LocalSystem and can, so there
   the permissions keep unprivileged local users out rather than the agent itself
   — inherent, since a process able to replace the system binary can rewrite the
-  file authorising the replacement. See "Signing update binaries" in the
-  server administration manual, including why the transitional unsigned-allowed
+  file authorising the replacement. Refusals are counted per agent and
+  surfaced fleet-wide as `yuzu_fleet_ota_signature_refusing_agents`, since the
+  update path has no status-report RPC and the agent has no metrics endpoint —
+  without that gauge a fleet-wide refusal would only be visible in per-endpoint
+  logs. See "Signing update binaries" in the server administration manual, including why the transitional unsigned-allowed
   mode is a downgrade oracle and why a failing agent is currently silent.

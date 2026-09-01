@@ -53,8 +53,11 @@ struct UpdateConfig {
     /// and the agent has NO /metrics endpoint — so a counter alone would be
     /// write-only. The total is therefore carried on the heartbeat as
     /// `yuzu.ota_signature_refused` (agent.cpp), which is the agent's only
-    /// outbound telemetry channel, so an operator sees a fleet-wide refusal
-    /// instead of discovering it when machines stop patching.
+    /// outbound telemetry channel, and the server derives the fleet gauge
+    /// `yuzu_fleet_ota_signature_refusing_agents` from it
+    /// (agent_registry.cpp::recompute_metrics). That gauge is the operator-facing
+    /// end of this: without it the counter would be write-only, which is what an
+    /// earlier round of this change shipped.
     ///
     /// Null in tests and wherever no registry exists.
     yuzu::MetricsRegistry* metrics{nullptr};

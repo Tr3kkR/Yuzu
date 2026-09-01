@@ -123,11 +123,13 @@ Source: "{#BuildDir}\agents\plugins\example\example.dll"; DestDir: "{app}\plugin
 [Dirs]
 Name: "{app}\logs"; Permissions: admins-full system-full
 Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
-; Trust-anchor directory for OTA update and plugin code-signing bundles
-; (#416/#3807). Matches the well-known path cert_discovery.cpp already looks in.
-; Its own directory, NOT {commonappdata}\Yuzu\certs: that path is the server's
-; CA directory on a co-installed host, and the two have incompatible ownership
-; requirements. Administrators and SYSTEM only. NOTE: the agent service runs as LocalSystem, so
+; Trust-anchor directory for OTA update signature verification (#416/#3807).
+; Its own directory, NOT {commonappdata}\Yuzu\certs: on a co-installed host that
+; path is the server's CA directory, whose ownership requirements are
+; incompatible with an agent-readable anchor. Plugin code signing is unaffected
+; and still uses <cert-dir>\plugin-trust-bundle.pem.
+;
+; Administrators and SYSTEM only. NOTE: the agent service runs as LocalSystem, so
 ; it is covered by system-full and CAN write here - this ACL keeps unprivileged
 ; local users out, not the agent itself. Inherent: a process able to replace the
 ; system binary can rewrite the file authorising the replacement. See "Signing
