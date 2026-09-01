@@ -29,6 +29,7 @@ struct FakeDir {
     std::map<std::string, int> os_errors_open; // name -> os_error for OsError refusal
     bool enumerate_os_error = false;
     bool enumerate_internal_error = false;
+    bool open_dir_throws = false;
     int enumerate_os_error_code = 0;
 };
 
@@ -52,6 +53,8 @@ public:
 
     OpenDirRes<DirHandle> open_dir(DirHandle& parent, const std::string& name) {
         FakeDir& p = dirs_.at(parent);
+        if (p.open_dir_throws)
+            throw std::runtime_error("fake open_dir failure");
         if (auto it = p.refusals.find(name); it != p.refusals.end())
             return OpenDirRes<DirHandle>{std::nullopt, it->second, 0};
         if (auto it = p.os_errors_open.find(name); it != p.os_errors_open.end())
@@ -217,6 +220,66 @@ TEST_CASE("walk_delete lazy match: MatchFn not called past the entry cap", "[con
     DeleteResult result = walk_delete<FakeOps>(root, ops, counting, limits);
     REQUIRE(match_calls == 0);
     REQUIRE(result.stop_reason == Reason::EntryCap);
+}
+
+// The outer exception firewall (walk.hpp) must catch a throw from ANY Ops
+// member, not just the MatchFn throw the inner catch handles. Found independently
+// by both external reviewers: every prior test reached Internal by RETURNING it
+// from enumerate, so the catch(...) itself was never exercised.
+TEST_CASE("walk_delete: a throwing Ops member is contained as Internal", "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    int child = ops.add_dir();
+    ops.dir(root).subdirs["sub"] = child;
+    ops.dir(root).entries = {dir_entry("sub")};
+    ops.dir(root).open_dir_throws = true;
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, kOpenLimits);
+    REQUIRE(result.stop_reason == Reason::Internal);
+    REQUIRE(ops.unlink_calls_ == 0);
+}
+
+// The saturating deadline (walk.hpp) is always executed but was never asserted
+// against a value that actually takes the clamp branch, so a regression to raw
+// `now() + max_wall` -- signed overflow, potentially a deadline in the PAST --
+// would not fail any test. Found independently by both external reviewers.
+TEST_CASE("walk_delete: an extreme max_wall saturates instead of overflowing",
+          "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    ops.dir(root).entries = {file_entry("a.txt", 10)};
+
+    DeleteLimits limits = kOpenLimits;
+    limits.max_wall = std::chrono::milliseconds::max();
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, limits);
+    // A wrapped deadline would land in the past and stop the walk immediately.
+    REQUIRE(result.stop_reason == Reason::None);
+    REQUIRE(result.entries.size() == 1);
+    REQUIRE(result.entries[0].status == EntryStatus::Deleted);
+    REQUIRE(ops.last_budget_.deadline > ops.now());
+}
+
+// The enumeration budget must be max_entries MINUS what has already been seen.
+// The existing passthrough test only asserted the first directory, where
+// entries_seen is still 0, so the subtraction itself was unproven.
+TEST_CASE("walk_delete: the enumerate budget subtracts entries already seen",
+          "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    int child = ops.add_dir();
+    ops.dir(root).subdirs["sub"] = child;
+    ops.dir(root).entries = {file_entry("a.txt"), file_entry("b.txt"), dir_entry("sub")};
+    ops.dir(child).entries = {file_entry("c.txt")};
+
+    DeleteLimits limits = kOpenLimits;
+    limits.max_entries = 10;
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, limits);
+    REQUIRE(result.stop_reason == Reason::None);
+    // Root consumed 3 entries before the child was enumerated, so the child's
+    // budget must be 10 - 3 = 7, not the raw 10.
+    REQUIRE(ops.last_budget_.max_entries == 7);
 }
 
 // B001 regression: the byte cap must be charged what the leg MEASURED at delete
