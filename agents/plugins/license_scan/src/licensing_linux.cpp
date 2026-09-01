@@ -124,31 +124,42 @@ void run_pkg_metadata_surface(ProbeHost& host, std::vector<LicRecord>& records,
         if (res.truncated) {
             // A truncated rpm -qa is a false-negative surface (some installed
             // packages silently missing) -- a distinct, honest outcome, never
-            // folded into "query failed" or a silent partial success.
+            // folded into "query failed" or a silent partial success. rpm DID
+            // run and IS the real tool here, so this stays terminal rather
+            // than falling through to a second tool that would just re-run
+            // the whole enumeration and produce a different partial result.
             outcomes.push_back({"pkg_metadata", false, 0, "output_truncated"});
             return;
         }
-        if (!res.ok) {
-            outcomes.push_back({"pkg_metadata", false, 0, "rpm_query_failed"});
+        if (res.ok) {
+            for (const auto& line : split_lines(res.output)) {
+                const auto fields = split_tabs(line);
+                if (fields.size() < 4 || fields[0].empty())
+                    continue;
+                LicRecord r;
+                r.product = fields[0];
+                r.version = fields[1];
+                r.vendor = fields[2] == "(none)" ? "" : fields[2];
+                r.license_type = classify_license_string(fields[3]); // open_source|freeware|unknown
+                r.status = "unknown"; // classification only — no lapse (stated gap)
+                r.source = "package_metadata";
+                r.confidence = "probable"; // declared by the packager
+                records.push_back(std::move(r));
+                ++emitted;
+            }
+            outcomes.push_back({"pkg_metadata", true, emitted, {}});
             return;
         }
-        for (const auto& line : split_lines(res.output)) {
-            const auto fields = split_tabs(line);
-            if (fields.size() < 4 || fields[0].empty())
-                continue;
-            LicRecord r;
-            r.product = fields[0];
-            r.version = fields[1];
-            r.vendor = fields[2] == "(none)" ? "" : fields[2];
-            r.license_type = classify_license_string(fields[3]); // open_source|freeware|unknown
-            r.status = "unknown"; // classification only — no lapse (stated gap)
-            r.source = "package_metadata";
-            r.confidence = "probable"; // declared by the packager
-            records.push_back(std::move(r));
-            ++emitted;
-        }
-        outcomes.push_back({"pkg_metadata", true, emitted, {}});
-        return;
+        // rpm's PRESENCE on the host is not proof it is the host's real
+        // package manager -- a Debian/Ubuntu box can carry a stray/leftover
+        // `rpm` binary (pulled in transitively, e.g. by packaging tooling)
+        // whose database was never initialized for real package management
+        // and errors on every query, while dpkg-query works fine as the
+        // host's actual manager. Found live: a shared self-hosted Linux CI
+        // runner reported `rpm_query_failed` on every run despite
+        // dpkg-query succeeding immediately after. So an rpm EXECUTION
+        // failure (as opposed to rpm being simply absent) falls through to
+        // try dpkg-query rather than reporting a terminal error.
     }
 
     auto dpkg_query = yuzu::agent::probe_tool_path({"/usr/bin/dpkg-query", "/bin/dpkg-query"});
