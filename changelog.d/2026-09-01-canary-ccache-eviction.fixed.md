@@ -7,4 +7,4 @@
   degraded rebuilds - and starved every other cache in the repo. The key is now
   an ISO-week bucket (roughly one saved entry per week; ccache's own
   preprocessed-input hashing absorbs source drift) and the canary job caps
-  `CCACHE_MAXSIZE` at 1.5G.
+  `CCACHE_MAXSIZE` at 2G.

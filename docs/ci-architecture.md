@@ -1385,7 +1385,7 @@ ran 7x over GitHub's 10 GB repo quota, and LRU eviction both degraded the canary
 (8-20 min rebuilds from week-old entries) and starved every other cache
 (measured 2026-09-01). One entry per week per scope now; ccache's own
 preprocessed-input hashing absorbs intra-week source drift (hit rate decays
-through the week, refreshed at rollover), and a job-level `CCACHE_MAXSIZE: 1.5G`
+through the week, refreshed at rollover), and a job-level `CCACHE_MAXSIZE: 2G`
 keeps the entry from growing without bound. The ccache save is gated on the
 Build step having run, pass or fail — a cancelled run leaves no thin entry, at
 the accepted cost that an early hard Build failure can occupy the week's key
