@@ -1462,7 +1462,17 @@ AgentServiceImpl::resolve_execution_id(const std::string& command_id) const {
     auto* tracker = execution_tracker_.load(std::memory_order_acquire);
     if (!tracker)
         return std::nullopt;
-    return tracker->lookup_execution_id(command_id);
+    // Distinguish a STORE DEGRADE from an ordinary miss (adversarial
+    // review Should-fix, PR #3780): this is the hot path, hit on every
+    // CommandResponse, and a nullopt here was previously indistinguishable
+    // from the common "out-of-band dispatch" case. A sustained degrade now
+    // counts, mirroring the write path's yuzu_exec_correlation_write_degrade_total.
+    std::string degrade_reason;
+    auto result = tracker->lookup_execution_id(command_id, &degrade_reason);
+    if (!degrade_reason.empty())
+        metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", degrade_reason}})
+            .increment();
+    return result;
 }
 
 // -- record_execution_id (PR 2; HA WS-1(1b) — PG-backed, ADR-2002 section 5) --

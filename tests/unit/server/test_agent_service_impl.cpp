@@ -1638,6 +1638,41 @@ TEST_CASE("notify_exec_tracker: unmapped command_id is a no-op",
     CHECK(ts.tracker->get_agent_statuses(exec_id).empty());
 }
 
+TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
+          "no tracker row (adversarial review, PR #3780)",
+          "[pg][agent_service][executions][issue872]") {
+    // The four non-tracked correlation-id prefixes (polchk-/bundle-/
+    // preflight-/deployment-) are minted as the execution_id VALUE by
+    // PolicyEvaluator/BundleOrchestrator/PreflightRunner/the deployment
+    // engine, then explicitly skipped by notify_exec_tracker's
+    // starts_with(...) guards (agent_service_impl.cpp) so they never
+    // create a phantom agent_exec_status row or publish a phantom
+    // agent-transition SSE event. test_execution_tracker.cpp proves the
+    // STORE round-trips these values opaquely; THIS test proves the
+    // actual DECISION SITE (notify_exec_tracker, reached only through
+    // resolve_execution_id -> ExecutionTracker::lookup_execution_id, the
+    // PG-backed path this PR migrated) still honours the skip — the
+    // property a prior version of this PR's own test claimed to prove
+    // but didn't (it looked up an unwritten key, never exercising this
+    // decision site at all).
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+
+    for (const std::string& execution_id :
+         {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
+        CAPTURE(execution_id);
+        const std::string command_id = "plugin-cmd-" + execution_id;
+        h.svc.record_execution_id(command_id, execution_id);
+
+        auto resp = GatewayResponseHarness::make_response(command_id, apb::CommandResponse::SUCCESS);
+        h.svc.process_gateway_response("agent-1", resp);
+
+        CHECK(ts.tracker->get_agent_statuses(execution_id).empty());
+    }
+}
+
 TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contract)",
           "[pg][agent_service][executions][issue872]") {
     // The atomic-load-acquire in notify_exec_tracker is the read half of the

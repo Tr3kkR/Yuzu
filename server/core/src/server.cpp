@@ -2609,6 +2609,20 @@ public:
                           "unaffected",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_write_degrade_total");
+        // Distinct from both counters above: this fires on the READ path
+        // (AgentServiceImpl::resolve_execution_id, hit on every
+        // CommandResponse) — adversarial review Should-fix, PR #3780: a
+        // degraded lookup was previously indistinguishable from the common
+        // "out-of-band dispatch" nullopt case, so a sustained pool/query
+        // degrade on this hot path had no signal pointing at it.
+        metrics_.describe("yuzu_exec_correlation_read_degrade_total",
+                          "Command-response-time command_id -> execution_id correlation lookups "
+                          "that degraded (reason: pool_exhausted or query_failed) rather than a "
+                          "genuine miss - the response's execution_id stamp/agent-transition "
+                          "event is dropped for it",
+                          "counter");
+        for (auto reason : {"pool_exhausted", "query_failed"})
+            metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,

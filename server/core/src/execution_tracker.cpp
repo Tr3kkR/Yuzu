@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <random>
@@ -925,6 +926,29 @@ constexpr int kCmdExecutionReapCap = 5000;
 // comfortably absorbing ordinary jitter while still catching a genuinely
 // wrong clock (a jump of days, not seconds).
 constexpr std::int64_t kMaxPlausibleSkewSecs = 24 * 3600;
+
+// Checked parse for the two clock-guard-critical readings (the DB now()
+// column and the persisted reap_meta anchor) — deliberately NOT this file's
+// ambient `to_i64`, which is a lenient `strtoll`-with-no-validation helper
+// appropriate for trusted DB-returned row columns elsewhere in this file,
+// but NOT for a value the clock-guarded-retention routed concern (CLAUDE.md
+// part 3) requires be SANITISED: "ahead-of-now / negative / unparseable =
+// anomaly, never a quiet reset". A migration bug, a manual `reap_meta` repair,
+// or storage corruption writing `123junk` or an overflowed value must be
+// REJECTED as an anomaly, not silently truncated/wrapped by an unchecked
+// strtoll (adversarial review finding, PR #3780 -- api_token_store.cpp's
+// `parse_meta_i64` / response_store.cpp's inline equivalent are the
+// reference shape this mirrors; a second hand-rolled copy is the drift
+// those two already accepted as "duplicating this one is cheaper than a
+// shared-utility header for a three-line function").
+std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(val.c_str(), &end, 10);
+    if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
+        return std::nullopt;
+    return static_cast<std::int64_t>(v);
+}
 } // namespace
 
 bool ExecutionTracker::record_command_execution(const std::string& command_id,
@@ -958,14 +982,25 @@ bool ExecutionTracker::record_command_execution(const std::string& command_id,
                               "DELETE FROM execution_tracker.command_execution "
                               "WHERE command_id = $1",
                               std::vector<std::string>{command_id})
+            // created_at is authored from Postgres now() IN-SQL, not the
+            // calling replica's app clock (adversarial review Should-fix,
+            // PR #3780): reap_command_execution_mappings compares created_at
+            // against its own DB `now()` reading, so authoring created_at
+            // from a different (app) clock domain means a replica whose
+            // local clock lags the DB primary by more than the reap window
+            // can write a mapping that reads as already-expired the moment
+            // another replica's sweep runs -- silently dropping the exact
+            // correlation this migration exists to preserve, in the exact
+            // multi-replica scenario it targets. Matches session_store's
+            // DB-clock-authority precedent (#3715).
             : pg::exec_params(
                   lease.get(),
                   "INSERT INTO execution_tracker.command_execution "
-                  "(command_id, execution_id, created_at) VALUES ($1, $2, $3) "
+                  "(command_id, execution_id, created_at) "
+                  "VALUES ($1, $2, extract(epoch FROM now())::bigint) "
                   "ON CONFLICT (command_id) DO UPDATE SET "
                   "execution_id = EXCLUDED.execution_id, created_at = EXCLUDED.created_at",
-                  std::vector<std::string>{command_id, execution_id,
-                                           std::to_string(now_epoch())});
+                  std::vector<std::string>{command_id, execution_id});
     if (res.status() != PGRES_COMMAND_OK) {
         spdlog::error("ExecutionTracker::record_command_execution: write failed for "
                       "command_id={} — this command's responses will not correlate to an "
@@ -978,18 +1013,27 @@ bool ExecutionTracker::record_command_execution(const std::string& command_id,
 }
 
 std::optional<std::string>
-ExecutionTracker::lookup_execution_id(const std::string& command_id) const {
+ExecutionTracker::lookup_execution_id(const std::string& command_id,
+                                      std::string* degrade_reason) const {
     if (!open_)
-        return std::nullopt;
+        return std::nullopt; // not a runtime degrade -- construction already failed loudly
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        if (degrade_reason)
+            *degrade_reason = "pool_exhausted";
         return std::nullopt;
+    }
     pg::PgResult res = pg::exec_params(lease.get(),
                                        "SELECT execution_id FROM execution_tracker.command_execution "
                                        "WHERE command_id = $1",
                                        std::vector<std::string>{command_id});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (degrade_reason)
+            *degrade_reason = "query_failed";
         return std::nullopt;
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::nullopt; // genuine miss -- out-of-band dispatch or an aged-out mapping
     return col_str(res.get(), 0, 0);
 }
 
@@ -1023,7 +1067,21 @@ ExecutionTracker::reap_command_execution_mappings() {
                 err = "reap now() read failed";
                 return false;
             }
-            now_s = to_i64(PQgetvalue(nr.get(), 0, 0));
+            // SANITISE the reading (clock-guarded-retention routed concern,
+            // part 3): unparseable or negative is an ANOMALY, never a quiet
+            // fallback to 0/silently-truncated garbage (adversarial review
+            // finding, PR #3780 -- the prior unchecked `to_i64` here would
+            // parse a malformed/overflowed value with no error and no
+            // rejection, in direct violation of this exact standing rule).
+            auto parsed_now = parse_reap_i64(col_str(nr.get(), 0, 0));
+            if (!parsed_now || *parsed_now < 0) {
+                spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: "
+                             "unparseable or negative now() reading '{}'",
+                             col_str(nr.get(), 0, 0));
+                clock_anomaly = true;
+                return true; // decline, anchor unchanged
+            }
+            now_s = *parsed_now;
         }
         pg::PgResult ar = pg::exec_params(
             c, "SELECT value FROM execution_tracker.reap_meta WHERE key = 'cmd_exec_reap_anchor'",
@@ -1033,7 +1091,25 @@ ExecutionTracker::reap_command_execution_mappings() {
             return false;
         }
         const bool has_anchor = PQntuples(ar.get()) > 0;
-        const std::int64_t anchor = has_anchor ? to_i64(PQgetvalue(ar.get(), 0, 0)) : 0;
+        std::int64_t anchor = 0;
+        if (has_anchor) {
+            // Same sanitisation as now_s, for the SAME reason -- reap_meta
+            // is a plain key/value table a bad migration, a manual repair,
+            // or storage corruption can write anything into. An unparseable
+            // or negative persisted anchor is an anomaly: decline this
+            // pass, do NOT silently treat it as 0 (which would read as
+            // "everything is stale" and mass-delete) or as any other quiet
+            // fallback.
+            auto parsed_anchor = parse_reap_i64(col_str(ar.get(), 0, 0));
+            if (!parsed_anchor || *parsed_anchor < 0) {
+                spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: "
+                             "unparseable or negative persisted anchor '{}'",
+                             col_str(ar.get(), 0, 0));
+                clock_anomaly = true;
+                return true;
+            }
+            anchor = *parsed_anchor;
+        }
         if (has_anchor && now_s > anchor + kMaxPlausibleSkewSecs) {
             spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: now_s {} "
                          "implausibly ahead of anchor {}",

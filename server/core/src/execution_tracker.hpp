@@ -255,7 +255,17 @@ public:
     /// fan-out): one command_id is dispatched to N agents, each sending its
     /// own response against the same command_id — deleting on the first
     /// response would strand agents 2..N with no execution_id to stamp.
-    [[nodiscard]] std::optional<std::string> lookup_execution_id(const std::string& command_id) const;
+    /// `degrade_reason`, when non-null, is set to "pool_exhausted" or
+    /// "query_failed" iff the nullopt return is a STORE DEGRADE rather than
+    /// a genuine miss (adversarial review Should-fix, PR #3780: previously
+    /// indistinguishable from an ordinary out-of-band-dispatch/aged-out
+    /// miss, which is the common case on every CommandResponse — a
+    /// sustained pool-exhaustion degrade on this hot path had no signal
+    /// pointing at it specifically). Left untouched on success or a
+    /// genuine miss; callers should only inspect it when the return is
+    /// nullopt.
+    [[nodiscard]] std::optional<std::string>
+    lookup_execution_id(const std::string& command_id, std::string* degrade_reason = nullptr) const;
 
     /// Clock-guarded retention sweep for the `command_execution` table
     /// (routed concern "Clock-guarded retention", CLAUDE.md). Mirrors

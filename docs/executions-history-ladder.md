@@ -11,10 +11,11 @@ document holds the hard invariants every successor PR in the ladder must check.
 (HA WS-1(1b), ADR-2002 section 5 — migrated off the former in-process
 `AgentServiceImpl::cmd_execution_ids_` map, which was replica-local and could
 not resolve a response landing on a different server instance than the one
-that dispatched it). `AgentServiceImpl::record_command_execution` /
-`::lookup_execution_id` are the write/read entry points;
-`AgentServiceImpl::resolve_execution_id` is the single chokepoint every
-response-receipt read goes through. The mapping is registered at dispatch
+that dispatched it). `ExecutionTracker::record_command_execution` /
+`::lookup_execution_id` are the store's write/read entry points;
+`AgentServiceImpl::record_execution_id` / `::resolve_execution_id` are the
+corresponding `AgentServiceImpl`-side wrappers, with `resolve_execution_id`
+the single chokepoint every response-receipt read goes through. The mapping is registered at dispatch
 time INSIDE `cmd_dispatch` BEFORE any RPC is sent — closes the FAST-agent race
 where a sub-millisecond loopback agent could reply before a post-dispatch
 registration. The `CommandDispatchFn` typedef carries `execution_id` as its

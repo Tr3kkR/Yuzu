@@ -919,6 +919,97 @@ TEST_CASE("ExecutionTracker: reap declines on a backward-stepped clock "
     CHECK(second->clock_anomaly);
 }
 
+TEST_CASE("ExecutionTracker: reap declines on an unparseable persisted "
+          "anchor (adversarial review Blocker, PR #3780)",
+          "[pg][execution_tracker]") {
+    // CLAUDE.md's clock-guarded-retention part 3: "SANITISE that reading
+    // (ahead-of-now / negative / unparseable = anomaly, never a quiet
+    // reset)". A bad migration, a manual reap_meta repair, or storage
+    // corruption can write anything into this plain key/value table — the
+    // parse must REJECT junk, never silently truncate/coerce it via an
+    // unchecked strtoll (the finding this test locks: `to_i64`'s prior
+    // zero-validation parse would have accepted "123junk" as 123, with no
+    // rejection and no counted anomaly).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    {
+        pg::PgPool& pool = tracker_bundle.pool();
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = '123junk' "
+            "WHERE key = 'cmd_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
+TEST_CASE("ExecutionTracker: reap declines on a negative persisted anchor "
+          "(adversarial review Blocker, PR #3780)",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    {
+        pg::PgPool& pool = tracker_bundle.pool();
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(),
+                                   "UPDATE execution_tracker.reap_meta SET value = '-1' "
+                                   "WHERE key = 'cmd_exec_reap_anchor'",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
+TEST_CASE("ExecutionTracker: reap declines on an overflowed persisted "
+          "anchor (adversarial review Blocker, PR #3780)",
+          "[pg][execution_tracker]") {
+    // A value strtoll cannot represent (beyond int64_t range) must be
+    // rejected via the errno==ERANGE check, not wrapped/clamped by
+    // static_cast<int64_t> on an already-saturated `long long`.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    {
+        pg::PgPool& pool = tracker_bundle.pool();
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "'99999999999999999999999999' WHERE key = 'cmd_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
 TEST_CASE("ExecutionTracker: the four non-tracked correlation-id VALUES "
           "round-trip opaquely through the PG-backed store",
           "[pg][execution_tracker]") {

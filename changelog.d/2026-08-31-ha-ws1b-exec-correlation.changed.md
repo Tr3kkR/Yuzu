@@ -8,5 +8,9 @@
   mapping ages out via a new clock-guarded retention sweep (`reap_command_execution_mappings`,
   ~60m cadence) rather than growing unbounded for process lifetime. New metrics:
   `yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` / `_store_degrade_total` (the
-  retention sweep) and `_write_degrade_total` (the dispatch-time write, distinct from the sweep),
-  plus a new `YuzuExecCorrelationReapClockAnomaly` Prometheus alert on the clock-anomaly counter.
+  retention sweep), `_write_degrade_total` (the dispatch-time write), and `_read_degrade_total`
+  (the response-receipt lookup, labelled `reason`), plus a new `YuzuExecCorrelationReapClockAnomaly`
+  Prometheus alert on the clock-anomaly counter. `created_at` is authored from Postgres `now()`
+  in-SQL (not the writing replica's app clock), matching the reap's own clock domain; the retention
+  sweep's persisted anchor is now checked-parsed (junk/negative/overflowed values are rejected as a
+  clock anomaly, never silently coerced).
