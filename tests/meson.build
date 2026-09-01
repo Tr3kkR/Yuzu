@@ -299,6 +299,12 @@ agent_test_exe = executable(
     'unit/test_licensing_parsers.cpp',
     'unit/test_licensing_sync.cpp',
     'unit/test_wifi_corewlan.cpp',
+    'unit/test_wifi_parsers.cpp',           # PKG-WIFI: pure nmcli/iw/iwlist/iwconfig/airport/
+                                              # system_profiler text parsers + NM D-Bus AP-tuple helpers
+    'unit/test_wifi_local_dispatcher.cpp',  # PKG-WIFI remediation: real wifi.dylib/.so driven
+                                              # end to end via LocalDispatcher (POSIX-only; a no-op
+                                              # TU on Windows via the file's own #ifndef _WIN32 guard),
+                                              # same pattern as test_users_posix_actions.cpp
     'unit/test_interaction_parsers.cpp',
     'unit/test_hardware_disks_macos.cpp',
     'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
@@ -499,6 +505,8 @@ agent_test_exe = executable(
   # windows_updates_plugin_lib / sccm_plugin_lib: same reasoning for
   # test_windows_updates_{posix,win}_actions.cpp / test_sccm_win_actions.cpp
   # (Wave 3 PR33d code-review remediation).
+  # wifi_plugin_lib (agents/plugins/wifi/meson.build): test_wifi_local_dispatcher.cpp
+  # loads the real wifi plugin by path for the same reason (PKG-WIFI).
   # event_logs_plugin_lib: same reasoning for test_event_logs_{posix,win}_actions.cpp
   # (Wave 4 PR4.2 native-acquisition migration remediation).
   # installed_apps_plugin_lib / msi_packages_plugin_lib
@@ -521,8 +529,8 @@ agent_test_exe = executable(
                 hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
                 windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
                 installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib,
-                content_dist_plugin_lib, script_exec_plugin_lib, echo_argv_fixture,
-                software_actions_plugin_lib, license_scan_plugin_lib],
+                wifi_plugin_lib, content_dist_plugin_lib, script_exec_plugin_lib,
+                software_actions_plugin_lib, license_scan_plugin_lib, echo_argv_fixture],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it

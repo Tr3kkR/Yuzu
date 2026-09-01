@@ -33,6 +33,20 @@ in one function; IDs are never reused after a site is deleted).
 Populated as the migration reaches each site (and immediately for any new or
 interim site — ADR-3002 Decisions 1 and 2).
 
+> **Limitation of the lexical CI gate — read before relying on it.**
+> `scripts/ci/check-plugin-spawn-lexical.sh` scans for raw spawn TOKENS
+> (`popen`/`system`/`fork`/`CreateProcess`). It does **not** see an interpreter
+> payload routed through the shared bounded runner: an argv vector of the shape
+> `{"/bin/sh","-c", ...}` handed to `run_bounded_subprocess` passes the gate
+> clean. This was confirmed empirically — that exact shape was injected into a
+> migrated plugin and the gate still reported no findings. So the gate enforces
+> "no raw spawn primitive", NOT ADR-3002 Decision 5's "no interpreter", and a
+> future change can silently return a plugin to rung 3 without CI noticing.
+> Until the gate is extended, the only guard is per-plugin: `wifi` pins it with
+> pure argv-builder functions plus a unit test asserting no vector invokes an
+> interpreter (`argv_invokes_interpreter`, `tests/unit/test_wifi_parsers.cpp`).
+
+
 | Site ID | Location | Mechanism | Platform | Provenance | Mutating | Shell features | Privilege | Ladder review | Rung + evidence | Registration |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `users/do_logged_on#1` | `agents/plugins/users/src/users_plugin.cpp:do_logged_on` | runner argv | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
@@ -160,6 +174,13 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `license_scan/run_entitlement_certs_surface_linux#2` | `agents/plugins/license_scan/src/licensing_linux.cpp:run_entitlement_certs_surface` | runner argv (`openssl x509 -noout -enddate -in <cert>`), fallback when `#1`'s `-dateopt iso_8601` form fails or is truncated | Linux | same as `#1` | read-only | none | none | same as `#1` | 2 — same as `#1` | n/a |
 | `network_config/do_dns_cache#1` | `agents/plugins/network_config/src/network_config_plugin.cpp:do_dns_cache` | runner argv (`resolvectl cache`), path resolved via `yuzu::agent::probe_tool_path` (no PATH search) | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated entirely | none | Reviewed — no public libsystemd/sd-bus API exposes resolved's cache contents; `resolvectl cache` is the only source | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess (was rung 3, `/bin/sh -c`, before this migration) | n/a |
 | `network_config/do_dns_cache#2` | `agents/plugins/network_config/src/network_config_plugin.cpp:do_dns_cache` | runner argv (`systemd-resolve --statistics`), path resolved via `yuzu::agent::probe_tool_path` | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated entirely | none | Reviewed — fallback for hosts where `resolvectl` is absent | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess (was rung 3) | n/a |
+| `wifi/do_list_networks#1` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`nmcli -t -f SSID,SIGNAL,SECURITY,CHAN,BSSID device wifi list`), path via `yuzu::agent::probe_tool_path` | Linux | none — fixed literal argv | read-only | none — `/bin/sh -c` eliminated | none | rung 1 (NetworkManager D-Bus) implemented in this file and tried first; this argv leg is the declared fallback | Rung 2 — direct argv via yuzu::agent::run_bounded_subprocess, reached only on sd-bus failure | n/a |
+| `wifi/do_list_networks#2` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`iw dev`), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — grep/awk pipeline replaced by pure `parse_iw_dev_interfaces` | none | tertiary fallback, reached only when D-Bus and nmcli are both unavailable | Rung 2 — direct argv; rung 1 passed over on the last-resort raw-text path | n/a |
+| `wifi/do_list_networks#3` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`iwlist <iface> scan`), path via `probe_tool_path` | Linux | iface name from local `iw dev` enumeration output, validated by `is_safe_iface_name` (rejects leading `-`, ADR-3002 Decision 6) — never operator input | read-only | none — grep replaced by pure `filter_iwlist_scan_lines` | **root for an active scan** — an unprivileged agent gets no results and the plugin reports the scan as failed, never as an empty airspace (see `docs/agent-privilege-model.md`) | same as #2 | Rung 2 — direct argv | n/a |
+| `wifi/do_list_networks#4` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`airport -s`, fixed private-framework path) | macOS | none — fixed literal argv | read-only | none | none | no Location-Services-free scan API on macOS; native scan path owned by the user-context-bridge work | Rung 2 — direct argv, up from rung 3 (`/bin/sh -c`) before this migration | n/a |
+| `wifi/do_list_networks#5` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_list_networks` | runner argv (`/usr/sbin/system_profiler SPAirPortDataType -detailLevel basic`) | macOS | none — fixed literal argv | read-only | none | none | same as #4 | Rung 2 — direct argv, up from rung 3 | n/a |
+| `wifi/do_connected#1` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_connected` | runner argv (`nmcli -t -f ACTIVE,SSID,SIGNAL,SECURITY,BSSID,DEVICE device wifi list`, ACTIVE row selected), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — line bound via the runner's max_lines | none | rung 1 (NetworkManager D-Bus) tried first; declared fallback | Rung 2 — direct argv, reached only on sd-bus failure | n/a |
+| `wifi/do_connected#2` | `agents/plugins/wifi/src/wifi_plugin.cpp:do_connected` | runner argv (`iwconfig`), path via `probe_tool_path` | Linux | none — fixed literal argv | read-only | none — grep replaced by pure `filter_iwconfig_essid_signal_lines` | none | tertiary fallback | Rung 2 — direct argv | n/a |
 | `script_exec/do_exec#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_exec` | runner argv, argv[0] resolved via the pure `resolve_executable` (script_exec_parsers.hpp) against the PARENT process's own PATH (forwarded through `SubprocessOptions::extra_env`), not the runner's fixed four-directory default | Linux/macOS/Windows | operator-supplied `command`/`args` params — this action's entire contract is "execute an arbitrary admin-specified program"; the server enforces admin-only role checks before ever dispatching to this plugin | **mutating** | none — pre-split argv, no shell in between; the deleted `execvpe`/`execvp`/Win32 spawn paths never involved a shell either | none beyond the agent's existing service-account context; gated admin-only at the server, not by a sudoers grant | Reviewed — this action's contract IS "run an arbitrary caller-named binary"; no rung-1 API can answer that generically | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 not applicable, the action IS "invoke an operator-named program", same principle as `network_actions/ping#1` | n/a |
 | `script_exec/do_bash#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_bash` | runner argv (`/bin/bash -c <script>`), script as ONE argv element | Linux/macOS | operator-supplied `script` param (admin-only action, server-gated) | **mutating** | bash itself interprets the script text (pipeline/redirection/glob/etc. all live inside bash's own interpretation); the outer spawn carries it as one opaque argv element, no shell hop before bash | none beyond the agent's existing service-account context; admin-only action gate | Reviewed — bash is the interpreter this action exists to invoke; no rung-1 substitute for "run an operator-authored bash script" | Rung 3 — Decision-5 governed-interpreter site; bash is the deepest interpreter intentionally invoked, same principle as PowerShell's `-EncodedCommand` and osascript's `-e` | Decision-5 interpreter registration (`bash_c`, unchanged from the prior `kActionDescriptors` entry — now prefixed `subprocess_runner:`) |
 | `script_exec/do_powershell#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_powershell` | runner argv (`powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64>`), `powershell.exe` at its fixed well-known System32 path (same location `interaction/input_windows#1` probes) | Windows | operator-supplied `script` param, Base64/UTF-16LE-encoded before assembly (admin-only action, server-gated) | **mutating** | PowerShell itself interprets the decoded script; the outer spawn is clean argv, no `cmd.exe`; `-EncodedCommand` exists specifically to remove all outer-shell escaping/injection surface | none beyond the agent's existing service-account context; admin-only action gate | Reviewed — PowerShell is the interpreter this action exists to invoke, same principle as `interaction/input_windows#1` | Rung 3 — Decision-5 governed-interpreter site, same as `interaction/input_windows#1` | Decision-5 interpreter registration (`powershell_encodedcommand`, unchanged from the prior `kActionDescriptors` entry — now prefixed `subprocess_runner:`) |
@@ -178,13 +199,8 @@ private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
 **Raw `popen`/`system` helpers:**
-device_identity, hardware, installed_apps,
-device_identity, event_logs, hardware,
-ioc, network_config,
-ioc, license_scan,
-network_diag, os_info, processes,
-tar, vuln_scan, wifi, windows_updates.
-software_actions, vuln_scan, wifi, windows_updates.
+device_identity, ioc, network_diag, os_info, processes,
+vuln_scan, windows_updates.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
 
