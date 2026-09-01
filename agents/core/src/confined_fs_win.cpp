@@ -113,6 +113,25 @@ constexpr NTSTATUS kStatusSharingViolation = static_cast<NTSTATUS>(0xC0000043L);
 constexpr NTSTATUS kStatusNotADirectory = static_cast<NTSTATUS>(0xC0000103L);
 constexpr NTSTATUS kStatusDirectoryNotEmpty = static_cast<NTSTATUS>(0xC0000101L);
 
+// Local NT CreateDisposition / CreateOptions values, for the same reason as the
+// kStatus* block above: <winternl.h> does not reliably export them, and today
+// they are supplied ONLY by the hand-written header stand-in this TU is parsed
+// against off-Windows -- verified by deleting them from the stand-in, which
+// produced 9 "use of undeclared identifier" errors at exactly these call sites.
+// Defining them here removes the dependency, so the first real MSVC compile
+// cannot fail on their absence. Values are the documented NT constants.
+constexpr ULONG kFileOpen = 0x00000001UL;                  // FILE_OPEN
+constexpr ULONG kFileDirectoryFile = 0x00000001UL;         // FILE_DIRECTORY_FILE
+constexpr ULONG kFileNonDirectoryFile = 0x00000040UL;      // FILE_NON_DIRECTORY_FILE
+constexpr ULONG kFileOpenReparsePoint = 0x00200000UL;      // FILE_OPEN_REPARSE_POINT
+constexpr ULONG kFileSynchronousIoNonalert = 0x00000020UL; // FILE_SYNCHRONOUS_IO_NONALERT
+// Traverse rights on a directory handle used as OBJECT_ATTRIBUTES.RootDirectory:
+// NT relative-name resolution traverse-checks the parent. On a default host
+// SeChangeNotifyPrivilege (Bypass traverse checking) masks its absence, but on a
+// host where that privilege is stripped every child open would fail closed and
+// the primitive would delete nothing.
+constexpr DWORD kFileTraverse = 0x00000020UL;              // FILE_TRAVERSE
+
 constexpr bool nt_success(NTSTATUS status) noexcept {
     return status >= 0;
 }
@@ -267,7 +286,7 @@ OpenRootResult open_root(const std::filesystem::path& path) {
     // By design, root only: this is the ONE CreateFileW in this file. Every
     // later open is parent-HANDLE-relative via nt_open_relative.
     const HANDLE raw =
-        CreateFileW(path.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+        CreateFileW(path.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | kFileTraverse,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (raw == INVALID_HANDLE_VALUE) {
@@ -315,9 +334,9 @@ OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIden
     }
 
     NtOpenResult opened = nt_open_relative(
-        parent, wide, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
-        FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT);
+        parent, wide, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | kFileTraverse | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
+        kFileDirectoryFile | kFileOpenReparsePoint | kFileSynchronousIoNonalert);
 
     if (opened.reason == Reason::Unsupported || opened.reason == Reason::InvalidName) {
         result.reason = opened.reason;
@@ -341,10 +360,15 @@ OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIden
     // A junction/mount-point/symlink swapped in mid-walk is opened RAW by
     // FILE_OPEN_REPARSE_POINT above and rejected here, never traversed.
     if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        // warn, matching the POSIX leg: this branch fires on a mid-walk junction
+        // swap -- the live TOCTOU attack this primitive exists to defeat, not a
+        // steady-state reparse entry (which decide_entry handles, unlogged).
+        spdlog::warn("confined_fs::open_dir_at: reparse point rejected for '{}'", name);
         result.reason = Reason::ReparseRejected;
         return result;
     }
     if (info.dwVolumeSerialNumber != root_id.volume_serial) {
+        spdlog::warn("confined_fs::open_dir_at: volume boundary rejected for '{}'", name);
         result.reason = Reason::DeviceBoundary;
         return result;
     }
@@ -372,12 +396,12 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
     }
 
     const ULONG type_option =
-        kind == UnlinkKind::EmptyDirectory ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE;
+        kind == UnlinkKind::EmptyDirectory ? kFileDirectoryFile : kFileNonDirectoryFile;
 
     NtOpenResult opened = nt_open_relative(
         parent, wide, DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | type_option);
+        FILE_SHARE_READ | FILE_SHARE_DELETE, kFileOpen,
+        kFileOpenReparsePoint | kFileSynchronousIoNonalert | type_option);
 
     if (opened.reason == Reason::Unsupported || opened.reason == Reason::InvalidName) {
         result.reason = opened.reason;
@@ -489,6 +513,7 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
         }
 
         const std::byte* cursor = buffer.data();
+        const std::byte* const buffer_end = buffer.data() + buffer.size();
         for (;;) {
             // Aliasing/alignment proof (docs/cpp-conventions.md requires one at a
         // syscall boundary): `buffer` is a std::vector<std::byte>, whose data()
@@ -497,7 +522,29 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
         // documented as 8-aligned -- so every `cursor` derived by advancing
         // through those offsets is correctly aligned for this type. The pointee
         // is read-only and owned by `buffer`, which outlives every use here.
+        // BOUNDS, before the cast is dereferenced. NextEntryOffset and
+        // FileNameLength are values supplied by the filesystem, and a user-mode
+        // or redirected filesystem (WinFsp/Dokan/SMB) is exactly the hostile
+        // source this primitive's threat model contemplates. The alignment and
+        // aliasing proof below says nothing about extent, so it is checked here:
+        // a header that does not fit, or a name that runs past the returned
+        // bytes, is an OS error -- never a silent break, which would truncate
+        // the listing while reporting a complete enumeration.
+        if (cursor < buffer.data() || cursor + sizeof(FILE_FULL_DIR_INFO) > buffer_end) {
+            spdlog::warn("confined_fs::enumerate_at: directory entry header out of bounds");
+            result.reason = Reason::OsError;
+            result.os_error = static_cast<int>(ERROR_INVALID_DATA);
+            return result;
+        }
         const auto* entry = reinterpret_cast<const FILE_FULL_DIR_INFO*>(cursor);
+        const std::byte* const name_begin =
+            cursor + offsetof(FILE_FULL_DIR_INFO, FileName);
+        if (entry->FileNameLength > static_cast<ULONG>(buffer_end - name_begin)) {
+            spdlog::warn("confined_fs::enumerate_at: directory entry name out of bounds");
+            result.reason = Reason::OsError;
+            result.os_error = static_cast<int>(ERROR_INVALID_DATA);
+            return result;
+        }
 
             const std::wstring_view wide_name(entry->FileName,
                                                entry->FileNameLength / sizeof(WCHAR));
@@ -534,6 +581,15 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
 
             if (entry->NextEntryOffset == 0)
                 break;
+            // The advance itself must stay in the buffer and must make progress;
+            // a zero-but-nonterminal or backward offset would loop forever.
+            if (entry->NextEntryOffset < sizeof(FILE_FULL_DIR_INFO) ||
+                entry->NextEntryOffset > static_cast<ULONG>(buffer_end - cursor)) {
+                spdlog::warn("confined_fs::enumerate_at: directory entry offset out of bounds");
+                result.reason = Reason::OsError;
+                result.os_error = static_cast<int>(ERROR_INVALID_DATA);
+                return result;
+            }
             cursor += entry->NextEntryOffset;
         }
     }
