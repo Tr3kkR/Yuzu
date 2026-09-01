@@ -15,6 +15,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <limits>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -213,7 +215,7 @@ void run_mid_walk_junction_swap(int depth) {
     CHECK_FALSE(reopened.h.valid());
     CHECK(reopened.reason == Reason::ReparseRejected);
 
-    UnlinkOutcome unlinked = unlink_at(current, swap_name, UnlinkKind::EmptyDirectory, root_id);
+    UnlinkOutcome unlinked = unlink_at(current, swap_name, UnlinkKind::EmptyDirectory, std::numeric_limits<std::uint64_t>::max(), root_id);
     CHECK(unlinked.status == EntryStatus::Failed);
     CHECK(unlinked.reason == Reason::ReparseRejected);
 
@@ -353,12 +355,12 @@ TEST_CASE("open_dir_at and unlink_at refuse structurally invalid names before an
     }
     SECTION("embedded NUL") {
         const std::string name("a\0b", 3);
-        UnlinkOutcome r = unlink_at(root_handle, name, UnlinkKind::File, root_id);
+        UnlinkOutcome r = unlink_at(root_handle, name, UnlinkKind::File, std::numeric_limits<std::uint64_t>::max(), root_id);
         CHECK(r.reason == Reason::InvalidName);
     }
     SECTION("oversize name (> USHORT bytes once widened)") {
         const std::string name(70000, 'a');
-        UnlinkOutcome r = unlink_at(root_handle, name, UnlinkKind::File, root_id);
+        UnlinkOutcome r = unlink_at(root_handle, name, UnlinkKind::File, std::numeric_limits<std::uint64_t>::max(), root_id);
         CHECK(r.reason == Reason::InvalidName);
     }
 }
@@ -408,7 +410,7 @@ TEST_CASE("open_dir_at and unlink_at refuse a spoofed root_id (DeviceBoundary)",
     CHECK_FALSE(dir_r.h.valid());
     CHECK(dir_r.reason == Reason::DeviceBoundary);
 
-    UnlinkOutcome unlink_r = unlink_at(root_handle, "a.txt", UnlinkKind::File, wrong_id);
+    UnlinkOutcome unlink_r = unlink_at(root_handle, "a.txt", UnlinkKind::File, std::numeric_limits<std::uint64_t>::max(), wrong_id);
     CHECK(unlink_r.status == EntryStatus::Failed);
     CHECK(unlink_r.reason == Reason::DeviceBoundary);
     CHECK(std::filesystem::exists(root_dir.path / "a.txt"));

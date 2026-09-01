@@ -240,6 +240,13 @@ struct UnlinkOutcome {
     EntryStatus status;
     Reason reason;
     int os_error;
+    /// Bytes actually removed, measured by the platform leg immediately before
+    /// the delete -- NOT the size seen during enumeration. The walker adds THIS
+    /// to the tally: an entry swapped between enumeration and delete would
+    /// otherwise let a large file be removed while the cap was charged the small
+    /// size seen earlier, defeating the byte cap it is meant to enforce.
+    /// Zero on any non-Deleted outcome.
+    std::uint64_t bytes{0};
 };
 
 /// One entry's terminal outcome as recorded into a `DeleteResult`.

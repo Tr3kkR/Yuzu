@@ -238,7 +238,7 @@ struct OpenDirResult {
 /// opens nothing, so it needs no such check. This POSIX/Windows asymmetry
 /// is deliberate, not an oversight.
 [[nodiscard]] YUZU_EXPORT UnlinkOutcome unlink_at(HANDLE parent, const std::string& name,
-                                                   UnlinkKind kind, const FileIdentity& root_id);
+                                                   UnlinkKind kind, std::uint64_t max_bytes_remaining, const FileIdentity& root_id);
 
 /// Open `name` inside `parent` as a new confined directory handle. `root_id`
 /// re-verifies the opened directory is still within the pinned root's
@@ -269,7 +269,7 @@ YUZU_EXPORT void set_ntcreatefile_for_test(void* fn, bool enable) noexcept;
 /// and opens nothing, so unlike the Windows twin it needs no root-identity
 /// parameter -- see the asymmetry note above `unlink_at`'s Windows overload.
 [[nodiscard]] YUZU_EXPORT UnlinkOutcome unlink_at(int dir_fd, const std::string& name,
-                                                   UnlinkKind kind);
+                                                   UnlinkKind kind, std::uint64_t max_bytes_remaining);
 
 /// Open `name` inside the directory referenced by `parent_fd` as a new
 /// confined directory fd. `root_id` re-verifies the opened directory is

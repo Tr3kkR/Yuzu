@@ -286,9 +286,34 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
     }
 }
 
-UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind) {
+UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
+                        std::uint64_t max_bytes_remaining) {
     if (is_invalid_name(name))
-        return UnlinkOutcome{EntryStatus::Failed, Reason::InvalidName, 0};
+        return UnlinkOutcome{EntryStatus::Failed, Reason::InvalidName, 0, 0};
+
+    // Re-measure NOW, not at enumeration time. An attacker who controls this
+    // tree can replace a small file with a large one after we enumerated it,
+    // and a cap charged the stale size would let the delete blow straight
+    // through the blast-radius limit it exists to enforce. A regular file
+    // whose LIVE size exceeds what is left of the budget is refused, not
+    // deleted. Directories are not byte-charged.
+    std::uint64_t live_bytes = 0;
+    if (kind == UnlinkKind::File) {
+        struct stat st{};
+        if (g_fstatat_fn(dir_fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) {
+            if (S_ISREG(st.st_mode)) {
+                live_bytes = static_cast<std::uint64_t>(st.st_size);
+                if (live_bytes > max_bytes_remaining) {
+                    spdlog::warn("confined_fs::unlink_at: '{}' grew past the byte cap since "
+                                 "enumeration -- refusing", name);
+                    return UnlinkOutcome{EntryStatus::Skipped, Reason::ByteCap, 0, 0};
+                }
+            }
+        }
+        // A failed re-measure is NOT fatal: unlinkat is name-level and the
+        // entry is already inside the confined parent. The tally then charges
+        // 0 for it, which is recorded honestly rather than guessed.
+    }
 
     // Accepted benign race (documented per spec): a symlink swapped in
     // between this entry's `fstatat` (in enumerate_at) and this `unlinkat`
@@ -300,9 +325,9 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind) {
     if (::unlinkat(dir_fd, name.c_str(), flags) != 0) {
         const int err = errno;
         spdlog::debug("confined_fs::unlink_at: unlinkat('{}') failed: {}", name, std::strerror(err));
-        return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err};
+        return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};
     }
-    return UnlinkOutcome{EntryStatus::Deleted, Reason::None, 0};
+    return UnlinkOutcome{EntryStatus::Deleted, Reason::None, 0, live_bytes};
 }
 
 namespace {
@@ -326,8 +351,9 @@ struct PosixOps {
         return enumerate_at(dir.get(), root_id, budget);
     }
 
-    UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind kind) {
-        return unlink_at(parent.get(), name, kind);
+    UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind kind,
+                         std::uint64_t max_bytes_remaining) {
+        return unlink_at(parent.get(), name, kind, max_bytes_remaining);
     }
 
     std::chrono::steady_clock::time_point now() { return std::chrono::steady_clock::now(); }

@@ -80,13 +80,26 @@ public:
         return EnumerateResult{out, r, 0};
     }
 
-    UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind kind) {
+    UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind kind,
+                         std::uint64_t max_bytes_remaining) {
         (void)kind;
         ++unlink_calls_;
         unlinked_names_.push_back(name);
         if (auto it = fail_unlink_.find(std::pair{parent, name}); it != fail_unlink_.end())
-            return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, it->second};
-        return UnlinkOutcome{EntryStatus::Deleted, Reason::None, 0};
+            return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, it->second, 0};
+        // Models a leg re-measuring the entry immediately before deleting it.
+        // By default nothing changed since enumeration, so the live size IS the
+        // enumerated size; `live_size_` overrides it to model an entry swapped
+        // out from under us between enumeration and delete.
+        std::uint64_t live = 0;
+        for (const auto& e : dirs_.at(parent).entries)
+            if (e.name == name)
+                live = e.meta.size_bytes;
+        if (auto it = live_size_.find(name); it != live_size_.end())
+            live = it->second;
+        if (live > max_bytes_remaining)
+            return UnlinkOutcome{EntryStatus::Skipped, Reason::ByteCap, 0, 0};
+        return UnlinkOutcome{EntryStatus::Deleted, Reason::None, 0, live};
     }
 
     void fail_unlink_with(DirHandle parent, const std::string& name, int errnum) {
@@ -100,6 +113,7 @@ public:
     int enumerate_calls_ = 0;
     std::vector<std::string> unlinked_names_;
     std::map<std::pair<int, std::string>, int> fail_unlink_;
+    std::map<std::string, std::uint64_t> live_size_;
     EnumBudget last_budget_{};
 };
 
@@ -203,6 +217,57 @@ TEST_CASE("walk_delete lazy match: MatchFn not called past the entry cap", "[con
     DeleteResult result = walk_delete<FakeOps>(root, ops, counting, limits);
     REQUIRE(match_calls == 0);
     REQUIRE(result.stop_reason == Reason::EntryCap);
+}
+
+// B001 regression: the byte cap must be charged what the leg MEASURED at delete
+// time, not the size seen during enumeration. An attacker who controls the tree
+// can swap a small enumerated file for a large one; charging the stale size would
+// let the delete blow through the blast-radius cap it exists to enforce.
+TEST_CASE("walk_delete charges the byte cap the size measured at delete time",
+          "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    // Enumeration reports 10 bytes each; "swapped.txt" is really 5000 on disk.
+    ops.dir(root).entries = {file_entry("a.txt"), file_entry("swapped.txt")};
+    ops.live_size_["swapped.txt"] = 5000;
+
+    DeleteLimits limits = kOpenLimits;
+    limits.max_bytes = 100;
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, limits);
+
+    // The swap is refused by the leg's re-measure, not silently deleted.
+    REQUIRE(result.tally.bytes_deleted == 10);
+    bool swapped_refused = false;
+    for (const auto& e : result.entries)
+        if (e.rel_path == "swapped.txt") {
+            CHECK(e.status == EntryStatus::Skipped);
+            CHECK(e.reason == Reason::ByteCap);
+            swapped_refused = true;
+        }
+    REQUIRE(swapped_refused);
+}
+
+// The companion case, and the one that actually exercises the TALLY: a file
+// swapped for a larger one that still FITS the budget is deleted, and the cap
+// must be charged what was really removed. Charging the enumerated size here
+// would let a sequence of grown files walk past max_bytes while every
+// individual delete looked in-budget.
+TEST_CASE("walk_delete charges the measured size when a grown entry still fits",
+          "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    ops.dir(root).entries = {file_entry("grown.txt", 10)}; // enumerated at 10
+    ops.live_size_["grown.txt"] = 50;                      // really 50 on disk
+
+    DeleteLimits limits = kOpenLimits;
+    limits.max_bytes = 100;
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, limits);
+
+    REQUIRE(result.entries.size() == 1);
+    REQUIRE(result.entries[0].status == EntryStatus::Deleted);
+    REQUIRE(result.tally.bytes_deleted == 50); // measured, NOT the enumerated 10
 }
 
 // Regression: an enumerate reason the walker has no specific policy for must

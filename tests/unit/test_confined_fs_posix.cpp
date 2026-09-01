@@ -14,6 +14,8 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <limits>
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -201,7 +203,7 @@ void run_midwalk_swap_test(int depth) {
     }
     REQUIRE(saw_victim);
 
-    UnlinkOutcome outcome = unlink_at(cur_fd, "victim.tmp", UnlinkKind::File);
+    UnlinkOutcome outcome = unlink_at(cur_fd, "victim.tmp", UnlinkKind::File, std::numeric_limits<std::uint64_t>::max());
     CHECK(outcome.status == EntryStatus::Deleted);
 
     CHECK(fs::exists(t.outside_victim));
@@ -506,7 +508,7 @@ TEST_CASE("unlink_at removes only the symlink entry itself, never its target", "
     OpenRootResult opened = open_root(root_dir);
     REQUIRE(opened.root.has_value());
 
-    UnlinkOutcome outcome = unlink_at(opened.root->fd_.get(), "link.tmp", UnlinkKind::File);
+    UnlinkOutcome outcome = unlink_at(opened.root->fd_.get(), "link.tmp", UnlinkKind::File, std::numeric_limits<std::uint64_t>::max());
     CHECK(outcome.status == EntryStatus::Deleted);
 
     std::error_code ec;
@@ -675,7 +677,7 @@ TEST_CASE("unlink_at refuses invalid names before touching the filesystem", "[co
         std::string("a\0b", 3),
     };
     for (const auto& bad : bad_names) {
-        UnlinkOutcome outcome = unlink_at(fd, bad, UnlinkKind::File);
+        UnlinkOutcome outcome = unlink_at(fd, bad, UnlinkKind::File, std::numeric_limits<std::uint64_t>::max());
         CHECK(outcome.status == EntryStatus::Failed);
         CHECK(outcome.reason == Reason::InvalidName);
     }

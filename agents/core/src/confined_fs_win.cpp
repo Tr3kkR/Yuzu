@@ -280,7 +280,11 @@ OpenRootResult open_root(const std::filesystem::path& path) {
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
     if (raw == INVALID_HANDLE_VALUE) {
-        result.reason = Reason::OsError;
+        // B004: a root that cannot be opened or identified is RootInvalid on both
+        // legs -- the POSIX leg already reports it that way, and a
+        // platform-dependent reason gives callers platform-dependent retry and
+        // diagnostic semantics. The OS code is preserved in os_error either way.
+        result.reason = Reason::RootInvalid;
         result.os_error = static_cast<int>(GetLastError());
         return result;
     }
@@ -288,7 +292,7 @@ OpenRootResult open_root(const std::filesystem::path& path) {
 
     BY_HANDLE_FILE_INFORMATION info{};
     if (!GetFileInformationByHandle(owned.get(), &info)) {
-        result.reason = Reason::OsError;
+        result.reason = Reason::RootInvalid; // B004: parity with the POSIX leg
         result.os_error = static_cast<int>(GetLastError());
         return result;
     }
@@ -360,6 +364,7 @@ OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIden
 }
 
 UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
+                        std::uint64_t max_bytes_remaining,
                          const FileIdentity& root_id) {
     UnlinkOutcome result{EntryStatus::Failed, Reason::None, 0};
 
@@ -400,6 +405,22 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
         result.reason = Reason::ReparseRejected;
         return result;
     }
+    // Byte cap re-measured from the handle we ALREADY hold, so unlike the POSIX
+    // leg (whose unlinkat is name-level) there is no residual window here: this
+    // is the exact object about to be deleted. A regular file whose live size
+    // exceeds the remaining budget is refused, not deleted.
+    std::uint64_t live_bytes = 0;
+    if (kind == UnlinkKind::File && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        live_bytes = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+        if (live_bytes > max_bytes_remaining) {
+            spdlog::warn("confined_fs::unlink_at: '{}' grew past the byte cap since "
+                         "enumeration -- refusing", name);
+            result.status = EntryStatus::Skipped;
+            result.reason = Reason::ByteCap;
+            result.bytes = 0;
+            return result;
+        }
+    }
     if (info.dwVolumeSerialNumber != root_id.volume_serial) {
         result.reason = Reason::DeviceBoundary;
         return result;
@@ -423,6 +444,7 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
 
     // opened.handle's destructor (CloseHandle) below completes the delete.
     result.status = EntryStatus::Deleted;
+    result.bytes = live_bytes;
     result.reason = Reason::None;
     return result;
 }
@@ -542,8 +564,9 @@ struct WinOps {
         return enumerate_at(dir.get(), root_id, budget);
     }
 
-    UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind kind) {
-        return unlink_at(parent.get(), name, kind, root_id);
+    UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind kind,
+                         std::uint64_t max_bytes_remaining) {
+        return unlink_at(parent.get(), name, kind, max_bytes_remaining, root_id);
     }
 
     static std::chrono::steady_clock::time_point now() {

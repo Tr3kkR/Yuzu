@@ -14,7 +14,8 @@
  *   using DirHandle = /-- move-only handle type (fd, HANDLE, whatever) --/;
  *   OpenDirRes<DirHandle> open_dir(DirHandle& parent, const std::string& name);
  *   EnumerateResult enumerate(DirHandle& dir, const EnumBudget&);
- *   UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind);
+ *   UnlinkOutcome unlink(DirHandle& parent, const std::string& name, UnlinkKind,
+ *                        std::uint64_t max_bytes_remaining);
  *   std::chrono::steady_clock::time_point now();
  *
  * `walk_delete` itself never opens a path, never resolves a symlink, and
@@ -25,7 +26,9 @@
  *
  * ── Binding walker semantics ─────────────────────────────────────────────
  *
- *  1. `deadline = ops.now() + limits.max_wall` is computed EXACTLY ONCE, at
+ *  1. `deadline = ops.now() + limits.max_wall` (SATURATING -- an extreme
+ *     max_wall clamps to time_point::max rather than overflowing) is
+ *     computed EXACTLY ONCE, at
  *     the start of the walk -- never re-derived per directory or per entry
  *     (a re-derived deadline would let the wall-time cap creep forward
  *     indefinitely on a slow walk).
@@ -67,9 +70,13 @@
  *         so far. Otherwise `decide_entry` is re-invoked with the real
  *         `name_matched` value and the walker acts on THAT decision.
  *  5. Acting on the (possibly re-evaluated) decision:
- *       - `Unlink`: call `ops.unlink(parent, name, File)`; append
+ *       - `Unlink`: call `ops.unlink(parent, name, File, remaining byte
+ *         budget)` -- the leg RE-MEASURES the entry immediately before
+ *         deleting and returns `Skipped(ByteCap)` if the live size would
+ *         breach the budget; append
  *         `Deleted` or `Failed(reason, os_error)` per the outcome;
- *         `entries_seen++` always; `bytes_deleted += size_bytes` ONLY on a
+ *         `entries_seen++` always; `bytes_deleted += outcome.bytes` (the
+ *         size the leg MEASURED, not the enumerated one) ONLY on a
  *         successful delete.
  *       - `RecurseIntoDir`: call `ops.open_dir`. A POLICY refusal
  *         (`SymlinkRejected`/`ReparseRejected`/`DeviceBoundary`/
@@ -94,6 +101,7 @@
 
 #include <yuzu/agent/confined_fs_rules.hpp>
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <utility>
@@ -153,7 +161,17 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
     result.stop_reason = Reason::None;
 
     try {
-        const auto deadline = ops.now() + limits.max_wall;
+        // B005: saturate rather than overflow. `now() + max_wall` is signed
+        // chrono arithmetic, so an extreme caller-supplied max_wall is UB and
+        // can wrap to a deadline in the PAST -- the opposite of failing closed
+        // for a cap whose whole job is to bound the walk.
+        const auto now0 = ops.now();
+        const auto headroom = std::chrono::steady_clock::time_point::max() - now0;
+        const auto capped_wall =
+            (limits.max_wall > std::chrono::duration_cast<std::chrono::milliseconds>(headroom))
+                ? std::chrono::duration_cast<std::chrono::milliseconds>(headroom)
+                : limits.max_wall;
+        const auto deadline = now0 + capped_wall;
 
         std::vector<detail::WalkFrame<DirHandle>> stack;
         stack.push_back(detail::WalkFrame<DirHandle>{std::move(root), std::string{}, 0});
@@ -236,10 +254,19 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
 
                 switch (decision.action) {
                 case Action::Unlink: {
-                    UnlinkOutcome outcome =
-                        ops.unlink(frame.handle, dir_entry.name, UnlinkKind::File);
+                    // Hand the leg the REMAINING byte budget so it can re-measure
+                    // the entry immediately before deleting it and refuse a swap
+                    // that would breach the cap. decide_entry's check used the
+                    // size seen during enumeration, which an attacker controlling
+                    // the tree can invalidate before we act.
+                    const std::uint64_t budget_left =
+                        limits.max_bytes > result.tally.bytes_deleted
+                            ? limits.max_bytes - result.tally.bytes_deleted
+                            : 0;
+                    UnlinkOutcome outcome = ops.unlink(frame.handle, dir_entry.name,
+                                                       UnlinkKind::File, budget_left);
                     if (outcome.status == EntryStatus::Deleted)
-                        result.tally.bytes_deleted += dir_entry.meta.size_bytes;
+                        result.tally.bytes_deleted += outcome.bytes;
                     result.entries.push_back(
                         EntryOutcome{rel_path, outcome.status, outcome.reason, outcome.os_error});
                     ++result.tally.entries_seen;
