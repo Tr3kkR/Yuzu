@@ -289,8 +289,19 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
 // 4096-byte file, deleted under a 10-byte remaining budget and charged 1.
 //
 // The fix is capture-then-measure: renameat the entry to a name the attacker
-// cannot predict, THEN measure and unlink that name. rename is atomic, so after
-// it the inode is bound to a name only this process knows.
+// cannot PREDICT, then measure and unlink that name. rename is atomic, so the
+// inode is bound to the new name in one step.
+//
+// HONEST LIMIT, do not overstate this. The capture name is unpredictable but it
+// is NOT hidden: anyone who can read the directory can see it appear and can
+// still race a swap over it before the unlink. POSIX offers no atomic
+// "unlink this specific inode by name", so the window is NARROWED -- from one an
+// attacker can wait for and win at leisure, to one requiring them to observe and
+// act inside a few syscalls -- not CLOSED. The byte cap is therefore best-effort
+// against an adversary holding write access to the parent directory, and the
+// action layer must not present it as a hard guarantee. Confinement (WHERE
+// deletion may happen) is unaffected and does hold: every operation stays
+// relative to the pinned parent handle.
 //
 // A separate staging DIRECTORY was considered and deliberately not used: on
 // POSIX a same-UID attacker can reach any directory we can create, so it adds
@@ -300,7 +311,7 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
 //
 // Residual, documented: a hard kill between the rename and the unlink leaves one
 // orphan named with the prefix below. Every non-crash path restores or removes it.
-constexpr const char* kCapturePrefix = ".yuzu_cfs_capture_";
+constexpr const char* kCapturePrefix = kCaptureNamePrefix; // exported in confined_fs.hpp
 
 /// Rename WITHOUT replacing an existing destination. A plain renameat() silently
 /// unlinks whatever occupies the target name, which on the restore path means an

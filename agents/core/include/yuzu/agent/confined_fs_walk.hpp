@@ -318,6 +318,14 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                     OpenDirRes<DirHandle> opened = ops.open_dir(frame.handle, dir_entry.name);
                     ++result.tally.entries_seen;
                     if (opened.handle.has_value()) {
+                        // S1: bound concurrently-open handles. The stack holds one
+                        // per pending subdirectory, so without this the descriptor
+                        // cost is bounded only by max_entries and is paid
+                        // process-wide, not by this walk alone.
+                        if (stack.size() >= limits.max_open_dirs) {
+                            result.stop_reason = Reason::OpenDirCap;
+                            return result;
+                        }
                         stack.push_back(detail::WalkFrame<DirHandle>{
                             std::move(*opened.handle), rel_path,
                             frame.depth + 1});

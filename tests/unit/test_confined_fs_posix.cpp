@@ -100,6 +100,7 @@ constexpr DeleteLimits generous_limits() {
         /*max_bytes=*/10'000'000,
         /*max_wall=*/std::chrono::milliseconds{60'000},
         /*max_depth=*/64,
+        /*max_open_dirs=*/256,
     };
 }
 
@@ -689,7 +690,7 @@ TEST_CASE("entry cap stops the walk with StopWalk(EntryCap)", "[confined_fs]") {
     REQUIRE(opened.root.has_value());
 
     const DeleteLimits limits{/*max_entries=*/3, /*max_bytes=*/1'000'000,
-                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/32};
+                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/32, /*max_open_dirs=*/64};
     DeleteResult result = delete_matching(*opened.root, match_all(), limits);
 
     // A directory of 5 with a cap of 3 is a NON-EMPTY truncated batch: it
@@ -722,7 +723,7 @@ TEST_CASE("byte cap skips an oversized file but a following smaller one still de
     REQUIRE(opened.root.has_value());
 
     const DeleteLimits limits{/*max_entries=*/1000, /*max_bytes=*/100,
-                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/32};
+                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/32, /*max_open_dirs=*/64};
     DeleteResult result = delete_matching(*opened.root, match_all(), limits);
 
     auto entries = sorted_entries(result.entries);
@@ -747,7 +748,7 @@ TEST_CASE("wall-time cap of zero stops immediately with nothing deleted", "[conf
     REQUIRE(opened.root.has_value());
 
     const DeleteLimits limits{/*max_entries=*/1000, /*max_bytes=*/1'000'000,
-                               /*max_wall=*/std::chrono::milliseconds{0}, /*max_depth=*/32};
+                               /*max_wall=*/std::chrono::milliseconds{0}, /*max_depth=*/32, /*max_open_dirs=*/64};
     DeleteResult result = delete_matching(*opened.root, match_all(), limits);
 
     CHECK(result.stop_reason == Reason::WallTimeCap);
@@ -768,7 +769,7 @@ TEST_CASE("depth cap skips a directory past max_depth but still deletes shallow 
     REQUIRE(opened.root.has_value());
 
     const DeleteLimits limits{/*max_entries=*/1000, /*max_bytes=*/1'000'000,
-                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/1};
+                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/1, /*max_open_dirs=*/64};
     DeleteResult result = delete_matching(*opened.root, match_all(), limits);
 
     auto entries = sorted_entries(result.entries);

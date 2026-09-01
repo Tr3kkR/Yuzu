@@ -109,6 +109,19 @@
 
 namespace yuzu::agent::confined_fs {
 
+/// Prefix of the transient name an entry is renamed to while it is measured and
+/// deleted (POSIX only; the Windows leg deletes by handle and never renames).
+///
+/// EXPORTED DELIBERATELY. A hard kill between the rename and the unlink, or a
+/// restore that finds the original name occupied, leaves a real file under this
+/// prefix. A consuming action that reclaims disk MUST make a recorded decision
+/// about such entries -- reap them, or exclude them from the entry budget --
+/// and it cannot do that against a literal copied out of a .cpp. Reaping widens
+/// blast radius, because a local user can create a file with this prefix to bait
+/// it, so this is a decision for the action layer, not an obvious default.
+inline constexpr const char* kCaptureNamePrefix = ".yuzu_cfs_capture_";
+
+
 #ifdef _WIN32
 /// Windows identity: NTFS volume serial + file index (the `dev:ino`
 /// analogue on this platform).

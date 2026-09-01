@@ -106,7 +106,7 @@ MatchFn always_match = [](std::string_view) { return true; };
 
 DeleteLimits open_limits() {
     return DeleteLimits{/*max_entries=*/1000, /*max_bytes=*/1'000'000,
-                         /*max_wall=*/std::chrono::milliseconds{30'000}, /*max_depth=*/8};
+                         /*max_wall=*/std::chrono::milliseconds{30'000}, /*max_depth=*/8, /*max_open_dirs=*/64};
 }
 
 void sort_by_rel_path(std::vector<EntryOutcome>& entries) {

@@ -91,6 +91,10 @@ enum class Reason : std::uint8_t {
     /// because something now occupies its original name. It was NOT deleted;
     /// it remains under the capture name and the tree HAS been modified.
     CaptureOrphaned,
+    /// The walk stopped because it would have had to hold more directory handles
+    /// open at once than DeleteLimits::max_open_dirs permits. A cap stop, not a
+    /// failure: the tree was NOT fully visited.
+    OpenDirCap,
 };
 
 /// Terminal per-entry disposition recorded in a `DeleteResult`.
@@ -126,6 +130,13 @@ struct DeleteLimits {
     std::uint64_t max_bytes{0};
     std::chrono::milliseconds max_wall{0};
     std::uint32_t max_depth{0};
+    /// Maximum directory handles the walk may hold OPEN AT ONCE. The other caps
+    /// bound work; this one bounds the resource the walk actually consumes. The
+    /// walker opens a handle per pending subdirectory, so a wide tree under a
+    /// large max_entries could otherwise exhaust the PROCESS's descriptor
+    /// budget -- degrading gRPC, SQLite and plugin loading in the same agent,
+    /// not merely this walk. Zero permits nothing, like every other cap here.
+    std::uint32_t max_open_dirs{0};
 };
 
 /// Running counters `decide_entry` is evaluated against; the walker owns the
