@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <random>
@@ -143,6 +144,24 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX idx_agent_exec_agent ON agent_exec_status(agent_id);"
          "CREATE INDEX idx_executions_dispatched ON executions(dispatched_at);"
          "CREATE INDEX idx_executions_definition ON executions(definition_id);"},
+        // HA WS-1(1b), ADR-2002 section 5: the command_id -> execution_id
+        // correlation, migrated off AgentServiceImpl's in-process map so a
+        // response landing on ANY server replica can resolve it. reap_meta
+        // is this store's own persisted-anchor table for
+        // reap_command_execution_mappings (clock-guarded-retention routed
+        // concern) — deliberately separate from `executions`/
+        // `agent_exec_status`, which carry no retention sweep of their own.
+        {2,
+         "CREATE TABLE command_execution ("
+         "  command_id    TEXT   PRIMARY KEY,"
+         "  execution_id  TEXT   NOT NULL,"
+         "  created_at    BIGINT NOT NULL"
+         ");"
+         "CREATE INDEX idx_command_execution_created ON command_execution(created_at);"
+         "CREATE TABLE reap_meta ("
+         "  key   TEXT PRIMARY KEY,"
+         "  value TEXT NOT NULL"
+         ");"},
     };
     return kMigrations;
 }
@@ -878,6 +897,273 @@ FleetExecutionSummary ExecutionTracker::get_fleet_summary(int64_t since) const {
     }
 
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5)
+// ---------------------------------------------------------------------------
+
+namespace {
+// Substrate-tuned to this table — do not copy from session_store's
+// constants (clock-guarded-retention routed concern: "never copy the
+// numbers"). A command's realistic in-flight lifetime is seconds to a few
+// minutes; 24h is generous headroom over any documented per-command
+// timeout, so a mapping this old is stale by construction, not merely idle.
+constexpr std::int64_t kCmdExecutionReapWindowSecs = 24 * 3600;
+constexpr int kCmdExecutionReapCap = 5000;
+// A DB `now()` reading more than this far ahead of the persisted anchor is
+// an anomaly, not legitimate elapsed time between reap ticks. The nominal
+// inter-pass interval is ~3600s (server.cpp's kCmdExecutionReapEveryNTicks),
+// but this threshold MUST carry real headroom over that nominal value, not
+// merely equal it (governance Gate 4 consistency-auditor finding, self-
+// verified): four OTHER reaps share this thread's tick loop and coincide on
+// the same tick as this one, and ordinary scheduler jitter across ~1800
+// individual sleep_for(1s) calls between passes is a plausible, non-clock-
+// skew way to exceed a zero-margin threshold — and because a declined pass
+// never advances the anchor, a single false trip would NEVER self-heal (the
+// gap only grows on every subsequent tick). 24h matches this table's own
+// reap window (kCmdExecutionReapWindowSecs) — ~24x the nominal cadence,
+// comfortably absorbing ordinary jitter while still catching a genuinely
+// wrong clock (a jump of days, not seconds).
+constexpr std::int64_t kMaxPlausibleSkewSecs = 24 * 3600;
+
+// Checked parse for the two clock-guard-critical readings (the DB now()
+// column and the persisted reap_meta anchor) — deliberately NOT this file's
+// ambient `to_i64`, which is a lenient `strtoll`-with-no-validation helper
+// appropriate for trusted DB-returned row columns elsewhere in this file,
+// but NOT for a value the clock-guarded-retention routed concern (CLAUDE.md
+// part 3) requires be SANITISED: "ahead-of-now / negative / unparseable =
+// anomaly, never a quiet reset". A migration bug, a manual `reap_meta` repair,
+// or storage corruption writing `123junk` or an overflowed value must be
+// REJECTED as an anomaly, not silently truncated/wrapped by an unchecked
+// strtoll (adversarial review finding, PR #3780 -- api_token_store.cpp's
+// `parse_meta_i64` / response_store.cpp's inline equivalent are the
+// reference shape this mirrors; a second hand-rolled copy is the drift
+// those two already accepted as "duplicating this one is cheaper than a
+// shared-utility header for a three-line function").
+std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(val.c_str(), &end, 10);
+    if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
+        return std::nullopt;
+    return static_cast<std::int64_t>(v);
+}
+} // namespace
+
+bool ExecutionTracker::record_command_execution(const std::string& command_id,
+                                                const std::string& execution_id) {
+    if (!open_)
+        return false;
+
+    // SINGLE attempt, no retry — deliberately NOT update_agent_status's
+    // retry-once shape (governance Gate 4 unhappy-path/Gate 3 performance
+    // finding). This call sits on the SYNCHRONOUS pre-RPC dispatch path
+    // (record_execution_id / server.cpp's command_dispatch_fn calls this
+    // BEFORE the RPC, UP2-4); a retry-once here would double the worst-case
+    // block on the calling worker thread (REST/dashboard/MCP dispatch, or a
+    // background runner such as ScheduleRunner/PreflightRunner/
+    // PolicyEvaluator — anything feeding the shared CommandDispatchFn
+    // closure) (2*kWriteTimeout)
+    // under sustained pool contention. update_agent_status's retry lives on
+    // the async gateway-response path, where that tradeoff is free.
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ExecutionTracker::record_command_execution: pool exhausted for "
+                      "command_id={} — this command's responses will not correlate to an "
+                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
+                      "dispatch itself is unaffected)",
+                      command_id);
+        return false;
+    }
+    pg::PgResult res =
+        execution_id.empty()
+            ? pg::exec_params(lease.get(),
+                              "DELETE FROM execution_tracker.command_execution "
+                              "WHERE command_id = $1",
+                              std::vector<std::string>{command_id})
+            // created_at is authored from Postgres now() IN-SQL, not the
+            // calling replica's app clock (adversarial review Should-fix,
+            // PR #3780): reap_command_execution_mappings compares created_at
+            // against its own DB `now()` reading, so authoring created_at
+            // from a different (app) clock domain means a replica whose
+            // local clock lags the DB primary by more than the reap window
+            // can write a mapping that reads as already-expired the moment
+            // another replica's sweep runs -- silently dropping the exact
+            // correlation this migration exists to preserve, in the exact
+            // multi-replica scenario it targets. Matches session_store's
+            // DB-clock-authority precedent (#3715).
+            : pg::exec_params(
+                  lease.get(),
+                  "INSERT INTO execution_tracker.command_execution "
+                  "(command_id, execution_id, created_at) "
+                  "VALUES ($1, $2, extract(epoch FROM now())::bigint) "
+                  "ON CONFLICT (command_id) DO UPDATE SET "
+                  "execution_id = EXCLUDED.execution_id, created_at = EXCLUDED.created_at",
+                  std::vector<std::string>{command_id, execution_id});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::error("ExecutionTracker::record_command_execution: write failed for "
+                      "command_id={} — this command's responses will not correlate to an "
+                      "execution_id on any replica (executions-drawer/SSE degraded for it, "
+                      "dispatch itself is unaffected)",
+                      command_id);
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::string>
+ExecutionTracker::lookup_execution_id(const std::string& command_id,
+                                      std::string* degrade_reason) const {
+    if (!open_)
+        return std::nullopt; // not a runtime degrade -- construction already failed loudly
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        if (degrade_reason)
+            *degrade_reason = "pool_exhausted";
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT execution_id FROM execution_tracker.command_execution "
+                                       "WHERE command_id = $1",
+                                       std::vector<std::string>{command_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        if (degrade_reason)
+            *degrade_reason = "query_failed";
+        return std::nullopt;
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::nullopt; // genuine miss -- out-of-band dispatch or an aged-out mapping
+    return col_str(res.get(), 0, 0);
+}
+
+std::expected<CommandExecutionReapOutcome, std::string>
+ExecutionTracker::reap_command_execution_mappings() {
+    if (!open_)
+        return std::unexpected("execution tracker not open");
+
+    // Shape mirrors SessionStore::reap_expired (clock-guarded-retention
+    // routed concern) — advisory lock as its OWN statement, one in-SQL DB
+    // `now()` read reused for the cutoff/anchor-compare/anchor-update,
+    // persisted+sanitised anchor, forward/backward-anomaly decline,
+    // unconditional cap. This table stores seconds (matching this store's
+    // own `now_epoch()` convention), not the milliseconds session_store uses
+    // — a substrate-tuning difference, not a shape deviation.
+    int deleted = 0;
+    bool clock_anomaly = false;
+    std::int64_t now_s = 0;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        if (pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext('execution_tracker:reap'))",
+                            std::vector<std::string>{})
+                .status() != PGRES_TUPLES_OK) {
+            err = "reap advisory lock failed";
+            return false;
+        }
+        {
+            pg::PgResult nr = pg::exec_params(
+                c, "SELECT extract(epoch FROM now())::bigint", std::vector<std::string>{});
+            if (nr.status() != PGRES_TUPLES_OK || PQntuples(nr.get()) == 0) {
+                err = "reap now() read failed";
+                return false;
+            }
+            // SANITISE the reading (clock-guarded-retention routed concern,
+            // part 3): unparseable or negative is an ANOMALY, never a quiet
+            // fallback to 0/silently-truncated garbage (adversarial review
+            // finding, PR #3780 -- the prior unchecked `to_i64` here would
+            // parse a malformed/overflowed value with no error and no
+            // rejection, in direct violation of this exact standing rule).
+            auto parsed_now = parse_reap_i64(col_str(nr.get(), 0, 0));
+            if (!parsed_now || *parsed_now < 0) {
+                spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: "
+                             "unparseable or negative now() reading '{}'",
+                             col_str(nr.get(), 0, 0));
+                clock_anomaly = true;
+                return true; // decline, anchor unchanged
+            }
+            now_s = *parsed_now;
+        }
+        pg::PgResult ar = pg::exec_params(
+            c, "SELECT value FROM execution_tracker.reap_meta WHERE key = 'cmd_exec_reap_anchor'",
+            std::vector<std::string>{});
+        if (ar.status() != PGRES_TUPLES_OK) {
+            err = "reap anchor read failed";
+            return false;
+        }
+        const bool has_anchor = PQntuples(ar.get()) > 0;
+        std::int64_t anchor = 0;
+        if (has_anchor) {
+            // Same sanitisation as now_s, for the SAME reason -- reap_meta
+            // is a plain key/value table a bad migration, a manual repair,
+            // or storage corruption can write anything into. An unparseable
+            // or negative persisted anchor is an anomaly: decline this
+            // pass, do NOT silently treat it as 0 (which would read as
+            // "everything is stale" and mass-delete) or as any other quiet
+            // fallback.
+            auto parsed_anchor = parse_reap_i64(col_str(ar.get(), 0, 0));
+            if (!parsed_anchor || *parsed_anchor < 0) {
+                spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: "
+                             "unparseable or negative persisted anchor '{}'",
+                             col_str(ar.get(), 0, 0));
+                clock_anomaly = true;
+                return true;
+            }
+            anchor = *parsed_anchor;
+        }
+        // Overflow-safe comparison (adversarial review Blocker round 2,
+        // PR #3780): `parse_reap_i64` rejects unparseable/negative values
+        // but NOT an implausibly-large one that parses cleanly (e.g.
+        // INT64_MAX from a bad migration/manual repair/corruption) --
+        // `anchor + kMaxPlausibleSkewSecs` on such a value is signed-
+        // integer-overflow UB (confirmed via UBSan). Subtracting instead
+        // of adding cannot overflow: both operands are already sanitised
+        // to be non-negative int64_t, so their difference always fits
+        // (int64_t's negative range strictly exceeds its positive range).
+        // The `now_s >= anchor` guard preserves the existing branch order
+        // -- when now_s < anchor, this condition is false and control
+        // falls through to the backward-anomaly check below, unchanged.
+        if (has_anchor && now_s >= anchor && now_s - anchor > kMaxPlausibleSkewSecs) {
+            spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: now_s {} "
+                         "implausibly ahead of anchor {}",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true; // decline, anchor unchanged
+        }
+        if (has_anchor && now_s < anchor) {
+            spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: now_s {} "
+                         "is behind anchor {} (backward clock movement or a poisoned anchor) — "
+                         "not deleting under a rewound clock",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true;
+        }
+        pg::PgResult dr = pg::exec_params(
+            c,
+            "DELETE FROM execution_tracker.command_execution WHERE command_id IN "
+            "(SELECT command_id FROM execution_tracker.command_execution "
+            " WHERE created_at < $1::bigint LIMIT $2::bigint) RETURNING command_id",
+            std::vector<std::string>{std::to_string(now_s - kCmdExecutionReapWindowSecs),
+                                     std::to_string(kCmdExecutionReapCap)});
+        if (dr.status() != PGRES_TUPLES_OK) {
+            err = std::string("reap delete failed: ") + PQerrorMessage(c);
+            return false;
+        }
+        deleted = PQntuples(dr.get());
+        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
+        pg::PgResult ur = pg::exec_params(
+            c,
+            "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+            "('cmd_exec_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{std::to_string(new_anchor)});
+        if (ur.status() != PGRES_COMMAND_OK) {
+            err = "reap anchor update failed";
+            return false;
+        }
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "reap failed" : err);
+    return CommandExecutionReapOutcome{deleted, clock_anomaly};
 }
 
 } // namespace yuzu::server

@@ -3814,3 +3814,38 @@ groups:
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
+
+  - name: yuzu-executions
+    # HA WS-1(1b) (ADR-2002 §5) — the command_id -> execution_id correlation
+    # (ExecutionTracker::command_execution, PG-backed, replacing the former
+    # in-process cmd_execution_ids_ map). Mirrors yuzu-auth-sessions'
+    # YuzuSessionReapClockAnomaly shape: a reap pass declines when its
+    # DB-primary now() read is implausibly ahead of, or behind, the
+    # persisted anchor. Lower stakes than the session case (this table is a
+    # regenerable observability aid, not compliance evidence — see
+    # docs/executions-history-ladder.md), so a single reap-clock-anomaly
+    # alert is the whole ask here; the write/store-degrade counters are
+    # deferred (no comparable existing shape to adapt, best-effort
+    # observability rather than an integrity signal). Zero-seeded at boot,
+    # so increase() > 0 is meaningful.
+    rules:
+      - alert: YuzuExecCorrelationReapClockAnomaly
+        expr: |
+          increase(yuzu_exec_correlation_reap_clock_anomaly_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Command/execution correlation reap declined on a DB-primary clock anomaly"
+          description: >-
+            The command_id -> execution_id correlation table's retention
+            sweep (ExecutionTracker::reap_command_execution_mappings) was
+            declined because the DB-PRIMARY clock reading (Postgres now(),
+            read in-SQL) was implausibly ahead of or behind the persisted
+            reap anchor. Unlike the durable-session case, a decline here
+            does not un-expire anything security-relevant — the table
+            simply stops draining (rows age past the intended 24h window)
+            until a subsequent pass reads a plausible now(). Investigate
+            the DATABASE primary's NTP / clock health; correlate with
+            yuzu_exec_correlation_store_degrade_total /
+            yuzu_exec_correlation_write_degrade_total.
