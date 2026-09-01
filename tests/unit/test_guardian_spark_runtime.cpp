@@ -1720,6 +1720,117 @@ TEST_CASE("attach_rule: a throw AFTER joining an ALREADY-armed key leaves no gho
     CHECK(rt->armed_key_count() == 0);
 }
 
+// ── PR #3821 review (fjarvis): prior_disarm dropped on an early exit ───────────
+// attach_rule captures prior_disarm (the OWED backend disarm for whatever
+// generation this call supersedes) BEFORE deciding which of three branches this
+// push takes, but the ONLY submission site was the function's normal fall-through
+// exit. Any earlier return or throw dropped it silently: a permanent, untracked
+// live watcher - a real regression vs. pre-#2233's inline disarm, which no later
+// step in this same function could skip. Three tests below, one per exit shape
+// the review named.
+
+TEST_CASE("attach_rule: a same-key busy fail-fast still disarms the re-pushed "
+          "rule's OWN prior generation",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    // r2 starts on its own key, fully armed.
+    REQUIRE(rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true));
+    CHECK(b->arms.load() == 1);
+
+    // r1 parks a hung arm on "/a".
+    b->hang_next_arm.store(true);
+    std::thread a_thread{[&] { rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    struct Cleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~Cleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } cleanup{b.get(), &a_thread};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    // r2 is re-pushed pointing at the SAME key r1 is currently arming ("/a") - a
+    // legitimate spec change. detach_rule_locked("r2") captures its old "/b"
+    // watcher as prior_disarm, THEN the busy check on "/a" fails fast and returns
+    // before prior_disarm's normal submission site.
+    auto gen_r2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    REQUIRE_FALSE(gen_r2);
+    CHECK(gen_r2.error() == "arm already in progress for this key");
+
+    // r2's OLD "/b" watcher must be disarmed regardless - it is unreachable from
+    // any Guardian state after detach_rule_locked erased it.
+    CHECK(b->disarms.load() == 1);
+
+    b->release_hang();
+    a_thread.join();
+    CHECK(b->arms.load() == 2); // r1's arm, once it resolved; r2's re-push never armed
+}
+
+TEST_CASE("attach_rule: an inline-type arm() failure still disarms the re-pushed "
+          "rule's prior bounded-key generation",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(b->arms.load() == 1);
+    CHECK(b->disarms.load() == 0);
+
+    // Re-push r1 as an inline type (Startup - never routes through io_class_
+    // for_spark_type's bounded set) whose arm() then fails.
+    b->fail_arm = true;
+    auto gen2 = rt->attach_rule("r1", SparkSpec{SparkType::Startup, StartupSparkParams{}},
+                                file_exists_rule("r1"), true);
+    REQUIRE_FALSE(gen2);
+    b->fail_arm = false;
+
+    // r1's OLD file-backed watcher must be disarmed even though the re-push
+    // itself failed - it is no longer referenced anywhere in Guardian's state.
+    CHECK(b->disarms.load() == 1);
+    CHECK(rt->rule_count() == 0); // the failed re-push left nothing behind either
+}
+
+TEST_CASE("attach_rule: a commit throw still disarms the re-pushed rule's prior "
+          "bounded-key generation",
+          "[spark][runtime]") {
+    struct ThrowOnCopy {
+        ThrowOnCopy() = default;
+        ThrowOnCopy(const ThrowOnCopy&) { throw std::runtime_error("waker copy boom"); }
+        ThrowOnCopy(ThrowOnCopy&&) noexcept = default;
+        ThrowOnCopy& operator=(ThrowOnCopy&&) noexcept = default;
+        void operator()() const {}
+    };
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(b->arms.load() == 1);
+    CHECK(b->disarms.load() == 0);
+
+    // Re-push r1 as another inline type; commit_new_generation_locked's own waker
+    // copy throws AFTER the new arm() succeeds, unwinding out of attach_rule.
+    rt->set_pending_initial_waker(ThrowOnCopy{});
+    CHECK_THROWS_AS(rt->attach_rule("r1", SparkSpec{SparkType::Startup, StartupSparkParams{}},
+                                     file_exists_rule("r1"), true),
+                    std::runtime_error);
+    rt->set_pending_initial_waker({});
+
+    // Both watchers must be disarmed: the NEW one via the inline branch's own
+    // pre-existing rollback (armed_here==true), and r1's OLD file-backed one via
+    // the #3821 review fix - the two rollbacks nest (LIFO) and neither replaces
+    // the other.
+    CHECK(b->arms.load() == 2);    // old File arm + new Startup arm
+    CHECK(b->disarms.load() == 2); // both rolled back
+    CHECK(rt->rule_count() == 0);
+}
+
 // ── #2233 item 3: arm/disarm liveness (bounded, off-registry_mu_ backend calls) ──
 
 TEST_CASE("#2233 item 3: a bounded arm that never returns times out, leaves no state, "

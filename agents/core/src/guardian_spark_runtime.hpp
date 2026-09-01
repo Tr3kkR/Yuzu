@@ -217,10 +217,12 @@ public:
     /// `shared_from_this()` to keep the runtime alive on a detached
     /// `GuardianIoExecutor` worker; calling it on an instance with no owning
     /// `shared_ptr` throws `std::bad_weak_ptr` AFTER phase-1 state
-    /// (`arming_keys_`/`index_`) is already mutated, with no rollback installed for
-    /// that specific throw - it would permanently block that key. Not reachable
-    /// today (verified: every construction site uses `make_shared`), but this is a
-    /// real precondition of the class now, not just of `enable_shared_from_this`
+    /// (`arming_keys_`/`index_`) is already mutated. `attach_rule`'s `arming_rollback`
+    /// (armed before the `io_executor_.run()` call whose argument list evaluates
+    /// `shared_from_this()`) undoes that mutation on this throw same as any other -
+    /// it does not permanently block the key. Not reachable today regardless
+    /// (verified: every construction site uses `make_shared`), but this is a real
+    /// precondition of the class now, not just of `enable_shared_from_this`
     /// abstractly.
     GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
                          std::shared_ptr<ISparkBackend> backend);
@@ -449,7 +451,10 @@ public:
     }
     /// #2233 item 3: attach_rule calls that hit cfg_.backend_op_deadline waiting on a
     /// backend arm (the rule is left errored, retried on the next push - never
-    /// silently dropped; see attach_rule). Lock-free.
+    /// silently dropped; see attach_rule), PLUS submit_disarm_off_lock calls that
+    /// hit the same deadline waiting on a backend disarm (detach_rule/detach_all/
+    /// the prior-generation and rollback disarm paths) - one shared counter for
+    /// both directions, not just arm. Lock-free.
     [[nodiscard]] std::uint64_t backend_op_timeouts() const noexcept {
         return backend_op_timeouts_.load(std::memory_order_relaxed);
     }

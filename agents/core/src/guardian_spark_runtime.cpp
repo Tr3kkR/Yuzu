@@ -170,7 +170,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     std::uint64_t gen = 0;
     bool need_bounded_arm = false;
     {
-        std::lock_guard<std::mutex> lk{registry_mu_};
+        std::unique_lock<std::mutex> lk{registry_mu_};
         if (stopping_)
             return std::unexpected(std::string{"stopping"});
 
@@ -183,6 +183,25 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // off-lock) - the "armed" entry below covers the new one, so ONE
         // outbox-waker firing at the end of this call covers both.
         prior_disarm = detach_rule_locked(rule_id);
+
+        // PR #3821 review (fjarvis): prior_disarm above is the backend disarm OWED
+        // to whatever generation this attach just superseded, deferred to the
+        // caller and submitted off-lock at the normal exit below (271-272). Every
+        // return or throw between here and there previously dropped it silently -
+        // a permanent, untracked live watcher, and a real regression vs.
+        // pre-#2233's inline disarm (which no later step in this function could
+        // skip). This guard closes every such exit uniformly: lk.unlock() before
+        // the off-lock submission, matching this function's own established
+        // discipline (the success-commit rollback below does the same). Declared
+        // right after prior_disarm is populated so it protects every branch that
+        // follows; committed once we reach the normal end of this locked block.
+        GuardianRollback prior_disarm_rollback;
+        prior_disarm_rollback.fn = [this, &prior_disarm, &lk] {
+            if (prior_disarm) {
+                lk.unlock();
+                submit_disarm_off_lock(*prior_disarm);
+            }
+        };
 
         gen = ++gen_counter_;
         rg->generation = gen;
@@ -261,6 +280,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             rollback.committed = true;
         }
         new_gen = gen;
+        prior_disarm_rollback.committed = true;
     }
 
     // Off-lock: any watcher a superseded prior generation owed a disarm to. Fire
@@ -281,9 +301,14 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
     // The actual backend arm, OFF both runtime locks, bounded by cfg_.backend_op_deadline.
     // A caller (GuardianEngine::apply_rules/start_local, still holding mtx_ for its
-    // whole body) waits at most this long for THIS rule; every other rule's
-    // attach/detach and every evaluate_key proceed freely in the meantime, since
-    // registry_mu_ is not held here at all.
+    // whole body) waits at most this long for THIS rule's arm - PLUS, if this
+    // rule_id had a prior generation on a bounded (F/R/S) key, up to another
+    // cfg_.backend_op_deadline for that generation's disarm above (271-272), since
+    // the two are sequential, not concurrent (deliberately: see that call site's own
+    // comment on why disarm-before-arm is ordered this way). A same-key redeploy is
+    // therefore up to 2x this deadline, not 1x. Every OTHER rule's attach/detach and
+    // every evaluate_key proceed freely throughout, since registry_mu_ is not held
+    // here at all.
     // T = std::expected<uint64_t, string> (backend_->arm's own return type) - two
     // layers to unwrap below: the OUTER expected is io_executor_'s own bounded-wait
     // outcome (timeout/capacity/etc, IoFailure), the INNER is backend_->arm()'s own
