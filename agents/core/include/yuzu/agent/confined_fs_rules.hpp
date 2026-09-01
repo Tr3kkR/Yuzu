@@ -87,6 +87,10 @@ enum class Reason : std::uint8_t {
     Unsupported,
     MatchError,
     Internal,
+    /// The entry was captured (renamed aside) but could NOT be restored,
+    /// because something now occupies its original name. It was NOT deleted;
+    /// it remains under the capture name and the tree HAS been modified.
+    CaptureOrphaned,
 };
 
 /// Terminal per-entry disposition recorded in a `DeleteResult`.

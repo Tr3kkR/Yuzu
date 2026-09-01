@@ -26,6 +26,9 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#if defined(__APPLE__)
+#include <sys/stdio.h> // renameatx_np, RENAME_EXCL
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -299,14 +302,42 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
 // orphan named with the prefix below. Every non-crash path restores or removes it.
 constexpr const char* kCapturePrefix = ".yuzu_cfs_capture_";
 
+/// Rename WITHOUT replacing an existing destination. A plain renameat() silently
+/// unlinks whatever occupies the target name, which on the restore path means an
+/// entry the local user created at the original name during the capture window is
+/// destroyed -- deleted uncharged against the byte cap, never offered to MatchFn,
+/// and absent from every EntryOutcome. Measured: renameat over an existing
+/// destination returns 0 and the destination's contents are gone.
+int rename_noreplace(int dir_fd, const char* from, const char* to) {
+#if defined(__APPLE__)
+    return ::renameatx_np(dir_fd, from, dir_fd, to, RENAME_EXCL);
+#elif defined(__linux__)
+    return ::renameat2(dir_fd, from, dir_fd, to, RENAME_NOREPLACE);
+#else
+    // No no-replace primitive: refuse rather than risk clobbering. The caller
+    // reports CaptureOrphaned, which is honest -- the entry stays under its
+    // capture name and the operator is told so.
+    (void)dir_fd; (void)from; (void)to;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 std::optional<std::string> make_capture_name() {
     unsigned char raw[8];
     // ScopedFd, not a raw open/close pair: manual cleanup in new code is a
     // governance policy floor even where no early return currently sits between
     // acquire and release, because the next edit is what introduces one.
     ScopedFd urandom{::open("/dev/urandom", O_RDONLY | O_CLOEXEC)};
-    if (!urandom.valid())
+    if (!urandom.valid()) {
+        // Capture errno HERE: ScopedFd's destructor runs close() on the way out
+        // and can clobber it before the caller reads it.
+        const int err = errno;
+        spdlog::warn("confined_fs: cannot open /dev/urandom for a capture name: {}",
+                     std::strerror(err));
+        errno = err;
         return std::nullopt;
+    }
     ssize_t got = 0;
     do {
         got = ::read(urandom.get(), raw, sizeof raw);
@@ -345,11 +376,16 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
 
     // Restores the entry to its original name on any refusal path below, so a
     // declined delete leaves the tree exactly as it was found.
-    const auto restore = [&]() {
-        if (::renameat(dir_fd, captured->c_str(), dir_fd, name.c_str()) != 0) {
-            spdlog::warn("confined_fs::unlink_at: could not restore '{}' after refusing it; it "
-                         "remains as '{}'", name, *captured);
-        }
+    // Returns true when the entry is back under its original name. NEVER
+    // overwrites: if something now occupies that name it is left alone and the
+    // caller reports CaptureOrphaned rather than destroying it.
+    const auto restore = [&]() -> bool {
+        if (rename_noreplace(dir_fd, captured->c_str(), name.c_str()) == 0)
+            return true;
+        const int err = errno;
+        spdlog::warn("confined_fs::unlink_at: could not restore '{}' ({}); it remains as '{}' "
+                     "and the tree HAS been modified", name, std::strerror(err), *captured);
+        return false;
     };
 
     // MEASURE the captured name. Nothing can substitute for it: the attacker
@@ -359,7 +395,8 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
         struct stat st{};
         if (g_fstatat_fn(dir_fd, captured->c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
             const int err = errno;
-            restore();
+            if (!restore())
+                return UnlinkOutcome{EntryStatus::Failed, Reason::CaptureOrphaned, err, 0};
             spdlog::warn("confined_fs::unlink_at: cannot measure '{}' before deleting ({}) -- "
                          "refusing rather than deleting it uncharged", name, std::strerror(err));
             return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};
@@ -367,7 +404,8 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
         if (S_ISREG(st.st_mode)) {
             live_bytes = static_cast<std::uint64_t>(st.st_size);
             if (live_bytes > max_bytes_remaining) {
-                restore();
+                if (!restore())
+                    return UnlinkOutcome{EntryStatus::Failed, Reason::CaptureOrphaned, 0, 0};
                 spdlog::warn("confined_fs::unlink_at: '{}' exceeds the remaining byte cap -- "
                              "refusing", name);
                 return UnlinkOutcome{EntryStatus::Skipped, Reason::ByteCap, 0, 0};
@@ -379,7 +417,8 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
     const int flags = (kind == UnlinkKind::EmptyDirectory) ? AT_REMOVEDIR : 0;
     if (::unlinkat(dir_fd, captured->c_str(), flags) != 0) {
         const int err = errno;
-        restore();
+        if (!restore())
+            return UnlinkOutcome{EntryStatus::Failed, Reason::CaptureOrphaned, err, 0};
         spdlog::debug("confined_fs::unlink_at: unlinkat('{}') failed: {}", name,
                       std::strerror(err));
         return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};

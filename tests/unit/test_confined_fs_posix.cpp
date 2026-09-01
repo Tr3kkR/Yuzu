@@ -14,6 +14,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <iterator>
 #include <limits>
 #include <system_error>
 
@@ -327,6 +328,59 @@ TEST_CASE("a symlink entry inside the root is skipped and its target survives", 
 // remaining budget while charging 1. Capture-then-measure closes it -- by the
 // time the swap lands, our inode is already bound to an unpredictable name and
 // the attacker has only replaced a name we no longer act on.
+// G1 regression (governance security-guardian, verified): the restore path used a
+// plain renameat, which REPLACES its destination. A local user who recreates the
+// entry's original name during the capture window therefore had that file silently
+// unlinked by the restore -- bytes deleted uncharged against the cap, on an entry
+// MatchFn was never asked about and that appears in no outcome. Restore is now
+// no-replace: the intruding file survives and the outcome says the tree changed.
+TEST_CASE("a refused delete never destroys a file created at the entry's name",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_restore_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "target.tmp", std::string(4096, 'x')); // will breach the cap
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    static fs::path s_root;
+    s_root = root_dir;
+    UnlinkOutcome outcome{};
+    {
+        // Fires during the measurement, i.e. while the entry is captured aside:
+        // the attacker plants their own file at the now-free original name.
+        FstatatSeamGuard guard{[](int dirfd, const char* nm, struct stat* st, int flags) -> int {
+            std::ofstream f(s_root / "target.tmp");
+            f << "ATTACKER-DATA";
+            return ::fstatat(dirfd, nm, st, flags);
+        }};
+        outcome = unlink_at(opened.root->fd_.get(), "target.tmp", UnlinkKind::File, 1);
+    }
+
+    // Nothing was deleted, and the intruding file is intact.
+    REQUIRE(fs::exists(root_dir / "target.tmp"));
+    std::ifstream in(root_dir / "target.tmp");
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    CHECK(content == "ATTACKER-DATA");
+
+    // The outcome must SAY the tree changed rather than reporting a clean refusal.
+    CHECK(outcome.status == EntryStatus::Failed);
+    CHECK(outcome.reason == Reason::CaptureOrphaned);
+    CHECK(outcome.bytes == 0);
+
+    // The captured 4096-byte entry is still present under its capture name.
+    bool orphan_present = false;
+    std::uintmax_t orphan_size = 0;
+    for (const auto& e : fs::directory_iterator(root_dir))
+        if (e.path().filename().string().rfind(".yuzu_cfs_capture_", 0) == 0) {
+            orphan_present = true;
+            orphan_size = fs::file_size(e.path());
+        }
+    CHECK(orphan_present);
+    CHECK(orphan_size == 4096);
+}
+
 TEST_CASE("unlink_at cannot be made to delete a file swapped in after measurement",
           "[confined_fs]") {
     yuzu::test::TempDir tmp{"yuzu_test_confined_posix_swapcap_"};
