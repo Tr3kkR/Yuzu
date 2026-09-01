@@ -1,0 +1,80 @@
+#pragma once
+
+/// @file detached_signature.hpp
+///
+/// Verification of a detached PEM CMS signature over a local file, against an
+/// operator-supplied PEM trust bundle.
+///
+/// WHY IT IS SHARED. This is the plugin loader's verifier, lifted so the OTA
+/// update path can use the same one (#416/#3807). Two independent verifiers for
+/// "is this binary the one my operator authorised" would be two places to get
+/// the CMS flags wrong, and the flags here are load-bearing enough that two
+/// separate governance findings are pinned in the comments below.
+///
+/// WHAT IT DOES NOT DO: it does not bind a signature to a filename or a version.
+/// The signature covers file CONTENT only. Callers that need a name or version
+/// binding must provide it themselves — the plugin loader does so with its
+/// allowlist, and the updater does so with the server-supplied SHA-256 and the
+/// semver downgrade check, both of which it applies BEFORE getting here.
+
+#include <filesystem>
+#include <optional>
+#include <string>
+#include <string_view>
+
+namespace yuzu::agent {
+
+/// Why a signature did not verify. Callers map this onto their own
+/// subject-specific reason strings, which is why this enum carries no prose.
+enum class CmsFailure {
+    /// The signature is malformed, or the digest does not cover this file.
+    kInvalid,
+    /// The signer's certificate does not chain to the trust bundle, or does not
+    /// carry the codeSigning EKU, or the bundle itself could not be read (an
+    /// unreadable bundle proves nothing, so it is a trust failure, not a pass).
+    kUntrusted,
+};
+
+struct CmsVerifyError {
+    CmsFailure kind;
+    std::string detail; ///< drained OpenSSL error text, for the log line
+};
+
+/// Verify `signature_pem` as a detached CMS signature over the bytes of
+/// `artifact_path`, with signer certificates chained against `trust_bundle_path`.
+///
+/// Returns `std::nullopt` when the signature verifies. The signature is taken as
+/// a buffer rather than a path because the OTA path receives it over the wire,
+/// while the plugin path reads it from a sibling file.
+///
+/// The trust store is built with `X509_PURPOSE_CODE_SIGN`, so a leaf WITHOUT the
+/// codeSigning EKU is rejected even when it chains to a CA in the bundle. That
+/// matters because internal PKIs very commonly issue mTLS and S/MIME certs from
+/// the same root: without the purpose, trusting that root for signing would make
+/// every cert it ever issued a signing authority. (plugin governance sec-LOW-2 /
+/// UP-8, preserved in the lift.)
+[[nodiscard]] std::optional<CmsVerifyError>
+verify_detached_cms(const std::filesystem::path& artifact_path, std::string_view signature_pem,
+                    const std::filesystem::path& trust_bundle_path);
+
+/// Same verification, reading the artifact from an ALREADY-OPEN descriptor.
+///
+/// Two reasons this exists rather than everything going through the path form:
+///
+///  1. It removes the re-open entirely, so the bytes verified are provably the
+///     bytes the caller already hashed — there is no window in which the path
+///     could be repointed at a different inode between the hash and the
+///     signature check.
+///  2. On Windows it is not optional. The updater stages its download with
+///     `dwShareMode=0`, so nothing — including this process — can open that path
+///     a second time while the handle is held. A path-based verifier would fail
+///     with a sharing violation on every Windows update.
+///
+/// The descriptor's file offset is saved and restored, and the descriptor is NOT
+/// closed; the caller keeps ownership. On Windows, pass a CRT descriptor obtained
+/// from a DUPLICATED handle, so closing it cannot disturb the caller's own.
+[[nodiscard]] std::optional<CmsVerifyError>
+verify_detached_cms_fd(int artifact_fd, std::string_view signature_pem,
+                       const std::filesystem::path& trust_bundle_path);
+
+} // namespace yuzu::agent
