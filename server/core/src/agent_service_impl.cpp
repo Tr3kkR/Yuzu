@@ -1,5 +1,7 @@
 #include "agent_service_impl.hpp"
 
+#include "ota_transfer_rules.hpp"
+
 #include <grpc/grpc_security_constants.h>
 
 #include <chrono>
@@ -1108,7 +1110,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                        .count();
                     ev.principal = "agent:" + mismatch_agent_id;
                     ev.principal_role = "agent";
-                    ev.action = "session.identity_mismatch";
+                    ev.action = "session.ota_identity_rejected";
                     ev.target_type = "Session";
                     ev.target_id = session_id;
                     ev.detail = "agent_id=" + mismatch_agent_id +
@@ -2020,11 +2022,21 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         return s;
 
     // ── Per-peer admission (#913) ───────────────────────────────────────────
-    const auto key_pair = ota_admission_key(*context);
-    const std::string& ota_key = key_pair.first;
-    metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", key_pair.second}}).increment();
+    const auto admission_key = ota_admission_key(*context);
+    const std::string& ota_key = admission_key.key;
+    metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", admission_key.mode}})
+        .increment();
 
-    auto slot = ota_quota_->try_acquire(ota_key, QuotaSide::kEngine);
+    auto slot = ota_quota_.try_acquire(ota_key, QuotaSide::kEngine);
+
+    // Published on EVERY call, admitted or not. Updating it only on the admit
+    // path left it stale exactly when the map is under pressure — which is the
+    // one condition YuzuOtaPeerMapNearCapacity exists to observe, since a peer
+    // storm large enough to fill the map is also the case most likely to be
+    // rejected rather than admitted.
+    metrics_.gauge("yuzu_ota_download_peers_tracked")
+        .set(static_cast<double>(ota_quota_.principal_count()));
+
     if (!slot.admitted()) {
         const bool by_concurrency = slot.decision().limit == QuotaLimit::kConcurrency;
         metrics_
@@ -2039,8 +2051,6 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
                             "per-peer OTA download limit exceeded");
     }
     metrics_.counter("yuzu_ota_download_admission_total", {{"decision", "admitted"}}).increment();
-    metrics_.gauge("yuzu_ota_download_peers_tracked")
-        .set(static_cast<double>(ota_quota_->principal_count()));
 
     // The concurrency slot is held by `slot` for the rest of this function and
     // released by its destructor on EVERY exit path, including the early returns
@@ -2052,23 +2062,35 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     // on #934 (7.5h) and #941 (75min). Idempotent: several exit paths refund, and
     // a double refund would mint quota.
     bool refunded = false;
-    auto refund_token = [&] {
+    auto refund_token = [&](const char* reason) {
         if (refunded)
             return;
         refunded = true;
-        ota_quota_->refund(ota_key);
-        metrics_.counter("yuzu_ota_download_admission_total", {{"decision", "refunded"}})
-            .increment();
+        ota_quota_.refund(ota_key);
+        // Its OWN family, deliberately not a `decision="refunded"` label on the
+        // admission counter: a refunded request already incremented
+        // `decision="admitted"`, so folding refunds in there stops `decision`
+        // being a partition and makes sum(admission_total) double-count. The
+        // `reason` label is also what makes the refund invariant checkable —
+        // #939 wants deadline charges compared against deadline refunds, which
+        // a single undifferentiated "refunded" bucket cannot express.
+        metrics_.counter("yuzu_ota_download_refund_total", {{"reason", reason}}).increment();
     };
 
     if (!update_registry_) {
-        refund_token(); // server misconfiguration — nothing streamed, not the peer's doing
+        refund_token("registry_unavailable"); // nothing streamed, and not the peer's doing
         return grpc::Status(grpc::StatusCode::UNAVAILABLE, "OTA not configured");
     }
 
     auto pkg = update_registry_->latest_for(request->platform().os(), request->platform().arch());
     if (!pkg || pkg->version != request->version()) {
-        refund_token(); // nothing streamed
+        // Refunded even though the peer chose the version: nothing was streamed,
+        // so no capacity was consumed, and the bucket meters WORK DONE rather
+        // than requests attempted. A staged rollout routinely has agents asking
+        // for versions this server does not hold; charging for that would drain
+        // their buckets against zero cost. Parallel probing is already bounded by
+        // the concurrency cap, which is the dimension that matters here.
+        refund_token("version_not_found");
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
     }
 
@@ -2076,7 +2098,7 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     std::ifstream file(file_path, std::ios::binary);
     if (!file) {
         spdlog::error("DownloadUpdate: binary file missing: {}", file_path.string());
-        refund_token(); // server-side artifact problem
+        refund_token("package_missing"); // server-side artifact problem
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "binary file missing");
     }
 
@@ -2108,34 +2130,41 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         const bool wrote = writer->Write(chunk);
         const auto write_elapsed = std::chrono::steady_clock::now() - write_started;
 
-        if (!wrote) {
-            // A Write unblocked by the watchdog's TryCancel and a Write that
-            // failed because the peer hung up are INDISTINGUISHABLE at this
-            // return value — so ask the watchdog which happened. They get
-            // different treatment: our deadline refunds, the peer's disconnect
-            // does not.
-            if (transfer_guard.cancelled()) {
-                metrics_
-                    .counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", "transfer"}})
+        // The decision itself lives in ota_transfer_rules.hpp so every branch is
+        // reachable by a test without a package on disk (which would drag in
+        // UpdateRegistry and a PgPool). This is the thin caller: classify, then
+        // act. A Write unblocked by our own TryCancel and one that failed because
+        // the peer hung up are INDISTINGUISHABLE at the return value, which is
+        // why the watchdog's verdict is an input.
+        const auto outcome = ota::classify_write(wrote, transfer_guard.cancelled(), write_elapsed,
+                                                 ota_cfg_.chunk_stall_deadline);
+
+        if (ota::is_terminal(outcome)) {
+            if (const char* phase = ota::deadline_phase(outcome)) {
+                metrics_.counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", phase}})
                     .increment();
+            }
+            if (const char* reason = ota::refund_reason(outcome))
+                refund_token(reason);
+
+            switch (outcome) {
+            case ota::TransferOutcome::kTransferDeadline:
                 spdlog::warn("DownloadUpdate: transfer deadline exceeded at offset {}", offset);
-                refund_token();
                 return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
                                     "OTA transfer deadline exceeded");
+            case ota::TransferOutcome::kChunkStalled:
+                spdlog::warn(
+                    "DownloadUpdate: chunk write stalled {}s at offset {}, aborting",
+                    std::chrono::duration_cast<std::chrono::seconds>(write_elapsed).count(),
+                    offset);
+                return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
+                                    "OTA chunk write deadline exceeded");
+            case ota::TransferOutcome::kPeerDisconnected:
+                spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
+                return grpc::Status::CANCELLED;
+            case ota::TransferOutcome::kContinue:
+                break; // unreachable: is_terminal() excluded it
             }
-            spdlog::warn("DownloadUpdate: client disconnected at offset {}", offset);
-            return grpc::Status::CANCELLED;
-        }
-
-        if (write_elapsed > ota_cfg_.chunk_stall_deadline) {
-            metrics_.counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", "write"}})
-                .increment();
-            spdlog::warn("DownloadUpdate: chunk write stalled {}s at offset {}, aborting",
-                         std::chrono::duration_cast<std::chrono::seconds>(write_elapsed).count(),
-                         offset);
-            refund_token();
-            return grpc::Status(grpc::StatusCode::DEADLINE_EXCEEDED,
-                                "OTA chunk write deadline exceeded");
         }
 
         offset += file.gcount();
@@ -2150,7 +2179,13 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
 
 void AgentServiceImpl::set_ota_bound_config(const OtaBoundConfig& cfg) {
     ota_cfg_ = cfg;
-    ota_quota_ = std::make_unique<PrincipalQuota>(PrincipalQuotaConfig{
+    // Drive the eviction counter at the moment the ceiling bites. Sampling
+    // evicted_count() instead would lose every eviction between samples, and a
+    // sampled cumulative value cannot honestly be exported as a counter.
+    // Capturing `this` is safe: the quota is a member, so it cannot outlive us.
+    ota_quota_.set_on_evict(
+        [this] { metrics_.counter("yuzu_ota_download_peers_evicted_total").increment(); });
+    ota_quota_.set_config(PrincipalQuotaConfig{
         .max_concurrency = cfg.max_concurrent_per_peer,
         // PrincipalQuota refills per SECOND; the OTA knob is per MINUTE because
         // that is the scale an operator reasons about for a fleet-update pull.
@@ -2161,23 +2196,23 @@ void AgentServiceImpl::set_ota_bound_config(const OtaBoundConfig& cfg) {
     });
 }
 
-std::pair<std::string, const char*>
+AgentServiceImpl::AdmissionKey
 AgentServiceImpl::ota_admission_key(const grpc::ServerContext& ctx) const {
     const auto idents = extract_peer_identities(ctx);
     if (!idents.empty())
-        return {idents.front(), "cert"};
+        return AdmissionKey{idents.front(), "cert"};
 
     // No client certificate. Fall back to peer IP rather than an empty shared
     // key — see the header comment on this function (#935).
     std::string ip = extract_peer_ip(ctx.peer());
     if (!ip.empty())
-        return {std::move(ip), "peer_ip"};
+        return AdmissionKey{std::move(ip), "peer_ip"};
 
     // Neither a certificate nor a parseable peer. gRPC always populates peer()
     // for a real connection, so this is defensive; it is kept distinguishable in
     // the metric so a deployment that somehow lands here is visible rather than
     // silently sharing one bucket.
-    return {std::string("unknown"), "unknown"};
+    return AdmissionKey{std::string("unknown"), "unknown"};
 }
 
 grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext* context,
@@ -2186,7 +2221,12 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
     if (!require_positive_ota_identity_ || !context)
         return grpc::Status::OK;
 
-    auto deny = [&](const char* reason, const char* message) {
+    // `code` is a parameter because the rejections are not all the same KIND.
+    // A missing/mismatched identity is UNAUTHENTICATED; an absent required field
+    // is INVALID_ARGUMENT, matching what Register already returns for the same
+    // empty-agent_id condition. Collapsing both onto one code would tell an agent
+    // its certificate was rejected when in fact its request was malformed.
+    auto deny = [&](grpc::StatusCode code, const char* reason, const char* message) {
         // event=security: unlike an admission rejection (expected steady state,
         // operational), a failed identity bind on an already-enrolled agent's OTA
         // pull is an authentication signal. Mirrors yuzu_grpc_revoked_cert_total.
@@ -2221,7 +2261,7 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
             if (!audit_store_->log(ev))
                 signal_grpc_audit_failed(context);
         }
-        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED, message);
+        return grpc::Status(code, message);
     };
 
     const auto idents = extract_peer_identities(*context);
@@ -2230,7 +2270,8 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
         // identity here is anomalous rather than a bootstrap case. Register keeps
         // its bootstrap exemption; an OTA pull has none, because an agent pulling
         // an update is by definition already enrolled.
-        return deny("no_client_identity", "client certificate required");
+        return deny(grpc::StatusCode::UNAUTHENTICATED, "no_client_identity",
+                    "client certificate required");
     }
 
     // Hermes CRITICAL-1, same reasoning as Register: in a multi-CA trust bundle a
@@ -2239,13 +2280,25 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
     // single trust root) every authenticated cert is an agent — legacy behaviour.
     const std::string peer_pem = extract_peer_cert_pem(*context);
     if (peer_cert_recognizer_ && !peer_cert_recognizer_(peer_pem))
-        return deny("foreign_ca", "client certificate was not issued by this server's CA");
+        return deny(grpc::StatusCode::UNAUTHENTICATED, "foreign_ca",
+                    "client certificate was not issued by this server's CA");
+
+    // An ABSENT claim is refused rather than waved through. Skipping the bind on
+    // an empty agent_id would make the whole check evadable by omission: the
+    // protobuf default is the empty string, and CheckForUpdate feeds that value
+    // straight to UpdateRegistry::is_eligible(), so a caller that simply omits
+    // the field would pick its own rollout bucket while presenting a valid
+    // certificate. Register already refuses an empty agent_id for the same
+    // reason (see the kMaxAgentIdLength gate at the top of this file); this is
+    // the OTA sibling of that rule.
+    if (claimed_agent_id.empty())
+        return deny(grpc::StatusCode::INVALID_ARGUMENT, "agent_id_missing", "agent_id is required");
 
     // Bind the request-body agent_id to the certificate. Until this, agent_id was
     // client-supplied and unverified, yet it drives rollout eligibility
     // (UpdateRegistry::is_eligible) and is logged as the acting identity.
-    if (!claimed_agent_id.empty() && !peer_identity_matches_agent_id(*context, claimed_agent_id))
-        return deny("agent_id_mismatch",
+    if (!peer_identity_matches_agent_id(*context, claimed_agent_id))
+        return deny(grpc::StatusCode::UNAUTHENTICATED, "agent_id_mismatch",
                     "agent_id must match client certificate identity (CN/SAN)");
 
     return grpc::Status::OK;

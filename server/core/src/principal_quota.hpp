@@ -166,6 +166,23 @@ class PrincipalQuota {
     /// QuotaDecision — never reserves or releases a concurrency slot.
     QuotaDecision try_rate_only(const std::string& principal_id, QuotaSide side);
 
+    /// Replace the configuration IN PLACE, without destroying this object.
+    ///
+    /// This exists so a caller that needs to reconfigure a quota never has to
+    /// replace the PrincipalQuota itself. Replacing it is a use-after-free: every
+    /// live `QuotaSlot` holds a raw back-pointer here (see `QuotaSlot::owner_`,
+    /// whose own comment states "a slot must not outlive its PrincipalQuota by
+    /// construction"), so destroying the object while any reservation is
+    /// outstanding orphans that pointer and `~QuotaSlot` then writes through it.
+    /// Reconfiguring in place keeps every outstanding slot valid.
+    ///
+    /// A lowered `burst` clamps existing buckets down to the new ceiling rather
+    /// than leaving them holding more credit than the configuration now allows.
+    /// `in_flight` counts are untouched — they belong to live reservations, and
+    /// lowering `max_concurrency` below the current in-flight count simply admits
+    /// nobody new until those drain.
+    void set_config(const PrincipalQuotaConfig& cfg);
+
     /// Injectable steady clock — the token-bucket refill clock ONLY (`last_seen`,
     /// purge_stale's idle-eviction clock, stays wall-clock; see UP-4 in the .cpp).
     /// Defaults to `std::chrono::steady_clock::now`. Mirrors the ClockFn idiom in
@@ -201,9 +218,20 @@ class PrincipalQuota {
     void refund(const std::string& principal_id);
 
     /// Keys evicted by the `max_tracked` ceiling since construction. Always 0 when
-    /// `max_tracked == 0`. Surfaced as a counter so an operator can see the cap
-    /// biting rather than inferring it from a flat `principal_count()`.
+    /// `max_tracked == 0`. Surfaced so an operator can see the cap biting rather
+    /// than inferring it from a flat `principal_count()`.
     std::uint64_t evicted_count() const;
+
+    /// Optional hook fired once per eviction, so a caller can drive a real
+    /// Prometheus counter at the moment the cap bites rather than sampling
+    /// `evicted_count()` and differencing it (which loses evictions between
+    /// samples and cannot be expressed as a counter at all).
+    ///
+    /// CONTRACT: invoked while `mu_` is HELD. It must not call back into this
+    /// PrincipalQuota — that would self-deadlock on a non-recursive mutex — and
+    /// must be cheap and non-throwing in practice. Incrementing a metrics counter
+    /// satisfies all three; anything more belongs outside.
+    void set_on_evict(std::function<void()> fn);
 
     /// Purge principals idle for longer than `idle_evict_seconds`, as of
     /// `now_epoch_seconds`. A principal with a live in-flight reservation
@@ -285,6 +313,7 @@ class PrincipalQuota {
     std::unordered_map<std::string, PerPrincipal> principals_;
     ClockFn clock_{[] { return std::chrono::steady_clock::now(); }};
     std::uint64_t evicted_{0};
+    std::function<void()> on_evict_{};
 };
 
 }  // namespace yuzu::server

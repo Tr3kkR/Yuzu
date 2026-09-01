@@ -63,6 +63,9 @@ void PrincipalQuota::enforce_cap_locked() {
 
     principals_.erase(victim);
     evicted_ += 1;
+    // Fired under mu_ — see set_on_evict's contract. Kept to a counter bump.
+    if (on_evict_)
+        on_evict_();
 }
 
 void PrincipalQuota::refill_locked(PerPrincipal& pp,
@@ -203,6 +206,21 @@ void PrincipalQuota::release(const std::string& principal_id) noexcept {
         // better than aborting the process, and a mutex that cannot be locked means the
         // quota accounting is already unreliable.
     }
+}
+
+void PrincipalQuota::set_config(const PrincipalQuotaConfig& cfg) {
+    std::lock_guard lock(mu_);
+    cfg_ = cfg;
+    // Clamp existing buckets to a lowered burst. Without this a bucket filled
+    // under the old, larger ceiling would keep spending credit the new
+    // configuration never authorised, until it happened to drain.
+    for (auto& entry : principals_)
+        entry.second.tokens = std::min(entry.second.tokens, cfg_.burst);
+}
+
+void PrincipalQuota::set_on_evict(std::function<void()> fn) {
+    std::lock_guard lock(mu_);
+    on_evict_ = std::move(fn);
 }
 
 void PrincipalQuota::set_clock_for_test(ClockFn fn) {

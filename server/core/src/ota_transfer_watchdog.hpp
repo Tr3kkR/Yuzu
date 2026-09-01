@@ -45,6 +45,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -66,8 +67,17 @@ class OtaTransferWatchdog {
     explicit OtaTransferWatchdog(std::chrono::milliseconds sweep_interval =
                                      std::chrono::milliseconds(1000));
 
-    /// Stops and joins the sweeper. Safe with registrations still live: they hold
-    /// no reference to the watchdog beyond the map entry they erase themselves.
+    /// Stops and joins the sweeper.
+    ///
+    /// A live `Registration` MUST NOT outlive the watchdog: it holds an `owner_`
+    /// back-pointer and dereferences it in both `reset()` and `cancelled()`, so
+    /// an outliving registration is a use-after-free. In production that ordering
+    /// is structural rather than hoped for — this watchdog is a member of
+    /// `AgentServiceImpl`, and `agent_server_` is declared AFTER `agent_service_`
+    /// in `ServerImpl`, so the gRPC server (and with it every handler frame
+    /// holding a Registration) is destroyed first; `stop()` additionally calls
+    /// `agent_server_->Shutdown(deadline)`, which drains or cancels in-flight
+    /// calls. Do not reorder those two members.
     ~OtaTransferWatchdog();
 
     OtaTransferWatchdog(const OtaTransferWatchdog&) = delete;

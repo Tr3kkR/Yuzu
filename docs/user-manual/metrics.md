@@ -858,7 +858,14 @@ alerts stay meaningful.
 yuzu_ota_download_admission_total{decision="admitted"} 0
 yuzu_ota_download_admission_total{decision="rejected_concurrency"} 0
 yuzu_ota_download_admission_total{decision="rejected_rate"} 0
-yuzu_ota_download_admission_total{decision="refunded"} 0
+
+# HELP yuzu_ota_download_refund_total Agent OTA rate tokens returned after a server-attributable failure, by reason
+# TYPE yuzu_ota_download_refund_total counter
+yuzu_ota_download_refund_total{reason="registry_unavailable"} 0
+yuzu_ota_download_refund_total{reason="version_not_found"} 0
+yuzu_ota_download_refund_total{reason="package_missing"} 0
+yuzu_ota_download_refund_total{reason="transfer_deadline"} 0
+yuzu_ota_download_refund_total{reason="chunk_deadline"} 0
 
 # HELP yuzu_ota_download_deadline_exceeded_total Agent OTA DownloadUpdate transfers aborted by a server-imposed deadline, by phase
 # TYPE yuzu_ota_download_deadline_exceeded_total counter
@@ -879,6 +886,14 @@ yuzu_grpc_ota_identity_rejected_total{event="security",rpc="download_update",rea
 # HELP yuzu_ota_download_peers_tracked Peers currently tracked by the OTA admission map
 # TYPE yuzu_ota_download_peers_tracked gauge
 yuzu_ota_download_peers_tracked 0
+
+# HELP yuzu_ota_download_peers_capacity Configured ceiling on the OTA admission map (--ota-max-peers-tracked)
+# TYPE yuzu_ota_download_peers_capacity gauge
+yuzu_ota_download_peers_capacity 50000
+
+# HELP yuzu_ota_download_peers_evicted_total Peers evicted from the OTA admission map by its cardinality ceiling
+# TYPE yuzu_ota_download_peers_evicted_total counter
+yuzu_ota_download_peers_evicted_total 0
 ```
 
 Every closed series is pre-seeded to `0` at startup so `absent()` alerts stay
@@ -893,8 +908,10 @@ that keeps the per-principal quota counters off `event="security"`).
 `event="security"`, because a failed certificate bind on an already-enrolled
 agent's OTA pull is an authentication event; it mirrors
 `yuzu_grpc_revoked_cert_total` and is paired with a
-`session.identity_mismatch` audit row (the metric is the signal, the audit row
-is the evidence).
+`session.ota_identity_rejected` audit row (the metric is the signal, the audit
+row is the evidence). Note that verb is deliberately distinct from
+`session.identity_mismatch`, which is the Subscribe binding check and carries a
+different `detail` shape — see `docs/user-manual/audit-log.md`.
 
 **Reading `decision`.** `rejected_concurrency` means the peer already held
 `--ota-max-concurrent-per-peer` parallel downloads — the primary bound, and the
@@ -902,13 +919,30 @@ one that should fire under an actual monopolisation attempt.
 `rejected_rate` means the peer drained its token bucket, which is a much looser
 secondary bound; sustained `rejected_rate` without `rejected_concurrency`
 usually indicates the rate knobs are tuned too tightly for the fleet's retry
-behaviour rather than an attack. `refunded` counts tokens returned after a
-**server-attributable** failure (a deadline the server imposed, an unavailable
-registry, or a failure before any bytes were streamed) — it is why a slow-link
-or flapping agent cannot spend itself into a lockout. In steady state
-`refunded` should track
-`yuzu_ota_download_deadline_exceeded_total` closely; a large and growing gap
-between charges and refunds means a code path is failing without refunding.
+behaviour rather than an attack. `decision` is a genuine partition — exactly one per call.
+
+**Reading refunds.** `yuzu_ota_download_refund_total{reason}` is a SEPARATE
+family, deliberately not a `decision="refunded"` label: a refunded request has
+already been counted as `admitted`, so folding refunds into that family would
+stop `decision` partitioning and make `sum(yuzu_ota_download_admission_total)`
+double-count. A refund is issued only for a **server-attributable** failure —
+a deadline the server imposed, an unavailable registry, a missing artifact, or
+a version this server does not hold — and it is why a slow-link or flapping
+agent cannot spend itself into a lockout. The `reason` label is what makes the
+invariant checkable: in steady state the two deadline reasons together must
+match `yuzu_ota_download_deadline_exceeded_total` exactly, and a growing gap
+means a code path is aborting without refunding (this is what
+`YuzuOtaRefundDivergence` watches). `version_not_found` is refunded on purpose
+even though the peer chose the version: nothing is streamed, so no capacity is
+consumed, and a staged rollout routinely has agents asking for versions a given
+server does not hold.
+
+**Reading the peer map.** `yuzu_ota_download_peers_capacity` publishes the
+configured `--ota-max-peers-tracked` so alerts can express occupancy as a RATIO
+rather than hardcoding a threshold that silently becomes wrong when an operator
+retunes the flag. `yuzu_ota_download_peers_evicted_total` increments at the
+moment the ceiling actually bites, so approaching the cap and hitting it are
+distinguishable.
 
 **Reading `mode`.** `cert` is the healthy case: admission is keyed on the
 peer's certificate identity. `peer_ip` means the peer presented no client

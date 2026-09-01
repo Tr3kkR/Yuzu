@@ -25,13 +25,24 @@ OtaTransferWatchdog::OtaTransferWatchdog(std::chrono::milliseconds sweep_interva
 }
 
 OtaTransferWatchdog::~OtaTransferWatchdog() {
-    {
-        std::lock_guard lock(mu_);
-        stop_ = true;
+    // Contained for the same structural reason erase() is: this runs from a
+    // destructor, so a std::system_error escaping either the lock or the join is
+    // std::terminate that no caller-side catch can intercept. An earlier revision
+    // contained erase() and left these two uncontained, which is the asymmetry
+    // this fixes.
+    try {
+        {
+            std::lock_guard lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (sweeper_.joinable())
+            sweeper_.join();
+    } catch (...) {
+        // Nothing safe to do but contain it. Aborting the whole process during
+        // teardown is not an improvement, and a mutex that cannot be locked means
+        // the watchdog is already unreliable.
     }
-    cv_.notify_all();
-    if (sweeper_.joinable())
-        sweeper_.join();
 }
 
 OtaTransferWatchdog::Registration

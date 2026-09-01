@@ -191,6 +191,7 @@
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
 #include "process_health.hpp"
+#include "grpc_bounds_rules.hpp"
 #include "rate_limiter.hpp"
 #include "security_headers.hpp"
 
@@ -586,8 +587,18 @@ public:
         // event — it mirrors yuzu_grpc_revoked_cert_total.
         metrics_.describe("yuzu_ota_download_admission_total",
                           "Agent OTA DownloadUpdate admission decisions by outcome", "counter");
-        for (auto d : {"admitted", "rejected_concurrency", "rejected_rate", "refunded"})
+        // `decision` is a genuine PARTITION: exactly one of these per call.
+        // Refunds are a separate family below precisely so they cannot break that.
+        for (auto d : {"admitted", "rejected_concurrency", "rejected_rate"})
             metrics_.counter("yuzu_ota_download_admission_total", {{"decision", d}});
+
+        metrics_.describe("yuzu_ota_download_refund_total",
+                          "Agent OTA rate tokens returned after a server-attributable failure, "
+                          "by reason",
+                          "counter");
+        for (auto r : {"registry_unavailable", "version_not_found", "package_missing",
+                       "transfer_deadline", "chunk_deadline"})
+            metrics_.counter("yuzu_ota_download_refund_total", {{"reason", r}});
 
         metrics_.describe("yuzu_ota_download_deadline_exceeded_total",
                           "Agent OTA DownloadUpdate transfers aborted by a server-imposed "
@@ -606,7 +617,8 @@ public:
                           "certificate identity, by rpc and reason",
                           "counter");
         for (auto rpc : {"check_for_update", "download_update"})
-            for (auto reason : {"no_client_identity", "foreign_ca", "agent_id_mismatch"})
+            for (auto reason :
+                 {"no_client_identity", "foreign_ca", "agent_id_missing", "agent_id_mismatch"})
                 metrics_.counter(
                     "yuzu_grpc_ota_identity_rejected_total",
                     {{"event", "security"}, {"rpc", rpc}, {"reason", reason}});
@@ -614,6 +626,20 @@ public:
         metrics_.describe("yuzu_ota_download_peers_tracked",
                           "Peers currently tracked by the OTA admission map", "gauge");
         metrics_.gauge("yuzu_ota_download_peers_tracked").set(0.0);
+
+        // Published so alerts express occupancy as a RATIO of the configured
+        // ceiling rather than hardcoding a threshold that silently becomes wrong
+        // the moment an operator retunes --ota-max-peers-tracked.
+        metrics_.describe("yuzu_ota_download_peers_capacity",
+                          "Configured ceiling on the OTA admission map (--ota-max-peers-tracked)",
+                          "gauge");
+        metrics_.gauge("yuzu_ota_download_peers_capacity")
+            .set(static_cast<double>(cfg_.ota_max_peers_tracked));
+
+        metrics_.describe("yuzu_ota_download_peers_evicted_total",
+                          "Peers evicted from the OTA admission map by its cardinality ceiling",
+                          "counter");
+        metrics_.counter("yuzu_ota_download_peers_evicted_total");
         // Per-principal quota cap exhaustions (PR 4.4, ADR-1005 class engine
         // principals). Pre-seed all 4 closed series to 0 (docs/observability-
         // conventions.md), mirroring yuzu_onbehalf_rejected_total above.
@@ -7140,12 +7166,15 @@ public:
         //
         // Both bounds REJECT at capacity rather than queueing — queueing would
         // hold the very threads the caps exist to free.
-        builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS,
-                                   cfg_.grpc_max_concurrent_streams);
         {
+            // Derivation lives in grpc_bounds_rules.hpp so the MiB->bytes
+            // arithmetic and its overflow guard are testable; these two lines are
+            // the thin application of it.
+            const auto bounds = grpc_bounds_from_config(cfg_);
+            builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS,
+                                       bounds.max_concurrent_streams);
             grpc::ResourceQuota quota("yuzu_grpc");
-            quota.Resize(static_cast<size_t>(cfg_.grpc_max_resource_memory_mb) * 1024ULL *
-                         1024ULL);
+            quota.Resize(bounds.resource_quota_bytes);
             builder.SetResourceQuota(quota);
         }
 

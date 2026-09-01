@@ -12,7 +12,9 @@
   exactly, whereas a tight bucket meters retries and locks out honest
   slow-link and flapping agents. Exhausting either returns gRPC
   `RESOURCE_EXHAUSTED` and increments the pre-seeded, bounded-label
-  `yuzu_ota_download_admission_total{decision}` counter. Admission keys on the
+  `yuzu_ota_download_admission_total{decision}` counter, with refunds tracked
+  separately on `yuzu_ota_download_refund_total{reason}` so `decision` stays a
+  true partition. Admission keys on the
   peer certificate identity, falling back to peer IP when none is presented
   (the agent listener does not always require a client certificate, and a
   single shared bucket would let one unenrolled agent lock out the rest); the
@@ -40,16 +42,26 @@
   128) and a `ResourceQuota` memory ceiling
   (`--grpc-max-resource-memory-mb`/`YUZU_GRPC_MAX_RESOURCE_MEMORY_MB`, default
   512). Both reject at capacity rather than queueing.
-- **Positive peer identity on the OTA RPCs (#416).** `CheckForUpdate` and
+- **Positive peer identity on the OTA RPCs (#416, PARTIAL — does not close it).**
+  `CheckForUpdate` and
   `DownloadUpdate` previously checked only that a peer was *not* revoked, and
   the `agent_id` in the request body was unverified despite selecting rollout
   eligibility. Both now require a positive certificate identity and bind the
   claimed `agent_id` to the certificate's CN/SAN, rejecting a mismatch with
-  `UNAUTHENTICATED` plus a `session.identity_mismatch` audit row and the
+  `UNAUTHENTICATED` plus a `session.ota_identity_rejected` audit row and the
   `yuzu_grpc_ota_identity_rejected_total{event="security",rpc,reason}` counter.
+  A request omitting `agent_id` entirely is refused with `INVALID_ARGUMENT`
+  rather than skipping the bind, so the check cannot be evaded by omission.
   This is gated on the agent listener actually requiring a client certificate,
   so the default-certificate bootstrap path for unenrolled agents is
   unaffected.
+
+  **This does NOT close #416.** That issue also asks for update binaries to be
+  signed and the signature verified agent-side. The agent verifies a SHA-256
+  today, but against a hash the server supplied over the same channel — that is
+  integrity, not authenticity, and it does not help if the channel or server is
+  the thing you are defending against. Signing is release-plane work touching
+  the packaging pipeline and is tracked separately; #416 stays open.
 - **Caveat — per-process, not fleet-wide.** OTA admission state lives in one
   server process's memory. Behind a load balancer with two or more replicas a
   peer that reconnects to a different replica gets a fresh allowance, so the

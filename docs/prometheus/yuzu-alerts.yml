@@ -3869,7 +3869,9 @@ groups:
             increase(yuzu_ota_download_deadline_exceeded_total[30m])
           )
             > sum by (job, instance) (
-                increase(yuzu_ota_download_admission_total{decision="refunded"}[30m])
+                increase(
+                  yuzu_ota_download_refund_total{reason=~"transfer_deadline|chunk_deadline"}[30m]
+                )
               )
         for: 15m
         labels:
@@ -3887,20 +3889,27 @@ groups:
 
       - alert: YuzuOtaPeerMapNearCapacity
         expr: |
-          yuzu_ota_download_peers_tracked > 40000
+          yuzu_ota_download_peers_tracked
+            / clamp_min(yuzu_ota_download_peers_capacity, 1)
+            > 0.8
         for: 30m
         labels:
           severity: info
         annotations:
           summary: "OTA per-peer admission map is approaching its cardinality ceiling"
           description: >-
-            The per-peer OTA admission map is nearing --ota-max-peers-tracked
-            (issue #935). The map is bounded and evicts the least-recently-seen
-            idle entry, so this is not a memory-exhaustion risk — but on a fleet
-            far smaller than this number it indicates admission has fallen back
-            to peer-IP keying for many peers (check
+            The per-peer OTA admission map is above 80% of
+            --ota-max-peers-tracked (issue #935). Expressed as a ratio against
+            the published yuzu_ota_download_peers_capacity gauge rather than a
+            hardcoded count, so it stays correct when an operator retunes the
+            flag. The map is bounded and evicts the least-recently-seen idle
+            entry, so this is not a memory-exhaustion risk — but on a fleet far
+            smaller than the configured ceiling it indicates admission has
+            fallen back to peer-IP keying for many peers (check
             yuzu_ota_admission_key_mode_total{mode="peer_ip"}), which is what a
-            NAT'd peer rotating source ports looks like.
+            NAT'd peer rotating source ports looks like. Correlate with
+            yuzu_ota_download_peers_evicted_total to see whether the cap is
+            actually biting yet.
 
   - name: yuzu-executions
     # HA WS-1(1b) (ADR-2002 §5) — the command_id -> execution_id correlation

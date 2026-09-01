@@ -71,7 +71,7 @@ tests:
     input_series:
       - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
         values: "0+1x60"
-      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="refunded"}'
+      - series: 'yuzu_ota_download_refund_total{job="yuzu",instance="s1",reason="transfer_deadline"}'
         values: "0+0x60"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing"}'
@@ -89,11 +89,74 @@ tests:
     input_series:
       - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
         values: "0+1x60"
-      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="refunded"}'
+      - series: 'yuzu_ota_download_refund_total{job="yuzu",instance="s1",reason="transfer_deadline"}'
         values: "0+1x60"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing"}'
         eval_time: 50m
+        exp_samples: []
+
+  # ── YuzuOtaIdentityRejections (#416) ─────────────────────────────────────
+
+  # CASE E -- any sustained identity rejection fires. On a fully-enrolled fleet
+  # this series should sit flat at zero, so the bar is deliberately low.
+  - interval: 1m
+    name: ota identity - sustained rejections fire
+    input_series:
+      - series: 'yuzu_grpc_ota_identity_rejected_total{job="yuzu",instance="s1",event="security",rpc="download_update",reason="agent_id_mismatch"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", event="security", instance="s1", job="yuzu", reason="agent_id_mismatch", rpc="download_update", severity="warning"}'
+            value: 1
+
+  # CASE F -- a fleet with no identity failures stays quiet. RED if the rule
+  # were ever written against absent() or a `>= 0` comparison.
+  - interval: 1m
+    name: ota identity - a clean fleet stays quiet
+    input_series:
+      - series: 'yuzu_grpc_ota_identity_rejected_total{job="yuzu",instance="s1",event="security",rpc="download_update",reason="agent_id_mismatch"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuOtaPeerMapNearCapacity (#935) ────────────────────────────────────
+
+  # CASE G -- occupancy is a RATIO of the configured ceiling, not a hardcoded
+  # count. 900/1000 = 90% fires even though 900 is far below the old literal
+  # 40000 threshold -- which is precisely the operator-retuned case the
+  # hardcoded form got wrong.
+  - interval: 1m
+    name: ota peer map - fires at 90% of a retuned ceiling
+    input_series:
+      - series: 'yuzu_ota_download_peers_tracked{job="yuzu",instance="s1"}'
+        values: "900+0x60"
+      - series: 'yuzu_ota_download_peers_capacity{job="yuzu",instance="s1"}'
+        values: "1000+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapNearCapacity", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaPeerMapNearCapacity", alertstate="firing", instance="s1", job="yuzu", severity="info"}'
+            value: 1
+
+  # CASE H -- a large map well under a large ceiling stays quiet. 30000/50000 =
+  # 60%. Under the old hardcoded `> 40000` this same shape was also quiet, but
+  # only by luck; this case pins the ratio semantics.
+  - interval: 1m
+    name: ota peer map - large but comfortable stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_peers_tracked{job="yuzu",instance="s1"}'
+        values: "30000+0x60"
+      - series: 'yuzu_ota_download_peers_capacity{job="yuzu",instance="s1"}'
+        values: "50000+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapNearCapacity", alertstate="firing"}'
+        eval_time: 45m
         exp_samples: []
 
   # ── YuzuOtaConcurrencyRejections (#913) ──────────────────────────────────

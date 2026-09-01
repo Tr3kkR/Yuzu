@@ -101,8 +101,15 @@ public:
         std::size_t max_peers_tracked{50000};
     };
 
-    /// Set-before-traffic, like the store setters below. Rebuilds the quota, so
-    /// calling it while requests are in flight would drop their accounting.
+    /// Reconfigure the OTA bounds. Safe to call at any time: it reconfigures the
+    /// quota IN PLACE via `PrincipalQuota::set_config` and never replaces the
+    /// object, so an in-flight `DownloadUpdate` holding a `QuotaSlot` keeps a
+    /// valid owner. (An earlier revision rebuilt the quota through a
+    /// `unique_ptr`, which orphaned exactly that back-pointer — a use-after-free
+    /// that only the absence of a mid-flight caller kept unreachable.)
+    ///
+    /// Deadlines are read per call, so a change takes effect on the next
+    /// transfer rather than retroactively shortening one already running.
     void set_ota_bound_config(const OtaBoundConfig& cfg);
 
     /// #416: require a POSITIVE peer identity on the two agent-initiated OTA
@@ -380,9 +387,12 @@ private:
 
     // ── OTA pull bounds (#913 / #911 / #416) ────────────────────────────────
     OtaBoundConfig ota_cfg_{};
-    // unique_ptr because PrincipalQuota holds a mutex and so is neither movable
-    // nor assignable; set_ota_bound_config rebuilds it.
-    std::unique_ptr<PrincipalQuota> ota_quota_;
+    // A DIRECT member, deliberately not a unique_ptr. PrincipalQuota holds a
+    // mutex so it is neither movable nor assignable, but it never needs to be
+    // replaced: `set_config` reconfigures it in place. Holding it by value makes
+    // the lifetime hazard structurally impossible rather than merely documented —
+    // there is no pointer to reseat, so no live QuotaSlot can be orphaned.
+    PrincipalQuota ota_quota_;
     OtaTransferWatchdog ota_watchdog_;
     bool require_positive_ota_identity_{false};
 
@@ -394,7 +404,11 @@ private:
     /// single empty string would collapse the whole unenrolled fleet onto ONE
     /// bucket, where one agent's pulls lock out every other (issue #935). Peer
     /// IP is the same keying the HTTP-side RateLimiter already uses.
-    std::pair<std::string, const char*> ota_admission_key(const grpc::ServerContext& ctx) const;
+    struct AdmissionKey {
+        std::string key;   ///< the value the per-peer quota is bucketed on
+        const char* mode;  ///< "cert" | "peer_ip" | "unknown" — the metric label
+    };
+    AdmissionKey ota_admission_key(const grpc::ServerContext& ctx) const;
 
     /// #416 — see set_require_positive_ota_identity. Returns OK when the gate is
     /// off. `claimed_agent_id` is the request-body value, which is unverified

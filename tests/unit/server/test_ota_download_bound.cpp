@@ -215,7 +215,9 @@ TEST_CASE("OTA identity gate: identity is checked BEFORE admission", "[ota][iden
     h.svc.set_require_positive_ota_identity(true);
     h.start();
 
+    // UNAUTHENTICATED rather than RESOURCE_EXHAUSTED is the whole assertion:
+    // the concurrency bound above would reject every call if admission ran
+    // first, so this status proves the identity gate came before it.
     auto st = h.download();
     CHECK(st.error_code() == grpc::StatusCode::UNAUTHENTICATED);
-    CHECK(st.error_code() != grpc::StatusCode::RESOURCE_EXHAUSTED);
 }
