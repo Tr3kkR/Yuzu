@@ -20,6 +20,7 @@
  *   -> compute diff -> insert events -> save current state
  */
 
+#include "tar_capture_status.hpp" // yuzu::tar::collect_or_retain
 #include "tar_collectors.hpp"
 #include "tar_netqual_nstat.hpp"
 #include "tar_proc_etw.hpp"
@@ -263,7 +264,13 @@ json services_to_json(const std::vector<yuzu::tar::ServiceInfo>& svcs) {
         arr.push_back({{"name", s.name},
                        {"display_name", s.display_name},
                        {"status", s.status},
-                       {"startup_type", s.startup_type}});
+                       {"startup_type", s.startup_type},
+                       // Finding 3: persisted across ticks so a Windows
+                       // per-service query-failure row loaded back as
+                       // "previous" next tick still suppresses the
+                       // startup_type comparison symmetrically (see
+                       // ServiceInfo::startup_type_query_failed's comment).
+                       {"startup_type_query_failed", s.startup_type_query_failed}});
     }
     return arr;
 }
@@ -280,6 +287,7 @@ std::vector<yuzu::tar::ServiceInfo> json_to_services(const std::string& s) {
             si.display_name = j.value("display_name", "");
             si.status = j.value("status", "");
             si.startup_type = j.value("startup_type", "");
+            si.startup_type_query_failed = j.value("startup_type_query_failed", false);
             result.push_back(std::move(si));
         }
     } catch (...) {}
@@ -388,17 +396,22 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
 //     effective_network_capture_method) + opt-in netqual are each native
 //     (rung 1) on every OS. macOS's process/tcp legs self-heal to a poll
 //     without the ES entitlement / nstat root privilege
-//     (tar_schema_registry.cpp process/tcp rows: kSupportedConstrained); on
-//     both Linux and macOS the opt-in arp/dns sub-sources are kPlanned
-//     (tar_arp_collector.cpp / tar_dns_collector.cpp) — CONSTRAINED, not a
-//     bare SUPPORTED, on those two legs.
-//   - collect_slow: service (SCM native / systemctl+launchctl popen) + user
-//     (native WTS/utmp/utmpx) + opt-in netconn/mapdrive. Windows is all
-//     native (scm/wts/wnet/wevtapi, rung 1). Linux/macOS service enumeration
-//     shells out via popen (tar_service_collector.cpp, rung 3 — the worst
-//     rung actually exercised on that OS); mapdrive is popen on Linux
-//     (tar_mapdrive_collector.cpp run_command, smbstatus) but a kPlanned
-//     empty stub on macOS, and netconn is kPlanned (no-op) on both non-
+//     (tar_schema_registry.cpp process/tcp rows: kSupportedConstrained); the
+//     opt-in arp sub-source is now wired natively on both non-Windows legs
+//     too (tar_arp_collector.cpp: /proc/net/arp on Linux, the shared
+//     route_sysctl_arp.hpp sysctl dump on macOS — constrained there,
+//     entry_type always 'unknown'), while dns remains kPlanned
+//     (tar_dns_collector.cpp) on both — CONSTRAINED, not a bare SUPPORTED,
+//     on those two legs.
+//   - collect_slow: service (SCM native / systemctl+launchctl, rung-2 argv
+//     via the shared subprocess runner) + user (native WTS/utmp/utmpx) +
+//     opt-in netconn/mapdrive. Windows is all native (scm/wts/wnet/wevtapi,
+//     rung 1). Linux/macOS service enumeration runs bounded argv
+//     (tar_service_collector.cpp, rung 2 — the worst rung actually
+//     exercised on that OS); mapdrive is native getfsstat (rung 1,
+//     outbound-live-only, constrained) on macOS and a rung-1/rung-2 mix on
+//     Linux (native /proc/mounts + /etc/fstab reads, rung-2 argv for
+//     smbstatus/journalctl), and netconn is kPlanned (no-op) on both non-
 //     Windows OSes (tar_netconn_win.cpp #else).
 //   - collect_perf: device counters (tar_perf.cpp) native on Windows/Linux,
 //     kPlanned (host_statistics) on macOS — the target rung is still 1
@@ -426,13 +439,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
     {
         "snapshot",
-        {YUZU_SUPPORT_CONSTRAINED, 3, "procfs+systemctl+dpkg_rpm(planned)",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "procfs+systemctl+dpkg_rpm(planned)",
          "software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; "
-         "service enumeration shells out via popen(systemctl)"},
-        {YUZU_SUPPORT_CONSTRAINED, 3, "endpoint_security+nstat+launchctl+pkgutil(planned)",
-         "software and mapdrive collection are PLANNED on macOS; service enumeration "
-         "shells out via popen(launchctl); process/tcp fall back to a poll without the "
-         "Endpoint Security entitlement or nstat root privilege"},
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess runner"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "endpoint_security+nstat+launchctl+getfsstat+pkgutil(planned)",
+         "software collection is PLANNED on macOS; mapdrive is wired but outbound-live-only "
+         "(getfsstat, no username, no inbound, no history); service enumeration runs bounded "
+         "argv (rung 2) via the shared subprocess runner; process/tcp fall back to a poll "
+         "without the Endpoint Security entitlement or nstat root privilege"},
         {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi+scm+wts+wnet+wevtapi+registry", nullptr},
     },
     {
@@ -450,22 +464,27 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "collect_fast",
         {YUZU_SUPPORT_CONSTRAINED, 1, "procfs",
-         "arp/dns opt-in sub-sources are PLANNED (no-op) on Linux; core "
-         "process/network/netqual collection is native"},
-        {YUZU_SUPPORT_CONSTRAINED, 1, "endpoint_security+nstat",
+         "dns opt-in sub-source is PLANNED (no-op) on Linux; arp opt-in sub-source is "
+         "native (procfs, /proc/net/arp); core process/network/netqual collection is "
+         "native"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "endpoint_security+nstat+route_sysctl",
          "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the "
-         "Endpoint Security entitlement or nstat root privilege; arp/dns opt-in "
-         "sub-sources are PLANNED (no-op) on macOS"},
+         "Endpoint Security entitlement or nstat root privilege; dns opt-in sub-source "
+         "is PLANNED (no-op) on macOS; arp opt-in sub-source is native but constrained "
+         "(route_sysctl, entry_type always 'unknown')"},
         {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi", nullptr},
     },
     {
         "collect_slow",
-        {YUZU_SUPPORT_CONSTRAINED, 3, "systemctl+utmp",
-         "service enumeration shells out via popen(systemctl); startup_type reads "
-         "'unknown'; netconn opt-in source is PLANNED (no-op) on Linux"},
-        {YUZU_SUPPORT_CONSTRAINED, 3, "launchctl+utmpx",
-         "service enumeration shells out via popen(launchctl); no startup_type; "
-         "mapdrive and netconn opt-in sources are PLANNED (no-op) on macOS"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "systemctl+utmp",
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess "
+         "runner; startup_type reads 'unknown'; netconn opt-in source is PLANNED "
+         "(no-op) on Linux"},
+        {YUZU_SUPPORT_CONSTRAINED, 2, "launchctl+utmpx+getfsstat",
+         "service enumeration runs bounded argv (rung 2) via the shared subprocess "
+         "runner; no startup_type; mapdrive opt-in source is wired but "
+         "outbound-live-only (getfsstat, no username, no inbound, no history); "
+         "netconn opt-in source is PLANNED (no-op) on macOS"},
         {YUZU_SUPPORT_SUPPORTED, 1, "scm+wts+wnet+wevtapi", nullptr},
     },
     {
@@ -1098,10 +1117,23 @@ private:
     // arp_pre/dns_pre: optionally pre-enumerated snapshots collected by the caller
     // BEFORE collect_mu_ was taken (the arp/dns collectors are syscall-heavy — see
     // do_collect_fast). When null, the leg enumerates inline (legacy/no-op path).
+    // arp_pre is an optional<vector> (not a bare vector) so a precollection
+    // failure (enumerate_arp() threw -- incomplete capture, tar_capture_status.hpp's
+    // collect_or_retain contract) is preserved as nullopt through this layer
+    // instead of collapsing to an empty vector indistinguishable from a
+    // genuinely empty ARP table (BR-001, round 2) -- do_collect_fast sets it.
+    // skipped_sources: when non-null, the name of every enabled
+    // collect_or_retain-backed source this call skipped (arp) is appended --
+    // do_snapshot (round 3, B3-002) aggregates these across both
+    // collect_fast_impl and collect_slow_impl to decide whether the forced
+    // `snapshot` action can honestly report "complete". Null for the regular
+    // collect_fast trigger tick (do_collect_fast), which already logs the
+    // same skip via spdlog and has no separate completeness response to give.
     int collect_fast_impl(yuzu::CommandContext& ctx,
-                          std::vector<yuzu::tar::ArpEntry>* arp_pre = nullptr,
+                          std::optional<std::vector<yuzu::tar::ArpEntry>>* arp_pre = nullptr,
                           std::vector<yuzu::tar::DnsEntry>* dns_pre = nullptr,
-                          std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr) {
+                          std::vector<yuzu::tar::TcpQualitySample>* netqual_pre = nullptr,
+                          std::vector<std::string>* skipped_sources = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         auto redaction = load_redaction_patterns(*db_);
@@ -1488,25 +1520,53 @@ private:
         }
 
         // ARP diff (ADR-0015). Opt-in: default_enabled=false in the registry, so
-        // source_enabled returns false until an operator turns it on. Windows-only
-        // collector today (enumerate_arp returns {} elsewhere). Non-fatal on insert
+        // source_enabled returns false until an operator turns it on. Implemented
+        // on Windows, Linux, and macOS -- see the registry (tar_schema_registry.cpp)
+        // for the platform-specific field constraints. Non-fatal on insert
         // failure — the always-on legs above already committed, so a failure here
         // must not misreport a healthy tick; the diff baseline is advanced ONLY on
         // success so a failed insert retries the same deltas next tick.
+        //
+        // enumerate_arp() throws when the platform capture didn't genuinely
+        // complete (sysctl/procfs/GetIpNetTable2 read failure, a kernel-
+        // truncated parse, or the kArpEntryCap reached before the whole table
+        // was consumed -- tar_arp_collector.cpp / tar_capture_status.hpp). A
+        // partial ARP table must never be diffed against the last COMPLETE
+        // snapshot (it would manufacture false appeared/removed forensic
+        // events) or replace it as the new baseline -- same
+        // collect-or-retain contract as the service/mapdrive legs below.
+        // arp_pre, when supplied, carries the OUTCOME of a precollection
+        // attempt (nullopt if that threw -- do_collect_fast), not just the
+        // entries.
         if (source_enabled(*db_, "arp")) {
-            auto current = arp_pre ? std::move(*arp_pre) : yuzu::tar::enumerate_arp();
-            auto previous = json_to_arp(db_->get_state("arp"));
-            auto typed = yuzu::tar::compute_arp_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_arp_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+            std::optional<std::vector<yuzu::tar::ArpEntry>> current;
+            if (arp_pre) {
+                current = std::move(*arp_pre);
+            } else {
+                auto res = yuzu::tar::collect_or_retain(
+                    [] { return yuzu::tar::enumerate_arp(); });
+                current = std::move(res.current);
+                if (!current) {
+                    spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                                 res.skip_reason);
+                    if (skipped_sources)
+                        skipped_sources->push_back("arp");
+                }
             }
-            if (ok)
-                db_->set_state("arp", arp_to_json(current).dump());
+            if (current) {
+                auto previous = json_to_arp(db_->get_state("arp"));
+                auto typed = yuzu::tar::compute_arp_events(previous, *current, ts, snap_id);
+                bool ok = true;
+                if (!typed.empty()) {
+                    ok = db_->insert_arp_events(typed);
+                    if (ok)
+                        total_events += static_cast<int>(typed.size());
+                    else
+                        spdlog::error("TAR: arp insert failed this tick (state not advanced)");
+                }
+                if (ok)
+                    db_->set_state("arp", arp_to_json(*current).dump());
+            }
         }
 
         // DNS-cache diff (ADR-0015). Opt-in (usage-class PII — visited domains).
@@ -1633,22 +1693,35 @@ private:
         // Windows ESTATS pass is a per-connection enable+read syscall sweep, so
         // it pre-collects lock-free with arp/dns.
         const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
-        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        // arp: precollected through collect_or_retain into an OPTIONAL (not a
+        // bare vector) so enumerate_arp()'s incomplete-capture throw (read
+        // failure / kernel-truncated parse / entry-cap reached --
+        // tar_arp_collector.cpp) is preserved as nullopt through this layer,
+        // rather than collapsing to an empty vector collect_fast_impl could
+        // not tell apart from a genuinely empty ARP table (BR-001, round 2).
+        // Isolated in its own try (via collect_or_retain) so an ARP failure
+        // does not also discard the independent dns/netqual precollection
+        // below.
+        std::optional<std::vector<yuzu::tar::ArpEntry>> arp_pre;
+        if (arp_on) {
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_arp(); });
+            arp_pre = std::move(res.current);
+            if (!arp_pre)
+                spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+        }
         std::vector<yuzu::tar::DnsEntry> dns_pre;
         std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
         try {
-            if (arp_on)
-                arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
             if (netqual_on)
                 netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
-            arp_pre.clear();
+            spdlog::error("TAR: dns/netqual enumeration threw; skipping this tick");
             dns_pre.clear();
             netqual_pre.clear();
         }
@@ -1808,29 +1881,53 @@ private:
 
     // ── collect_slow: services + users ────────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
-    int collect_slow_impl(yuzu::CommandContext& ctx) {
+    // skipped_sources: see collect_fast_impl's parameter doc above -- service
+    // and mapdrive are BOTH collected entirely inside this function (no
+    // outer precollection stage like arp/dns/netqual has), so this is the
+    // only place their collect_or_retain skip can be recorded for do_snapshot.
+    int collect_slow_impl(yuzu::CommandContext& ctx,
+                          std::vector<std::string>* skipped_sources = nullptr) {
         auto ts = now_epoch_seconds();
         auto snap_id = next_snapshot_id();
         int total_events = 0;
 
         // Service diff (C6: check insert return)
         if (source_enabled(*db_, "service")) {
-            const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
-            auto current = yuzu::tar::enumerate_services();
-            auto prev_json = db_->get_state(svc_key);
-            auto previous = json_to_services(prev_json);
-
-            auto typed = yuzu::tar::compute_service_events(previous, current, ts, snap_id);
-            if (!typed.empty()) {
-                if (!db_->insert_service_events(typed)) {
-                    spdlog::error("TAR: failed to insert service events, skipping state save");
-                    ctx.write_output("error|service insert failed");
-                    return 1;
-                }
-                total_events += static_cast<int>(typed.size());
+            // enumerate_services() throws when the underlying capture (systemctl/
+            // launchctl via run_bounded_subprocess) didn't genuinely complete --
+            // spawn failure, deadline, output-cap truncation, or non-zero exit
+            // (tar_service_collector.cpp, tar_capture_status.hpp). A partial
+            // service list must never be diffed against the last COMPLETE
+            // snapshot (it would manufacture false stopped/started events) or
+            // replace it as the new baseline -- so on a throw, skip this tick's
+            // diff and state-advance entirely and retry next tick, exactly the
+            // same "leave state untouched, retry" contract already used for the
+            // mapdrive historical backfill (init(), enumerate_mapdrive_history).
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_services(); });
+            auto current = std::move(res.current);
+            if (!current) {
+                spdlog::warn("TAR: service snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("service");
             }
+            if (current) {
+                const std::string svc_key{yuzu::tar::diff_state_key("service")}; // #538
+                auto prev_json = db_->get_state(svc_key);
+                auto previous = json_to_services(prev_json);
 
-            db_->set_state(svc_key, services_to_json(current).dump());
+                auto typed = yuzu::tar::compute_service_events(previous, *current, ts, snap_id);
+                if (!typed.empty()) {
+                    if (!db_->insert_service_events(typed)) {
+                        spdlog::error("TAR: failed to insert service events, skipping state save");
+                        ctx.write_output("error|service insert failed");
+                        return 1;
+                    }
+                    total_events += static_cast<int>(typed.size());
+                }
+
+                db_->set_state(svc_key, services_to_json(*current).dump());
+            }
         }
 
         // User diff
@@ -1910,20 +2007,42 @@ private:
         // retries the same deltas next tick. The one-time historical backfill is
         // separate (init, mapdrive_backfill_done) and does not touch this baseline.
         if (source_enabled(*db_, "mapdrive")) {
-            const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
-            auto current = yuzu::tar::enumerate_mapdrive();
-            auto previous = json_to_mapdrive(db_->get_state(md_key));
-            auto typed = yuzu::tar::compute_mapdrive_events(previous, current, ts, snap_id);
-            bool ok = true;
-            if (!typed.empty()) {
-                ok = db_->insert_mapdrive_events(typed);
-                if (ok)
-                    total_events += static_cast<int>(typed.size());
-                else
-                    spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+            // enumerate_mapdrive() throws when its underlying LIVE capture
+            // didn't genuinely complete -- WNet/NetSessionEnum on Windows,
+            // /proc/mounts/smbstatus on Linux, or on macOS a getfsstat(2)
+            // failure/over-cap snapshot (tar_mapdrive_collector.cpp, BR-002
+            // round 2) -- same contract as enumerate_services() above.
+            // (wevtutil/journalctl are used only by the SEPARATE one-time
+            // enumerate_mapdrive_history() backfill, not this live path --
+            // BR4-007, round 4: an earlier version of this comment named
+            // them here and could mislead a reader auditing live
+            // completeness into thinking the live WNet/procfs legs were
+            // history-tool-guarded too.) Skip the whole tick's
+            // diff/state-advance on a throw rather than diff a partial snapshot
+            // against the last COMPLETE one.
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_mapdrive(); });
+            auto current = std::move(res.current);
+            if (!current) {
+                spdlog::warn("TAR: mapdrive snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                if (skipped_sources)
+                    skipped_sources->push_back("mapdrive");
             }
-            if (ok)
-                db_->set_state(md_key, mapdrive_to_json(current).dump());
+            if (current) {
+                const std::string md_key{yuzu::tar::diff_state_key("mapdrive")}; // #538
+                auto previous = json_to_mapdrive(db_->get_state(md_key));
+                auto typed = yuzu::tar::compute_mapdrive_events(previous, *current, ts, snap_id);
+                bool ok = true;
+                if (!typed.empty()) {
+                    ok = db_->insert_mapdrive_events(typed);
+                    if (ok)
+                        total_events += static_cast<int>(typed.size());
+                    else
+                        spdlog::error("TAR: mapdrive insert failed this tick (state not advanced)");
+                }
+                if (ok)
+                    db_->set_state(md_key, mapdrive_to_json(*current).dump());
+            }
         }
 
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
@@ -2210,13 +2329,14 @@ private:
         // §3.8 mapdrive — the capture mechanism is fixed per-OS (no runtime/health-
         // dependent path like process/module), so this reports the platform method
         // for parity with the other *_capture_method keys; the full per-OS matrix is
-        // in the `compatibility` action. "none" where the source is kPlanned.
+        // in the `compatibility` action. macOS reports "getfsstat" (outbound-live-only,
+        // constrained — see the mapdrive os_support row).
 #if defined(_WIN32)
         ctx.write_output("config|mapdrive_capture_method|wnet");
 #elif defined(__linux__)
         ctx.write_output("config|mapdrive_capture_method|procfs");
 #else
-        ctx.write_output("config|mapdrive_capture_method|none");
+        ctx.write_output("config|mapdrive_capture_method|getfsstat");
 #endif
         return 0;
     }
@@ -2480,39 +2600,102 @@ private:
         const bool arp_on = source_enabled(*db_, "arp");
         const bool dns_on = source_enabled(*db_, "dns");
         const bool netqual_on = db_->get_config("netqual_enabled", "false") == "true";
-        std::vector<yuzu::tar::ArpEntry> arp_pre;
+        // round 3 (B3-002): names of every enabled source classified
+        // incomplete this pass (arp/service/mapdrive) -- accumulated across
+        // the arp precollection below AND collect_slow_impl's service/
+        // mapdrive legs (collect_fast_impl's arp leg never adds to this: arp
+        // is always precollected here, so its own internal else-branch is
+        // unreachable for this caller). snapshot_result_line
+        // (tar_capture_status.hpp) turns this into the action's honest
+        // response -- the whole point being that a forced `snapshot` must
+        // never report "complete" while it silently skipped a source and
+        // left its baseline stale, which is exactly what happened before
+        // this round: the collect_*_impl return values were ignored and the
+        // action wrote "tar|snapshot|complete" unconditionally.
+        //
+        // round 4 (BR4-001): that fix covered only the collect_or_retain /
+        // IncompleteCaptureError skip path (arp/service/mapdrive). An
+        // ordinary persistence failure inside collect_fast_impl,
+        // collect_slow_impl, or do_collect_software (each already writes
+        // its own "error|... insert failed" line and returns 1) was still
+        // invisible here -- the three calls below were bare expression
+        // statements with their return values discarded, so the action
+        // still finished "tar|snapshot|complete" / rc 0 despite a failed
+        // write. fast_rc/slow_rc/software_rc capture those return codes;
+        // snapshot_phase_outcome (tar_capture_status.hpp) is the pure
+        // function deciding which phase names to add here and the action's
+        // own exit code, unit-tested directly since TarPlugin is
+        // translation-unit-local and cannot be exercised from
+        // tests/unit/*.cpp.
+        std::vector<std::string> skipped_sources;
+        // arp: same optional-through-collect_or_retain precollection as
+        // do_collect_fast, and for the identical reason (BR-001, round 2) --
+        // see that function's comment.
+        std::optional<std::vector<yuzu::tar::ArpEntry>> arp_pre;
+        if (arp_on) {
+            auto res = yuzu::tar::collect_or_retain([] { return yuzu::tar::enumerate_arp(); });
+            arp_pre = std::move(res.current);
+            if (!arp_pre) {
+                spdlog::warn("TAR: arp snapshot incomplete ({}) -- retaining baseline",
+                             res.skip_reason);
+                skipped_sources.push_back("arp");
+            }
+        }
         std::vector<yuzu::tar::DnsEntry> dns_pre;
         std::vector<yuzu::tar::TcpQualitySample> netqual_pre;
         // Belt-and-suspenders (SRE): the dns collector calls an undocumented dnsapi
         // export over an opaque heap list; isolate any throw so a bad list degrades
         // this tick to empty rather than crossing the plugin ABI boundary.
         try {
-            if (arp_on)
-                arp_pre = yuzu::tar::enumerate_arp();
             if (dns_on)
                 dns_pre = yuzu::tar::enumerate_dns();
             if (netqual_on)
                 netqual_pre = yuzu::tar::collect_tcp_quality();
         } catch (...) {
-            spdlog::error("TAR: arp/dns/netqual enumeration threw; skipping this tick");
-            arp_pre.clear();
+            spdlog::error("TAR: dns/netqual enumeration threw; skipping this tick");
             dns_pre.clear();
             netqual_pre.clear();
         }
+        int fast_rc = 0;
+        int slow_rc = 0;
         {
             std::lock_guard lock(collect_mu_);
-            collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr, dns_on ? &dns_pre : nullptr,
-                              netqual_on ? &netqual_pre : nullptr);
-            collect_slow_impl(ctx);
+            fast_rc = collect_fast_impl(ctx, arp_on ? &arp_pre : nullptr,
+                                        dns_on ? &dns_pre : nullptr,
+                                        netqual_on ? &netqual_pre : nullptr, &skipped_sources);
+            slow_rc = collect_slow_impl(ctx, &skipped_sources);
         }
         // Software lives on its own dedicated software_collect_mu_ (NOT collect_mu_),
         // so collect it as a SEPARATE step after the collect_mu_ scope closes —
         // preserving the collect_mu_ ≺ software_collect_mu_ lock order. It self-gates
         // on source_enabled("software"), so a disabled source is a no-op. The manual
         // promises `snapshot` collects all enabled capture sources (#1620).
-        do_collect_software(ctx);
-        ctx.write_output("tar|snapshot|complete");
-        return 0;
+        const int software_rc = do_collect_software(ctx);
+        // BR4-001 (round 4): fold each phase's own return code into the
+        // honesty response -- see the comment above skipped_sources.
+        //
+        // round 5 (adversarial-review finding): by this point skipped_sources
+        // already holds every arp/service/mapdrive name collect_fast_impl /
+        // collect_slow_impl pushed for a collect_or_retain skip (each phase
+        // rc above stays 0 for that kind of skip -- it's not a persistence
+        // failure). Fold that into the honesty decision too, so a snapshot
+        // that silently retained a source's stale baseline returns nonzero
+        // at the action level, not just in the "tar|snapshot|partial|..."
+        // text line a generic/MCP/automation consumer may not parse.
+        const bool had_earlier_skips = !skipped_sources.empty();
+        const auto phase_outcome =
+            yuzu::tar::snapshot_phase_outcome(fast_rc, slow_rc, software_rc, had_earlier_skips);
+        skipped_sources.insert(skipped_sources.end(), phase_outcome.failed_phases.begin(),
+                               phase_outcome.failed_phases.end());
+        if (!skipped_sources.empty()) {
+            // Structured ABI4 result seam (runner_status.hpp's pattern) --
+            // a partial/skipped-sources snapshot is CONSTRAINED/PARTIAL for
+            // any consumer reading the typed status, not only the text line.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "tar:snapshot_skipped_sources");
+        }
+        ctx.write_output(yuzu::tar::snapshot_result_line(skipped_sources));
+        return phase_outcome.return_code;
     }
 
     // ── fleet_snapshot action (single JSON document for fleet-topology viz) ──

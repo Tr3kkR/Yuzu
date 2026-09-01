@@ -200,6 +200,20 @@ the Postgres substrate rather than an auth-specific one-off.
 updated to the matched counter, so the same code cannot be reused within
 its 90 s window even via clock-skew accommodation.
 
+The login verify (`AuthDB::mfa_verify_login_code`) advances the counter
+under a **two-layer** replay guard: the SELECT-verify-UPDATE runs as one
+`SELECT … FOR UPDATE` row-locked transaction (so two concurrent submissions
+of one still-valid code cannot both pass), and the counter-advancing UPDATE
+additionally carries the same `RETURNING`-gated atomic-UPDATE idiom the
+recovery-code path uses below (recovery has no preceding lock stage, since it
+needs an app-side PBKDF2 compare first) —
+`… WHERE mfa_last_counter < $matched RETURNING id`. A zero-row `RETURNING`
+result means the stored counter already reached the matched value and the
+submission is graded an already-consumed code — never a burned success and
+never a store error. The `WHERE` guard is defense-in-depth behind the row
+lock: it keeps the advance monotonic even if that isolation were ever
+weakened (a read replica, a future lock-free refactor).
+
 The constant-time string compare inside `verify_window` is moot for
 6-digit codes (length leak is bounded) but defends against timing
 oracles in case a future change widens the truncation.

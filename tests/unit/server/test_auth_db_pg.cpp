@@ -34,9 +34,11 @@
 
 #include <libpq-fe.h>
 
+#include <atomic>
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::AuthDB;
@@ -680,6 +682,299 @@ TEST_CASE("AuthDB MFA enroll -> verify round trip is envelope-encrypted end to e
     auto after_disable = h.db.mfa_status("mfauser");
     REQUIRE(after_disable.has_value());
     CHECK_FALSE(after_disable->enrolled);
+}
+
+// ── #3762: enrollment double-verify is atomic — one winner, no orphaned codes ──
+//
+// `mfa_verify_enrollment`'s pre-txn `mfa_status().enrolled` check and its enrollment
+// UPDATE are not atomic; the guard predicate `AND mfa_enrolled_at IS NULL` closes the
+// window where two concurrent verifies of one enrollment code both stamp `enrolled_at`
+// and both run `regenerate_recovery_codes_locked` (DELETE-all + INSERT) — the loser
+// deleting the winner's just-issued set. Exactly one caller must get 10 codes; the loser
+// must be graded `MfaAlreadyEnrolled` (NOT a false `WriteFailed`/503 from the classify
+// branch); and the PERSISTED set must be the winner's (a winner code must still consume).
+// Assert on COUNTS, not which thread wins, so the test is deterministic; each thread
+// writes only its own codes slot (via a distinct pointer), so there is no shared mutation.
+TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orphaned "
+          "recovery codes",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()}; // pool size 4 — enough for two concurrent verifies
+    REQUIRE(h.db.upsert_user("enrollrace", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto init = h.db.mfa_init_enrollment("enrollrace", "Yuzu");
+    REQUIRE(init.has_value());
+    auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw_secret.has_value());
+    auto secret_view =
+        std::string_view(reinterpret_cast<const char*>(raw_secret->data()), raw_secret->size());
+    auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
+    auto code = yuzu::server::mfa::generate(secret_view, counter);
+
+    std::atomic<int> ok{0};
+    std::atomic<int> already{0};   // MfaAlreadyEnrolled — the intended loser outcome
+    std::atomic<int> other_err{0}; // any other error (e.g. a false WriteFailed/503)
+    std::atomic<bool> go{false};
+    std::vector<std::string> v1, v2;
+    auto submit = [&](std::vector<std::string>* slot) {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        auto r = h.db.mfa_verify_enrollment("enrollrace", code);
+        if (r.has_value()) {
+            *slot = *r;
+            ok.fetch_add(1, std::memory_order_relaxed);
+        } else if (r.error() == AuthDBError::MfaAlreadyEnrolled) {
+            already.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            other_err.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    std::thread t1(submit, &v1);
+    std::thread t2(submit, &v2);
+    go.store(true, std::memory_order_release);
+    t1.join();
+    t2.join();
+
+    // Exactly one enrollment; the loser is graded MfaAlreadyEnrolled — never a false
+    // WriteFailed/503, and never a second success.
+    CHECK(ok.load() == 1);
+    CHECK(already.load() == 1);
+    CHECK(other_err.load() == 0);
+
+    const std::vector<std::string>& winner = v1.empty() ? v2 : v1;
+    REQUIRE(winner.size() == 10);
+
+    // Anti-orphan: the persisted set is the winner's — 10 remain, and a winner code
+    // consumes (it would fail if the loser had regenerated over it).
+    auto status = h.db.mfa_status("enrollrace");
+    REQUIRE(status.has_value());
+    CHECK(status->enrolled);
+    CHECK(status->recovery_codes_remaining == 10);
+    CHECK(h.db.mfa_consume_recovery_code("enrollrace", winner[0]).value());
+}
+
+// ── #3762: white-box coverage of the enrollment guard's WHERE predicate ─────
+//
+// The concurrency test above proves exactly-once end-to-end, but the loser can be
+// caught by the pre-txn `mfa_status().enrolled` check before ever reaching the guarded
+// UPDATE, so it does not deterministically exercise the guard's own 0-row branch. This
+// pins every predicate clause directly against a seeded row. The guard binds the commit to
+// the EXACT secret blob the verify authenticated against (`mfa_totp_secret = decode($3,
+// 'hex')`), so a row is claimed ONLY when it is active, still provisional (`mfa_enrolled_at
+// IS NULL`), and its stored secret is byte-identical to the loaded one. It rejects,
+// deterministically: deactivated, already-enrolled, disabled (secret NULLed), and ROTATED
+// (a concurrent disable+init put a DIFFERENT secret B in the column — a bare `IS NOT NULL`
+// would wrongly match B and enrol over an unverified secret; #3781 review). It mirrors the
+// exact predicate from `mfa_verify_enrollment`; a drift between the two is the thing to
+// notice. Each `run_guard()` match stamps `mfa_enrolled_at`, so state is reset per case.
+TEST_CASE("AuthDB MFA: enrollment guard claims only the row whose stored secret still "
+          "matches the verified one; rejects rotated / disabled / enrolled / deactivated",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("enrollguard", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto set_col = [&](const char* sql) {
+        const char* v[] = {"enrollguard"};
+        PgResult r{PQexecParams(h.conn.get(), sql, 1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.ok());
+    };
+    // A provisional pending-enrollment candidate: active, enrolled_at NULL, secret present.
+    auto make_provisional = [&] {
+        set_col("UPDATE auth.users SET is_active = TRUE, mfa_enrolled_at = NULL, "
+                "mfa_totp_secret = decode('0011223344','hex') WHERE username = $1");
+    };
+    // The exact guard from mfa_verify_enrollment, bound to the verified secret's hex ($3).
+    auto run_guard = [&](const char* bound_secret_hex) -> int {
+        const char* v[] = {"7", "enrollguard", bound_secret_hex};
+        PgResult r{PQexecParams(
+            h.conn.get(),
+            "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
+            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
+            "AND mfa_totp_secret = decode($3, 'hex') RETURNING id",
+            3, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+
+    const char* kSecretA = "0011223344";        // what make_provisional() seeds (verified)
+    const char* kSecretB = "aabbccddee";         // a different, rotated secret
+
+    make_provisional();
+    CHECK(run_guard(kSecretA) == 1); // still holding A -> claimed (stamps enrolled_at)
+    CHECK(run_guard(kSecretA) == 0); // now enrolled -> rejected
+
+    // Rotated: a concurrent disable+init replaced the secret with B while still provisional.
+    // The verify authenticated against A, so the guard bound to A must reject B -- a bare
+    // `IS NOT NULL` would wrongly match B and enrol over an unverified secret (#3781).
+    make_provisional();
+    set_col("UPDATE auth.users SET mfa_totp_secret = decode('aabbccddee','hex') WHERE username = $1");
+    CHECK(run_guard(kSecretA) == 0); // B != A -> rejected
+    CHECK(run_guard(kSecretB) == 1); // a verify of B would, of course, claim it
+
+    // Disabled: mfa_disable NULLs the secret. NULL != A -> rejected.
+    make_provisional();
+    set_col("UPDATE auth.users SET mfa_enrolled_at = NULL, mfa_totp_secret = NULL WHERE username = $1");
+    CHECK(run_guard(kSecretA) == 0);
+
+    // Deactivated: is_active = FALSE rejects.
+    make_provisional();
+    set_col("UPDATE auth.users SET is_active = FALSE WHERE username = $1");
+    CHECK(run_guard(kSecretA) == 0);
+}
+
+// ── #3762: the enrollment guard must NOT wedge a legitimate re-enroll ───────
+//
+// The `mfa_enrolled_at IS NULL` guard is safe against blocking a post-disable
+// re-enroll ONLY because the un-enroll paths NULL `mfa_enrolled_at`. This pins the
+// `mfa_disable` path specifically (the primary un-enroll path): enroll → disable →
+// re-enroll must yield a fresh 10-code set. A future `mfa_disable` variant that forgot
+// to clear the column would wedge re-enrollment into a permanent MfaAlreadyEnrolled, and
+// this test is what catches it. (Soft-delete also NULLs the column, but is not exercised
+// here — a re-enroll through that path additionally requires reactivation.)
+TEST_CASE("AuthDB MFA: disable then re-enroll succeeds — the guard does not wedge re-enroll",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("reenroll", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto enroll_once = [&]() {
+        auto init = h.db.mfa_init_enrollment("reenroll", "Yuzu");
+        REQUIRE(init.has_value());
+        auto raw = yuzu::server::mfa::base32_decode(init->secret_base32);
+        REQUIRE(raw.has_value());
+        auto sv = std::string_view(reinterpret_cast<const char*>(raw->data()), raw->size());
+        auto code = yuzu::server::mfa::generate(
+            sv, yuzu::server::mfa::current_counter(std::chrono::system_clock::now()));
+        auto verify = h.db.mfa_verify_enrollment("reenroll", code);
+        REQUIRE(verify.has_value());
+        CHECK(verify->size() == 10);
+    };
+
+    enroll_once();
+    REQUIRE(h.db.mfa_disable("reenroll").has_value());
+    auto disabled = h.db.mfa_status("reenroll");
+    REQUIRE(disabled.has_value());
+    CHECK_FALSE(disabled->enrolled); // mfa_disable NULLed mfa_enrolled_at
+
+    // Re-enroll from scratch: a fresh secret + code must be accepted, proving the guard
+    // did not permanently latch on the prior enrollment.
+    enroll_once();
+    auto reenrolled = h.db.mfa_status("reenroll");
+    REQUIRE(reenrolled.has_value());
+    CHECK(reenrolled->enrolled);
+    CHECK(reenrolled->recovery_codes_remaining == 10);
+}
+
+// ── #2399: a single valid TOTP code is consumed AT MOST ONCE, even under two
+//    concurrent submissions ─────────────────────────────────────────────────
+//
+// `mfa_verify_login_code` is a `SELECT ... FOR UPDATE` transaction whose
+// counter advance is additionally guarded by `WHERE mfa_last_counter < $matched
+// RETURNING`. Two mechanisms, one invariant: the same code cannot pass twice.
+// This exercises it end-to-end against live PG with the pool handing each
+// thread its own connection — the row lock serializes them, and the monotonic
+// WHERE is the belt to that lock's suspenders. Assert on the COUNT (exactly one
+// success), not on which thread wins, so the test is deterministic.
+TEST_CASE("AuthDB MFA: concurrent submission of one valid code succeeds exactly once",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()}; // pool size 4 — enough for two concurrent verifies
+    REQUIRE(h.db.upsert_user("racer", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    auto init = h.db.mfa_init_enrollment("racer", "Yuzu");
+    REQUIRE(init.has_value());
+    auto raw_secret = yuzu::server::mfa::base32_decode(init->secret_base32);
+    REQUIRE(raw_secret.has_value());
+    auto secret_view =
+        std::string_view(reinterpret_cast<const char*>(raw_secret->data()), raw_secret->size());
+    auto counter = yuzu::server::mfa::current_counter(std::chrono::system_clock::now());
+    // Complete enrollment at `counter`; the login code is the NEXT step so the
+    // enrollment counter's own replay protection does not reject it.
+    REQUIRE(h.db.mfa_verify_enrollment("racer", yuzu::server::mfa::generate(secret_view, counter))
+                .has_value());
+    auto login_code = yuzu::server::mfa::generate(secret_view, counter + 1);
+
+    std::atomic<int> ok{0};
+    std::atomic<int> rejected{0};
+    std::atomic<int> errored{0};
+    std::atomic<bool> go{false};
+    auto submit = [&] {
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield(); // start barrier — yield (not busy-spin) so two
+                                       // spinners don't burn a core on the shared 4-runner CI box
+        }
+        auto r = h.db.mfa_verify_login_code("racer", login_code);
+        if (!r.has_value())
+            errored.fetch_add(1, std::memory_order_relaxed);
+        else if (*r)
+            ok.fetch_add(1, std::memory_order_relaxed);
+        else
+            rejected.fetch_add(1, std::memory_order_relaxed);
+    };
+    std::thread t1(submit);
+    std::thread t2(submit);
+    go.store(true, std::memory_order_release);
+    t1.join();
+    t2.join();
+
+    // Exactly one submission burns the code; the other is a clean `false`
+    // (already-consumed), never a second success and never a store error.
+    CHECK(ok.load() == 1);
+    CHECK(rejected.load() == 1);
+    CHECK(errored.load() == 0);
+
+    // And the code stays burned for any later attempt.
+    auto replay = h.db.mfa_verify_login_code("racer", login_code);
+    REQUIRE(replay.has_value());
+    CHECK(*replay == false);
+}
+
+// ── #2399: white-box coverage of the monotonic guard's WHERE predicate ──────
+//
+// The concurrency test above proves single-consumption end-to-end, but under
+// the production `FOR UPDATE` lock the guard's own zero-rows branch is
+// unreachable (verify_window rejects a replay before the UPDATE runs). This
+// test exercises the guard clause DIRECTLY against a seeded row so BOTH
+// outcomes — a forward advance (1 row) and a non-forward reject (0 rows) — are
+// deterministically pinned. It mirrors the exact `mfa_last_counter < $matched`
+// predicate from `mfa_verify_login_code`; a drift between the two is the thing
+// to notice.
+TEST_CASE("AuthDB MFA: monotonic counter guard accepts a forward advance, rejects "
+          "a non-forward one",
+          "[pg][auth_db][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    REQUIRE(h.db.upsert_user("guardrow", "h", "s", yuzu::server::auth::Role::user).has_value());
+
+    // Seed the stored counter at 100.
+    {
+        const char* v[] = {"guardrow"};
+        PgResult seed{PQexecParams(h.conn.get(),
+                                   "UPDATE auth.users SET mfa_last_counter = 100 WHERE username = $1",
+                                   1, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(seed.ok());
+    }
+
+    // The exact monotonic predicate from mfa_verify_login_code, keyed by username
+    // for the test's convenience (production keys by id — the `mfa_last_counter <
+    // $1 RETURNING` clause is identical). Returns the row count the guard yields.
+    auto run_guard = [&](const char* matched) -> int {
+        const char* v[] = {matched, "guardrow"};
+        PgResult r{PQexecParams(
+            h.conn.get(),
+            "UPDATE auth.users SET mfa_last_counter = $1, last_login_at = now() "
+            "WHERE username = $2 AND mfa_last_counter < $1 RETURNING id",
+            2, nullptr, v, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+
+    CHECK(run_guard("101") == 1); // forward advance (101 > 100): matches the one row
+    CHECK(run_guard("101") == 0); // equal (101 == stored-now-101): non-forward → rejected
+    CHECK(run_guard("50") == 0);  // backward (50 < 101): rejected
+    CHECK(run_guard("102") == 1); // a further forward advance (102 > 101) is accepted
 }
 
 // ── ★ fail-closed: corrupted/undecryptable secret NEVER reads as "not
