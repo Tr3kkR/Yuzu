@@ -79,20 +79,69 @@ struct DirCloser {
     DirCloser& operator=(const DirCloser&) = delete;
 };
 
+using FstatFn = int (*)(int, struct stat*);
+using FstatatFn = int (*)(int, const char*, struct stat*, int);
+
+FstatFn g_fstat_fn = &::fstat;
+FstatatFn g_fstatat_fn = &::fstatat;
+
 } // namespace
+
+namespace detail {
+
+/// TEST SEAM: substitutes the `fstat`/`fstatat` function this TU calls
+/// through -- mirrors the Windows leg's `detail::set_ntcreatefile_for_test`
+/// (confined_fs.hpp), just for the two POSIX metadata syscalls instead of
+/// `NtCreateFile`. Lets a test force a deterministic real POSIX metadata
+/// failure (root identity capture, per-entry `fstatat`) without racing a
+/// live TOCTOU window. `enable=true` installs `fn`; `enable=false` restores
+/// the real syscall. Single-threaded, test-only, no internal
+/// synchronization -- a test MUST restore (`enable=false`) before it ends,
+/// or a later test observes the substituted pointer.
+YUZU_EXPORT void set_fstat_for_test(FstatFn fn, bool enable) noexcept {
+    g_fstat_fn = enable ? fn : &::fstat;
+}
+YUZU_EXPORT void set_fstatat_for_test(FstatatFn fn, bool enable) noexcept {
+    g_fstatat_fn = enable ? fn : &::fstatat;
+}
+
+} // namespace detail
 
 std::optional<FileIdentity> capture_identity(int fd) {
     struct stat st {};
-    if (::fstat(fd, &st) != 0)
+    if (g_fstat_fn(fd, &st) != 0)
         return std::nullopt;
     return FileIdentity{static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino)};
+}
+
+// `openat`/`open` with O_NOFOLLOW|O_DIRECTORY does NOT report a refused symlink
+// the same way across POSIX platforms: Linux returns ELOOP, but Darwin/BSD
+// return ENOTDIR when both flags are set and the last component is a symlink.
+// The refusal is safe either way -- the link is never followed -- but the
+// REASON is part of this API's contract (callers surface it per path), so an
+// ENOTDIR is disambiguated here rather than blanket-reported as NotRegularFile.
+// Uses the fstatat seam so a test can drive both branches.
+bool is_symlink_at(int dirfd, const char* name) {
+    struct stat st{};
+    if (g_fstatat_fn(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+        return false; // cannot tell -- fall back to the non-symlink reason
+    return S_ISLNK(st.st_mode);
 }
 
 OpenRootResult open_root(const std::filesystem::path& path) {
     const int raw = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (raw < 0) {
         const int err = errno;
-        spdlog::debug("confined_fs::open_root: refused '{}': {}", path.string(), std::strerror(err));
+        // ELOOP here means `path`'s last component is a symlink (O_NOFOLLOW
+        // refused it) -- a security-class refusal, logged at warn like
+        // open_dir_at's ELOOP branch below; every other open_root failure
+        // (missing path, not-a-directory, ...) stays debug.
+        if (err == ELOOP || (err == ENOTDIR && is_symlink_at(AT_FDCWD, path.c_str()))) {
+            spdlog::warn("confined_fs::open_root: refused symlink root '{}'", path.string());
+        } else {
+            spdlog::debug("confined_fs::open_root: refused '{}': {}", path.string(),
+                          std::strerror(err));
+        }
         return OpenRootResult{std::nullopt, Reason::RootInvalid, err};
     }
     ScopedFd fd{raw};
@@ -118,6 +167,10 @@ OpenDirResult open_dir_at(int parent_fd, const std::string& name, const FileIden
             return OpenDirResult{ScopedFd{}, Reason::SymlinkRejected, err};
         }
         if (err == ENOTDIR) {
+            if (is_symlink_at(parent_fd, name.c_str())) {
+                spdlog::warn("confined_fs::open_dir_at: symlink rejected for '{}'", name);
+                return OpenDirResult{ScopedFd{}, Reason::SymlinkRejected, err};
+            }
             spdlog::debug("confined_fs::open_dir_at: not a directory: '{}'", name);
             return OpenDirResult{ScopedFd{}, Reason::NotRegularFile, err};
         }
@@ -145,13 +198,13 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
 
     // INDEPENDENT-DESCRIPTION rule (PLAN-005/PLAN-012): obtain the
     // enumeration stream via a FRESH open-file-description over `dir_fd`'s
-    // own inode, NEVER `dup(dir_fd)` -- a dup shares the same open-file-
-    // description, including its directory read offset, so a second
-    // enumeration of a reused root would silently resume (empty) from
-    // wherever the first walk's readdir cursor stopped; dup() also does
-    // not carry FD_CLOEXEC forward. `openat(dir_fd, ".")` resolves through
-    // `dir_fd`'s own inode, not a path string, so it is exempt from the
-    // no-path-below-root rule.
+    // own inode, NEVER `::dup` on `dir_fd` -- duplicating shares the same
+    // open-file-description, including its directory read offset, so a
+    // second enumeration of a reused root would silently resume (empty)
+    // from wherever the first walk's readdir cursor stopped; duplicating
+    // also does not carry FD_CLOEXEC forward. `openat(dir_fd, ".")`
+    // resolves through `dir_fd`'s own inode, not a path string, so it is
+    // exempt from the no-path-below-root rule.
     const int raw = ::openat(dir_fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (raw < 0) {
         result.reason = Reason::OsError;
@@ -168,48 +221,60 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
     [[maybe_unused]] const int released = owned.release(); // closedir() now owns the fd
     DirCloser closer{dirp};
 
-    while (true) {
-        if (std::chrono::steady_clock::now() >= budget.deadline) {
-            result.reason = Reason::WallTimeCap;
-            return result;
-        }
-
-        errno = 0;
-        struct dirent* de = ::readdir(dirp);
-        if (de == nullptr) {
-            if (errno != 0) {
-                result.reason = Reason::OsError;
-                result.os_error = errno;
+    // EXCEPTION FIREWALL: this TU's own "no exceptions escape" invariant
+    // (file banner) applies to `enumerate_at` as a directly-callable export,
+    // not just when it runs inside `walk_delete`'s own outer try/catch --
+    // `std::string`/`std::vector` allocation below can throw `bad_alloc`.
+    // Best-effort partial result on catch, same mapping `walk_delete` uses
+    // for an exception it did not itself throw (confined_fs_walk.hpp rule 7).
+    try {
+        while (true) {
+            if (std::chrono::steady_clock::now() >= budget.deadline) {
+                result.reason = Reason::WallTimeCap;
+                return result;
             }
-            return result; // fully enumerated (reason stays None)
-        }
 
-        const std::string name = de->d_name;
-        if (name == "." || name == "..")
-            continue;
+            errno = 0;
+            struct dirent* de = ::readdir(dirp);
+            if (de == nullptr) {
+                if (errno != 0) {
+                    result.reason = Reason::OsError;
+                    result.os_error = errno;
+                }
+                return result; // fully enumerated (reason stays None)
+            }
 
-        if (static_cast<std::uint64_t>(result.entries.size()) >= budget.max_entries) {
-            // Another entry exists beyond the budget: this is a real
-            // truncation, not "happened to finish exactly at the cap".
-            result.reason = Reason::EntryCap;
-            return result;
-        }
+            const std::string name = de->d_name;
+            if (name == "." || name == "..")
+                continue;
 
-        DirEntry entry{};
-        entry.name = name;
-        struct stat st {};
-        if (::fstatat(dir_fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            // PLAN-002: a stat failure is recorded as-is, never silently
-            // reclassified as Other -- the walker reports Failed(OsError)
-            // and never deletes it.
-            entry.stat_error = errno;
-        } else {
-            const EntryType type = classify_mode(st.st_mode);
-            const std::uint64_t size =
-                (type == EntryType::RegularFile) ? static_cast<std::uint64_t>(st.st_size) : 0;
-            entry.meta = EntryMeta{type, size, static_cast<std::uint64_t>(st.st_dev) == root_id.dev};
+            if (static_cast<std::uint64_t>(result.entries.size()) >= budget.max_entries) {
+                // Another entry exists beyond the budget: this is a real
+                // truncation, not "happened to finish exactly at the cap".
+                result.reason = Reason::EntryCap;
+                return result;
+            }
+
+            DirEntry entry{};
+            entry.name = name;
+            struct stat st {};
+            if (g_fstatat_fn(dir_fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                // PLAN-002: a stat failure is recorded as-is, never silently
+                // reclassified as Other -- the walker reports Failed(OsError)
+                // and never deletes it.
+                entry.stat_error = errno;
+            } else {
+                const EntryType type = classify_mode(st.st_mode);
+                const std::uint64_t size =
+                    (type == EntryType::RegularFile) ? static_cast<std::uint64_t>(st.st_size) : 0;
+                entry.meta =
+                    EntryMeta{type, size, static_cast<std::uint64_t>(st.st_dev) == root_id.dev};
+            }
+            result.entries.push_back(std::move(entry));
         }
-        result.entries.push_back(std::move(entry));
+    } catch (...) {
+        result.reason = Reason::Internal;
+        return result;
     }
 }
 
