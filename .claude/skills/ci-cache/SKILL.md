@@ -118,13 +118,32 @@ restore-keys: |
   vcpkg-<triplet>-
 ```
 
-For ccache: hash all `.cpp` / `.hpp` / `.h` source. Cascading restore-keys keep the cache mostly warm across source changes:
+For ccache: a TIME-BUCKET key, not a source hash. ccache hashes the real
+preprocessed input per object, so the GHA cache key needs no source identity —
+a stale entry can only lower the hit rate, never yield a wrong object. A
+source-hash key (`hashFiles('**/*.cpp', ...)`) was the original recipe here and
+is DISPROVEN for this repo: on ~75 commits/day it never exact-hits, so every
+run falls to the prefix restore-key and then saves a fresh multi-GB entry —
+the canary's copies alone ran the repo 7x over GitHub's 10 GB cache quota,
+and the resulting LRU eviction degraded the canary itself and starved every
+other cache (measured 2026-09-01; fixed in the same change that rewrote this
+recipe). Bucket by ISO week — one saved entry per week per scope; later
+same-week runs exact-hit and skip the save:
 
 ```yaml
-key: ccache-<leg>-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
+- name: Compute ccache week bucket
+  run: echo "CCACHE_WEEK=$(date -u +%G-W%V)" >> "$GITHUB_ENV"
+# %G (ISO year) pairs with %V (ISO week) — %Y mispairs at year boundaries.
+...
+key: ccache-<leg>-${{ env.CCACHE_WEEK }}
 restore-keys: |
   ccache-<leg>-
 ```
+
+Pair the bucket with a job-level `CCACHE_MAXSIZE` sized for ONE build of that
+leg (the workflow-level value may be a self-hosted budget orders of magnitude
+larger) — ccache only trims at MAXSIZE, so an uncapped entry grows
+monotonically forever.
 
 **Branch-scope gotcha (the canary cold-start lesson from PR #740):**
 
