@@ -1,0 +1,462 @@
+#ifndef _WIN32
+
+// Filesystem-backed unit tests for confined_fs_posix.cpp, driven through
+// the exported confined_fs.hpp API against a real temp directory tree.
+// std::filesystem is used here ONLY for fixture setup (create dirs/files/
+// symlinks/renames) -- production code never path-resolves below the root;
+// see confined_fs_posix.cpp. Deterministic: no threads, no sleeping; the
+// wall-time-cap test relies on max_wall=0 plus the monotonic property of
+// steady_clock, never a manufactured delay.
+
+#include <yuzu/agent/confined_fs.hpp>
+
+#include "test_helpers.hpp"
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+using namespace yuzu::agent::confined_fs;
+namespace fs = std::filesystem;
+
+namespace {
+
+void write_file(const fs::path& p, std::string_view content = "x") {
+    std::ofstream out(p, std::ios::binary);
+    out << content;
+}
+
+std::vector<EntryOutcome> sorted_entries(std::vector<EntryOutcome> v) {
+    std::sort(v.begin(), v.end(),
+              [](const EntryOutcome& a, const EntryOutcome& b) { return a.rel_path < b.rel_path; });
+    return v;
+}
+
+MatchFn match_all() {
+    return [](std::string_view) { return true; };
+}
+
+MatchFn suffix_match(std::string suffix) {
+    return [suffix](std::string_view rel_path) {
+        return rel_path.size() >= suffix.size() &&
+               rel_path.compare(rel_path.size() - suffix.size(), suffix.size(), suffix) == 0;
+    };
+}
+
+constexpr DeleteLimits generous_limits() {
+    return DeleteLimits{
+        /*max_entries=*/10'000,
+        /*max_bytes=*/10'000'000,
+        /*max_wall=*/std::chrono::milliseconds{60'000},
+        /*max_depth=*/64,
+    };
+}
+
+/// A directory nest `root/lvl1/.../lvlDEPTH/victim.tmp`, plus an unrelated
+/// `outside/victim.tmp`. `deepest_dir`/`deepest_rel` name the depth-DEPTH
+/// directory itself -- the swap target in the adversarial tests below.
+struct NestedTree {
+    fs::path root_dir;
+    fs::path outside_dir;
+    fs::path outside_victim;
+    fs::path deepest_dir;
+    std::string deepest_rel;
+};
+
+NestedTree build_nested_tree(const fs::path& tmp_root, int depth) {
+    NestedTree t;
+    t.root_dir = tmp_root / "root";
+    fs::create_directories(t.root_dir);
+    t.outside_dir = tmp_root / "outside";
+    fs::create_directories(t.outside_dir);
+    t.outside_victim = t.outside_dir / "victim.tmp";
+    write_file(t.outside_victim);
+
+    fs::path cur = t.root_dir;
+    std::string rel;
+    for (int i = 1; i <= depth; ++i) {
+        cur /= "lvl" + std::to_string(i);
+        fs::create_directory(cur);
+        rel = rel.empty() ? "lvl" + std::to_string(i) : rel + "/lvl" + std::to_string(i);
+    }
+    write_file(cur / "victim.tmp");
+    t.deepest_dir = cur;
+    t.deepest_rel = rel;
+    return t;
+}
+
+/// Pre-walk swap variant, run for a given depth: the depth-N directory is
+/// already a symlink to `outside` before `delete_matching` ever starts.
+void run_prewalk_swap_test(int depth) {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_swap_pre_"};
+    NestedTree t = build_nested_tree(tmp.path, depth);
+
+    const fs::path moved_aside(t.deepest_dir.string() + ".moved");
+    fs::rename(t.deepest_dir, moved_aside);
+    fs::create_directory_symlink(t.outside_dir, t.deepest_dir);
+
+    OpenRootResult opened = open_root(t.root_dir);
+    REQUIRE(opened.root.has_value());
+
+    DeleteResult result = delete_matching(*opened.root, match_all(), generous_limits());
+
+    const EntryOutcome* found = nullptr;
+    for (const auto& e : result.entries) {
+        if (e.rel_path == t.deepest_rel) {
+            found = &e;
+            break;
+        }
+    }
+    REQUIRE(found != nullptr);
+    CHECK(found->status == EntryStatus::Skipped);
+    CHECK(found->reason == Reason::SymlinkRejected);
+    CHECK(fs::exists(t.outside_victim));
+}
+
+/// Mid-walk interposition variant, run for a given depth: `open_root` +
+/// `open_dir_at` down to the depth-N directory FIRST (holding its fd open),
+/// THEN the swap happens underneath the already-held fd, then
+/// `enumerate_at`/`unlink_at` are driven directly on that fd -- proving the
+/// walk binds to the inode the fd refers to, not the path used to reach it.
+void run_midwalk_swap_test(int depth) {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_swap_mid_"};
+    NestedTree t = build_nested_tree(tmp.path, depth);
+
+    OpenRootResult opened = open_root(t.root_dir);
+    REQUIRE(opened.root.has_value());
+    const FileIdentity root_id = opened.root->identity();
+
+    std::vector<OpenDirResult> chain;
+    int cur_fd = opened.root->fd_.get();
+    for (int i = 1; i <= depth; ++i) {
+        OpenDirResult r = open_dir_at(cur_fd, "lvl" + std::to_string(i), root_id);
+        REQUIRE(r.reason == Reason::None);
+        cur_fd = r.fd.get();
+        chain.push_back(std::move(r));
+    }
+
+    const fs::path moved_aside(t.deepest_dir.string() + ".moved");
+    fs::rename(t.deepest_dir, moved_aside);
+    fs::create_directory_symlink(t.outside_dir, t.deepest_dir);
+
+    EnumBudget budget{100, std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    EnumerateResult enum_result = enumerate_at(cur_fd, root_id, budget);
+    REQUIRE(enum_result.reason == Reason::None);
+    bool saw_victim = false;
+    for (const auto& e : enum_result.entries) {
+        if (e.name == "victim.tmp")
+            saw_victim = true;
+    }
+    REQUIRE(saw_victim);
+
+    UnlinkOutcome outcome = unlink_at(cur_fd, "victim.tmp", UnlinkKind::File);
+    CHECK(outcome.status == EntryStatus::Deleted);
+
+    CHECK(fs::exists(t.outside_victim));
+    CHECK_FALSE(fs::exists(moved_aside / "victim.tmp"));
+}
+
+} // namespace
+
+// ── (1) Happy path ──────────────────────────────────────────────────────
+
+TEST_CASE("delete_matching deletes matched files and leaves the rest", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_happy_"};
+    fs::create_directories(tmp.path / "sub");
+    write_file(tmp.path / "keep.txt");
+    write_file(tmp.path / "a.tmp");
+    write_file(tmp.path / "sub" / "b.tmp");
+    write_file(tmp.path / "sub" / "keep2.txt");
+
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+    REQUIRE(opened.reason == Reason::None);
+
+    DeleteResult result = delete_matching(*opened.root, suffix_match(".tmp"), generous_limits());
+
+    CHECK(result.stop_reason == Reason::None);
+    auto entries = sorted_entries(result.entries);
+    REQUIRE(entries.size() == 2);
+    CHECK(entries[0].rel_path == "a.tmp");
+    CHECK(entries[0].status == EntryStatus::Deleted);
+    CHECK(entries[0].reason == Reason::None);
+    CHECK(entries[1].rel_path == "sub/b.tmp");
+    CHECK(entries[1].status == EntryStatus::Deleted);
+    CHECK(entries[1].reason == Reason::None);
+
+    CHECK(fs::exists(tmp.path / "keep.txt"));
+    CHECK(fs::exists(tmp.path / "sub" / "keep2.txt"));
+    CHECK_FALSE(fs::exists(tmp.path / "a.tmp"));
+    CHECK_FALSE(fs::exists(tmp.path / "sub" / "b.tmp"));
+}
+
+// ── (2) open_root refusals ───────────────────────────────────────────────
+
+TEST_CASE("open_root refuses a symlinked root and a file root", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_openroot_"};
+    const fs::path real_dir = tmp.path / "real";
+    fs::create_directories(real_dir);
+    const fs::path link = tmp.path / "link";
+    fs::create_directory_symlink(real_dir, link);
+
+    OpenRootResult sym_result = open_root(link);
+    CHECK_FALSE(sym_result.root.has_value());
+    CHECK(sym_result.reason == Reason::RootInvalid);
+
+    const fs::path file_path = tmp.path / "file.txt";
+    write_file(file_path);
+    OpenRootResult file_result = open_root(file_path);
+    CHECK_FALSE(file_result.root.has_value());
+    CHECK(file_result.reason == Reason::RootInvalid);
+}
+
+// ── (3) In-tree symlink entry ────────────────────────────────────────────
+
+TEST_CASE("a symlink entry inside the root is skipped and its target survives", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_symlink_entry_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    const fs::path outside_dir = tmp.path / "outside";
+    fs::create_directories(outside_dir);
+    const fs::path victim = outside_dir / "victim.tmp";
+    write_file(victim);
+    fs::create_symlink(victim, root_dir / "link.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    DeleteResult result = delete_matching(*opened.root, match_all(), generous_limits());
+
+    REQUIRE(result.entries.size() == 1);
+    CHECK(result.entries[0].rel_path == "link.tmp");
+    CHECK(result.entries[0].status == EntryStatus::Skipped);
+    CHECK(result.entries[0].reason == Reason::SymlinkRejected);
+    CHECK(fs::exists(victim));
+}
+
+// ── (4) Adversarial swap at depths 1, 2, 3 -- pre-walk and mid-walk ──────
+
+TEST_CASE("adversarial swap at depth 1, pre-walk", "[confined_fs]") { run_prewalk_swap_test(1); }
+TEST_CASE("adversarial swap at depth 2, pre-walk", "[confined_fs]") { run_prewalk_swap_test(2); }
+TEST_CASE("adversarial swap at depth 3, pre-walk", "[confined_fs]") { run_prewalk_swap_test(3); }
+
+TEST_CASE("adversarial swap at depth 1, mid-walk interposition", "[confined_fs]") {
+    run_midwalk_swap_test(1);
+}
+TEST_CASE("adversarial swap at depth 2, mid-walk interposition", "[confined_fs]") {
+    run_midwalk_swap_test(2);
+}
+TEST_CASE("adversarial swap at depth 3, mid-walk interposition", "[confined_fs]") {
+    run_midwalk_swap_test(3);
+}
+
+// ── (5) Caps ──────────────────────────────────────────────────────────────
+
+TEST_CASE("entry cap stops the walk with StopWalk(EntryCap)", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_entrycap_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    for (int i = 0; i < 5; ++i)
+        write_file(root_dir / ("f" + std::to_string(i) + ".tmp"));
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    const DeleteLimits limits{/*max_entries=*/3, /*max_bytes=*/1'000'000,
+                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/32};
+    DeleteResult result = delete_matching(*opened.root, match_all(), limits);
+
+    CHECK(result.stop_reason == Reason::EntryCap);
+    CHECK(result.entries.size() <= 3);
+    CHECK(result.tally.entries_seen <= 3);
+}
+
+TEST_CASE("byte cap skips an oversized file but a following smaller one still deletes",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_bytecap_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "big.tmp", std::string(2000, 'x'));
+    write_file(root_dir / "small.tmp", "ok");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    const DeleteLimits limits{/*max_entries=*/1000, /*max_bytes=*/100,
+                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/32};
+    DeleteResult result = delete_matching(*opened.root, match_all(), limits);
+
+    auto entries = sorted_entries(result.entries);
+    REQUIRE(entries.size() == 2);
+    CHECK(entries[0].rel_path == "big.tmp");
+    CHECK(entries[0].status == EntryStatus::Skipped);
+    CHECK(entries[0].reason == Reason::ByteCap);
+    CHECK(entries[1].rel_path == "small.tmp");
+    CHECK(entries[1].status == EntryStatus::Deleted);
+
+    CHECK(fs::exists(root_dir / "big.tmp"));
+    CHECK_FALSE(fs::exists(root_dir / "small.tmp"));
+}
+
+TEST_CASE("wall-time cap of zero stops immediately with nothing deleted", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_wallcap_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "a.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    const DeleteLimits limits{/*max_entries=*/1000, /*max_bytes=*/1'000'000,
+                               /*max_wall=*/std::chrono::milliseconds{0}, /*max_depth=*/32};
+    DeleteResult result = delete_matching(*opened.root, match_all(), limits);
+
+    CHECK(result.stop_reason == Reason::WallTimeCap);
+    CHECK(result.entries.empty());
+    CHECK(result.tally.entries_seen == 0);
+    CHECK(fs::exists(root_dir / "a.tmp"));
+}
+
+TEST_CASE("depth cap skips a directory past max_depth but still deletes shallow entries",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_depthcap_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir / "lvl1" / "lvl2");
+    write_file(root_dir / "shallow.tmp");
+    write_file(root_dir / "lvl1" / "lvl2" / "deep.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    const DeleteLimits limits{/*max_entries=*/1000, /*max_bytes=*/1'000'000,
+                               /*max_wall=*/std::chrono::milliseconds{60'000}, /*max_depth=*/1};
+    DeleteResult result = delete_matching(*opened.root, match_all(), limits);
+
+    auto entries = sorted_entries(result.entries);
+    REQUIRE(entries.size() == 2);
+    CHECK(entries[0].rel_path == "lvl1/lvl2");
+    CHECK(entries[0].status == EntryStatus::Skipped);
+    CHECK(entries[0].reason == Reason::DepthCap);
+    CHECK(entries[1].rel_path == "shallow.tmp");
+    CHECK(entries[1].status == EntryStatus::Deleted);
+
+    CHECK(fs::exists(root_dir / "lvl1" / "lvl2" / "deep.tmp"));
+    CHECK_FALSE(fs::exists(root_dir / "shallow.tmp"));
+}
+
+// ── (6) Default-constructed DeleteLimits ─────────────────────────────────
+
+TEST_CASE("a default-constructed DeleteLimits deletes nothing on a populated tree",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_defaultlimits_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "a.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    DeleteResult result = delete_matching(*opened.root, match_all(), DeleteLimits{});
+
+    CHECK(result.entries.empty());
+    CHECK(result.tally.bytes_deleted == 0);
+    CHECK(fs::exists(root_dir / "a.tmp"));
+}
+
+// ── (7) InvalidName ───────────────────────────────────────────────────────
+
+TEST_CASE("unlink_at refuses invalid names before touching the filesystem", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_invalidname_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "real.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+    const int fd = opened.root->fd_.get();
+
+    const std::vector<std::string> bad_names{
+        "../x",
+        "a/b",
+        std::string("a\0b", 3),
+    };
+    for (const auto& bad : bad_names) {
+        UnlinkOutcome outcome = unlink_at(fd, bad, UnlinkKind::File);
+        CHECK(outcome.status == EntryStatus::Failed);
+        CHECK(outcome.reason == Reason::InvalidName);
+    }
+
+    CHECK(fs::exists(root_dir / "real.tmp"));
+}
+
+// ── (8) Root reuse ────────────────────────────────────────────────────────
+
+TEST_CASE("a ConfinedRoot supports two sequential delete_matching calls", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_reuse_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "a.tmp");
+    write_file(root_dir / "b.log");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    DeleteResult first = delete_matching(*opened.root, suffix_match(".tmp"), generous_limits());
+    CHECK(first.stop_reason == Reason::None);
+    REQUIRE(first.entries.size() == 1);
+    CHECK(first.entries[0].rel_path == "a.tmp");
+    CHECK(first.entries[0].status == EntryStatus::Deleted);
+    CHECK_FALSE(fs::exists(root_dir / "a.tmp"));
+    CHECK(fs::exists(root_dir / "b.log"));
+
+    DeleteResult second = delete_matching(*opened.root, suffix_match(".log"), generous_limits());
+    CHECK(second.stop_reason == Reason::None);
+    REQUIRE(second.entries.size() == 1);
+    CHECK(second.entries[0].rel_path == "b.log");
+    CHECK(second.entries[0].status == EntryStatus::Deleted);
+    CHECK_FALSE(fs::exists(root_dir / "b.log"));
+}
+
+// ── (9) A throwing MatchFn ────────────────────────────────────────────────
+
+TEST_CASE("a throwing MatchFn stops the walk with MatchError, consistent with the filesystem",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_matcherror_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "a.tmp");
+    write_file(root_dir / "z_throws.tmp");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    MatchFn throwing = [](std::string_view rel_path) -> bool {
+        if (rel_path == "z_throws.tmp")
+            throw std::runtime_error("boom");
+        return true;
+    };
+
+    DeleteResult result = delete_matching(*opened.root, throwing, generous_limits());
+
+    CHECK(result.stop_reason == Reason::MatchError);
+    for (const auto& e : result.entries) {
+        const bool exists = fs::exists(root_dir / e.rel_path);
+        if (e.status == EntryStatus::Deleted)
+            CHECK_FALSE(exists);
+        else
+            CHECK(exists);
+    }
+    // z_throws.tmp itself is never acted on -- the throw happens inside the
+    // match call, before any decision that could delete it.
+    CHECK(fs::exists(root_dir / "z_throws.tmp"));
+}
+
+#endif // !_WIN32
