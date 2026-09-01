@@ -28,6 +28,7 @@ struct FakeDir {
     std::map<std::string, Reason> refusals;  // name -> open_dir policy refusal
     std::map<std::string, int> os_errors_open; // name -> os_error for OsError refusal
     bool enumerate_os_error = false;
+    bool enumerate_internal_error = false;
     int enumerate_os_error_code = 0;
 };
 
@@ -65,6 +66,8 @@ public:
         ++enumerate_calls_;
         if (fd.enumerate_os_error)
             return EnumerateResult{{}, Reason::OsError, fd.enumerate_os_error_code};
+        if (fd.enumerate_internal_error)
+            return EnumerateResult{{}, Reason::Internal, 0};
         if (now() >= budget.deadline)
             return EnumerateResult{{}, Reason::WallTimeCap, 0};
         std::vector<DirEntry> out;
@@ -200,6 +203,21 @@ TEST_CASE("walk_delete lazy match: MatchFn not called past the entry cap", "[con
     DeleteResult result = walk_delete<FakeOps>(root, ops, counting, limits);
     REQUIRE(match_calls == 0);
     REQUIRE(result.stop_reason == Reason::EntryCap);
+}
+
+// Regression: an enumerate reason the walker has no specific policy for must
+// STOP the walk, not fall through every branch and silently truncate the
+// directory while reporting stop_reason None. Reason::Internal is what a
+// platform shell's own exception firewall reports on allocation failure.
+TEST_CASE("walk_delete: an unhandled enumerate reason stops the walk", "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    ops.dir(root).entries = {file_entry("a.txt")};
+    ops.dir(root).enumerate_internal_error = true;
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, kOpenLimits);
+    REQUIRE(result.stop_reason == Reason::Internal);
+    REQUIRE(ops.unlink_calls_ == 0);
 }
 
 // Regression: a NON-EMPTY batch truncated by the entry budget must still report

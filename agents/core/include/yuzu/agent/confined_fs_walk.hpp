@@ -168,6 +168,19 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                                                         Reason::OsError, enum_result.os_error});
                 continue; // move on to sibling directories still on the stack
             }
+            // Any OTHER non-None reason means enumeration did not complete for a
+            // reason this walker does not have a specific policy for -- today
+            // Reason::Internal from a platform shell's own exception firewall.
+            // Stop and report it. This is deliberately a catch-all rather than a
+            // list: an unhandled reason previously fell through every branch and
+            // silently truncated the directory while reporting stop_reason None,
+            // which a caller reads as "exhaustively visited". EntryCap is absent
+            // here ON PURPOSE -- its batch must be processed first, so it is
+            // handled after the entry loop below.
+            if (enum_result.reason != Reason::None && enum_result.reason != Reason::EntryCap) {
+                result.stop_reason = enum_result.reason;
+                return result;
+            }
 
             bool stopped = false;
             for (auto& dir_entry : enum_result.entries) {
