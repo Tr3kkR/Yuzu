@@ -80,14 +80,17 @@ jobs:
       # keep-all instead of letting it prune off a possibly-stale map. No
       # new permission scope: keep-all only means NOT passing
       # keep-unaffected-fuzz-targets=false, it never deletes or writes
-      # anything. Every failure path below (API error, an unparseable or
-      # future-dated created_at) explicitly writes force_keep_all=true
-      # before exiting rather than relying on the job to hard-fail closed -
-      # a tool hiccup degrades this run to "fuzz everything", it never
-      # silently misreads garbage as fresh (round-1 governance findings
-      # UP-1/CH-1: GNU `date -d` parses non-ISO8601 junk as "now" instead
-      # of erroring, which would have misclassified a corrupted API
-      # response as trustworthy).
+      # anything. Every failure path below (API error, a matched artifact
+      # record with no created_at, an unparseable, calendar-invalid, or
+      # future-dated created_at) explicitly writes force_keep_all=true via
+      # the fail_safe() helper and exits 0, rather than relying on the job
+      # to hard-fail closed - a tool hiccup degrades this run to "fuzz
+      # everything", it never silently misreads garbage as fresh (round-1
+      # governance findings UP-1/CH-1: GNU `date -d` parses non-ISO8601
+      # junk as "now" instead of erroring; round-2 findings: a
+      # shape-valid-but-calendar-invalid timestamp still reached the
+      # unguarded `date -d` call, and a present-but-malformed artifact
+      # record collapsed into the same branch as "no artifact at all").
       - name: Check coverage-artifact age
         id: coverage_age
         env:
@@ -102,35 +105,46 @@ jobs:
           MAX_AGE_DAYS: 30
         run: |
           set -euo pipefail
-          created_at=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=cifuzz-coverage-latest&per_page=1" \
-            --jq '.artifacts[0].created_at // empty') || {
-            echo "::warning title=cflite coverage age::could not query the GitHub artifacts API (gh api exit $?) - failing safe to keep-all."
+          fail_safe() {
+            echo "::warning title=cflite coverage age::$1 - failing safe to keep-all."
             echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
             exit 0
           }
-          if [ -z "$created_at" ]; then
+          artifact=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=cifuzz-coverage-latest&per_page=1" \
+            --jq '.artifacts[0] // empty') || fail_safe "could not query the GitHub artifacts API (gh api exit $?)"
+          if [ -z "$artifact" ]; then
             echo "::notice title=cflite coverage age::no cifuzz-coverage-latest artifact found - build_fuzzers will fail open to keep-all on its own (nothing to prune against)."
             echo "force_keep_all=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # A matched-but-malformed artifact record (missing/null created_at)
+          # is NOT the same as no artifact: the "not found" branch above is
+          # safe only because build_fuzzers's own lookup will find nothing
+          # either, whereas here an artifact genuinely exists and we just
+          # can't read its age - defaulting that to "prune normally" would
+          # be the least safe of the two, not the most.
+          created_at=$(jq -r '.created_at // empty' <<< "$artifact")
+          if [ -z "$created_at" ]; then
+            fail_safe "found a cifuzz-coverage-latest artifact record with no created_at field"
+          fi
           # Reject anything that isn't the exact ISO-8601 shape GitHub's API
           # documents before handing it to `date -d`: GNU date's fallback
           # parser accepts strings like "today" or "0" as valid and silently
-          # resolves them to "now", which would misreport a malformed/
+          # resolves them to a plausible-looking timestamp near the current
+          # time instead of erroring, which would misreport a malformed/
           # schema-drifted API response as a fresh artifact instead of
           # failing safe.
           if ! [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
-            echo "::warning title=cflite coverage age::cifuzz-coverage-latest's created_at ('$created_at') is not a recognizable ISO-8601 timestamp - failing safe to keep-all."
-            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            fail_safe "cifuzz-coverage-latest's created_at ('$created_at') is not a recognizable ISO-8601 timestamp"
           fi
-          created_epoch=$(date -u -d "$created_at" +%s)
+          # Shape-valid but calendar-invalid (month 13, hour 25, ...) still
+          # reaches here and `date -d` rejects it - guard this the same way
+          # rather than trusting the regex to also prove calendar validity.
+          created_epoch=$(date -u -d "$created_at" +%s) || fail_safe "could not parse created_at ('$created_at') as a date"
           now_epoch=$(date -u +%s)
           age_days=$(( (now_epoch - created_epoch) / 86400 ))
           if [ "$age_days" -lt 0 ]; then
-            echo "::warning title=cflite coverage age::cifuzz-coverage-latest's created_at ($created_at) is in the future relative to this runner's clock - failing safe to keep-all."
-            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            fail_safe "cifuzz-coverage-latest's created_at ($created_at) is in the future relative to this runner's clock"
           fi
           if [ "$age_days" -gt "$MAX_AGE_DAYS" ]; then
             echo "::notice title=cflite coverage age::cifuzz-coverage-latest is ${age_days}d old (max ${MAX_AGE_DAYS}d) - STALE, falling back to keep-all (no affected-target pruning this run)."

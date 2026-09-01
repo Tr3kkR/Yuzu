@@ -42,7 +42,7 @@
 #
 # Corpus durability = artifact retention (default 90 days). The only cadence
 # is dev pushes touching the paths below (measured ~1 per 10 days over the
-# last 60 - this is also the basis cflite-pr.yml's coverage-artifact
+# last 60 - this is also what cflite-pr.yml's coverage-artifact
 # MAX_AGE_DAYS gate (#3770) sizes its 30-day threshold against; a change to
 # this cadence is a reason to revisit that constant); if 90 quiet days ever
 # pass, the corpus and coverage report
