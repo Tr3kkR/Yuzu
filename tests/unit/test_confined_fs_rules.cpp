@@ -17,6 +17,7 @@ constexpr DeleteLimits kOpenLimits{
     /*max_bytes=*/1'000'000,
     /*max_wall=*/std::chrono::milliseconds{60'000},
     /*max_depth=*/32,
+    /*max_open_dirs=*/64,
 };
 
 constexpr EntryMeta regular_file(std::uint64_t size = 100) {

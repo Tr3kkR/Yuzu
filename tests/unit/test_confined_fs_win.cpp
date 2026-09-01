@@ -393,7 +393,7 @@ TEST_CASE("delete_matching with max_wall=0 stops immediately", "[confined_fs]") 
     OpenRootResult opened = open_root(root_dir.path);
     REQUIRE(opened.root.has_value());
 
-    DeleteLimits limits{100, 1'000'000, std::chrono::milliseconds{0}, 8};
+    DeleteLimits limits{100, 1'000'000, std::chrono::milliseconds{0}, 8, /*max_open_dirs=*/64};
     DeleteResult result = delete_matching(*opened.root, always_match, limits);
 
     CHECK(result.stop_reason == Reason::WallTimeCap);

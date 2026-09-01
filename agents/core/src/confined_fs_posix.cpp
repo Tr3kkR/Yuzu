@@ -28,6 +28,15 @@
 #include <fcntl.h>
 #if defined(__APPLE__)
 #include <sys/stdio.h> // renameatx_np, RENAME_EXCL
+#elif defined(__linux__)
+// glibc declares renameat2 in <stdio.h>, and only under __USE_GNU. It compiles
+// today only because spdlog transitively pulls <cstdio> and libstdc++ defines
+// _GNU_SOURCE for us -- neither is this file's to rely on, and a libc++ Linux
+// leg (the sanitizer builds) has neither.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#include <stdio.h>
 #endif
 #include <sys/stat.h>
 #include <unistd.h>
@@ -292,16 +301,21 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
 // cannot PREDICT, then measure and unlink that name. rename is atomic, so the
 // inode is bound to the new name in one step.
 //
-// HONEST LIMIT, do not overstate this. The capture name is unpredictable but it
-// is NOT hidden: anyone who can read the directory can see it appear and can
-// still race a swap over it before the unlink. POSIX offers no atomic
-// "unlink this specific inode by name", so the window is NARROWED -- from one an
-// attacker can wait for and win at leisure, to one requiring them to observe and
-// act inside a few syscalls -- not CLOSED. The byte cap is therefore best-effort
-// against an adversary holding write access to the parent directory, and the
-// action layer must not present it as a hard guarantee. Confinement (WHERE
-// deletion may happen) is unaffected and does hold: every operation stays
-// relative to the pinned parent handle.
+// HONEST LIMIT, and it is WIDER than byte accounting. The capture name is
+// unpredictable but NOT hidden: anyone who can read the directory sees it appear
+// and can rename their own file over it before we measure and unlink. We would
+// then stat AND delete THEIR inode -- a file MatchFn was never offered -- and
+// report it as {Deleted, rel_path=<original name>}. So the swap defeats WHAT is
+// deleted, not merely HOW MUCH is charged. POSIX offers no atomic "unlink this
+// specific inode by name", so the window is NARROWED -- from one an attacker can
+// wait for and win at leisure, to one requiring them to observe and act inside a
+// few syscalls -- not CLOSED.
+//
+// Therefore, against an adversary holding write access to the parent directory:
+//   * CONFINEMENT holds absolutely -- every operation is relative to the pinned
+//     parent handle, so nothing outside the root can be reached.
+//   * SELECTION (which entry is deleted) and ACCOUNTING (the byte cap) are both
+//     BEST-EFFORT, and the action layer must not present either as a guarantee.
 //
 // A separate staging DIRECTORY was considered and deliberately not used: on
 // POSIX a same-UID attacker can reach any directory we can create, so it adds
@@ -321,17 +335,30 @@ constexpr const char* kCapturePrefix = kCaptureNamePrefix; // exported in confin
 /// destination returns 0 and the destination's contents are gone.
 int rename_noreplace(int dir_fd, const char* from, const char* to) {
 #if defined(__APPLE__)
-    return ::renameatx_np(dir_fd, from, dir_fd, to, RENAME_EXCL);
+    if (::renameatx_np(dir_fd, from, dir_fd, to, RENAME_EXCL) == 0)
+        return 0;
+    if (errno != ENOTSUP && errno != EINVAL && errno != ENOSYS)
+        return -1; // a real failure, not an unsupported flag
 #elif defined(__linux__)
-    return ::renameat2(dir_fd, from, dir_fd, to, RENAME_NOREPLACE);
-#else
-    // No no-replace primitive: refuse rather than risk clobbering. The caller
-    // reports CaptureOrphaned, which is honest -- the entry stays under its
-    // capture name and the operator is told so.
-    (void)dir_fd; (void)from; (void)to;
-    errno = ENOSYS;
-    return -1;
+    if (::renameat2(dir_fd, from, dir_fd, to, RENAME_NOREPLACE) == 0)
+        return 0;
+    if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP)
+        return -1;
 #endif
+    // FALLBACK -- the no-replace flag is FILESYSTEM-gated, not merely
+    // kernel-gated: NFS, CIFS and most FUSE backends (including the
+    // fuse-overlayfs that rootless Docker defaults to) reject it with EINVAL.
+    // Refusing outright there would make EVERY refusal path -- including an
+    // ordinary byte-cap skip -- orphan the entry under its capture name, so the
+    // primitive would never cleanly decline on such a mount. Check-then-rename
+    // is racy, but it is exactly as racy as the plain renameat this replaced,
+    // and strictly better than orphaning: we lose the guarantee on those
+    // filesystems, we do not lose the operation.
+    if (::faccessat(dir_fd, to, F_OK, AT_SYMLINK_NOFOLLOW) == 0) {
+        errno = EEXIST; // occupied -- do not clobber it
+        return -1;
+    }
+    return ::renameat(dir_fd, from, dir_fd, to);
 }
 
 std::optional<std::string> make_capture_name() {
@@ -353,8 +380,13 @@ std::optional<std::string> make_capture_name() {
     do {
         got = ::read(urandom.get(), raw, sizeof raw);
     } while (got < 0 && errno == EINTR); // short/interrupted read is not a failure to ignore
-    if (got != static_cast<ssize_t>(sizeof raw))
+    if (got != static_cast<ssize_t>(sizeof raw)) {
+        // Capture before ~ScopedFd's close() can overwrite it, exactly as the
+        // open-failure branch above does.
+        const int err = errno;
+        errno = err;
         return std::nullopt;
+    }
     static const char* kHex = "0123456789abcdef";
     std::string out = kCapturePrefix;
     for (unsigned char b : raw) {
@@ -399,8 +431,9 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
         return false;
     };
 
-    // MEASURE the captured name. Nothing can substitute for it: the attacker
-    // cannot guess it, and it never existed under a name they controlled.
+    // MEASURE the captured name. The attacker cannot GUESS this name, but they
+    // can observe it via readdir and rename over it -- see the honest-limit note
+    // above. This narrows the window; it does not close it.
     std::uint64_t live_bytes = 0;
     if (kind == UnlinkKind::File) {
         struct stat st{};

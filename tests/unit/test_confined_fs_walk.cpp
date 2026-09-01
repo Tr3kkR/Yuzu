@@ -288,6 +288,47 @@ TEST_CASE("walk_delete: the enumerate budget subtracts entries already seen",
     REQUIRE(ops.last_budget_.max_entries == 7);
 }
 
+// Gate 8 (security-guardian): OpenDirCap shipped as a new fail-closed
+// enforcement branch with no test at all. The bound is on concurrently-open
+// directory handles, which is +2 above the stack depth (the popped frame still
+// owns its handle and the freshly-opened child is live), so this asserts the
+// documented meaning rather than the implementation's arithmetic.
+TEST_CASE("walk_delete stops when it would exceed the open-directory cap",
+          "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    std::vector<DirEntry> kids;
+    for (int i = 0; i < 6; ++i) {
+        int child = ops.add_dir();
+        const std::string nm = "sub" + std::to_string(i);
+        ops.dir(root).subdirs[nm] = child;
+        kids.push_back(dir_entry(nm));
+    }
+    ops.dir(root).entries = kids;
+
+    DeleteLimits limits = kOpenLimits;
+    limits.max_open_dirs = 3; // permits one descent, then stops
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, limits);
+    REQUIRE(result.stop_reason == Reason::OpenDirCap);
+    REQUIRE(ops.unlink_calls_ == 0); // a cap stop deletes nothing it had not already
+}
+
+// Zero permits nothing, exactly as every other cap in DeleteLimits does.
+TEST_CASE("walk_delete with max_open_dirs zero descends into nothing", "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    int child = ops.add_dir();
+    ops.dir(root).subdirs["sub"] = child;
+    ops.dir(root).entries = {dir_entry("sub")};
+
+    DeleteLimits limits = kOpenLimits;
+    limits.max_open_dirs = 0;
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, limits);
+    REQUIRE(result.stop_reason == Reason::OpenDirCap);
+}
+
 // B001 regression: the byte cap must be charged what the leg MEASURED at delete
 // time, not the size seen during enumeration. An attacker who controls the tree
 // can swap a small enumerated file for a large one; charging the stale size would

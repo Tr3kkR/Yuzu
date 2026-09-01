@@ -285,10 +285,22 @@ OpenRootResult open_root(const std::filesystem::path& path) {
 
     // By design, root only: this is the ONE CreateFileW in this file. Every
     // later open is parent-HANDLE-relative via nt_open_relative.
-    const HANDLE raw =
+    // FILE_TRAVERSE is requested because NT relative-name resolution
+    // traverse-checks the parent handle -- but requesting a right we did not
+    // previously ask for can itself turn a working open into ACCESS_DENIED on a
+    // root whose ACL grants List but not Traverse. Ask for it, then retry once
+    // without it: a static mask cannot serve both the privilege-stripped host
+    // and the restrictive-ACL root.
+    HANDLE raw =
         CreateFileW(path.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | kFileTraverse,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (raw == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED) {
+        raw = CreateFileW(path.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING,
+                          FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    }
     if (raw == INVALID_HANDLE_VALUE) {
         // B004: a root that cannot be opened or identified is RootInvalid on both
         // legs -- the POSIX leg already reports it that way, and a

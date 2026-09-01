@@ -322,7 +322,11 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                         // per pending subdirectory, so without this the descriptor
                         // cost is bounded only by max_entries and is paid
                         // process-wide, not by this walk alone.
-                        if (stack.size() >= limits.max_open_dirs) {
+                        // +2, measured: the popped frame still owns its handle
+                        // and `opened.handle` is live, so peak concurrent handles
+                        // is stack.size() + 2. Counting frames alone overshot the
+                        // documented bound by exactly that much.
+                        if (stack.size() + 2 > limits.max_open_dirs) {
                             result.stop_reason = Reason::OpenDirCap;
                             return result;
                         }
