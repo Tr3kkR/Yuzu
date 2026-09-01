@@ -8,6 +8,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -78,6 +79,19 @@ public:
     using ResolveFn = std::function<std::pair<std::string, std::string>(
         const std::string& instruction_text)>;
 
+    /// D3: resolves the caller's Response:Read-visible agent set for the
+    /// dashboard facet/scope surfaces (filter bar, create-group form, and
+    /// group-from-results POST). `nullopt` means the caller sees all agents
+    /// (RBAC legacy-open, or a global Response:Read grant); a present-but-
+    /// EMPTY set means fail-closed on a degraded store — a degrade must
+    /// NEVER be signalled as `nullopt`, since that would silently widen to
+    /// "sees all". Deliberately anchored on Response:Read, NOT the
+    /// Infrastructure:Read-anchored `visible_set_fn` (server.cpp:16786):
+    /// reusing that one would hand a global-Response:Read holder table rows
+    /// while leaving these dropdowns empty.
+    using VisibleSetFn = std::function<std::optional<std::set<std::string>>(
+        const std::string& username)>;
+
     void register_routes(httplib::Server& svr,
                          AuthFn auth_fn,
                          PermFn perm_fn,
@@ -92,7 +106,8 @@ public:
                          CallerFn caller_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         InstructionStore* instruction_store = nullptr);
+                         InstructionStore* instruction_store = nullptr,
+                         VisibleSetFn visible_set_fn = {});
 
     /// HttpRouteSink overload — identical registration against the polymorphic
     /// seam so the fragment handlers (notably the destructive TAR
@@ -113,7 +128,8 @@ public:
                          CallerFn caller_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
-                         InstructionStore* instruction_store = nullptr);
+                         InstructionStore* instruction_store = nullptr,
+                         VisibleSetFn visible_set_fn = {});
 
     /// Operator-declared external origins for the CSRF same-site gate (#2537),
     /// already normalised by `normalise_trusted_origins` at boot. Set BEFORE
@@ -164,8 +180,30 @@ private:
     CallerFn caller_fn_;
     ResolveFn resolve_fn_;
     yuzu::MetricsRegistry* metrics_{nullptr};
+    VisibleSetFn visible_set_fn_;
 
     // -- Fragment renderers ---------------------------------------------------
+
+    /// Resolves @p username's Response:Read-visible agent scope via
+    /// `visible_set_fn_`. Unwired (default-constructed `visible_set_fn_`)
+    /// returns `nullopt` (legacy-open, byte-identical to pre-scoping
+    /// behaviour). When wired, `nullopt` from the callback passes through
+    /// unchanged (sees all); a returned set — including an empty one, which
+    /// signals fail-closed on a degraded store — is converted to a sorted
+    /// vector.
+    std::optional<std::vector<std::string>> resolve_visible_scope(
+        const std::string& username) const;
+
+    /// Same as above, but for a caller who already has the resolved session
+    /// in hand: a JIT-elevated session gets the full-fleet view (`nullopt`)
+    /// without ever calling `visible_set_fn_` — a username-only RBAC lookup
+    /// cannot see the session's in-memory elevation, so this must short-
+    /// circuit here rather than inside `visible_set_fn_`. Removes the
+    /// `is_elevated(*session) ? nullopt : resolve_visible_scope(username)`
+    /// ternary previously duplicated at each of this file's handler call
+    /// sites.
+    std::optional<std::vector<std::string>> resolve_visible_scope(
+        const auth::Session& session) const;
 
     /// Resolves the column-name list @ref render_results and @ref
     /// col_index_for_name should render/sort against: index 0 is always
@@ -215,7 +253,9 @@ private:
     /// operator-defined templates on the definition.
     std::string render_filter_bar(const std::string& command_id, const std::string& plugin,
                                    const std::string& definition_id = {},
-                                   const std::string& template_id = {});
+                                   const std::string& template_id = {},
+                                   const std::string& username = {},
+                                   bool elevated = false);
 
     /// Render group creation form. `agent_count` nullopt (#2691, Doomgoose
     /// finding #7) renders an honest "count unavailable" hint instead of a

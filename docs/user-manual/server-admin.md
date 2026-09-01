@@ -3188,7 +3188,22 @@ reported `SERVICE_STOPPED` (#1822) — so a watchdog fire there behaves similarl
 to the Linux `Restart=always` unit, not as a permanent stop. What it does
 change: `TerminateProcess` bypasses `report_status`, so a code-4 exit
 does not land in the `sc query`/Event Viewer "specific error" buckets
-described further down — it surfaces as a generic unexpected termination. If
+described further down — it surfaces as a generic unexpected termination.
+
+**Two watchdogs, not one, and their budgets don't share a clock.**
+`AgentImpl::stop()` and the agent's own `run()`-exit teardown each arm their
+own separate 20s deadline — in the worst case (both phases legitimately slow
+but not individually wedged) the two can compose sequentially to as much as
+~40 seconds before either one actually fires, exceeding this 30s SCM hint
+with **neither** watchdog triggering. That specific case is not a hang and
+not a restart: both phases genuinely finish, the agent reports a normal clean
+stop (`SERVICE_STOPPED`/success), and per the SCM's own recovery-action rules
+a clean stop with a zero exit code does not trigger `SC_ACTION_RESTART`
+either — the service simply reports stopped later than the SCM's hint
+anticipated, with no automatic action taken either way. Composition-aware
+budgeting between the two deadlines (so a slow `stop()` shortens the
+remaining budget available to the teardown that follows it) is tracked as a
+follow-up (#3756), not implemented today. If
 the agent logs `shutdown watcher unavailable` at boot (thread/fd
 exhaustion), a hard-exit handler is installed instead: the agent exits promptly
 on the FIRST signal, ungracefully — no plugin shutdown, no clean store close.

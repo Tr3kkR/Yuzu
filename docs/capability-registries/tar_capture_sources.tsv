@@ -28,8 +28,8 @@ software	windows	supported	registry
 software	linux	planned	dpkg_rpm
 software	macos	planned	pkgutil
 arp	windows	supported	iphlpapi
-arp	linux	planned	procfs
-arp	macos	planned	route_sysctl
+arp	linux	supported	procfs
+arp	macos	constrained	route_sysctl
 dns	windows	supported	dnsapi
 dns	linux	planned	systemd-resolved
 dns	macos	planned	dscacheutil
@@ -38,4 +38,4 @@ netconn	linux	planned	journald
 netconn	macos	planned	oslog
 mapdrive	windows	supported	wnet
 mapdrive	linux	constrained	procfs
-mapdrive	macos	planned	getfsstat
+mapdrive	macos	constrained	getfsstat

@@ -221,10 +221,13 @@ TEST_CASE("#2500 — the route-level reason set matches what the routes actually
     // Keep in step with the emit sites: `body_type` (server.cpp /api/command,
     // workflow_routes.cpp execute), `parent_id_type`/`parent_id_empty`
     // (rest_api_v1.cpp run_async + from-inventory-query), `closure_no_target`
-    // (server.cpp shared command_dispatch_fn).
-    const std::array<std::string_view, 5> emitted_by_routes{
-        "body_type", "parent_id_type", "parent_id_empty", "closure_no_target",
-        "scope_unsupported"};
+    // (server.cpp shared command_dispatch_fn), `destructive_untargeted`
+    // (#3685: server.cpp /api/command Destructive RefuseUntargeted arm AND
+    // mcp_server.cpp execute_instruction's C8 pre-mint + main-handler sites —
+    // the one reason in this array with more than one owning surface).
+    const std::array<std::string_view, 6> emitted_by_routes{
+        "body_type",         "parent_id_type",         "parent_id_empty",
+        "closure_no_target", "scope_unsupported", "destructive_untargeted"};
 
     CHECK(kRouteRejectReasons.size() == emitted_by_routes.size());
     for (const auto r : emitted_by_routes) {
