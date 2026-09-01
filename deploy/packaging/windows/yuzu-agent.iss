@@ -123,6 +123,12 @@ Source: "{#BuildDir}\agents\plugins\example\example.dll"; DestDir: "{app}\plugin
 [Dirs]
 Name: "{app}\logs"; Permissions: admins-full system-full
 Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
+; Trust-anchor directory for OTA update and plugin code-signing bundles
+; (#416/#3807). Matches the well-known path cert_discovery.cpp already looks in.
+; Administrators and SYSTEM only: the agent service reads its update-signing
+; anchor from here, so a writable directory would let a compromised agent
+; authorise its own replacement.
+Name: "{commonappdata}\Yuzu\certs"; Permissions: admins-full system-full
 
 [Run]
 ; Register and start the service after install

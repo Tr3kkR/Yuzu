@@ -13,6 +13,15 @@ mkdir -p "${DATA_DIR}" "${LOG_DIR}"
 chmod 750 "${DATA_DIR}"
 chmod 755 "${LOG_DIR}"
 
+# Trust-anchor directory for OTA update and plugin code-signing bundles
+# (#416/#3807). Matches the well-known path cert_discovery.cpp already looks in.
+# root-owned and world-readable but NOT agent-writable: the agent verifies its
+# own updates against what lives here, so an agent that could write it would be
+# able to authorise its own replacement.
+mkdir -p /etc/yuzu/certs
+chown root:wheel /etc/yuzu/certs
+chmod 755 /etc/yuzu/certs
+
 # Load the launch daemon (starts the agent)
 if launchctl list com.yuzu.agent &>/dev/null; then
     launchctl unload "${PLIST}" 2>/dev/null || true

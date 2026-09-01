@@ -5289,6 +5289,15 @@ void SettingsRoutes::register_routes(
                             "text/html; charset=utf-8");
             return;
         }
+        // Optional detached CMS signature (#416/#3807). Optional because a fleet
+        // that has not adopted signing yet must still be able to upload, and
+        // because the agent — not this server — decides whether an unsigned
+        // package is acceptable. Uploading one here does not make it trusted:
+        // the agent checks it against an anchor this server never supplies.
+        std::string signature_pem;
+        if (SETTINGS_REQ_HAS_FILE(req, "signature"))
+            signature_pem = SETTINGS_REQ_GET_FILE(req, "signature").content;
+
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
         if (uploaded.content.empty()) {
             res.status = 400;
@@ -5349,6 +5358,29 @@ void SettingsRoutes::register_routes(
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
+        // Write the signature sidecar AFTER the package row exists, so a failure
+        // here leaves an unsigned-but-usable package rather than a registered
+        // package pointing at a half-written signature. An agent with
+        // --update-require-signature then refuses it, which is the correct
+        // outcome for a partial upload.
+        if (!signature_pem.empty()) {
+            const auto sig_path = update_registry_->signature_path(pkg);
+            std::ofstream sf(sig_path, std::ios::binary | std::ios::trunc);
+            if (sf) {
+                sf.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
+            }
+            if (!sf) {
+                std::error_code rm_ec;
+                std::filesystem::remove(sig_path, rm_ec);
+                spdlog::error("OTA package {}: signature sidecar could not be written; the "
+                              "package remains registered as UNSIGNED",
+                              pkg.filename);
+            } else {
+                spdlog::info("OTA package {}: detached signature stored ({} bytes)", pkg.filename,
+                             signature_pem.size());
+            }
+        }
+
         res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
     });
 
@@ -5372,6 +5404,12 @@ void SettingsRoutes::register_routes(
                             auto bin_path = update_registry_->binary_path(pkg);
                             std::error_code ec;
                             std::filesystem::remove(bin_path, ec);
+                            // Remove the signature sidecar with it. Leaving it
+                            // behind would let a later upload of a same-named
+                            // package inherit a signature made over DIFFERENT
+                            // bytes — which the agent would then reject as
+                            // tampered, with no obvious cause.
+                            std::filesystem::remove(update_registry_->signature_path(pkg), ec);
                             break;
                         }
                     }

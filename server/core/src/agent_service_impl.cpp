@@ -1980,6 +1980,33 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
     response->set_eligible(eligible);
     response->set_file_size(latest->file_size);
 
+    // The detached signature, when the operator uploaded one (#416/#3807).
+    //
+    // Read fresh from the sidecar rather than cached: it is a few KB against an
+    // RPC an agent makes every six hours, and a cache would be one more place
+    // for the signature to go stale relative to the binary it covers. A missing
+    // sidecar is the ordinary unsigned case, not an error — the AGENT decides
+    // whether that is acceptable, since this server is not the authority on its
+    // own packages' authenticity.
+    {
+        const auto sig_path = update_registry_->signature_path(*latest);
+        std::error_code sig_ec;
+        if (std::filesystem::exists(sig_path, sig_ec)) {
+            std::ifstream sig_in(sig_path, std::ios::binary);
+            if (sig_in) {
+                std::string sig((std::istreambuf_iterator<char>(sig_in)),
+                                std::istreambuf_iterator<char>());
+                response->set_update_signature(std::move(sig));
+            } else {
+                // Present but unreadable is worth a log: the operator believes
+                // this package is signed and every agent will be told it is not.
+                spdlog::warn("CheckForUpdate: signature sidecar for {} exists but is unreadable; "
+                             "serving the package as unsigned",
+                             latest->filename);
+            }
+        }
+    }
+
     spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
                  request->agent_id(), request->current_version(), latest->version, eligible,
                  latest->mandatory);

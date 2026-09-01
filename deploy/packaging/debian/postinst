@@ -27,6 +27,14 @@ case "$1" in
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$DATA_DIR"
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /var/log/yuzu
 
+        # Trust-anchor directory for OTA update and plugin code-signing bundles
+        # (#416/#3807). ROOT-owned and world-readable, deliberately NOT owned by
+        # the service user: the agent verifies its own updates against whatever
+        # is in here, so an agent able to write it could authorise its own
+        # replacement and the check would prove nothing. 0755/root:root means
+        # only an administrator can install or change an anchor.
+        install -d -m 0755 -o root -g root /etc/yuzu/certs
+
         if [[ "$COMPONENT" == "yuzu-server" ]]; then
             install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu
 

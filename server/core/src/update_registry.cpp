@@ -293,4 +293,14 @@ std::filesystem::path UpdateRegistry::binary_path(const UpdatePackage& pkg) cons
     return update_dir_ / pkg.filename;
 }
 
+std::filesystem::path UpdateRegistry::signature_path(const UpdatePackage& pkg) const {
+    // Derived from the binary path, never from a separately-supplied name: the
+    // filename is operator-controlled, and letting the signature location be
+    // named independently would allow a package to point at some other
+    // package's signature.
+    auto p = binary_path(pkg);
+    p += ".sig";
+    return p;
+}
+
 } // namespace yuzu::server

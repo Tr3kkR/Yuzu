@@ -116,6 +116,16 @@ public:
     /// Pure — no DB.
     std::filesystem::path binary_path(const UpdatePackage& pkg) const;
 
+    /// Path to the package's detached CMS signature, if the operator supplied
+    /// one at upload (#416/#3807). A SIDECAR beside the binary rather than a
+    /// column on the row, mirroring how plugin signatures are stored, so the
+    /// signature travels with the artifact and needs no schema migration.
+    ///
+    /// The server does not verify this and is deliberately not trusted to: the
+    /// agent checks it against a trust anchor placed on disk at install time,
+    /// out of band of this server entirely. Absent file means unsigned.
+    std::filesystem::path signature_path(const UpdatePackage& pkg) const;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
