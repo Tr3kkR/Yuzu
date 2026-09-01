@@ -5,8 +5,9 @@
 #
 # mode: code-change — fuzzes only what the PR touches, short budget
 # (fuzz-seconds below), so this is a fast regression net, not a soak.
-# Deep exploration belongs to a future scheduled batch leg (deferred
-# until the harness set stabilizes). NOT a required status check.
+# Deep exploration is cflite-batch.yml's job (batch + coverage + prune;
+# it also feeds this job's corpus and pruning data). NOT a required
+# status check.
 #
 # This also satisfies the OpenSSF Scorecard Fuzzing check (0/10 before
 # this workflow existed — the check detects the .clusterfuzzlite/ config).
@@ -16,15 +17,32 @@ name: ClusterFuzzLite PR fuzzing
 on:
   pull_request:
     branches: [dev, main]
-    # Only fuzz PRs that can change fuzzed behavior — the harnesses
-    # compile first-party C++ directly (no meson/vcpkg), so workflows,
-    # docs, gateway-Erlang, YAML-content or script changes can't affect
-    # them. Keep this list in sync with .clusterfuzzlite/build.sh inputs.
+    # Only fuzz PRs that can change fuzzed behavior. The harnesses compile
+    # first-party C++ directly (no meson/vcpkg), and their entire compile
+    # closure is the six parser families below plus tests/fuzz/ itself -
+    # nothing in agents/, sdk/, proto/, or the rest of server/ reaches
+    # them. Family globs (not exact files) so a sibling header/impl added
+    # to a family stays covered. KEEP IN SYNC with BOTH
+    # .clusterfuzzlite/build.sh's inputs AND cflite-batch.yml's identical
+    # paths list - the batch leg uses the SAME filter, so a PR this list
+    # misses is missed by both legs; when a fuzzed file grows an
+    # out-of-family include, add the new family glob to both workflows in
+    # the same change. Narrowing matters because affected-target pruning
+    # fails OPEN (an empty affected set keeps ALL targets), so this filter
+    # is the only mechanism that makes an unrelated PR free. KNOWN
+    # EXCEPTION (#1978 class): GitHub evaluates event-level paths: against
+    # a bounded diff window, so a very large PR touching a fuzzed file
+    # can skip BOTH legs entirely - the same limitation that moved ci.yml
+    # onto detect-code-change.sh. Accepted for now (documented in
+    # docs/ci-architecture.md; adopting the detect-code-change pattern is
+    # tracked on #3771).
     paths:
-      - 'server/**'
-      - 'agents/**'
-      - 'sdk/**'
-      - 'proto/**'
+      - 'server/core/src/preflight_parse*'
+      - 'server/core/src/deployment_parse*'
+      - 'server/core/src/yaml_scan*'
+      - 'server/core/src/guardian_rule_spec*'
+      - 'server/core/src/guardian_resilience_schema*'
+      - 'server/core/src/guardian_schema_registry*'
       - 'tests/fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'
@@ -33,7 +51,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions: read-all
+# Job blocks below declare their own scopes; keep the workflow default
+# minimal so a future job cannot silently inherit a broad grant.
+permissions:
+  contents: read
 
 jobs:
   fuzz:
@@ -42,6 +63,11 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      actions: read            # cifuzz filestore reads cross-workflow artifacts
+                               # (cifuzz-corpus-<target>, cifuzz-coverage-latest)
+                               # via the REST artifact API; unspecified scopes
+                               # in this block are none, which silently breaks
+                               # both corpus download and target pruning
       security-events: write   # SARIF upload of crash findings
     steps:
       - name: Build fuzzers
@@ -50,12 +76,25 @@ jobs:
         with:
           language: c++
           sanitizer: address
+          # Pruning of unaffected targets happens in THIS step and needs the
+          # coverage report artifact; the input has no default, so omitting
+          # it leaves the build container with an empty token and pruning
+          # silently keeps all targets.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run fuzzers
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          fuzz-seconds: 300
+          # Total wall budget split across the retained targets (sequential).
+          # 180s keeps the whole job under ~5.5 min (measured fixed costs:
+          # ~35s image pull + ~68s build + ~37s run-step overhead) - the
+          # operator ceiling is 6 min. parallel-fuzzing runs libFuzzer with
+          # one worker per vCPU inside each target's slice, so total
+          # executions EXCEED the old 300s single-worker budget (~720
+          # core-seconds vs 300 on the 4-vCPU public runners).
+          fuzz-seconds: 180
+          parallel-fuzzing: true
           mode: code-change
           sanitizer: address
           output-sarif: true

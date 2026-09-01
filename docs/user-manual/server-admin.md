@@ -1629,6 +1629,25 @@ If this returns any interface names, those hosts will report a different (shorte
 
 ---
 
+### vNEXT — `software_actions.installed_count`'s reported number can change after upgrading (breaking)
+
+**What changed.** The `software_actions` agent plugin's `installed_count` action was migrated off `popen`/a `powershell -Command` shell-out onto native counting, and the counting rule changed on both platforms it touches:
+
+- **Linux.** The dpkg presence filter now counts packages in the `hi` (installed, held) status alongside `ii` (installed), matching the filter `installed_apps` and `vuln_scan` already use. A host with any held packages reports a higher count than before, by exactly the number of held packages.
+- **Windows.** `installed_count` now reads a raw subkey count of the registry `Uninstall` key via `RegQueryInfoKeyW`, replacing a `powershell -Command Get-ItemProperty ... | Measure-Object` pipeline. The two are not byte-identical: the registry read counts every subkey, the old script counted only subkeys carrying at least one property — a rare shape, but not one the new count can be relied on to match exactly. Both the old and new implementation read only the default (64-bit) registry view; 32-bit applications registered under `WOW6432Node` were never counted by either one and still are not.
+
+**Who this affects.** Any deployment with automation, a dashboard trend line, or an alert threshold keyed on the literal `count|N` value from `installed_count` — particularly a Linux fleet with `apt-mark hold`ed packages, or any Windows fleet (the registry-count/property-count divergence is rare but not bounded to a specific host shape, so it isn't pre-checkable the way the Linux change is).
+
+**Before upgrading, check whether this affects you.** On a representative Linux host:
+
+```bash
+dpkg-query -W -f='${db:Status-Abbrev}\n' | grep -c '^hi'
+```
+
+A nonzero result means that host's `installed_count` will report a higher number after upgrading, by exactly that many. If your automation only compares the count to a rough threshold or trend, no action is needed; if it asserts an exact expected value, re-baseline it after upgrading.
+
+---
+
 ## Settings Page
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.
