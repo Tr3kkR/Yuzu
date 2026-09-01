@@ -319,6 +319,26 @@ TEST_CASE("a symlink entry inside the root is skipped and its target survives", 
 //    called directly rather than through delete_matching, so a fault in the
 //    primitive itself can't be masked by walker-level checks) ─────────────
 
+TEST_CASE("open_root refuses a root path containing an embedded NUL", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_rootnul_"};
+    const fs::path real_root = tmp.path / "root";
+    fs::create_directories(real_root);
+    write_file(real_root / "victim.tmp");
+
+    // "<root>\0/decoy" truncates at the NUL when handed to a C API, so an
+    // unchecked open_root would silently pin <root> while the caller believes
+    // it named something else -- every later operation is then confined to the
+    // wrong tree. Must be refused before the first syscall.
+    std::string poisoned = real_root.string();
+    poisoned.push_back('\0');
+    poisoned += "/decoy";
+    OpenRootResult r = open_root(fs::path{poisoned});
+
+    CHECK_FALSE(r.root.has_value());
+    CHECK(r.reason == Reason::RootInvalid);
+    CHECK(fs::exists(real_root / "victim.tmp"));
+}
+
 TEST_CASE("open_dir_at refuses a directory swapped for a symlink before the open",
           "[confined_fs]") {
     yuzu::test::TempDir tmp{"yuzu_test_confined_posix_odaswap_"};

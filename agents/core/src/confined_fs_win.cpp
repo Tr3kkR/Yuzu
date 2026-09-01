@@ -261,6 +261,18 @@ std::optional<FileIdentity> capture_identity(HANDLE h) {
 OpenRootResult open_root(const std::filesystem::path& path) {
     OpenRootResult result;
 
+    // An embedded NUL would be truncated by c_str(), pinning a DIFFERENT
+    // directory than the caller named and confining every later operation to
+    // the wrong root. Entry names are checked for this (validate_name); the
+    // root path is the caller's own string and needs the same check. Sibling of
+    // the identical guard in confined_fs_posix.cpp's open_root.
+    if (path.native().find(L'\0') != std::wstring::npos) {
+        spdlog::warn("confined_fs::open_root: refused root path containing an embedded NUL");
+        result.reason = Reason::RootInvalid;
+        result.os_error = 0;
+        return result;
+    }
+
     // By design, root only: this is the ONE CreateFileW in this file. Every
     // later open is parent-HANDLE-relative via nt_open_relative.
     const HANDLE raw =

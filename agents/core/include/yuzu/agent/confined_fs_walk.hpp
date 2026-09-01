@@ -121,6 +121,16 @@ struct WalkFrame {
     std::uint32_t depth;
 };
 
+/// The refusal reasons that mean "this entry was deliberately declined by
+/// policy" -- the walk records them and continues. Any OTHER refusal means the
+/// subtree was not traversed for a reason the walk cannot treat as a decision,
+/// and must stop it instead of silently completing.
+constexpr bool is_policy_refusal(Reason r) {
+    return r == Reason::SymlinkRejected || r == Reason::ReparseRejected ||
+           r == Reason::DeviceBoundary || r == Reason::NotRegularFile ||
+           r == Reason::InvalidName || r == Reason::DepthCap;
+}
+
 inline std::string join_rel(const std::string& prefix, const std::string& name) {
     if (prefix.empty())
         return name;
@@ -245,9 +255,22 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                     } else if (opened.reason == Reason::OsError) {
                         result.entries.push_back(EntryOutcome{
                             rel_path, EntryStatus::Failed, Reason::OsError, opened.os_error});
-                    } else {
+                    } else if (detail::is_policy_refusal(opened.reason)) {
                         result.entries.push_back(
                             EntryOutcome{rel_path, EntryStatus::Skipped, opened.reason, 0});
+                    } else {
+                        // NOT a policy refusal -- the subtree was never traversed for
+                        // a reason that is not "we deliberately declined this entry"
+                        // (today Reason::Unsupported, when the platform primitive is
+                        // unavailable at all). Recording it as a Skipped entry and
+                        // continuing would let the walk finish with stop_reason None,
+                        // which a caller reads as exhaustively visited. Whitelist the
+                        // real refusals and stop on everything else.
+                        result.entries.push_back(
+                            EntryOutcome{rel_path, EntryStatus::Failed, opened.reason,
+                                         opened.os_error});
+                        result.stop_reason = opened.reason;
+                        return result;
                     }
                     break;
                 }

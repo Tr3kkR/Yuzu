@@ -129,6 +129,14 @@ bool is_symlink_at(int dirfd, const char* name) {
 }
 
 OpenRootResult open_root(const std::filesystem::path& path) {
+    // An embedded NUL would be truncated by c_str(), pinning a DIFFERENT
+    // directory than the caller named and confining every later operation to
+    // the wrong root. Entry names are checked for this (is_invalid_name); the
+    // root path is the caller's own string and needs the same check.
+    if (path.native().find('\0') != std::string::npos) {
+        spdlog::warn("confined_fs::open_root: refused root path containing an embedded NUL");
+        return OpenRootResult{std::nullopt, Reason::RootInvalid, 0};
+    }
     const int raw = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (raw < 0) {
         const int err = errno;
