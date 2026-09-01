@@ -199,14 +199,8 @@ private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
 **Raw `popen`/`system` helpers:**
-device_identity, hardware, installed_apps,
-device_identity, event_logs, hardware,
-ioc, network_config,
-ioc, license_scan,
-network_diag, os_info, processes,
-software_actions, vuln_scan, windows_updates.
-tar, vuln_scan, wifi, windows_updates.
-software_actions, vuln_scan, wifi, windows_updates.
+device_identity, ioc, network_diag, os_info, processes,
+vuln_scan, windows_updates.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
 
