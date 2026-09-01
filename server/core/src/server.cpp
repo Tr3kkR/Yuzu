@@ -1180,8 +1180,9 @@ public:
                           "Dispatch calls refused because a supplied targeting argument "
                           "named no device, plus dispatch-closure calls that named no target at "
                           "all (#2500), plus Destructive-class capabilities targeted without "
-                          "explicit agent_ids on REST (route=command) or MCP execute_instruction "
-                          "(route=mcp, #3685). Both labels are closed sets; every reachable pair "
+                          "explicit agent_ids on REST (route=command), MCP execute_instruction "
+                          "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
+                          "Both labels are closed sets; every reachable pair "
                           "is pre-seeded at boot so absent() stays meaningful.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
@@ -1214,7 +1215,11 @@ public:
         // seeding it here would publish a series claiming a reachability
         // that does not exist, which is exactly what the per-route seeding
         // above exists to avoid.
-        for (const char* route : {"command", "mcp"})
+        // "dashboard" seeded alongside the other two (PR6.0b): a series created
+        // only on first use reads as ABSENT until the first refusal, which is
+        // exactly the absent()-alerting break the single-array discipline exists
+        // to prevent -- and three docs tell operators to alert on this series.
+        for (const char* route : {"command", "mcp", "dashboard"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
