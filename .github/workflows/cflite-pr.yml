@@ -70,6 +70,47 @@ jobs:
                                # both corpus download and target pruning
       security-events: write   # SARIF upload of crash findings
     steps:
+      # #3770: a non-empty-but-STALE cifuzz-coverage-latest actively prunes a
+      # target that IS affected by this PR (upstream's own fail-open only
+      # protects the EMPTY-match case - see cflite-batch.yml's header). This
+      # step re-runs the SAME name-scoped artifact lookup build_fuzzers itself
+      # uses (`actions: read`, already granted above) and, if the newest match
+      # is older than MAX_AGE_DAYS, forces build_fuzzers into keep-all instead
+      # of letting it prune off a possibly-stale map. No new permission scope:
+      # keep-all only means NOT passing keep-unaffected-fuzz-targets=false, it
+      # never deletes or writes anything.
+      - name: Check coverage-artifact age
+        id: coverage_age
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Max age (days) before cifuzz-coverage-latest is trusted to drive
+          # affected-target pruning. Chosen against the ~10-day measured
+          # cadence of cflite-batch.yml's only trigger (closure-touching dev
+          # pushes; no cron, see that workflow's header) - 30 days is 3x that
+          # cadence, so a healthy refresh cycle never trips this, while a
+          # stalled batch leg (an unfixed cflite-batch-broken issue, or a
+          # long quiet period on the fuzzed closure) does.
+          MAX_AGE_DAYS: 30
+        run: |
+          set -euo pipefail
+          created_at=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=cifuzz-coverage-latest&per_page=1" \
+            --jq '.artifacts[0].created_at // empty')
+          if [ -z "$created_at" ]; then
+            echo "::notice title=cflite coverage age::no cifuzz-coverage-latest artifact found - build_fuzzers will fail open to keep-all on its own (nothing to prune against)."
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          created_epoch=$(date -u -d "$created_at" +%s)
+          now_epoch=$(date -u +%s)
+          age_days=$(( (now_epoch - created_epoch) / 86400 ))
+          if [ "$age_days" -gt "$MAX_AGE_DAYS" ]; then
+            echo "::notice title=cflite coverage age::cifuzz-coverage-latest is ${age_days}d old (max ${MAX_AGE_DAYS}d) - STALE, falling back to keep-all (no affected-target pruning this run)."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice title=cflite coverage age::cifuzz-coverage-latest is ${age_days}d old (max ${MAX_AGE_DAYS}d) - within range, affected-target pruning proceeds normally."
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build fuzzers
         id: build
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
@@ -79,7 +120,12 @@ jobs:
           # Pruning of unaffected targets happens in THIS step and needs the
           # coverage report artifact; the input has no default, so omitting
           # it leaves the build container with an empty token and pruning
-          # silently keeps all targets.
+          # silently keeps all targets. The age check above forces keep-all
+          # when the coverage report is too stale to trust for pruning
+          # (#3770) - a fresh-TIMESTAMP stale-CONTENT artifact (e.g. from a
+          # main-ref dispatch) would still slip this check, but cflite-
+          # batch.yml's dev ref-guards close the known producer of that case.
+          keep-unaffected-fuzz-targets: ${{ steps.coverage_age.outputs.stale }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run fuzzers
