@@ -10,7 +10,8 @@
   `yuzu_exec_correlation_reap_total` / `_reap_clock_anomaly_total` / `_store_degrade_total` (the
   retention sweep), `_write_degrade_total` (the dispatch-time write), and `_read_degrade_total`
   (the response-receipt lookup, labelled `reason`), plus a new `YuzuExecCorrelationReapClockAnomaly`
-  Prometheus alert on the clock-anomaly counter. `created_at` is authored from Postgres `now()`
-  in-SQL (not the writing replica's app clock), matching the reap's own clock domain; the retention
-  sweep's persisted anchor is now checked-parsed (junk/negative/overflowed values are rejected as a
-  clock anomaly, never silently coerced).
+  Prometheus alert (with promtool behavior test cases) on the clock-anomaly counter. `created_at` is
+  authored from Postgres `now()` in-SQL (not the writing replica's app clock), matching the reap's
+  own clock domain; the retention sweep's persisted anchor is now checked-parsed and the forward-skew
+  comparison is overflow-safe (junk/negative/overflowed-string/implausibly-large values are all
+  rejected as a clock anomaly, never silently coerced or fed into undefined-behavior arithmetic).

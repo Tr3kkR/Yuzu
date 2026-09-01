@@ -1660,7 +1660,7 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
     GatewayResponseHarness h(pool);
     TrackerScope ts{h.svc, pool};
 
-    for (const std::string& execution_id :
+    for (const std::string execution_id :
          {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
         CAPTURE(execution_id);
         const std::string command_id = "plugin-cmd-" + execution_id;
@@ -1671,6 +1671,45 @@ TEST_CASE("notify_exec_tracker: non-tracked correlation-id prefixes produce "
 
         CHECK(ts.tracker->get_agent_statuses(execution_id).empty());
     }
+}
+
+TEST_CASE("resolve_execution_id bumps yuzu_exec_correlation_read_degrade_total "
+          "by reason (adversarial review, PR #3780)",
+          "[pg][agent_service][executions]") {
+    // The read-degrade counter is the only signal for a sustained lookup
+    // failure on this hot path (hit on every CommandResponse) — mirrors
+    // test_software_inventory_store.cpp's "read-degrade bumps
+    // yuzu_inventory_read_degrade_total by reason (#1675)" precedent.
+    // Dropping the command_execution table under the open store forces a
+    // genuine query_failed on the next lookup (not a coincidental
+    // pool-exhaustion path).
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+
+    h.svc.record_execution_id("cmd-A", "exec-42"); // a mapping DOES exist...
+
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto drop = pg::exec_params(lease.get(),
+                                    "DROP TABLE execution_tracker.command_execution",
+                                    std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    // ...but the lookup can no longer reach it.
+    auto resp = GatewayResponseHarness::make_response("cmd-A", apb::CommandResponse::SUCCESS);
+    h.svc.process_gateway_response("agent-1", resp);
+
+    // A terminal response resolves execution_id from TWO independent call
+    // sites (response-store stamping at agent_service_impl.cpp:1577, then
+    // again inside notify_exec_tracker at :1606) — both hit the dropped
+    // table, so the counter increments twice per response, not once.
+    CHECK(h.metrics
+              .counter("yuzu_exec_correlation_read_degrade_total", {{"reason", "query_failed"}})
+              .value() == 2.0);
 }
 
 TEST_CASE("notify_exec_tracker: null tracker pointer is a no-op (shutdown contract)",

@@ -1010,6 +1010,44 @@ TEST_CASE("ExecutionTracker: reap declines on an overflowed persisted "
     CHECK(second->clock_anomaly);
 }
 
+TEST_CASE("ExecutionTracker: reap does not overflow on a legitimately-parsed "
+          "INT64_MAX anchor (adversarial review Blocker round 2, PR #3780)",
+          "[pg][execution_tracker]") {
+    // Distinct from the "overflowed" test above: that one exercises a
+    // string strtoll cannot even PARSE (rejected by parse_reap_i64 itself,
+    // via errno==ERANGE). THIS value parses cleanly and is >= 0, so it
+    // passes parse_reap_i64 -- the residual defect was in the CONSUMING
+    // arithmetic (`anchor + kMaxPlausibleSkewSecs`), not the parse. Under
+    // UBSan this specific value reproduces "signed integer overflow:
+    // 9223372036854775807 + 86400 cannot be represented in type 'long
+    // int'" against the pre-fix comparison. The fixed comparison
+    // (`now_s - anchor > kMaxPlausibleSkewSecs`, both operands already
+    // non-negative) must decline this as a forward-skew anomaly without
+    // invoking UB.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+
+    auto first = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(first.has_value());
+    CHECK_FALSE(first->clock_anomaly);
+
+    {
+        pg::PgPool& pool = tracker_bundle.pool();
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = "
+            "'9223372036854775807' WHERE key = 'cmd_exec_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker_bundle->reap_command_execution_mappings();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
 TEST_CASE("ExecutionTracker: the four non-tracked correlation-id VALUES "
           "round-trip opaquely through the PG-backed store",
           "[pg][execution_tracker]") {
@@ -1028,7 +1066,7 @@ TEST_CASE("ExecutionTracker: the four non-tracked correlation-id VALUES "
     // test_agent_service_impl.cpp), not in the store.
     yuzu::test::ExecutionTrackerPg tracker_bundle;
 
-    for (const std::string& execution_id :
+    for (const std::string execution_id :
          {"polchk-abc123", "bundle-def456", "preflight-run1-check2", "deployment-xyz-stage"}) {
         CAPTURE(execution_id);
         const std::string command_id = "plugin-cmd-" + execution_id;

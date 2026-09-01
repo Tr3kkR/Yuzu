@@ -1110,7 +1110,19 @@ ExecutionTracker::reap_command_execution_mappings() {
             }
             anchor = *parsed_anchor;
         }
-        if (has_anchor && now_s > anchor + kMaxPlausibleSkewSecs) {
+        // Overflow-safe comparison (adversarial review Blocker round 2,
+        // PR #3780): `parse_reap_i64` rejects unparseable/negative values
+        // but NOT an implausibly-large one that parses cleanly (e.g.
+        // INT64_MAX from a bad migration/manual repair/corruption) --
+        // `anchor + kMaxPlausibleSkewSecs` on such a value is signed-
+        // integer-overflow UB (confirmed via UBSan). Subtracting instead
+        // of adding cannot overflow: both operands are already sanitised
+        // to be non-negative int64_t, so their difference always fits
+        // (int64_t's negative range strictly exceeds its positive range).
+        // The `now_s >= anchor` guard preserves the existing branch order
+        // -- when now_s < anchor, this condition is false and control
+        // falls through to the backward-anomaly check below, unchanged.
+        if (has_anchor && now_s >= anchor && now_s - anchor > kMaxPlausibleSkewSecs) {
             spdlog::warn("ExecutionTracker::reap_command_execution_mappings declined: now_s {} "
                          "implausibly ahead of anchor {}",
                          now_s, anchor);
