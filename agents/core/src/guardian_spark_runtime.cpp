@@ -320,28 +320,32 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // class's own established pattern for every other off-thread-executing capture
     // (make_handler's shared_ptr<GuardianSparkRuntime>, this file's header doc).
     //
-    // Wrapped in try/catch (unhappy-path UP-1, adversarial-review-class finding):
-    // GuardianIoExecutor::run()'s own outer try/catch does not cover its second lock
-    // acquisition (the `cv.wait_until` wait site) - a std::system_error from THAT
-    // construction would otherwise propagate out of this function with
-    // arming_keys_[key] never erased, permanently orphaning the key (every future
-    // attach on it fails-fast "busy" forever, no self-heal). Pre-existing gap in the
-    // shared executor class itself (GuardianStateReader's own callers are equally
-    // unguarded) - not fixed here, but this function's OWN new state must not leak
-    // because of it. apply_rules' existing per-rule exception firewall already
-    // catches whatever this rethrows, so the agent does not crash either way; this
-    // closes the orphaned-key gap specifically.
-    // Nested std::expected: the OUTER layer is io_executor_'s own bounded-wait
-    // outcome (IoFailure); the INNER is backend_->arm()'s own synchronous refusal,
-    // matching this function's own doc a few lines above.
-    // Gate 8 re-review (security-guardian): matches this function's own RAII
-    // convention instead of a bare try/catch/cleanup/rethrow. Declared and armed
-    // BEFORE the risky off-lock call, committed only once it returns without
-    // throwing - if it DOES throw, this guard's destructor fires during that
-    // unwind (fn() itself takes registry_mu_, since it isn't held here) and undoes
-    // phase 1's arming_keys_/index_ bookkeeping. No live subscription exists to
-    // disarm here (the exception means we never got an io_result at all,
-    // successful or not) - the in-memory cleanup is all that is needed.
+    // UP-1 (unhappy-path, adversarial-review-class finding): GuardianIoExecutor::
+    // run()'s own outer try/catch does not cover its second lock acquisition (the
+    // `cv.wait_until` wait site) - a std::system_error from THAT construction would
+    // otherwise propagate out of this function with arming_keys_[key] never erased,
+    // permanently orphaning the key (every future attach on it fails-fast "busy"
+    // forever, no self-heal). Pre-existing gap in the shared executor class itself
+    // (GuardianStateReader's own callers are equally unguarded) - not fixed here,
+    // but this function's OWN new state must not leak because of it.
+    // apply_rules' existing per-rule exception firewall already catches whatever
+    // this rethrows, so the agent does not crash either way; the guard below closes
+    // the orphaned-key gap specifically. Nested std::expected in the return type:
+    // the OUTER layer is io_executor_'s own bounded-wait outcome (IoFailure); the
+    // INNER is backend_->arm()'s own synchronous refusal, matching this function's
+    // own doc a few lines above.
+    //
+    // Gate 8 re-review (security-guardian): a RAII GuardianRollback, matching this
+    // function's own convention, rather than a bare try/catch/cleanup/rethrow (an
+    // earlier draft of this exact fix used the latter and was flagged for it -
+    // inconsistent with how the OTHER rollback in this function, a few lines below,
+    // handles the same class of problem). Declared and armed BEFORE the risky
+    // off-lock call, committed only once it returns without throwing - if it DOES
+    // throw, this guard's destructor fires during that unwind (fn() itself takes
+    // registry_mu_, since it isn't held here) and undoes phase 1's arming_keys_/
+    // index_ bookkeeping. No live subscription exists to disarm here (the exception
+    // means we never got an io_result at all, successful or not) - the in-memory
+    // cleanup is all that is needed.
     GuardianRollback arming_rollback;
     arming_rollback.fn = [this, key, rule_id, gen] {
         std::lock_guard<std::mutex> lk{registry_mu_};
