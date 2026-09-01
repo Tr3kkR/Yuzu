@@ -104,16 +104,23 @@ GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
 void GuardianSparkRuntime::submit_disarm_off_lock(const DisarmWork& work) {
     // fn's own return value is discarded below - disarm() is void and was never
     // awaited for success even in the old inline call this replaces (see the
-    // header doc). Only Timeout/CapacityExhausted/etc are worth counting: they
-    // mean the OS watcher's fate is now genuinely unknown to us (still armed?
-    // torn down mid-flight?), which the old synchronous call never risked.
+    // header doc).
     auto result =
         io_executor_.run(work.io_class, work.key, cfg_.backend_op_deadline,
                          [backend = backend_, sub = work.subscription]() -> int {
                              backend->disarm(sub);
                              return 0;
                          });
-    if (!result)
+    // backend_op_timeouts_ is documented (guardian_spark_runtime.hpp) as counting
+    // deadline hits specifically - only IoFailure::Timeout, matching attach_rule's
+    // own increment site (adversarial review C3/k1: this previously counted EVERY
+    // executor failure here, including a clean Stopped during shutdown or
+    // CapacityExhausted, both unrelated to a hung backend call and misleading for
+    // an operator diagnosing a wedge from this counter alone). A non-timeout
+    // disarm failure still means the OS watcher's fate is genuinely unknown to us
+    // (unlike the old synchronous call, which never risked this) but that is a
+    // DIFFERENT condition from a deadline hit and does not belong in this counter.
+    if (!result && result.error() == IoFailure::Timeout)
         backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -272,13 +279,63 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // layers to unwrap below: the OUTER expected is io_executor_'s own bounded-wait
     // outcome (timeout/capacity/etc, IoFailure), the INNER is backend_->arm()'s own
     // synchronous refusal, exactly as returned before this call moved off-lock.
-    auto io_result = io_executor_.run(*io_class, key, cfg_.backend_op_deadline,
-                                      [backend = backend_, spec]() { return backend->arm(spec); });
+    //
+    // C1/c1 (adversarial review, both reviewers independently HIGH): GuardianIoExecutor
+    // itself documents that a result arriving after the caller's deadline is simply
+    // discarded ("the late worker write is discarded" - guardian_io_executor.hpp).
+    // That is safe for a STATE READ (idempotent, re-read next sweep) but NOT for arm():
+    // a late SUCCESS mints a real, live SparkEngine subscription that would otherwise
+    // be permanently untracked - no keys_/rules_ entry ever references it, so nothing
+    // ever disarms it. The check below closes the common case: arming_keys_[key] is
+    // the authoritative "is anyone still waiting for THIS episode" signal, erased by
+    // this function's own post-wait commit UNCONDITIONALLY (every outcome branch)
+    // under registry_mu_ - so a late-arriving success that finds its own rule_id no
+    // longer there (this episode already concluded, or a NEWER episode has since
+    // claimed the key) self-disarms instead of leaking. This is NOT airtight: there is
+    // a narrow residual window between the submitter's cv.wait_until deciding Timeout
+    // (inside io_executor_'s own internals) and this function reaching the erase
+    // below, during which this check can still see "present" and hand back a
+    // subscription the submitter has already stopped waiting for. Closing that
+    // requires io_executor_ itself to expose an abandonment signal synchronized with
+    // its own internal cell/cv decision point - a GuardianIoExecutor API extension,
+    // out of scope for this fix (tracked: needs its own design, shared by
+    // GuardianStateReader too). This reduces a GUARANTEED leak on every timeout-then-
+    // late-success to a rare scheduling race, which is the honest claim - not "fixed".
+    // self_keepalive, NOT `this`: this lambda can still be running on a detached
+    // io_executor_ worker after ~GuardianSparkRuntime() runs (the whole reason
+    // io_executor_'s workers are detached, not joined - a wedged OS call cannot be
+    // cancelled). A raw `this` capture would use-after-free registry_mu_/arming_keys_
+    // the moment the worker finally returns past that destruction. Matches the
+    // class's own established pattern for every other off-thread-executing capture
+    // (make_handler's shared_ptr<GuardianSparkRuntime>, this file's header doc).
+    auto io_result = io_executor_.run(
+        *io_class, key, cfg_.backend_op_deadline,
+        [self_keepalive = shared_from_this(), backend = backend_, spec, key,
+         rule_id]() -> std::expected<std::uint64_t, std::string> {
+            auto armed = backend->arm(spec);
+            if (!armed)
+                return armed;
+            bool still_wanted = false;
+            {
+                std::lock_guard<std::mutex> lk{self_keepalive->registry_mu_};
+                const auto it = self_keepalive->arming_keys_.find(key);
+                still_wanted = it != self_keepalive->arming_keys_.end() && it->second.rule_id == rule_id;
+            }
+            if (!still_wanted) {
+                backend->disarm(*armed); // off-lock: this worker thread never held registry_mu_ for it
+                return std::unexpected(std::string{"arm succeeded after abandonment"});
+            }
+            return armed;
+        });
 
     std::optional<DisarmWork> stale_disarm; // set below iff we must undo a LATE success
     std::expected<std::uint64_t, std::string> outcome = new_gen;
     {
-        std::lock_guard<std::mutex> lk{registry_mu_};
+        // unique_lock, not lock_guard: the success-commit branch below needs to
+        // .unlock() explicitly before its exceptional-rollback path submits a
+        // bounded off-lock disarm (C2/c2, adversarial review) - see that branch's
+        // comment.
+        std::unique_lock<std::mutex> lk{registry_mu_};
         const auto it = arming_keys_.find(key);
         const bool withdrawn = it != arming_keys_.end() && it->second.withdrawn;
         arming_keys_.erase(key); // this in-flight episode is over either way
@@ -317,35 +374,49 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             index_->remove_rule(rule_id);
             outcome = std::unexpected(io_result->error());
         } else {
-            // Mirrors attach_rule's fast-path rollback (same armed_here=true shape):
             // index_->add already ran in phase 1, and we now hold a live subscription
             // - a throw from here down (keys_/rules_/pending_initial insert, or a
             // throwing waker/outbox_waker COPY, exactly as the fast path's own
             // "throw AFTER arm()" test exercises) must not leave keys_/rules_/index_
-            // desynced or leak the watcher. Calls backend_->disarm() synchronously,
-            // still under registry_mu_ (unlike the normal off-lock disarm path) -
-            // this is the SAME tradeoff the pre-#2233 code always made for this exact
-            // rare unwind case (a map-insert bad_alloc or a throwing waker copy, not
-            // the common path), so it does not reopen the liveness hazard this PR
-            // fixes.
+            // desynced or leak the watcher. UNLIKE the fast (inline-type) path's
+            // rollback, this one must NOT call backend_->disarm() while holding
+            // registry_mu_ (adversarial review C2/c2, both reviewers independently
+            // confirmed HIGH): that would let the exact class of hung backend call
+            // this PR exists to unblock wedge every other registry_mu_ operation
+            // again, just via a rarer trigger (an allocation failure or a throwing
+            // waker copy, not the common path - rarity does not bound duration once
+            // entered). So: catch here, undo ONLY the in-memory state (all nothrow
+            // map operations) while still locked, unlock explicitly, submit the
+            // compensating disarm bounded and off-lock, THEN rethrow - the caller
+            // still sees the original exception, exactly as before.
             const std::uint64_t sub = **io_result;
-            GuardianRollback rollback;
-            rollback.fn = [this, rule_id, key, sub] {
+            const IoClass sub_ioc = *io_class;
+            try {
+                auto pk = std::make_shared<PerKey>();
+                pk->spec = spec;
+                pk->subscription = sub;
+                keys_.emplace(key, pk);
+                rules_.insert_or_assign(rule_id, std::move(rg));
+                pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
+                waker = pending_initial_waker_;
+                outbox_waker = outbox_enqueue_waker_;
+                enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
+            } catch (...) {
                 index_->remove_rule(rule_id); // undo phase 1's index_->add
                 keys_.erase(key);
-                backend_->disarm(sub);
                 rules_.erase(rule_id);
-            };
-            auto pk = std::make_shared<PerKey>();
-            pk->spec = spec;
-            pk->subscription = sub;
-            keys_.emplace(key, pk);
-            rules_.insert_or_assign(rule_id, std::move(rg));
-            pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
-            waker = pending_initial_waker_;
-            outbox_waker = outbox_enqueue_waker_;
-            enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
-            rollback.committed = true;
+                lk.unlock(); // BEFORE the bounded backend call - see the comment above
+                try {
+                    submit_disarm_off_lock(DisarmWork{sub_ioc, key, sub});
+                } catch (...) {
+                    // submit_disarm_off_lock should not throw (io_executor_.run()
+                    // contains worker/launch failures internally), but this runs
+                    // during an active exception's unwind - a second throw here
+                    // would std::terminate, so contain defensively rather than
+                    // trust that guarantee transitively.
+                }
+                throw; // original exception, unchanged
+            }
         }
     }
     if (stale_disarm)
@@ -1184,16 +1255,25 @@ void GuardianSparkRuntime::begin_stop() {
         reader->request_stop();
     // #2233 item 3: wake any attach_rule/detach_rule currently parked in a bounded
     // backend wait immediately, rather than making it ride out cfg_.backend_op_deadline.
-    // GuardianIoExecutor::stop() is idempotent, non-throwing, and safe to call from
-    // ~GuardianSparkRuntime() same as request_stop() above. NOTE this does not make
-    // GuardianEngine::stop() itself instant: stop() takes GuardianEngine::mtx_
-    // BEFORE calling begin_stop() (guardian_engine.cpp), so if apply_rules() is
-    // currently the one parked in a bounded wait, stop() cannot even reach this
-    // call until that wait resolves - bounded by cfg_.backend_op_deadline, same as
-    // apply_rules() itself, not instant. This DOES matter for a caller that already
-    // holds mtx_ across a DIFFERENT blocking section calling begin_stop() directly,
-    // and for the runtime's own destructor path.
-    io_executor_.stop();
+    // NOTE this does not make GuardianEngine::stop() itself instant: stop() takes
+    // GuardianEngine::mtx_ BEFORE calling begin_stop() (guardian_engine.cpp), so if
+    // apply_rules() is currently the one parked in a bounded wait, stop() cannot even
+    // reach this call until that wait resolves - bounded by cfg_.backend_op_deadline,
+    // same as apply_rules() itself, not instant. This DOES matter for a caller that
+    // already holds mtx_ across a DIFFERENT blocking section calling begin_stop()
+    // directly, and for the runtime's own destructor path.
+    //
+    // Contained in try/catch (adversarial review C4/k2): idempotent and DOCUMENTED
+    // as nonblocking, but its internal std::lock_guard is, per the standard, permitted
+    // to throw std::system_error - not "non-throwing" as an earlier version of this
+    // comment claimed. begin_stop() runs from ~GuardianSparkRuntime(), implicitly
+    // noexcept; an escaping exception there would std::terminate the agent. Mirrors
+    // GuardianStateReader::request_stop()'s identical containment of the same
+    // executor's stop() call, just above.
+    try {
+        io_executor_.stop();
+    } catch (...) {
+    }
 }
 
 std::size_t GuardianSparkRuntime::armed_key_count() const {
