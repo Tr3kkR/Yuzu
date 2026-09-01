@@ -345,6 +345,27 @@ TEST_CASE("unlink_at refuses to delete when it cannot measure the entry", "[conf
     CHECK(fs::exists(root_dir / "big.tmp")); // never deleted uncharged
 }
 
+TEST_CASE("capture_identity agrees with the identity open_root pinned", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_ident_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    // capture_identity is exported for reuse, but every other test reaches it
+    // only through open_root, so a field-mapping regression (dev/ino swapped or
+    // truncated) would be invisible.
+    const auto direct = capture_identity(opened.root->fd_.get());
+    REQUIRE(direct.has_value());
+    CHECK(*direct == opened.root->identity());
+
+    struct stat st{};
+    REQUIRE(::stat(root_dir.c_str(), &st) == 0);
+    CHECK(direct->dev == static_cast<std::uint64_t>(st.st_dev));
+    CHECK(direct->ino == static_cast<std::uint64_t>(st.st_ino));
+}
+
 TEST_CASE("open_root refuses a root path containing an embedded NUL", "[confined_fs]") {
     yuzu::test::TempDir tmp{"yuzu_test_confined_posix_rootnul_"};
     const fs::path real_root = tmp.path / "root";

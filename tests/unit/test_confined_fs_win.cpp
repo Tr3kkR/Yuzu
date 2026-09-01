@@ -225,6 +225,41 @@ void run_mid_walk_junction_swap(int depth) {
 
 } // namespace
 
+TEST_CASE("open_root refuses a root path containing an embedded NUL", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_rootnul_"};
+    const std::filesystem::path real_root = tmp.path / L"root";
+    std::filesystem::create_directories(real_root);
+
+    // c_str() truncates at the NUL, so an unchecked open_root would pin
+    // <root> while the caller believes it named something else.
+    std::wstring poisoned = real_root.wstring();
+    poisoned.push_back(L'\0');
+    poisoned += L"\\decoy";
+
+    OpenRootResult r = open_root(std::filesystem::path{poisoned});
+    CHECK_FALSE(r.root.has_value());
+    CHECK(r.reason == Reason::RootInvalid);
+}
+
+TEST_CASE("delete_matching honours a non-default entry cap", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_entrycap_"};
+    const std::filesystem::path root_dir = tmp.path / L"root";
+    std::filesystem::create_directories(root_dir);
+    for (const wchar_t* n : {L"a.tmp", L"b.tmp", L"c.tmp", L"d.tmp", L"e.tmp"})
+        write_file(root_dir / n, "x");
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    DeleteLimits limits = open_limits();
+    limits.max_entries = 3;
+    DeleteResult result = delete_matching(*opened.root, [](std::string_view) { return true; },
+                                          limits);
+
+    CHECK(result.stop_reason == Reason::EntryCap);
+    CHECK(result.tally.entries_seen <= 3);
+}
+
 TEST_CASE("delete_matching happy path deletes matched files with exact sorted outcomes",
           "[confined_fs]") {
     yuzu::test::TempDir root_dir{"yuzu_test_confined_win_happy_"};

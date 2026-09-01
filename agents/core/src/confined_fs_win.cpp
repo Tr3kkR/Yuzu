@@ -484,7 +484,14 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
 
         const std::byte* cursor = buffer.data();
         for (;;) {
-            const auto* entry = reinterpret_cast<const FILE_FULL_DIR_INFO*>(cursor);
+            // Aliasing/alignment proof (docs/cpp-conventions.md requires one at a
+        // syscall boundary): `buffer` is a std::vector<std::byte>, whose data()
+        // is suitably aligned for any scalar type, and the kernel writes each
+        // FILE_FULL_DIR_INFO at an 8-byte-aligned offset -- NextEntryOffset is
+        // documented as 8-aligned -- so every `cursor` derived by advancing
+        // through those offsets is correctly aligned for this type. The pointee
+        // is read-only and owned by `buffer`, which outlives every use here.
+        const auto* entry = reinterpret_cast<const FILE_FULL_DIR_INFO*>(cursor);
 
             const std::wstring_view wide_name(entry->FileName,
                                                entry->FileNameLength / sizeof(WCHAR));
@@ -564,7 +571,7 @@ struct WinOps {
         return std::chrono::steady_clock::now();
     }
 
-    const FileIdentity& root_id;
+    FileIdentity root_id; // by value, matching PosixOps -- no borrow to outlive
 };
 
 } // namespace

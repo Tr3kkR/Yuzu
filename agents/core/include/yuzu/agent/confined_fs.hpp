@@ -56,6 +56,14 @@
  *     with O_RDONLY|O_NOFOLLOW|O_CLOEXEC). That is a share-mode/fd PIN, not
  *     a comparable identity VALUE -- there is no dev:ino pair constructed or
  *     compared anywhere in that flow.
+ *
+ *   A note on `WinHandle` below, since it is a fourth thing in this space:
+ *   `guard_win_handle.hpp` already has `ScopedWinHandle<CloseFn>` with the same
+ *   semantics, but it is a PRIVATE header under src/ and this is a PUBLIC
+ *   header, so reusing it would mean hoisting it into include/ and widening its
+ *   audience as a side effect of this PR. That is a deliberate deferral, not an
+ *   oversight: if a third consumer appears, hoist it and collapse the two.
+ *
  *   - guardian_state_reader.cpp:95 builds a `dev:ino` STRING
  *     (`file_identity()`) purely as an opaque change-detection token for
  *     convergence bookkeeping -- explicitly "NOT part of any verdict". Its
