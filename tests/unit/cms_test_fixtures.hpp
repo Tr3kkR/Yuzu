@@ -44,6 +44,7 @@ struct SslFreer {
     void operator()(X509* p) const noexcept { X509_free(p); }
     void operator()(X509_NAME* p) const noexcept { X509_NAME_free(p); }
     void operator()(CMS_ContentInfo* p) const noexcept { CMS_ContentInfo_free(p); }
+    void operator()(EVP_MD_CTX* p) const noexcept { EVP_MD_CTX_free(p); }
 };
 template <typename T> using ssl_ptr = std::unique_ptr<T, SslFreer>;
 
