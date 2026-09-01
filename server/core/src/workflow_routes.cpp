@@ -2063,8 +2063,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // closes the UP2-4 FAST-agent race where a sub-millisecond
         // loopback agent could reply before a post-dispatch
         // register-mapping call landed. cmd_dispatch registers the
-        // mapping in `agent_service_.cmd_execution_ids_` BEFORE any
-        // RPC is sent so the response handler always finds the entry.
+        // mapping (HA WS-1(1b): PG-backed via
+        // `ExecutionTracker::record_command_execution`) BEFORE any RPC is
+        // sent so the response handler always finds the entry.
         // agents_targeted is updated below once dispatch confirms `sent`.
         std::string execution_id;
         if (execution_tracker) {

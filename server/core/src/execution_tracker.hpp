@@ -149,6 +149,16 @@ struct ExecutionStatsQuery {
     int limit{50};
 };
 
+/// HA WS-1(1b), ADR-2002 section 5. Outcome of a `command_execution`
+/// correlation-table retention pass. Mirrors `SessionStore::ReapOutcome`'s
+/// shape (clock-guarded-retention routed concern) — `clock_anomaly` true
+/// means the pass declined due to an implausible DB `now()` reading, not
+/// that rows were deleted.
+struct CommandExecutionReapOutcome {
+    int deleted{0};
+    bool clock_anomaly{false};
+};
+
 class ExecutionTracker {
 public:
     explicit ExecutionTracker(pg::PgPool& pool);
@@ -209,6 +219,79 @@ public:
     std::vector<AgentExecutionStats> get_agent_statistics(const ExecutionStatsQuery& q = {}) const;
     std::vector<DefinitionExecutionStats> get_definition_statistics(const ExecutionStatsQuery& q = {}) const;
     FleetExecutionSummary get_fleet_summary(int64_t since = 0) const;
+
+    // ── Command <-> execution correlation (HA WS-1(1b), ADR-2002 section 5) ──
+    //
+    // Replaces AgentServiceImpl's former in-process `cmd_execution_ids_` map.
+    // That map was replica-local: a command dispatched on one server instance
+    // populated it only in that process's memory, so a CommandResponse that
+    // landed on a DIFFERENT gateway-fronted replica found no mapping and
+    // silently dropped the correlation (no responses.execution_id stamp, no
+    // executions-drawer SSE event, no tracker-counter advance for that
+    // response) — exactly the cross-instance correlation hazard ADR-2002
+    // section 5 names `cmd_execution_ids_` as a required PG migration to close.
+
+    /// Records (or clears) a command_id -> execution_id mapping. Last-write-
+    /// wins on a repeated command_id, matching the former map's `operator[]=`
+    /// semantics. An empty `execution_id` deletes any existing mapping (the
+    /// former map's explicit-clear branch; no current caller exercises it).
+    /// Best-effort by design: a write failure degrades OBSERVABILITY for
+    /// this one command — the executions drawer misses its agent-transition
+    /// events — it never FAILS the dispatch that is calling this
+    /// (record_execution_id / server.cpp's command_dispatch_fn calls this
+    /// BEFORE the RPC, UP2-4; the return value is best-effort telemetry for
+    /// the caller to count, not a signal to act on).
+    ///
+    /// It DOES have a bounded worst-case DELAY: a single attempt at
+    /// `kWriteTimeout` (no retry — deliberately NOT `update_agent_status`'s
+    /// retry-once shape, because that call sits on the async gateway-
+    /// response path while this one sits on the SYNCHRONOUS pre-RPC dispatch
+    /// path; a second attempt here would double the worst-case block on the
+    /// calling worker thread — REST/dashboard/MCP dispatch, or a background
+    /// runner such as ScheduleRunner/PreflightRunner/PolicyEvaluator,
+    /// anything feeding the shared CommandDispatchFn closure — under
+    /// sustained pool contention). Returns false on failure so the caller can count a
+    /// degrade metric; a caller MUST NOT fail or delay dispatch on a false
+    /// return (governance Gate 4 unhappy-path UP-1/UP-11, Gate 3 performance
+    /// review — the prior wording here claimed zero delay, which was false).
+    [[nodiscard]] bool record_command_execution(const std::string& command_id,
+                                                const std::string& execution_id);
+
+    /// Resolves a previously-recorded mapping. Returns nullopt for an unknown
+    /// command_id (out-of-band dispatch, a reaped/aged-out mapping, or a
+    /// degraded read) — callers treat nullopt exactly like the former map's
+    /// find()==end() branch: nothing to publish, not an error.
+    /// NON-DESTRUCTIVE: a lookup never deletes the row. HF-1 (multi-agent
+    /// fan-out): one command_id is dispatched to N agents, each sending its
+    /// own response against the same command_id — deleting on the first
+    /// response would strand agents 2..N with no execution_id to stamp.
+    /// `degrade_reason`, when non-null, is set to "pool_exhausted" or
+    /// "query_failed" iff the nullopt return is a STORE DEGRADE rather than
+    /// a genuine miss (adversarial review Should-fix, PR #3780: previously
+    /// indistinguishable from an ordinary out-of-band-dispatch/aged-out
+    /// miss, which is the common case on every CommandResponse — a
+    /// sustained pool-exhaustion degrade on this hot path had no signal
+    /// pointing at it specifically). Left untouched on success or a
+    /// genuine miss; callers should only inspect it when the return is
+    /// nullopt.
+    [[nodiscard]] std::optional<std::string>
+    lookup_execution_id(const std::string& command_id, std::string* degrade_reason = nullptr) const;
+
+    /// Clock-guarded retention sweep for the `command_execution` table
+    /// (routed concern "Clock-guarded retention", CLAUDE.md). Mirrors
+    /// `SessionStore::reap_expired`'s shape: an advisory lock taken as its
+    /// own statement, DB `now()` read once in-SQL under that lock (so the
+    /// cutoff, the anchor comparison, and the anchor update share one clock
+    /// domain), a persisted+sanitised anchor, forward- and backward-anomaly
+    /// decline, and an unconditional per-pass cap — copy the SHAPE, never the
+    /// constants (this table's window/cap are tuned to it, not borrowed from
+    /// `session_store`'s). Missing-anchor decision: PROCEED on the first pass
+    /// (`ResultSetStore`'s answer, same choice `SessionStore` made) — a
+    /// mapping is a regenerable observability aid, not compliance evidence,
+    /// so a from-boot skewed clock deleting a batch of already-consumed
+    /// mappings is an acceptable worst case.
+    [[nodiscard]] std::expected<CommandExecutionReapOutcome, std::string>
+    reap_command_execution_mappings();
 
     /// Whether the store is usable (schema migrated). False after a failed
     /// migration — feeds the `/readyz` probe so a broken execution-history

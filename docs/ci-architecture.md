@@ -135,6 +135,38 @@ registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
 
+### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
+
+PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
+inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
+deliberately path-gated to the fuzzed compile closure — six parser families
+under `server/core/src/` plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+"why did the fuzz check not run on my PR" is almost always "the PR touches
+nothing a harness compiles". The two workflows share one paths list;
+KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
+One known hole, deliberately accepted: event-level `paths:` evaluation
+inspects a bounded diff window (the #1978 limitation that moved `ci.yml`
+onto `detect-code-change.sh`), so a very large PR touching a fuzzed file
+can skip both legs; adopting the detect-code-change pattern here is
+tracked on #3771.
+
+`cflite-batch.yml` (push-to-dev on those paths; manual dispatch once the
+file is on `main` — until then push-to-dev is its only live trigger) grows
+the corpus and publishes the coverage report the PR job uses for
+affected-target pruning. State is GHA artifacts on 90-day retention and
+self-heals: if it expires or a download fails, PR runs degrade OPEN to
+seed corpora + keep-all pruning (slower, never a false green skip on that
+fully-expired path; short of expiry, though, a stale-but-unexpired coverage
+report can still prune an affected target — a tracked follow-up), and the
+next batch run regrows it.
+Expiry-by-inactivity files no issue — only a RED run alerts, so a long
+quiet period degrades silently. `prune` is dispatch-only — it replaces the
+corpus wholesale, so it never runs unattended. A red batch run auto-files
+a `cflite-batch-broken` issue (the `nightly-broken` pattern, minus the
+merge discipline — it is a repair prompt, not a gate); while it is open,
+coverage staleness silently degrades PR-time pruning, so treat it as
+same-week work.
+
 ### Capability matrix drift gate (`check-capability-matrix.sh`, #2204)
 
 Runs on every Linux CI leg immediately after `Build`, once

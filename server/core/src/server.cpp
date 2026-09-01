@@ -2576,6 +2576,53 @@ public:
                           "DB-clock-authored, ADR-2002 section 4)",
                           "counter");
         metrics_.counter("yuzu_auth_local_clock_backward_total");
+        // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
+        // correlation-table retention (ExecutionTracker's PG-backed
+        // command_execution table, replacing AgentServiceImpl's former
+        // in-process cmd_execution_ids_ map). Mirrors the session-reap
+        // metric trio above — same clock-guarded-retention shape, a
+        // separate table/store, so a separate counter family.
+        metrics_.describe("yuzu_exec_correlation_reap_total",
+                          "Aged-out command_id -> execution_id correlation-table rows deleted by "
+                          "the clock-guarded retention sweep (HA WS-1(1b))",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_reap_total");
+        metrics_.describe("yuzu_exec_correlation_reap_clock_anomaly_total",
+                          "Correlation-table reap passes declined due to an implausible (forward "
+                          "or backward) PostgreSQL now() reading vs the persisted anchor",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_reap_clock_anomaly_total");
+        metrics_.describe("yuzu_exec_correlation_store_degrade_total",
+                          "Correlation-table reap passes that failed outright (pool/query "
+                          "degradation), distinct from a clock-anomaly decline",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_store_degrade_total");
+        // Distinct from the reap-only counter above: this fires on the
+        // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
+        // not the retention sweep. Governance Gate 4/6 finding: previously
+        // log-only, no counter, so a sustained write-side degrade (unlike a
+        // reap failure) was invisible to Prometheus.
+        metrics_.describe("yuzu_exec_correlation_write_degrade_total",
+                          "Command-dispatch-time command_id -> execution_id correlation writes "
+                          "that failed (pool exhausted or query error) - the executions drawer "
+                          "misses these commands' agent-transition events; dispatch itself is "
+                          "unaffected",
+                          "counter");
+        metrics_.counter("yuzu_exec_correlation_write_degrade_total");
+        // Distinct from both counters above: this fires on the READ path
+        // (AgentServiceImpl::resolve_execution_id, hit on every
+        // CommandResponse) — adversarial review Should-fix, PR #3780: a
+        // degraded lookup was previously indistinguishable from the common
+        // "out-of-band dispatch" nullopt case, so a sustained pool/query
+        // degrade on this hot path had no signal pointing at it.
+        metrics_.describe("yuzu_exec_correlation_read_degrade_total",
+                          "Command-response-time command_id -> execution_id correlation lookups "
+                          "that degraded (reason: pool_exhausted or query_failed) rather than a "
+                          "genuine miss - the response's execution_id stamp/agent-transition "
+                          "event is dropped for it",
+                          "counter");
+        for (auto reason : {"pool_exhausted", "query_failed"})
+            metrics_.counter("yuzu_exec_correlation_read_degrade_total", {{"reason", reason}});
         // First-boot seed observability (authdb MEDIUM). Incremented exactly
         // once, iff `seed_admin_if_empty` actually seeded the sole admin row
         // (an empty `auth.users` table) — a no-op (table already populated,
@@ -4170,7 +4217,9 @@ public:
         //    refill happening every 60s would otherwise spam its history
         //    pane. record_send_time stays so the standard latency
         //    histogram still observes these dispatches (sec-INFO-10:
-        //    intentionally opted-out of cmd_execution_ids_).
+        //    intentionally opted out of the command_id -> execution_id
+        //    correlation, HA WS-1(1b)'s ExecutionTracker::command_execution
+        //    table).
         //  * forward_gateway_pending() drains commands queued for
         //    gateway-proxied agents so a fleet that mixes direct and
         //    gateway-connected hosts gets uniform dispatch.
@@ -18835,6 +18884,11 @@ private:
                 // display_name / oidc_sub (identity/PII), so age them out on a
                 // ~15m cadence. reap_expired is clock-guarded + capped (5000/pass).
                 constexpr int kSessionReapEveryNTicks = 450; // ~15 minutes at 2s/tick
+                // HA WS-1(1b), ADR-2002 section 5: command_id -> execution_id
+                // correlation-table retention. No PII (both ids are opaque),
+                // so this rides the same 60m cadence as the other non-PII
+                // stores above, not the tighter session cadence.
+                constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -19012,6 +19066,25 @@ private:
                             } else {
                                 metrics_.counter("yuzu_auth_session_store_degrade_total",
                                                  {{"op", "reap"}})
+                                    .increment();
+                            }
+                        }
+
+                        // 2e) command_id -> execution_id correlation-table
+                        // retention (HA WS-1(1b), ADR-2002 section 5). Same
+                        // clock-guarded shape as the session reap above, on
+                        // its own table/metric family (no PII, 60m cadence).
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kCmdExecutionReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_command_execution_mappings()) {
+                                if (reaped->deleted > 0)
+                                    metrics_.counter("yuzu_exec_correlation_reap_total")
+                                        .increment(static_cast<double>(reaped->deleted));
+                                if (reaped->clock_anomaly)
+                                    metrics_.counter("yuzu_exec_correlation_reap_clock_anomaly_total")
+                                        .increment();
+                            } else {
+                                metrics_.counter("yuzu_exec_correlation_store_degrade_total")
                                     .increment();
                             }
                         }
@@ -21538,8 +21611,9 @@ private:
                 cfg_.mcp_read_only, cfg_.mcp_disable,
                 // DispatchFn — reuses /api/command dispatch logic for MCP execute_instruction.
                 // #1088 — execution_id parameter added so the MCP tool's
-                // pre-created execution row is bridged into
-                // AgentServiceImpl's cmd_execution_ids_ map BEFORE any
+                // pre-created execution row is bridged into the
+                // command_id -> execution_id correlation (HA WS-1(1b):
+                // ExecutionTracker::record_command_execution) BEFORE any
                 // RPC fires (UP2-4 race close from PR 2). Empty
                 // execution_id is the legacy untracked path.
                 [this](const std::string& plugin, const std::string& action,

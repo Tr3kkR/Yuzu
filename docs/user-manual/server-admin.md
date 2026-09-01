@@ -196,6 +196,33 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — the `wifi` plugin's Linux output changes shape (breaking)
+
+The `wifi` plugin moves to reading NetworkManager directly over D-Bus on Linux
+(plugin version 1.1.0). Three operator-visible changes to the records it emits:
+
+- **`connected` field 6 changes meaning on Linux.** It now carries the network
+  interface (for example `wlan0`). Earlier agents put the NetworkManager
+  *connection profile name* there. Any dashboard query, export or script that
+  reads that field as a profile name needs updating.
+- **Unsecured networks report `Open`, not `NONE`.** Previously the value
+  depended on which acquisition path answered; all paths now agree on `Open`.
+- **WPA3 and enhanced-open networks are reported distinctly.** They previously
+  appeared as `WPA2`, so a fleet may show WPA3 networks for the first time
+  after upgrading. This is a reporting change, not a change on the network.
+
+**During a staged rollout the two shapes are mixed, and the record does not say
+which one it is.** An un-upgraded agent reports the profile name in field 6 and
+an upgraded agent reports the interface, with no discriminator in the row —
+unlike the firewall change, where a `backend|` value distinguished per device.
+Until the fleet is fully upgraded, treat field 6 as free text: match on agent
+version rather than on the field's content, or defer any query that keys on it.
+`SELECT` on the plugin version, not on the value.
+
+A long-standing bug that made the macOS network scan return no results on
+macOS 14 and later is fixed in the same release; macOS hosts that reported an
+empty scan may begin reporting networks, subject to Location Services.
+
 ### vNEXT — `event_logs` acquires natively; Windows message text and `count` semantics change (breaking)
 
 The `event_logs` plugin now reads the event log **in-process** — wevtapi on
@@ -1599,6 +1626,25 @@ ip -o link show | awk -F': ' '{print $2}' | grep '@'
 ```
 
 If this returns any interface names, those hosts will report a different (shorter) adapter name for those interfaces after upgrade — update any saved filter, dashboard, or join key that references the old `@`-suffixed string. If it returns nothing, this note does not affect you.
+
+---
+
+### vNEXT — `software_actions.installed_count`'s reported number can change after upgrading (breaking)
+
+**What changed.** The `software_actions` agent plugin's `installed_count` action was migrated off `popen`/a `powershell -Command` shell-out onto native counting, and the counting rule changed on both platforms it touches:
+
+- **Linux.** The dpkg presence filter now counts packages in the `hi` (installed, held) status alongside `ii` (installed), matching the filter `installed_apps` and `vuln_scan` already use. A host with any held packages reports a higher count than before, by exactly the number of held packages.
+- **Windows.** `installed_count` now reads a raw subkey count of the registry `Uninstall` key via `RegQueryInfoKeyW`, replacing a `powershell -Command Get-ItemProperty ... | Measure-Object` pipeline. The two are not byte-identical: the registry read counts every subkey, the old script counted only subkeys carrying at least one property — a rare shape, but not one the new count can be relied on to match exactly. Both the old and new implementation read only the default (64-bit) registry view; 32-bit applications registered under `WOW6432Node` were never counted by either one and still are not.
+
+**Who this affects.** Any deployment with automation, a dashboard trend line, or an alert threshold keyed on the literal `count|N` value from `installed_count` — particularly a Linux fleet with `apt-mark hold`ed packages, or any Windows fleet (the registry-count/property-count divergence is rare but not bounded to a specific host shape, so it isn't pre-checkable the way the Linux change is).
+
+**Before upgrading, check whether this affects you.** On a representative Linux host:
+
+```bash
+dpkg-query -W -f='${db:Status-Abbrev}\n' | grep -c '^hi'
+```
+
+A nonzero result means that host's `installed_count` will report a higher number after upgrading, by exactly that many. If your automation only compares the count to a rough threshold or trend, no action is needed; if it asserts an exact expected value, re-baseline it after upgrading.
 
 ---
 

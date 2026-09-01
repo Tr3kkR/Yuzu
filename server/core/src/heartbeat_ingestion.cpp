@@ -34,8 +34,8 @@ void HeartbeatIngestion::ingest(const ::yuzu::agent::v1::HeartbeatRequest& hb,
     // /viz/fleet instead of vanishing. Best-effort and OFF the gRPC hot-path
     // lock — a slow/blipping database never blocks the heartbeat (the in-memory
     // stores stay authoritative). Does not touch the executions-ladder
-    // invariants (cmd_execution_ids_ / polchk-): those live on the
-    // CommandResponse path, not here.
+    // invariants (the command_id -> execution_id correlation / polchk-):
+    // those live on the CommandResponse path, not here.
     if (offline_store_) {
         std::string hostname;
         std::string os;

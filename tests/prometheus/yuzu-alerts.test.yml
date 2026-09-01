@@ -2196,3 +2196,37 @@ tests:
       - expr: 'ALERTS{alertname="YuzuSessionReapClockAnomaly"}'
         eval_time: 90m
         exp_samples: []
+
+  # ── YuzuExecCorrelationReapClockAnomaly (HA WS-1(1b), ADR-2002 section 5) ──
+  #
+  # Mirrors YuzuSessionReapClockAnomaly's shape above (adversarial review, PR
+  # #3780): a command_execution correlation-table reap pass declines on an
+  # implausible (forward/backward) DB now() reading and increments
+  # yuzu_exec_correlation_reap_clock_anomaly_total. The alert must FIRE on any
+  # increase over [1h] (the counter is zero-seeded at boot) and stay quiet
+  # while it is flat.
+
+  # CASE — a single clock anomaly (0 → 1) fires after the 5m `for:`.
+  - interval: 1m
+    name: exec correlation reap clock anomaly - a single decline fires
+    input_series:
+      - series: 'yuzu_exec_correlation_reap_clock_anomaly_total{job="yuzu",instance="s1"}'
+        values: "0x5 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapClockAnomaly"}'
+        eval_time: 60m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuExecCorrelationReapClockAnomaly", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE — a flat (never-anomalous) counter stays quiet: RED against dropping the
+  # `> 0` (an `absent()`/`>= 0` form would fire on the healthy zero-seeded series).
+  - interval: 1m
+    name: exec correlation reap clock anomaly - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_exec_correlation_reap_clock_anomaly_total{job="yuzu",instance="s1"}'
+        values: "0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuExecCorrelationReapClockAnomaly"}'
+        eval_time: 90m
+        exp_samples: []

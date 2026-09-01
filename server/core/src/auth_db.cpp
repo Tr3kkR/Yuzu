@@ -1419,13 +1419,63 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
     std::vector<std::string> raw_codes;
     AuthDBError txn_error = AuthDBError::WriteFailed;
     const bool ok = impl_->pool.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // ★ TOCTOU guard (#3762): the WHERE predicate makes the provisional→enrolled
+        // commit atomic with its own preconditions, exactly as `mfa_consume_recovery_code`
+        // guards on `consumed_at IS NULL` (docs/auth-mfa-design.md "Recovery codes",
+        // "race-safe without an explicit transaction"). The pre-txn `mfa_status()` /
+        // `load_mfa_row` reads above are separate pooled statements, so two concurrency
+        // hazards exist that this one guarded UPDATE closes under READ COMMITTED (the
+        // loser blocks on the row lock and re-evaluates its WHERE against the committed
+        // row):
+        //   (a) `mfa_enrolled_at IS NULL` — two concurrent verifies of one code would
+        //       otherwise BOTH stamp enrolled_at and BOTH run
+        //       regenerate_recovery_codes_locked (DELETE-all + INSERT), the loser deleting
+        //       the winner's just-issued codes and orphaning the set the winner was handed.
+        //   (b) `mfa_totp_secret = decode($3,'hex')` binds the commit to the EXACT encrypted
+        //       secret blob that was loaded, decrypted, and TOTP-verified pre-txn (`row.
+        //       secret_blob`). The secret verified against must still be the stored secret,
+        //       upholding the "mfa_disable is atomic against in-flight verifies" hard
+        //       invariant (docs/auth-mfa-design.md §Hard invariants item 3: a concurrent
+        //       verify sees the old state and matches, OR the new state and FAILS). It is
+        //       IDENTITY, not mere presence: a concurrent `mfa_disable` NULLs the secret
+        //       (NULL ≠ loaded blob → 0 rows), AND a concurrent `mfa_disable`+`mfa_init`
+        //       that rotates to a DIFFERENT provisional secret B likewise fails (B ≠ the
+        //       loaded A → 0 rows) — a bare `IS NOT NULL` would have MATCHED B and enrolled
+        //       the account against a secret whose code was never verified (#3781 review).
+        //       Any 0-row outcome here → classify below keeps WriteFailed/503 (fail-closed,
+        //       no half-enrolled state).
+        // LOAD-BEARING: dropping (a) reopens the double-regen; weakening (b) from the exact
+        // blob to `IS NOT NULL` reopens the enrol-over-a-rotated-secret race. Neither wedges
+        // a legitimate enroll: an uninterrupted verify's loaded secret is still the stored
+        // one, and a post-disable re-enroll re-inits a fresh secret and verifies a code of
+        // THAT secret, so its own loaded blob matches.
         pg::PgResult r = pg::exec_params(
             conn,
             "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
-            "WHERE username = $2 AND is_active = TRUE RETURNING id",
-            std::vector<std::string>{std::to_string(*matched), username});
-        if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0)
-            return false; // user deactivated/deleted mid-request — fail closed
+            "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
+            "AND mfa_totp_secret = decode($3, 'hex') RETURNING id",
+            std::vector<std::string>{std::to_string(*matched), username,
+                                     auth::AuthManager::bytes_to_hex(row->secret_blob)});
+        if (r.status() != PGRES_TUPLES_OK)
+            return false; // write outage → fail closed (WriteFailed → 503)
+        if (PQntuples(r.get()) == 0) {
+            // 0 rows = the user was deactivated/deleted mid-request, OR a concurrent
+            // verify already enrolled them (the guard above). Classify so the
+            // concurrent-enroll loser is graded MfaAlreadyEnrolled — NOT WriteFailed,
+            // which `is_store_unavailable()` routes to a false 503 + a
+            // secret-unavailable degrade metric + a kCritical "store unavailable" audit
+            // for a benign race. A genuinely deactivated user keeps the fail-closed
+            // WriteFailed/503 (unchanged).
+            pg::PgResult cls = pg::exec_params(
+                conn,
+                "SELECT is_active, (mfa_enrolled_at IS NOT NULL) FROM auth.users WHERE username = $1",
+                std::vector<std::string>{username});
+            if (cls.status() == PGRES_TUPLES_OK && PQntuples(cls.get()) == 1 &&
+                to_bool(col(cls.get(), 0, 0)) && to_bool(col(cls.get(), 0, 1))) {
+                txn_error = AuthDBError::MfaAlreadyEnrolled;
+            }
+            return false;
+        }
 
         auto codes = regenerate_recovery_codes_locked(conn, username);
         if (!codes) {

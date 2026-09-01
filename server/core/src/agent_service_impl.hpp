@@ -305,32 +305,16 @@ private:
     std::mutex cmd_times_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
-    /// PR 2 in-memory mapping `command_id → execution_id`. Populated by
-    /// the dispatch path (currently only `/api/instructions/:id/execute`
-    /// in `workflow_routes.cpp`; MCP / dashboard / scheduled / rerun are
-    /// known gaps tracked as PR 2.x follow-ups); consumed by the
-    /// response-receipt branches in process_gateway_response / Subscribe
-    /// to stamp the new responses.execution_id column. Guarded by
-    /// cmd_times_mu_ for locality with the existing send-time map.
-    ///
-    /// **Multi-agent fan-out invariant (HF-1).** A single command_id is
-    /// dispatched to N agents; each agent sends its own response with
-    /// the same command_id. Entries are NOT erased on terminal status —
-    /// erasing on the first agent's terminal would leave agents 2..N
-    /// stamping empty execution_id. Entries persist until a future
-    /// sweeper (PR 2.x) lands.
-    ///
-    /// **Known leak surface (sec-M1 / perf-S1).** Without a periodic
-    /// sweeper, entries grow over time:
-    ///   - Multi-agent dispatches: N entries until process restart.
-    ///   - Agent crash / network drop / server restart with in-flight:
-    ///     entries persist forever until process exits.
-    /// Per-entry cost ~64 bytes (two SSO strings). Acceptable for typical
-    /// dispatch rates over a service lifetime; bounded fix is a sweeper
-    /// keyed on a steady_clock timestamp stored alongside each entry,
-    /// evicting > max-command-timeout (default 1h). Filed as a hard
-    /// predecessor for closing the executions-history ladder.
-    std::unordered_map<std::string, std::string> cmd_execution_ids_;
+    // The former in-process `cmd_execution_ids_` map (command_id ->
+    // execution_id) moved to Postgres (HA WS-1(1b), ADR-2002 section 5) —
+    // see ExecutionTracker::record_command_execution /
+    // ::lookup_execution_id. It was replica-local: a response landing on a
+    // DIFFERENT gateway-fronted replica than the one that dispatched found
+    // no mapping and silently dropped the correlation. The PG-backed
+    // version is shared across replicas and carries its own clock-guarded
+    // retention sweep (execution_tracker.cpp's reap_command_execution_
+    // mappings), closing the unbounded-growth risk the map's doc comment
+    // used to flag here (sec-M1 / perf-S1).
     std::atomic<size_t> output_row_count_{0};
     std::vector<std::string> tar_dynamic_columns_; // TAR SQL dynamic schema cache
     bool require_client_identity_{false};
@@ -396,8 +380,10 @@ private:
 
     /// UAT 2026-05-06 #8: notify the executions tracker of a per-agent
     /// state change for the given command_id. Resolves command_id →
-    /// execution_id via cmd_execution_ids_ and calls
-    /// `ExecutionTracker::update_agent_status` with a synthesised
+    /// execution_id via `ExecutionTracker::lookup_execution_id` (HA
+    /// WS-1(1b): PG-backed, shared across replicas — no longer an
+    /// in-process map) and calls `ExecutionTracker::update_agent_status`
+    /// with a synthesised
     /// `AgentExecStatus` (status, exit_code, error_detail, timestamps).
     /// No-op if the tracker isn't wired or the command_id has no
     /// execution mapping (out-of-band dispatch). Each call publishes an
@@ -405,6 +391,16 @@ private:
     /// live-updates without a page reload.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp);
+
+    /// HA WS-1(1b), ADR-2002 section 5: the single chokepoint every
+    /// command_id -> execution_id read goes through (response-stamping in
+    /// process_gateway_response's four branches, plus notify_exec_tracker) —
+    /// resolves via `ExecutionTracker::lookup_execution_id`, or nullopt if
+    /// the tracker isn't wired / the read degrades / there is no mapping. A
+    /// second hand-rolled load-and-lookup at a new call site is the drift
+    /// this helper exists to prevent (mirrors this codebase's other single-
+    /// chokepoint conventions, e.g. `dispatch_confined_arms`).
+    std::optional<std::string> resolve_execution_id(const std::string& command_id) const;
 };
 
 } // namespace yuzu::server::detail
