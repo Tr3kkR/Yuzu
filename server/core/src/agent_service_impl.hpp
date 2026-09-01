@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -416,6 +417,15 @@ private:
     PrincipalQuota ota_quota_;
     OtaTransferWatchdog ota_watchdog_;
     bool require_positive_ota_identity_{false};
+
+    /// One in this many admission rejections is logged (the first always is).
+    /// See should_log_ota_rejection for why the log is sampled but the metric is not.
+    static constexpr std::uint64_t kOtaRejectionLogSample = 100;
+    std::atomic<std::uint64_t> ota_rejection_log_seq_{0};
+
+    /// Rate-samples the admission-rejection log line. Not const: it advances a
+    /// counter.
+    bool should_log_ota_rejection();
 
     /// Server-wide in-flight transfer count (see OtaBoundConfig::max_concurrent_total).
     /// Atomic rather than mutex-guarded: it is a single counter on the admission

@@ -16,9 +16,8 @@
 /// Verifying that `GRPC_ARG_MAX_CONCURRENT_STREAMS` and `SetResourceQuota`
 /// actually bound the runtime would be testing the library, not this change.
 
-#include <climits>
 #include <cstddef>
-#include <cstdint>
+#include <cstdint> // SIZE_MAX
 
 #include <yuzu/server/server.hpp>
 

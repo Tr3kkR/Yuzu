@@ -2042,9 +2042,10 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
             metrics_
                 .counter("yuzu_ota_download_admission_total", {{"decision", "rejected_total"}})
                 .increment();
-            spdlog::warn("DownloadUpdate: rejected by server-wide transfer cap "
-                         "(in_flight={} cap={} key={})",
-                         prev, ota_cfg_.max_concurrent_total, ota_key);
+            if (should_log_ota_rejection())
+                spdlog::warn("DownloadUpdate: rejected by server-wide transfer cap "
+                             "(in_flight={} cap={} key={}) [sampled]",
+                             prev, ota_cfg_.max_concurrent_total, ota_key);
             return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
                                 "server OTA transfer capacity exceeded");
         }
@@ -2070,12 +2071,21 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         // Name the peer. Admission rejections are deliberately metric-only (no
         // audit row — see docs/user-manual/audit-log.md), and the metric labels are
         // bounded, so without this line a YuzuOtaConcurrencyRejections page has NO
-        // path from alert to peer. The line fires only on a REJECTED request, which
-        // is itself bounded by the very cap it reports, so it cannot flood.
-        spdlog::warn("DownloadUpdate: rejected by per-peer {} bound "
-                     "(key={} mode={} retry_after_ms={})",
-                     by_concurrency ? "concurrency" : "rate", ota_key, admission_key.mode,
-                     slot.decision().retry_after_ms);
+        // path from alert to peer.
+        //
+        // SAMPLED, because the obvious justification for logging every one is
+        // wrong: the cap bounds concurrent ADMISSIONS, not rejections — a refused
+        // request returns immediately, so rejections are bounded only by inbound
+        // request rate, and the file sink is a non-rotating basic_logger_mt. One
+        // peer looping refused pulls would grow the log without limit. The metric
+        // is the complete count; this line exists for ATTRIBUTION, and the first
+        // occurrence plus a periodic sample gives an operator the identity they
+        // need without making the log the failure.
+        if (should_log_ota_rejection())
+            spdlog::warn("DownloadUpdate: rejected by per-peer {} bound "
+                         "(key={} mode={} retry_after_ms={}) [sampled]",
+                         by_concurrency ? "concurrency" : "rate", ota_key, admission_key.mode,
+                         slot.decision().retry_after_ms);
         // One wire status for both dimensions, and a REJECT rather than a queue:
         // queueing at capacity would hold the very thread the cap exists to free.
         return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -2245,6 +2255,17 @@ void AgentServiceImpl::set_ota_bound_config(const OtaBoundConfig& cfg) {
         // silently disables the rate dimension rather than merely shrinking a cache.
         .max_tracked = std::max(cfg.max_peers_tracked, kMinPeersTracked),
     });
+}
+
+bool AgentServiceImpl::should_log_ota_rejection() {
+    // Log the first rejection, then one in every kOtaRejectionLogSample. Cheap
+    // (one relaxed atomic increment), lock-free, and it keeps the log bounded to
+    // O(rejections / sample) without hiding the condition — the metric carries the
+    // exact count, and YuzuOtaConcurrencyRejections alerts off the metric, not off
+    // the log. The first-occurrence case matters because an operator paged at 03:00
+    // needs an identity immediately, not after the sample interval.
+    const auto n = ota_rejection_log_seq_.fetch_add(1, std::memory_order_relaxed);
+    return n == 0 || (n % kOtaRejectionLogSample) == 0;
 }
 
 AgentServiceImpl::AdmissionKey
