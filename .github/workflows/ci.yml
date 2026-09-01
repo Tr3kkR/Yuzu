@@ -95,8 +95,16 @@ env:
   # thrashing the cache between configs. This is a self-hosted-only budget:
   # the macOS leg moved to the BigMags pool (#3217) and no longer uploads
   # ccache via actions/cache, so the only job still writing to GitHub's
-  # 10 GB per-repo cache is the GHA-hosted canary, which sets its own
-  # (much smaller) ccache scope.
+  # 10 GB per-repo cache is the GHA-hosted canary — which therefore
+  # carries its OWN job-level CCACHE_MAXSIZE override sized for one build
+  # (see the canary job's env). This comment previously claimed that
+  # override existed while none did: the canary inherited 30G, its cache
+  # never trimmed, and the saved entry grew monotonically (measured
+  # 2.28 GB → 2.50 GB, Aug-28 → Sep-1) while each source-delta run saved
+  # a fresh copy — dozens of ~2.3 GB entries against the repo's 10 GB
+  # cache quota, evicting every other cache and putting the canary
+  # itself into 8-20 min degraded rebuilds whenever its freshest entry
+  # got evicted (bimodal wallclock, measured 2026-09-01).
   CCACHE_MAXSIZE: "30G"
   CCACHE_COMPRESS: "true"
   CCACHE_COMPRESSLEVEL: "1"
@@ -2228,6 +2236,21 @@ jobs:
     # cache saves rescued the next run. 120 min covers a cold build with
     # margin; warm runs still finish in ~6 min.
     timeout-minutes: 120
+    env:
+      # Override the workflow-level 30G (a self-hosted budget). This job is
+      # the ONLY writer to GitHub's 10 GB per-repo cache quota, and ccache
+      # only trims at MAXSIZE: without this cap the saved entry grows
+      # monotonically (measured 2.3-2.5 GB and climbing) and its copies
+      # crowd the quota until GitHub's LRU eviction takes them AND every
+      # other cache in the repo. One full canary build (~700 debug TUs,
+      # gcc-13, compressed) is ESTIMATED at 0.9-1.35 GB; 2G sits above that
+      # estimate's upper bound with margin (operator call: the ~0.5 GB of
+      # extra quota is noise, a cap that trims a live working set is not),
+      # while still bounding the entry at a fifth of the quota. ccache
+      # evicts its own oldest objects past the cap, which is the desired
+      # steady state; the 'ccache stats (canary)' step after Build shows
+      # whether the working set ever approaches it.
+      CCACHE_MAXSIZE: "2G"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2290,31 +2313,51 @@ jobs:
             vcpkg-canary-x64-linux-${{ env.VCPKG_COMMIT }}-
             vcpkg-canary-x64-linux-
 
+      - name: Compute ccache time bucket (canary)
+        # The ccache key deliberately does NOT hash sources any more. The
+        # source-hash key (previous design, #3270) never exact-hit on a repo
+        # doing ~75 commits/day, so EVERY canary run fell to the prefix
+        # restore-key and then saved a fresh multi-GB entry — measured
+        # 2026-09-01: 10+ live ~2.3 GB entries, the dominant share of a
+        # cache pool 7x over GitHub's 10 GB quota, whose LRU eviction then
+        # served the canary week-old entries (8-20 min degraded rebuilds,
+        # bimodal wallclock) and starved every other cache in the repo.
+        # ccache needs no source identity in the KEY — it hashes the real
+        # preprocessed input per object, so a stale entry can never yield a
+        # wrong object, only a smaller hit rate. (That guarantee is
+        # load-bearing on CCACHE_SLOPPINESS staying unset and compiler_check
+        # at its default for this job — a future sloppiness edit voids it,
+        # and the key design with it.) A rolling 3-DAY bucket (epoch days
+        # div 3 — no calendar alignment needed, the boundary is arbitrary):
+        # the bucket's first completed run saves, later runs exact-hit
+        # (skip the save) and absorb source drift via ccache's internal
+        # hashing. 3 days caps hit-rate decay at ~3 days of dev drift
+        # (operator call over a weekly bucket, whose Thu/Fri decay on a
+        # heavy week was the residual risk) while keeping live entries to
+        # ~2-3 per scope (<= ~6 GB at the 2G cap) — daily buckets would
+        # re-crowd the quota this change frees.
+        run: echo "CCACHE_BUCKET=$(( $(date -u +%s) / 259200 ))" >> "$GITHUB_ENV"
+
       - name: Restore ccache (canary)
         # ccache is `apt-get install`-ed and used as the compiler wrapper
         # below, but the GHA-hosted runner is fresh-disk per job — without
         # this cache step every TU compiles cold every run. Mirrors the
-        # macOS pattern. Source-hash key triggers a fresh save on any
-        # source change but cascading restore-keys keep most of the cache
-        # warm. Closes the canary's biggest unforced-loss perf hole (#743).
+        # macOS pattern; 3-day-bucket key per the step above. Closes the
+        # canary's biggest unforced-loss perf hole (#743).
+        #
+        # #3269 (thin-entry occupancy) trade, decided deliberately: a run
+        # whose Build fails EARLY in a fresh bucket saves a thin entry that
+        # occupies the bucket's key until it rolls. Accepted because (a) the
+        # save gate below already excludes cancellations, the routine thin
+        # producer, (b) an early hard Build failure on the canary is rare
+        # (it builds merge refs that compile on the required legs), and
+        # (c) the blast radius is bounded to 3 days — the source-hash
+        # design this replaces had the unbounded-growth failure instead.
         id: cache-ccache-canary
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
-          # Scoped to the repo's own compiled source roots, NOT a bare `**/*.cpp`
-          # glob. `hashFiles` globs the whole workspace and does not honour
-          # .gitignore, and the vcpkg restore step ABOVE has already materialised
-          # thousands of vendored headers into vcpkg_installed/ by this point — so
-          # a bare glob hashes those too, and the key then differs between a
-          # vcpkg-cold and a vcpkg-warm run. Measured 2026-08-18: 8 distinct keys
-          # across 10 live entries, PR #3293 alone holding three at ~870 MB, and
-          # the dev-warmed entry sitting at a key no vcpkg-warm PR ever recomputes
-          # — i.e. the ccache half of the shared-scope warming was inert (#3270).
-          # These roots are every directory meson compiles (tools/ arrives via
-          # meson.build's `subdir('tools/capmatrix-gen')`). Missing a root would
-          # cost cache efficiency only, never correctness: ccache hashes the real
-          # preprocessed input, so a stale key cannot yield a wrong object.
-          key: ccache-canary-x64-linux-${{ hashFiles('agents/**/*.cpp', 'agents/**/*.hpp', 'agents/**/*.h', 'server/**/*.cpp', 'server/**/*.hpp', 'server/**/*.h', 'sdk/**/*.cpp', 'sdk/**/*.hpp', 'sdk/**/*.h', 'common/**/*.cpp', 'common/**/*.hpp', 'common/**/*.h', 'tests/**/*.cpp', 'tests/**/*.hpp', 'tests/**/*.h', 'tools/**/*.cpp', 'tools/**/*.hpp', 'tools/**/*.h') }}
+          key: ccache-canary-x64-linux-${{ env.CCACHE_BUCKET }}
           restore-keys: |
             ccache-canary-x64-linux-
 
@@ -2375,6 +2418,19 @@ jobs:
       # (linux_matrix, nightly asan/tsan/coverage). Skipping it here saves
       # ~10 min per canary run without reducing coverage. #743.
 
+      - name: ccache stats (canary)
+        # The only ccache leg previously WITHOUT a stats step. Load-bearing
+        # for the CCACHE_MAXSIZE 2G sizing: the cap was estimated (one
+        # full canary build ~0.9-1.35 GB compressed), not measured — if
+        # "Cache size" here sits at the ceiling with cleanups > 0 on a
+        # warm run, the cap is trimming a live working set and should be
+        # raised. Informational only; never fails the job.
+        if: always()
+        run: |
+          set +e
+          ccache -s
+          exit 0
+
       # Paired saves for the two restore-only steps above. `if: always()`
       # is the documented replacement for `save-always: true` and lets
       # the cache populate even when Build failed. The
@@ -2420,18 +2476,19 @@ jobs:
       # ccache is ADDITIVE — every object in it is independently valid — so unlike
       # the vcpkg tree above, a partial save is not a correctness problem. But key
       # OCCUPANCY bites both classes: `cache-hit != 'true'` means a thin entry,
-      # once written, is exact-hit by every later same-source run, which then skips
-      # its own save. The key is immutable, so the cache stays thin until the
-      # sources change. Under `cancel-in-progress` on PRs, cancelled runs are the
-      # routine producer of thin entries, and #3270 makes the key stable enough for
-      # that to actually bite (#3269).
+      # once written, is exact-hit by every later run on the same key, which then
+      # skips its own save. The key is immutable and now a 3-DAY BUCKET (see the
+      # restore step), so a thin entry occupies its bucket until it rolls —
+      # longer-lived than under the old source-hash key, which #3269 tracked.
+      # Under `cancel-in-progress` on PRs, cancelled runs are the routine
+      # producer of thin entries.
       #
       # So: save when Build RAN, pass or fail — a failed build still produced
       # objects worth keeping, which is why this is not `== 'success'`. Skip when
       # Build was cancelled or never started. The cost is that a run cancelled
-      # after a long compile loses its cache; that is small, because the push which
-      # superseded it has different sources and therefore a different key, so it
-      # could only ever have reached that entry by prefix fallback anyway.
+      # after a long compile loses its cache; a superseding same-bucket push then
+      # exact-hits nothing (no entry was saved) and writes the bucket's entry
+      # itself, so the loss is one run's warmth, not the bucket's.
       - name: Save ccache (canary)
         # Same CWE-349 gate as "Save vcpkg installed packages (canary)" above
         # — a trusted-fork-ci dispatch must never write fork-built objects

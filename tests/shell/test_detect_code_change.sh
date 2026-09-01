@@ -253,13 +253,20 @@ if [ -f "$workflow" ]; then
     'diff_mode=--git-diff-merge-base '
   expect_caller true  "ci.yml still uses two-dot for the push arm" \
     'diff_mode=--git-diff '
-  # #3270: a bare workspace-wide glob also hashes whatever the vcpkg restore
-  # step above has already unpacked, so the ccache key stops being a function of
-  # our sources alone and the namespace splits. Scoped roots only.
-  expect_caller false "canary ccache key does not use a workspace-wide glob" \
-    "key: ccache-canary-x64-linux-\\\$\\{\\{ hashFiles\\('\\*\\*/"
-  expect_caller true  "canary ccache key is scoped to our own source roots" \
-    "key: ccache-canary-x64-linux-.*hashFiles\\('agents/"
+  # The canary ccache key is a TIME BUCKET, not a source hash (#3270's
+  # successor design): any hashFiles() in this key is a regression to a
+  # source identity — the workspace-wide form splits the namespace against
+  # the vcpkg restore's unpacked headers (#3270), and even the scoped-roots
+  # form never exact-hits at this repo's commit rate, so every run saves a
+  # fresh multi-GB entry and the pool evicts (measured 2026-09-01, 7x over
+  # the 10 GB quota). The bucket value comes from the runner clock via
+  # CCACHE_BUCKET, unreachable by any restore step by construction.
+  expect_caller false "canary ccache key does not hash sources at all" \
+    "key: ccache-canary-x64-linux-.*hashFiles"
+  expect_caller true  "canary ccache key is the time bucket" \
+    'key: ccache-canary-x64-linux-\$\{\{ env\.CCACHE_BUCKET \}\}'
+  expect_caller true  "canary computes the time bucket from the runner clock" \
+    'CCACHE_BUCKET=\$\(\( \$\(date -u \+%s\) / 259200 \)\)'
   # #3269: a cancelled run must not write a thin ccache entry that later
   # same-source runs exact-hit and then decline to replace.
   expect_caller true  "canary ccache save is gated on the Build step outcome" \
