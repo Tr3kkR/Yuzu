@@ -523,14 +523,41 @@ agent_test_exe = executable(
   # link_depends, a fresh build could leave the test executable built before
   # the fixture exists (build-ci B3's lesson: a fixture with no consumer in
   # the meson graph can silently stop building unnoticed).
-  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
-                users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
-                network_diag_plugin_lib, ioc_plugin_lib,
-                hardware_plugin_lib, device_identity_plugin_lib, netstat_plugin_lib,
-                windows_updates_plugin_lib, sccm_plugin_lib, event_logs_plugin_lib,
-                installed_apps_plugin_lib, msi_packages_plugin_lib, network_config_plugin_lib,
-                wifi_plugin_lib, content_dist_plugin_lib, script_exec_plugin_lib,
-                software_actions_plugin_lib, license_scan_plugin_lib, echo_argv_fixture],
+  # One identifier per line, alphabetized: this array has been repeatedly
+  # corrupted (a stray extra closing bracket followed by more list items,
+  # breaking meson configure on every platform) by the automated dev-merge-
+  # into-open-PR-branches bot's line-based 3-way merge -- two different PRs
+  # each appending one plugin identifier to the same shared wrapped line look
+  # like non-conflicting inserts to a line-based merge, but the combined
+  # result is invalid. One-per-line makes two independent appends land as
+  # two independent inserted lines, which merges cleanly. Do not repack this
+  # onto fewer lines -- see the identical, already-safe shape in
+  # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
+  link_depends: [
+                abi3_fixture_plugin,
+                content_dist_plugin_lib,
+                device_identity_plugin_lib,
+                echo_argv_fixture,
+                event_logs_plugin_lib,
+                hardware_plugin_lib,
+                installed_apps_plugin_lib,
+                invalid_name_fixture_plugin,
+                ioc_plugin_lib,
+                license_scan_plugin_lib,
+                msi_packages_plugin_lib,
+                netstat_plugin_lib,
+                network_config_plugin_lib,
+                network_diag_plugin_lib,
+                os_info_plugin_lib,
+                processes_plugin_lib,
+                reserved_name_fixture_plugin,
+                sccm_plugin_lib,
+                script_exec_plugin_lib,
+                software_actions_plugin_lib,
+                users_plugin_lib,
+                wifi_plugin_lib,
+                windows_updates_plugin_lib,
+                ],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
