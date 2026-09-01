@@ -9,6 +9,15 @@
 #ifdef _WIN32
 
 #include <yuzu/agent/confined_fs.hpp>
+
+// AFTER confined_fs.hpp, which pulls <windows.h>: <winioctl.h> depends on the
+// base Windows types and does not include them itself, so the order is
+// load-bearing. It is REQUIRED for FSCTL_SET_REPARSE_POINT, which <windows.h>
+// does NOT provide under WIN32_LEAN_AND_MEAN (set by confined_fs.hpp). The
+// off-Windows header stand-in used during development declared that constant
+// itself, so the omission compiled there and failed only on the first real MSVC
+// build; the stand-in has since been split to mirror the real header layout.
+#include <winioctl.h>
 #include <yuzu/agent/confined_fs_rules.hpp>
 
 #include "test_helpers.hpp" // yuzu::test::TempDir
