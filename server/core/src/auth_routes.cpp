@@ -2491,11 +2491,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 recovery_codes = std::move(*r);
                 verified = true;
             } else if (r.error() == AuthDBError::MfaAlreadyEnrolled) {
-                // A benign concurrency race (a second verify of the same code, or
-                // a disable+re-init that superseded the secret) already resolved
-                // this account's enrollment. NOT a wrong code and NOT an outage —
-                // handled distinctly below so it neither burns a pending attempt
-                // nor emits a false store-unavailable signal (#3777, CC7.2).
+                // The account is already enrolled — a concurrent verify won the
+                // race (or it was enrolled before this pending token committed).
+                // NOT a wrong code and NOT an outage — handled distinctly below so
+                // it neither burns a pending attempt nor emits a false
+                // store-unavailable signal (#3777, CC7.2). (A bare disable+re-init
+                // WITHOUT a subsequent winning verify leaves mfa_enrolled_at NULL,
+                // so it does NOT reach here — it stays fail-closed WriteFailed→503.)
                 already_enrolled = true;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
@@ -2508,18 +2510,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
 
         if (already_enrolled) {
-            // Distinct benign outcome: audit as a race (not a rejected code),
-            // drop the now-moot pending entry, and tell the caller the true
-            // state. No session is minted (as on every non-success path here);
-            // the operator simply completes login normally, now enrolled.
+            // Distinct benign outcome: audit as a race (not a rejected code) and
+            // tell the caller the true state. No session is minted (as on every
+            // non-success path here); the operator simply completes login
+            // normally, now enrolled. The pending entry was already move-erased on
+            // take-ownership above (a verify consumes its token), so there is
+            // nothing further to drop — unlike the wrong-code path, this branch
+            // never re-inserts it, so the one-shot token is spent.
             audit_log_for_principal(req, "mfa.enroll.race", "ok", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "already enrolled by a concurrent verify; no duplicate "
                                     "enrollment");
-            {
-                std::lock_guard lock(mfa_pending_mu_);
-                mfa_pending_.erase(pending);
-            }
             res.status = 409;
             res.set_content(
                 R"({"error":{"code":409,"message":"MFA is already enrolled on this account"},)"

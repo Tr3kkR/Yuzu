@@ -824,9 +824,9 @@ TEST_CASE("POST /login/mfa/enroll completes enforced enrollment: 200 + cookie + 
 TEST_CASE("POST /login/mfa/enroll for an already-enrolled account audits mfa.enroll.race, "
           "not a rejected code (#3777)",
           "[pg][mfa][enroll][routes][auth_routes]") {
-    // A concurrent verify (or a disable+re-init) can enrol the account between
-    // this pending token's mint and its verify — mfa_verify_enrollment then
-    // returns MfaAlreadyEnrolled. That benign race must be audited distinctly
+    // A concurrent verify can enrol the account between this pending token's
+    // mint and its verify — mfa_verify_enrollment then returns
+    // MfaAlreadyEnrolled. That benign race must be audited distinctly
     // (CC7.2), never as a rejected code or a store outage, and must not mint a
     // session. Simulate the concurrent winner by enrolling alice out-of-band.
     AuthRoutesHarness h;
