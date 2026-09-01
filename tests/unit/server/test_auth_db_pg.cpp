@@ -759,16 +759,17 @@ TEST_CASE("AuthDB MFA: concurrent enrollment verify enrolls exactly once, no orp
 // The concurrency test above proves exactly-once end-to-end, but the loser can be
 // caught by the pre-txn `mfa_status().enrolled` check before ever reaching the guarded
 // UPDATE, so it does not deterministically exercise the guard's own 0-row branch. This
-// pins all three predicate clauses directly against a seeded row:
-//   `is_active = TRUE` — a deactivated row is rejected,
-//   `mfa_enrolled_at IS NULL` — an already-enrolled row is rejected,
-//   `mfa_totp_secret IS NOT NULL` — a disabled row (mfa_disable NULLs both the secret AND
-//     mfa_enrolled_at) is rejected, closing the enrol-over-disabled-secret race.
-// It mirrors the exact predicate from `mfa_verify_enrollment`; a drift between the two is
-// the thing to notice. Each `run_guard()` match stamps `mfa_enrolled_at`, so the state is
-// reset explicitly before every case.
-TEST_CASE("AuthDB MFA: enrollment guard claims a provisional-with-secret row, rejects "
-          "enrolled / deactivated / disabled-secret ones",
+// pins every predicate clause directly against a seeded row. The guard binds the commit to
+// the EXACT secret blob the verify authenticated against (`mfa_totp_secret = decode($3,
+// 'hex')`), so a row is claimed ONLY when it is active, still provisional (`mfa_enrolled_at
+// IS NULL`), and its stored secret is byte-identical to the loaded one. It rejects,
+// deterministically: deactivated, already-enrolled, disabled (secret NULLed), and ROTATED
+// (a concurrent disable+init put a DIFFERENT secret B in the column — a bare `IS NOT NULL`
+// would wrongly match B and enrol over an unverified secret; #3781 review). It mirrors the
+// exact predicate from `mfa_verify_enrollment`; a drift between the two is the thing to
+// notice. Each `run_guard()` match stamps `mfa_enrolled_at`, so state is reset per case.
+TEST_CASE("AuthDB MFA: enrollment guard claims only the row whose stored secret still "
+          "matches the verified one; rejects rotated / disabled / enrolled / deactivated",
           "[pg][auth_db][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
     Harness h{db.dsn()};
@@ -784,37 +785,43 @@ TEST_CASE("AuthDB MFA: enrollment guard claims a provisional-with-secret row, re
         set_col("UPDATE auth.users SET is_active = TRUE, mfa_enrolled_at = NULL, "
                 "mfa_totp_secret = decode('0011223344','hex') WHERE username = $1");
     };
-    // The exact guard from mfa_verify_enrollment. Returns the row count it yields.
-    auto run_guard = [&]() -> int {
-        const char* v[] = {"7", "enrollguard"};
+    // The exact guard from mfa_verify_enrollment, bound to the verified secret's hex ($3).
+    auto run_guard = [&](const char* bound_secret_hex) -> int {
+        const char* v[] = {"7", "enrollguard", bound_secret_hex};
         PgResult r{PQexecParams(
             h.conn.get(),
             "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
             "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
-            "AND mfa_totp_secret IS NOT NULL RETURNING id",
-            2, nullptr, v, nullptr, nullptr, 0)};
+            "AND mfa_totp_secret = decode($3, 'hex') RETURNING id",
+            3, nullptr, v, nullptr, nullptr, 0)};
         REQUIRE(r.status() == PGRES_TUPLES_OK);
         return PQntuples(r.get());
     };
 
-    make_provisional();
-    CHECK(run_guard() == 1); // provisional + secret + active → claimed (stamps enrolled_at)
-    CHECK(run_guard() == 0); // now enrolled (enrolled_at set) → rejected
+    const char* kSecretA = "0011223344";        // what make_provisional() seeds (verified)
+    const char* kSecretB = "aabbccddee";         // a different, rotated secret
 
-    // Disabled mid-flight: mfa_disable leaves secret NULL + enrolled_at NULL. The
-    // `mfa_totp_secret IS NOT NULL` clause rejects it — no enrol over a NULL secret.
+    make_provisional();
+    CHECK(run_guard(kSecretA) == 1); // still holding A -> claimed (stamps enrolled_at)
+    CHECK(run_guard(kSecretA) == 0); // now enrolled -> rejected
+
+    // Rotated: a concurrent disable+init replaced the secret with B while still provisional.
+    // The verify authenticated against A, so the guard bound to A must reject B -- a bare
+    // `IS NOT NULL` would wrongly match B and enrol over an unverified secret (#3781).
+    make_provisional();
+    set_col("UPDATE auth.users SET mfa_totp_secret = decode('aabbccddee','hex') WHERE username = $1");
+    CHECK(run_guard(kSecretA) == 0); // B != A -> rejected
+    CHECK(run_guard(kSecretB) == 1); // a verify of B would, of course, claim it
+
+    // Disabled: mfa_disable NULLs the secret. NULL != A -> rejected.
     make_provisional();
     set_col("UPDATE auth.users SET mfa_enrolled_at = NULL, mfa_totp_secret = NULL WHERE username = $1");
-    CHECK(run_guard() == 0);
+    CHECK(run_guard(kSecretA) == 0);
 
     // Deactivated: is_active = FALSE rejects.
     make_provisional();
     set_col("UPDATE auth.users SET is_active = FALSE WHERE username = $1");
-    CHECK(run_guard() == 0);
-
-    // Back to a clean provisional-with-secret row → claimed again.
-    make_provisional();
-    CHECK(run_guard() == 1);
+    CHECK(run_guard(kSecretA) == 0);
 }
 
 // ── #3762: the enrollment guard must NOT wedge a legitimate re-enroll ───────

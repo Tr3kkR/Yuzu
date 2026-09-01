@@ -1431,25 +1431,31 @@ AuthDB::mfa_verify_enrollment(const std::string& username, std::string_view code
         //       otherwise BOTH stamp enrolled_at and BOTH run
         //       regenerate_recovery_codes_locked (DELETE-all + INSERT), the loser deleting
         //       the winner's just-issued codes and orphaning the set the winner was handed.
-        //   (b) `mfa_totp_secret IS NOT NULL` — a concurrent `mfa_disable` NULLs BOTH the
-        //       secret and `mfa_enrolled_at`, so predicate (a) alone would still MATCH the
-        //       post-disable row and enrol the account with a NULL secret (an unusable
-        //       second factor). Requiring the secret to still be present makes a verify
-        //       that observes the post-disable state FAIL, upholding the "mfa_disable is
-        //       atomic against in-flight verifies" hard invariant (docs/auth-mfa-design.md
-        //       §Hard invariants item 3). Post-disable → 0 rows → classify below keeps
-        //       WriteFailed/503 (fail-closed, no half-enrolled state).
-        // LOAD-BEARING: dropping (a) reopens the double-regen; dropping (b) reopens the
-        // enrol-over-disabled-secret race. Neither wedges a legitimate re-enroll: every
-        // un-enroll path (`mfa_disable`, soft-delete) NULLs `mfa_enrolled_at`, and a fresh
-        // `mfa_init_enrollment` writes a new non-NULL secret, so a post-disable re-enroll
-        // satisfies both predicates.
+        //   (b) `mfa_totp_secret = decode($3,'hex')` binds the commit to the EXACT encrypted
+        //       secret blob that was loaded, decrypted, and TOTP-verified pre-txn (`row.
+        //       secret_blob`). The secret verified against must still be the stored secret,
+        //       upholding the "mfa_disable is atomic against in-flight verifies" hard
+        //       invariant (docs/auth-mfa-design.md §Hard invariants item 3: a concurrent
+        //       verify sees the old state and matches, OR the new state and FAILS). It is
+        //       IDENTITY, not mere presence: a concurrent `mfa_disable` NULLs the secret
+        //       (NULL ≠ loaded blob → 0 rows), AND a concurrent `mfa_disable`+`mfa_init`
+        //       that rotates to a DIFFERENT provisional secret B likewise fails (B ≠ the
+        //       loaded A → 0 rows) — a bare `IS NOT NULL` would have MATCHED B and enrolled
+        //       the account against a secret whose code was never verified (#3781 review).
+        //       Any 0-row outcome here → classify below keeps WriteFailed/503 (fail-closed,
+        //       no half-enrolled state).
+        // LOAD-BEARING: dropping (a) reopens the double-regen; weakening (b) from the exact
+        // blob to `IS NOT NULL` reopens the enrol-over-a-rotated-secret race. Neither wedges
+        // a legitimate enroll: an uninterrupted verify's loaded secret is still the stored
+        // one, and a post-disable re-enroll re-inits a fresh secret and verifies a code of
+        // THAT secret, so its own loaded blob matches.
         pg::PgResult r = pg::exec_params(
             conn,
             "UPDATE auth.users SET mfa_enrolled_at = now(), mfa_last_counter = $1, updated_at = now() "
             "WHERE username = $2 AND is_active = TRUE AND mfa_enrolled_at IS NULL "
-            "AND mfa_totp_secret IS NOT NULL RETURNING id",
-            std::vector<std::string>{std::to_string(*matched), username});
+            "AND mfa_totp_secret = decode($3, 'hex') RETURNING id",
+            std::vector<std::string>{std::to_string(*matched), username,
+                                     auth::AuthManager::bytes_to_hex(row->secret_blob)});
         if (r.status() != PGRES_TUPLES_OK)
             return false; // write outage → fail closed (WriteFailed → 503)
         if (PQntuples(r.get()) == 0) {
