@@ -935,6 +935,13 @@ int main(int argc, char* argv[]) {
 
     CLI11_PARSE(app, argc, argv);
 
+
+    // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
+
+    // the settings page and the docs all report the value the server enforces.
+
+    yuzu::server::normalize_ota_options(cfg);
+
     // ── CSRF trusted origins: normalise ONCE, here (#2537) ──
     // Comma-splitting, trimming, lowercasing and default-port stripping happen
     // exactly once at boot rather than per request. Storing the normalised form

@@ -125,7 +125,7 @@ tests:
       - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
         eval_time: 90m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
             value: 1
 
   # CASE K -- a healthy fleet completing its transfers stays quiet.
@@ -134,6 +134,62 @@ tests:
     input_series:
       - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
         values: "0+0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE N -- the low-and-slow identity probe. THIS is the case the previous
+  # window could not see: with `for:` >= the lookback, increase() decays before
+  # the `for:` elapses, so a sparse signal never fires. One rejection every 20
+  # minutes is exactly the shape a spoof probe takes, and it must alert.
+  - interval: 1m
+    name: ota identity - a low-and-slow probe still fires
+    input_series:
+      - series: 'yuzu_grpc_ota_identity_rejected_total{job="yuzu",instance="s1",event="security",rpc="download_update",reason="agent_id_mismatch"}'
+        values: "0 0x19 1 1x19 2 2x19 3 3x19"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
+        eval_time: 75m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", instance="s1", job="yuzu", reason="agent_id_mismatch", severity="warning"}'
+            value: 1
+
+  # ── YuzuOtaServerCapacityRejections (UP8-1) ──────────────────────────────
+
+  # CASE O -- the server-wide ceiling saturating fires. Without this rule the
+  # fleet-wide denial it represents is entirely silent.
+  - interval: 1m
+    name: ota server capacity - saturation fires
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE P -- a fleet inside the ceiling stays quiet.
+  - interval: 1m
+    name: ota server capacity - within the ceiling stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE Q -- a benign rollout tail must NOT page. Three deadline aborts in the
+  # window is the trickle a large rollout's slowest links produce; the bar is >3
+  # so this stays quiet while CASE J's sustained storm fires.
+  - interval: 1m
+    name: ota transfers aborting - a benign rollout tail stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0 1 2 3 3x120"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
         eval_time: 90m
@@ -179,7 +235,7 @@ tests:
       - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
         eval_time: 45m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", instance="s1", job="yuzu", reason="agent_id_mismatch", severity="warning"}'
             value: 1
 
   # CASE F -- a fleet with no identity failures stays quiet. RED if the rule

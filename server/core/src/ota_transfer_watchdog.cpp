@@ -1,5 +1,7 @@
 #include "ota_transfer_watchdog.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <cstdlib>
 #include <utility>
 
@@ -30,6 +32,14 @@ OtaTransferWatchdog::OtaTransferWatchdog(std::chrono::milliseconds sweep_interva
             try {
                 sweep_once();
             } catch (...) {
+                // Observable, not silent. This watchdog is the ONLY enforcement of
+                // the OTA transfer deadline, so a repeatedly-throwing pass lapses
+                // that deadline with every alert reading zero — the fail-visibility
+                // rule this codebase already applies to its other sole-enforcement
+                // sweeps. Counting is the caller's job (no metrics sink here), so
+                // the log line is the signal.
+                spdlog::error("OtaTransferWatchdog: sweep threw; the OTA transfer "
+                              "deadline was NOT enforced for this pass");
             }
             lock.lock();
         }
@@ -126,7 +136,12 @@ void OtaTransferWatchdog::erase(std::uint64_t id) noexcept {
         // policy for the same class of failure: a bookkeeping structure that cannot
         // be maintained must not be left in a state that dereferences freed memory.
         // Reaching here requires std::mutex::lock to throw, which on a healthy
-        // process does not happen.
+        // process does not happen. Say so before dying: an operator who finds a
+        // SIGABRT with nothing in the log has no way to tell this deliberate,
+        // safety-motivated abort from a crash.
+        spdlog::critical("OtaTransferWatchdog: could not erase a registration "
+                         "(mutex failure); aborting rather than leaving a dangling "
+                         "cancel callback that would fire on a freed ServerContext");
         std::abort();
     }
 }

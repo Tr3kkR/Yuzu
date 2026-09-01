@@ -287,12 +287,29 @@ struct Config {
     // same absence.
     int grpc_max_concurrent_streams{128};  // per-connection HTTP/2 stream cap
     int grpc_max_resource_memory_mb{512};  // gRPC ResourceQuota ceiling
-    // Thread ceiling for the gRPC sync server. WITHOUT this, the stream cap above
-    // bounds nothing globally — it is PER CONNECTION and connections are uncapped,
-    // so N connections yield N x cap concurrent handlers. It is also what makes the
-    // OTA admission map's overshoot bound real: that map may exceed its cardinality
-    // ceiling only by the number of IN-FLIGHT handlers, which is exactly this.
-    int grpc_max_threads{256};
+    // Thread ceiling for the gRPC sync server.
+    //
+    // THIS IS A FLEET-SIZE CEILING, NOT A WORK CEILING, and it must be set above
+    // your concurrently-connected agent count. AgentService is a SYNCHRONOUS
+    // service and Subscribe blocks for the life of each agent's command stream, so
+    // every connected agent permanently occupies one thread. Once the quota is
+    // exhausted gRPC answers ResourceExhausted to EVERY rpc on every service
+    // sharing it — agent, management and gateway-upstream alike — so a value below
+    // the fleet size is a fleet-wide outage, not back-pressure.
+    //
+    // The default is therefore generous rather than tight. It exists to stop
+    // pathological runaway (and to give the OTA admission map's overshoot a real
+    // bound), not to size the fleet.
+    int grpc_max_threads{8192};
+
+    // Fraction of ota_max_concurrent_total reserved for peers admitted on a
+    // CERTIFICATE identity, expressed as a percentage. The server-wide cap is a
+    // shared exhaustible resource, so without a reserve a handful of source
+    // addresses holding slow transfers can starve the whole fleet — a cheaper
+    // denial than the address-space scaling the cap was added to prevent. Peers
+    // keyed on source IP may occupy at most (100 - this)% of the cap; enrolled
+    // peers may use all of it.
+    int ota_cert_reserve_pct{50};
     // Server-wide ceiling on concurrent DownloadUpdate transfers, across ALL peers.
     // The per-peer cap bounds one identity; on a deployment where the identity gate
     // is inert the admission key falls back to source IP, so the per-peer bound

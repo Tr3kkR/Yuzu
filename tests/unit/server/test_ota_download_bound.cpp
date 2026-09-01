@@ -208,6 +208,7 @@ TEST_CASE("DownloadUpdate: the server-wide slot is released on every exit path",
     AgentServiceImpl::OtaBoundConfig cfg;
     cfg.max_concurrent_per_peer = 64;
     cfg.max_concurrent_total = 1;  // exactly one at a time
+    cfg.cert_reserve_pct = 0;      // this harness is IP-keyed; take the whole cap
     h.svc.set_ota_bound_config(cfg);
     h.start();
 
@@ -218,6 +219,45 @@ TEST_CASE("DownloadUpdate: the server-wide slot is released on every exit path",
         auto st = h.download();
         CHECK(st.error_code() == grpc::StatusCode::UNAVAILABLE);
     }
+}
+
+TEST_CASE("DownloadUpdate: the certificate reserve bounds IP-keyed peers, not enrolled ones",
+          "[ota][bound][grpc]") {
+    // A flat shared ceiling is itself exhaustible: without a reserve, a handful of
+    // source addresses holding slow transfers can occupy every slot and deny the
+    // fleet — cheaper than the address-space scaling the flat cap was added to
+    // prevent. This harness is insecure, so every caller is IP-keyed and sees only
+    // the unreserved share.
+    OtaHarness h;
+    AgentServiceImpl::OtaBoundConfig cfg;
+    cfg.max_concurrent_per_peer = 64;
+    cfg.max_concurrent_total = 10;
+    cfg.cert_reserve_pct = 100;  // reserve everything for certificate-keyed peers
+    h.svc.set_ota_bound_config(cfg);
+    h.start();
+
+    // The floor guarantees one slot even at a 100% reserve, so an IP-keyed peer is
+    // throttled, never locked out — a reserve that can starve the majority case
+    // would be worse than no reserve.
+    auto st = h.download();
+    CHECK(st.error_code() == grpc::StatusCode::UNAVAILABLE);
+}
+
+TEST_CASE("DownloadUpdate: a zero reserve gives IP-keyed peers the whole ceiling",
+          "[ota][bound][grpc]") {
+    OtaHarness h;
+    AgentServiceImpl::OtaBoundConfig cfg;
+    cfg.max_concurrent_per_peer = 64;
+    cfg.max_concurrent_total = 0;  // nothing available to anyone
+    cfg.cert_reserve_pct = 0;
+    h.svc.set_ota_bound_config(cfg);
+    h.start();
+
+    // cap 0 with no reserve still refuses — the floor applies to the RESERVE
+    // arithmetic, not to an operator who configured no capacity at all.
+    auto st = h.download();
+    CHECK(st.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
+    CHECK(st.error_message().find("server OTA transfer capacity") != std::string::npos);
 }
 
 TEST_CASE("OTA identity gate: inert by default so an unenrolled agent can still pull",

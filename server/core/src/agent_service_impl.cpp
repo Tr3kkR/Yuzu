@@ -1,8 +1,10 @@
 #include "agent_service_impl.hpp"
 
+#include "on_behalf_guard.hpp"
 #include "ota_transfer_rules.hpp"
 
 #include <algorithm>
+#include <string_view>
 
 #include <grpc/grpc_security_constants.h>
 
@@ -2034,22 +2036,19 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     // where the identity gate is inert the key falls back to source IP, so a
     // caller with a /24 buys 256 independent per-peer budgets. This one is flat.
     // Taken before the per-peer bucket so a refused transfer spends no token.
-    TotalSlot total_slot;
-    {
-        const int prev = ota_in_flight_total_.fetch_add(1, std::memory_order_acq_rel);
-        if (prev >= ota_cfg_.max_concurrent_total) {
-            ota_in_flight_total_.fetch_sub(1, std::memory_order_acq_rel);
-            metrics_
-                .counter("yuzu_ota_download_admission_total", {{"decision", "rejected_total"}})
-                .increment();
-            if (should_log_ota_rejection())
-                spdlog::warn("DownloadUpdate: rejected by server-wide transfer cap "
-                             "(in_flight={} cap={} key={}) [sampled]",
-                             prev, ota_cfg_.max_concurrent_total, ota_key);
-            return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
-                                "server OTA transfer capacity exceeded");
-        }
-        total_slot = TotalSlot(&ota_in_flight_total_);
+    const bool cert_keyed = std::string_view(admission_key.mode) == "cert";
+    auto total = ota_total_admission_.try_acquire(ota_cfg_.max_concurrent_total,
+                                                  ota_cfg_.cert_reserve_pct, cert_keyed);
+    if (!total.admitted) {
+        metrics_.counter("yuzu_ota_download_admission_total", {{"decision", "rejected_total"}})
+            .increment();
+        if (should_log_ota_rejection())
+            spdlog::warn("DownloadUpdate: rejected by server-wide transfer cap "
+                         "(in_flight={} cap={} cert_keyed={} key={}) [sampled]",
+                         total.observed_in_flight, total.effective_cap, cert_keyed,
+                         onbehalf::sanitize_for_log(ota_key));
+        return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                            "server OTA transfer capacity exceeded");
     }
 
     auto slot = ota_quota_.try_acquire(ota_key, QuotaSide::kEngine);
@@ -2084,7 +2083,8 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         if (should_log_ota_rejection())
             spdlog::warn("DownloadUpdate: rejected by per-peer {} bound "
                          "(key={} mode={} retry_after_ms={}) [sampled]",
-                         by_concurrency ? "concurrency" : "rate", ota_key, admission_key.mode,
+                         by_concurrency ? "concurrency" : "rate",
+                         onbehalf::sanitize_for_log(ota_key), admission_key.mode,
                          slot.decision().retry_after_ms);
         // One wire status for both dimensions, and a REJECT rather than a queue:
         // queueing at capacity would hold the very thread the cap exists to free.
@@ -2308,8 +2308,13 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
             .counter("yuzu_grpc_ota_identity_rejected_total",
                      {{"event", "security"}, {"rpc", std::string(rpc)}, {"reason", reason}})
             .increment();
+        // SANITIZED, not merely truncated. This value is attacker-chosen and it
+        // lands in the file the OTA runbook names as the only attribution path for
+        // these rejections, so a raw write lets a caller embed newlines and forge
+        // log lines that are indistinguishable from real ones. sanitize_for_log
+        // replaces control characters and bounds the length.
         spdlog::warn("{} rejected: {} (agent_id={})", rpc, reason,
-                     claimed_agent_id.substr(0, auth::kMaxAgentIdLength));
+                     onbehalf::sanitize_for_log(claimed_agent_id));
 
         // WHICH REJECTIONS GET AN AUDIT ROW, and why this is not all of them.
         //
@@ -2330,7 +2335,19 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
         // the same split reject_revoked_peer already makes for `heartbeat` ("a
         // flood must not hammer the WAL") and the no-resolvable-principal carve-out
         // in docs/observability-conventions.md.
-        const bool audit_worthy = (std::string_view(reason) != "no_client_identity");
+        // RATE-BOUNDED, and the earlier justification for not bounding it was
+        // wrong. It claimed the audited reasons were "bounded by the size of the
+        // issued-certificate population"; they are bounded by the number of
+        // REQUESTS. One enrolled agent holding a valid certificate can loop
+        // CheckForUpdate — which has no admission bound at all — with a mismatched
+        // agent_id and drive one synchronous Postgres write per call, ahead of
+        // every other bound. That is the vector this change exists to close, so
+        // the write is gated on a small per-key bucket. The METRIC still counts
+        // every rejection, so suppression is visible as a gap between the counter
+        // and the row count, never as a missing signal.
+        const bool audit_worthy = (std::string_view(reason) != "no_client_identity") &&
+                                  ota_identity_audit_limiter_.allow(std::string(rpc) + ":" +
+                                                                    claimed_agent_id);
         if (audit_worthy && audit_store_ && audit_store_->is_open()) {
             const auto ids = extract_peer_identities(*context);
             const std::string cert_id = ids.empty() ? std::string{} : ids.front();

@@ -20,6 +20,8 @@
 
 #include <yuzu/server/server.hpp>
 
+#include "principal_quota.hpp" // kMinPeersTracked
+
 namespace yuzu::server {
 
 /// Register the OTA + gRPC bound options onto `app`, bound to `cfg`.
@@ -72,11 +74,22 @@ inline void register_ota_options(CLI::App& app, Config& cfg) {
         ->default_val(64)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_OTA_MAX_CONCURRENT_TOTAL");
+    app.add_option("--ota-cert-reserve-pct", cfg.ota_cert_reserve_pct,
+                   "Percent of --ota-max-concurrent-total reserved for peers admitted "
+                   "on a certificate identity (default: 50). IP-keyed peers may use at "
+                   "most the remainder, so an unauthenticated flood cannot starve an "
+                   "enrolled fleet out of the shared ceiling.")
+        ->default_val(50)
+        ->check(CLI::Range(0, 100))
+        ->envname("YUZU_OTA_CERT_RESERVE_PCT");
     app.add_option("--grpc-max-threads", cfg.grpc_max_threads,
-                   "Thread ceiling for the gRPC sync server (default: 256). Without "
-                   "this the per-connection stream cap bounds nothing globally, since "
-                   "connections are uncapped.")
-        ->default_val(256)
+                   "Thread ceiling for the gRPC sync server (default: 8192). THIS IS A "
+                   "FLEET-SIZE CEILING: AgentService is synchronous and Subscribe holds "
+                   "one thread per connected agent for the life of its command stream, "
+                   "so this MUST exceed your concurrently-connected agent count. Below "
+                   "it, gRPC answers ResourceExhausted to every RPC on every service "
+                   "sharing the quota — a fleet-wide outage, not back-pressure.")
+        ->default_val(8192)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_GRPC_MAX_THREADS");
     app.add_option("--grpc-max-concurrent-streams", cfg.grpc_max_concurrent_streams,
@@ -89,6 +102,21 @@ inline void register_ota_options(CLI::App& app, Config& cfg) {
         ->default_val(512)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_GRPC_MAX_RESOURCE_MEMORY_MB");
+}
+
+/// Apply the floors that the consumers enforce, so every operator-facing surface
+/// reports the value the server will ACTUALLY use.
+///
+/// Without this the floor lives at one call site and the capacity gauge, the
+/// settings page and the alert that divides by that gauge all publish the raw
+/// configured number — so an operator who sets `--ota-max-peers-tracked=500` is
+/// paged at 400 tracked keys against a real ceiling of 1024, and the runbook's
+/// remedy does nothing until they cross a threshold no surface mentions. Call this
+/// immediately after parsing, before anything reads `cfg`.
+inline void normalize_ota_options(Config& cfg) {
+    const auto floored = static_cast<int>(kMinPeersTracked);
+    if (cfg.ota_max_peers_tracked < floored)
+        cfg.ota_max_peers_tracked = floored;
 }
 
 } // namespace yuzu::server

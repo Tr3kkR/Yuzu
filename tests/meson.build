@@ -971,6 +971,7 @@ if build_server
       'unit/server/test_ota_transfer_watchdog.cpp', # OTA transfer deadline watchdog (#911 UP-101)
       'unit/server/test_ota_download_bound.cpp', # OTA admission + identity gates over real gRPC (#913/#416)
       'unit/server/test_ota_transfer_rules.cpp', # OTA chunk-write outcome decision (#911/#934/#941)
+      'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
       'unit/server/test_ota_stalled_write.cpp', # TryCancel unblocks a stalled sync Write (#911 UP-101)
       'unit/server/test_server_ota_options.cpp', # OTA CLI/env contract + gRPC bound derivation (#913/#911)
       'unit/server/test_principal_quota_denial.cpp', # PR 4.4 dual-transport classifier lock (#2291)

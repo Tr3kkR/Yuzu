@@ -6969,6 +6969,7 @@ public:
             .chunk_stall_deadline = std::chrono::seconds(cfg_.ota_chunk_write_deadline_secs),
             .max_peers_tracked = static_cast<std::size_t>(cfg_.ota_max_peers_tracked),
             .max_concurrent_total = cfg_.ota_max_concurrent_total,
+            .cert_reserve_pct = cfg_.ota_cert_reserve_pct,
         });
 
         // #416: require a positive peer identity on the OTA RPCs, and bind the

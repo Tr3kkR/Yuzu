@@ -30,7 +30,9 @@
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 #include "ota_transfer_watchdog.hpp"
+#include "ota_total_admission.hpp"
 #include "principal_quota.hpp"
+#include "rate_limiter.hpp"
 
 // Forward declarations to avoid pulling in full store headers
 namespace yuzu::server {
@@ -113,6 +115,15 @@ public:
         /// key falls back to source IP, so that bound scales with the caller's
         /// address space. This one does not.
         int max_concurrent_total{64};
+
+        /// Percentage of `max_concurrent_total` reserved for CERTIFICATE-keyed
+        /// peers. A flat shared ceiling is itself exhaustible: a handful of source
+        /// addresses holding slow transfers to the transfer deadline can occupy
+        /// every slot and deny the fleet — cheaper than the address-space scaling
+        /// the flat cap was added to prevent. IP-keyed peers may therefore occupy
+        /// at most `(100 - this)%` of the cap; enrolled peers may use all of it,
+        /// so an unauthenticated flood cannot starve an enrolled fleet.
+        int cert_reserve_pct{50};
     };
 
     /// Reconfigure the OTA bounds. SET BEFORE TRAFFIC — call it before
@@ -418,6 +429,14 @@ private:
     OtaTransferWatchdog ota_watchdog_;
     bool require_positive_ota_identity_{false};
 
+    /// Bounds the identity-deny AUDIT write per (rpc, claimed agent_id). The write
+    /// is synchronous and Postgres-backed and sits ahead of every admission bound,
+    /// so an enrolled peer looping a mismatched CheckForUpdate would otherwise pin
+    /// a server thread per call on the audit path. A few per second per key is far
+    /// above any legitimate rate (an agent checks every 6h by default) and far
+    /// below a flood. The metric counts every rejection regardless.
+    RateLimiter ota_identity_audit_limiter_{2};
+
     /// One in this many admission rejections is logged (the first always is).
     /// See should_log_ota_rejection for why the log is sampled but the metric is not.
     static constexpr std::uint64_t kOtaRejectionLogSample = 100;
@@ -427,31 +446,11 @@ private:
     /// counter.
     bool should_log_ota_rejection();
 
-    /// Server-wide in-flight transfer count (see OtaBoundConfig::max_concurrent_total).
-    /// Atomic rather than mutex-guarded: it is a single counter on the admission
-    /// path and must not add contention to the quota's own lock.
-    std::atomic<int> ota_in_flight_total_{0};
-
-    /// Move-only RAII for the server-wide slot. Mirrors QuotaSlot's contract so
-    /// every DownloadUpdate exit path releases exactly once.
-    class TotalSlot {
-      public:
-        TotalSlot() = default;
-        explicit TotalSlot(std::atomic<int>* c) : counter_(c) {}
-        TotalSlot(TotalSlot&& o) noexcept : counter_(o.counter_) { o.counter_ = nullptr; }
-        TotalSlot& operator=(TotalSlot&& o) noexcept {
-            if (this != &o) { reset(); counter_ = o.counter_; o.counter_ = nullptr; }
-            return *this;
-        }
-        TotalSlot(const TotalSlot&) = delete;
-        TotalSlot& operator=(const TotalSlot&) = delete;
-        ~TotalSlot() noexcept { reset(); }
-        void reset() noexcept {
-            if (counter_) { counter_->fetch_sub(1, std::memory_order_acq_rel); counter_ = nullptr; }
-        }
-      private:
-        std::atomic<int>* counter_{nullptr};
-    };
+    /// Server-wide transfer gate (OtaBoundConfig::max_concurrent_total plus the
+    /// certificate reserve). Lives in its own header because the counter is the
+    /// one part of this gate a live-wire test cannot observe — see
+    /// ota_total_admission.hpp.
+    OtaTotalAdmission ota_total_admission_;
 
     /// The admission key for one OTA call, plus which keying produced it.
     ///

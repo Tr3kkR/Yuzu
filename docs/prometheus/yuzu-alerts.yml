@@ -3836,7 +3836,7 @@ groups:
           severity: warning
         annotations:
           summary: "A peer is repeatedly hitting the per-peer OTA concurrency cap"
-          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             One or more agents are being refused DownloadUpdate because they
             already hold --ota-max-concurrent-per-peer parallel transfers. This
@@ -3857,13 +3857,15 @@ groups:
 
       - alert: YuzuOtaIdentityRejections
         expr: |
-          sum by (job, instance) (increase(yuzu_grpc_ota_identity_rejected_total[15m])) > 0
-        for: 15m
+          sum by (job, instance, reason) (
+            increase(yuzu_grpc_ota_identity_rejected_total[1h])
+          ) > 0
+        for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Agent OTA RPCs rejected for a missing or mismatched certificate identity"
-          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             CheckForUpdate or DownloadUpdate was rejected because the peer
             presented no usable client certificate, presented one from a
@@ -3872,7 +3874,16 @@ groups:
             this should be flat at zero, so any sustained signal is either a
             misconfigured agent or an identity being spoofed. The reason label
             says which. Paired forensic evidence is the
-            session.ota_identity_rejected audit row.
+            session.ota_identity_rejected audit row (note `no_client_identity` is
+            metric-only and writes none).
+
+            Window note: the lookback is an HOUR and `for:` is deliberately SHORTER
+            than it. A `for:` at least as long as the lookback can never be
+            satisfied by a sparse signal — `increase()>0` decays before the `for:`
+            elapses — which would make this rule blind to exactly the low-and-slow
+            identity probe it exists to catch. `reason` is preserved in the
+            aggregation because the description and runbook both tell the operator
+            to read it.
 
       - alert: YuzuOtaRefundDivergence
         expr: |
@@ -3889,7 +3900,7 @@ groups:
           severity: warning
         annotations:
           summary: "OTA deadline aborts exceed rate-token refunds — lockout regression suspected"
-          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Every transfer aborted by a SERVER-imposed deadline must refund the
             rate token it was charged at admission; that invariant is what stops
@@ -3908,13 +3919,15 @@ groups:
 
       - alert: YuzuOtaTransfersAborting
         expr: |
-          sum by (job, instance) (increase(yuzu_ota_download_deadline_exceeded_total[30m])) > 0
+          sum by (job, instance, phase) (
+            increase(yuzu_ota_download_deadline_exceeded_total[30m])
+          ) > 3
         for: 30m
         labels:
           severity: warning
         annotations:
           summary: "OTA transfers are being aborted by a server-imposed deadline"
-          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Transfers are hitting --ota-transfer-deadline-secs or
             --ota-chunk-write-deadline-secs. This is the alert that makes a
@@ -3928,6 +3941,31 @@ groups:
             a single chunk stalled. Correlate with
             yuzu_ota_download_refund_total{reason=~".*deadline"}.
 
+      - alert: YuzuOtaServerCapacityRejections
+        expr: |
+          sum by (job, instance) (
+            increase(yuzu_ota_download_admission_total{decision="rejected_total"}[15m])
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTA transfers refused by the SERVER-WIDE capacity ceiling"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            --ota-max-concurrent-total is saturated, so agents are being refused
+            regardless of their own per-peer budget. Two very different causes look
+            identical here and the log line distinguishes them by `cert_keyed`.
+            EITHER a fleet-wide rollout genuinely wants more concurrency than the
+            ceiling allows — raise it, sizing roughly as
+            `devices x transfer_seconds / rollout_seconds` — OR a small number of
+            source addresses are holding slow transfers to occupy the shared
+            ceiling, which is a denial attempt: IP-keyed peers are confined to the
+            unreserved share (`--ota-cert-reserve-pct`) precisely so they cannot
+            starve enrolled agents, so check whether the refusals carry
+            `cert_keyed=false` and correlate with
+            yuzu_ota_admission_key_mode_total.
+
       - alert: YuzuOtaPeerMapEvicting
         expr: |
           sum by (job, instance) (increase(yuzu_ota_download_peers_evicted_total[1h])) > 0
@@ -3936,7 +3974,7 @@ groups:
           severity: warning
         annotations:
           summary: "The OTA admission map is evicting — the rate limiter may be disabled"
-          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Sustained eviction means --ota-max-peers-tracked is at or below the live
             peer count. This is not a cache-efficiency concern: an evicted key that
@@ -3957,7 +3995,7 @@ groups:
           severity: info
         annotations:
           summary: "OTA per-peer admission map is approaching its cardinality ceiling"
-          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             The per-peer OTA admission map is above 80% of
             --ota-max-peers-tracked (issue #935). Expressed as a ratio against
