@@ -141,6 +141,42 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
+
+The legacy pre-v1 `GET /api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`,
+`/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes previously carried NO
+management-group confinement at all — a bare `Execution:Read`/`Execute` grant, global or
+group-scoped, saw and could act on the entire fleet's executions. They now gate on
+`require_fleet_read`, the same admit-then-filter mechanism `GET /api/v1/executions/{id}` already
+used.
+
+**Who this affects:** operators holding `Execution:Read`/`Execute` ONLY through a management group
+(not a global grant) — these callers are newly ADMITTED to the five GET routes (previously flat
+`403`'d outright) but see a narrowed, redacted view. A global grant holder sees no behavior change
+on read shape. Everyone sees the following response-shape changes regardless of scope:
+
+- `GET /{id}/summary`, `/{id}/agents`, and `/{id}/children` now return `404` for an unknown
+  execution id, instead of a zero-filled/empty `200`.
+- `POST /{id}/cancel` now returns `404` for a nonexistent execution id, instead of a false
+  `200 {"status":"cancelled"}` (the underlying `UPDATE` always reported success even when it
+  matched zero rows).
+- A caller holding `Execution:Execute` but **not** `Execution:Read` can no longer rerun or cancel
+  an execution — both mutating routes now also require `Read` admission through the fleet gate,
+  since `require_fleet_read` is the only place the mutation's target-visibility check happens.
+- `GET /api/executions` (list) now caps `limit` at 500 (previously unbounded).
+- A gate failure caused by a degraded RBAC/management-group store now returns `503` with
+  `retry_after_ms` instead of a flat `403`.
+
+**What to do:** if you have automation with a group-scoped (not global) `Execution:Read`/`Execute`
+grant, re-verify it still sees the executions it depends on — a confined caller now sees only
+executions it dispatched itself or that involve at least one agent it can see, rather than being
+denied outright or (previously) seeing everything. If you scripted around the old `/cancel`
+false-success or the old zero-filled `/summary` response for an unknown id, update to expect `404`.
+
+**Verify:** `GET /api/executions/{id}` for an execution outside your management-group scope should
+return `404`, not the previously-unfiltered full record. `docs/auth-architecture.md`'s "Fourth
+migration (#3789)" section has the full design.
+
 ## Behaviour change: Destructive-class dispatch now requires explicit `agent_ids` on REST and MCP (#3685)
 
 17 `plugin.action` pairs are classified `Destructive` in the command catalogue: `tar.purge_source`,

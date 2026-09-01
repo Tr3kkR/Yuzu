@@ -7007,33 +7007,58 @@ table entry above).
 
 ### Executions
 
+All seven routes below are management-group confined as of #3789 (`docs/auth-architecture.md`'s
+"Fourth migration"): a caller holding `Execution:Read`/`Execute` through a management group only
+sees/acts on executions it dispatched itself or that involve at least one agent it can see. A
+global grant is unrestricted. An execution outside the caller's visibility and a nonexistent one
+return the identical `404` (no existence oracle).
+
 #### `GET /api/executions`
 
-List executions. Accepts `definition_id`, `status`, and `limit` as query parameters.
+**Permission:** `Execution:Read`. List executions. Accepts `definition_id`, `status`, and `limit`
+(capped at 500) as query parameters. Under a confined grant, `agents_targeted`/`agents_responded`/
+`agents_success`/`agents_failure` are recomputed from only the caller's visible agents.
 
 #### `GET /api/executions/{id}`
 
-Get details of a single execution.
+**Permission:** `Execution:Read`. Get details of a single execution. Under a confined grant,
+`scope_expression` and `parameter_values` are redacted (`"(redacted - confined view)"`) and the
+four agent counts are recomputed from only the visible agents; `status`/`dispatched_by`/
+`dispatched_at`/`completed_at`/lineage stay truthful. **Response (404):** unknown or
+outside-scope id.
 
 #### `GET /api/executions/{id}/summary`
 
-Get an execution summary (counts of targeted, responded, success, failure agents).
+**Permission:** `Execution:Read`. Get an execution summary (counts of targeted, responded,
+success, failure agents, `progress_pct`). **Response (404):** unknown or outside-scope id.
 
 #### `GET /api/executions/{id}/agents`
 
-List agents involved in an execution.
+**Permission:** `Execution:Read`. List agents involved in an execution, filtered to the caller's
+visible agents under a confined grant. **Response (404):** unknown or outside-scope id.
 
 #### `GET /api/executions/{id}/children`
 
-List child executions spawned from a parent execution.
+**Permission:** `Execution:Read`. List child executions spawned from a parent execution. Each
+child is independently checked against the caller's visibility — a visible parent does not by
+itself disclose a child dispatched by, or targeting, someone else. **Response (404):** unknown or
+outside-scope parent id.
 
 #### `POST /api/executions/{id}/rerun`
 
-Re-execute a previously run instruction with the same parameters and targets.
+**Permission:** `Execution:Execute` AND `Execution:Read` (the mutation's target-visibility check
+runs through the Read fleet gate). Re-execute a previously run instruction with the same
+parameters and targets. Under a confined grant, every targeted agent must be visible to the
+caller — a partially-visible or not-yet-fully-reported execution is refused, with a `404`
+(deliberately non-distinguishing from a nonexistent id, to avoid disclosing a hidden cohort). A
+global (unconfined) grant is unaffected by this check and keeps the pre-existing `400 {"error":
+"original execution not found"}` response for an unknown id.
 
 #### `POST /api/executions/{id}/cancel`
 
-Cancel a running execution.
+**Permission:** `Execution:Execute` AND `Execution:Read`, same confinement rule as `rerun`.
+**Response (404):** unknown execution id (this route no longer reports a false success for a
+nonexistent id), outside-scope, or an incomplete/partial target cohort.
 
 ---
 

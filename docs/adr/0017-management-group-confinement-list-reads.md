@@ -262,6 +262,19 @@ gate.
     group-write + confined response-read) can use the unscoped facet query to discover and enroll
     out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3489
     (canonical; #3525 tracked the same finding and was closed as its duplicate).
+- **Executions (legacy pre-v1 routes)** — `GET /api/executions` (list), `/{id}` (detail),
+  `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, `POST /{id}/cancel`
+  (`server.cpp`) — absent from every prior version of this coverage map; found during #1634's own
+  Gate 2 review and deliberately deferred to a dedicated issue rather than folded into that PR.
+  **DONE (#3789, closed):** all seven migrated onto `require_fleet_read`/`authz::in_scope`, matching
+  the `GET /api/v1/executions/{id}` shape documented in `docs/auth-architecture.md`'s "Fourth
+  migration (#3789)". The LIST route's confinement predicate is pushed into SQL before `LIMIT`
+  (INV-3) via a correlated `EXISTS` over `agent_exec_status` plus an owner disjunct — a real
+  visible-agent intersection, not the own-dispatches-only shortcut MCP `list_executions` still uses
+  (`docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
+  `require_fleet_read(..., "Read")` (the fleet gate is structurally Read-only, INV — see
+  `authz_gates.cpp`) and apply a stricter complete-cohort-in-scope rule, not bare visibility, before
+  allowing a rerun/cancel. Coverage: `tests/unit/server/test_legacy_executions_scope_authz.cpp`.
 - **Device list** — `/api/agents` (`server.cpp:5312`), `/fragments/devices/list`, the dashboard
   `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892`),
   `get_visible_agents_json` (`server.cpp:3784/8543`).

@@ -59,6 +59,7 @@
 #include "discovery_store.hpp"
 #include "engine_principal_store.hpp"
 #include "execution_event_bus.hpp"
+#include "execution_scope_rules.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
@@ -17254,16 +17255,29 @@ private:
         });
 
         // -- Execution API ----------------------------------------------------
+        //
+        // #3789: every route below is gated on `require_fleet_read(...,
+        // "Read")` (mutations additionally keep their pre-existing
+        // `require_permission(..., "Execute")` ahead of it — the fleet gate
+        // structurally rejects any operation but "Read", see
+        // authz_gates.cpp). `gate.scope` engaged means a confined caller;
+        // visibility/count/mutation-admission decisions are delegated to
+        // execution_scope_rules.hpp so every route (and its tests) share ONE
+        // implementation of each rule. See docs/auth-architecture.md's
+        // "Fourth migration (#3789)" note for the full design rationale.
 
         web_server_->Get("/api/executions", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
-                return;
+            // No correlation-id capture here: list confinement is silent
+            // narrowing (like every other list-read gate in this file), so
+            // no audit-detail string needs it — a4_error mints one lazily
+            // on any 503/400 branch below.
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -17277,26 +17291,103 @@ private:
                     q.limit = std::stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            // #3789: the legacy route previously had no upper bound; cap
+            // matches MCP list_executions (mcp_server.cpp).
+            if (q.limit < 1)
+                q.limit = 1;
+            if (q.limit > 500)
+                q.limit = 500;
+
+            yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+                // #3789 (mcp_server.cpp list_executions CH-5 precedent): an
+                // empty username must never silently widen the owner
+                // disjunct to "no owner filter" for a confined caller.
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                yuzu::server::ExecutionListScope s;
+                s.owner = username;
+                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                scope_arg = std::move(s);
+            }
+
+            auto execs_opt = execution_tracker_->query_executions_checked(q, scope_arg);
+            if (!execs_opt) {
+                res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
                     "application/json");
                 return;
             }
+            const auto& execs = *execs_opt;
 
-            auto execs = execution_tracker_->query_executions(q);
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& e : execs) {
-                arr.push_back({{"id", e.id},
-                               {"definition_id", e.definition_id},
-                               {"status", e.status},
-                               {"dispatched_by", e.dispatched_by},
-                               {"dispatched_at", e.dispatched_at},
-                               {"agents_targeted", e.agents_targeted},
-                               {"agents_responded", e.agents_responded},
-                               {"agents_success", e.agents_success},
-                               {"agents_failure", e.agents_failure},
-                               {"completed_at", e.completed_at},
-                               {"rerun_of", e.rerun_of}});
+            if (gate.scope) {
+                // #3789: batched per-row visibility + confined counts, one
+                // round trip (ADR-0017 INV-10) — the SQL scope pushdown
+                // above already restricted `execs` to visible rows; this
+                // re-check is defense-in-depth plus how the per-row confined
+                // counts get derived.
+                std::vector<std::string> ids;
+                ids.reserve(execs.size());
+                for (const auto& e : execs)
+                    ids.push_back(e.id);
+                auto statuses_opt = execution_tracker_->get_agent_statuses_for_executions_checked(ids);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& e : execs) {
+                    auto it = statuses_opt->find(e.id);
+                    const auto& statuses =
+                        it != statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(e, statuses, gate.scope, username))
+                        continue;
+                    auto counts = confined_projection(statuses, gate.scope);
+                    arr.push_back({{"id", e.id},
+                                   {"definition_id", e.definition_id},
+                                   {"status", e.status},
+                                   {"dispatched_by", e.dispatched_by},
+                                   {"dispatched_at", e.dispatched_at},
+                                   {"agents_targeted", counts.agents_targeted},
+                                   {"agents_responded", counts.agents_responded},
+                                   {"agents_success", counts.agents_success},
+                                   {"agents_failure", counts.agents_failure},
+                                   {"completed_at", e.completed_at},
+                                   {"rerun_of", e.rerun_of}});
+                }
+            } else {
+                for (const auto& e : execs) {
+                    arr.push_back({{"id", e.id},
+                                   {"definition_id", e.definition_id},
+                                   {"status", e.status},
+                                   {"dispatched_by", e.dispatched_by},
+                                   {"dispatched_at", e.dispatched_at},
+                                   {"agents_targeted", e.agents_targeted},
+                                   {"agents_responded", e.agents_responded},
+                                   {"agents_success", e.agents_success},
+                                   {"agents_failure", e.agents_failure},
+                                   {"completed_at", e.completed_at},
+                                   {"rerun_of", e.rerun_of}});
+                }
             }
             res.set_content(nlohmann::json({{"executions", arr}, {"count", arr.size()}}).dump(),
                             "application/json");
@@ -17304,85 +17395,255 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+))", [this](const httplib::Request& req,
                                                               httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto exec = execution_tracker_->get_execution(id);
-            if (!exec) {
-                res.status = 404;
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
                     "application/json");
                 return;
             }
+            const auto& exec_opt = *exec_r;
 
-            res.set_content(nlohmann::json({{"id", exec->id},
-                                            {"definition_id", exec->definition_id},
-                                            {"status", exec->status},
-                                            {"scope_expression", exec->scope_expression},
-                                            {"parameter_values", exec->parameter_values},
-                                            {"dispatched_by", exec->dispatched_by},
-                                            {"dispatched_at", exec->dispatched_at},
-                                            {"agents_targeted", exec->agents_targeted},
-                                            {"agents_responded", exec->agents_responded},
-                                            {"agents_success", exec->agents_success},
-                                            {"agents_failure", exec->agents_failure},
-                                            {"completed_at", exec->completed_at},
-                                            {"parent_id", exec->parent_id},
-                                            {"rerun_of", exec->rerun_of}})
+            std::vector<AgentExecStatus> statuses;
+            if (gate.scope) {
+                // #1634 perf precedent: only fetch/scan agent statuses when
+                // confined — an unrestricted caller is always visible
+                // regardless, so this indexed lookup would be pure waste.
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                statuses = std::move(*statuses_opt);
+            }
+
+            const bool visible =
+                exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            if (!exec_opt || !visible) {
+                // #3789: a suppressed cross-operator read attempt is
+                // CC7.2-evidence-worthy the same way the #1634 v1 detail
+                // route treats it — audit it distinctly even though the
+                // caller-visible response stays identical to a nonexistent
+                // execution_id (no oracle).
+                (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                "not found or outside caller's fleet-read scope surface=detail "
+                                "cid=" +
+                                    cid);
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            const auto& exec = *exec_opt;
+            std::string scope_expression = exec.scope_expression;
+            std::string parameter_values = exec.parameter_values;
+            int agents_targeted = exec.agents_targeted;
+            int agents_responded = exec.agents_responded;
+            int agents_success = exec.agents_success;
+            int agents_failure = exec.agents_failure;
+            // #3789: `owns_execution` above exists only to admit a
+            // dispatcher to a just-dispatched, zero-status-row execution —
+            // it must never also bypass this projection (#1634 precedent,
+            // rest_api_v1.cpp). Apply confinement whenever `gate.scope` is
+            // engaged, dispatcher or not.
+            if (gate.scope) {
+                auto counts = confined_projection(statuses, gate.scope);
+                agents_targeted = counts.agents_targeted;
+                agents_responded = counts.agents_responded;
+                agents_success = counts.agents_success;
+                agents_failure = counts.agents_failure;
+                scope_expression = "(redacted - confined view)";
+                parameter_values = "(redacted - confined view)";
+            }
+            // Deliberately keep status, completion time, dispatcher, and
+            // lineage truthful (#1634 precedent) — none directly names
+            // another agent. Deliberately NOT adding last_error_detail:
+            // this legacy payload never carried it, and it is
+            // PII-adjacent (agent stderr) — do not introduce a new
+            // unconfined exposure while closing this gap.
+            res.set_content(nlohmann::json({{"id", exec.id},
+                                            {"definition_id", exec.definition_id},
+                                            {"status", exec.status},
+                                            {"scope_expression", scope_expression},
+                                            {"parameter_values", parameter_values},
+                                            {"dispatched_by", exec.dispatched_by},
+                                            {"dispatched_at", exec.dispatched_at},
+                                            {"agents_targeted", agents_targeted},
+                                            {"agents_responded", agents_responded},
+                                            {"agents_success", agents_success},
+                                            {"agents_failure", agents_failure},
+                                            {"completed_at", exec.completed_at},
+                                            {"parent_id", exec.parent_id},
+                                            {"rerun_of", exec.rerun_of}})
                                 .dump(),
                             "application/json");
         });
 
         web_server_->Get(R"(/api/executions/([^/]+)/summary)", [this](const httplib::Request& req,
                                                                       httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto summary = execution_tracker_->get_summary(id);
-            res.set_content(nlohmann::json({{"id", summary.id},
-                                            {"status", summary.status},
-                                            {"agents_targeted", summary.agents_targeted},
-                                            {"agents_responded", summary.agents_responded},
-                                            {"agents_success", summary.agents_success},
-                                            {"agents_failure", summary.agents_failure},
-                                            {"progress_pct", summary.progress_pct}})
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            std::vector<AgentExecStatus> statuses;
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                statuses = std::move(*statuses_opt);
+            }
+
+            const bool visible =
+                exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            if (!exec_opt || !visible) {
+                // #3789: unknown-id and invisible now collapse to the SAME
+                // 404 for EVERY caller — the legacy route previously
+                // returned a zero-filled 200 for an unknown id even to an
+                // unconfined caller (behavior change; docs/user-manual/
+                // upgrading.md).
+                (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                "not found or outside caller's fleet-read scope surface=summary "
+                                "cid=" +
+                                    cid);
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            const auto& exec = *exec_opt;
+            int agents_targeted = exec.agents_targeted;
+            int agents_responded = exec.agents_responded;
+            int agents_success = exec.agents_success;
+            int agents_failure = exec.agents_failure;
+            if (gate.scope) {
+                auto counts = confined_projection(statuses, gate.scope);
+                agents_targeted = counts.agents_targeted;
+                agents_responded = counts.agents_responded;
+                agents_success = counts.agents_success;
+                agents_failure = counts.agents_failure;
+            }
+            const int progress_pct =
+                agents_targeted > 0 ? (agents_responded * 100 / agents_targeted) : 0;
+
+            res.set_content(nlohmann::json({{"id", exec.id},
+                                            {"status", exec.status},
+                                            {"agents_targeted", agents_targeted},
+                                            {"agents_responded", agents_responded},
+                                            {"agents_success", agents_success},
+                                            {"agents_failure", agents_failure},
+                                            {"progress_pct", progress_pct}})
                                 .dump(),
                             "application/json");
         });
 
         web_server_->Get(R"(/api/executions/([^/]+)/agents)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto agents = execution_tracker_->get_agent_statuses(id);
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+            if (!statuses_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& statuses = *statuses_opt;
+
+            const bool visible =
+                exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            if (!exec_opt || !visible) {
+                (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                "not found or outside caller's fleet-read scope surface=agents "
+                                "cid=" +
+                                    cid);
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            // #3789: this route returns raw agent identities — the worst
+            // leak of the seven pre-migration routes. Filter to in-scope
+            // agents; the projection applies to the dispatcher too, same as
+            // the detail route.
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : agents) {
+            for (const auto& a : statuses) {
+                if (!authz::in_scope(gate.scope, a.agent_id))
+                    continue;
                 arr.push_back({{"agent_id", a.agent_id},
                                {"status", a.status},
                                {"dispatched_at", a.dispatched_at},
@@ -17398,11 +17659,13 @@ private:
                                                                      httplib::Response& res) {
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -17412,6 +17675,50 @@ private:
 
             auto session = auth_routes_->resolve_session(req);
             auto user = session ? session->username : "unknown";
+            const std::string username = session ? session->username : std::string{};
+
+            if (gate.scope) {
+                auto exec_r = execution_tracker_->get_execution_checked(id);
+                if (!exec_r) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                const auto& exec_opt = *exec_r;
+                bool admitted = false;
+                if (exec_opt) {
+                    auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                    if (!statuses_opt) {
+                        res.status = 503;
+                        res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                        {.retry_after_ms = 5000}),
+                                        "application/json");
+                        return;
+                    }
+                    admitted = admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
+                                                      username);
+                }
+                if (!admitted) {
+                    // #3789: uniform deny shape — nonexistent, zero-visible,
+                    // partial, and incomplete-target-ledger all collapse to
+                    // the SAME 404 + non-distinguishing audit detail (a
+                    // distinct status for "partial visibility" would be a
+                    // hidden-cohort oracle, Sol/gpt-5.6-sol adversarial
+                    // review).
+                    (void)audit_log(req, "execution.rerun", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope cid=" + cid);
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "not found"), "application/json");
+                    return;
+                }
+            }
+            // Unconfined callers (and confined-and-admitted ones) fall
+            // through to create_rerun, which performs its own
+            // (degrade-collapsing) existence check internally — unchanged
+            // from pre-#3789 behavior for an unconfined caller hitting an
+            // unknown id (400 "original execution not found").
 
             auto result = execution_tracker_->create_rerun(id, user, failed_only);
             if (!result) {
@@ -17434,17 +17741,60 @@ private:
                                                                       httplib::Response& res) {
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
             auto session = auth_routes_->resolve_session(req);
             auto user = session ? session->username : "unknown";
+            const std::string username = session ? session->username : std::string{};
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+            // #3789: `mark_cancelled` reports PGRES_COMMAND_OK (success) on
+            // an UPDATE that matched zero rows — without an explicit
+            // existence check here, ANY caller hitting an unknown id would
+            // get a false "cancelled" 200 (Sol/gpt-5.6-sol adversarial
+            // review). This check applies uniformly regardless of
+            // confinement — existence is orthogonal to scope, and already
+            // disclosed via the GET routes.
+            if (!exec_opt) {
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                if (!admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope, username)) {
+                    (void)audit_log(req, "execution.cancel", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope cid=" + cid);
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "not found"), "application/json");
+                    return;
+                }
+            }
 
             // governance PR review (2026-08-31): mark_cancelled now reports
             // whether the update actually happened — do not tell the
@@ -17453,9 +17803,8 @@ private:
             if (!execution_tracker_->mark_cancelled(id, user)) {
                 (void)audit_log(req, "execution.cancel", "failure", "execution", id);
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"cancel failed - execution store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "cancel failed - execution store degraded"),
+                                "application/json");
                 return;
             }
             (void)audit_log(req, "execution.cancel", "success", "execution", id);
@@ -17468,22 +17817,104 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+)/children)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto children = execution_tracker_->get_children(id);
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            std::vector<AgentExecStatus> parent_statuses;
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                parent_statuses = std::move(*statuses_opt);
+            }
+
+            const bool parent_visible =
+                exec_opt.has_value() &&
+                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+            if (!exec_opt || !parent_visible) {
+                (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                "not found or outside caller's fleet-read scope surface=children "
+                                "cid=" +
+                                    cid);
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            auto children_opt = execution_tracker_->get_children_checked(id);
+            if (!children_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& c : children) {
-                arr.push_back(
-                    {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+            if (gate.scope) {
+                // #3789 (Sol/gpt-5.6-sol adversarial review, overriding an
+                // earlier "truthful lineage" reading of the #1634 detail
+                // precedent): parent visibility does NOT authorize
+                // enumerating separate child execution records — each
+                // child passes the same owner-or-visible-agent predicate
+                // independently. One batched statuses call, not N+1.
+                std::vector<std::string> child_ids;
+                child_ids.reserve(children_opt->size());
+                for (const auto& c : *children_opt)
+                    child_ids.push_back(c.id);
+                auto child_statuses_opt =
+                    execution_tracker_->get_agent_statuses_for_executions_checked(child_ids);
+                if (!child_statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& c : *children_opt) {
+                    auto it = child_statuses_opt->find(c.id);
+                    const auto& c_statuses =
+                        it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                        continue;
+                    arr.push_back(
+                        {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+                }
+            } else {
+                for (const auto& c : *children_opt) {
+                    arr.push_back(
+                        {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+                }
             }
             res.set_content(nlohmann::json({{"children", arr}}).dump(), "application/json");
         });

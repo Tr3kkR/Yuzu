@@ -89,6 +89,30 @@ struct ExecutionQuery {
     bool include_error_detail{false};
 };
 
+/// #3789: SQL-pushdown caller-visibility for `query_executions_checked`
+/// (the migrated legacy `GET /api/executions` LIST route). Unlike
+/// `ExecutionQuery::dispatched_by` above (an exact-match FILTER — narrows
+/// to only that dispatcher's rows), this is an ADMISSION predicate: a row
+/// is included when EITHER `owner` dispatched it OR the execution has at
+/// least one `agent_exec_status` row whose `agent_id` is in
+/// `visible_agents`. The owner disjunct exists because `agent_exec_status`
+/// rows are written ONLY on response arrival (see `update_agent_status`'s
+/// sole caller, `agent_service_impl.cpp`) — a just-dispatched execution has
+/// zero status rows regardless of its real target set, so an
+/// agent-membership-only predicate would make a caller's own execution
+/// invisible to them until the first agent replies. `owner` empty AND
+/// `visible_agents` empty means "visible to nobody" (every row excluded),
+/// matching `response_store.cpp`'s `append_scope_clause` engaged-empty
+/// convention. This is a plain data type with no authz dependency — the
+/// route layer derives it from `authz::VisibleSet`/the session username.
+struct ExecutionListScope {
+    std::string owner;
+    std::vector<std::string> visible_agents;
+};
+/// `nullopt` = unrestricted (TOP, no pushdown) — every existing caller of
+/// `query_executions`/`query_executions_checked`'s default keeps this.
+using ExecutionScope = std::optional<ExecutionListScope>;
+
 struct ExecutionSummary {
     std::string id;
     std::string status;
@@ -182,7 +206,33 @@ public:
 
     // Query
     std::vector<Execution> query_executions(const ExecutionQuery& q = {}) const;
+    /// #3789: degrade-distinguishable + scope-pushdown twin of
+    /// `query_executions`, for the migrated legacy `GET /api/executions`
+    /// LIST route. `nullopt` on a pool/query failure (a plain empty vector
+    /// there is indistinguishable from "no matching executions" — a caller
+    /// that drops rows and writes audit trails off this result must not
+    /// treat a degrade as an empty result set). `scope` engaged pushes the
+    /// `ExecutionListScope` admission predicate into the `WHERE` clause
+    /// BEFORE `ORDER BY`/`LIMIT` (ADR-0017 INV-3) via a correlated `EXISTS`
+    /// over `agent_exec_status` — `executions` carries no per-row
+    /// `agent_id` column, so this is not the N+1 shape
+    /// `ExecutionQuery::dispatched_by`'s doc comment above rejects (one
+    /// statement, planner-optimizable to a semi-join).
+    std::optional<std::vector<Execution>>
+    query_executions_checked(const ExecutionQuery& q = {},
+                             const ExecutionScope& scope = std::nullopt) const;
     std::optional<Execution> get_execution(const std::string& id) const;
+    /// #3789: degrade-distinguishable twin of `get_execution`. That method
+    /// collapses "row absent" and "read degraded" to the same `nullopt`
+    /// (single early-return in the shared `exec_by_id_at` helper) — fine
+    /// for its existing best-effort callers, but a confined route that
+    /// turns a `nullopt` into a 404 + a `denied` audit row must not do that
+    /// on a transient degrade (false 404 for a legitimate owner; a
+    /// permanently wrong CC7.2 audit trail for a non-owner). `unexpected`
+    /// only for a pool/query failure; the inner `optional` empty means the
+    /// row genuinely doesn't exist.
+    [[nodiscard]] std::expected<std::optional<Execution>, std::string>
+    get_execution_checked(const std::string& id) const;
     ExecutionSummary get_summary(const std::string& id) const;
     std::vector<AgentExecStatus> get_agent_statuses(const std::string& execution_id) const;
     /// #1634 (Doomgoose review finding, important) — degrade-distinguishable
@@ -212,7 +262,26 @@ public:
     /// without touching the pool (engaged-empty, not a degrade).
     std::unordered_map<std::string, std::vector<AgentExecStatus>>
     get_agent_statuses_for_executions(const std::vector<std::string>& execution_ids) const;
+    /// #3789: degrade-distinguishable twin of `get_agent_statuses_for_executions`,
+    /// for callers that DROP rows or write `denied` audit rows off the
+    /// result (the migrated legacy LIST route). The plain map's
+    /// degrade-vs-empty ambiguity is tolerable for MCP `list_executions`'
+    /// count-only projection (a degrade there just yields false zero
+    /// counts on an otherwise-unaffected row) but not here, where it would
+    /// silently drop in-scope executions from a confined caller's page.
+    /// `nullopt` on a pool/query failure; an engaged-but-empty map means
+    /// zero of the requested executions have any status rows yet — a
+    /// normal, non-degraded outcome for a just-dispatched execution
+    /// (`agent_exec_status` is response-arrival-seeded, #3789 finding).
+    std::optional<std::unordered_map<std::string, std::vector<AgentExecStatus>>>
+    get_agent_statuses_for_executions_checked(
+        const std::vector<std::string>& execution_ids) const;
     std::vector<Execution> get_children(const std::string& parent_id) const;
+    /// #3789: degrade-distinguishable twin of `get_children`, for the
+    /// migrated `/api/executions/{id}/children` route — `nullopt` on a
+    /// pool/query failure, an empty vector means the parent genuinely has
+    /// no children.
+    std::optional<std::vector<Execution>> get_children_checked(const std::string& parent_id) const;
 
     // Mutation
     std::expected<std::string, std::string> create_execution(const Execution& exec);
