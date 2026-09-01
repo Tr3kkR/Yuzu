@@ -2259,10 +2259,12 @@ AgentServiceImpl::ota_admission_key(const grpc::ServerContext& ctx) const {
     if (!ip.empty())
         return AdmissionKey{std::move(ip), "peer_ip"};
 
-    // Neither a certificate nor a parseable peer. gRPC always populates peer()
-    // for a real connection, so this is defensive; it is kept distinguishable in
-    // the metric so a deployment that somehow lands here is visible rather than
-    // silently sharing one bucket.
+    // Neither a certificate nor a parseable peer. This is REACHABLE, not merely
+    // defensive: extract_peer_ip returns empty for any scheme that is not ipv4/ipv6
+    // (see peer_ip.hpp), so a unix-socket listen address collapses every caller
+    // onto this one bucket — 2 concurrent transfers for the whole fleet. Yuzu
+    // configures a TCP listener, so it does not arise in a supported deployment,
+    // and the mode label makes it visible if it ever does.
     return AdmissionKey{std::string("unknown"), "unknown"};
 }
 

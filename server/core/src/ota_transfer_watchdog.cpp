@@ -19,7 +19,18 @@ OtaTransferWatchdog::OtaTransferWatchdog(std::chrono::milliseconds sweep_interva
             if (stop_)
                 return;
             lock.unlock();
-            sweep_once();
+            // Guarded because an escape here terminates the process with no
+            // diagnostic: a throw out of a thread function is std::terminate, and
+            // nothing above this frame can catch it. register_transfer's CancelFn
+            // carries no noexcept contract (unlike set_on_evict, which states one),
+            // so a future caller could supply a throwing one; production's
+            // `[ctx]{ctx->TryCancel();}` cannot throw. Swallow and keep sweeping —
+            // a dropped pass costs at most one sweep_interval of deadline latency,
+            // whereas dying takes the whole server with it.
+            try {
+                sweep_once();
+            } catch (...) {
+            }
             lock.lock();
         }
     });

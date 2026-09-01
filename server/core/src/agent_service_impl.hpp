@@ -114,15 +114,23 @@ public:
         int max_concurrent_total{64};
     };
 
-    /// Reconfigure the OTA bounds. Safe to call at any time: it reconfigures the
-    /// quota IN PLACE via `PrincipalQuota::set_config` and never replaces the
-    /// object, so an in-flight `DownloadUpdate` holding a `QuotaSlot` keeps a
-    /// valid owner. (An earlier revision rebuilt the quota through a
-    /// `unique_ptr`, which orphaned exactly that back-pointer — a use-after-free
-    /// that only the absence of a mid-flight caller kept unreachable.)
+    /// Reconfigure the OTA bounds. SET BEFORE TRAFFIC — call it before
+    /// `BuildAndStart`, which is what every current caller does.
     ///
-    /// Deadlines are read per call, so a change takes effect on the next
-    /// transfer rather than retroactively shortening one already running.
+    /// The QUOTA half is safe at any time: `PrincipalQuota::set_config`
+    /// reconfigures in place under its own mutex and never replaces the object, so
+    /// an in-flight `DownloadUpdate` holding a `QuotaSlot` keeps a valid owner. (An
+    /// earlier revision rebuilt the quota through a `unique_ptr`, orphaning exactly
+    /// that back-pointer — a use-after-free that only the absence of a mid-flight
+    /// caller kept unreachable.)
+    ///
+    /// `ota_cfg_` ITSELF IS NOT. It is a plain struct with no synchronisation, and
+    /// the handler reads `chunk_stall_deadline` once per chunk and
+    /// `transfer_deadline` once per transfer. A concurrent write is a data race, so
+    /// an earlier version of this comment ("safe to call at any time") was an
+    /// invitation to write one. Making it safe means an atomic snapshot or a
+    /// seqlock, which is unwarranted while no runtime caller exists — but a future
+    /// caller must add it rather than trust this comment.
     void set_ota_bound_config(const OtaBoundConfig& cfg);
 
     /// #416: require a POSITIVE peer identity on the two agent-initiated OTA
