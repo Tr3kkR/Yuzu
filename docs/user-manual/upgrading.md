@@ -21,6 +21,44 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## Agent OTA pulls are now bounded per peer (#913, #911) — behaviour change
+
+`DownloadUpdate` is now admitted through a per-peer gate. A refused pull returns
+gRPC `RESOURCE_EXHAUSTED`; a transfer exceeding `--ota-transfer-deadline-secs`
+(default 900) or `--ota-chunk-write-deadline-secs` (default 30) returns
+`DEADLINE_EXCEEDED`. Agents retry on their normal update interval, so no update is
+lost — but the first fleet-wide update after upgrading can take substantially
+longer than before, and on one deployment shape it can take days.
+
+**Check this before your first post-upgrade fleet update.** Admission keys on the
+peer's certificate identity, falling back to **source IP** where no client
+certificate is presented. Every certless agent behind one NAT egress therefore
+shares **one** bucket: 2 concurrent transfers and a sustained 1 admission per
+minute for the entire site, after an initial burst of 20.
+
+| Certless devices behind one egress | Time for a fleet-wide update |
+|---|---|
+| 20 | minutes (absorbed by the burst) |
+| 500 | ~8 hours |
+| 5,000 | ~3.5 days |
+
+**What to do.** Run `yuzu_ota_admission_key_mode_total` and look at the
+`mode="peer_ip"` share. If it is material:
+
+- **Preferred:** enrol those agents with client certificates. Each then gets its
+  own bucket and the problem disappears.
+- **Otherwise:** raise `--ota-rate-refill-per-min` and `--ota-max-concurrent-per-peer`
+  for the rollout window, and raise `--ota-max-concurrent-total` (default 64) if you
+  raise the per-peer values across a large fleet.
+
+Watch `yuzu_ota_download_admission_total{decision="rejected_rate"}` during the
+rollout, and see the "Agent OTA pull bounds" runbook in `server-admin.md`.
+
+Also new and worth a look before upgrading: `--grpc-max-threads` (default 256) now
+caps the gRPC sync server's thread pool. Previously nothing did. If you run an
+unusually large fleet with many long-lived `Subscribe` streams, confirm 256 is
+above your steady-state concurrent-handler count.
+
 ## ⚠️ Security: rotate `oidc_client_secret` if it was ever set on this install
 
 **Every release up to and including v0.13.0** emitted the OIDC client secret in the clear to three

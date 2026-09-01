@@ -20,7 +20,19 @@
   single shared bucket would let one unenrolled agent lock out the rest); the
   keying in force is visible on
   `yuzu_ota_admission_key_mode_total{mode}`, and the per-peer map is capped by
-  `--ota-max-peers-tracked`/`YUZU_OTA_MAX_PEERS_TRACKED` (default 50000).
+  `--ota-max-peers-tracked`/`YUZU_OTA_MAX_PEERS_TRACKED` (default 50000, floored
+  at 1024 — a ceiling at or below the live key count makes every insert evict, and
+  a re-inserted key is minted with a full burst, which silently disables the rate
+  dimension it exists to protect). A server-wide ceiling
+  (`--ota-max-concurrent-total`/`YUZU_OTA_MAX_CONCURRENT_TOTAL`, default 64) bounds
+  concurrent transfers across ALL peers: the per-peer cap bounds one identity, but
+  where the identity gate is inert the key falls back to source IP, so that bound
+  otherwise scales with a caller's address space.
+
+  **Behaviour change — read the upgrade note.** Every certless agent behind one NAT
+  egress shares a single bucket, so a 500-device certless site takes roughly eight
+  hours to complete its first post-upgrade fleet-wide update. See
+  `docs/user-manual/upgrading.md`.
 - **OTA transfers are deadline-bounded (#911).** A whole-transfer deadline
   (`--ota-transfer-deadline-secs`/`YUZU_OTA_TRANSFER_DEADLINE_SECS`, default
   900) is enforced by cancelling the RPC from a watchdog thread — the only
@@ -41,7 +53,12 @@
   (`--grpc-max-concurrent-streams`/`YUZU_GRPC_MAX_CONCURRENT_STREAMS`, default
   128) and a `ResourceQuota` memory ceiling
   (`--grpc-max-resource-memory-mb`/`YUZU_GRPC_MAX_RESOURCE_MEMORY_MB`, default
-  512). Both reject at capacity rather than queueing.
+  512), plus a thread ceiling
+  (`--grpc-max-threads`/`YUZU_GRPC_MAX_THREADS`, default 256) applied via
+  `ResourceQuota::SetMaxThreads`. The thread ceiling is the one that bounds
+  concurrent handlers globally — the stream cap is per-CONNECTION and connections
+  are uncapped, so on its own it bounds nothing fleet-wide. All reject at capacity
+  rather than queueing.
 - **Positive peer identity on the OTA RPCs (#416, PARTIAL — does not close it).**
   `CheckForUpdate` and
   `DownloadUpdate` previously checked only that a peer was *not* revoked, and
@@ -50,6 +67,10 @@
   claimed `agent_id` to the certificate's CN/SAN, rejecting a mismatch with
   `UNAUTHENTICATED` plus a `session.ota_identity_rejected` audit row and the
   `yuzu_grpc_ota_identity_rejected_total{event="security",rpc,reason}` counter.
+  A rejection naming no certificate at all (`no_client_identity`) is metric-only:
+  it has no principal to attribute and the audit write is synchronous and sits
+  ahead of the rate bound, so auditing it would reopen the thread-pinning vector
+  this change closes.
   A request omitting `agent_id` entirely is refused with `INVALID_ARGUMENT`
   rather than skipping the bind, so the check cannot be evaded by omission.
   This is gated on the agent listener actually requiring a client certificate,

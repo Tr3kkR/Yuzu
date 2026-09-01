@@ -594,7 +594,7 @@ public:
         // their own families, so this sum is legitimately lower than
         // yuzu_grpc_requests_total{method="DownloadUpdate",status="received"}.
         // Refunds are a separate family below precisely so they cannot break that.
-        for (auto d : {"admitted", "rejected_concurrency", "rejected_rate"})
+        for (auto d : {"admitted", "rejected_concurrency", "rejected_rate", "rejected_total"})
             metrics_.counter("yuzu_ota_download_admission_total", {{"decision", d}});
 
         metrics_.describe("yuzu_ota_download_refund_total",
@@ -6968,6 +6968,7 @@ public:
             .transfer_deadline = std::chrono::seconds(cfg_.ota_transfer_deadline_secs),
             .chunk_stall_deadline = std::chrono::seconds(cfg_.ota_chunk_write_deadline_secs),
             .max_peers_tracked = static_cast<std::size_t>(cfg_.ota_max_peers_tracked),
+            .max_concurrent_total = cfg_.ota_max_concurrent_total,
         });
 
         // #416: require a positive peer identity on the OTA RPCs, and bind the
@@ -7180,6 +7181,11 @@ public:
                                        bounds.max_concurrent_streams);
             grpc::ResourceQuota quota("yuzu_grpc");
             quota.Resize(bounds.resource_quota_bytes);
+            // The THREAD ceiling is the one that bounds concurrent handlers
+            // globally. GRPC_ARG_MAX_CONCURRENT_STREAMS is per-connection and
+            // connections are uncapped, so without this nothing limits how many
+            // sync handlers — Subscribe, DownloadUpdate — run at once.
+            quota.SetMaxThreads(bounds.max_threads);
             builder.SetResourceQuota(quota);
         }
 

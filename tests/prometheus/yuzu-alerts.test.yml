@@ -96,6 +96,76 @@ tests:
         eval_time: 50m
         exp_samples: []
 
+  # CASE I -- the single-increment quiet case. This is the one that was MISSING,
+  # and its absence is why an inert `for:` shipped: `for: 10m` against a [15m]
+  # lookback debounces nothing, so one benign rejection paged. The bar is now a
+  # COUNT (>5), and this case is RED against the old duration-only form.
+  - interval: 1m
+    name: ota concurrency - a single benign rejection stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_concurrency"}'
+        values: "0 1 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuOtaTransfersAborting (#911 / UP-7) ───────────────────────────────
+
+  # CASE J -- the silent-outage detector fires. A misconfigured transfer deadline
+  # aborts every transfer, and because each abort REFUNDS its token the buckets
+  # never drain and RefundDivergence stays quiet — so without this rule the fleet
+  # stops updating with every other dashboard green.
+  - interval: 1m
+    name: ota transfers aborting - sustained deadline aborts fire
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE K -- a healthy fleet completing its transfers stays quiet.
+  - interval: 1m
+    name: ota transfers aborting - no aborts stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # ── YuzuOtaPeerMapEvicting (#935 / UP-8) ─────────────────────────────────
+
+  # CASE L -- sustained eviction fires. Continuous eviction silently DISABLES the
+  # rate dimension, because a re-inserted key is minted with a full burst.
+  - interval: 1m
+    name: ota peer map evicting - sustained eviction fires
+    input_series:
+      - series: 'yuzu_ota_download_peers_evicted_total{job="yuzu",instance="s1"}'
+        values: "0+2x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapEvicting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaPeerMapEvicting", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE M -- a map comfortably under its ceiling never evicts, stays quiet.
+  - interval: 1m
+    name: ota peer map evicting - no eviction stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_peers_evicted_total{job="yuzu",instance="s1"}'
+        values: "0+0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapEvicting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
   # ── YuzuOtaIdentityRejections (#416) ─────────────────────────────────────
 
   # CASE E -- any sustained identity rejection fires. On a fully-enrolled fleet
@@ -107,9 +177,9 @@ tests:
         values: "0+1x60"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
-        eval_time: 30m
+        eval_time: 45m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", event="security", instance="s1", job="yuzu", reason="agent_id_mismatch", rpc="download_update", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
   # CASE F -- a fleet with no identity failures stays quiet. RED if the rule
@@ -174,7 +244,7 @@ tests:
       - expr: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
-          - labels: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing", decision="rejected_concurrency", instance="s1", job="yuzu", severity="warning"}'
+          - labels: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
   # CASE D -- rate-only rejections must NOT wake anyone. This is the

@@ -16,6 +16,7 @@
 /// Verifying that `GRPC_ARG_MAX_CONCURRENT_STREAMS` and `SetResourceQuota`
 /// actually bound the runtime would be testing the library, not this change.
 
+#include <climits>
 #include <cstddef>
 #include <cstdint>
 
@@ -26,6 +27,7 @@ namespace yuzu::server {
 struct GrpcResourceBounds {
     int max_concurrent_streams{0};
     std::size_t resource_quota_bytes{0};
+    int max_threads{0};
 };
 
 /// Clamp floor for both knobs. A zero or negative value would configure a server
@@ -35,6 +37,9 @@ struct GrpcResourceBounds {
 /// future config-file loader that does not go through CLI11).
 inline constexpr int kMinConcurrentStreams = 1;
 inline constexpr std::size_t kMinResourceQuotaBytes = 1024ULL * 1024ULL;
+/// A server that cannot run at least this many handler threads cannot serve a
+/// fleet at all; the floor exists for the same reason as the two above.
+inline constexpr int kMinThreads = 8;
 
 [[nodiscard]] inline GrpcResourceBounds grpc_bounds_from_config(const Config& cfg) {
     GrpcResourceBounds b;
@@ -49,9 +54,16 @@ inline constexpr std::size_t kMinResourceQuotaBytes = 1024ULL * 1024ULL;
     // size_t, silently disabling the very bound it was meant to raise.
     const std::int64_t mb =
         cfg.grpc_max_resource_memory_mb < 1 ? 1 : cfg.grpc_max_resource_memory_mb;
-    b.resource_quota_bytes = static_cast<std::size_t>(mb) * 1024ULL * 1024ULL;
+    const std::uint64_t bytes = static_cast<std::uint64_t>(mb) * 1024ULL * 1024ULL;
+    // Clamp into size_t BEFORE narrowing — on a 32-bit target the multiply above
+    // would otherwise wrap on assignment and the floor below would then hand back a
+    // TINY quota, the inverse of what the operator asked for.
+    b.resource_quota_bytes = static_cast<std::size_t>(
+        bytes > static_cast<std::uint64_t>(SIZE_MAX) ? static_cast<std::uint64_t>(SIZE_MAX) : bytes);
     if (b.resource_quota_bytes < kMinResourceQuotaBytes)
         b.resource_quota_bytes = kMinResourceQuotaBytes;
+
+    b.max_threads = cfg.grpc_max_threads < kMinThreads ? kMinThreads : cfg.grpc_max_threads;
     return b;
 }
 

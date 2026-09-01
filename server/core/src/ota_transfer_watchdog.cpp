@@ -1,5 +1,6 @@
 #include "ota_transfer_watchdog.hpp"
 
+#include <cstdlib>
 #include <utility>
 
 namespace yuzu::server {
@@ -102,10 +103,20 @@ void OtaTransferWatchdog::erase(std::uint64_t id) noexcept {
         std::lock_guard lock(mu_);
         live_.erase(id);
     } catch (...) {
-        // A mutex that cannot be locked means the watchdog is already unreliable.
-        // Leaking one map entry is strictly better than aborting the process; the
-        // entry's CancelFn is the only thing at risk and the sweeper re-checks
-        // `cancelled` before invoking it.
+        // A leaked entry is NOT harmless, and an earlier version of this comment
+        // claimed it was on the grounds that "the sweeper re-checks `cancelled`".
+        // That is false: `cancelled` latches only entries the sweeper has ALREADY
+        // cancelled, so an entry leaked before its deadline still has
+        // `cancelled == false` and a later sweep WILL invoke its CancelFn — on a
+        // ServerContext whose handler frame has returned. The latch suppresses
+        // sweeps 2..n, not sweep 1.
+        //
+        // So this abort()s rather than continuing, matching the destructor's stated
+        // policy for the same class of failure: a bookkeeping structure that cannot
+        // be maintained must not be left in a state that dereferences freed memory.
+        // Reaching here requires std::mutex::lock to throw, which on a healthy
+        // process does not happen.
+        std::abort();
     }
 }
 

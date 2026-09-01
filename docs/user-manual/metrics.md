@@ -858,6 +858,7 @@ alerts stay meaningful.
 yuzu_ota_download_admission_total{decision="admitted"} 0
 yuzu_ota_download_admission_total{decision="rejected_concurrency"} 0
 yuzu_ota_download_admission_total{decision="rejected_rate"} 0
+yuzu_ota_download_admission_total{decision="rejected_total"} 0
 
 # HELP yuzu_ota_download_refund_total Agent OTA rate tokens returned after a server-attributable failure, by reason
 # TYPE yuzu_ota_download_refund_total counter
@@ -905,7 +906,9 @@ meaningful. Labels are bounded by construction — a peer identity or IP is
 behaviour during a fleet-wide update, not an attack signal (the same reasoning
 that keeps the per-principal quota counters off `event="security"`).
 `yuzu_grpc_ota_identity_rejected_total` is the exception and carries
-`event="security"`, because a failed certificate bind on an already-enrolled
+`event="security"` (it counts all four rejection reasons; only three of them also
+write an audit row — `no_client_identity` is metric-only, see
+`docs/user-manual/audit-log.md`), because a failed certificate bind on an already-enrolled
 agent's OTA pull is an authentication event; it mirrors
 `yuzu_grpc_revoked_cert_total` and is paired with a
 `session.ota_identity_rejected` audit row (the metric is the signal, the audit
@@ -916,6 +919,9 @@ different `detail` shape — see `docs/user-manual/audit-log.md`.
 **Reading `decision`.** `rejected_concurrency` means the peer already held
 `--ota-max-concurrent-per-peer` parallel downloads — the primary bound, and the
 one that should fire under an actual monopolisation attempt.
+`rejected_total` means the SERVER-WIDE ceiling
+(`--ota-max-concurrent-total`) was hit — the only bound that does not scale with a
+caller's address space, so it is the one that fires under a distributed pull.
 `rejected_rate` means the peer drained its token bucket, which is a much looser
 secondary bound; sustained `rejected_rate` without `rejected_concurrency`
 usually indicates the rate knobs are tuned too tightly for the fleet's retry

@@ -98,7 +98,20 @@ public:
         /// #935: the admission key falls back to peer IP when no client
         /// certificate is presented, so the key space is attacker-influenced
         /// and MUST be capped.
+        ///
+        /// FLOOR, deliberately: a value below `kMinPeersTracked` is clamped up.
+        /// Setting it near or below the live peer count does not merely shrink a
+        /// cache — every insert then evicts, and `locate_locked` mints a FULL
+        /// burst for the re-inserted key, so the rate dimension silently stops
+        /// limiting anything (at 1 it is off entirely). A cap that disables the
+        /// limiter it exists to protect is worse than no cap.
         std::size_t max_peers_tracked{50000};
+
+        /// Server-wide ceiling on concurrent transfers across ALL peers. The
+        /// per-peer cap bounds one identity; where the identity gate is inert the
+        /// key falls back to source IP, so that bound scales with the caller's
+        /// address space. This one does not.
+        int max_concurrent_total{64};
     };
 
     /// Reconfigure the OTA bounds. Safe to call at any time: it reconfigures the
@@ -395,6 +408,32 @@ private:
     PrincipalQuota ota_quota_;
     OtaTransferWatchdog ota_watchdog_;
     bool require_positive_ota_identity_{false};
+
+    /// Server-wide in-flight transfer count (see OtaBoundConfig::max_concurrent_total).
+    /// Atomic rather than mutex-guarded: it is a single counter on the admission
+    /// path and must not add contention to the quota's own lock.
+    std::atomic<int> ota_in_flight_total_{0};
+
+    /// Move-only RAII for the server-wide slot. Mirrors QuotaSlot's contract so
+    /// every DownloadUpdate exit path releases exactly once.
+    class TotalSlot {
+      public:
+        TotalSlot() = default;
+        explicit TotalSlot(std::atomic<int>* c) : counter_(c) {}
+        TotalSlot(TotalSlot&& o) noexcept : counter_(o.counter_) { o.counter_ = nullptr; }
+        TotalSlot& operator=(TotalSlot&& o) noexcept {
+            if (this != &o) { reset(); counter_ = o.counter_; o.counter_ = nullptr; }
+            return *this;
+        }
+        TotalSlot(const TotalSlot&) = delete;
+        TotalSlot& operator=(const TotalSlot&) = delete;
+        ~TotalSlot() noexcept { reset(); }
+        void reset() noexcept {
+            if (counter_) { counter_->fetch_sub(1, std::memory_order_acq_rel); counter_ = nullptr; }
+        }
+      private:
+        std::atomic<int>* counter_{nullptr};
+    };
 
     /// The admission key for one OTA call, plus which keying produced it.
     ///

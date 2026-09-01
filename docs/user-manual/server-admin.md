@@ -104,9 +104,11 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--ota-max-concurrent-per-peer` | `2` | **Agent OTA pulls (#913).** Maximum parallel `DownloadUpdate` streams a single peer may hold. This is the PRIMARY bound on the OTA path: the attack it closes is one authenticated agent opening many concurrent streams, each pinning a gRPC thread on blocking disk and network I/O. Exceeding it returns gRPC `RESOURCE_EXHAUSTED` (rejected, never queued). Admission keys on the peer's certificate identity, falling back to peer IP when no client certificate is presented. Env: `YUZU_OTA_MAX_CONCURRENT_PER_PEER`. |
 | `--ota-rate-capacity` | `20.0` | **Agent OTA pulls (#913).** Token-bucket burst per peer, a secondary bound that exists only to stop a fast open/close hammer loop. Deliberately loose: a bucket meters *attempts*, so tightening it punishes retries and can lock out honest slow-link or flapping agents rather than the attacker (this is the failure mode recorded on #934 and #941). Tune `--ota-max-concurrent-per-peer` first. Env: `YUZU_OTA_RATE_CAPACITY`. |
 | `--ota-rate-refill-per-min` | `1.0` | **Agent OTA pulls (#913).** Tokens restored per minute per peer. At the defaults a peer that reconnects five times spends five tokens and recovers them in five minutes. A transfer that trips a server-imposed deadline refunds its token, so failures the server caused never count against the peer. Env: `YUZU_OTA_RATE_REFILL_PER_MIN`. |
-| `--ota-transfer-deadline-secs` | `900` | **Agent OTA pulls (#911).** Whole-transfer bound. Enforced by cancelling the RPC from a watchdog thread — the only thing that unblocks a synchronous `ServerWriter::Write` stalled on a peer whose HTTP/2 receive window has collapsed to zero. Keepalive does NOT catch that case: such a peer keeps answering pings while the stream is stalled. Tripping it returns `DEADLINE_EXCEEDED` and refunds the peer's rate token. Env: `YUZU_OTA_TRANSFER_DEADLINE_SECS`. |
-| `--ota-chunk-write-deadline-secs` | `30` | **Agent OTA pulls (#911).** Per-chunk stall bound, catching a slow-drip peer (every write completes, but slowly) earlier than the whole-transfer deadline would. **Raise this for fleets on genuinely slow links** — satellite, residential 4G/LTE, congested corporate WAN — where 30s per 64 KiB chunk is achievable but not comfortable; the trade is a thread held longer against fewer aborted updates. Env: `YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS`. |
+| `--ota-transfer-deadline-secs` | `900` | **Agent OTA pulls (#911).** Whole-transfer bound, and **the knob that binds on a slow link**. Enforced by cancelling the RPC from a watchdog thread — the only thing that unblocks a synchronous `ServerWriter::Write` stalled on a peer whose HTTP/2 receive window has collapsed to zero. Keepalive does NOT catch that case: such a peer keeps answering pings while the stream is stalled. Tripping it returns `DEADLINE_EXCEEDED` and refunds the peer's rate token. **It implies a throughput floor**: the default 900 s over a 100 MiB binary is ~0.93 Mbit/s sustained. A link below `artifact_size / deadline` can never complete an update — there is no resume, so each attempt restarts from offset 0 — and the only signal is `yuzu_ota_download_deadline_exceeded_total{phase="transfer"}` (alert `YuzuOtaTransfersAborting`). Raise it for satellite, residential 4G/LTE and congested-WAN fleets. Env: `YUZU_OTA_TRANSFER_DEADLINE_SECS`. |
+| `--ota-chunk-write-deadline-secs` | `30` | **Agent OTA pulls (#911).** Per-chunk stall bound, catching a peer whose individual writes hang. Note this is rarely the binding constraint: 64 KiB / 30 s is 2.2 KiB/s, and a peer that slow blows the whole-transfer budget long before 30 chunks. **For slow links tune `--ota-transfer-deadline-secs`, not this** — see its row. Env: `YUZU_OTA_CHUNK_WRITE_DEADLINE_SECS`. |
 | `--ota-max-peers-tracked` | `50000` | **Agent OTA pulls (#935).** Cardinality ceiling on the per-peer admission map. Load-bearing because the admission key falls back to peer IP when a peer presents no client certificate, which makes the key space attacker-influenced: a NAT'd peer rotating source ports would otherwise grow the map without bound. At the ceiling a new peer evicts the least-recently-seen entry that holds no in-flight transfer. **Shared-bucket caveat:** where peers present no client certificate, admission keys on source IP, so every agent behind one NAT egress shares a single bucket and therefore a single `--ota-max-concurrent-per-peer` allowance — on a large certless fleet behind one egress this can throttle legitimate updates. Enrolling agents with client certificates moves each onto its own bucket; watch `yuzu_ota_admission_key_mode_total{mode="peer_ip"}` to see how much of the fleet is affected. Env: `YUZU_OTA_MAX_PEERS_TRACKED`. |
+| `--ota-max-concurrent-total` | `64` | **Agent OTA pulls (#913).** Server-wide ceiling on concurrent transfers across ALL peers. The per-peer cap bounds one identity; where the identity gate is inert the admission key falls back to source IP, so that bound scales with a caller's address space (a /24 buys 256 independent per-peer budgets). This is the bound that does not. Exceeding it returns `RESOURCE_EXHAUSTED` with a message naming the server capacity, distinct from the per-peer message. Env: `YUZU_OTA_MAX_CONCURRENT_TOTAL`. |
+| `--grpc-max-threads` | `256` | **gRPC server bound (#913).** Thread ceiling for the gRPC sync server, applied via `ResourceQuota::SetMaxThreads`. Without it the per-connection stream cap below bounds nothing globally — connections are uncapped, so N connections yield N x cap concurrent handlers. This is also what bounds the OTA admission map's overshoot. Env: `YUZU_GRPC_MAX_THREADS`. |
 | `--grpc-max-concurrent-streams` | `128` | **gRPC server bound (#913).** Maximum concurrent HTTP/2 streams per gRPC connection. Before this setting the server's one `ServerBuilder` carried keepalive/ping arguments and nothing else — no stream cap and no `ResourceQuota` existed anywhere — which is what made an unbounded per-peer OTA path a capacity-monopolisation issue rather than a theoretical one. Env: `YUZU_GRPC_MAX_CONCURRENT_STREAMS`. |
 | `--grpc-max-resource-memory-mb` | `512` | **gRPC server bound (#913).** `ResourceQuota` memory ceiling in MiB for the gRPC server. At capacity gRPC rejects rather than queueing. Sized for a typical fleet server; raise it on large deployments if you observe rejections that do not correlate with an actual attack. Env: `YUZU_GRPC_MAX_RESOURCE_MEMORY_MB`. |
 | `--log-file` | *(none)* | Path for explicit on-disk log output. When set, log lines are written to this file in addition to stdout. The directory must be writable by the server's runtime user; if the file or directory cannot be opened the server logs an ERROR but continues to start. Independent of the default platform log path (see [File Logging](#file-logging)). |
@@ -3103,6 +3105,49 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | `dex.device.procperf.query` | An operator loads a device's per-application panel (usage-class telemetry — deliberately a separate verb from the machine-health `dex.device.perf.query` so usage reads stay separately countable). Execute-gated; detail records the target agent and command id. |
 
 ---
+
+## Agent OTA pull bounds
+
+Runbook for the `yuzu-ota` alert group. The agent OTA path (`DownloadUpdate`) is
+bounded on four axes: a per-peer concurrency semaphore, a per-peer token bucket, a
+server-wide transfer ceiling, and two deadlines.
+
+**Admission keying, and why it matters operationally.** A peer is bucketed by its
+certificate identity where it presents one, and by **source IP** where it does not.
+Check `yuzu_ota_admission_key_mode_total` to see which mode your fleet is in. The
+IP fallback has two consequences worth planning for:
+
+- **Every certless agent behind one NAT egress shares one bucket** — one
+  concurrency allowance and one token stream for the whole site. Enrolling agents
+  with client certificates gives each its own.
+- The per-peer bound therefore scales with a caller's address space, which is why
+  `--ota-max-concurrent-total` exists as a flat ceiling.
+
+**Alert responses.**
+
+| Alert | What it means | First action |
+|---|---|---|
+| `YuzuOtaConcurrencyRejections` | A peer is repeatedly refused for holding too many parallel transfers. | Find the peer in the server log — the rejection line carries `key=` and `mode=`. There is deliberately no audit row for admission rejections. |
+| `YuzuOtaIdentityRejections` | A peer presented no usable certificate, one from a foreign CA, or an `agent_id` that does not match it. | Check the `reason` label, then the `session.ota_identity_rejected` audit rows (note `no_client_identity` is metric-only and writes none). |
+| `YuzuOtaTransfersAborting` | Transfers are hitting a deadline. **This is the silent-outage detector.** | Check the `phase` label. `transfer` usually means `--ota-transfer-deadline-secs` is below `artifact_size / link_throughput` for that fleet — raise it. |
+| `YuzuOtaPeerMapEvicting` | `--ota-max-peers-tracked` is at or below the live key count, which silently disables the rate dimension. | Raise it above your expected distinct-key count. |
+| `YuzuOtaPeerMapNearCapacity` | The map is above 80% of its ceiling. | Same action. Note the map never shrinks in-process, so this stays firing until restart. |
+| `YuzuOtaRefundDivergence` | Deadline aborts are outrunning refunds — a regression in the refund wiring. | This is a code defect, not a tuning problem. Check the deadline branches in `agent_service_impl.cpp`. |
+
+**Known limitation — keep OTA artifacts on local storage.** The per-chunk read of
+the update binary is blocking and cannot be interrupted; the transfer watchdog
+cancels the RPC but cannot unpark a thread waiting on the kernel. If the artifact
+lives on a network mount that stalls, the handler never returns, and the peer whose
+pull wedged holds one of its concurrency slots until the server restarts — so that
+peer is refused `RESOURCE_EXHAUSTED` on every later pull. At
+`--ota-max-concurrent-per-peer=1` that is permanent for that peer. The blast radius
+is bounded to that peer and to one share of `--ota-max-concurrent-total`, but there
+is no in-process recovery.
+
+**Known limitation — per-process, not fleet-wide.** All of these bounds live in one
+server process's memory. Behind a load balancer with N replicas the effective
+ceiling is `configured_cap x N`, and a peer that reconnects to a different replica
+gets a fresh allowance.
 
 ## File Logging
 

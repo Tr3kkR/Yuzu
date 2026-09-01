@@ -64,6 +64,21 @@ inline void register_ota_options(CLI::App& app, Config& cfg) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_OTA_MAX_PEERS_TRACKED");
 
+    app.add_option("--ota-max-concurrent-total", cfg.ota_max_concurrent_total,
+                   "Server-wide cap on concurrent OTA transfers across all peers "
+                   "(default: 64). The per-peer cap bounds one identity; where the "
+                   "identity gate is inert the admission key falls back to source IP, "
+                   "so only this bound does not scale with a caller's address space.")
+        ->default_val(64)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_OTA_MAX_CONCURRENT_TOTAL");
+    app.add_option("--grpc-max-threads", cfg.grpc_max_threads,
+                   "Thread ceiling for the gRPC sync server (default: 256). Without "
+                   "this the per-connection stream cap bounds nothing globally, since "
+                   "connections are uncapped.")
+        ->default_val(256)
+        ->check(CLI::PositiveNumber)
+        ->envname("YUZU_GRPC_MAX_THREADS");
     app.add_option("--grpc-max-concurrent-streams", cfg.grpc_max_concurrent_streams,
                    "Max concurrent HTTP/2 streams per gRPC connection (default: 128)")
         ->default_val(128)

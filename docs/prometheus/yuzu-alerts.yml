@@ -3828,12 +3828,15 @@ groups:
     rules:
       - alert: YuzuOtaConcurrencyRejections
         expr: |
-          increase(yuzu_ota_download_admission_total{decision="rejected_concurrency"}[15m]) > 0
-        for: 10m
+          sum by (job, instance) (
+            increase(yuzu_ota_download_admission_total{decision="rejected_concurrency"}[15m])
+          ) > 5
+        for: 15m
         labels:
           severity: warning
         annotations:
           summary: "A peer is repeatedly hitting the per-peer OTA concurrency cap"
+          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             One or more agents are being refused DownloadUpdate because they
             already hold --ota-max-concurrent-per-peer parallel transfers. This
@@ -3847,14 +3850,20 @@ groups:
             docs/user-manual/audit-log.md), so do not look for one. A short burst during a
             fleet-wide rollout is benign; a sustained signal is not.
 
+            Threshold note: a `for:` shorter than the lookback debounces NOTHING —
+            increase() over [15m] stays positive for a full 15m after a single
+            event, so `for: 10m` fired on one rejection. The bar is a count, not a
+            duration, for that reason.
+
       - alert: YuzuOtaIdentityRejections
         expr: |
-          increase(yuzu_grpc_ota_identity_rejected_total[15m]) > 0
-        for: 5m
+          sum by (job, instance) (increase(yuzu_grpc_ota_identity_rejected_total[15m])) > 0
+        for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Agent OTA RPCs rejected for a missing or mismatched certificate identity"
+          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             CheckForUpdate or DownloadUpdate was rejected because the peer
             presented no usable client certificate, presented one from a
@@ -3880,6 +3889,7 @@ groups:
           severity: warning
         annotations:
           summary: "OTA deadline aborts exceed rate-token refunds — lockout regression suspected"
+          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Every transfer aborted by a SERVER-imposed deadline must refund the
             rate token it was charged at admission; that invariant is what stops
@@ -3888,6 +3898,54 @@ groups:
             running ahead of refunds means a code path is aborting without
             refunding, which silently re-opens that lockout. Check recent changes
             to the DownloadUpdate deadline branches in agent_service_impl.cpp.
+
+            SCOPE, honestly: this compares two counters incremented from the same
+            classified outcome, so what it detects is a code path that aborts
+            WITHOUT refunding — a dropped or reordered call site. It cannot see a
+            refund that was issued but did not land inside PrincipalQuota::refund
+            (which is find-not-insert and silently drops an untracked key). That
+            case is covered by the primitive's own unit tests, not by this alert.
+
+      - alert: YuzuOtaTransfersAborting
+        expr: |
+          sum by (job, instance) (increase(yuzu_ota_download_deadline_exceeded_total[30m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTA transfers are being aborted by a server-imposed deadline"
+          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            Transfers are hitting --ota-transfer-deadline-secs or
+            --ota-chunk-write-deadline-secs. This is the alert that makes a
+            MISCONFIGURED deadline visible, and without it that failure is silent:
+            every aborted transfer refunds its rate token, so the buckets never
+            drain, YuzuOtaRefundDivergence stays quiet, and the agent retries on its
+            own 6-hourly timer. The fleet simply stops updating while every other
+            dashboard stays green. Check the phase label — `transfer` means the
+            whole-transfer budget was too small for the artifact on that link
+            (900s over a 100 MiB binary implies a ~0.93 Mbit/s floor), `write` means
+            a single chunk stalled. Correlate with
+            yuzu_ota_download_refund_total{reason=~".*deadline"}.
+
+      - alert: YuzuOtaPeerMapEvicting
+        expr: |
+          sum by (job, instance) (increase(yuzu_ota_download_peers_evicted_total[1h])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The OTA admission map is evicting — the rate limiter may be disabled"
+          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            Sustained eviction means --ota-max-peers-tracked is at or below the live
+            peer count. This is not a cache-efficiency concern: an evicted key that
+            returns is re-inserted with a FULL token burst, so continuous eviction
+            silently disables the rate dimension for the peers cycling through it.
+            Raise --ota-max-peers-tracked above the number of distinct admission
+            keys you expect (check yuzu_ota_download_peers_tracked, and
+            yuzu_ota_admission_key_mode_total to see whether keys are certificates
+            or source IPs — the IP fallback inflates the key count).
 
       - alert: YuzuOtaPeerMapNearCapacity
         expr: |
@@ -3899,6 +3957,7 @@ groups:
           severity: info
         annotations:
           summary: "OTA per-peer admission map is approaching its cardinality ceiling"
+          runbook_url: "docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             The per-peer OTA admission map is above 80% of
             --ota-max-peers-tracked (issue #935). Expressed as a ratio against
@@ -3912,6 +3971,13 @@ groups:
             NAT'd peer rotating source ports looks like. Correlate with
             yuzu_ota_download_peers_evicted_total to see whether the cap is
             actually biting yet.
+
+            STALENESS: yuzu_ota_download_peers_tracked is refreshed only when a
+            DownloadUpdate arrives. On an idle fleet (default update_check_interval
+            is 6h) it holds its last value, so treat a firing instance with no
+            recent admissions as a stale reading rather than a live condition. The
+            map also never shrinks — purge_stale has no periodic caller — so once
+            this fires it stays firing until the process restarts.
 
   - name: yuzu-executions
     # HA WS-1(1b) (ADR-2002 §5) — the command_id -> execution_id correlation

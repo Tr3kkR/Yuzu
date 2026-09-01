@@ -2,6 +2,8 @@
 
 #include "ota_transfer_rules.hpp"
 
+#include <algorithm>
+
 #include <grpc/grpc_security_constants.h>
 
 #include <chrono>
@@ -1110,7 +1112,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                                        .count();
                     ev.principal = "agent:" + mismatch_agent_id;
                     ev.principal_role = "agent";
-                    ev.action = "session.ota_identity_rejected";
+                    ev.action = "session.identity_mismatch";
                     ev.target_type = "Session";
                     ev.target_id = session_id;
                     ev.detail = "agent_id=" + mismatch_agent_id +
@@ -2027,6 +2029,28 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
     metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", admission_key.mode}})
         .increment();
 
+    // SERVER-WIDE cap first — it is the only bound that does not scale with the
+    // caller's address space. The per-peer gate below bounds one identity, but
+    // where the identity gate is inert the key falls back to source IP, so a
+    // caller with a /24 buys 256 independent per-peer budgets. This one is flat.
+    // Taken before the per-peer bucket so a refused transfer spends no token.
+    TotalSlot total_slot;
+    {
+        const int prev = ota_in_flight_total_.fetch_add(1, std::memory_order_acq_rel);
+        if (prev >= ota_cfg_.max_concurrent_total) {
+            ota_in_flight_total_.fetch_sub(1, std::memory_order_acq_rel);
+            metrics_
+                .counter("yuzu_ota_download_admission_total", {{"decision", "rejected_total"}})
+                .increment();
+            spdlog::warn("DownloadUpdate: rejected by server-wide transfer cap "
+                         "(in_flight={} cap={} key={})",
+                         prev, ota_cfg_.max_concurrent_total, ota_key);
+            return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                "server OTA transfer capacity exceeded");
+        }
+        total_slot = TotalSlot(&ota_in_flight_total_);
+    }
+
     auto slot = ota_quota_.try_acquire(ota_key, QuotaSide::kEngine);
 
     // Published on EVERY call, admitted or not. Updating it only on the admit
@@ -2043,8 +2067,15 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
             .counter("yuzu_ota_download_admission_total",
                      {{"decision", by_concurrency ? "rejected_concurrency" : "rejected_rate"}})
             .increment();
-        spdlog::warn("DownloadUpdate: rejected by per-peer {} bound (retry_after_ms={})",
-                     by_concurrency ? "concurrency" : "rate", slot.decision().retry_after_ms);
+        // Name the peer. Admission rejections are deliberately metric-only (no
+        // audit row — see docs/user-manual/audit-log.md), and the metric labels are
+        // bounded, so without this line a YuzuOtaConcurrencyRejections page has NO
+        // path from alert to peer. The line fires only on a REJECTED request, which
+        // is itself bounded by the very cap it reports, so it cannot flood.
+        spdlog::warn("DownloadUpdate: rejected by per-peer {} bound "
+                     "(key={} mode={} retry_after_ms={})",
+                     by_concurrency ? "concurrency" : "rate", ota_key, admission_key.mode,
+                     slot.decision().retry_after_ms);
         // One wire status for both dimensions, and a REJECT rather than a queue:
         // queueing at capacity would hold the very thread the cap exists to free.
         return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
@@ -2094,6 +2125,24 @@ grpc::Status AgentServiceImpl::DownloadUpdate(grpc::ServerContext* context,
         return grpc::Status(grpc::StatusCode::NOT_FOUND, "version not found");
     }
 
+    // KNOWN LIMITATION, and its consequence is worse than the read itself.
+    //
+    // This read is blocking and cannot be interrupted: TryCancel does not unblock
+    // read(2), and O_NONBLOCK is a no-op for a regular file. That is UP-112, which
+    // ships mitigated rather than closed. What is NOT obvious, and is recorded here
+    // because it bit a review: a wedged read holds this peer's QuotaSlot for the
+    // process lifetime, because the slot is released by scope exit and the scope
+    // never exits. So that peer is refused RESOURCE_EXHAUSTED on every subsequent
+    // pull until restart, and at --ota-max-concurrent-per-peer=1 a single hang is
+    // permanent for that peer.
+    //
+    // What bounds the damage: the server-wide cap above (one wedged handler is one
+    // of --ota-max-concurrent-total, not an unbounded drain), and the per-peer cap
+    // (the blast radius is that peer, not the fleet). What does NOT bound it: the
+    // transfer watchdog, which fires, marks the registration cancelled, and cannot
+    // do anything about a thread parked in the kernel.
+    //
+    // Operators: keep OTA artifacts on local storage. The runbook says so.
     auto file_path = update_registry_->binary_path(*pkg);
     std::ifstream file(file_path, std::ios::binary);
     if (!file) {
@@ -2192,7 +2241,9 @@ void AgentServiceImpl::set_ota_bound_config(const OtaBoundConfig& cfg) {
         .rate_per_second = cfg.rate_refill_per_min / 60.0,
         .burst = cfg.rate_capacity,
         .idle_evict_seconds = 3600,
-        .max_tracked = cfg.max_peers_tracked,
+        // Clamp UP: see OtaBoundConfig::max_peers_tracked. A too-small ceiling
+        // silently disables the rate dimension rather than merely shrinking a cache.
+        .max_tracked = std::max(cfg.max_peers_tracked, kMinPeersTracked),
     });
 }
 
@@ -2234,15 +2285,42 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
             .counter("yuzu_grpc_ota_identity_rejected_total",
                      {{"event", "security"}, {"rpc", std::string(rpc)}, {"reason", reason}})
             .increment();
-        spdlog::warn("{} rejected: {}", rpc, reason);
-        if (audit_store_ && audit_store_->is_open()) {
+        spdlog::warn("{} rejected: {} (agent_id={})", rpc, reason,
+                     claimed_agent_id.substr(0, auth::kMaxAgentIdLength));
+
+        // WHICH REJECTIONS GET AN AUDIT ROW, and why this is not all of them.
+        //
+        // The audit write is SYNCHRONOUS and PostgreSQL-backed, and this gate runs
+        // BEFORE the per-peer admission bound — so an unbounded stream of denials
+        // here would pin gRPC threads on the audit path, which is the exact vector
+        // this change exists to close. Two distinct floods reach it: an attacker
+        // looping a certless or mismatched pull (sec-2), and a fleet-wide identity
+        // drift after a mass re-image, which needs no attacker at all and scales
+        // with fleet size (UP-4).
+        //
+        // So only a rejection that names a RESOLVABLE PRINCIPAL is audited: the
+        // peer presented a certificate we recognise, and the dispute is about which
+        // agent it claims to be. That is the forensically interesting case and it
+        // is bounded by the size of the issued-certificate population.
+        // `no_client_identity` — no cert at all — has no principal to attribute, is
+        // the cheapest case to forge in volume, and is left metric-only. That is
+        // the same split reject_revoked_peer already makes for `heartbeat` ("a
+        // flood must not hammer the WAL") and the no-resolvable-principal carve-out
+        // in docs/observability-conventions.md.
+        const bool audit_worthy = (std::string_view(reason) != "no_client_identity");
+        if (audit_worthy && audit_store_ && audit_store_->is_open()) {
             const auto ids = extract_peer_identities(*context);
             const std::string cert_id = ids.empty() ? std::string{} : ids.front();
             AuditEvent ev;
             ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
-            ev.principal = "agent:" + (cert_id.empty() ? claimed_agent_id : cert_id);
+            // Clamp: Register's kMaxAgentIdLength gate is Register-only, so an
+            // unclamped body value would let a peer inflate every audit row it
+            // provokes (the W1.4/UP-H1 defect, on a new surface).
+            ev.principal =
+                "agent:" + (cert_id.empty() ? claimed_agent_id.substr(0, auth::kMaxAgentIdLength)
+                                            : cert_id);
             ev.principal_role = "agent";
             // session.* keeps this inside the CC7.2 auth-sample export, which
             // filters on that prefix (see AuditQuery::action_prefixes).

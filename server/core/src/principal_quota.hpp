@@ -134,6 +134,12 @@ struct PrincipalQuotaConfig {
     std::size_t max_tracked{0};
 };
 
+/// Floor for an attacker-influenced key space. Below this, every insert evicts and
+/// `locate_locked` mints a fresh FULL burst for the re-inserted key, so the rate
+/// dimension stops limiting anything — a cap that disables the limiter it protects.
+/// Callers that set `max_tracked` at all should clamp up to this.
+inline constexpr std::size_t kMinPeersTracked = 1024;
+
 /// Thread-safe per-principal quota tracker. One mutex guards a
 /// `principal_id -> PerPrincipal` map; a `QuotaSlot`'s destructor re-locks
 /// and decrements `in_flight` for the principal it was minted against.
@@ -300,12 +306,17 @@ class PrincipalQuota {
     // holds no in-flight reservation.
     //
     // If every tracked entry is in-flight, the insert is allowed through rather
-    // than denied. That is a deliberate fail-open on CARDINALITY, and it is bounded:
-    // an in-flight entry corresponds to a request actually executing, so the
-    // overshoot can never exceed the server's concurrent-request ceiling (the gRPC
-    // stream cap for the OTA caller). Denying instead would turn a memory-shape
-    // concern into a refusal to serve legitimate callers, which is the worse trade —
-    // the resource that actually matters is already bounded by max_concurrency.
+    // than denied. That is a deliberate fail-open on CARDINALITY, and the overshoot
+    // is bounded by the number of handlers that can be executing at once.
+    //
+    // THAT BOUND IS THE gRPC THREAD CEILING, not the stream cap. An earlier version
+    // of this comment cited GRPC_ARG_MAX_CONCURRENT_STREAMS, which is PER
+    // CONNECTION with connections uncapped — it bounds nothing globally, so the
+    // justification was false and the map could in principle grow without limit.
+    // `Config::grpc_max_threads` (applied via ResourceQuota::SetMaxThreads) is the
+    // real ceiling; the OTA caller additionally holds a server-wide transfer cap.
+    // Denying instead would turn a memory-shape concern into a refusal to serve
+    // legitimate callers, which is the worse trade.
     void enforce_cap_locked();
 
     PrincipalQuotaConfig cfg_;

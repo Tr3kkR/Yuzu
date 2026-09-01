@@ -248,11 +248,50 @@ TEST_CASE("PrincipalQuota refund: never takes a principal above its burst",
         PrincipalQuotaConfig{.max_concurrency = 1000, .rate_per_second = 0.0, .burst = 2.0});
     q.set_clock_for_test([&fake_now] { return fake_now; });
 
-    // Bucket starts full at burst=2. Three refunds on a full bucket must not
-    // bank credit — otherwise a refund-heavy failure mode would mint quota.
+    // MATERIALISE THE ENTRY FIRST. `refund()` is deliberately find-not-insert, so
+    // refunding a principal the quota has never seen is a no-op — an earlier
+    // version of this case refunded three times before any admission and therefore
+    // tested nothing at all (it silently duplicated the untracked-principal case
+    // above, and deleting the burst clamp left it green).
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);  // tokens: 2 -> 1
+
+    // Now three refunds against a bucket that can hold at most one more. Without
+    // the clamp this would bank credit to 4 and the third admission below would
+    // succeed.
     q.refund("p1");
     q.refund("p1");
     q.refund("p1");
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+    CHECK_FALSE(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
+
+    q.set_clock_for_test({});
+}
+
+TEST_CASE("PrincipalQuota set_config: reconfigures in place and clamps a lowered burst",
+          "[quota][primitive]") {
+    // set_config exists because replacing the object was a use-after-free — every
+    // live QuotaSlot holds a raw back-pointer to it. It had no test at all.
+    auto fake_now = std::chrono::steady_clock::now();
+    PrincipalQuota q(
+        PrincipalQuotaConfig{.max_concurrency = 4, .rate_per_second = 0.0, .burst = 8.0});
+    q.set_clock_for_test([&fake_now] { return fake_now; });
+
+    // Hold a live reservation across the reconfigure — the case the by-value member
+    // and in-place set_config exist to make safe.
+    auto held = q.try_acquire("p1", QuotaSide::kEngine);
+    REQUIRE(held.admitted());
+    CHECK(q.in_flight("p1") == 1);
+
+    q.set_config(PrincipalQuotaConfig{.max_concurrency = 1, .rate_per_second = 0.0, .burst = 2.0});
+
+    // The reservation survives, and releasing it still accounts correctly.
+    CHECK(q.in_flight("p1") == 1);
+    held.reset();
+    CHECK(q.in_flight("p1") == 0);
+
+    // The lowered burst clamped the existing bucket down rather than leaving it
+    // holding credit the new configuration never authorised.
     CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
     CHECK(q.try_rate_only("p1", QuotaSide::kEngine).admitted);
     CHECK_FALSE(q.try_rate_only("p1", QuotaSide::kEngine).admitted);

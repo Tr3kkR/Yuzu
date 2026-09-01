@@ -83,7 +83,15 @@ struct OtaHarness {
     }
 
     ~OtaHarness() {
-        if (server_) server_->Shutdown();
+        if (!server_)
+            return;
+        // FINITE, matching test_ota_stalled_write.cpp and production's
+        // agent_server_->Shutdown(deadline). A deadline-free Shutdown waits
+        // indefinitely for in-flight sync handlers, so a future regression that
+        // wedges DownloadUpdate would hang the shard to its 600s timeout instead
+        // of failing attributably. Three Gate 3 reviewers flagged this
+        // independently.
+        server_->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
     }
 
     // Drives one DownloadUpdate to completion and returns its terminal status.
@@ -172,6 +180,44 @@ TEST_CASE("DownloadUpdate: the per-peer rate bound rejects with RESOURCE_EXHAUST
 
     auto st = h.download();
     CHECK(st.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
+}
+
+TEST_CASE("DownloadUpdate: the SERVER-WIDE cap rejects independently of the per-peer bound",
+          "[ota][bound][grpc]") {
+    OtaHarness h;
+    // The per-peer bound is wide open; only the fleet-wide ceiling is closed. This
+    // is the bound that does NOT scale with a caller's address space: where the
+    // identity gate is inert the admission key falls back to source IP, so a /24
+    // buys 256 independent per-peer budgets but only one share of this.
+    AgentServiceImpl::OtaBoundConfig cfg;
+    cfg.max_concurrent_per_peer = 64;
+    cfg.max_concurrent_total = 0;
+    h.svc.set_ota_bound_config(cfg);
+    h.start();
+
+    auto st = h.download();
+    CHECK(st.error_code() == grpc::StatusCode::RESOURCE_EXHAUSTED);
+    // Distinguishable from the per-peer rejection, so an operator reading the
+    // status can tell which ceiling they hit.
+    CHECK(st.error_message().find("server OTA transfer capacity") != std::string::npos);
+}
+
+TEST_CASE("DownloadUpdate: the server-wide slot is released on every exit path",
+          "[ota][bound][grpc]") {
+    OtaHarness h;
+    AgentServiceImpl::OtaBoundConfig cfg;
+    cfg.max_concurrent_per_peer = 64;
+    cfg.max_concurrent_total = 1;  // exactly one at a time
+    h.svc.set_ota_bound_config(cfg);
+    h.start();
+
+    // Each call returns UNAVAILABLE (no registry wired) — an EARLY exit, well
+    // before the streaming loop. If the RAII release were missing or misplaced,
+    // the counter would stay at 1 and the second call would be refused.
+    for (int i = 0; i < 5; ++i) {
+        auto st = h.download();
+        CHECK(st.error_code() == grpc::StatusCode::UNAVAILABLE);
+    }
 }
 
 TEST_CASE("OTA identity gate: inert by default so an unenrolled agent can still pull",

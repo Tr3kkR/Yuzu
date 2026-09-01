@@ -287,6 +287,18 @@ struct Config {
     // same absence.
     int grpc_max_concurrent_streams{128};  // per-connection HTTP/2 stream cap
     int grpc_max_resource_memory_mb{512};  // gRPC ResourceQuota ceiling
+    // Thread ceiling for the gRPC sync server. WITHOUT this, the stream cap above
+    // bounds nothing globally — it is PER CONNECTION and connections are uncapped,
+    // so N connections yield N x cap concurrent handlers. It is also what makes the
+    // OTA admission map's overshoot bound real: that map may exceed its cardinality
+    // ceiling only by the number of IN-FLIGHT handlers, which is exactly this.
+    int grpc_max_threads{256};
+    // Server-wide ceiling on concurrent DownloadUpdate transfers, across ALL peers.
+    // The per-peer cap bounds one identity; on a deployment where the identity gate
+    // is inert the admission key falls back to source IP, so the per-peer bound
+    // scales with the caller's address space (a /24 buys 256 buckets). This is the
+    // bound that does not.
+    int ota_max_concurrent_total{64};
 
     // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
     // CC6.3. After `auth_lockout_threshold` consecutive failed local-password
