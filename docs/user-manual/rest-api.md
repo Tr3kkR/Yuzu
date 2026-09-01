@@ -6688,8 +6688,19 @@ path. Refusals are counted the same way as every other targeting refusal on this
 and audited (`command.dispatch`, `result=denied`).
 
 MCP `execute_instruction` enforces the identical rule (same refusal message, same
-`agent_ids`-only requirement) — see `docs/mcp-server.md`. `POST /api/instructions/{id}/execute`,
-the dashboard execute surface, and MCP `execute_bundle` do not yet enforce this gate.
+`agent_ids`-only requirement) — see `docs/mcp-server.md`. The dashboard exec console
+(`POST /api/dashboard/execute`) enforces it too: it refuses the same three shapes — `__all__`,
+a `group:<id>` scope, and no target selected at all — with the same two messages, confines an
+explicit selection to the operator's visible agents, and counts refusals on
+`yuzu_server_dispatch_target_rejected_total{route="dashboard",reason="destructive_untargeted"}`.
+Because that surface answers htmx fragments rather than the A4 JSON envelope, its refusal is a
+`200` carrying the message in the console's result line, not a `400`/`404`. `POST
+/api/instructions/{id}/execute` and MCP `execute_bundle` do not yet enforce this gate.
+
+Scheduled and background dispatch is deliberately **not** covered by it. A schedule targets by
+scope expression by construction (it has no `agent_ids`), so a scheduled destructive instruction
+keeps working exactly as before; it is gated instead by the schedule's own fire-time
+re-verification of the arming principal and, where configured, its approval ticket.
 
 **Response (403): unauthorized dispatch.** Two distinct causes share the `403` status but carry
 different messages (#1398) — an incident review can tell them apart from the audit trail's

@@ -93,6 +93,49 @@
 /// intersection `dispatch_confined_arms` performs on every dispatch arm
 /// (that one still runs, later, on the confined `agent_ids` this function
 /// returns).
+///
+/// CALLER 3 — `POST /api/dashboard/execute` (PR6.0b). The exec console is the
+/// third and last operator-facing surface that resolves a free-form
+/// `plugin.action` and lets the operator fan it out (`scope=__all__`,
+/// `scope=group:<id>`, or `scope` omitted entirely, which that handler's
+/// legacy UI contract reads as the whole fleet). It reaches agents through
+/// `ServerImpl::dispatch_confined`, NOT through `/api/command`, so #3685's
+/// two call sites did not cover it and every non-`AdminOrApproval`
+/// Destructive row — `tar.purge_source`, `registry.delete_key`,
+/// `filesystem.delete_lines`, `tags.clear`, `storage.clear` and the rest —
+/// was fleet-targetable from it by any holder of the declared securable.
+/// It is wired to THIS header for the reason D3 gives below: the gate belongs
+/// in route/handler code, and the exec console is a route handler.
+///
+/// D3 IS UNCHANGED AND IS NOT A GAP — READ IT BEFORE "FINISHING THE JOB" AT
+/// `ServerImpl::dispatch_confined`. It is tempting to read the absence of a
+/// dispatch-class check in that shared seam as the last hole and to close it
+/// there instead of adding a third route-level caller. That would be wrong,
+/// and it is wrong for a reason no reviewer can see from `server.cpp` alone:
+/// `ScheduleRunner::dispatch_tracked` (`schedule_runner.cpp`) dispatches
+/// EVERY scheduled fire with `agent_ids={}` and a scope expression — an empty
+/// stored `scope_expression` is mapped to `kBroadcastScope` right at the call
+/// site — and `schedule_arming_check.hpp`'s `schedule_arming_permitted`
+/// refuses only `system_reserved` and unclassified rows, never Destructive
+/// ones. A Destructive-refusing gate at that seam therefore converts every
+/// scheduled Destructive instruction into a permanent, silent zero-reach fire
+/// (`yuzu_schedule_fire_failures_total`, "reached no agents"), including the
+/// approval-gated ones the four-eyes ticket flow exists to make safe. The
+/// same is true of `rest_api_v1.cpp`'s async result-set producers, which also
+/// dispatch `{}` + `__all__` by construction. That behaviour is pinned by
+/// `test_dispatch_confined_arms.cpp`'s "the shared confined-dispatch seam
+/// does not refuse a Destructive fan-out" case, so the next person to try
+/// this gets a red test instead of a shipped regression.
+///
+/// NOTHING BELOW CHANGED FOR THE DASHBOARD CALLER. Both functions were
+/// already total over the inputs the exec console has, so PR6.0b EXTENDS this
+/// header by adding a third call site and this documentation ONLY — it does
+/// not fork, copy, widen or special-case either function, and the dashboard
+/// reuses both refusal strings byte-for-byte rather than spelling its own.
+/// That is the catastrophic-if-violated rule in
+/// `.claude/routed-concerns-access-control.md`'s "Dispatch targeting" row: a
+/// second copy of a chokepoint is exactly the drift the chokepoint exists to
+/// remove.
 namespace yuzu::server {
 
 /// The two refusal messages, spelled ONCE so `/api/command`, a future MCP

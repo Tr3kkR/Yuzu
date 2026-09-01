@@ -20143,6 +20143,17 @@ private:
         // above); wiring it here too so /fragments/results migrates onto
         // require_fleet_read as its sole gate.
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
+        // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
+        // execute_instruction consult, so the three operator-facing dispatch
+        // surfaces cannot disagree about whether a plugin.action is Destructive.
+        // Wired UNCONDITIONALLY, exactly like set_capability_classify_fn on
+        // McpServer below: per DashboardRoutes::ClassifyFn's fail-closed
+        // contract, omitting this call does not merely degrade the exec console
+        // — it refuses every /api/dashboard/execute dispatch.
+        dashboard_routes_->set_capability_classify_fn(
+            [this](std::string_view p, std::string_view a) {
+                return capability_registry_.classify(p, a);
+            });
         dashboard_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,

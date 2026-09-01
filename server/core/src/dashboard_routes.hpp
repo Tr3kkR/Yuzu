@@ -5,11 +5,13 @@
 /// group creation from filtered results, scope panel with groups,
 /// and HTMX-native instruction dispatch.
 
+#include <expected>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -22,6 +24,7 @@
 
 #include "authz_gates.hpp" // yuzu::server::authz::FleetReadGate (#1712 / #3290 Phase 2)
 #include "authz_model.hpp" // yuzu::server::authz::VisibleSet (#1788 / CDX-R7-02)
+#include "command_capability.hpp" // PR6.0b: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 
 namespace yuzu::server {
@@ -163,6 +166,38 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// PR6.0b — classifies a `plugin.action` pair for the Destructive
+    /// TARGETING gate on `POST /api/dashboard/execute`
+    /// (`dispatch_destructive_gate.hpp`). Deliberately the SAME shape and the
+    /// same fail-closed contract as `McpServer::ClassifyFn`, and wired in
+    /// `server.cpp` to the SAME `CommandCapabilityRegistry::classify` that
+    /// `/api/command` and MCP `execute_instruction` consult — the three
+    /// operator-facing surfaces must not be able to disagree about what a
+    /// pair IS, only about how each answers its own caller.
+    ///
+    /// FAIL-CLOSED when unset (`{}`): the exec console cannot determine
+    /// whether ANY pair is Destructive, so it refuses EVERY dispatch with a
+    /// distinguishable "classifier unavailable" message rather than falling
+    /// through. A silently-unwired classifier would otherwise revert this
+    /// gate to its pre-PR6.0b state while every other test stayed green —
+    /// the `ContainmentGate{}` class of regression `dispatch_confined_arms
+    /// .hpp` warns about, and the reason that type has no default state.
+    /// Production wires this unconditionally (`server.cpp`, next to
+    /// `set_fleet_read_fn`); an unset fn reaching a live request means the
+    /// wiring itself regressed.
+    ///
+    /// A WIRED fn returning `Unclassified`/`Ambiguous` is the DIFFERENT,
+    /// unchanged Policy-B case — see the handler's own `ClassifyMiss` arm.
+    using ClassifyFn =
+        std::function<std::expected<yuzu::server::CommandCapability,
+                                    yuzu::server::ClassificationError>(
+            std::string_view plugin, std::string_view action)>;
+
+    /// Same setter idiom as `set_fleet_read_fn` above: the handlers capture
+    /// `this` at registration and read the member per request, so an
+    /// injection after `register_routes` still takes live effect.
+    void set_capability_classify_fn(ClassifyFn fn) { classify_fn_ = std::move(fn); }
+
 private:
     std::vector<std::string> csrf_trusted_origins_;
     AuthFn auth_fn_;
@@ -181,6 +216,9 @@ private:
     ResolveFn resolve_fn_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     VisibleSetFn visible_set_fn_;
+    // PR6.0b — see ClassifyFn's doc comment above: unset means every
+    // /api/dashboard/execute dispatch is refused, never silently ungated.
+    ClassifyFn classify_fn_;
 
     // -- Fragment renderers ---------------------------------------------------
 
