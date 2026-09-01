@@ -3842,7 +3842,9 @@ groups:
             agent needs. Investigate which identity: correlate with
             yuzu_ota_admission_key_mode_total to see whether admission is
             keyed on certificates or has fallen back to peer IP, and check the
-            audit store for that agent. A single short burst during a
+            server logs, which name the rejected peer. Admission rejections are
+            deliberately metric-only and write NO audit row (see
+            docs/user-manual/audit-log.md), so do not look for one. A short burst during a
             fleet-wide rollout is benign; a sustained signal is not.
 
       - alert: YuzuOtaIdentityRejections

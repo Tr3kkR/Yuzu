@@ -21,7 +21,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <cstdlib>
+#include <cstdlib> // setenv/unsetenv (POSIX), _putenv_s (MSVC)
 #include <string>
 #include <vector>
 
@@ -47,13 +47,31 @@ bool parse(const std::vector<std::string>& args, Config& cfg) {
     }
 }
 
-// RAII setenv/unsetenv so an env-driven case cannot leak into its neighbours.
+// RAII environment override so an env-driven case cannot leak into its
+// neighbours.
+//
+// PLATFORM SPLIT IS LOAD-BEARING: `setenv`/`unsetenv` are POSIX and the MSVC CRT
+// supplies neither, so an unconditional call fails to COMPILE on the required
+// Windows leg — this file is added to `yuzu_server_tests` for every platform.
+// Windows uses `_putenv_s`, where assigning an empty value is the documented way
+// to remove a variable. Same split, same reason, as
+// tests/unit/test_subprocess_runner.cpp's `_WIN32` section.
 struct ScopedEnv {
     std::string name;
     explicit ScopedEnv(const std::string& n, const std::string& v) : name(n) {
+#ifdef _WIN32
+        (void)_putenv_s(name.c_str(), v.c_str());
+#else
         ::setenv(name.c_str(), v.c_str(), 1);
+#endif
     }
-    ~ScopedEnv() { ::unsetenv(name.c_str()); }
+    ~ScopedEnv() {
+#ifdef _WIN32
+        (void)_putenv_s(name.c_str(), "");
+#else
+        ::unsetenv(name.c_str());
+#endif
+    }
 };
 
 } // namespace

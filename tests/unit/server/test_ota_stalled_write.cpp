@@ -118,8 +118,17 @@ struct StallHarness {
     }
 
     ~StallHarness() {
-        if (server)
-            server->Shutdown();
+        if (!server)
+            return;
+        // FINITE deadline, deliberately. A deadline-free Shutdown() waits
+        // indefinitely for in-flight synchronous handlers and does not forcibly
+        // terminate a running streaming handler — so on the very regression this
+        // file exists to catch (a TryCancel that stops working), the REQUIRE
+        // below would unwind into a destructor that blocks forever and the suite
+        // would hang to its outer CI timeout instead of failing in ~30s.
+        // Production makes the same choice for the same reason: see
+        // server.cpp's agent_server_->Shutdown(deadline).
+        server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
     }
 };
 
@@ -148,6 +157,10 @@ TEST_CASE("OTA stalled write: the watchdog unblocks a Write stalled on a zero re
     const auto ready = done.wait_for(std::chrono::seconds(30));
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
+    // Release the client side BEFORE any assertion that can unwind, so the
+    // destructor is never left waiting on a stream this test still holds.
+    ctx.TryCancel();
+
     REQUIRE(ready == std::future_status::ready);
 
     // If this trips, the write never blocked, so the test proved nothing about
@@ -167,7 +180,6 @@ TEST_CASE("OTA stalled write: the watchdog unblocks a Write stalled on a zero re
     // the write path was exercised, not short-circuited.
     CHECK(h.chunks_written.load() > 0);
 
-    ctx.TryCancel(); // release the client side
     reader->Finish();
 }
 

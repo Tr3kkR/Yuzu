@@ -1354,38 +1354,6 @@ public:
         ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
 
-        // #928 CH-1 — head-of-line contention on the ONE shared channel.
-        //
-        // Every agent RPC rides a single grpc::CreateCustomChannel below: the
-        // command stream, the inventory sync_stub, and the heartbeat hb_stub are
-        // three stubs on one HTTP/2 connection. So a saturating OTA DownloadUpdate
-        // contends for the same connection as the heartbeat — and if the heartbeat
-        // is starved, the fleet reads a healthy device as offline. A larger
-        // connection-level flow-control window keeps one stream's backlog from
-        // consuming the whole connection's credit, and an explicit stream cap
-        // bounds how many the connection multiplexes at once.
-        //
-        // HONEST STATUS: this is defence-in-depth reasoned from the channel
-        // topology, NOT a demonstrated fix. The tc/netem chaos harness CH-1
-        // specifies does not exist anywhere in this repo, so no test here
-        // measures head-of-line blocking before or after. #928 stays open on
-        // CH-1 with that harness as its remaining work; do not read these
-        // lines as closing it.
-        //
-        // Note on what is DELIBERATELY not set here: GRPC_ARG_MAX_CONCURRENT_
-        // STREAMS is a per-endpoint advertisement bounding streams the PEER may
-        // open. gRPC servers never open streams on a client connection, so
-        // setting it client-side is inert — it belongs on the server builder
-        // (where this change does set it) and would be cargo-culted here.
-        //
-        // The lever that does apply client-side is the per-stream flow-control
-        // window: capping it stops one stream (a 100 MiB OTA pull) from claiming
-        // the whole connection's credit and starving the heartbeat sharing it.
-        // BDP probing stays on so the CONNECTION window still auto-tunes to the
-        // real bandwidth-delay product; only the per-stream share is bounded.
-        ch_args.SetInt(GRPC_ARG_HTTP2_STREAM_LOOKAHEAD_BYTES, 2 * 1024 * 1024);
-        ch_args.SetInt(GRPC_ARG_HTTP2_BDP_PROBE, 1);
-
         // Auto-discover client certificate if none explicitly configured
         if (cfg_.cert_auto_discovery && cfg_.tls_client_cert.empty() && cfg_.cert_store.empty()) {
             auto discovered = discover_client_cert();

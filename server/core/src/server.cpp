@@ -587,7 +587,12 @@ public:
         // event — it mirrors yuzu_grpc_revoked_cert_total.
         metrics_.describe("yuzu_ota_download_admission_total",
                           "Agent OTA DownloadUpdate admission decisions by outcome", "counter");
-        // `decision` is a genuine PARTITION: exactly one of these per call.
+        // `decision` is a genuine PARTITION over calls that REACH the admission
+        // gate — exactly one of these each. It is deliberately NOT a partition of
+        // every received DownloadUpdate: the on-behalf, revoked-certificate and
+        // positive-identity gates all return before admission and are counted by
+        // their own families, so this sum is legitimately lower than
+        // yuzu_grpc_requests_total{method="DownloadUpdate",status="received"}.
         // Refunds are a separate family below precisely so they cannot break that.
         for (auto d : {"admitted", "rejected_concurrency", "rejected_rate"})
             metrics_.counter("yuzu_ota_download_admission_total", {{"decision", d}});

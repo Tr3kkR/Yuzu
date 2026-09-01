@@ -70,12 +70,3 @@
   guarantee; shared cross-instance state is follow-up work. Admission
   rejections are metric-only with no audit row (a high-frequency operational
   event, not a lifecycle action). See `docs/user-manual/server-admin.md`.
-- **Agent channel flow-control tuning (#928 CH-1, partial).** All agent RPCs —
-  the command stream, inventory sync, and heartbeat — share one HTTP/2
-  connection, so a saturating OTA download contends with the heartbeat that
-  keeps the device visible. The agent now caps its per-stream flow-control
-  window so one stream cannot claim the whole connection's credit, leaving BDP
-  probing on so the connection window still auto-tunes. **This ships
-  unverified**: the `tc`/`netem` chaos harness #928 CH-1 specifies does not
-  exist in this repo, so nothing here measures head-of-line blocking before or
-  after. #928 stays open on CH-1 with that harness as its remaining work.

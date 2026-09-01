@@ -25,11 +25,17 @@ OtaTransferWatchdog::OtaTransferWatchdog(std::chrono::milliseconds sweep_interva
 }
 
 OtaTransferWatchdog::~OtaTransferWatchdog() {
-    // Contained for the same structural reason erase() is: this runs from a
-    // destructor, so a std::system_error escaping either the lock or the join is
-    // std::terminate that no caller-side catch can intercept. An earlier revision
-    // contained erase() and left these two uncontained, which is the asymmetry
-    // this fixes.
+    // NOTE ON WHAT THIS CATCH DOES AND DOES NOT DO. It stops an exception
+    // ESCAPING this destructor, which is required — a throw out of a destructor
+    // is std::terminate that no caller-side catch can intercept. It does NOT make
+    // a failed teardown recoverable: if the lock or join() throws, `sweeper_` may
+    // still be joinable when the member is destroyed, and ~std::thread then calls
+    // std::terminate anyway. So the honest description is that this relocates the
+    // terminate, it does not prevent one, and that is the deliberate policy:
+    // a sweeper that cannot be joined MUST NOT be allowed to outlive the object
+    // it holds a `this` pointer into, and silently detaching it would be worse.
+    // Neither failure has a known production trigger — destruction never runs on
+    // the sweeper thread and no concurrent owner touches `sweeper_`.
     try {
         {
             std::lock_guard lock(mu_);
@@ -39,9 +45,9 @@ OtaTransferWatchdog::~OtaTransferWatchdog() {
         if (sweeper_.joinable())
             sweeper_.join();
     } catch (...) {
-        // Nothing safe to do but contain it. Aborting the whole process during
-        // teardown is not an improvement, and a mutex that cannot be locked means
-        // the watchdog is already unreliable.
+        // Swallow so nothing escapes the destructor. See the note above: if this
+        // left `sweeper_` joinable, member destruction terminates — by design,
+        // not by oversight.
     }
 }
 

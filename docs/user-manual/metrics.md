@@ -919,7 +919,14 @@ one that should fire under an actual monopolisation attempt.
 `rejected_rate` means the peer drained its token bucket, which is a much looser
 secondary bound; sustained `rejected_rate` without `rejected_concurrency`
 usually indicates the rate knobs are tuned too tightly for the fleet's retry
-behaviour rather than an attack. `decision` is a genuine partition — exactly one per call.
+behaviour rather than an attack. `decision` is a genuine partition over calls that **reach the admission gate** —
+exactly one per such call. It is deliberately not a partition of every received
+`DownloadUpdate`: the on-behalf, revoked-certificate and positive-identity gates
+return before admission and are counted by their own families, so this sum is
+legitimately lower than
+`yuzu_grpc_requests_total{method="DownloadUpdate",status="received"}`. A
+divergence between the two is expected during an identity attack, not missing
+accounting.
 
 **Reading refunds.** `yuzu_ota_download_refund_total{reason}` is a SEPARATE
 family, deliberately not a `decision="refunded"` label: a refunded request has
