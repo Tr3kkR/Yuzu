@@ -231,6 +231,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_actions.cpp',
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
+    'unit/test_confined_fs_posix.cpp',
+    'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
     'unit/test_metrics.cpp',
