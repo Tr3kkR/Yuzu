@@ -191,6 +191,18 @@ bool make_unicode_string(const std::wstring& wide, UNICODE_STRING& out) {
         return false;
     out.Length = static_cast<USHORT>(byte_len);
     out.MaximumLength = out.Length;
+    // const_cast proof (docs/cpp-conventions.md requires one at a syscall
+    // boundary). CONSTNESS: UNICODE_STRING::Buffer is declared PWSTR because
+    // the same struct is used for kernel OUT parameters; as an
+    // OBJECT_ATTRIBUTES::ObjectName it is strictly an INPUT and NtCreateFile
+    // does not write through it, so casting away const cannot produce a
+    // mutation of `wide`. OWNERSHIP: this borrows, it does not own -- `out`
+    // holds a non-owning view into the caller's `wide`, which every call site
+    // keeps alive as a local for the whole duration of the NtCreateFile call
+    // (see open_dir_at/unlink_at below); `out` must never outlive it.
+    // MaximumLength is set equal to Length precisely so that a kernel path
+    // that did attempt to append would have zero spare capacity rather than
+    // writing past the string's buffer.
     out.Buffer = const_cast<PWSTR>(wide.c_str());
     return true;
 }

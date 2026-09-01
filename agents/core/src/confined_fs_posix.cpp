@@ -1,5 +1,24 @@
 #ifndef _WIN32
 
+// MUST be the first thing in this TU, before ANY #include -- project, spdlog,
+// or libc. glibc's <features.h> reads _GNU_SOURCE once, when the first libc
+// header pulls it in, and is then guarded against re-entry; a definition that
+// appears after that point is silently INERT. This sat below <dirent.h> and
+// <fcntl.h> until it was moved here, which meant the Linux `renameat2` /
+// RENAME_NOREPLACE declaration was not actually being secured by it -- the TU
+// compiled only because libstdc++ (reached via spdlog) defines _GNU_SOURCE
+// itself, the exact accidental reliance the guard was added to remove.
+//
+// Verified on glibc 2.43 / gcc-13: with the define in its old position and no
+// libstdc++ in the include graph, this TU fails with "renameat2 implicitly
+// declared" and "RENAME_NOREPLACE undeclared"; with the define here, it
+// compiles. No configured Linux leg uses libc++ today (checked across
+// .github/workflows, meson/native, meson/cross), so nothing was broken in
+// practice -- but the guard now does the job its comment claims.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 /**
  * confined_fs_posix.cpp -- POSIX shell for confined recursive delete
  * (confined_fs.hpp's platform contract). Every operation past `open_root`
@@ -29,13 +48,9 @@
 #if defined(__APPLE__)
 #include <sys/stdio.h> // renameatx_np, RENAME_EXCL
 #elif defined(__linux__)
-// glibc declares renameat2 in <stdio.h>, and only under __USE_GNU. It compiles
-// today only because spdlog transitively pulls <cstdio> and libstdc++ defines
-// _GNU_SOURCE for us -- neither is this file's to rely on, and a libc++ Linux
-// leg (the sanitizer builds) has neither.
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
+// glibc declares renameat2 in <stdio.h>, and only under __USE_GNU, which is
+// selected by _GNU_SOURCE -- see the hoisted #define at the TOP of this file
+// and the comment there explaining why it cannot live here.
 #include <stdio.h>
 #endif
 #include <sys/stat.h>
@@ -241,6 +256,20 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
     // Best-effort partial result on catch, same mapping `walk_delete` uses
     // for an exception it did not itself throw (confined_fs_walk.hpp rule 7).
     try {
+        // Cross-leg parity (B004's principle): a zero entry budget reports
+        // EntryCap on BOTH legs. The Windows leg has this same early guard
+        // before its own deadline check; without it here, a default-
+        // constructed DeleteLimits -- every cap zero, so every cap is
+        // simultaneously hit -- reported WallTimeCap on POSIX and EntryCap on
+        // Windows for byte-identical input. Both refuse and both delete
+        // nothing, so this was never a safety difference, but a caller
+        // asserting on the fail-closed default's reason should not get a
+        // different answer per platform.
+        if (budget.max_entries == 0) {
+            result.reason = Reason::EntryCap;
+            return result;
+        }
+
         while (true) {
             if (std::chrono::steady_clock::now() >= budget.deadline) {
                 result.reason = Reason::WallTimeCap;

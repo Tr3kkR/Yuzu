@@ -163,27 +163,47 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
     DeleteResult result{};
     result.stop_reason = Reason::None;
 
-    // `stop_reason == None` is a CONTRACT: the caller is entitled to read it as
-    // "every entry was visited and every action either succeeded or was a
-    // deliberate policy skip". Six separate defects in this file were the same
-    // shape -- some path left work undone while None was still reported -- so
-    // this is derived from the OUTCOMES rather than from a list of causes that
-    // has to be extended every time a new one appears:
+    // `stop_reason == None` is a CONTRACT. State it precisely, because the
+    // loose phrasing ("a walk that skipped anything never reports None") is
+    // WRONG in a way that matters to a successor: it would make every symlink
+    // refusal an incomplete walk, which is the opposite of what a policy
+    // refusal means. The contract is:
+    //
+    //   None == every entry was VISITED, and every entry that this walk was
+    //           supposed to act on was acted on. A deliberate policy refusal
+    //           counts as acted on; a budget that stopped us does not.
+    //
+    // Six separate defects in this file were the same shape -- some path left
+    // work undone while None was still reported -- so this is derived from the
+    // OUTCOMES rather than from a list of causes that has to be extended every
+    // time a new one appears. Incomplete:
     //   * any Failed outcome            -- an action did not happen
     //   * a DepthCap skip               -- a subtree was never visited
+    //   * a ByteCap skip                -- an entry we SELECTED went undeleted
     //   * enumerate/open_dir OsError    -- a subtree was never visited
-    // A Skipped outcome for any OTHER reason IS a completed visit: the walker
-    // looked at the entry and deliberately declined it, which is what a policy
-    // refusal means. Recording `incomplete` centrally, at the one place outcomes
-    // are appended, is what stops a seventh instance.
+    //
+    // ByteCap is in that list and the other policy reasons are not, and the
+    // distinction is the whole point: ByteCap is a BUDGET, exactly like
+    // DepthCap. The entry matched, we intended to delete it, and a limit
+    // stopped us -- and because the budget does not replenish, every later
+    // match is skipped too, so a byte-exhausted walk can silently do nothing
+    // for its entire remaining traversal. SymlinkRejected, ReparseRejected,
+    // DeviceBoundary, NotRegularFile and InvalidName are REFUSALS: the walker
+    // looked at the entry and declined it on purpose, which is a completed
+    // visit and must not read as incomplete. NameFilteredOut never reaches an
+    // outcome at all.
+    //
+    // Recording `incomplete` centrally, at the one place outcomes are appended,
+    // is what stops a seventh instance.
     Reason incomplete = Reason::None;
     const auto note_outcome = [&incomplete](const EntryOutcome& o) {
         if (incomplete != Reason::None)
             return; // first cause wins
         if (o.status == EntryStatus::Failed)
             incomplete = o.reason == Reason::None ? Reason::OsError : o.reason;
-        else if (o.status == EntryStatus::Skipped && o.reason == Reason::DepthCap)
-            incomplete = Reason::DepthCap;
+        else if (o.status == EntryStatus::Skipped &&
+                 (o.reason == Reason::DepthCap || o.reason == Reason::ByteCap))
+            incomplete = o.reason;
     };
 
     try {
@@ -315,21 +335,28 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                     break;
                 }
                 case Action::RecurseIntoDir: {
+                    // S1: bound concurrently-open handles. The stack holds one
+                    // per pending subdirectory, so without this the descriptor
+                    // cost is bounded only by max_entries and is paid
+                    // process-wide, not by this walk alone.
+                    // +2, measured: the popped frame still owns its handle and
+                    // the handle we are about to open would be live, so peak
+                    // concurrent handles is stack.size() + 2. Counting frames
+                    // alone overshot the documented bound by exactly that much.
+                    //
+                    // Checked BEFORE the open, not after. Opening first and
+                    // refusing on the result would make the refusal path itself
+                    // hold max_open_dirs + 1 handles for the window between the
+                    // open and the return -- one over the bound this exists to
+                    // enforce, on the very path that reports the bound was hit.
+                    if (stack.size() + 2 > limits.max_open_dirs) {
+                        ++result.tally.entries_seen;
+                        result.stop_reason = Reason::OpenDirCap;
+                        return result;
+                    }
                     OpenDirRes<DirHandle> opened = ops.open_dir(frame.handle, dir_entry.name);
                     ++result.tally.entries_seen;
                     if (opened.handle.has_value()) {
-                        // S1: bound concurrently-open handles. The stack holds one
-                        // per pending subdirectory, so without this the descriptor
-                        // cost is bounded only by max_entries and is paid
-                        // process-wide, not by this walk alone.
-                        // +2, measured: the popped frame still owns its handle
-                        // and `opened.handle` is live, so peak concurrent handles
-                        // is stack.size() + 2. Counting frames alone overshot the
-                        // documented bound by exactly that much.
-                        if (stack.size() + 2 > limits.max_open_dirs) {
-                            result.stop_reason = Reason::OpenDirCap;
-                            return result;
-                        }
                         stack.push_back(detail::WalkFrame<DirHandle>{
                             std::move(*opened.handle), rel_path,
                             frame.depth + 1});

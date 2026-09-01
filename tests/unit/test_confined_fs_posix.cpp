@@ -9,6 +9,7 @@
 // steady_clock, never a manufactured delay.
 
 #include <yuzu/agent/confined_fs.hpp>
+#include <yuzu/agent/scoped_fd.hpp>
 
 #include "test_helpers.hpp"
 
@@ -270,9 +271,16 @@ TEST_CASE("a real root fstat failure closes the fd and reports RootInvalid, no l
     const fs::path root_dir = tmp.path / "root";
     fs::create_directories(root_dir);
 
-    const int probe1 = ::open("/dev/null", O_RDONLY);
-    REQUIRE(probe1 >= 0);
-    ::close(probe1);
+    // RAII, not a bare ::open/::close pair: every CHECK/REQUIRE below can
+    // throw, and a manually-closed fd would leak out of this scope if one did.
+    // The fd NUMBER is what the assertion needs, so it is copied out of the
+    // owner before the owner releases it.
+    int probe1_fd = -1;
+    {
+        yuzu::agent::ScopedFd probe1{::open("/dev/null", O_RDONLY)};
+        REQUIRE(probe1.get() >= 0);
+        probe1_fd = probe1.get();
+    }
 
     {
         FstatSeamGuard guard(failing_fstat);
@@ -285,10 +293,13 @@ TEST_CASE("a real root fstat failure closes the fd and reports RootInvalid, no l
     // If open_root's ScopedFd had failed to close the root fd on the fstat
     // failure path above, the next lowest-numbered fd would land one higher
     // than probe1 instead of reusing the exact same number.
-    const int probe2 = ::open("/dev/null", O_RDONLY);
-    REQUIRE(probe2 >= 0);
-    ::close(probe2);
-    CHECK(probe2 == probe1);
+    int probe2_fd = -1;
+    {
+        yuzu::agent::ScopedFd probe2{::open("/dev/null", O_RDONLY)};
+        REQUIRE(probe2.get() >= 0);
+        probe2_fd = probe2.get();
+    }
+    CHECK(probe2_fd == probe1_fd);
 }
 
 // ── (3) In-tree symlink entry ────────────────────────────────────────────

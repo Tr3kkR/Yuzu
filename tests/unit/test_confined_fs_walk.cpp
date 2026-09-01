@@ -356,6 +356,43 @@ TEST_CASE("walk_delete charges the byte cap the size measured at delete time",
             swapped_refused = true;
         }
     REQUIRE(swapped_refused);
+
+    // ...and the walk as a whole reports INCOMPLETE. A ByteCap skip is a
+    // budget stopping work we selected and intended to do, exactly like
+    // DepthCap -- not a policy refusal like Symlink/Reparse/InvalidName,
+    // which are completed visits and correctly leave None. This matters
+    // because the byte budget does not replenish: once exhausted, every
+    // later match is skipped too, so reporting None here would tell a
+    // caller "nothing was left undone" about a walk that may have deleted
+    // nothing at all for its entire remaining traversal.
+    CHECK(result.stop_reason == Reason::ByteCap);
+}
+
+TEST_CASE("walk_delete: a policy refusal is a COMPLETED visit and leaves stop_reason None",
+          "[confined_fs]") {
+    // The companion to the assertion above, pinning the other half of the
+    // contract so a future change cannot collapse the two. A walk whose only
+    // blemish is a deliberate refusal must NOT report incompleteness --
+    // "any skip => non-None" is the wrong reading and would make every
+    // symlink rejection look like a failed cleanup run.
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    ops.dir(root).entries = {
+        file_entry("keep.txt"),
+        DirEntry{"link", EntryMeta{EntryType::Symlink, 0, true}, 0, false},
+    };
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, kOpenLimits);
+
+    bool link_refused = false;
+    for (const auto& e : result.entries)
+        if (e.rel_path == "link") {
+            CHECK(e.status == EntryStatus::Skipped);
+            CHECK(e.reason == Reason::SymlinkRejected);
+            link_refused = true;
+        }
+    REQUIRE(link_refused);
+    CHECK(result.stop_reason == Reason::None);
 }
 
 // The companion case, and the one that actually exercises the TALLY: a file
