@@ -405,6 +405,10 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
         result.reason = Reason::ReparseRejected;
         return result;
     }
+    if (info.dwVolumeSerialNumber != root_id.volume_serial) {
+        result.reason = Reason::DeviceBoundary;
+        return result;
+    }
     // Byte cap re-measured from the handle we ALREADY hold, so unlike the POSIX
     // leg (whose unlinkat is name-level) there is no residual window here: this
     // is the exact object about to be deleted. A regular file whose live size
@@ -420,10 +424,6 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
             result.bytes = 0;
             return result;
         }
-    }
-    if (info.dwVolumeSerialNumber != root_id.volume_serial) {
-        result.reason = Reason::DeviceBoundary;
-        return result;
     }
 
     // updater.cpp:568's delete-by-handle mechanism, on a handle WE opened

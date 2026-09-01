@@ -300,19 +300,28 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
     std::uint64_t live_bytes = 0;
     if (kind == UnlinkKind::File) {
         struct stat st{};
-        if (g_fstatat_fn(dir_fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) {
-            if (S_ISREG(st.st_mode)) {
-                live_bytes = static_cast<std::uint64_t>(st.st_size);
-                if (live_bytes > max_bytes_remaining) {
-                    spdlog::warn("confined_fs::unlink_at: '{}' grew past the byte cap since "
-                                 "enumeration -- refusing", name);
-                    return UnlinkOutcome{EntryStatus::Skipped, Reason::ByteCap, 0, 0};
-                }
+        if (g_fstatat_fn(dir_fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            // FAIL CLOSED. An earlier revision deleted anyway and charged the
+            // tally 0, reasoning that the entry is inside the confined parent
+            // so the delete is still safe. That conflates two SEPARATE
+            // controls: confinement bounds WHERE we may delete, this cap bounds
+            // HOW MUCH. Measured on that revision: a 4096-byte file was deleted
+            // under a 1-byte remaining budget and reported Deleted/bytes=0, so
+            // the cap was not weakened but wholly bypassed, and invisibly. If
+            // we cannot measure an entry, we do not delete it.
+            const int err = errno;
+            spdlog::warn("confined_fs::unlink_at: cannot measure '{}' before deleting ({}) -- "
+                         "refusing rather than deleting it uncharged", name, std::strerror(err));
+            return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};
+        }
+        if (S_ISREG(st.st_mode)) {
+            live_bytes = static_cast<std::uint64_t>(st.st_size);
+            if (live_bytes > max_bytes_remaining) {
+                spdlog::warn("confined_fs::unlink_at: '{}' grew past the byte cap since "
+                             "enumeration -- refusing", name);
+                return UnlinkOutcome{EntryStatus::Skipped, Reason::ByteCap, 0, 0};
             }
         }
-        // A failed re-measure is NOT fatal: unlinkat is name-level and the
-        // entry is already inside the confined parent. The tally then charges
-        // 0 for it, which is recorded honestly rather than guessed.
     }
 
     // Accepted benign race (documented per spec): a symlink swapped in

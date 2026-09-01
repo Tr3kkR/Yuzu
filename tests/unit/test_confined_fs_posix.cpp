@@ -321,6 +321,35 @@ TEST_CASE("a symlink entry inside the root is skipped and its target survives", 
 //    called directly rather than through delete_matching, so a fault in the
 //    primitive itself can't be masked by walker-level checks) ─────────────
 
+// The byte cap must FAIL CLOSED when the entry cannot be measured at delete
+// time. An earlier revision deleted anyway and charged the tally 0: measured, a
+// 4096-byte file was removed under a 1-byte remaining budget while reporting
+// Deleted/bytes=0, so the cap was bypassed invisibly rather than weakened.
+TEST_CASE("unlink_at refuses to delete when it cannot measure the entry", "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_measfail_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "big.tmp", std::string(4096, 'x'));
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    UnlinkOutcome outcome{};
+    {
+        FstatatSeamGuard guard{[](int, const char*, struct stat*, int) -> int {
+            errno = EACCES;
+            return -1;
+        }};
+        outcome = unlink_at(opened.root->fd_.get(), "big.tmp", UnlinkKind::File, 1);
+    }
+
+    CHECK(outcome.status == EntryStatus::Failed);
+    CHECK(outcome.reason == Reason::OsError);
+    CHECK(outcome.os_error == EACCES);
+    CHECK(outcome.bytes == 0);
+    CHECK(fs::exists(root_dir / "big.tmp")); // never deleted uncharged
+}
+
 TEST_CASE("open_root refuses a root path containing an embedded NUL", "[confined_fs]") {
     yuzu::test::TempDir tmp{"yuzu_test_confined_posix_rootnul_"};
     const fs::path real_root = tmp.path / "root";
