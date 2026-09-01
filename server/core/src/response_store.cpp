@@ -703,10 +703,36 @@ int sanitize_limit(int limit) {
     return limit > 0 ? limit : ResponseQuery{}.limit; // struct default (100)
 }
 
+// Appends `AND agent_id = ANY($n::text[])` / `AND 1=0` to `sql` (advancing
+// `idx`/`binds` past whatever it binds), or does nothing when `scope` is
+// unrestricted (nullopt). MUST be called before `ORDER BY`/`LIMIT`/`OFFSET`
+// or `GROUP BY` — ADR-0017 INV-3 (CRITICAL): a paginated/aggregated read
+// that filters after LIMIT can hand a confined caller a short or empty page
+// even though visible rows exist past the ones a post-fetch filter dropped.
+// One array bind regardless of set size (mirrors `facet_values`/
+// `facet_agent_count` above) — an earlier version of this helper bound one
+// placeholder per agent behind a 10,000-agent cap and silently truncated
+// (and, for `aggregate`, silently under-counted) past it; `pg::to_text_array`
+// removes the cap rather than raising it.
+void append_scope_clause(std::string& sql, std::vector<std::string>& binds, int& idx,
+                         const AggregateScope& scope) {
+    if (!scope.has_value())
+        return;
+    const auto& allowed = *scope;
+    if (allowed.empty()) {
+        sql += " AND 1=0"; // visible to no one → exclude every row
+        return;
+    }
+    std::vector<std::string_view> sv(allowed.begin(), allowed.end());
+    sql += " AND agent_id = ANY($" + std::to_string(idx++) + "::text[])";
+    binds.push_back(pg::to_text_array(sv));
+}
+
 } // namespace
 
 std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::string& instruction_id,
-                                                                 const ResponseQuery& q) const {
+                                                                 const ResponseQuery& q,
+                                                                 const AggregateScope& scope) const {
     static DegradeSampler sampler;
     return resp_read<std::vector<StoredResponse>>(
         open_, pool_, metrics_, "query", sampler, [&](PGconn* conn) -> std::optional<std::vector<StoredResponse>> {
@@ -730,6 +756,7 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
                 binds.push_back(std::to_string(q.until));
             }
+            append_scope_clause(sql, binds, idx, scope);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
@@ -748,7 +775,8 @@ std::optional<std::vector<StoredResponse>> ResponseStore::query(const std::strin
 }
 
 std::optional<std::vector<StoredResponse>>
-ResponseStore::query_by_execution(const std::string& execution_id, const ResponseQuery& q) const {
+ResponseStore::query_by_execution(const std::string& execution_id, const ResponseQuery& q,
+                                  const AggregateScope& scope) const {
     static DegradeSampler sampler;
     if (execution_id.empty()) {
         // arch-B1 (ported): empty execution_id is the legacy sentinel and
@@ -779,6 +807,7 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
                 binds.push_back(std::to_string(q.until));
             }
+            append_scope_clause(sql, binds, idx, scope);
             sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
@@ -818,10 +847,6 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
     return resp_read<std::vector<AggregationResult>>(
         open_, pool_, metrics_, "aggregate", sampler,
         [&](PGconn* conn) -> std::optional<std::vector<AggregationResult>> {
-            // Upper bound on the management-group IN-list (#1634) — same cap
-            // as the SQLite original.
-            static constexpr std::size_t kScopeAgentBindCap = 10000;
-
             const auto& allowed_group = allowed_group_by();
             if (std::find(allowed_group.begin(), allowed_group.end(), aq.group_by) ==
                 allowed_group.end()) {
@@ -862,26 +887,7 @@ ResponseStore::aggregate(const std::string& instruction_id, const AggregationQue
                 binds.push_back(filter.agent_id);
             }
             // #1634 management-group scope (filter-BEFORE-aggregate).
-            if (scope.has_value()) {
-                const auto& allowed = *scope;
-                if (allowed.empty()) {
-                    sql += " AND 1=0"; // visible to no one → exclude every row
-                } else {
-                    const std::size_t n = std::min<std::size_t>(allowed.size(), kScopeAgentBindCap);
-                    if (n < allowed.size())
-                        spdlog::warn("ResponseStore::aggregate: in-scope agent set ({}) exceeds "
-                                    "bind cap ({}); totals computed over the first {} agents "
-                                    "(#1634)",
-                                    allowed.size(), kScopeAgentBindCap, n);
-                    sql += " AND agent_id IN (";
-                    for (std::size_t i = 0; i < n; ++i) {
-                        sql += (i == 0) ? "$" + std::to_string(idx) : ",$" + std::to_string(idx);
-                        binds.push_back(allowed[i]);
-                        idx++;
-                    }
-                    sql += ")";
-                }
-            }
+            append_scope_clause(sql, binds, idx, scope);
             if (filter.status >= 0) {
                 sql += " AND status = $" + std::to_string(idx++) + "::integer";
                 binds.push_back(std::to_string(filter.status));
@@ -923,6 +929,29 @@ ResponseStore::distinct_agent_ids(const std::string& instruction_id) const {
                 "SELECT DISTINCT agent_id FROM response_store.responses WHERE instruction_id = "
                 "$1 ORDER BY agent_id",
                 std::vector<std::string>{instruction_id});
+            if (res.status() != PGRES_TUPLES_OK)
+                return std::nullopt;
+            std::vector<std::string> ids;
+            ids.reserve(static_cast<std::size_t>(PQntuples(res.get())));
+            for (int i = 0; i < PQntuples(res.get()); ++i)
+                ids.push_back(text_col(res.get(), i, 0));
+            return ids;
+        });
+}
+
+std::optional<std::vector<std::string>>
+ResponseStore::distinct_agent_ids_by_execution(const std::string& execution_id) const {
+    static DegradeSampler sampler;
+    if (execution_id.empty())
+        return std::vector<std::string>{}; // arch-B1 sentinel, see query_by_execution
+    return resp_read<std::vector<std::string>>(
+        open_, pool_, metrics_, "distinct_agent_ids_by_execution", sampler,
+        [&](PGconn* conn) -> std::optional<std::vector<std::string>> {
+            pg::PgResult res = pg::exec_params(
+                conn,
+                "SELECT DISTINCT agent_id FROM response_store.responses WHERE execution_id = "
+                "$1 ORDER BY agent_id",
+                std::vector<std::string>{execution_id});
             if (res.status() != PGRES_TUPLES_OK)
                 return std::nullopt;
             std::vector<std::string> ids;

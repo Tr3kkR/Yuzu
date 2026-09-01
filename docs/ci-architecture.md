@@ -156,16 +156,23 @@ the corpus and publishes the coverage report the PR job uses for
 affected-target pruning. State is GHA artifacts on 90-day retention and
 self-heals: if it expires or a download fails, PR runs degrade OPEN to
 seed corpora + keep-all pruning (slower, never a false green skip on that
-fully-expired path; short of expiry, though, a stale-but-unexpired coverage
-report can still prune an affected target — a tracked follow-up), and the
-next batch run regrows it.
+fully-expired path). Short of expiry, `cflite-pr.yml`'s "Check
+coverage-artifact age" step (#3770) guards the remaining gap — a
+stale-but-unexpired `cifuzz-coverage-latest` older than 30 days (3x the
+~10-day measured refresh cadence) is treated as untrustworthy and the job
+forces `keep-unaffected-fuzz-targets: true` instead of letting build_fuzzers
+prune against it, logging which branch it took as a `::notice::`. A
+fresh-timestamp, stale-content artifact (e.g. from a main-ref dispatch)
+would still slip this age check, but `cflite-batch.yml`'s dev ref-guards
+close the known producer of that case. The next healthy batch run regrows
+both the corpus and a fresh coverage report.
 Expiry-by-inactivity files no issue — only a RED run alerts, so a long
 quiet period degrades silently. `prune` is dispatch-only — it replaces the
 corpus wholesale, so it never runs unattended. A red batch run auto-files
 a `cflite-batch-broken` issue (the `nightly-broken` pattern, minus the
 merge discipline — it is a repair prompt, not a gate); while it is open,
-coverage staleness silently degrades PR-time pruning, so treat it as
-same-week work.
+coverage staleness silently degrades PR-time pruning **within** the 30-day
+window the age gate above doesn't cover, so treat it as same-week work.
 
 ### Capability matrix drift gate (`check-capability-matrix.sh`, #2204)
 
@@ -1374,16 +1381,25 @@ base *is* `base.sha` and three-dot silently collapses back to two-dot. That
 no-op is pinned by cases in `tests/shell/test_detect_code_change.sh`, which
 also assert the caller passes a resolved head.
 
-**Cache keys must not be reachable by an earlier restore step.** The canary's
-ccache key is scoped to the source roots meson compiles rather than a
-workspace-wide glob: `hashFiles` does not honour `.gitignore`, and the vcpkg
-restore runs first, so a bare glob also hashed the vendored dependency headers and
-the key differed between a cold and a warm run — splitting the namespace and
-leaving the dev-warmed ccache entry at a key no warm PR recomputes (#3270). The
-ccache save is gated on the Build step having run, pass or fail, so a cancelled
-run cannot leave a thin entry that later same-source runs exact-hit and decline to
-replace (#3269); the vcpkg save is gated more strictly, on its install step
-succeeding, because a partial tree is a correctness problem rather than a slow one.
+**Cache keys must not be reachable by an earlier restore step.** (#3270's
+original instance: a workspace-wide `hashFiles` glob picked up the vendored
+headers the vcpkg restore had just materialised, so the key differed between a
+cold and a warm run.) The canary's ccache key is now a **rolling 3-day bucket**
+(`ccache-canary-x64-linux-<epoch/259200>`, computed from the runner clock —
+trivially unreachable by any restore): the source-hash key it replaces never
+exact-hit on a repo doing ~75 commits/day, so every run saved a fresh multi-GB
+entry, the pool ran 7x over GitHub's 10 GB repo quota, and LRU eviction both
+degraded the canary (8-20 min rebuilds from week-old entries) and starved every
+other cache (measured 2026-09-01). One entry per 3-day bucket per scope now
+(~2-3 live, bounded by the cap below); ccache's own preprocessed-input hashing
+absorbs intra-bucket source drift, so hit-rate decay is capped at ~3 days of dev
+churn, and a job-level `CCACHE_MAXSIZE: 2G` keeps each entry from growing
+without bound. The ccache save is gated on the Build step having run, pass or
+fail — a cancelled run leaves no thin entry, at the accepted cost that an early
+hard Build failure can occupy the bucket's key with a thin one (#3269,
+documented at the restore step); the vcpkg save is gated more strictly, on its
+install step succeeding, because a partial tree is a correctness problem rather
+than a slow one.
 
 **Pushes to `dev` are what keep the cache warm.** GHA cache scope lets a PR job
 read its own ref, the default branch, and its base branch — never a sibling

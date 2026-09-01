@@ -550,13 +550,14 @@ duplicate `10`; the one live cross-reference to the old numbering
     `/api/v1/engine-principals` + `{id}/credentials{,/rotate,/confirm}` +
     `{id}/roles` + `{id}/transfer-owner`, MCP twins, console, and the
     no-admin auditor (#2194/#2284); **4.4** per-principal quota cap
-    (#2309 — gate decision extracted into `principal_quota_gate.hpp`;
-    **#2309's title says "closes #1973" but GitHub never actioned it — a merge
-    to `dev` does not auto-close, and #1973 is still OPEN**. It is
-    `security`-labelled and framed as a production-enablement interlock
-    ("the cap must exist before any engine principal is enabled in
-    production"), so it belongs in the hardening backlog below, not in a
-    closed column); **4.5** `principal_class="engine"` as a live
+    (#2309 — gate decision extracted into `principal_quota_gate.hpp`.
+    **#2309's "closes #1973" did NOT auto-close it — #1973 is `security`-labelled
+    and so protected from automated closure. It was CLOSED deliberately on
+    2026-08-07 after an independent human verification against `dev` (per
+    `docs/agents/issue-standard.md` §5.1, the closure path for a `security`
+    issue)**; the production-enablement interlock ("the cap must exist before any
+    engine principal is enabled in production") is discharged); **4.5**
+    `principal_class="engine"` as a live
     `yuzu_http_requests_total` label value (#2342), which required the
     *resolved* `principal_kind` and so could not be done from presentation
     (`principal_class.hpp:77`).
@@ -607,40 +608,34 @@ duplicate `10`; the one live cross-reference to the old numbering
 ### Open hardening backlog (tracked issues, not features)
 
 Not gaps in the feature matrix — accepted debt on shipped surfaces. Ranked by
-what a security reviewer would flag first:
+what a security reviewer would flag first. (Reconciled against `dev`
+2026-09-01: **#1973** engine-principal interlock, **#2376** grant-graph
+topology floor, **#2396** login/PG-degrade, **#2395** KEK rotation, **#2397**
+auth-recovery docs, **#2399** MFA-store robustness — TOTP counter double-use,
+shipped #3764 — and **#2407** pre-auth body cap have all landed and are dropped
+from this list.)
 
-- **#1973 — production-enablement interlock, still OPEN.** `security`-labelled:
-  the per-principal concurrency/quota cap "must exist before any engine
-  principal is enabled in production". #2309 shipped the cap and its title says
-  "closes #1973", but GitHub never actioned that (a merge to `dev` does not
-  auto-close), so the interlock has never been formally discharged. Either
-  close it deliberately with the evidence, or treat engine principals as
-  not-yet-production-enabled. Listed first because it gates a deployment
-  decision, not just a code fix.
-- **#2376 — sensitive grant-graph reads fall open to any authenticated user
-  when RBAC is off.** The only item here that is an *authorization* defect,
-  and it bites in the **default** deployment posture (RBAC off). Same failure
-  class as #2202. Fix before the cosmetic items below.
-- **#2396** — login availability is hard-coupled to Postgres: a transient blip
-  takes authentication down with no retry or degrade. The direct cost of
-  ADR-0006 fail-closed; worth an explicit decision rather than drift.
-- **#2395** — KEK rotation runbook + rewrap flow for SecretCodec columns.
-  Lands with, or immediately after, PR #2394 — a first SecretCodec consumer
-  with no rotation story is an audit finding waiting to happen.
-- **#2397** — Postgres auth recovery runbook + sweep of the SQLite-era auth
-  docs (`docs/ops-runbooks/auth-db-recovery.md` still assumes a file).
-- **#2399** — MFA store robustness: TOTP counter double-use window +
-  recovery-code store-error handling.
+- **#3777** — the concurrent-enroll / disable-race MFA-enrollment loser is
+  audited as a generic "code rejected" (and a benign concurrent `mfa_disable`
+  trips a false "store unavailable" 503 + secret-unavailable degrade metric +
+  kCritical audit). Give `MfaAlreadyEnrolled` its own audit branch at the route
+  consumers — the only item here that is a live audit-fidelity (CC7.2) defect.
+  Follow-up from #3762.
+- **#3779** — concurrent `mfa_regenerate_recovery_codes` orphans the earlier
+  code set (last-writer-wins on an explicit, user-initiated regenerate — the
+  same class as the enrollment orphan #3762 closed, but arguably acceptable
+  semantics). Decide deliberately: serialize it, or document the last-writer
+  contract. Follow-up from #3762.
 - **#2401** — `yuzu_auth_secret_unavailable_total` lacks the cardinality to
   tell a retry storm from a uniform outage (CC7.2 evidence quality).
+- **#2375** — access reviews cannot distinguish a deprovisioned/terminated
+  principal from a temporarily-disabled one in `lifecycle_state` (CC6.2).
 - **#2398** — extract a shared `build_auth_stack()`; `main.cpp` and
   `server.cpp` duplicate the PgPool → FileKeyProvider → SecretCodec → AuthDB
   construction chain, so a wiring fix has to be made twice.
-- **#2375** — access reviews cannot distinguish a deprovisioned/terminated
-  principal from a temporarily-disabled one in `lifecycle_state`.
-- **#2407** — server-wide HTTP request-body size cap (bodies are read before
-  auth). Not auth-specific, but the auth surface is where it is reachable
-  pre-authentication.
+- **#3783** — nightly TSan leg for the live-PG MFA concurrency regressions
+  (`test_auth_db_pg.cpp`) — test-hardening; the concurrency guards are checked
+  by inspection today. Follow-up from #3762.
 
 ---
 

@@ -29,6 +29,7 @@
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
+#include "test_response_execution_authz_pg_helper.hpp"
 #include "workflow_engine.hpp"
 #include "workflow_routes.hpp"
 
@@ -192,7 +193,9 @@ struct ExecHarness {
                          bool wire_exec_visible_arg = true,
                          bool with_workflow_engine = false,
                          bool wire_fleet_read_fn_arg = true,
-                         bool with_product_pack_store = false)
+                         bool with_product_pack_store = false,
+                         WorkflowRoutes::AuthFn auth_override = {},
+                         WorkflowRoutes::FleetReadFn fleet_read_override = {})
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -238,14 +241,17 @@ struct ExecHarness {
             product_pack_store->set_require_signed_packs(false); // unsigned test bundles
         }
 
-        auto auth_fn = [this](const httplib::Request&,
-                              httplib::Response&) -> std::optional<auth::Session> {
+        WorkflowRoutes::AuthFn auth_fn =
+            [this](const httplib::Request&,
+                   httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::admin;
             s.token_scope_service = mock_token_scope_service;
             return s;
         };
+        if (auth_override)
+            auth_fn = std::move(auth_override);
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                               const std::string&) -> bool {
             if (!perm_grant) {
@@ -258,15 +264,17 @@ struct ExecHarness {
         // gate. Fails 403 when fleet_read_grant is false (mirrors perm_fn's
         // deny shape); admits with fleet_read_scope otherwise (nullopt =
         // unfiltered, the default).
-        auto fleet_read_fn = [this](const httplib::Request&, httplib::Response& res,
-                                    const std::string&,
-                                    const std::string&) -> yuzu::server::authz::FleetReadGate {
+        WorkflowRoutes::FleetReadFn fleet_read_fn =
+            [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) -> yuzu::server::authz::FleetReadGate {
             if (!fleet_read_grant) {
                 res.status = 403;
                 return {false, yuzu::server::authz::deny_all()};
             }
             return {true, fleet_read_scope};
         };
+        if (fleet_read_override)
+            fleet_read_fn = std::move(fleet_read_override);
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
@@ -395,13 +403,14 @@ struct ExecHarness {
     /// Create an execution row and return its id.
     std::string make_exec(const std::string& definition_id, const std::string& status,
                           int agents_targeted, int agents_success, int agents_failure,
-                          int64_t dispatched_at = 1735689600 /* 2025-01-01 */) {
+                          int64_t dispatched_at = 1735689600 /* 2025-01-01 */,
+                          const std::string& dispatched_by = "tester") {
         Execution e;
         // Atomic counter, not std::hash, per CLAUDE.md test isolation rules.
         e.id = "exec-" + std::to_string(exec_counter.fetch_add(1));
         e.definition_id = definition_id;
         e.status = status;
-        e.dispatched_by = "tester";
+        e.dispatched_by = dispatched_by;
         e.dispatched_at = dispatched_at;
         e.agents_targeted = agents_targeted;
         e.agents_success = agents_success;
@@ -640,22 +649,37 @@ TEST_CASE("executions detail: unwired fleet_read_fn -> 503, fail closed",
 // own doc comment on VisibleSet{}) of an engaged-empty scope (deny_all())
 // being mishandled as unfiltered/nullopt, serving the whole fleet to a
 // caller with no grants at all. Pin the distinction directly for this route.
-TEST_CASE("executions detail: admitted-but-deny_all() scope shows nothing",
+TEST_CASE("executions detail: admitted-but-deny_all() non-owner gets collapsed 404",
           "[pg][workflow][executions][detail][rbac]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool);
     h.make_def("def-Y2", "Y2");
-    auto eid = h.make_exec("def-Y2", "completed", 1, 1, 0);
+    auto eid = h.make_exec("def-Y2", "completed", 1, 1, 0, 1735689600, "alice");
     h.agent_status(eid, "agent-should-not-appear", "success", 0, "", 1735689601);
     h.store_response("def-Y2", "agent-should-not-appear", "should never render", eid);
 
     h.fleet_read_scope = yuzu::server::authz::deny_all();
     auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    auto missing = h.sink.Get("/fragments/executions/does-not-exist/detail");
     REQUIRE(res);
-    CHECK(res->status == 200);
+    REQUIRE(missing);
+    CHECK(res->status == 404);
+    CHECK(missing->status == 404);
+    CHECK(res->body == missing->body);
     CHECK(res->body.find("agent-should-not-appear") == std::string::npos);
     CHECK(res->body.find("should never render") == std::string::npos);
+    // #1634 (governance Gate 6/Gate 8 compliance-officer finding): a
+    // suppressed cross-operator read now DOES get a distinct `denied` audit
+    // row (CC7.2 evidence, parity with the REST twin) — never the
+    // `success`-shaped row a genuine admit gets.
+    bool saw_denied = false;
+    for (const auto& a : h.audit_calls) {
+        CHECK(a.result != "success");
+        if (a.action == "execution.detail.view" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
 }
 
 // #1712 / #3290 Phase 2: the "Responses" section must drop rows for agents
@@ -679,6 +703,54 @@ TEST_CASE("executions detail: responses section drops out-of-scope agents",
     CHECK(res->status == 200);
     CHECK(res->body.find("in-scope output") != std::string::npos);
     CHECK(res->body.find("out-of-scope output") == std::string::npos);
+}
+
+TEST_CASE("executions detail: confined-but-admitted caller gets scope/parameter redaction "
+          "(Doomgoose review, blocking)",
+          "[pg][workflow][executions][detail][rbac][scope]") {
+    // This route's sidebar previously rendered exec.scope_expression/
+    // parameter_values verbatim with no gate.scope conditional at all,
+    // unlike the REST twin (GET /api/v1/executions/{id}) and MCP
+    // get_execution_status, which both replace these fields with
+    // "(redacted - confined view)" whenever the caller is confined —
+    // dispatcher included. A confined caller admitted via one visible
+    // agent could read the full scope DSL of an execution naming
+    // out-of-scope agent ids/hostnames. This test admits (200, not 404)
+    // via a narrow-but-nonempty scope and asserts the real scope
+    // expression/parameters never appear.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-REDACT", "Redact");
+
+    Execution e;
+    e.id = "exec-redact-test";
+    e.definition_id = "def-REDACT";
+    e.status = "completed";
+    e.dispatched_by = "someone-else";
+    e.dispatched_at = 1735689600;
+    e.completed_at = 1735689660;
+    e.agents_targeted = 1;
+    e.agents_success = 1;
+    e.agents_responded = 1;
+    e.scope_expression = "tag:secret-project-out-of-scope-hostname";
+    e.parameter_values = R"({"admin_password":"should-never-leak"})";
+    auto created = h.tracker->create_execution(e);
+    REQUIRE(created.has_value());
+    const auto eid = *created;
+    h.agent_status(eid, "agent-in", "success", 0, "", 1735689601);
+
+    // Narrow-but-nonempty scope: caller sees "agent-in" (admits, 200) but
+    // is still confined (not the deny_all/full-visibility cases already
+    // covered by sibling tests).
+    h.fleet_read_scope =
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("redacted - confined view") != std::string::npos);
+    CHECK(res->body.find("secret-project-out-of-scope-hostname") == std::string::npos);
+    CHECK(res->body.find("should-never-leak") == std::string::npos);
 }
 
 TEST_CASE("executions detail: KPI strip shows counts + p50/p95", "[pg][workflow][executions][detail]") {
@@ -1332,6 +1404,43 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][execut
     CHECK(res->status == 410);
 }
 
+TEST_CASE("SSE handler: invisible terminal execution collapses to the missing-id 404",
+          "[pg][workflow][executions][pr3][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz_rig{db.dsn()};
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr,
+                  /*wire_exec_visible=*/true, /*with_workflow_engine=*/false,
+                  /*wire_fleet_read_fn=*/true, /*with_product_pack_store=*/false,
+                  authz_rig.auth_fn(), authz_rig.fleet_read_fn());
+    h.make_def("def-HIDDEN", "Hidden");
+    auto exec_id =
+        h.make_exec("def-HIDDEN", "succeeded", 1, 1, 0, 1735689600, "alice");
+    h.agent_status(exec_id, "alice-agent", "success");
+
+    const auto token = authz_rig.mint_bob();
+    const auto headers = yuzu::test::ResponseExecutionAuthzPgRig::bearer(token);
+    auto invisible = h.sink.Get("/sse/executions/" + exec_id, headers);
+    auto missing = h.sink.Get("/sse/executions/does-not-exist", headers);
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    CHECK(invisible->status == 404);
+    CHECK(missing->status == 404);
+    CHECK(invisible->body == missing->body);
+    CHECK(h.event_bus->subscriber_count(exec_id) == 0);
+    // #1634 (governance Gate 6 compliance-officer fix): a suppressed
+    // cross-operator subscribe attempt now DOES get a distinct `denied` audit
+    // row (CC7.2 evidence, parity with the REST twin) — it must never be the
+    // `success`-shaped row a genuine admit gets.
+    bool saw_denied = false;
+    for (const auto& a : h.audit_calls) {
+        CHECK(a.result != "success");
+        if (a.action == "execution.live_subscribe" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
+}
+
 // ── ADR-0034 shared-budget admission (governance regression guards) ─────────
 //
 // These exist because the two blockers this route shipped were BOTH invisible to
@@ -1414,13 +1523,14 @@ TEST_CASE("SSE handler: an unmetered route still serves (nullptr budget is a tes
     CHECK(res->status == 200);
 }
 
-TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution", "[pg][workflow][executions][pr3]") {
+TEST_CASE("SSE handler: 403 when fleet_read_fn denies Read on Execution",
+          "[pg][workflow][executions][pr3]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ExecHarness h(pool);
     h.make_def("def-FORBID", "Forbid");
     auto exec_id = h.make_exec("def-FORBID", "running", 5, 0, 0);
-    h.perm_grant = false;
+    h.fleet_read_grant = false;
     auto res = h.sink.Get("/sse/executions/" + exec_id);
     REQUIRE(res);
     CHECK(res->status == 403);
@@ -1732,7 +1842,7 @@ TEST_CASE("SSE handler: 200 path emits execution.live_subscribe audit",
     CHECK(saw);
 }
 
-TEST_CASE("SSE handler: 403 perm-deny does NOT emit live_subscribe audit",
+TEST_CASE("SSE handler: 403 fleet-read denial does NOT emit live_subscribe audit",
           "[pg][workflow][executions][pr3][pr4]") {
     // qe-S4: a denied subscribe must not leave a forensic ghost row in
     // audit_store — the success-shaped audit only fires after perm_fn
@@ -1744,7 +1854,7 @@ TEST_CASE("SSE handler: 403 perm-deny does NOT emit live_subscribe audit",
     ExecHarness h(pool);
     h.make_def("def-DENY", "Deny");
     auto exec_id = h.make_exec("def-DENY", "running", 1, 0, 0);
-    h.perm_grant = false;
+    h.fleet_read_grant = false;
 
     auto res = h.sink.Get("/sse/executions/" + exec_id);
     REQUIRE(res);
