@@ -669,6 +669,17 @@ TEST_CASE("executions detail: admitted-but-deny_all() non-owner gets collapsed 4
     CHECK(res->body == missing->body);
     CHECK(res->body.find("agent-should-not-appear") == std::string::npos);
     CHECK(res->body.find("should never render") == std::string::npos);
+    // #1634 (governance Gate 6/Gate 8 compliance-officer finding): a
+    // suppressed cross-operator read now DOES get a distinct `denied` audit
+    // row (CC7.2 evidence, parity with the REST twin) — never the
+    // `success`-shaped row a genuine admit gets.
+    bool saw_denied = false;
+    for (const auto& a : h.audit_calls) {
+        CHECK(a.result != "success");
+        if (a.action == "execution.detail.view" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
 }
 
 // #1712 / #3290 Phase 2: the "Responses" section must drop rows for agents

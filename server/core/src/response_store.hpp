@@ -125,7 +125,7 @@ struct ResponseQuery {
 /// be supplied explicitly at every call site.
 ///   * `nullopt`           = no scoping (legacy-open / RBAC-disabled / global
 ///                           operator — totals over all agents, any scale).
-///   * engaged + NON-empty = restrict to `agent_id IN (the set)`.
+///   * engaged + NON-empty = restrict to `agent_id = ANY(the set)`.
 ///   * engaged + EMPTY     = the operator can see none → ZERO rows (`AND 1=0`),
 ///                           never a silent unfiltered read (also the fail-closed
 ///                           sink for a corrupt RBAC store / a store-read error).
@@ -231,7 +231,7 @@ public:
     /// Degrade-distinguishable read: `std::nullopt` on a store/pool/query
     /// failure (see the file header's posture note); an engaged EMPTY vector
     /// is a genuine "no rows" result.
-    /// `scope` (#1634, ADR-0017 INV-3): applied as SQL `agent_id IN (...)` /
+    /// `scope` (#1634, ADR-0017 INV-3): applied as SQL `agent_id = ANY(...)` /
     /// `AND 1=0` BEFORE `ORDER BY`/`LIMIT`/`OFFSET`, same semantics and same
     /// type as `aggregate()`'s scope below. Post-fetch filtering a paginated
     /// read is a fail-open pagination bug — a confined caller's page can come

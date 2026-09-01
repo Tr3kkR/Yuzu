@@ -385,10 +385,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
                 // #1634 (governance Gate 6 compliance-officer finding): a
                 // suppressed cross-operator read attempt is CC7.2-evidence-worthy
-                // the same way the REST twin (GET /api/v1/executions/{id}) and
-                // MCP get_execution_status treat it — audit it distinctly, using
-                // the SAME non-distinguishing detail text so no enumeration
-                // oracle is reopened via query_audit_log.
+                // the same way the REST twin (GET /api/v1/executions/{id},
+                // action execution.detail.fetch) and MCP get_execution_status
+                // already audit their own denials — this route keeps its own
+                // pre-existing action name (execution.detail.view, matching
+                // its success row below) rather than adopting the REST twin's,
+                // but uses the SAME non-distinguishing detail text so no
+                // enumeration oracle is reopened via query_audit_log.
                 (void)audit_fn(req, "execution.detail.view", "denied", "Execution", exec_id,
                                "not found or outside caller's fleet-read scope");
                 res.status = 404;
@@ -910,9 +913,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                      // #1634 (governance Gate 6 compliance-officer finding): a
                      // suppressed cross-operator subscribe attempt is
                      // CC7.2-evidence-worthy the same way the REST twin
-                     // (GET /api/v1/events) treats it — audit it distinctly,
-                     // using the SAME non-distinguishing detail text so no
-                     // enumeration oracle is reopened via query_audit_log.
+                     // (GET /api/v1/events, action api.v1.events.subscribe)
+                     // already audits its own denials — this route keeps its
+                     // own pre-existing action name (execution.live_subscribe,
+                     // matching its success row below), but uses the SAME
+                     // non-distinguishing detail text so no enumeration oracle
+                     // is reopened via query_audit_log.
                      (void)audit_fn(req, "execution.live_subscribe", "denied", "Execution",
                                     exec_id, "not found or outside caller's fleet-read scope");
                      res.status = 404;
