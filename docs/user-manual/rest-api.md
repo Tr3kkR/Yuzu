@@ -4891,9 +4891,9 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 
 #### `GET /api/v1/executions/{id}/visualization`
 
-**Permission:** `Response:Read`
+**Permission:** `require_fleet_read("Response","Read")` (ADR-0017 admit-then-filter — #1634, replaced the flat `Response:Read` gate)
 
-**Hardening (#1634, partial).** Under a **corrupt or unavailable RBAC store** this endpoint now fails **closed** (returns no rows) rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of this endpoint for normal operators is **not yet effective** — a holder of global `Response:Read` currently sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). `rows_capped` (below) is computed on the raw pre-filter result. When rows are dropped (today, the fail-closed path), the success audit detail carries ` scope_dropped=<N>`.
+**Confined (#1634).** A management-group-confined operator is admitted and sees only their in-scope agents' rows in the rendered chart — real cross-operator isolation, not the earlier inert per-row filter. The visible-agent set is resolved and pushed into the underlying SQL query before the row cap (ADR-0017 INV-3), so `rows_capped` (below) reflects the CALLER's own scoped cap hit, not a raw-then-filtered one that could fire entirely inside another operator's rows. On a **corrupt or unavailable RBAC store** the endpoint still fails **closed** (`403`/`503`) rather than exposing the whole fleet. When rows are dropped, the success audit detail carries ` scope_dropped=<N>` — this fires under ordinary operation for a confined caller whose execution spans agents outside their groups, not only on RBAC-store corruption.
 
 **Path parameters:**
 
@@ -7191,7 +7191,7 @@ Aggregate response data for a command (counts, summaries).
 
 Export response data in CSV format.
 
-**Confined (#1634).** All three readers are gated by `require_fleet_read` (ADR-0017 admit-then-filter) — a management-group-confined operator is admitted and sees only their in-scope agents' rows, real cross-operator isolation rather than the earlier inert per-row filter. `/export` and the catch-all GET push the visible-agent set into the underlying SQL query before `LIMIT`/`OFFSET` (ADR-0017 INV-3), so a confined caller's page reflects only their own visible rows. On a **corrupt or unavailable RBAC store**, all three still fail **closed** — `GET /api/responses/{id}` and `/export` return no rows; `/aggregate` returns `503` — rather than exposing the whole fleet via the legacy read fallback. Scripted/Grafana consumers of `/aggregate` that start receiving `503`/empty after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
+**Confined (#1634).** All three readers are gated by `require_fleet_read` (ADR-0017 admit-then-filter) — a management-group-confined operator is admitted and sees only their in-scope agents' rows, real cross-operator isolation rather than the earlier inert per-row filter. `/export` and the catch-all GET push the visible-agent set into the underlying SQL query before `LIMIT`/`OFFSET` (ADR-0017 INV-3), so a confined caller's page reflects only their own visible rows. All three now share ONE gate's failure posture: a **null/unopened response store** returns `503`; an **open but corrupt RBAC store** fails **closed** with `403` (`rbac_enforcement_in_effect` holds, so `require_fleet_read`'s underlying permission check denies rather than falling through to the legacy read path) — for all three readers alike, not the differentiated no-rows-vs-503 split of the pre-migration gate. Scripted/Grafana consumers that start receiving `503`/`403` after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
 
 ---
 
