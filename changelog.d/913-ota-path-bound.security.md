@@ -55,8 +55,8 @@
   caller commanding a range of addresses can hold all of it and lock the
   enrolled fleet out of updates — the per-peer cap does not help, because each
   address is its own peer. Refusals increment
-  `yuzu_ota_download_admission_total{decision="rejected_total"}` and alert as
-  `YuzuOtaServerCapacityRejections`; the rejection log's `cert_keyed` field
+  `yuzu_ota_download_admission_total{decision="rejected_total"}`; the rejection
+  log's `cert_keyed` field
   separates a genuine rollout from a denial attempt.
 - **Server-wide gRPC resource bounds (#913).** The single `ServerBuilder`
   previously set keepalive/ping arguments and nothing else — no

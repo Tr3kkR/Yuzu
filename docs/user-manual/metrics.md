@@ -955,7 +955,7 @@ agent cannot spend itself into a lockout. The `reason` label is what makes the
 invariant checkable: in steady state the two deadline reasons together must
 match `yuzu_ota_download_deadline_exceeded_total` exactly, and a growing gap
 means a code path is aborting without refunding (this is what
-`YuzuOtaRefundDivergence` watches). `version_not_found` is refunded on purpose
+the invariant a refund-divergence alert watches — the rule for it ships with the OTA alert group, separately). `version_not_found` is refunded on purpose
 even though the peer chose the version: nothing is streamed, so no capacity is
 consumed, and a staged rollout routinely has agents asking for versions a given
 server does not hold.
