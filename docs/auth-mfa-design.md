@@ -52,10 +52,10 @@ CC6.6 — privileged access).
   code via `POST /login/mfa/stepup`.
 - **Audit chain.** Every state transition emits an audit row through
   `AuthRoutes::audit_log`. The verbs are: `mfa.enroll.initiated`,
-  `mfa.enroll.verified`, `mfa.enroll.failed`, `mfa.disabled`,
-  `mfa.login.required`, `mfa.login.verified`, `mfa.login.failed`,
-  `mfa.recovery_codes.generated`, `mfa.recovery_code.used` (PR 2 adds
-  `mfa.step_up.*`).
+  `mfa.enroll.verified`, `mfa.enroll.failed`, `mfa.enroll.race`,
+  `mfa.disabled`, `mfa.login.required`, `mfa.login.verified`,
+  `mfa.login.failed`, `mfa.recovery_codes.generated`,
+  `mfa.recovery_code.used` (PR 2 adds `mfa.step_up.*`).
 
 ---
 
@@ -539,6 +539,7 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 | `mfa.enroll.required` | `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3) |
 | `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll` — first code accepted |
 | `mfa.enroll.failed` | First code rejected (Settings or login bootstrap) |
+| `mfa.enroll.race` | Result `ok` — a concurrent verify (or disable+re-init) already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
 | `mfa.disabled` | `POST /api/settings/mfa/disable` (`error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |

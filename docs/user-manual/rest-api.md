@@ -8106,10 +8106,11 @@ Only a 6-digit TOTP code is accepted (recovery codes do not exist until enrollme
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted; enrollment complete, session minted | `{"status":"ok","recovery_codes":["XXXX-XXXX-XXXX-XXXX", … 10 total]}` — revealed **once**; save them |
 | `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, attempts exhausted, **or the auth store is not configured at all** (null DB) | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
 | `503` | Auth store reachable but the secret could not be verified — decrypt/store failure (e.g. KEK unresolvable) | `{"error":{"code":503,"message":"authentication store is temporarily unavailable"}}` |
+| `409` | The account was already enrolled by a concurrent verify (or a disable+re-init) before this pending token committed — a benign race, not a rejected code | `{"error":{"code":409,"message":"MFA is already enrolled on this account"}}` — no session minted; complete login normally |
 
-A null auth store returns `401`, **not** `503`, deliberately: a distinct status would confirm "this pending token is valid" to an attacker holding one during a store outage. The reason is recorded in the audit `detail` only. The `503` above is reserved for the case where the store answered but the secret could not be decrypted or verified — that one is fail-closed and never burns an enrollment attempt.
+A null auth store returns `401`, **not** `503`, deliberately: a distinct status would confirm "this pending token is valid" to an attacker holding one during a store outage. The reason is recorded in the audit `detail` only. The `503` above is reserved for the case where the store answered but the secret could not be decrypted or verified — that one is fail-closed and never burns an enrollment attempt. The `409` is only reachable by the caller who already holds a valid enrollment-pending token for that account (minted after their own password login), so it discloses nothing new, and it deliberately does **not** burn an enrollment attempt.
 
-**Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on failure `mfa.enroll.failed`.
+**Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on a rejected code `mfa.enroll.failed`; on the benign already-enrolled race `mfa.enroll.race` (result `ok`).
 
 #### `POST /login/mfa/stepup`
 
