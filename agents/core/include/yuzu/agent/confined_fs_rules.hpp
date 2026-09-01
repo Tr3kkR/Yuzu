@@ -236,6 +236,27 @@ enum class UnlinkKind : std::uint8_t {
 };
 
 /// Outcome of one unlink/rmdir attempt.
+/// Structural component-name validation, shared by BOTH platform legs (PLAN-015).
+/// A directory-entry name is refused BEFORE any syscall when it is empty, `.`,
+/// `..`, carries a path separator, or contains an EMBEDDED NUL -- the last
+/// checked against size(), never strlen, because `c_str()` would truncate there
+/// and the syscall would then act on a different name than the one validated.
+/// `windows_separators` additionally refuses a backslash. This lives here, in
+/// the OS-free header, because it is pure decision logic: two hand-copies of one
+/// binding rule is exactly the drift the shared walker was centralised to stop.
+[[nodiscard]] constexpr bool is_invalid_component(std::string_view name,
+                                                 bool windows_separators) noexcept {
+    if (name.empty() || name == "." || name == "..")
+        return true;
+    if (name.find('/') != std::string_view::npos)
+        return true;
+    if (windows_separators && name.find('\\') != std::string_view::npos)
+        return true;
+    if (name.find('\0') != std::string_view::npos)
+        return true;
+    return false;
+}
+
 struct UnlinkOutcome {
     EntryStatus status;
     Reason reason;

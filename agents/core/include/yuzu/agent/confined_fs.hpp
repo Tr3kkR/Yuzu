@@ -93,6 +93,7 @@
 #endif
 #include <windows.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <yuzu/agent/scoped_fd.hpp>
@@ -247,6 +248,7 @@ struct OpenDirResult {
                                                      const FileIdentity& root_id);
 
 namespace detail {
+
 /// TEST SEAM (PLAN-011, adopted): substitute the resolved `NtCreateFile`
 /// function pointer used internally by the platform TU. `enable=true`
 /// installs `fn` (a null `fn` simulates ntdll-resolution failure, which
@@ -270,6 +272,21 @@ YUZU_EXPORT void set_ntcreatefile_for_test(void* fn, bool enable) noexcept;
 /// parameter -- see the asymmetry note above `unlink_at`'s Windows overload.
 [[nodiscard]] YUZU_EXPORT UnlinkOutcome unlink_at(int dir_fd, const std::string& name,
                                                    UnlinkKind kind, std::uint64_t max_bytes_remaining);
+
+namespace detail {
+/// POSIX metadata-syscall seams, declared here rather than left as an undeclared
+/// exported symbol the test hand-redeclares: these redirect the fstat/fstatat
+/// calls this primitive's device, type and byte-cap decisions rest on, so their
+/// signatures belong under the same review as the API. Mirrors the Windows
+/// `set_ntcreatefile_for_test` seam below. Test-only and single-threaded:
+/// `enable=true` substitutes `fn` (nullptr simulates failure), `enable=false`
+/// restores the real syscall, and every caller MUST restore before test end.
+using FstatFn = int (*)(int, struct stat*);
+using FstatatFn = int (*)(int, const char*, struct stat*, int);
+YUZU_EXPORT void set_fstat_for_test(FstatFn fn, bool enable) noexcept;
+YUZU_EXPORT void set_fstatat_for_test(FstatatFn fn, bool enable) noexcept;
+} // namespace detail
+
 
 /// Open `name` inside the directory referenced by `parent_fd` as a new
 /// confined directory fd. `root_id` re-verifies the opened directory is

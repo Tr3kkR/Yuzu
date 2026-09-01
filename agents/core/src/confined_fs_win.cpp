@@ -137,15 +137,6 @@ int map_ntstatus_to_os_error(NTSTATUS status) {
 
 // ── Name validation (confined_fs.hpp InvalidName rule, PLAN-015/PLAN-007) ──
 
-bool structurally_invalid_name(const std::string& name) {
-    if (name.empty() || name == "." || name == "..")
-        return true;
-    if (name.find('/') != std::string::npos || name.find('\\') != std::string::npos)
-        return true;
-    if (name.find('\0') != std::string::npos)
-        return true;
-    return false;
-}
 
 // Validates `name` BEFORE any syscall touches it and produces its wide form.
 // Returns InvalidName (never calls to_wide) for a structurally-invalid name,
@@ -165,7 +156,7 @@ bool structurally_invalid_name(const std::string& name) {
 // no such test exists for this specific branch (see confined_fs_win.cpp's
 // other InvalidName cases, which ARE exercisable and ARE tested).
 std::optional<Reason> validate_name(const std::string& name, std::wstring& out_wide) {
-    if (structurally_invalid_name(name))
+    if (is_invalid_component(name, /*windows_separators=*/true))
         return Reason::InvalidName;
     out_wide = yuzu::win::to_wide(name);
     if (out_wide.empty())

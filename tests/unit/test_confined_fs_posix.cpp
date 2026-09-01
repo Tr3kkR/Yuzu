@@ -38,12 +38,7 @@ namespace fs = std::filesystem;
 // detail::set_ntcreatefile_for_test declared in confined_fs.hpp -- this one
 // has no header declaration since it is not part of the exported platform
 // contract, only linked directly by this test TU).
-namespace yuzu::agent::confined_fs::detail {
-using FstatFn = int (*)(int, struct stat*);
-using FstatatFn = int (*)(int, const char*, struct stat*, int);
-void set_fstat_for_test(FstatFn fn, bool enable) noexcept;
-void set_fstatat_for_test(FstatatFn fn, bool enable) noexcept;
-} // namespace yuzu::agent::confined_fs::detail
+// Seams are declared in confined_fs.hpp (POSIX branch) -- no hand-redeclaration.
 
 namespace {
 

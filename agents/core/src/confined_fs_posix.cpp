@@ -45,15 +45,6 @@ namespace {
 /// `find`, which respects embedded NULs), never `strlen`, so a NUL-
 /// truncation attempt is caught rather than silently shortening the name
 /// the syscall actually receives.
-bool is_invalid_name(const std::string& name) {
-    if (name.empty() || name == "." || name == "..")
-        return true;
-    if (name.find('/') != std::string::npos)
-        return true;
-    if (name.find('\0') != std::string::npos)
-        return true;
-    return false;
-}
 
 EntryType classify_mode(mode_t mode) {
     if (S_ISREG(mode))
@@ -121,12 +112,14 @@ std::optional<FileIdentity> capture_identity(int fd) {
 // REASON is part of this API's contract (callers surface it per path), so an
 // ENOTDIR is disambiguated here rather than blanket-reported as NotRegularFile.
 // Uses the fstatat seam so a test can drive both branches.
+namespace {
 bool is_symlink_at(int dirfd, const char* name) {
     struct stat st{};
     if (g_fstatat_fn(dirfd, name, &st, AT_SYMLINK_NOFOLLOW) != 0)
         return false; // cannot tell -- fall back to the non-symlink reason
     return S_ISLNK(st.st_mode);
 }
+} // namespace
 
 OpenRootResult open_root(const std::filesystem::path& path) {
     // An embedded NUL would be truncated by c_str(), pinning a DIFFERENT
@@ -164,7 +157,7 @@ OpenRootResult open_root(const std::filesystem::path& path) {
 }
 
 OpenDirResult open_dir_at(int parent_fd, const std::string& name, const FileIdentity& root_id) {
-    if (is_invalid_name(name))
+    if (is_invalid_component(name, /*windows_separators=*/false))
         return OpenDirResult{ScopedFd{}, Reason::InvalidName, 0};
 
     const int raw = ::openat(parent_fd, name.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -288,7 +281,7 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
 
 UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
                         std::uint64_t max_bytes_remaining) {
-    if (is_invalid_name(name))
+    if (is_invalid_component(name, /*windows_separators=*/false))
         return UnlinkOutcome{EntryStatus::Failed, Reason::InvalidName, 0, 0};
 
     // Re-measure NOW, not at enumeration time. An attacker who controls this
