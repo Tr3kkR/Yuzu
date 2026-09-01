@@ -19,8 +19,10 @@ repository-wide, so any workflow run in this repo (including an approved
 fork-PR run) could upload shadow corpus/coverage artifacts — and because
 upstream's filestore untars downloads with an unguarded `tarfile.extractall`
 (a standing upstream TODO), a malicious archive member (`../build-out/...`)
-can overwrite a freshly-built fuzzer and reach CODE EXECUTION inside the
-fuzz job, bounded by the ephemeral runner and its read-scoped token; the
+can overwrite a freshly-built fuzzer and execute attacker-controlled code
+inside the fuzz job, bounded by the ephemeral runner and its read-scoped
+token (the PR fuzz job additionally holds `security-events: write`, so a
+poisoned run there could also tamper with code-scanning alerts); the
 routine-case ceiling is misdirected pruning and crash noise on a
 non-required check. Revisit if the check ever becomes required (tracked on
 #3773/#3775). And every artifact download FAILS OPEN

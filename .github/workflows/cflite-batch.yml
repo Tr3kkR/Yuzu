@@ -30,7 +30,9 @@
 # main-ref run would build the months-stale tree and publish a
 # fresh-timestamped, stale-content cifuzz-coverage-latest that misdirects
 # every PR's pruning (the exact hazard the no-cron decision below
-# rejects): ALWAYS select ref=dev when dispatching. There is deliberately NO
+# rejects), and a main-ref prune would minimize the corpus against
+# fuzzers built from stale main, permanently shedding dev-only corpus
+# entries: ALWAYS select ref=dev when dispatching. There is deliberately NO
 # cron: schedule only fires from the DEFAULT branch (main), which lags dev
 # by months - a cron run would build main's stale tree, its coverage
 # upload would then be the freshest cifuzz-coverage-latest most weeks and
@@ -296,7 +298,11 @@ jobs:
               core.notice('No open cflite-batch-broken issues to close.');
               return;
             }
-            for (const issue of open.data) {
+            // Issue-standard rule: automation never closes issues carrying
+            // security / do-not-close labels.
+            const closable = open.data.filter(i =>
+              !i.labels.some(l => ['security', 'do-not-close'].includes(l.name)));
+            for (const issue of closable) {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
