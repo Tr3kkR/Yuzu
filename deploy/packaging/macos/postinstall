@@ -13,16 +13,16 @@ mkdir -p "${DATA_DIR}" "${LOG_DIR}"
 chmod 750 "${DATA_DIR}"
 chmod 755 "${LOG_DIR}"
 
-# Trust-anchor directory for OTA update and plugin code-signing bundles
-# (#416/#3807). Matches the well-known path cert_discovery.cpp already looks in.
-# root-owned and world-readable. NOTE: the agent's LaunchDaemon runs as root, so
-# it CAN write this - the mode protects the anchor from unprivileged local users,
-# not from the agent itself. That is inherent: a process able to replace the
-# system binary is able to rewrite the file authorising the replacement. See
-# "Signing update binaries" in docs/user-manual/server-admin.md.
-mkdir -p /etc/yuzu/certs
-chown root:wheel /etc/yuzu/certs
-chmod 755 /etc/yuzu/certs
+# Trust-anchor directory for OTA update signature verification (#416/#3807).
+# Its OWN directory, NOT /etc/yuzu/certs: that path is the server's --ca-dir,
+# which the server owns and re-chmods 0700 on boot, so an anchor there is either
+# unwritable by the server or unreadable by the agent. NOTE the LaunchDaemon runs
+# as root, so the agent CAN write this - the mode keeps unprivileged local users
+# out, not the agent itself. See "Signing update binaries" in
+# docs/user-manual/server-admin.md.
+mkdir -p /etc/yuzu-agent/certs
+chown root:wheel /etc/yuzu-agent /etc/yuzu-agent/certs
+chmod 755 /etc/yuzu-agent /etc/yuzu-agent/certs
 
 # Load the launch daemon (starts the agent)
 if launchctl list com.yuzu.agent &>/dev/null; then

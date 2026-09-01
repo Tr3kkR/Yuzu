@@ -21,8 +21,10 @@
   only while the flag is off. The signature is produced by whoever builds the
   package (`openssl cms -sign -binary -outform PEM`), uploaded alongside it, and
   stored beside it; the server never signs and is not trusted to. The Debian,
-  macOS and Windows packagers now create the trust-anchor directory, which none
-  of them did before. On Linux the agent runs unprivileged and cannot write the
+  macOS and Windows packagers now create a dedicated trust-anchor directory
+  (`/etc/yuzu-agent/certs`, `%ProgramData%\Yuzu\agent-certs`), which none of them
+  did before — deliberately separate from the server's own CA directory, whose
+  ownership requirements are incompatible with an agent-readable anchor. On Linux the agent runs unprivileged and cannot write the
   anchor; on macOS and Windows it runs as root and LocalSystem and can, so there
   the permissions keep unprivileged local users out rather than the agent itself
   — inherent, since a process able to replace the system binary can rewrite the

@@ -27,6 +27,38 @@ case "$1" in
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$DATA_DIR"
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /var/log/yuzu
 
+        # Trust-anchor directory for OTA update signature verification
+        # (#416/#3807). Its OWN directory, deliberately not /etc/yuzu/certs:
+        # that path is the SERVER's --ca-dir (auth.cpp), owned and written by the
+        # yuzu user, and default_certs.cpp re-chmods it 0700 on every boot. An
+        # anchor placed there is either unwritable by the server (breaking CA
+        # creation) or unreadable by the agent (breaking every signed update),
+        # depending on who owns it — there is no mode that satisfies both.
+        #
+        # root-owned: on Linux the agent runs unprivileged, so it genuinely
+        # cannot rewrite the anchor that authorises its own updates.
+        install -d -m 0755 -o root -g root /etc/yuzu-agent
+        install -d -m 0755 -o root -g root /etc/yuzu-agent/certs
+
+        if [[ "$COMPONENT" == "yuzu-server" ]]; then
+            SVC_USER="yuzu"
+            SVC_NAME="yuzu-server"
+            DATA_DIR="/var/lib/yuzu"
+        else
+            SVC_USER="yuzu-agent"
+            SVC_NAME="yuzu-agent"
+            DATA_DIR="/var/lib/yuzu-agent"
+        fi
+
+        # Create system user
+        if ! getent passwd "$SVC_USER" >/dev/null 2>&1; then
+            adduser --system --group --home "$DATA_DIR" --no-create-home --shell /usr/sbin/nologin "$SVC_USER"
+        fi
+
+        # Create directories
+        install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$DATA_DIR"
+        install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /var/log/yuzu
+
         # Trust-anchor directory for OTA update and plugin code-signing bundles
         # (#416/#3807). ROOT-owned, deliberately NOT owned by the service user:
         # on Linux the agent runs unprivileged, so it genuinely cannot rewrite
@@ -44,11 +76,7 @@ case "$1" in
         install -d -m 0755 -o root -g root /etc/yuzu/certs
 
         if [[ "$COMPONENT" == "yuzu-server" ]]; then
-            # NOTE: /etc/yuzu is created 0755 root:root above so a co-installed
-            # agent can traverse to /etc/yuzu/certs. Do NOT restore 0750
-            # yuzu:yuzu here — that reintroduces the co-install lockout. Secrets
-            # under this directory are protected by their own file modes, not by
-            # the directory bit.
+            install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu
 
             # Postgres provisioning (ADR-0006, #1320). NON-FATAL by design:
             # the helper exits 0 with install hints when no local cluster is

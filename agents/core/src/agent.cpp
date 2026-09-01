@@ -2310,6 +2310,31 @@ public:
                                 metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
                             tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
+                            // OTA signature refusals (#416/#3807). Carried on the
+                            // heartbeat for the same reason as the dedup counters
+                            // above: the agent has no /metrics endpoint, so this
+                            // is the ONLY channel by which an operator learns that
+                            // an endpoint is refusing updates. Without it a
+                            // fleet-wide refusal is discovered when machines stop
+                            // patching, which is exactly the failure the signing
+                            // work exists to make visible.
+                            {
+                                const auto refused =
+                                    metrics_
+                                        .counter("yuzu_agent_ota_signature_refused_total",
+                                                 {{"reason", "missing"}})
+                                        .value() +
+                                    metrics_
+                                        .counter("yuzu_agent_ota_signature_refused_total",
+                                                 {{"reason", "untrusted"}})
+                                        .value() +
+                                    metrics_
+                                        .counter("yuzu_agent_ota_signature_refused_total",
+                                                 {{"reason", "invalid"}})
+                                        .value();
+                                tags["yuzu.ota_signature_refused"] =
+                                    std::to_string(static_cast<int64_t>(refused));
+                            }
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};

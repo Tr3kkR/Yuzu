@@ -48,11 +48,15 @@ struct UpdateConfig {
     /// Optional metrics sink, so a signature refusal is visible to something
     /// other than a local log line.
     ///
-    /// This is the closest thing to the "audited" half of #3807 that the update
-    /// path can currently offer: there is no status-report RPC, so a refusing
-    /// agent cannot tell the server anything. A scrape of this counter is what
-    /// lets an operator see a fleet-wide refusal instead of discovering it when
-    /// machines stop patching. Null in tests and wherever no registry exists.
+    /// This is the closest thing to the "audited" half of #3807 the update path
+    /// can currently offer. There is no status-report RPC on the update surface,
+    /// and the agent has NO /metrics endpoint — so a counter alone would be
+    /// write-only. The total is therefore carried on the heartbeat as
+    /// `yuzu.ota_signature_refused` (agent.cpp), which is the agent's only
+    /// outbound telemetry channel, so an operator sees a fleet-wide refusal
+    /// instead of discovering it when machines stop patching.
+    ///
+    /// Null in tests and wherever no registry exists.
     yuzu::MetricsRegistry* metrics{nullptr};
 };
 

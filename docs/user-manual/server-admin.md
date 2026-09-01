@@ -2053,7 +2053,9 @@ in a confusing way.** The agent builds its trust store with OpenSSL's codeSignin
 - the leaf's `keyUsage` MUST be marked **critical** (`keyUsage = critical,
   digitalSignature`). A non-critical keyUsage is rejected — this is the single
   most common way to produce a certificate that looks correct and does not work;
-- the issuing CA MUST carry `keyUsage = critical, keyCertSign, cRLSign`.
+- the issuing CA should carry `keyUsage = critical, keyCertSign, cRLSign`. This one is
+  good practice rather than enforced — a CA with no `keyUsage` at all still
+  verifies — but set it, since a CA that declares its purpose is easier to audit.
 
 A minimal OpenSSL extension file for the leaf:
 
@@ -2100,14 +2102,17 @@ the binary was selected into the signature field by mistake.
 
 **Place the trust anchor out of band.** Agents verify against a PEM bundle you
 install on the endpoint — never fetched over the update channel, because a trust
-anchor delivered by the party being verified anchors nothing. The installers now
-create the directory for it:
+anchor delivered by the party being verified anchors nothing. The installers now create the directory for it. It is deliberately separate from
+`/etc/yuzu/certs`, which is the SERVER's CA directory — the server owns that path
+and re-tightens its mode on every boot, so an anchor placed there would be either
+unwritable by the server or unreadable by the agent, with no mode satisfying
+both:
 
 | Platform | Path | Ownership |
 |---|---|---|
-| Linux | `/etc/yuzu/certs/` | `root:root`, mode 0755 |
-| macOS | `/etc/yuzu/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\certs\` | Administrators + SYSTEM |
+| Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
+| macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
@@ -2131,7 +2136,7 @@ editing the unit:
 
 | Platform | How |
 |---|---|
-| Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
+| Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
 | macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
 | Windows | `setx /M YUZU_UPDATE_TRUST_BUNDLE "C:\ProgramData\Yuzu\certs\update-trust-bundle.pem"` then restart the service, or add the flag to the service's binary path. |
 

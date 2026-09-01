@@ -1996,12 +1996,20 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
             // CheckForUpdateResponse, and gRPC clients default to a 4 MB receive
             // limit, so an oversized file here would break update checks for the
             // whole fleet rather than for one package.
-            const auto sig_size = std::filesystem::file_size(sig_path, sig_ec);
+            // A SEPARATE error_code: reusing the one exists() filled meant a
+            // FAILED file_size left !size_ec false, skipping the cap branch and
+            // falling through to an unbounded read — the exact case the cap is
+            // for. A size we cannot determine is treated as over-cap, because a
+            // sidecar that is not a regular file (a FIFO, say) is not a
+            // signature and must never be read into a response.
+            std::error_code size_ec;
+            const auto sig_size = std::filesystem::file_size(sig_path, size_ec);
             std::ifstream sig_in(sig_path, std::ios::binary);
-            if (!sig_ec && sig_size > kMaxSignatureBytes) {
-                spdlog::error("CheckForUpdate: signature sidecar for {} is {} bytes, over the {} "
-                              "byte cap; serving the package as unsigned",
-                              latest->filename, sig_size, kMaxSignatureBytes);
+            if (size_ec || sig_size > kMaxSignatureBytes) {
+                spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (size {} "
+                              "bytes, cap {}, stat: {}); serving the package as unsigned",
+                              latest->filename, sig_size, kMaxSignatureBytes,
+                              size_ec ? size_ec.message() : "ok");
             } else if (sig_in) {
                 std::string sig((std::istreambuf_iterator<char>(sig_in)),
                                 std::istreambuf_iterator<char>());

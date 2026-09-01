@@ -5314,8 +5314,18 @@ void SettingsRoutes::register_routes(
         }
 
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
-        if (uploaded.filename.size() >= 4 &&
-            uploaded.filename.compare(uploaded.filename.size() - 4, 4, ".sig") == 0) {
+        // Case-INSENSITIVE: the server may store packages on a case-insensitive
+        // filesystem (macOS, Windows), where "foo.SIG" and "foo.sig" are the
+        // same file, so a case-sensitive guard is bypassable there.
+        auto ends_with_sig = [](std::string n) {
+            if (n.size() < 4)
+                return false;
+            n = n.substr(n.size() - 4);
+            std::transform(n.begin(), n.end(), n.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return n == ".sig";
+        };
+        if (ends_with_sig(uploaded.filename)) {
             // Signature sidecars are derived as "<binary>.sig", so a package
             // literally named X.sig would occupy package X's sidecar slot. It
             // fails closed (X's agents then see a signature over the wrong
