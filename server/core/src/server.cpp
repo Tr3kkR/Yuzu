@@ -15475,8 +15475,9 @@ private:
         // Aggregate endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/aggregate)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
@@ -15553,46 +15554,29 @@ private:
                 return;
             }
 
-            // #1634 management-group scope (filter-BEFORE-aggregate; same as MCP
-            // aggregate_responses). The flat Response:Read gate is not a per-agent
-            // ownership check, so resolve the in-scope agent set and push it into the
-            // aggregate WHERE clause. Uses an EXPLICIT positive check, never the
-            // "dropped==0 → unrestricted" inference (#1634 UP-1/2/3):
-            //   * RBAC loaded & explicitly disabled → leave scope nullopt (open).
-            //   * Global Response:Read holder → leave scope nullopt (correct totals at
-            //     any scale; also the perf hoist — skips the distinct scan + per-agent
-            //     loop). check_permission (not is_rbac_enabled) gates this, so a corrupt
-            //     store can't take this branch.
-            //   * Otherwise (group-scoped operator) → resolve and ALWAYS set scope,
-            //     even to the empty set (`AND 1=0` → zero rows), never an unrestricted
-            //     read. A distinct_agent_ids() read error returns 503 (store-availability
-            //     failure is NOT "operator sees no agents" — it must not look like empty
-            //     data; observability-conventions + agentic-first A4 + ADR-0016
-            //     authoritative-reads, #1634 sre review).
+            // #1634 management-group scope. Resolve the responding agents only to
+            // retain the existing distinct-drop audit; the gate's VisibleSet is the
+            // authority and the engaged AggregateScope is applied before folding.
             AggregateScope agg_scope; // nullopt = no restriction
             std::size_t agg_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                if (rbac_enforcement_in_effect(rbac_store_.get()) &&
-                    !(rbac_store_ &&
-                      rbac_store_->check_permission(session->username, "Response", "Read"))) {
-                    auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                    if (!distinct) {
-                        res.status = 503;
-                        res.set_content(
-                            R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
-                            "application/json");
-                        return;
-                    }
-                    std::vector<std::string> in_scope;
-                    in_scope.reserve(distinct->size());
-                    for (auto& aid : *distinct)
-                        if (response_agent_in_scope(session->username, aid))
-                            in_scope.push_back(std::move(aid));
-                    agg_dropped = distinct->size() - in_scope.size();
-                    agg_scope = std::move(in_scope); // ALWAYS engaged in this branch
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
-            } else {
-                return; // require_auth already wrote 401
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++agg_dropped;
+                }
+                agg_scope = std::move(in_scope); // engaged-empty means no rows
             }
             // CC7.2 evidence: a scope-drop is a security-relevant filtering event — record
             // it so a cross-operator access attempt that was suppressed is auditable on this
@@ -15632,8 +15616,9 @@ private:
         // Export endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/export)", [this](const httplib::Request& req,
                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
@@ -15666,7 +15651,34 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
+            // post-fetch filter on a paginated read can hand a confined caller a short or
+            // empty page even though visible rows exist past the hidden ones LIMIT already
+            // truncated. Mirrors the /aggregate sibling's resolve-then-scope pattern above.
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t export_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++export_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15676,32 +15688,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope agents' rows before
-            // export (mirrors MCP query_responses / the visualization reader). The
-            // flat Response:Read gate is not a per-agent ownership check.
-            std::size_t export_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
-                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
-                // response_agent_in_scope, rather than skipping it and serving the fleet.
-                if (rbac_enforcement_in_effect(rbac_store_.get())) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(results.size());
-                    for (auto& r : results) {
-                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
-                        if (ins)
-                            m->second = response_agent_in_scope(session->username, r.agent_id);
-                        if (m->second)
-                            visible.push_back(std::move(r));
-                        else if (ins) // count each DISTINCT dropped agent once
-                            ++export_dropped;
-                    }
-                    results.swap(visible);
-                }
-            } else {
-                return; // require_auth already wrote 401
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (export_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
@@ -15746,8 +15732,9 @@ private:
 
         web_server_->Get(R"(/api/responses/(.+))", [this](const httplib::Request& req,
                                                           httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (instruction_id.empty()) {
@@ -15788,7 +15775,33 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET — see the /export sibling above
+            // for the full rationale (post-fetch filtering a paginated read can hand a
+            // confined caller a short or empty page).
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t get_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++get_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15798,32 +15811,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope agents' rows before
-            // serving (mirrors the export sibling above + MCP query_responses). The
-            // flat Response:Read gate is not a per-agent ownership check.
-            std::size_t get_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
-                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
-                // response_agent_in_scope, rather than skipping it and serving the fleet.
-                if (rbac_enforcement_in_effect(rbac_store_.get())) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(results.size());
-                    for (auto& r : results) {
-                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
-                        if (ins)
-                            m->second = response_agent_in_scope(session->username, r.agent_id);
-                        if (m->second)
-                            visible.push_back(std::move(r));
-                        else if (ins) // count each DISTINCT dropped agent once
-                            ++get_dropped;
-                    }
-                    results.swap(visible);
-                }
-            } else {
-                return; // require_auth already wrote 401
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (get_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,

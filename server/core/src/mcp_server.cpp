@@ -401,20 +401,21 @@ static const ToolDef kTools[] = {
      "dispatch is still in flight; a result without it (even with zero rows) means "
      "no rows currently match, or (instruction_id-only queries) in-flight-ness "
      "could not be determined. "
-     "A per-agent management-group filter is applied but is INERT under the current "
-     "global Response:Read gate (a normal holder receives rows for all agents; "
-     "effective scoping needs the #1634 gate change); its active effect today is "
-     "failing closed (zero rows) when the RBAC store is corrupt.",
+     "Confined by management group: a caller admitted through a management-group "
+     "grant sees only their in-scope agents' rows, pushed into the underlying query "
+     "before the row-limit cap so a confined caller's page is never truncated by "
+     "hidden rows; a global Response:Read holder sees every agent's rows unchanged. "
+     "Fails closed (zero rows) when the RBAC store is corrupt.",
      R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
      R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"timestamp":{"type":"integer"}},"required":["agent_id","execution_id","status","output","timestamp"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"retry_after_ms":{"type":"integer","description":"Present only when execution_id was supplied and its execution is confirmed non-terminal — minimum ms before polling again"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
-     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. A per-agent management-group "
-     "filter is applied before aggregation but is INERT under the current global Response:Read gate "
-     "(a normal Response:Read holder aggregates across all agents; effective scoping needs the #1634 "
-     "gate change). Active effect today: fails closed (a JSON-RPC error, never empty totals) when the "
-     "RBAC store is corrupt or the response read errors. A denied-scope audit row is emitted on a "
-     "drop.",
+     "Aggregate response data (COUNT, SUM, AVG) grouped by a column. Confined by management group: "
+     "the caller's visible-agent set is resolved and applied to the aggregation source rows BEFORE "
+     "grouping (filter-before-aggregate), so a confined caller's totals cover only their in-scope "
+     "agents; a global Response:Read holder's totals are unchanged. Fails closed (a JSON-RPC error, "
+     "never empty totals) when the RBAC store is corrupt or the response read errors. A denied-scope "
+     "audit row is emitted on a drop.",
      R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})",
      R"j({"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"group_value":{"type":"string"},"count":{"type":"integer"},"aggregate_value":{"type":"number"}},"required":["group_value","count","aggregate_value"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["results"]})j"},
 
@@ -485,11 +486,21 @@ static const ToolDef kTools[] = {
      "non-terminal the result includes retry_after_ms, the minimum wait in "
      "milliseconds before polling again. Prefer the streamed execute_instruction "
      "response (or a GET resume by execution_id) when streaming is available; "
-     "poll this tool as the fallback when it is not.",
+     "poll this tool as the fallback when it is not. Confined by management group: "
+     "an execution with no agent visible to the caller returns the same error as a "
+     "nonexistent execution_id; a confined caller's counts/progress are computed "
+     "from only their visible agents and scope_expression is redacted — the "
+     "execution's dispatcher is admitted to VIEW the execution (avoids a false "
+     "not-found on a just-dispatched execution with no responses yet) but gets "
+     "the SAME redacted counts/scope_expression as any other confined caller.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
 
-    {"list_executions", "List recent command executions.",
+    {"list_executions", "List recent command executions. Confined by management group: a "
+     "caller admitted through a management-group grant (rather than a global permission) "
+     "sees only executions they themselves dispatched — a narrower interim mechanism than "
+     "the visible-agent filtering other read tools apply, since execution rows carry no "
+     "single agent_id to filter by.",
      R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})",
      R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"}},"required":["id","definition_id","status","dispatched_by","dispatched_at","agents_targeted","agents_responded"]}}},"required":["executions"]})j"},
 
@@ -1811,8 +1822,13 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"query_audit_log", {"AuditLog", "Read"}},
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
-    {"query_responses", {"Response", "Read"}},
-    {"aggregate_responses", {"Response", "Read"}},
+    // #1634 (adversarial-review C3/D7) — migrated onto fleet_read_fn_, which
+    // gives these a REAL confinement mechanism (meet(management-group,
+    // service-scope)), same as get_agent_details above — reclassified from
+    // the default `denied` so a correctly-confined service-scoped token gets
+    // a real, filtered answer instead of a blanket 403.
+    {"query_responses", {"Response", "Read", ServiceScopeClass::confined}},
+    {"aggregate_responses", {"Response", "Read", ServiceScopeClass::confined}},
     {"query_inventory", {"Infrastructure", "Read"}},
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
@@ -1823,8 +1839,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_compliance_summary", {"Policy", "Read"}},
     {"get_fleet_compliance", {"Policy", "Read"}},
     {"list_management_groups", {"ManagementGroup", "Read"}},
-    {"get_execution_status", {"Execution", "Read"}},
-    {"list_executions", {"Execution", "Read"}},
+    // #1634 (adversarial-review K3/D3 follow-up) — both migrated onto
+    // fleet_read_fn_ alongside the response tools above; same reclassification
+    // rationale.
+    {"get_execution_status", {"Execution", "Read", ServiceScopeClass::confined}},
+    {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
@@ -5371,14 +5390,15 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── query_responses ───────────────────────────────────────────
             if (tool_name == "query_responses") {
-                if (!tier_allows(tier, "Response", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("query_responses: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Response", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Response", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!response_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Response store unavailable"),
@@ -5457,15 +5477,61 @@ McpServer::HandlerFn McpServer::build_handler(
                 // freshly minted by execute_instruction on this server cannot
                 // have pre-PR-2 untagged rows, so a fallback would only risk
                 // folding in another execution's responses.
-                auto responses_opt = !exec_id.empty()
-                                         ? response_store->query_by_execution(exec_id, rq)
-                                         : response_store->query(instr_id, rq);
                 // Audit target is the primary correlation key actually used:
                 // execution_id when present (the exact-correlation path), else
                 // instruction_id. When both are supplied execution_id wins, so
                 // a dual-id call is recorded under the execution_id it served —
                 // deliberate (execution_id is the agentic-dispatch unit).
                 const std::string& key = !exec_id.empty() ? exec_id : instr_id;
+
+                // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and
+                // push it into the SQL WHERE clause BEFORE LIMIT, not as a post-fetch
+                // filter — a post-fetch filter on a capped read can hand a confined
+                // caller a short or empty result even though visible rows exist past the
+                // hidden ones the LIMIT already truncated. Mirrors aggregate_responses'
+                // resolve-then-scope pattern; `distinct_agent_ids`/`_by_execution` picks
+                // the twin matching whichever id this call used.
+                AggregateScope scope_arg; // nullopt = unrestricted
+                bool scope_filtered = false;
+                std::size_t dropped_agents = 0;
+                if (gate.scope) {
+                    auto distinct = !exec_id.empty()
+                                        ? response_store->distinct_agent_ids_by_execution(exec_id)
+                                        : response_store->distinct_agent_ids(instr_id);
+                    if (!distinct) {
+                        mcp_audit("failure", "store degraded; " + key);
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "Response store degraded — query failed", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    std::vector<std::string> in_scope;
+                    in_scope.reserve(distinct->size());
+                    for (auto& aid : *distinct) {
+                        if (authz::in_scope(gate.scope, aid)) {
+                            in_scope.push_back(std::move(aid));
+                        } else {
+                            scope_filtered = true;
+                            ++dropped_agents;
+                        }
+                    }
+                    scope_arg = std::move(in_scope); // engaged-empty means no rows
+                }
+                // #1634 (adversarial-review C4/D8): `poll_hint` was resolved above from
+                // the RAW tracker read, before scope was known — a confined caller with
+                // ZERO visible agents on this execution could otherwise learn "running"
+                // vs "terminal/nonexistent" via `retry_after_ms`'s presence alone, even
+                // though every response row is filtered out. Suppress it the same way the
+                // instruction_id-only path already suppresses an unknowable hint: nullopt,
+                // not false, so the poll-rate counter isn't diluted either.
+                if (poll_hint && scope_arg && scope_arg->empty())
+                    poll_hint.reset();
+
+                auto responses_opt = !exec_id.empty()
+                                         ? response_store->query_by_execution(exec_id, rq, scope_arg)
+                                         : response_store->query(instr_id, rq, scope_arg);
                 if (!responses_opt) {
                     mcp_audit("failure", "store degraded; " + key);
                     res.set_content(
@@ -5476,53 +5542,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto responses = std::move(*responses_opt);
 
-                // Did the raw query hit the row cap BEFORE scope filtering? If so the
-                // result is incomplete (more rows exist past the LIMIT). Capture this
-                // pre-filter so we can flag result_truncated_by_cap below — the filter
-                // shrinks `responses`, so `responses.size()` post-filter can't tell us.
+                // The scoped query's own LIMIT now bounds the IN-SCOPE result directly,
+                // so hitting it means this caller's own visible view was truncated —
+                // more precise than the old raw-then-filter signal, which could fire on
+                // a cap hit entirely inside another operator's out-of-scope rows.
                 const bool hit_cap = responses.size() == static_cast<std::size_t>(rq.limit);
-
-                // #1550 HIGH-1 / #1634: management-group scope. The flat Response:Read
-                // gate above is NOT an ownership check (dispatched_by is display-only),
-                // so without this an operator could collect ANOTHER operator's execution
-                // rows by execution_id. Filter per-agent through the injected scope
-                // predicate (production: check_scoped_permission, the same chokepoint the
-                // per-device REST/dashboard routes use), passing the already-resolved
-                // principal so we don't re-resolve the session per call. Dedupe the
-                // check per distinct agent_id — an execution fans out to a bounded agent
-                // set even with many response rows. Unwired/RBAC-off → no filter
-                // (legacy-open), matching require_scoped_permission. NOTE: the filter
-                // runs AFTER the store LIMIT, so a fan-out wider than the cap that spans
-                // out-of-scope agents may truncate the in-scope view (keyset follow-up
-                // #1634); the isolation guarantee — never another operator's rows —
-                // holds regardless, and result_truncated_by_cap signals the gap.
-                // NOTE (ADR-0017): like the inventory sibling, this responses filter is
-                // INERT under the global Response:Read gate (it does not narrow by
-                // management group today); the list-view correction is tracked #1718 PR-B.
-                bool scope_filtered = false;
-                std::size_t dropped_agents = 0;
-                if (response_scope_fn) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(responses.size());
-                    for (auto& r : responses) {
-                        // try_emplace returns a VALID iterator + an inserted flag, so we
-                        // never re-read a find() iterator across the insert (the insert
-                        // can rehash). `inserted` marks the first sighting of this
-                        // agent_id — run the scope check once, then memoise.
-                        auto [m, inserted] = memo.try_emplace(r.agent_id, false);
-                        if (inserted)
-                            m->second = response_scope_fn(session->username, r.agent_id);
-                        if (m->second) {
-                            visible.push_back(std::move(r));
-                        } else {
-                            scope_filtered = true;
-                            if (inserted) // count each DISTINCT dropped agent once
-                                ++dropped_agents;
-                        }
-                    }
-                    responses.swap(visible);
-                }
 
                 JArr arr;
                 for (const auto& r : responses) {
@@ -5751,14 +5775,15 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── aggregate_responses ───────────────────────────────────────
             if (tool_name == "aggregate_responses") {
-                if (!tier_allows(tier, "Response", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("aggregate_responses: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Response", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Response", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!response_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Response store unavailable"),
@@ -5794,24 +5819,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 else
                     aq.op = AggregateOp::Count;
 
-                // #1634: management-group scope (filter-BEFORE-aggregate). The flat
-                // Response:Read gate above is not a per-agent ownership check, so
-                // without this an operator could aggregate ANOTHER operator's
-                // instruction rows (e.g. count-by-status across agents outside their
-                // groups). A folded aggregate can't be post-filtered — the out-of-
-                // scope rows are already summed in — so we resolve the in-scope agent
-                // set and push it into the aggregate's WHERE clause via the dedicated
-                // `scope` arg. response_scope_fn routes through the single fail-closed
-                // response_agent_in_scope helper, so a corrupt rbac.db drops EVERY agent
-                // here → empty scope → zero rows (UP-1). A distinct_agent_ids() read
-                // ERROR returns nullopt → we fail CLOSED to the empty set, never an
-                // unrestricted read (UP-2). Only when the read succeeds AND no agent is
-                // dropped (operator sees every responding agent / RBAC cleanly disabled)
-                // do we leave scope nullopt — unrestricted, correct totals at any scale
-                // (the residual dropped==0 TOCTOU window is an acknowledged LOW, #1634).
+                // #1634: resolve the gate's VisibleSet before aggregation. An engaged,
+                // empty AggregateScope is deliberate and produces zero rows.
                 AggregateScope agg_scope; // nullopt = unrestricted
                 std::size_t dropped_agents = 0;
-                if (response_scope_fn) {
+                if (gate.scope) {
                     auto distinct = response_store->distinct_agent_ids(instr_id);
                     if (!distinct) {
                         // Store-read error resolving the in-scope set. Surface it as an
@@ -5830,13 +5842,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::vector<std::string> in_scope;
                     in_scope.reserve(distinct->size());
                     for (auto& aid : *distinct) {
-                        if (response_scope_fn(session->username, aid))
+                        if (authz::in_scope(gate.scope, aid))
                             in_scope.push_back(std::move(aid));
                         else
                             ++dropped_agents;
                     }
-                    if (dropped_agents > 0)
-                        agg_scope = std::move(in_scope);
+                    agg_scope = std::move(in_scope);
                 }
 
                 auto results_opt = response_store->aggregate(instr_id, aq, {}, agg_scope);
@@ -6392,15 +6403,23 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_execution_status ──────────────────────────────────────
+            // #1634 (adversarial-review K3/D3 follow-up) — migrated onto
+            // fleet_read_fn_, mirroring REST GET /api/v1/executions/{id}
+            // exactly: no-existence-oracle 404 for invisible-vs-nonexistent,
+            // dispatcher-ownership admits visibility only (never bypasses the
+            // confined projection), and a visible-only recompute of the
+            // per-agent counts + a redacted scope_expression for a confined
+            // non-owner.
             if (tool_name == "get_execution_status") {
-                if (!tier_allows(tier, "Execution", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_execution_status: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Execution", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!execution_tracker) {
                     res.set_content(
                         error_response(id, kInternalError, "Execution tracker unavailable"),
@@ -6409,26 +6428,87 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto exec_id = param_str(args, "execution_id");
                 auto exec = execution_tracker->get_execution(exec_id);
-                if (!exec) {
+                // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+                // statuses when confined — an unrestricted caller is always
+                // visible regardless, so this indexed lookup would be pure
+                // waste on every poll.
+                std::vector<AgentExecStatus> agents;
+                bool has_visible_agent = false;
+                if (gate.scope) {
+                    // #1634 (Doomgoose review finding, important): fail
+                    // closed on a transient tracker degrade rather than
+                    // silently treat it as "zero agents" — see
+                    // get_agent_statuses_checked's doc comment.
+                    auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                    if (!agents_opt) {
+                        res.set_content(
+                            error_response(id, kInternalError, "execution tracker degraded"),
+                            "application/json");
+                        return;
+                    }
+                    agents = std::move(*agents_opt);
+                    for (const auto& a : agents)
+                        has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+                }
+                const bool owns_execution = exec && exec->dispatched_by == session->username;
+                const bool visible = !gate.scope || owns_execution || has_visible_agent;
+                if (!exec || !visible) {
+                    spdlog::debug("get_execution_status: {} exec_id={}",
+                                  exec ? "outside caller fleet-read scope" : "no match", exec_id);
+                    mcp_audit("denied", "not found or outside caller's fleet-read scope: " + exec_id);
                     res.set_content(
                         error_response(id, kInvalidParams, "Execution not found: " + exec_id),
                         "application/json");
                     return;
                 }
-                auto summary = execution_tracker->get_summary(exec_id);
-                auto obj =
-                    JObj()
-                        .add("id", exec->id)
-                        .add("definition_id", exec->definition_id)
-                        .add("status", exec->status)
-                        .add("scope_expression", exec->scope_expression)
-                        .add("dispatched_by", exec->dispatched_by)
-                        .add("dispatched_at", exec->dispatched_at)
-                        .add("agents_targeted", static_cast<int64_t>(exec->agents_targeted))
-                        .add("agents_responded", static_cast<int64_t>(exec->agents_responded))
-                        .add("agents_success", static_cast<int64_t>(exec->agents_success))
-                        .add("agents_failure", static_cast<int64_t>(exec->agents_failure))
-                        .add("progress_pct", static_cast<int64_t>(summary.progress_pct));
+                int64_t agents_targeted = exec->agents_targeted;
+                int64_t agents_responded = exec->agents_responded;
+                int64_t agents_success = exec->agents_success;
+                int64_t agents_failure = exec->agents_failure;
+                int64_t progress_pct =
+                    execution_tracker->get_summary(exec_id).progress_pct;
+                std::string scope_expression = exec->scope_expression;
+                if (gate.scope) {
+                    // #1634 residual: see REST GET /api/v1/executions/{id} — agent status
+                    // rows are response-arrival seeded, not dispatch-time target seeded,
+                    // so this intentionally undercounts pending in-scope targets.
+                    agents_targeted = agents_responded = agents_success = agents_failure = 0;
+                    // #1634 (Doomgoose review finding, important): only a
+                    // TERMINAL status counts as "responded" (matches
+                    // execution_tracker.cpp's canonical recompute) — this
+                    // loop previously counted 'running' rows as responded
+                    // too, which fed a self-contradictory progress_pct==100
+                    // below while agents were still executing.
+                    for (const auto& a : agents) {
+                        if (!authz::in_scope(gate.scope, a.agent_id))
+                            continue;
+                        ++agents_targeted;
+                        if (a.status == "success") {
+                            ++agents_responded;
+                            ++agents_success;
+                        } else if (a.status == "failure" || a.status == "timeout" ||
+                                a.status == "rejected") {
+                            ++agents_responded;
+                            ++agents_failure;
+                        }
+                    }
+                    progress_pct = agents_targeted > 0
+                                       ? (agents_responded * 100 / agents_targeted)
+                                       : 0;
+                    scope_expression = "(redacted - confined view)";
+                }
+                auto obj = JObj()
+                               .add("id", exec->id)
+                               .add("definition_id", exec->definition_id)
+                               .add("status", exec->status)
+                               .add("scope_expression", scope_expression)
+                               .add("dispatched_by", exec->dispatched_by)
+                               .add("dispatched_at", exec->dispatched_at)
+                               .add("agents_targeted", agents_targeted)
+                               .add("agents_responded", agents_responded)
+                               .add("agents_success", agents_success)
+                               .add("agents_failure", agents_failure)
+                               .add("progress_pct", progress_pct);
                 // #3344: retry_after_ms is emitted ONLY while non-terminal, via
                 // the shared mcp::is_execution_terminal() predicate (Gate 8
                 // fold: this and query_responses' poll-hint independently
@@ -6445,36 +6525,96 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── list_executions ───────────────────────────────────────────
+            // #1634 (adversarial-review K3/D3 follow-up) — migrated onto
+            // fleet_read_fn_. Execution rows carry no single agent_id (they
+            // fan out to many), so per-row visible-agent filtering would need
+            // a per-execution agent-status lookup per row — an N+1 pattern
+            // (ADR-0017 INV-10). Until a batched version exists, a confined
+            // caller is restricted to their OWN dispatches (`dispatched_by`
+            // pushed into the SQL WHERE, ExecutionQuery::dispatched_by) —
+            // cheap, provably safe (never another operator's execution), and
+            // consistent with the dispatcher-ownership precedent elsewhere.
             if (tool_name == "list_executions") {
-                if (!tier_allows(tier, "Execution", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Execution", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!execution_tracker) {
                     res.set_content(
                         error_response(id, kInternalError, "Execution tracker unavailable"),
                         "application/json");
                     return;
                 }
+                // #1634 (governance Gate 5 chaos-injector finding, CH-5): an empty
+                // `dispatched_by` is `ExecutionQuery`'s OWN sentinel for "no filter"
+                // (see execution_tracker.hpp) — if a confined session's username
+                // were ever empty, this would silently widen to an unrestricted
+                // list instead of narrowing to "sees nothing," the wrong direction
+                // for a confinement check to fail in. No live path produces an
+                // authenticated confined session with an empty username today
+                // (session creation rejects it), but fail closed explicitly rather
+                // than rely on that invariant holding forever.
+                if (gate.scope && session->username.empty()) {
+                    spdlog::error("list_executions: confined session has empty username; "
+                                  "failing closed rather than risk an unfiltered list");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
                 ExecutionQuery eq;
                 eq.definition_id = param_str(args, "definition_id");
                 eq.status = param_str(args, "status");
+                if (gate.scope)
+                    eq.dispatched_by = session->username;
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
                 auto execs = execution_tracker->query_executions(eq);
+                // #1634 (Doomgoose review finding, important): get_execution_status
+                // projects agents_targeted/agents_responded to the caller's visible
+                // agents when confined; this LIST sibling served the raw fleet-wide
+                // counts unprojected. Batched (non-N+1, ADR-0017 INV-10) — one
+                // execution_id = ANY($1::text[]) read for every listed row instead
+                // of a per-row lookup.
+                std::unordered_map<std::string, std::vector<AgentExecStatus>> statuses_by_exec;
+                if (gate.scope) {
+                    std::vector<std::string> exec_ids;
+                    exec_ids.reserve(execs.size());
+                    for (const auto& e : execs)
+                        exec_ids.push_back(e.id);
+                    statuses_by_exec =
+                        execution_tracker->get_agent_statuses_for_executions(exec_ids);
+                }
                 JArr arr;
                 for (const auto& e : execs) {
+                    int64_t agents_targeted = e.agents_targeted;
+                    int64_t agents_responded = e.agents_responded;
+                    if (gate.scope) {
+                        agents_targeted = 0;
+                        agents_responded = 0;
+                        auto it = statuses_by_exec.find(e.id);
+                        if (it != statuses_by_exec.end()) {
+                            for (const auto& a : it->second) {
+                                if (!authz::in_scope(gate.scope, a.agent_id))
+                                    continue;
+                                ++agents_targeted;
+                                if (a.status == "success" || a.status == "failure" ||
+                                    a.status == "timeout" || a.status == "rejected")
+                                    ++agents_responded;
+                            }
+                        }
+                    }
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("definition_id", e.definition_id)
                                 .add("status", e.status)
                                 .add("dispatched_by", e.dispatched_by)
                                 .add("dispatched_at", e.dispatched_at)
-                                .add("agents_targeted", static_cast<int64_t>(e.agents_targeted))
-                                .add("agents_responded", static_cast<int64_t>(e.agents_responded)));
+                                .add("agents_targeted", agents_targeted)
+                                .add("agents_responded", agents_responded));
                 }
                 mcp_audit("success");
                 res.set_content(

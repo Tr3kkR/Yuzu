@@ -262,6 +262,38 @@ TEST_CASE("POST /api/settings/mfa/recovery-codes regenerates 10 codes + cache he
     CHECK(h.has_audit("mfa.recovery_codes.generated", "ok", "admin"));
 }
 
+TEST_CASE("POST /api/settings/mfa/verify on an already-enrolled account audits mfa.enroll.race, "
+          "not mfa.enroll.failed (#3777)",
+          "[pg][mfa][routes][settings]") {
+    // A concurrent verify can win the enrollment race between this operator's
+    // init and their verify — mfa_verify_enrollment then returns
+    // MfaAlreadyEnrolled (the top-of-function enrolled-state check short-circuits
+    // before the code is even examined, so the submitted code's validity is
+    // immaterial). That benign race must be audited distinctly (CC7.2), never as
+    // mfa.enroll.failed (a bad-code attempt) or a store outage, and must tell the
+    // operator the true state. Simulate the winner by enrolling admin out-of-band.
+    MfaSettingsHarness h;
+    auto init = h.auth_db->mfa_init_enrollment("admin", "Yuzu");
+    REQUIRE(init.has_value());
+    auto bytes = mfa::base32_decode(init->secret_base32);
+    REQUIRE(bytes.has_value());
+    std::string raw(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    auto code = mfa::generate(raw, mfa::current_counter(std::chrono::system_clock::now()));
+    // Concurrent winner: enroll out-of-band, then drive the settings verify route
+    // with the same still-valid code the racing operator would have submitted.
+    REQUIRE(h.auth_db->mfa_verify_enrollment("admin", code).has_value());
+
+    auto res = post_same_origin(h.sink, "/api/settings/mfa/verify", "code=" + code);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("already enrolled") != std::string::npos);
+    // Audited as the benign race, NOT as a rejected code or a verified enrollment,
+    // and no store-outage path.
+    CHECK(h.has_audit("mfa.enroll.race", "ok", "admin"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.failed"));
+    CHECK_FALSE(h.has_audit("mfa.enroll.verified"));
+}
+
 TEST_CASE("POST /api/settings/mfa/disable clears state + emits mfa.disabled",
           "[pg][mfa][routes][settings]") {
     MfaSettingsHarness h;
