@@ -122,6 +122,17 @@ struct FakeBackend : ISparkBackend {
         }
         gate_cv_.notify_all();
     }
+    /// Quality-engineer Gate 3 finding: entered_hang_/released_ latch permanently
+    /// true after one release_hang() and were never resettable, a silent-no-op trap
+    /// for any test needing a SECOND hang on the same FakeBackend (e.g. a
+    /// timeout-then-retry sequence). Call between uses, only once release_hang()'s
+    /// waiter has actually woken (the caller's own synchronization - typically
+    /// after observing the effect of the first hang, e.g. a timeout return).
+    void reset_hang() {
+        std::lock_guard<std::mutex> lk{gate_mu_};
+        entered_hang_ = false;
+        released_ = false;
+    }
 
     /// Adversarial-review C2/c2 regression coverage: park the NEXT disarm() call
     /// (a SEPARATE gate from arm()'s, so a test can hang a rollback's disarm
@@ -141,6 +152,12 @@ struct FakeBackend : ISparkBackend {
             disarm_released_ = true;
         }
         disarm_gate_cv_.notify_all();
+    }
+    /// See reset_hang()'s doc - same single-shot-latch fix, disarm side.
+    void reset_disarm_hang() {
+        std::lock_guard<std::mutex> lk{disarm_gate_mu_};
+        disarm_entered_hang_ = false;
+        disarm_released_ = false;
     }
 };
 
@@ -1872,6 +1889,15 @@ TEST_CASE("#2233 item 3 (C1/c1): a timeout followed by a LATE successful arm "
     b->hang_next_arm.store(true);
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
                                                           std::chrono::milliseconds(50)});
+    // cpp-safety Gate 3 finding: without this, a REQUIRE failure below (exactly the
+    // regression this test exists to catch) throws past every plain statement,
+    // including the release_hang() near the end - leaking the parked detached
+    // worker for the rest of the binary's run. release_hang() is idempotent
+    // (harmless if it also runs again, non-exceptionally, further down).
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
 
     auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
     REQUIRE_FALSE(gen);
@@ -1904,6 +1930,70 @@ TEST_CASE("#2233 item 3 (C1/c1): a timeout followed by a LATE successful arm "
     REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
     CHECK(rt->armed_key_count() == 1);
     CHECK(b->arms.load() == 2);
+}
+
+TEST_CASE("#2233 item 3 (security-guardian F2 / cpp-safety HIGH): a same-rule_id "
+          "RETRY after a timeout arms cleanly, exercising the generation token",
+          "[spark][runtime][liveness]") {
+    // Matches production's actual retry shape more precisely than the C1 test above
+    // (which retries as a DIFFERENT rule_id, "r2"): apply_rules' policy_generation
+    // hold-on-failure means a timed-out rule is retried under the SAME rule_id on
+    // the next push. This is the scenario InFlightArm::generation exists for - a
+    // stale worker's self-disarm check must not match a LATER episode's marker just
+    // because it shares the same rule_id. This test proves the END-TO-END outcome
+    // (subscription census stays consistent: every arm() is eventually matched by
+    // exactly one disarm() or one live tracked watcher) across a full
+    // timeout-then-retry-then-late-resolution cycle; it does not pin the exact
+    // microsecond interleaving cpp-safety traced (that window is genuinely narrow -
+    // both the stale worker's check and a rejected retry's own cleanup race through
+    // only a couple of registry_mu_ acquisitions - forcing it deterministically
+    // would need a new production-code test hook, out of proportion here; the fix
+    // itself (compare generation, not just rule_id) is correct by construction
+    // regardless of how precisely this test can pin the race).
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    // Episode 1: times out. arming_keys_ is fully cleared by the time this returns
+    // (attach_rule's post-wait commit runs on the SUBMITTER's timeout, independent
+    // of whether the underlying backend->arm() call has itself returned yet).
+    auto gen1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE_FALSE(gen1);
+    CHECK(gen1.error() == "arm timed out");
+    CHECK(rt->rule_count() == 0);
+
+    // Episode 2: SAME rule_id, SAME key, retried immediately while episode 1's
+    // worker is still parked (single-flight on the executor rejects this - not
+    // committed, not leaked, matches UP-3/UP-4's disclosed "busy" shape).
+    auto gen2 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE_FALSE(gen2);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+
+    // Release the original hang - whichever episode's worker was actually parked
+    // resolves now. Regardless of exactly how the two episodes interleaved above,
+    // the runtime's own bookkeeping must end up CONSISTENT: no rule ever commits as
+    // armed (both episodes ended in error), and the real backend subscription that
+    // arm() mints is eventually disarmed - never left live and untracked.
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->arms.load() >= 1; }, std::chrono::seconds(10)));
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() >= b->arms.load(); },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(drain_lifecycle(*rt).empty()); // neither episode ever produced a phantom "armed"
+
+    // Runtime is still healthy: a genuinely fresh retry (well after both prior
+    // episodes settled) arms cleanly.
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
 }
 
 TEST_CASE("#2233 item 3 (C2/c2): the post-arm commit rollback's disarm runs "

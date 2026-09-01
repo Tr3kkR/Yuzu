@@ -24,6 +24,10 @@
  *     for a key and the freshest read commits last (no backward compliance).
  *   - registry mutex guards the index / rule generations / per-key maps + the
  *     stopping flag; held only for brief, IO-free snapshot and commit sections.
+ *   - #2233 item 3: File/Registry/Service arm/disarm runs OFF registry_mu_
+ *     (bounded, GuardianIoExecutor) - a key sits in arming_keys_ between the
+ *     mark and the post-wait commit, and a same-key attach during that window
+ *     fails fast rather than blocking or double-arming.
  *   - Monotonic per-rule generations: a rule update installs a NEW
  *     RuleGeneration (never mutates one in place), so an in-flight eval on the
  *     old generation finishes harmlessly and its commit is rejected by a
@@ -205,6 +209,19 @@ public:
     /// a detached mid-read. The clock callable must likewise be self-contained (the
     /// default captures nothing); a clock that borrows agent state reintroduces the
     /// same hazard.
+    ///
+    /// PRECONDITION (cpp-safety, adversarial review): every instance MUST be owned
+    /// by a `shared_ptr<GuardianSparkRuntime>` for its ENTIRE lifetime (construct
+    /// via `std::make_shared` - as `GuardianEngine::wire_spark_engine()` and every
+    /// test fixture already do). `attach_rule()`'s bounded-arm path calls
+    /// `shared_from_this()` to keep the runtime alive on a detached
+    /// `GuardianIoExecutor` worker; calling it on an instance with no owning
+    /// `shared_ptr` throws `std::bad_weak_ptr` AFTER phase-1 state
+    /// (`arming_keys_`/`index_`) is already mutated, with no rollback installed for
+    /// that specific throw - it would permanently block that key. Not reachable
+    /// today (verified: every construction site uses `make_shared`), but this is a
+    /// real precondition of the class now, not just of `enable_shared_from_this`
+    /// abstractly.
     GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
                          std::shared_ptr<ISparkBackend> backend);
     GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
@@ -609,8 +626,21 @@ private:
     /// whether THAT rule_id was detached while its own arm was still resolving, so
     /// the arm's completion abandons + disarms instead of committing a rule nobody
     /// wants any more.
+    ///
+    /// `generation` (adversarial review C1/c1 follow-up, security-guardian F2 /
+    /// cpp-safety HIGH): the worker's own self-disarm check (attach_rule) must
+    /// match BOTH rule_id AND this episode's generation, not rule_id alone. A
+    /// same-rule_id RETRY - which this PR's own policy_generation-hold-and-retry
+    /// behavior causes ordinarily, not just as a rare race - re-populates
+    /// arming_keys_[key] with a FRESH InFlightArm for the SAME rule_id while the
+    /// ORIGINAL (still-wedged) worker is still running. Without the generation
+    /// check, that stale worker's self-disarm check would match the RETRY's own
+    /// marker (same rule_id) and wrongly conclude "still wanted", handing a live
+    /// subscription back to a caller that already gave up on it - reopening the
+    /// abandonment-leak window on every retry, not once.
     struct InFlightArm {
         std::string rule_id;
+        std::uint64_t generation{0};
         bool withdrawn{false};
     };
 
@@ -636,6 +666,22 @@ private:
     /// WHERE it runs, not whether anyone confirms it). Never called with either
     /// runtime lock held.
     void submit_disarm_off_lock(const DisarmWork& work);
+    /// registry_mu_ held. The commit body shared by all three of attach_rule's
+    /// success branches (inline-type, existing-shared-watcher, bounded-arm
+    /// post-wait) - installs the new generation, marks it pending-initial, copies
+    /// the wakers, and enqueues the "armed" audit entry, in that order (the waker
+    /// copies precede the audit enqueue so a throwing copy rolls back with no
+    /// phantom "armed" entry - see attach_rule's own doc). `pk` must already be the
+    /// key's live PerKey (freshly created or the existing shared one); `rg` is
+    /// consumed. `waker`/`outbox_waker` are OUT params the caller fires after
+    /// unlocking.
+    void commit_new_generation_locked(const std::string& rule_id, std::uint64_t gen,
+                                      const char* guard_type, const std::string& rule_name,
+                                      const std::shared_ptr<PerKey>& pk,
+                                      std::shared_ptr<RuleGeneration> rg,
+                                      std::chrono::steady_clock::time_point attach_now,
+                                      std::function<void()>& waker,
+                                      std::function<void()>& outbox_waker);
     EvalOutcome eval_rule(const SparkSpec& spec, const RuleAssertion& a, RuleEvalState& state,
                           std::chrono::steady_clock::time_point now, bool edge,
                           const ReadResult<FileSnapshot>* file,
