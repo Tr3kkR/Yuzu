@@ -490,6 +490,42 @@ TEST_CASE("open_dir_at and unlink_at refuse a spoofed root_id (DeviceBoundary)",
     CHECK(std::filesystem::exists(root_dir.path / "a.txt"));
 }
 
+TEST_CASE("unlink_at charges the byte cap against the LIVE size on real NTFS",
+          "[confined_fs]") {
+    // The Windows half of the byte-cap-fails-open defense (the live re-measure
+    // plus the deliberate omission of FILE_SHARE_WRITE on the delete handle)
+    // was previously exercised only through the fake-Ops walk tests, never on
+    // a real NTFS volume -- while the POSIX leg had three direct cases. That
+    // left an 8-line defense, in a class that has already regressed once,
+    // with no tripwire on its own leg: a refactor adding FILE_SHARE_WRITE or
+    // dropping the re-measure would keep every existing test green.
+    yuzu::test::TempDir root_dir{"yuzu_test_confined_win_bytecap_"};
+    std::filesystem::create_directories(root_dir.path);
+    write_file(root_dir.path / "big.txt", std::string(5000, 'x'));
+
+    OpenRootResult opened = open_root(root_dir.path);
+    REQUIRE(opened.root.has_value());
+    const HANDLE root_handle = opened.root->h_.get();
+    const FileIdentity root_id = opened.root->identity();
+
+    // Budget deliberately below the file's real on-disk size: the leg must
+    // measure the object it holds open and refuse, not delete it uncharged.
+    UnlinkOutcome refused = unlink_at(root_handle, "big.txt", UnlinkKind::File,
+                                      /*max_bytes_remaining=*/100, root_id);
+    CHECK(refused.status == EntryStatus::Skipped);
+    CHECK(refused.reason == Reason::ByteCap);
+    CHECK(refused.bytes == 0);
+    CHECK(std::filesystem::exists(root_dir.path / "big.txt"));
+
+    // Same file, a budget that accommodates it: deleted, and charged what was
+    // really removed rather than any enumerated or assumed size.
+    UnlinkOutcome removed = unlink_at(root_handle, "big.txt", UnlinkKind::File,
+                                      /*max_bytes_remaining=*/10000, root_id);
+    CHECK(removed.status == EntryStatus::Deleted);
+    CHECK(removed.bytes == 5000);
+    CHECK_FALSE(std::filesystem::exists(root_dir.path / "big.txt"));
+}
+
 TEST_CASE("enumerate_at flags a lone-surrogate on-disk name as name_invalid, "
           "and delete_matching skips it without deleting",
           "[confined_fs]") {
