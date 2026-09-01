@@ -59,22 +59,6 @@ case "$1" in
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" "$DATA_DIR"
         install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /var/log/yuzu
 
-        # Trust-anchor directory for OTA update and plugin code-signing bundles
-        # (#416/#3807). ROOT-owned, deliberately NOT owned by the service user:
-        # on Linux the agent runs unprivileged, so it genuinely cannot rewrite
-        # the anchor that authorises its own updates.
-        #
-        # /etc/yuzu used to be created 0750 yuzu:yuzu by the SERVER branch below.
-        # On a host carrying both packages the agent user could then not even
-        # traverse into its own certs directory, and every SIGNED package would
-        # be refused with "trust bundle unreadable" — a failure whose cause is
-        # nowhere near its symptom. So the parent is created traversable here;
-        # 0755 on a directory holding only public trust anchors and config
-        # discloses nothing, and the server branch's own 0750 files keep their
-        # modes regardless of the directory bit.
-        install -d -m 0755 -o root -g root /etc/yuzu
-        install -d -m 0755 -o root -g root /etc/yuzu/certs
-
         if [[ "$COMPONENT" == "yuzu-server" ]]; then
             install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu
 

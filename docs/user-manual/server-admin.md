@@ -2138,7 +2138,7 @@ editing the unit:
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
 | macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
-| Windows | `setx /M YUZU_UPDATE_TRUST_BUNDLE "C:\ProgramData\Yuzu\certs\update-trust-bundle.pem"` then restart the service, or add the flag to the service's binary path. |
+| Windows | `setx /M YUZU_UPDATE_TRUST_BUNDLE "C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem"` then restart the service, or add the flag to the service's binary path. |
 
 Every flag below has the environment variable shown beside it:
 
