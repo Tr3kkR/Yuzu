@@ -11,6 +11,8 @@
 
 #include <yuzu/agent/detached_signature.hpp>
 
+#include <yuzu/metrics.hpp>
+
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 
@@ -529,7 +531,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         sa.lpSecurityDescriptor = sd;
 
         h_guard.h = CreateFileW(temp_path.wstring().c_str(),
-                                GENERIC_WRITE | DELETE, // DELETE required for FileRenameInfo*
+                                // GENERIC_READ is required, not decorative: the share mode below
+                                // is 0, so this path cannot be opened a second time, and
+                                // signature verification therefore has to read the staged bytes
+                                // back through THIS handle. Without read access every signed
+                                // update fails verification and the agent stops updating.
+                                // DELETE is required for FileRenameInfo*.
+                                GENERIC_READ | GENERIC_WRITE | DELETE,
                                 0, // No sharing — load-bearing exclusive hold
                                 &sa,
                                 CREATE_NEW, // Atomic create; fail if exists
@@ -744,6 +752,11 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         const std::string& sig = check_resp.update_signature();
         if (sig.empty()) {
             if (config_.require_signature) {
+                if (config_.metrics)
+                    config_.metrics
+                        ->counter("yuzu_agent_ota_signature_refused_total",
+                                  {{"reason", "missing"}})
+                        .increment();
                 cleanup_temp();
                 return std::unexpected(UpdateError{
                     "update package is unsigned and --update-require-signature is set"});
@@ -763,27 +776,46 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 #ifdef _WIN32
             // Bridge the HANDLE to a CRT descriptor through a DUPLICATE, so the
             // descriptor we close cannot disturb the handle apply_update needs.
-            HANDLE dup_handle = nullptr;
-            if (!::DuplicateHandle(::GetCurrentProcess(), h_guard.h,
-                                   ::GetCurrentProcess(), &dup_handle, 0, FALSE,
-                                   DUPLICATE_SAME_ACCESS)) {
+            // RAII, because verify_detached_cms_fd allocates and can throw: a bare
+            // _close() after the call would leak a handle and a descriptor on
+            // every failure, once per six-hour update cycle.
+            struct ScopedOsfHandle {
+                HANDLE h{nullptr};
+                int fd{-1};
+                ~ScopedOsfHandle() {
+                    // _close owns the duplicated HANDLE once the bind succeeds,
+                    // so closing both would be a double-close. Exactly one runs.
+                    if (fd >= 0)
+                        ::_close(fd);
+                    else if (h)
+                        ::CloseHandle(h);
+                }
+            } dup;
+
+            if (!::DuplicateHandle(::GetCurrentProcess(), h_guard.h, ::GetCurrentProcess(), &dup.h,
+                                   0, FALSE, DUPLICATE_SAME_ACCESS)) {
                 cleanup_temp();
                 return std::unexpected(
                     UpdateError{"cannot duplicate update file handle for signature verification"});
             }
-            const int sig_fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(dup_handle), _O_RDONLY | _O_BINARY);
-            if (sig_fd < 0) {
-                ::CloseHandle(dup_handle);
+            dup.fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(dup.h), _O_RDONLY | _O_BINARY);
+            if (dup.fd < 0) {
                 cleanup_temp();
                 return std::unexpected(
                     UpdateError{"cannot bind update file handle for signature verification"});
             }
-            auto sig_err = verify_detached_cms_fd(sig_fd, sig, config_.signature_trust_bundle);
-            ::_close(sig_fd); // closes dup_handle; h_guard's own handle is untouched
+            auto sig_err = verify_detached_cms_fd(dup.fd, sig, config_.signature_trust_bundle);
 #else
             auto sig_err = verify_detached_cms_fd(fd_guard.fd, sig, config_.signature_trust_bundle);
 #endif
             if (sig_err) {
+                if (config_.metrics)
+                    config_.metrics
+                        ->counter("yuzu_agent_ota_signature_refused_total",
+                                  {{"reason", sig_err->kind == CmsFailure::kUntrusted
+                                                  ? "untrusted"
+                                                  : "invalid"}})
+                        .increment();
                 // Refused in BOTH modes. require_signature governs whether an
                 // ABSENT signature is tolerated; a signature that is present and
                 // does not verify is always an active integrity failure.

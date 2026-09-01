@@ -9,6 +9,10 @@
 #include <mutex>
 #include <string>
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 namespace yuzu::agent {
 
 struct UpdateError {
@@ -40,6 +44,16 @@ struct UpdateConfig {
     [[nodiscard]] bool signature_checking_enabled() const noexcept {
         return !signature_trust_bundle.empty();
     }
+
+    /// Optional metrics sink, so a signature refusal is visible to something
+    /// other than a local log line.
+    ///
+    /// This is the closest thing to the "audited" half of #3807 that the update
+    /// path can currently offer: there is no status-report RPC, so a refusing
+    /// agent cannot tell the server anything. A scrape of this counter is what
+    /// lets an operator see a fleet-wide refusal instead of discovering it when
+    /// machines stop patching. Null in tests and wherever no registry exists.
+    yuzu::MetricsRegistry* metrics{nullptr};
 };
 
 class YUZU_EXPORT Updater {

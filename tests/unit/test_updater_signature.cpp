@@ -17,6 +17,8 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <grpcpp/grpcpp.h>
@@ -128,12 +130,18 @@ struct FakeExe {
     }
 };
 
-UpdateConfig cfg_with(const fs::path& bundle, bool require) {
+UpdateConfig cfg_with(const fs::path& bundle, bool require,
+                      yuzu::MetricsRegistry* m = nullptr) {
     UpdateConfig c;
     c.enabled = true;
     c.signature_trust_bundle = bundle;
     c.require_signature = require;
+    c.metrics = m;
     return c;
+}
+
+double refused(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter("yuzu_agent_ota_signature_refused_total", {{"reason", reason}}).value();
 }
 
 } // namespace
@@ -166,11 +174,15 @@ TEST_CASE("updater: a package signed by a FOREIGN CA is refused", "[updater][sig
     h.start();
 
     // Same package, same valid signature — but the agent trusts a different CA.
-    Updater updater(cfg_with(f.other_trust_bundle, /*require=*/false), "test-agent", "0.1.0",
-                    "linux", "x86_64", exe.path);
+    yuzu::MetricsRegistry metrics;
+    Updater updater(cfg_with(f.other_trust_bundle, /*require=*/false, &metrics), "test-agent",
+                    "0.1.0", "linux", "x86_64", exe.path);
     auto r = updater.check_and_apply(h.stub.get());
     REQUIRE_FALSE(r.has_value());
     CHECK(read_file(exe.path) == "old-binary"); // untouched
+    // The refusal must be visible to something other than a local log line —
+    // with no status RPC on this path, this counter is all an operator gets.
+    CHECK(refused(metrics, "untrusted") == 1.0);
 }
 
 TEST_CASE("updater: a tampered payload is refused even with a real signature",
@@ -199,11 +211,13 @@ TEST_CASE("updater: an unsigned package is refused only when require is set",
         h.svc.payload = read_file(f.artifact_file);
         h.svc.signature.clear();
         h.start();
-        Updater updater(cfg_with(f.trust_bundle, /*require=*/true), "test-agent", "0.1.0", "linux",
-                        "x86_64", exe.path);
+        yuzu::MetricsRegistry metrics;
+        Updater updater(cfg_with(f.trust_bundle, /*require=*/true, &metrics), "test-agent", "0.1.0",
+                        "linux", "x86_64", exe.path);
         auto r = updater.check_and_apply(h.stub.get());
         REQUIRE_FALSE(r.has_value());
         CHECK(read_file(exe.path) == "old-binary");
+        CHECK(refused(metrics, "missing") == 1.0);
     }
 
     SECTION("require off → applied, transitional mode") {

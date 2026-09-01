@@ -2225,6 +2225,12 @@ std::string SettingsRoutes::render_updates_fragment() {
             "<div class=\"mini-field\">"
             "<label>Binary</label>"
             "<input type=\"file\" name=\"file\" required></div>"
+            // Optional detached CMS signature (#416/#3807). Without this input
+            // the documented signing workflow is unreachable from the UI and an
+            // operator would ship an unsigned package believing it signed.
+            "<div class=\"form-row\">"
+            "<label>Signature <span class=\"muted\">(optional, .sig)</span></label>"
+            "<input type=\"file\" name=\"signature\" accept=\".sig\"></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
             "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:50px\"></div>"
@@ -5295,10 +5301,31 @@ void SettingsRoutes::register_routes(
         // package is acceptable. Uploading one here does not make it trusted:
         // the agent checks it against an anchor this server never supplies.
         std::string signature_pem;
-        if (SETTINGS_REQ_HAS_FILE(req, "signature"))
+        if (SETTINGS_REQ_HAS_FILE(req, "signature")) {
             signature_pem = SETTINGS_REQ_GET_FILE(req, "signature").content;
+            if (signature_pem.size() > kMaxSignatureBytes) {
+                res.status = 400;
+                res.set_content("<span class=\"feedback-error\">Signature file is too large "
+                                "(max 64 KB). A detached CMS signature is a few KB — check you "
+                                "selected the .sig file and not the binary.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+        }
 
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
+        if (uploaded.filename.size() >= 4 &&
+            uploaded.filename.compare(uploaded.filename.size() - 4, 4, ".sig") == 0) {
+            // Signature sidecars are derived as "<binary>.sig", so a package
+            // literally named X.sig would occupy package X's sidecar slot. It
+            // fails closed (X's agents then see a signature over the wrong
+            // bytes and refuse), but the cause would be invisible.
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">Package filenames may not end in "
+                            "'.sig' — that suffix is reserved for signature sidecars.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (uploaded.content.empty()) {
             res.status = 400;
             res.set_content("<span class=\"feedback-error\">Empty file.</span>",

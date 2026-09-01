@@ -15,9 +15,11 @@ chmod 755 "${LOG_DIR}"
 
 # Trust-anchor directory for OTA update and plugin code-signing bundles
 # (#416/#3807). Matches the well-known path cert_discovery.cpp already looks in.
-# root-owned and world-readable but NOT agent-writable: the agent verifies its
-# own updates against what lives here, so an agent that could write it would be
-# able to authorise its own replacement.
+# root-owned and world-readable. NOTE: the agent's LaunchDaemon runs as root, so
+# it CAN write this - the mode protects the anchor from unprivileged local users,
+# not from the agent itself. That is inherent: a process able to replace the
+# system binary is able to rewrite the file authorising the replacement. See
+# "Signing update binaries" in docs/user-manual/server-admin.md.
 mkdir -p /etc/yuzu/certs
 chown root:wheel /etc/yuzu/certs
 chmod 755 /etc/yuzu/certs

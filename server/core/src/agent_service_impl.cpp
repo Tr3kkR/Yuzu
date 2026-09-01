@@ -1992,8 +1992,17 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
         const auto sig_path = update_registry_->signature_path(*latest);
         std::error_code sig_ec;
         if (std::filesystem::exists(sig_path, sig_ec)) {
+            // Size-checked BEFORE reading. This blob is attached to every
+            // CheckForUpdateResponse, and gRPC clients default to a 4 MB receive
+            // limit, so an oversized file here would break update checks for the
+            // whole fleet rather than for one package.
+            const auto sig_size = std::filesystem::file_size(sig_path, sig_ec);
             std::ifstream sig_in(sig_path, std::ios::binary);
-            if (sig_in) {
+            if (!sig_ec && sig_size > kMaxSignatureBytes) {
+                spdlog::error("CheckForUpdate: signature sidecar for {} is {} bytes, over the {} "
+                              "byte cap; serving the package as unsigned",
+                              latest->filename, sig_size, kMaxSignatureBytes);
+            } else if (sig_in) {
                 std::string sig((std::istreambuf_iterator<char>(sig_in)),
                                 std::istreambuf_iterator<char>());
                 response->set_update_signature(std::move(sig));

@@ -323,9 +323,10 @@ message CheckForUpdateResponse {
   // Empty when the operator has not signed the package. A new agent with
   // --update-require-signature refuses such a package; without that flag it
   // warns and proceeds, which is the transitional mode. An OLD agent ignores
-  // this field entirely (unknown fields are dropped), which is why the
-  // signature is carried here rather than by changing DownloadUpdateChunk's
-  // framing — that would have broken every agent already in the field.
+  // this field entirely (proto3 preserves unknown fields rather than failing on
+  // them), which is why the signature is carried here rather than by changing
+  // DownloadUpdateChunk's framing — that would have broken every agent already
+  // in the field.
   bytes  update_signature = 7;
 }
 

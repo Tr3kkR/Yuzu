@@ -202,18 +202,25 @@ std::optional<CmsVerifyError> verify_detached_cms_fd(int artifact_fd,
     if (seek_fd(artifact_fd, 0, SEEK_SET) < 0)
         return CmsVerifyError{CmsFailure::kInvalid, "cannot rewind artifact descriptor"};
 
+    // RAII rather than a trailing call: verify_with_content_bio allocates, so an
+    // exception would otherwise leave the caller's descriptor silently rewound —
+    // the exact trap this restore exists to prevent, reintroduced on the failure
+    // path.
+    struct OffsetRestore {
+        int fd;
+        std::int64_t offset;
+        ~OffsetRestore() { seek_fd(fd, offset, SEEK_SET); }
+    } restore{artifact_fd, saved};
+
     // BIO_NOCLOSE: the descriptor belongs to the caller, and closing it here
     // would close the staged file out from under the apply step.
     openssl_ptr<BIO> content_bio{BIO_new_fd(artifact_fd, BIO_NOCLOSE)};
     if (!content_bio) {
-        seek_fd(artifact_fd, saved, SEEK_SET);
         const auto err = drain_openssl_errors();
         return CmsVerifyError{CmsFailure::kInvalid, "cannot wrap artifact descriptor: " + err.text};
     }
 
-    auto result = verify_with_content_bio(content_bio.get(), signature_pem, trust_bundle_path);
-    seek_fd(artifact_fd, saved, SEEK_SET);
-    return result;
+    return verify_with_content_bio(content_bio.get(), signature_pem, trust_bundle_path);
 }
 
 } // namespace yuzu::agent

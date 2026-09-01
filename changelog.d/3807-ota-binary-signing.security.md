@@ -22,8 +22,10 @@
   package (`openssl cms -sign -binary -outform PEM`), uploaded alongside it, and
   stored beside it; the server never signs and is not trusted to. The Debian,
   macOS and Windows packagers now create the trust-anchor directory, which none
-  of them did before — root-owned and readable but never writable by the agent
-  service account, since an agent able to rewrite the anchor authorising its own
-  updates would make the check meaningless. See "Signing update binaries" in the
+  of them did before. On Linux the agent runs unprivileged and cannot write the
+  anchor; on macOS and Windows it runs as root and LocalSystem and can, so there
+  the permissions keep unprivileged local users out rather than the agent itself
+  — inherent, since a process able to replace the system binary can rewrite the
+  file authorising the replacement. See "Signing update binaries" in the
   server administration manual, including why the transitional unsigned-allowed
   mode is a downgrade oracle and why a failing agent is currently silent.

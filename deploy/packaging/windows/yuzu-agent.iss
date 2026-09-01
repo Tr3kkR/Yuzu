@@ -125,9 +125,11 @@ Name: "{app}\logs"; Permissions: admins-full system-full
 Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 ; Trust-anchor directory for OTA update and plugin code-signing bundles
 ; (#416/#3807). Matches the well-known path cert_discovery.cpp already looks in.
-; Administrators and SYSTEM only: the agent service reads its update-signing
-; anchor from here, so a writable directory would let a compromised agent
-; authorise its own replacement.
+; Administrators and SYSTEM only. NOTE: the agent service runs as LocalSystem, so
+; it is covered by system-full and CAN write here - this ACL keeps unprivileged
+; local users out, not the agent itself. Inherent: a process able to replace the
+; system binary can rewrite the file authorising the replacement. See "Signing
+; update binaries" in docs/user-manual/server-admin.md.
 Name: "{commonappdata}\Yuzu\certs"; Permissions: admins-full system-full
 
 [Run]
