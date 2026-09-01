@@ -121,8 +121,12 @@ struct ResponseQuery {
 /// in-scope agent set into the SQL WHERE clause before LIMIT/aggregate via the
 /// shared `append_scope_clause` helper. Kept off the shared `ResponseQuery`
 /// struct so a caller can never silently pass an unpopulated/wrong-typed scope
-/// field and get an unintentionally-unrestricted read — this parameter has to
-/// be supplied explicitly at every call site.
+/// field and get an unintentionally-unrestricted read — this is a SEPARATE
+/// parameter a caller passes explicitly (its default is `std::nullopt`,
+/// legacy-open, matching every pre-#1634 call site's behavior — an existing
+/// caller that doesn't yet pass one is unaffected, not silently broken; a
+/// NEW confinement-aware caller must pass its resolved scope explicitly to
+/// get a restricted read).
 ///   * `nullopt`           = no scoping (legacy-open / RBAC-disabled / global
 ///                           operator — totals over all agents, any scale).
 ///   * engaged + NON-empty = restrict to `agent_id = ANY(the set)`.

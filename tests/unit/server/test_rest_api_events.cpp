@@ -1079,6 +1079,22 @@ TEST_CASE("GET /api/v1/executions/{id}: unknown id → 404 A4 envelope",
     REQUIRE(res->body.find(R"("api_version":"v1")") != std::string::npos);
 }
 
+TEST_CASE("GET /api/v1/executions/{id}: unknown id emits execution.detail.fetch denied audit "
+          "row (Doomgoose review, important — was undocumented and untested)",
+          "[pg][events][executions][issue-1088][notfound][audit]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/executions/exec-does-not-exist");
+    REQUIRE(res);
+    REQUIRE(res->status == 404);
+    bool saw_denied = false;
+    for (const auto& a : h.audit_log) {
+        CHECK(a.result != "success");
+        if (a.action == "execution.detail.fetch" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
+}
+
 TEST_CASE("GET /api/v1/executions/{id}: invisible and nonexistent ids share one 404 shape",
           "[pg][events][executions][scope][notfound]") {
     RestEventsHarness h;

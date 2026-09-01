@@ -705,6 +705,54 @@ TEST_CASE("executions detail: responses section drops out-of-scope agents",
     CHECK(res->body.find("out-of-scope output") == std::string::npos);
 }
 
+TEST_CASE("executions detail: confined-but-admitted caller gets scope/parameter redaction "
+          "(Doomgoose review, blocking)",
+          "[pg][workflow][executions][detail][rbac][scope]") {
+    // This route's sidebar previously rendered exec.scope_expression/
+    // parameter_values verbatim with no gate.scope conditional at all,
+    // unlike the REST twin (GET /api/v1/executions/{id}) and MCP
+    // get_execution_status, which both replace these fields with
+    // "(redacted - confined view)" whenever the caller is confined —
+    // dispatcher included. A confined caller admitted via one visible
+    // agent could read the full scope DSL of an execution naming
+    // out-of-scope agent ids/hostnames. This test admits (200, not 404)
+    // via a narrow-but-nonempty scope and asserts the real scope
+    // expression/parameters never appear.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-REDACT", "Redact");
+
+    Execution e;
+    e.id = "exec-redact-test";
+    e.definition_id = "def-REDACT";
+    e.status = "completed";
+    e.dispatched_by = "someone-else";
+    e.dispatched_at = 1735689600;
+    e.completed_at = 1735689660;
+    e.agents_targeted = 1;
+    e.agents_success = 1;
+    e.agents_responded = 1;
+    e.scope_expression = "tag:secret-project-out-of-scope-hostname";
+    e.parameter_values = R"({"admin_password":"should-never-leak"})";
+    auto created = h.tracker->create_execution(e);
+    REQUIRE(created.has_value());
+    const auto eid = *created;
+    h.agent_status(eid, "agent-in", "success", 0, "", 1735689601);
+
+    // Narrow-but-nonempty scope: caller sees "agent-in" (admits, 200) but
+    // is still confined (not the deny_all/full-visibility cases already
+    // covered by sibling tests).
+    h.fleet_read_scope =
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-in"}};
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body.find("redacted - confined view") != std::string::npos);
+    CHECK(res->body.find("secret-project-out-of-scope-hostname") == std::string::npos);
+    CHECK(res->body.find("should-never-leak") == std::string::npos);
+}
+
 TEST_CASE("executions detail: KPI strip shows counts + p50/p95", "[pg][workflow][executions][detail]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

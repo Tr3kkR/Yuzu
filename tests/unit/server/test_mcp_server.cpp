@@ -5386,6 +5386,65 @@ TEST_CASE("MCP get_execution_status: confined non-owner gets visible-only projec
     CHECK(res->body.find("agent:secret-target") == std::string::npos);
 }
 
+// (Doomgoose review, minor): every real-rig get_execution_status test to date
+// seeds at least one agent visible to the caller — the invisible-execution
+// 404-collapse branch (identical-error property + its denied audit row) was
+// never exercised against the real RBAC/ManagementGroupStore composition.
+TEST_CASE("MCP get_execution_status: invisible execution collapses to the same "
+          "not-found error as a nonexistent one (#1634, Doomgoose review)",
+          "[pg][mcp][integration][execution][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-invisible";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    // Only alice-agent is visible to alice; bob has NO visible agent on this
+    // execution at all (unlike the sibling test above, which seeds bob-agent).
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "success";
+    tracker.update_agent_status(exec_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto call = [&](const std::string& id) {
+        return ts.call_raw(
+            "POST",
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":733,)"
+                        R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+                id + R"("}}})",
+            {{"Authorization", "Bearer " + token}});
+    };
+    auto invisible = call(exec_id);
+    auto missing = call("exec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    // Both are JSON-RPC error responses (kInvalidParams). The message embeds
+    // the (different) requested execution_id verbatim on both branches — the
+    // no-oracle property is the shared PREFIX/code, not byte-identical text,
+    // matching the "Execution not found: <id>" format on both paths.
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    REQUIRE(invisible_json.contains("error"));
+    REQUIRE(missing_json.contains("error"));
+    CHECK(invisible_json["error"]["code"] == missing_json["error"]["code"]);
+    CHECK(invisible_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+    CHECK(missing_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+}
+
 // #1634: execution rows carry no single agent_id, so a confined caller is
 // restricted to their own dispatches (ExecutionQuery::dispatched_by) rather than
 // a full per-row visible-agent check — never another operator's execution.
@@ -5423,6 +5482,62 @@ TEST_CASE("MCP list_executions: confined caller sees only own dispatches (#1634)
     auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
     REQUIRE(sc.size() == 1);
     CHECK(sc[0]["dispatched_by"] == "bob");
+}
+
+TEST_CASE("MCP list_executions: confined caller's counts reflect only in-scope, "
+          "TERMINAL agents (Doomgoose review, important)",
+          "[pg][mcp][integration][execution][scope]") {
+    // list_executions previously served RAW agents_targeted/agents_responded
+    // unprojected for a confined caller (unlike its get_execution_status
+    // sibling), AND (a shared bug with that sibling, fixed in the same
+    // round) counted a 'running' agent as "responded". This test proves
+    // both: an in-scope 'running' agent must NOT inflate agents_responded,
+    // and an out-of-scope agent must not be counted at all.
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution bob_exec;
+    bob_exec.definition_id = "def-list-counts";
+    bob_exec.dispatched_by = "bob";
+    bob_exec.status = "running";
+    bob_exec.agents_targeted = 2;
+    bob_exec.agents_responded = 2; // raw row: both "responded" (stale/wrong if served verbatim)
+    auto created = tracker.create_execution(bob_exec);
+    REQUIRE(created.has_value());
+    const auto exec_id = *created;
+
+    yuzu::server::AgentExecStatus in_scope_running;
+    in_scope_running.agent_id = "bob-agent";
+    in_scope_running.status = "running";
+    tracker.update_agent_status(exec_id, in_scope_running);
+
+    yuzu::server::AgentExecStatus out_of_scope_success;
+    out_of_scope_success.agent_id = "alice-agent";
+    out_of_scope_success.status = "success";
+    tracker.update_agent_status(exec_id, out_of_scope_success);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":732,"params":{"name":"list_executions","arguments":{"definition_id":"def-list-counts"}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
+    REQUIRE(sc.size() == 1);
+    // Only bob-agent is in scope: targeted == 1. It is 'running', not
+    // terminal, so responded must be 0 -- never 1 (the pre-fix bug) and
+    // never 2 (alice-agent's out-of-scope success must not leak in either).
+    CHECK(sc[0]["agents_targeted"] == 1);
+    CHECK(sc[0]["agents_responded"] == 0);
 }
 
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",

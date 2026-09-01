@@ -155,7 +155,7 @@ canonical form.
 ADR-0017 INV-3).** The MCP `query_responses` collect path — and the legacy REST
 `/api/responses/{id}/export` and catch-all list — resolve the caller's visible-agent
 set (`ResponseStore::distinct_agent_ids`/`distinct_agent_ids_by_execution`) and push
-it into `ResponseStore::query`/`query_by_execution` as SQL `agent_id IN (...)`
+it into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)`
 **before** `ORDER BY ... LIMIT`, via a new optional scope parameter (mirroring
 `aggregate()`'s existing `AggregateScope`). This closes a real defect the first
 #1634 migration pass shipped: filtering *after* `LIMIT` meant an execution that
@@ -167,8 +167,16 @@ now signals that the CALLER'S OWN scoped query hit the cap, not a raw-then-filte
 cap hit that could fire entirely inside another operator's rows. The gate itself
 (`require_fleet_read`/`fleet_read_fn_`) replaced the old flat `Response:Read` check
 these readers sat behind, so a management-group-confined operator is admitted and
-narrowed rather than 403'd outright. The same applies to every other
-operator-facing reader of this store.
+narrowed rather than 403'd outright. **NOT true of every reader (correction, PR review
+2026-09-01):** the executions-drawer detail fragment (`workflow_routes.cpp`, `limit=500`)
+and the dashboard's `/fragments/results` (`dashboard_routes.cpp`, `limit=10000`) both
+predate #1634 and still call `query_by_execution`/`query` with no scope argument,
+post-fetch-filtering the raw (capped) result instead — the same INV-3 shape this
+paragraph describes as closed elsewhere. Isolation still holds (under-display only,
+never over-disclosure: a confined caller can see fewer in-scope rows than exist past
+the cap, never an out-of-scope row), so this is not a security regression, but it is
+not migrated onto the SQL-pushdown pattern above. Not the same surfaces as #3789/#3526;
+tracked separately as #3805.
 
 ## PR 3 — SSE live updates
 

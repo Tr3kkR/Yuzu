@@ -488,9 +488,11 @@ static const ToolDef kTools[] = {
      "response (or a GET resume by execution_id) when streaming is available; "
      "poll this tool as the fallback when it is not. Confined by management group: "
      "an execution with no agent visible to the caller returns the same error as a "
-     "nonexistent execution_id; a confined non-dispatcher's counts/progress are "
-     "computed from only their visible agents and scope_expression is redacted — "
-     "the caller who dispatched the execution always sees the true values.",
+     "nonexistent execution_id; a confined caller's counts/progress are computed "
+     "from only their visible agents and scope_expression is redacted — the "
+     "execution's dispatcher is admitted to VIEW the execution (avoids a false "
+     "not-found on a just-dispatched execution with no responses yet) but gets "
+     "the SAME redacted counts/scope_expression as any other confined caller.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
 
@@ -6433,7 +6435,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::vector<AgentExecStatus> agents;
                 bool has_visible_agent = false;
                 if (gate.scope) {
-                    agents = execution_tracker->get_agent_statuses(exec_id);
+                    // #1634 (Doomgoose review finding, important): fail
+                    // closed on a transient tracker degrade rather than
+                    // silently treat it as "zero agents" — see
+                    // get_agent_statuses_checked's doc comment.
+                    auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                    if (!agents_opt) {
+                        res.set_content(
+                            error_response(id, kInternalError, "execution tracker degraded"),
+                            "application/json");
+                        return;
+                    }
+                    agents = std::move(*agents_opt);
                     for (const auto& a : agents)
                         has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
                 }
@@ -6460,16 +6473,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     // rows are response-arrival seeded, not dispatch-time target seeded,
                     // so this intentionally undercounts pending in-scope targets.
                     agents_targeted = agents_responded = agents_success = agents_failure = 0;
+                    // #1634 (Doomgoose review finding, important): only a
+                    // TERMINAL status counts as "responded" (matches
+                    // execution_tracker.cpp's canonical recompute) — this
+                    // loop previously counted 'running' rows as responded
+                    // too, which fed a self-contradictory progress_pct==100
+                    // below while agents were still executing.
                     for (const auto& a : agents) {
                         if (!authz::in_scope(gate.scope, a.agent_id))
                             continue;
                         ++agents_targeted;
-                        ++agents_responded;
-                        if (a.status == "success")
+                        if (a.status == "success") {
+                            ++agents_responded;
                             ++agents_success;
-                        else if (a.status == "failure" || a.status == "timeout" ||
-                                a.status == "rejected")
+                        } else if (a.status == "failure" || a.status == "timeout" ||
+                                a.status == "rejected") {
+                            ++agents_responded;
                             ++agents_failure;
+                        }
                     }
                     progress_pct = agents_targeted > 0
                                        ? (agents_responded * 100 / agents_targeted)
@@ -6552,16 +6573,48 @@ McpServer::HandlerFn McpServer::build_handler(
                     eq.dispatched_by = session->username;
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
                 auto execs = execution_tracker->query_executions(eq);
+                // #1634 (Doomgoose review finding, important): get_execution_status
+                // projects agents_targeted/agents_responded to the caller's visible
+                // agents when confined; this LIST sibling served the raw fleet-wide
+                // counts unprojected. Batched (non-N+1, ADR-0017 INV-10) — one
+                // execution_id = ANY($1::text[]) read for every listed row instead
+                // of a per-row lookup.
+                std::unordered_map<std::string, std::vector<AgentExecStatus>> statuses_by_exec;
+                if (gate.scope) {
+                    std::vector<std::string> exec_ids;
+                    exec_ids.reserve(execs.size());
+                    for (const auto& e : execs)
+                        exec_ids.push_back(e.id);
+                    statuses_by_exec =
+                        execution_tracker->get_agent_statuses_for_executions(exec_ids);
+                }
                 JArr arr;
                 for (const auto& e : execs) {
+                    int64_t agents_targeted = e.agents_targeted;
+                    int64_t agents_responded = e.agents_responded;
+                    if (gate.scope) {
+                        agents_targeted = 0;
+                        agents_responded = 0;
+                        auto it = statuses_by_exec.find(e.id);
+                        if (it != statuses_by_exec.end()) {
+                            for (const auto& a : it->second) {
+                                if (!authz::in_scope(gate.scope, a.agent_id))
+                                    continue;
+                                ++agents_targeted;
+                                if (a.status == "success" || a.status == "failure" ||
+                                    a.status == "timeout" || a.status == "rejected")
+                                    ++agents_responded;
+                            }
+                        }
+                    }
                     arr.add(JObj()
                                 .add("id", e.id)
                                 .add("definition_id", e.definition_id)
                                 .add("status", e.status)
                                 .add("dispatched_by", e.dispatched_by)
                                 .add("dispatched_at", e.dispatched_at)
-                                .add("agents_targeted", static_cast<int64_t>(e.agents_targeted))
-                                .add("agents_responded", static_cast<int64_t>(e.agents_responded)));
+                                .add("agents_targeted", agents_targeted)
+                                .add("agents_responded", agents_responded));
                 }
                 mcp_audit("success");
                 res.set_content(

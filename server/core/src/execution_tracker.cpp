@@ -1,6 +1,7 @@
 #include "execution_tracker.hpp"
 
 #include "execution_event_bus.hpp"
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -287,14 +288,13 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
     return s;
 }
 
-std::vector<AgentExecStatus>
-ExecutionTracker::get_agent_statuses(const std::string& execution_id) const {
-    std::vector<AgentExecStatus> results;
+std::optional<std::vector<AgentExecStatus>>
+ExecutionTracker::get_agent_statuses_checked(const std::string& execution_id) const {
     if (!open_)
-        return results;
+        return std::nullopt;
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return results;
+        return std::nullopt;
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -303,8 +303,9 @@ ExecutionTracker::get_agent_statuses(const std::string& execution_id) const {
         "WHERE execution_id = $1 ORDER BY agent_id",
         std::vector<std::string>{execution_id});
     if (res.status() != PGRES_TUPLES_OK)
-        return results;
+        return std::nullopt;
 
+    std::vector<AgentExecStatus> results;
     const int rows = PQntuples(res.get());
     results.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i) {
@@ -320,6 +321,53 @@ ExecutionTracker::get_agent_statuses(const std::string& execution_id) const {
         results.push_back(std::move(a));
     }
     return results;
+}
+
+std::vector<AgentExecStatus>
+ExecutionTracker::get_agent_statuses(const std::string& execution_id) const {
+    return get_agent_statuses_checked(execution_id).value_or(std::vector<AgentExecStatus>{});
+}
+
+std::unordered_map<std::string, std::vector<AgentExecStatus>>
+ExecutionTracker::get_agent_statuses_for_executions(
+    const std::vector<std::string>& execution_ids) const {
+    std::unordered_map<std::string, std::vector<AgentExecStatus>> by_execution;
+    // Engaged-empty: zero requested executions means zero rows, without
+    // touching the pool — success-empty, not degrade (matches
+    // ResponseStore::facet_values' convention for this same shape).
+    if (execution_ids.empty())
+        return by_execution;
+    if (!open_)
+        return by_execution;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return by_execution;
+
+    std::vector<std::string_view> sv(execution_ids.begin(), execution_ids.end());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
+        "exit_code, error_detail, COALESCE(plugin_result_status, 0) "
+        "FROM execution_tracker.agent_exec_status "
+        "WHERE execution_id = ANY($1::text[]) ORDER BY execution_id, agent_id",
+        std::vector<std::string>{pg::to_text_array(sv)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return by_execution;
+
+    const int rows = PQntuples(res.get());
+    for (int i = 0; i < rows; ++i) {
+        AgentExecStatus a;
+        a.agent_id = col_str(res.get(), i, 1);
+        a.status = col_str(res.get(), i, 2);
+        a.dispatched_at = to_i64(col(res.get(), i, 3));
+        a.first_response_at = to_i64(col(res.get(), i, 4));
+        a.completed_at = to_i64(col(res.get(), i, 5));
+        a.exit_code = to_i(col(res.get(), i, 6));
+        a.error_detail = col_str(res.get(), i, 7);
+        a.plugin_result_status = to_i(col(res.get(), i, 8));
+        by_execution[col_str(res.get(), i, 0)].push_back(std::move(a));
+    }
+    return by_execution;
 }
 
 std::vector<Execution> ExecutionTracker::get_children(const std::string& parent_id) const {

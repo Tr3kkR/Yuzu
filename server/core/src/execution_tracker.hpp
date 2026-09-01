@@ -30,6 +30,7 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -184,6 +185,33 @@ public:
     std::optional<Execution> get_execution(const std::string& id) const;
     ExecutionSummary get_summary(const std::string& id) const;
     std::vector<AgentExecStatus> get_agent_statuses(const std::string& execution_id) const;
+    /// #1634 (Doomgoose review finding, important) — degrade-distinguishable
+    /// twin of `get_agent_statuses`, for the #1634 visibility/audit call
+    /// sites (REST GET /api/v1/executions/{id}, GET /api/v1/events,
+    /// GET /sse/executions/{id}, dashboard detail fragment, MCP
+    /// get_execution_status). `get_agent_statuses` itself keeps its
+    /// existing plain-vector contract — pre-existing callers (rerun-lineage
+    /// composition, etc.) are unaffected — because a store-read failure
+    /// there degrades in a direction that only ever UNDER-serves data,
+    /// never mints a false CC7.2 audit row or a false 404/200 admission
+    /// decision. `nullopt` on a pool-acquire timeout or query failure,
+    /// matching ResponseStore's own nullopt-on-degrade convention
+    /// (`docs/cpp-conventions.md`'s degrade-vs-empty distinguishability
+    /// rule) — a caller MUST fail closed (503/deny) on nullopt rather than
+    /// treat it as "zero agents" (which would 404 a caller during a
+    /// transient PG degrade and permanently record a false `denied` audit
+    /// row for a non-owner, or hand an owner a false 200-with-zero-counts).
+    std::optional<std::vector<AgentExecStatus>>
+    get_agent_statuses_checked(const std::string& execution_id) const;
+    /// #1634 (Doomgoose review finding, important) — batched twin of
+    /// `get_agent_statuses` for a LIST caller that needs per-execution
+    /// in-scope counts for N executions without N+1 queries (ADR-0017
+    /// INV-10). One `execution_id = ANY($1::text[])` read; returns a map
+    /// keyed by execution_id so a caller can recompute confined counts per
+    /// row from a single round trip. Empty `execution_ids` short-circuits
+    /// without touching the pool (engaged-empty, not a degrade).
+    std::unordered_map<std::string, std::vector<AgentExecStatus>>
+    get_agent_statuses_for_executions(const std::vector<std::string>& execution_ids) const;
     std::vector<Execution> get_children(const std::string& parent_id) const;
 
     // Mutation

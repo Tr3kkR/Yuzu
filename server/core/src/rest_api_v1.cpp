@@ -1039,7 +1039,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Subscribe to per-execution live events (JSON SSE)", "tags": ["Events"], "description": "Authenticated agentic-first JSON Server-Sent Events channel (sprint W5.1). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined subscriber's agent-transition events are filtered to their in-scope agents, execution-progress is withheld, and execution-completed carries only the real terminal status (no fleet-wide counts). Reuses the per-execution ExecutionEventBus that backs the dashboard /sse/executions/{id} route. Each SSE frame carries an `id:`, `event:` (one of `agent-transition`, `execution-progress`, `execution-completed`, plus the synthetic `replay-gap` / `events-dropped` / `heartbeat`), and a JSON `data:` payload conforming to ExecutionSseEvent. Reconnect via `Last-Event-ID` request header OR `?since=<event_id>` query (query wins). Non-integer `?since` values silently degrade to 0 (no replay). On reconnect after the per-execution ring buffer has evicted older events (FIFO, ~1000 events / ~30s window), a synthetic `replay-gap` frame is emitted as the first event so the worker knows state may be inconsistent. A slow consumer that lets the per-connection queue fill receives a synthetic `events-dropped` envelope summarising the drop count rather than silent OOM growth. Errors use the A4 envelope (ErrorEnvelope schema). Response headers always include X-Correlation-Id; Sec-Audit-Failed: true is set when audit persistence fails (CC6.6 contract).", "parameters": [{"name": "execution_id", "in": "query", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}, "description": "Execution to subscribe to. Unfiltered subscription is reserved for sprint W5.2."}, {"name": "since", "in": "query", "schema": {"type": "integer", "minimum": 0}, "description": "Replay events with id > since. Overrides Last-Event-ID header. Non-integer values silently degrade to 0."}, {"name": "Last-Event-ID", "in": "header", "schema": {"type": "string"}, "description": "Browser EventSource auto-reconnect header. Ignored when `since` is set."}], "responses": {"200": {"description": "SSE stream. Content-Type: text/event-stream. Each `data:` line is an ExecutionSseEvent.", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when audit row persistence failed; subscription still proceeds (CC6.6 evidence chain)."}}, "content": {"text/event-stream": {"schema": {"$ref": "#/components/schemas/ExecutionSseEvent"}}}}, "400": {"description": "Missing or malformed execution_id", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "410": {"description": "Execution already terminal — subscribe-time stream is no longer available", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Tracker or event bus not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions/{id}": {
-      "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined non-dispatcher's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Fetch the final state of a single execution (#1088)", "tags": ["Events"], "description": "Companion to GET /api/v1/events: when the SSE subscribe returns 410 (execution already terminal), the worker calls this endpoint to fetch the final state in one round-trip. Mirrors the dashboard /fragments/executions/{id}/detail data but JSON-shaped. Gated by the ADR-0017 admit-then-filter fleet-read primitive (Execution:Read) — an execution with no agent visible to the caller 404s identically to a nonexistent one; a confined caller's counts/last_error_detail are recomputed from only their visible agents, and scope_expression/parameter_values are redacted — the execution's dispatcher is admitted to VIEW it (avoids a false 404 on a just-dispatched execution with no responses yet) but gets the same redacted projection as any other confined caller.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Final execution state", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) before the A4 approvals row.
         R"json(,
@@ -6865,7 +6865,25 @@ void RestApiV1::register_routes(
             std::vector<AgentExecStatus> agents;
             bool has_visible_agent = false;
             if (gate.scope) {
-                agents = execution_tracker->get_agent_statuses(exec_id);
+                // #1634 (Doomgoose review finding, important): a plain
+                // vector cannot distinguish "genuinely zero agent rows"
+                // from "a transient PG pool/query degrade" — the old
+                // get_agent_statuses collapsed both to empty, which could
+                // false-404 a genuine owner/visible caller AND permanently
+                // record a false CC7.2 `denied` audit row for a non-owner
+                // during a transient degrade. Fail closed (503) instead.
+                auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                if (!agents_opt) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::error_json_a4(503, "execution tracker degraded", cid,
+                                              /*retry_after_ms=*/5000,
+                                              "retry shortly; the agent-status read failed "
+                                              "transiently"),
+                        "application/json");
+                    return;
+                }
+                agents = std::move(*agents_opt);
                 for (const auto& a : agents)
                     has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
             }
@@ -6918,11 +6936,21 @@ void RestApiV1::register_routes(
                     if (!authz::in_scope(gate.scope, a.agent_id))
                         continue;
                     ++agents_targeted;
-                    ++agents_responded;
+                    // #1634 (Doomgoose review finding, important): only a
+                    // TERMINAL status counts as "responded" — matches
+                    // execution_tracker.cpp's canonical refresh_counts_once
+                    // recompute (agents_responded = COUNT(status IN
+                    // ('success','failure','timeout','rejected'))). This
+                    // loop previously incremented agents_responded for
+                    // EVERY in-scope row including 'running', so a confined
+                    // caller could see responded==targeted (100% progress)
+                    // while an agent was still executing.
                     if (a.status == "success") {
+                        ++agents_responded;
                         ++agents_success;
                     } else if (a.status == "failure" || a.status == "timeout" ||
                                a.status == "rejected") {
+                        ++agents_responded;
                         ++agents_failure;
                     }
                     if (!a.error_detail.empty() && a.completed_at >= newest_error_at) {
@@ -12180,8 +12208,21 @@ void RestApiV1::register_routes(
         // every SSE subscribe.
         bool has_visible_agent = false;
         if (gate.scope) {
-            auto agents = execution_tracker->get_agent_statuses(exec_id);
-            for (const auto& a : agents)
+            // #1634 (Doomgoose review finding, important): fail closed on a
+            // transient tracker degrade rather than silently treat it as
+            // "zero agents" — see get_agent_statuses_checked's doc comment.
+            auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+            if (!agents_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "execution tracker degraded", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry shortly; the agent-status read failed "
+                                          "transiently"),
+                    "application/json");
+                return;
+            }
+            for (const auto& a : *agents_opt)
                 has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
         }
         const bool owns_execution =

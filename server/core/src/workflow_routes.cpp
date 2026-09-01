@@ -376,10 +376,30 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             auto exec_id = req.matches[1].str();
             auto exec_opt = execution_tracker->get_execution(exec_id);
-            auto agents = execution_tracker->get_agent_statuses(exec_id);
+            // #1634 (Doomgoose review finding, important): fail closed on a
+            // transient tracker degrade rather than silently treat it as
+            // "zero agents" — see get_agent_statuses_checked's doc comment.
+            // Fetched unconditionally (not gated on gate.scope): every
+            // downstream consumer of `agents` below (KPI counts, decile
+            // bucketing, the per-agent table, the legacy-fallback in_set
+            // join) needs the real set for BOTH restricted and unrestricted
+            // callers — only the visibility/audit decision below is
+            // scope-conditional.
+            auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+            if (!agents_opt) {
+                res.status = 503;
+                res.set_content(
+                    "<div class=\"empty-state\">Execution tracker degraded — retry "
+                    "shortly.</div>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+            auto agents = std::move(*agents_opt);
             bool has_visible_agent = false;
-            for (const auto& a : agents)
-                has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+            if (gate.scope) {
+                for (const auto& a : agents)
+                    has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+            }
             const bool owns_execution =
                 exec_opt && exec_opt->dispatched_by == session->username;
             if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
@@ -810,13 +830,22 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     html_escape(format_iso_utc(exec.dispatched_at)) + "</div>";
             html += "<h4>Completed at</h4><div>" + html_escape(format_iso_utc(exec.completed_at)) +
                     "</div>";
-            if (!exec.scope_expression.empty()) {
+            // #1634 (Doomgoose review finding, blocking): this sidebar must
+            // apply the same confined projection as the REST twin
+            // (rest_api_v1.cpp GET /api/v1/executions/{id}) — ownership
+            // admits VISIBILITY only, never a bypass of this redaction,
+            // dispatcher included (mirrors that route's own comment).
+            const std::string scope_display =
+                gate.scope ? "(redacted - confined view)" : exec.scope_expression;
+            const std::string params_display =
+                gate.scope ? "(redacted - confined view)" : exec.parameter_values;
+            if (!scope_display.empty()) {
                 html += "<h4>Scope</h4><code class=\"exec-detail-scope\">" +
-                        html_escape(exec.scope_expression) + "</code>";
+                        html_escape(scope_display) + "</code>";
             }
-            if (!exec.parameter_values.empty()) {
+            if (!params_display.empty()) {
                 html += "<h4>Parameters</h4><pre class=\"exec-detail-params\">" +
-                        html_escape(exec.parameter_values) + "</pre>";
+                        html_escape(params_display) + "</pre>";
             }
             html += "</aside>";
 
@@ -902,8 +931,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  // waste on every SSE subscribe.
                  bool has_visible_agent = false;
                  if (gate.scope) {
-                     auto agents = execution_tracker->get_agent_statuses(exec_id);
-                     for (const auto& a : agents)
+                     // #1634 (Doomgoose review finding, important): fail
+                     // closed on a transient tracker degrade rather than
+                     // silently treat it as "zero agents" — see
+                     // get_agent_statuses_checked's doc comment.
+                     auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                     if (!agents_opt) {
+                         res.status = 503;
+                         res.set_content("live updates unavailable — tracker degraded, retry "
+                                        "shortly",
+                                        "text/plain; charset=utf-8");
+                         return;
+                     }
+                     for (const auto& a : *agents_opt)
                          has_visible_agent =
                              authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
                  }

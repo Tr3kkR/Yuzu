@@ -357,7 +357,11 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   `query_responses` row for that mechanism's current status.
   **Update (#1634, closed):** `query_responses`, `aggregate_responses`, and the REST
   `/executions/{id}/visualization` + `/api/responses` family all migrated onto `require_fleet_read`
-  in a later PR — `response_scope_fn`/`response_agent_in_scope` is retired on these surfaces. The
+  in a later PR — `response_scope_fn`/`response_agent_in_scope` no longer computes scope on any
+  of these surfaces. "Retired" describes the MECHANISM (nothing calls it to decide visibility
+  anymore), not a completed code deletion: `ResponseScopeFn response_scope_fn` remains an unused
+  parameter accepted and threaded through `rest_api_v1.cpp`'s constructor call chain (found in PR
+  #3793's review, minor, not fixed) — dead plumbing, not a live second gate. The
   dashboard scan fragment is unaffected by this update and remains as described.
 
   **Also NOT covered by #1712, found during this PR's own governance re-review and previously

@@ -28,11 +28,29 @@ std::string read_server_cpp() {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+std::string read_source_file(const std::string& filename) {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / filename);
+    REQUIRE(input.is_open());
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
 std::string route_block(const std::string& source, const std::string& marker) {
     const auto begin = source.find(marker);
     REQUIRE(begin != std::string::npos);
     const auto end = source.find("web_server_->", begin + marker.size());
     return source.substr(begin, (end == std::string::npos ? source.size() : end) - begin);
+}
+
+// Generic route-block extractor for files that don't share server.cpp's
+// `web_server_->` end-of-function idiom: bounded by an explicit end marker
+// instead (the next route registration, or a function-tail sentinel string).
+std::string route_block_bounded(const std::string& source, const std::string& start_marker,
+                                const std::string& end_marker) {
+    const auto begin = source.find(start_marker);
+    REQUIRE(begin != std::string::npos);
+    const auto end = source.find(end_marker, begin + start_marker.size());
+    REQUIRE(end != std::string::npos);
+    return source.substr(begin, end - begin);
 }
 
 } // namespace
@@ -79,4 +97,36 @@ TEST_CASE("legacy response routes retain the fleet gate and pre-serve scope filt
     CHECK(aggregate.find("response_store_->aggregate") != std::string::npos);
     CHECK(aggregate.find("agg_scope") < aggregate.find("response_store_->aggregate"));
     CHECK(list.find(R"({"count", arr.size()})") != std::string::npos);
+}
+
+// #1634 (Doomgoose review finding, important): the SSE per-event scope
+// projection (`classify_execution_event_for_scope`/
+// `sanitize_execution_event_for_scope`) is enforced only inside two
+// httplib route-registration lambdas — server.cpp's route family gets the
+// tripwire above, but these two never did. Deleting either call left the
+// whole suite green before this test existed: unit tests exercise the
+// classifier function directly (test_execution_event_bus.cpp), never the
+// actual SSE handler's use of it. This pins the call site, not the
+// function's own logic.
+TEST_CASE("REST /api/v1/events: scope projection call sites are present in source",
+          "[source_tripwire][1634][scope]") {
+    const auto source = read_source_file("rest_api_v1.cpp");
+    const auto block = route_block_bounded(source, R"d(sink.Get("/api/v1/events")d",
+                                           "registered all routes at /api/v1/*");
+    CHECK(block.find("classify_execution_event_for_scope(ev, scope)") != std::string::npos);
+    CHECK(block.find("sanitize_execution_event_for_scope(ev)") != std::string::npos);
+    CHECK(block.find("ExecutionEventVerdict::kDrop") != std::string::npos);
+    CHECK(block.find("ExecutionEventVerdict::kSanitize") != std::string::npos);
+}
+
+TEST_CASE("Dashboard SSE /sse/executions/{id}: scope projection call sites are present in source",
+          "[source_tripwire][1634][scope]") {
+    const auto source = read_source_file("workflow_routes.cpp");
+    const auto block =
+        route_block_bounded(source, R"d(sink.Get(R"(/sse/executions/([A-Za-z0-9_-]{1,128}))")d",
+                            R"d(sink.Get("/fragments/schedules")d");
+    CHECK(block.find("classify_execution_event_for_scope(ev, scope)") != std::string::npos);
+    CHECK(block.find("sanitize_execution_event_for_scope(ev)") != std::string::npos);
+    CHECK(block.find("ExecutionEventVerdict::kDrop") != std::string::npos);
+    CHECK(block.find("ExecutionEventVerdict::kSanitize") != std::string::npos);
 }
