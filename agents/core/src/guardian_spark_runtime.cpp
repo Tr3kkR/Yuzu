@@ -334,36 +334,43 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // Nested std::expected: the OUTER layer is io_executor_'s own bounded-wait
     // outcome (IoFailure); the INNER is backend_->arm()'s own synchronous refusal,
     // matching this function's own doc a few lines above.
-    IoResult<std::expected<std::uint64_t, std::string>> io_result;
-    try {
-        io_result = io_executor_.run(
-            *io_class, key, cfg_.backend_op_deadline,
-            [self_keepalive = shared_from_this(), backend = backend_, spec, key, rule_id,
-             gen]() -> std::expected<std::uint64_t, std::string> {
-                auto armed = backend->arm(spec);
-                if (!armed)
-                    return armed;
-                bool still_wanted = false;
-                {
-                    std::lock_guard<std::mutex> lk{self_keepalive->registry_mu_};
-                    const auto it = self_keepalive->arming_keys_.find(key);
-                    still_wanted = it != self_keepalive->arming_keys_.end() &&
-                                  it->second.rule_id == rule_id && it->second.generation == gen;
-                }
-                if (!still_wanted) {
-                    backend->disarm(*armed); // off-lock: this worker thread never held registry_mu_ for it
-                    return std::unexpected(std::string{"arm succeeded after abandonment"});
-                }
-                return armed;
-            });
-    } catch (...) {
+    // Gate 8 re-review (security-guardian): matches this function's own RAII
+    // convention instead of a bare try/catch/cleanup/rethrow. Declared and armed
+    // BEFORE the risky off-lock call, committed only once it returns without
+    // throwing - if it DOES throw, this guard's destructor fires during that
+    // unwind (fn() itself takes registry_mu_, since it isn't held here) and undoes
+    // phase 1's arming_keys_/index_ bookkeeping. No live subscription exists to
+    // disarm here (the exception means we never got an io_result at all,
+    // successful or not) - the in-memory cleanup is all that is needed.
+    GuardianRollback arming_rollback;
+    arming_rollback.fn = [this, key, rule_id, gen] {
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (const auto it = arming_keys_.find(key);
             it != arming_keys_.end() && it->second.rule_id == rule_id && it->second.generation == gen)
             arming_keys_.erase(it);
         index_->remove_rule(rule_id); // no-op if already withdrawn
-        throw;
-    }
+    };
+    auto io_result = io_executor_.run(
+        *io_class, key, cfg_.backend_op_deadline,
+        [self_keepalive = shared_from_this(), backend = backend_, spec, key, rule_id,
+         gen]() -> std::expected<std::uint64_t, std::string> {
+            auto armed = backend->arm(spec);
+            if (!armed)
+                return armed;
+            bool still_wanted = false;
+            {
+                std::lock_guard<std::mutex> lk{self_keepalive->registry_mu_};
+                const auto it = self_keepalive->arming_keys_.find(key);
+                still_wanted = it != self_keepalive->arming_keys_.end() &&
+                              it->second.rule_id == rule_id && it->second.generation == gen;
+            }
+            if (!still_wanted) {
+                backend->disarm(*armed); // off-lock: this worker thread never held registry_mu_ for it
+                return std::unexpected(std::string{"arm succeeded after abandonment"});
+            }
+            return armed;
+        });
+    arming_rollback.committed = true;
 
     std::optional<DisarmWork> stale_disarm; // set below iff we must undo a LATE success
     std::expected<std::uint64_t, std::string> outcome = new_gen;
@@ -386,14 +393,22 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                 // committed - it was never armed from the runtime's point of view.
                 // This EXTENDS the pre-existing "pending arm withdrawn -> no
                 // lifecycle entry" contract to a new, ORDINARY case (compliance
-                // review): pre-#2233 that contract only ever applied to the
-                // EXCEPTIONAL withdrawn-during-in-flight-arm path; since the backend
-                // arm itself is now bounded (cfg_.backend_op_deadline) rather than
-                // synchronous, this same branch is also reached by a routine
-                // timeout/stop racing a genuinely-succeeding-but-late arm - a real,
-                // not merely inherited, expansion of the no-audit-entry window from
-                // "exceptional" to "ordinary". No MISLEADING entry is ever written
-                // either way (silence reads as "not armed", which stays accurate),
+                // review, corrected per Gate 8 consistency re-review - the widener
+                // is stopping_, NOT a timeout: a timed-out io_executor_.run() call
+                // returns IoFailure::Timeout, which fails `armed_live` above and
+                // never reaches this branch at all): pre-#2233 the withdrawn arm
+                // could only be reached via the EXCEPTIONAL withdrawn-during-
+                // in-flight-arm path, because arm() itself ran synchronously under
+                // registry_mu_, so stopping_ could not flip mid-arm. Now that arm
+                // runs off-lock and bounded, stopping_ CAN flip while this rule's
+                // arm is still resolving, and a genuinely-succeeding-but-late arm
+                // can race it - a real, not merely inherited, expansion of the
+                // no-audit-entry window from "exceptional" to "ordinary". (The
+                // SEPARATE timeout-then-late-success case is handled entirely by
+                // the worker lambda's own still_wanted self-disarm check above -
+                // that generation never reaches this function's post-wait commit
+                // at all.) No MISLEADING entry is ever written either way (silence
+                // reads as "not armed", which stays accurate),
                 // but the window is wider than before this PR.
                 stale_disarm = DisarmWork{*io_class, key, **io_result};
             }
@@ -442,17 +457,25 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             // built for firing mid-unwind), so no inner try/catch is needed here.
             const std::uint64_t sub = **io_result;
             const IoClass sub_ioc = *io_class;
-            auto pk = std::make_shared<PerKey>();
-            pk->spec = spec;
-            pk->subscription = sub;
+            // Rollback armed BEFORE touching pk (Gate 8 re-review, happy-path): the
+            // original hand-rolled try wrapped make_shared<PerKey>() and the pk->
+            // assignments too, so a bad_alloc there still disarmed the live
+            // subscription. Constructing this guard AFTER those lines (an earlier
+            // draft of this RAII conversion did) would narrow that protection back
+            // to a leak on the exact rare-allocation-failure path this whole
+            // rollback exists for - keep the guard's scope at least as wide as the
+            // resource it protects.
             GuardianRollback rollback;
             rollback.fn = [this, rule_id, key, sub, sub_ioc, &lk] {
                 index_->remove_rule(rule_id); // undo phase 1's index_->add
-                keys_.erase(key);
+                keys_.erase(key); // no-op if make_shared<PerKey>/keys_.emplace never ran
                 rules_.erase(rule_id);
                 lk.unlock(); // BEFORE the bounded off-lock disarm - see the comment above
                 submit_disarm_off_lock(DisarmWork{sub_ioc, key, sub});
             };
+            auto pk = std::make_shared<PerKey>();
+            pk->spec = spec;
+            pk->subscription = sub;
             keys_.emplace(key, pk);
             commit_new_generation_locked(rule_id, gen, guard_type, rule_name, pk, std::move(rg),
                                          attach_now, waker, outbox_waker);
