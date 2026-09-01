@@ -198,11 +198,19 @@ Plugin-granularity seed from the ADR-3002 review inventory (dev @ 2026-07-23,
 private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
-**Raw `popen`/`system` helpers:**
-device_identity, ioc, network_diag, os_info, processes,
-vuln_scan, windows_updates.
-(`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
-sequence that cleanup against migrating it, tracked in #2380.)
+**Raw `popen`/`system` helpers** (one plugin per line, alphabetized — this
+list has been repeatedly corrupted into duplicate/stale entries by the
+automated dev-merge-into-open-PR-branches bot's line-based 3-way merge when
+two PRs independently touched the same wrapped line; keep it one-per-line so
+two independent edits land as two independent inserted lines instead):
+- device_identity
+- ioc
+- network_diag
+- os_info
+- processes
+- vuln_scan (carries code slated for retirement per ADR-0028/ADR-0018 —
+  sequence that cleanup against migrating it, tracked in #2380)
+- windows_updates
 
 **Migrated off raw spawn (Wave 4, PR4.2):** `event_logs` (Windows
 PowerShell `Get-WinEvent` via raw `_popen` promoted to rung-1 wevtapi
