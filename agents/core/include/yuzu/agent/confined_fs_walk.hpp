@@ -136,6 +136,20 @@ struct WalkFrame {
 /// policy" -- the walk records them and continues. Any OTHER refusal means the
 /// subtree was not traversed for a reason the walk cannot treat as a decision,
 /// and must stop it instead of silently completing.
+///
+/// This predicate answers CONTINUE-VS-STOP. It is NOT the complete-vs-incomplete
+/// question, which `note_outcome` below answers, and the two lists deliberately
+/// do not match: `DepthCap` appears here (a depth refusal does not stop the
+/// walk) AND in `note_outcome`'s incomplete set (a subtree went unvisited, so
+/// the walk is not complete). Both are correct simultaneously. Do not
+/// "harmonise" them -- they are answers to different questions, and making
+/// either list mirror the other reintroduces one of the two defect shapes this
+/// file exists to prevent.
+///
+/// `DepthCap` is currently unreachable through this predicate: it arrives via
+/// `Action::SkipEntry` (confined_fs_rules.hpp rule 6), never as an `open_dir`
+/// refusal reason from either platform shell. It is listed defensively so a
+/// shell that does start reporting it cannot accidentally stop the walk.
 constexpr bool is_policy_refusal(Reason r) {
     return r == Reason::SymlinkRejected || r == Reason::ReparseRejected ||
            r == Reason::DeviceBoundary || r == Reason::NotRegularFile ||
