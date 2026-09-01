@@ -24,6 +24,13 @@ PrincipalQuota::PrincipalQuota(PrincipalQuotaConfig cfg) : cfg_(cfg) {}
 
 PrincipalQuota::PerPrincipal& PrincipalQuota::locate_locked(
     const std::string& principal_id, std::chrono::steady_clock::time_point now) {
+    // Look up first, and only enforce the ceiling on the INSERT path: an existing
+    // key must never be able to evict a peer just by being used again.
+    if (auto it = principals_.find(principal_id); it != principals_.end())
+        return it->second;
+
+    enforce_cap_locked();
+
     auto [it, inserted] = principals_.try_emplace(principal_id);
     auto& pp = it->second;
     if (inserted) {
@@ -31,6 +38,34 @@ PrincipalQuota::PerPrincipal& PrincipalQuota::locate_locked(
         pp.last_refill = now;
     }
     return pp;
+}
+
+void PrincipalQuota::enforce_cap_locked() {
+    if (cfg_.max_tracked == 0 || principals_.size() < cfg_.max_tracked)
+        return;
+
+    // Evict the least-recently-seen entry that holds no in-flight reservation.
+    // `last_seen` is the wall clock (see the UP-4 note above) — good enough for a
+    // recency ordering, and a wall-clock step can at worst evict a slightly wrong
+    // victim, which costs that key a full bucket rather than any correctness.
+    auto victim = principals_.end();
+    for (auto it = principals_.begin(); it != principals_.end(); ++it) {
+        if (it->second.in_flight != 0)
+            continue;  // a live reservation must outlive the map entry it accounts to
+        if (victim == principals_.end() || it->second.last_seen < victim->second.last_seen)
+            victim = it;
+    }
+
+    // Every entry in-flight: allow the overshoot rather than deny. See the header
+    // comment on this function for why that is the right trade here.
+    if (victim == principals_.end())
+        return;
+
+    principals_.erase(victim);
+    evicted_ += 1;
+    // Fired under mu_ — see set_on_evict's contract. Kept to a counter bump.
+    if (on_evict_)
+        on_evict_();
 }
 
 void PrincipalQuota::refill_locked(PerPrincipal& pp,
@@ -51,7 +86,7 @@ QuotaSlot PrincipalQuota::try_acquire(const std::string& principal_id, QuotaSide
     // Clock reads BEFORE the lock (moved out of the critical section) — a
     // syscall/vDSO read has no business running while other threads block
     // on mu_. Both clocks are read once and reused for every use below.
-    const auto now_steady = std::chrono::steady_clock::now();
+    const auto now_steady = clock_();
     const double now_wall = now_epoch_seconds();
 
     std::lock_guard lock(mu_);
@@ -100,7 +135,7 @@ QuotaSlot PrincipalQuota::try_acquire(const std::string& principal_id, QuotaSide
 
 QuotaDecision PrincipalQuota::try_rate_only(const std::string& principal_id, QuotaSide side) {
     // Clock reads BEFORE the lock — see try_acquire's comment.
-    const auto now_steady = std::chrono::steady_clock::now();
+    const auto now_steady = clock_();
     const double now_wall = now_epoch_seconds();
 
     std::lock_guard lock(mu_);
@@ -171,6 +206,55 @@ void PrincipalQuota::release(const std::string& principal_id) noexcept {
         // better than aborting the process, and a mutex that cannot be locked means the
         // quota accounting is already unreliable.
     }
+}
+
+void PrincipalQuota::set_config(const PrincipalQuotaConfig& cfg) {
+    std::lock_guard lock(mu_);
+    cfg_ = cfg;
+    // Clamp existing buckets to a lowered burst. Without this a bucket filled
+    // under the old, larger ceiling would keep spending credit the new
+    // configuration never authorised, until it happened to drain.
+    for (auto& entry : principals_)
+        entry.second.tokens = std::min(entry.second.tokens, cfg_.burst);
+}
+
+void PrincipalQuota::set_on_evict(std::function<void()> fn) {
+    std::lock_guard lock(mu_);
+    on_evict_ = std::move(fn);
+}
+
+void PrincipalQuota::set_clock_for_test(ClockFn fn) {
+    std::lock_guard lock(mu_);
+    if (fn)
+        clock_ = std::move(fn);
+    else
+        clock_ = [] { return std::chrono::steady_clock::now(); };
+}
+
+void PrincipalQuota::refund(const std::string& principal_id) {
+    // Clock read BEFORE the lock — see try_acquire's comment.
+    const auto now_steady = clock_();
+
+    std::lock_guard lock(mu_);
+    // Deliberately find-not-insert: refunding an untracked principal is a no-op.
+    // A refund arriving after the sweeper (or the max_tracked ceiling) reclaimed
+    // the entry must not resurrect it — re-inserting here would mint a fresh
+    // FULL-burst bucket for a key that is no longer tracked, which is strictly
+    // more generous than the refund being dropped.
+    auto it = principals_.find(principal_id);
+    if (it == principals_.end())
+        return;
+
+    // Refill for elapsed time first, so the +1 lands on an up-to-date bucket and
+    // is then clamped by the same `burst` ceiling every other credit obeys — a
+    // refund can never take a principal above its configured burst.
+    refill_locked(it->second, now_steady);
+    it->second.tokens = std::min(cfg_.burst, it->second.tokens + 1.0);
+}
+
+std::uint64_t PrincipalQuota::evicted_count() const {
+    std::lock_guard lock(mu_);
+    return evicted_;
 }
 
 QuotaSlot::QuotaSlot(QuotaSlot&& other) noexcept

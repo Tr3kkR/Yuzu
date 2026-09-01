@@ -191,6 +191,7 @@
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
 #include "process_health.hpp"
+#include "grpc_bounds_rules.hpp"
 #include "rate_limiter.hpp"
 #include "security_headers.hpp"
 
@@ -572,6 +573,90 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+
+        // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
+        // per docs/observability-conventions.md so absent() alerts stay
+        // meaningful. Bounded labels only — never a peer identity or IP.
+        //
+        // The admission and deadline counters are OPERATIONAL, not security:
+        // a rate/concurrency rejection is expected steady-state behaviour under
+        // a fleet-wide update, not an attack signal (same reasoning as the
+        // per-principal quota counters below). The IDENTITY counter is the
+        // exception and carries event="security", because a failed certificate
+        // bind on an already-enrolled agent's OTA pull is an authentication
+        // event — it mirrors yuzu_grpc_revoked_cert_total.
+        metrics_.describe("yuzu_ota_download_admission_total",
+                          "Agent OTA DownloadUpdate admission decisions by outcome", "counter");
+        // `decision` is a genuine PARTITION over calls that REACH the admission
+        // gate — exactly one of these each. It is deliberately NOT a partition of
+        // every received DownloadUpdate: the on-behalf, revoked-certificate and
+        // positive-identity gates all return before admission and are counted by
+        // their own families, so this sum is legitimately lower than
+        // yuzu_grpc_requests_total{method="DownloadUpdate",status="received"}.
+        // Refunds are a separate family below precisely so they cannot break that.
+        for (auto d : {"admitted", "rejected_concurrency", "rejected_rate", "rejected_total"})
+            metrics_.counter("yuzu_ota_download_admission_total", {{"decision", d}});
+
+        metrics_.describe("yuzu_ota_download_refund_total",
+                          "Agent OTA rate tokens returned after a server-attributable failure, "
+                          "by reason",
+                          "counter");
+        for (auto r : {"registry_unavailable", "version_not_found", "package_missing",
+                       "transfer_deadline", "chunk_deadline"})
+            metrics_.counter("yuzu_ota_download_refund_total", {{"reason", r}});
+
+        metrics_.describe("yuzu_ota_download_deadline_exceeded_total",
+                          "Agent OTA DownloadUpdate transfers aborted by a server-imposed "
+                          "deadline, by phase",
+                          "counter");
+        for (auto ph : {"transfer", "write"})
+            metrics_.counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", ph}});
+
+        metrics_.describe("yuzu_ota_admission_key_mode_total",
+                          "Agent OTA admission keying actually used, by mode", "counter");
+        for (auto m : {"cert", "peer_ip", "unknown"})
+            metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", m}});
+
+        metrics_.describe("yuzu_grpc_ota_identity_rejected_total",
+                          "Agent OTA RPCs rejected for a missing or mismatched client "
+                          "certificate identity, by rpc and reason",
+                          "counter");
+        for (auto rpc : {"check_for_update", "download_update"})
+            for (auto reason :
+                 {"no_client_identity", "foreign_ca", "agent_id_missing", "agent_id_mismatch"})
+                metrics_.counter(
+                    "yuzu_grpc_ota_identity_rejected_total",
+                    {{"event", "security"}, {"rpc", rpc}, {"reason", reason}});
+
+        // Pre-seeded for the same reason as the rejection counter above: an alert
+        // or dashboard that divides by a series which does not exist yet reads as
+        // "no data", not as zero.
+        metrics_.describe("yuzu_ota_identity_audit_suppressed_total",
+                          "Identity-deny audit rows NOT written because the per-peer "
+                          "audit rate limit was exhausted, by rpc and reason",
+                          "counter");
+        for (auto rpc : {"check_for_update", "download_update"})
+            for (auto reason : {"foreign_ca", "agent_id_missing", "agent_id_mismatch"})
+                metrics_.counter("yuzu_ota_identity_audit_suppressed_total",
+                                 {{"rpc", rpc}, {"reason", reason}});
+
+        metrics_.describe("yuzu_ota_download_peers_tracked",
+                          "Peers currently tracked by the OTA admission map", "gauge");
+        metrics_.gauge("yuzu_ota_download_peers_tracked").set(0.0);
+
+        // Published so alerts express occupancy as a RATIO of the configured
+        // ceiling rather than hardcoding a threshold that silently becomes wrong
+        // the moment an operator retunes --ota-max-peers-tracked.
+        metrics_.describe("yuzu_ota_download_peers_capacity",
+                          "Configured ceiling on the OTA admission map (--ota-max-peers-tracked)",
+                          "gauge");
+        metrics_.gauge("yuzu_ota_download_peers_capacity")
+            .set(static_cast<double>(cfg_.ota_max_peers_tracked));
+
+        metrics_.describe("yuzu_ota_download_peers_evicted_total",
+                          "Peers evicted from the OTA admission map by its cardinality ceiling",
+                          "counter");
+        metrics_.counter("yuzu_ota_download_peers_evicted_total");
         // Per-principal quota cap exhaustions (PR 4.4, ADR-1005 class engine
         // principals). Pre-seed all 4 closed series to 0 (docs/observability-
         // conventions.md), mirroring yuzu_onbehalf_rejected_total above.
@@ -6886,6 +6971,30 @@ public:
         // OR operator-supplied). Register stays bootstrap-exempt (it issues the
         // first cert); every other RPC requires a verified, non-revoked identity.
         agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
+
+        // #913 / #911: bounds on the agent OTA pull path.
+        agent_service_.set_ota_bound_config(detail::AgentServiceImpl::OtaBoundConfig{
+            .max_concurrent_per_peer = cfg_.ota_max_concurrent_per_peer,
+            .rate_capacity = cfg_.ota_rate_capacity,
+            .rate_refill_per_min = cfg_.ota_rate_refill_per_min,
+            .transfer_deadline = std::chrono::seconds(cfg_.ota_transfer_deadline_secs),
+            .chunk_stall_deadline = std::chrono::seconds(cfg_.ota_chunk_write_deadline_secs),
+            .max_peers_tracked = static_cast<std::size_t>(cfg_.ota_max_peers_tracked),
+            .max_concurrent_total = cfg_.ota_max_concurrent_total,
+            .cert_reserve_pct = cfg_.ota_cert_reserve_pct,
+        });
+
+        // #416: require a positive peer identity on the OTA RPCs, and bind the
+        // request-body agent_id to the certificate.
+        //
+        // Gated on the LISTENER being strict, NOT on require_client_identity_
+        // above. They differ exactly where it matters: on default agent certs the
+        // agent listener deliberately relaxes to request-but-do-not-require so an
+        // unenrolled agent can bootstrap (see the credential block above), while
+        // require_client_identity_ is TRUE there. Gating on that would reject
+        // every bootstrapping agent's OTA pull.
+        agent_service_.set_require_positive_ota_identity(cfg_.tls_enabled &&
+                                                         !cfg_.using_default_agent_certs);
         // Only an install with our OWN issuing CA (built-in defaults today,
         // subordinate in PR6) signs agent CSRs. When the operator brought their
         // own certs there is no root in ca_store → no signer, and agents must carry
@@ -7065,6 +7174,34 @@ public:
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 30000);
+
+        // Server-wide resource bounds (#913's fleet-wide half). Until these, this
+        // builder carried keepalive/ping args and NOTHING else — no ResourceQuota,
+        // no stream cap, no sync-server thread bound anywhere in the tree. That
+        // absence is what turned the unbounded per-peer OTA path into a genuine
+        // capacity-monopolisation P0 rather than a theoretical one: a single
+        // authenticated agent could open unlimited concurrent streams, each
+        // pinning a gRPC thread on blocking disk and network I/O.
+        //
+        // Both bounds REJECT at capacity rather than queueing — queueing would
+        // hold the very threads the caps exist to free.
+        {
+            // Derivation lives in grpc_bounds_rules.hpp so the MiB->bytes
+            // arithmetic and its overflow guard are testable; these two lines are
+            // the thin application of it.
+            const auto bounds = grpc_bounds_from_config(cfg_);
+            builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS,
+                                       bounds.max_concurrent_streams);
+            grpc::ResourceQuota quota("yuzu_grpc");
+            quota.Resize(bounds.resource_quota_bytes);
+            // The THREAD ceiling is the one that bounds concurrent handlers
+            // globally. GRPC_ARG_MAX_CONCURRENT_STREAMS is per-connection and
+            // connections are uncapped, so without this nothing limits how many
+            // sync handlers — Subscribe, DownloadUpdate — run at once.
+            quota.SetMaxThreads(bounds.max_threads);
+            builder.SetResourceQuota(quota);
+        }
+
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, mgmt_creds);
         builder.RegisterService(&agent_service_);
