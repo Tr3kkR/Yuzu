@@ -160,6 +160,27 @@ TEST_CASE("detached CMS (fd): a tampered artifact is rejected through the fd for
     CHECK(err->kind == CmsFailure::kInvalid);
 }
 
+TEST_CASE("detached CMS (fd): a descriptor without read access fails CLOSED",
+          "[signature][cms][fd]") {
+    // THE CASE THAT HID A REAL BUG. Every other fd test here opens O_RDONLY — a
+    // readable descriptor the production path did not actually supply. The
+    // Windows updater staged its download GENERIC_WRITE|DELETE with no share
+    // access, so the handle the verifier read through had no read rights and
+    // every signed update was refused on that platform, invisibly to this suite.
+    //
+    // The behaviour is correct — unreadable content must never verify — so what
+    // this pins is the fail-closed direction, and it stands as the reason the
+    // updater's file handle must carry read access.
+    auto f = build_signing_fixtures();
+    const auto sig = read_file(f.sig_file);
+
+    const int fd = ::open(f.artifact_file.c_str(), O_WRONLY);
+    REQUIRE(fd >= 0);
+    auto err = verify_detached_cms_fd(fd, sig, f.trust_bundle);
+    ::close(fd);
+    REQUIRE(err.has_value()); // never "verified"
+}
+
 TEST_CASE("detached CMS (fd): a bad descriptor is rejected, not dereferenced",
           "[signature][cms][fd]") {
     auto f = build_signing_fixtures();
