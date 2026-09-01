@@ -61,7 +61,8 @@
   today, but against a hash the server supplied over the same channel — that is
   integrity, not authenticity, and it does not help if the channel or server is
   the thing you are defending against. Signing is release-plane work touching
-  the packaging pipeline and is tracked separately; #416 stays open.
+  the packaging pipeline and is tracked separately as #3807; #416 stays open
+  until that lands.
 - **Caveat — per-process, not fleet-wide.** OTA admission state lives in one
   server process's memory. Behind a load balancer with two or more replicas a
   peer that reconnects to a different replica gets a fresh allowance, so the
