@@ -174,6 +174,11 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `script_exec/do_bash#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_bash` | runner argv (`/bin/bash -c <script>`), script as ONE argv element | Linux/macOS | operator-supplied `script` param (admin-only action, server-gated) | **mutating** | bash itself interprets the script text (pipeline/redirection/glob/etc. all live inside bash's own interpretation); the outer spawn carries it as one opaque argv element, no shell hop before bash | none beyond the agent's existing service-account context; admin-only action gate | Reviewed — bash is the interpreter this action exists to invoke; no rung-1 substitute for "run an operator-authored bash script" | Rung 3 — Decision-5 governed-interpreter site; bash is the deepest interpreter intentionally invoked, same principle as PowerShell's `-EncodedCommand` and osascript's `-e` | Decision-5 interpreter registration (`bash_c`, unchanged from the prior `kActionDescriptors` entry — now prefixed `subprocess_runner:`) |
 | `script_exec/do_powershell#1` | `agents/plugins/script_exec/src/script_exec_plugin.cpp:do_powershell` | runner argv (`powershell.exe -NoProfile -NonInteractive -EncodedCommand <base64>`), `powershell.exe` at its fixed well-known System32 path (same location `interaction/input_windows#1` probes) | Windows | operator-supplied `script` param, Base64/UTF-16LE-encoded before assembly (admin-only action, server-gated) | **mutating** | PowerShell itself interprets the decoded script; the outer spawn is clean argv, no `cmd.exe`; `-EncodedCommand` exists specifically to remove all outer-shell escaping/injection surface | none beyond the agent's existing service-account context; admin-only action gate | Reviewed — PowerShell is the interpreter this action exists to invoke, same principle as `interaction/input_windows#1` | Rung 3 — Decision-5 governed-interpreter site, same as `interaction/input_windows#1` | Decision-5 interpreter registration (`powershell_encodedcommand`, unchanged from the prior `kActionDescriptors` entry — now prefixed `subprocess_runner:`) |
 | `content_dist/do_execute#1` | `agents/plugins/content_dist/src/content_dist_plugin.cpp:do_execute` (via `content_dist_exec_seam.hpp:execute_verified_payload`) | runner argv, hash-verified staged payload as absolute argv[0]; Linux additionally enables B6 fd-exec verification | Linux/macOS/Windows | staged file re-verified against agent KV's recorded SHA-256 (#808) immediately before this call, plus operator-supplied split `args` (validated against a shell-metacharacter denylist, `is_safe_arg`) | **mutating** | none — pre-split argv, no shell in between; the deleted OS-specific spawn paths never involved a shell either | agent service account | Reviewed — this action's contract is execution of the staged, hash-verified payload; no rung-1 substitute exists for "run a previously staged installer" | Rung 2 — direct argv via `yuzu::agent::run_bounded_subprocess`; rung 1 not applicable, same principle as `script_exec/do_exec#1` | n/a |
+| `tar/enumerate_services#1` | `agents/plugins/tar/src/tar_service_collector.cpp:enumerate_services` | runner argv (`systemctl list-units --type=service --all --plain --no-pager --no-legend`) | Linux | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false); no `/bin/sh -c` hop, `timeout 10` subsumed by the runner's own deadline | none | no rung-1 API for service enumeration in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess with a 10s deadline; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `tar/enumerate_services#2` | `agents/plugins/tar/src/tar_service_collector.cpp:enumerate_services` | runner argv (`launchctl list`) | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess with a 10s deadline; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `tar/enumerate_mapdrive#1` | `agents/plugins/tar/src/tar_mapdrive_collector.cpp:enumerate_mapdrive` | runner argv (`smbstatus -b`) | Linux | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false); `timeout 10` subsumed by the runner's own deadline | none | no rung-1 API for currently-connected inbound SMB sessions on Linux | 2 — direct argv via yuzu::agent::run_bounded_subprocess (10s deadline, 8 MiB output cap); rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `tar/enumerate_mapdrive_history#1` | `agents/plugins/tar/src/tar_mapdrive_collector.cpp:enumerate_mapdrive_history` | runner argv (`wevtutil qe Security /q:*[System[(EventID=4624)]] /c:5000 /f:text /rd:true`) | Windows | constant XPath filter, no interpolation; `wevtutil.exe` resolved via `system32_path` (absolute System32 path, not a PATH search) | read-only | none — the old `cmd /c`-level quoting around the XPath is gone (clean argv, no shell hop); `2>nul` subsumed by the runner's default stderr discard | none beyond the agent's existing Security-log read access | no rung-1 API for querying the Security event log's 4624 records with this filter in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess (15s deadline, 8 MiB output cap); rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `tar/enumerate_mapdrive_history#2` | `agents/plugins/tar/src/tar_mapdrive_collector.cpp:enumerate_mapdrive_history` | runner argv (`journalctl -u smbd --no-pager -o short-iso -n 5000`) | Linux | compile-time literal argv; fallback only when the on-disk `log.smbd` tail is empty | read-only | none | none | no rung-1 API for querying journald's smbd unit log with this filter in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess (15s deadline, 8 MiB output cap); rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -187,7 +192,7 @@ device_identity, hardware, installed_apps,
 device_identity, event_logs, hardware,
 ioc, license_scan,
 network_diag, os_info, processes,
-software_actions, tar, vuln_scan, windows_updates.
+software_actions, vuln_scan, windows_updates.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
 
@@ -340,10 +345,22 @@ on POSIX, neither one narrowed or widened by this migration — and now
 documented rather than left implicit: see the ENVIRONMENT comment block at
 `script_exec_plugin.cpp`'s top).
 
-**Direct exec via private helpers:** filesystem (filesystem is fully migrated
-onto the runner on the #2321 branch; content_dist's own `do_execute` site is
-now transcribed above as `content_dist/do_execute#1`, BR-007 whole-branch
-review round 2).
+**Migrated off raw spawn:** `tar` (service enumeration's `systemctl`/
+`launchctl` popen calls and mapdrive's Linux `smbstatus`/Windows `wevtutil`
+popen-style calls all moved to direct runner argv, rung 2 — see Registered
+sites above). Not raw-spawn migrations, but wired the same wave: `arp`
+gained native Linux (`/proc/net/arp`) and constrained macOS (`route_sysctl`
+sysctl dump) legs, and mapdrive gained a constrained macOS leg
+(`getfsstat`, outbound-live-only) — none of the three add a spawn site, so
+none get manifest rows; `software` (dpkg_rpm/pkgutil) remains kPlanned on
+Linux/macOS, not yet wired. `tar` carries zero raw spawn tokens now and is
+removed from `scripts/ci/check-plugin-spawn-lexical.sh`'s GRANDFATHERED
+allowlist.
+
+**Direct exec via private helpers:** script_exec, content_dist, filesystem
+(filesystem is fully migrated onto the runner on the #2321 branch;
+content_dist's own `do_execute` site is now transcribed above as
+`content_dist/do_execute#1`, BR-007 whole-branch review round 2).
 
 **Agent-core sites:** trigger_engine (2 sites), dex_linux_collector,
 dex_macos_collector.
