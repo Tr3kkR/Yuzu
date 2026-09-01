@@ -628,6 +628,18 @@ public:
                     "yuzu_grpc_ota_identity_rejected_total",
                     {{"event", "security"}, {"rpc", rpc}, {"reason", reason}});
 
+        // Pre-seeded for the same reason as the rejection counter above: an alert
+        // or dashboard that divides by a series which does not exist yet reads as
+        // "no data", not as zero.
+        metrics_.describe("yuzu_ota_identity_audit_suppressed_total",
+                          "Identity-deny audit rows NOT written because the per-peer "
+                          "audit rate limit was exhausted, by rpc and reason",
+                          "counter");
+        for (auto rpc : {"check_for_update", "download_update"})
+            for (auto reason : {"foreign_ca", "agent_id_missing", "agent_id_mismatch"})
+                metrics_.counter("yuzu_ota_identity_audit_suppressed_total",
+                                 {{"rpc", rpc}, {"reason", reason}});
+
         metrics_.describe("yuzu_ota_download_peers_tracked",
                           "Peers currently tracked by the OTA admission map", "gauge");
         metrics_.gauge("yuzu_ota_download_peers_tracked").set(0.0);

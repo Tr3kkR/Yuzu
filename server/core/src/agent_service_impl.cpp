@@ -1,5 +1,7 @@
 #include "agent_service_impl.hpp"
 
+#include "ota_audit_key.hpp"
+
 #include "on_behalf_guard.hpp"
 #include "ota_transfer_rules.hpp"
 
@@ -2349,11 +2351,36 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
         // The bucket key is the PEER, never the claimed agent_id: see the member's
         // own comment. Keying on the claim let a caller varying it per request mint
         // a fresh, always-admitting bucket every time.
-        const auto audit_key = ota_admission_key(*context);
-        const bool audit_worthy =
-            (std::string_view(reason) != "no_client_identity") &&
-            ota_identity_audit_limiter_.allow(std::string(rpc) + ":" + audit_key.mode + ":" +
-                                              audit_key.key);
+        //
+        // ORDER MATTERS on both counts. The store check comes FIRST so a token is
+        // never spent on a denial that could not have been written anyway, and the
+        // key comes from the shared composer so the peer/reason namespacing cannot
+        // drift — see ota_audit_key.hpp for what went wrong twice here.
+        //
+        // The limiter is consulted on REASON alone, before any check on whether a
+        // store is wired. Consulting it store-first would be marginally cheaper —
+        // no token is spent on a denial that could not have been written — but it
+        // would also make the bound unobservable without Postgres, and this bound
+        // has now shipped broken twice. A suppression counter that only moves on
+        // deployments with an audit store is not a counter anyone tests. The cost
+        // of the trade is one map entry per (rpc, reason, peer) on a server with
+        // no audit store, which the same handshake price already bounds.
+        bool audit_worthy = false;
+        if (std::string_view(reason) != "no_client_identity") {
+            const auto peer = ota_admission_key(*context);
+            audit_worthy = ota_identity_audit_limiter_.allow(
+                ota_identity_audit_key(rpc, reason, peer.mode, peer.key));
+            if (!audit_worthy) {
+                // The operator-facing half of the trade documented in audit-log.md
+                // and metrics.md: rows are sampled under a flood, and THIS is how
+                // an operator sees that it is happening rather than inferring it
+                // from a gap between two other numbers.
+                metrics_
+                    .counter("yuzu_ota_identity_audit_suppressed_total",
+                             {{"rpc", std::string(rpc)}, {"reason", reason}})
+                    .increment();
+            }
+        }
         if (audit_worthy && audit_store_ && audit_store_->is_open()) {
             const auto ids = extract_peer_identities(*context);
             const std::string cert_id = ids.empty() ? std::string{} : ids.front();

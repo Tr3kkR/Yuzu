@@ -437,16 +437,26 @@ private:
     /// counts every rejection regardless, so suppression shows as a gap between the
     /// counter and the row count, never as a missing signal.
     ///
-    /// KEYED ON THE PEER, NEVER ON THE CLAIM — and this is the whole correctness
-    /// of the bound. An earlier version keyed on `(rpc, claimed_agent_id)`, which
-    /// is the caller's own request field. `RateLimiter::allow` admits any NEW key
-    /// unconditionally (`try_emplace` + return true), so a caller varying the
-    /// claimed id per request minted a fresh bucket every time and was never
-    /// throttled at all — the bound existed only against a caller obliging enough
-    /// to reuse one id. It also inserted an unbounded map entry per request, keyed
-    /// on an unclamped attacker string, on a map whose `purge_stale()` has no
-    /// production caller. The key is now the peer's certificate identity, or its
-    /// source IP where it presented none: values a caller cannot vary at will.
+    /// KEYED ON THE PEER AND THE REASON, NEVER ON THE CLAIM. The key is built by
+    /// `ota_identity_audit_key` (ota_audit_key.hpp), which carries the full
+    /// history of what went wrong here twice; the short version is that keying on
+    /// the caller's `claimed_agent_id` did not bound anything, and keying on the
+    /// peer alone let a foreign-CA holder squat a victim's bucket.
+    ///
+    /// WHAT THIS DOES AND DOES NOT BOUND. A new bucket now costs a certificate
+    /// the listener accepts plus a TLS handshake, so it is no longer free to mint
+    /// — but it is not impossible either, and this is deliberately not described
+    /// as a value the caller cannot influence. The map itself is still unbounded:
+    /// `RateLimiter::purge_stale()` has no production caller, so entries live for
+    /// the process lifetime. That is tolerable only because the handshake cost
+    /// dominates: nobody exhausts memory here more cheaply than they exhaust the
+    /// TLS path. `kMaxAuditKeyIdentity` clamps the per-entry cost. Wiring an
+    /// eviction sweep is tracked separately.
+    ///
+    /// Every path reaching this limiter has already presented a certificate: the
+    /// certless case is `no_client_identity`, which short-circuits above. So the
+    /// key's mode is "cert" in practice, and the peer_ip arm exists for the
+    /// composer's completeness rather than as a reachable branch here.
     RateLimiter ota_identity_audit_limiter_{2};
 
     /// One in this many admission rejections is logged (the first always is).
