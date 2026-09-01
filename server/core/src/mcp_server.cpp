@@ -1811,8 +1811,13 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"query_audit_log", {"AuditLog", "Read"}},
     {"list_definitions", {"InstructionDefinition", "Read"}},
     {"get_definition", {"InstructionDefinition", "Read"}},
-    {"query_responses", {"Response", "Read"}},
-    {"aggregate_responses", {"Response", "Read"}},
+    // #1634 (adversarial-review C3/D7) — migrated onto fleet_read_fn_, which
+    // gives these a REAL confinement mechanism (meet(management-group,
+    // service-scope)), same as get_agent_details above — reclassified from
+    // the default `denied` so a correctly-confined service-scoped token gets
+    // a real, filtered answer instead of a blanket 403.
+    {"query_responses", {"Response", "Read", ServiceScopeClass::confined}},
+    {"aggregate_responses", {"Response", "Read", ServiceScopeClass::confined}},
     {"query_inventory", {"Infrastructure", "Read"}},
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
@@ -1823,8 +1828,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_compliance_summary", {"Policy", "Read"}},
     {"get_fleet_compliance", {"Policy", "Read"}},
     {"list_management_groups", {"ManagementGroup", "Read"}},
-    {"get_execution_status", {"Execution", "Read"}},
-    {"list_executions", {"Execution", "Read"}},
+    // #1634 (adversarial-review K3/D3 follow-up) — both migrated onto
+    // fleet_read_fn_ alongside the response tools above; same reclassification
+    // rationale.
+    {"get_execution_status", {"Execution", "Read", ServiceScopeClass::confined}},
+    {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
@@ -5500,6 +5508,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     scope_arg = std::move(in_scope); // engaged-empty means no rows
                 }
+                // #1634 (adversarial-review C4/D8): `poll_hint` was resolved above from
+                // the RAW tracker read, before scope was known — a confined caller with
+                // ZERO visible agents on this execution could otherwise learn "running"
+                // vs "terminal/nonexistent" via `retry_after_ms`'s presence alone, even
+                // though every response row is filtered out. Suppress it the same way the
+                // instruction_id-only path already suppresses an unknowable hint: nullopt,
+                // not false, so the poll-rate counter isn't diluted either.
+                if (poll_hint && scope_arg && scope_arg->empty())
+                    poll_hint.reset();
 
                 auto responses_opt = !exec_id.empty()
                                          ? response_store->query_by_execution(exec_id, rq, scope_arg)
@@ -6375,15 +6392,23 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── get_execution_status ──────────────────────────────────────
+            // #1634 (adversarial-review K3/D3 follow-up) — migrated onto
+            // fleet_read_fn_, mirroring REST GET /api/v1/executions/{id}
+            // exactly: no-existence-oracle 404 for invisible-vs-nonexistent,
+            // dispatcher-ownership admits visibility only (never bypasses the
+            // confined projection), and a visible-only recompute of the
+            // per-agent counts + a redacted scope_expression for a confined
+            // non-owner.
             if (tool_name == "get_execution_status") {
-                if (!tier_allows(tier, "Execution", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_execution_status: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Execution", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!execution_tracker) {
                     res.set_content(
                         error_response(id, kInternalError, "Execution tracker unavailable"),
@@ -6392,26 +6417,61 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto exec_id = param_str(args, "execution_id");
                 auto exec = execution_tracker->get_execution(exec_id);
-                if (!exec) {
+                auto agents = execution_tracker->get_agent_statuses(exec_id);
+                bool has_visible_agent = false;
+                for (const auto& a : agents)
+                    has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+                const bool owns_execution = exec && exec->dispatched_by == session->username;
+                const bool visible = !gate.scope || owns_execution || has_visible_agent;
+                if (!exec || !visible) {
+                    spdlog::debug("get_execution_status: {} exec_id={}",
+                                  exec ? "outside caller fleet-read scope" : "no match", exec_id);
+                    mcp_audit("denied", "not found or outside caller's fleet-read scope: " + exec_id);
                     res.set_content(
                         error_response(id, kInvalidParams, "Execution not found: " + exec_id),
                         "application/json");
                     return;
                 }
-                auto summary = execution_tracker->get_summary(exec_id);
-                auto obj =
-                    JObj()
-                        .add("id", exec->id)
-                        .add("definition_id", exec->definition_id)
-                        .add("status", exec->status)
-                        .add("scope_expression", exec->scope_expression)
-                        .add("dispatched_by", exec->dispatched_by)
-                        .add("dispatched_at", exec->dispatched_at)
-                        .add("agents_targeted", static_cast<int64_t>(exec->agents_targeted))
-                        .add("agents_responded", static_cast<int64_t>(exec->agents_responded))
-                        .add("agents_success", static_cast<int64_t>(exec->agents_success))
-                        .add("agents_failure", static_cast<int64_t>(exec->agents_failure))
-                        .add("progress_pct", static_cast<int64_t>(summary.progress_pct));
+                int64_t agents_targeted = exec->agents_targeted;
+                int64_t agents_responded = exec->agents_responded;
+                int64_t agents_success = exec->agents_success;
+                int64_t agents_failure = exec->agents_failure;
+                int64_t progress_pct =
+                    execution_tracker->get_summary(exec_id).progress_pct;
+                std::string scope_expression = exec->scope_expression;
+                if (gate.scope) {
+                    // #1634 residual: see REST GET /api/v1/executions/{id} — agent status
+                    // rows are response-arrival seeded, not dispatch-time target seeded,
+                    // so this intentionally undercounts pending in-scope targets.
+                    agents_targeted = agents_responded = agents_success = agents_failure = 0;
+                    for (const auto& a : agents) {
+                        if (!authz::in_scope(gate.scope, a.agent_id))
+                            continue;
+                        ++agents_targeted;
+                        ++agents_responded;
+                        if (a.status == "success")
+                            ++agents_success;
+                        else if (a.status == "failure" || a.status == "timeout" ||
+                                a.status == "rejected")
+                            ++agents_failure;
+                    }
+                    progress_pct = agents_targeted > 0
+                                       ? (agents_responded * 100 / agents_targeted)
+                                       : 0;
+                    scope_expression = "(redacted - confined view)";
+                }
+                auto obj = JObj()
+                               .add("id", exec->id)
+                               .add("definition_id", exec->definition_id)
+                               .add("status", exec->status)
+                               .add("scope_expression", scope_expression)
+                               .add("dispatched_by", exec->dispatched_by)
+                               .add("dispatched_at", exec->dispatched_at)
+                               .add("agents_targeted", agents_targeted)
+                               .add("agents_responded", agents_responded)
+                               .add("agents_success", agents_success)
+                               .add("agents_failure", agents_failure)
+                               .add("progress_pct", progress_pct);
                 // #3344: retry_after_ms is emitted ONLY while non-terminal, via
                 // the shared mcp::is_execution_terminal() predicate (Gate 8
                 // fold: this and query_responses' poll-hint independently
@@ -6428,15 +6488,25 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── list_executions ───────────────────────────────────────────
+            // #1634 (adversarial-review K3/D3 follow-up) — migrated onto
+            // fleet_read_fn_. Execution rows carry no single agent_id (they
+            // fan out to many), so per-row visible-agent filtering would need
+            // a per-execution agent-status lookup per row — an N+1 pattern
+            // (ADR-0017 INV-10). Until a batched version exists, a confined
+            // caller is restricted to their OWN dispatches (`dispatched_by`
+            // pushed into the SQL WHERE, ExecutionQuery::dispatched_by) —
+            // cheap, provably safe (never another operator's execution), and
+            // consistent with the dispatcher-ownership precedent elsewhere.
             if (tool_name == "list_executions") {
-                if (!tier_allows(tier, "Execution", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_executions: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Execution", "Read"))
-                    return;
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
                 if (!execution_tracker) {
                     res.set_content(
                         error_response(id, kInternalError, "Execution tracker unavailable"),
@@ -6446,6 +6516,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 ExecutionQuery eq;
                 eq.definition_id = param_str(args, "definition_id");
                 eq.status = param_str(args, "status");
+                if (gate.scope)
+                    eq.dispatched_by = session->username;
                 eq.limit = std::min(param_int32(args, "limit", 50), 500);
                 auto execs = execution_tracker->query_executions(eq);
                 JArr arr;

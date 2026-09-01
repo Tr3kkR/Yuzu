@@ -130,24 +130,24 @@ partial-index predicate. Every query against this index must include
 scan. See `query_by_execution`'s SQL in `response_store.cpp` for the
 canonical form.
 
-**Management-group scope is applied AFTER the LIMIT, in the handler — not in the
-SQL.** The MCP `query_responses` collect path runs a per-agent
-`check_scoped_permission` filter on the returned rows (#1550), *after* the store
-has applied `ORDER BY timestamp DESC LIMIT`. **NOTE (#1634): this filter is INERT
-under the current global `Response:Read` gate** — a holder of global `Response:Read`
-(the only principal that passes the gate) admits every agent, so no rows are
-dropped, while a management-group-confined operator is 403'd at the gate before the
-filter runs. So it does **not** today provide cross-operator isolation: a normal
-caller sees all agents' rows. Its only active effect is failing **closed** on a
-corrupt/load-failed `rbac.db`. When the #1634 admit-then-filter gate makes scoping
-effective, this after-LIMIT placement means an execution that fans out wider than
-the row cap and spans both in- and out-of-scope agents can have the cap consumed by
-out-of-scope rows, truncating the in-scope caller's view (or a row present in one
-poll vanishes from the next as the window shifts) — at that point the isolation
-holds (never another operator's rows) but completeness does not. The handler flags
-truncation with `result_truncated_by_cap:true`; the durable fix (scope-aware keyset
-pagination + pushing the predicate into the WHERE clause) is part of the #1634
-follow-up. The same applies to every other operator-facing reader of this store.
+**Management-group scope is now applied BEFORE the LIMIT, in the SQL (#1634,
+ADR-0017 INV-3).** The MCP `query_responses` collect path — and the legacy REST
+`/api/responses/{id}/export` and catch-all list — resolve the caller's visible-agent
+set (`ResponseStore::distinct_agent_ids`/`distinct_agent_ids_by_execution`) and push
+it into `ResponseStore::query`/`query_by_execution` as SQL `agent_id IN (...)`
+**before** `ORDER BY ... LIMIT`, via a new optional scope parameter (mirroring
+`aggregate()`'s existing `AggregateScope`). This closes a real defect the first
+#1634 migration pass shipped: filtering *after* `LIMIT` meant an execution that
+fans out wider than the row cap and spans both in- and out-of-scope agents could
+have the cap consumed entirely by out-of-scope rows, handing a confined caller a
+short or empty page despite visible rows existing further back — found by an
+adversarial review (Kimi + Codex) citing this exact INV-3 text. `result_truncated_by_cap:true`
+now signals that the CALLER'S OWN scoped query hit the cap, not a raw-then-filtered
+cap hit that could fire entirely inside another operator's rows. The gate itself
+(`require_fleet_read`/`fleet_read_fn_`) replaced the old flat `Response:Read` check
+these readers sat behind, so a management-group-confined operator is admitted and
+narrowed rather than 403'd outright. The same applies to every other
+operator-facing reader of this store.
 
 ## PR 3 — SSE live updates
 

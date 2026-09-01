@@ -7191,7 +7191,7 @@ Aggregate response data for a command (counts, summaries).
 
 Export response data in CSV format.
 
-**Hardening (#1634, partial).** On a **corrupt or unavailable RBAC store**, these three readers fail **closed** — `GET /api/responses/{id}` and `/export` return no rows; `/aggregate` returns `503` — rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of these readers for normal operators is **not yet effective**: a holder of global `Response:Read` sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). Scripted/Grafana consumers of `/aggregate` that start receiving `503`/empty after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
+**Confined (#1634).** All three readers are gated by `require_fleet_read` (ADR-0017 admit-then-filter) — a management-group-confined operator is admitted and sees only their in-scope agents' rows, real cross-operator isolation rather than the earlier inert per-row filter. `/export` and the catch-all GET push the visible-agent set into the underlying SQL query before `LIMIT`/`OFFSET` (ADR-0017 INV-3), so a confined caller's page reflects only their own visible rows. On a **corrupt or unavailable RBAC store**, all three still fail **closed** — `GET /api/responses/{id}` and `/export` return no rows; `/aggregate` returns `503` — rather than exposing the whole fleet via the legacy read fallback. Scripted/Grafana consumers of `/aggregate` that start receiving `503`/empty after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
 
 ---
 

@@ -218,6 +218,10 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
         sql += " AND status = $" + std::to_string(idx++);
         params.push_back(q.status);
     }
+    if (!q.dispatched_by.empty()) {
+        sql += " AND dispatched_by = $" + std::to_string(idx++);
+        params.push_back(q.dispatched_by);
+    }
     sql += " ORDER BY dispatched_at DESC LIMIT $" + std::to_string(idx++);
     params.push_back(std::to_string(q.limit));
 

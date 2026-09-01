@@ -68,6 +68,16 @@ struct Execution {
 struct ExecutionQuery {
     std::string definition_id;
     std::string status;
+    /// #1634: restricts to executions dispatched by this exact principal.
+    /// Empty (the default) is unrestricted. Used by MCP `list_executions`
+    /// for a management-group-confined caller — executions carry no single
+    /// `agent_id` to filter by (they fan out to many), so "own dispatches
+    /// only" is the cheap, provably-safe confinement until a real per-row
+    /// visible-agent-intersection check exists (that would need a
+    /// per-execution agent-status lookup per row — an N+1 pattern ADR-0017
+    /// INV-10 calls out as a latency/DoS surface, not something to add
+    /// silently inside a LIST route).
+    std::string dispatched_by;
     int limit{100};
     /// When true, populate `Execution::last_error_detail` via a correlated
     /// subquery on `agent_exec_status`. Default false because most callers

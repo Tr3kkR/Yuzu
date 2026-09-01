@@ -5334,6 +5334,97 @@ TEST_CASE("MCP get_execution_status: #3344 retry_after_ms present only while non
     CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
+// #1634 (adversarial-review K3/D3 follow-up): get_execution_status migrated onto
+// fleet_read_fn_, mirroring REST GET /api/v1/executions/{id}. Real RBAC/mgmt-group
+// composition via ResponseExecutionAuthzPgRig — not a fake gate callback.
+TEST_CASE("MCP get_execution_status: confined non-owner gets visible-only projection (#1634)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-scope";
+    exec.scope_expression = "agent:secret-target";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::server::AgentExecStatus bob_status;
+    bob_status.agent_id = "bob-agent";
+    bob_status.status = "success";
+    tracker.update_agent_status(exec_id, bob_status);
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "failure";
+    tracker.update_agent_status(exec_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":730,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+            exec_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["agents_targeted"] == 1);
+    CHECK(sc["agents_responded"] == 1);
+    CHECK(sc["agents_success"] == 1);
+    CHECK(sc["agents_failure"] == 0);
+    CHECK(sc["scope_expression"] == "(redacted - confined view)");
+    CHECK(res->body.find("agent:secret-target") == std::string::npos);
+}
+
+// #1634: execution rows carry no single agent_id, so a confined caller is
+// restricted to their own dispatches (ExecutionQuery::dispatched_by) rather than
+// a full per-row visible-agent check — never another operator's execution.
+TEST_CASE("MCP list_executions: confined caller sees only own dispatches (#1634)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution bob_exec;
+    bob_exec.definition_id = "def-list-scope";
+    bob_exec.dispatched_by = "bob";
+    bob_exec.status = "running";
+    REQUIRE(tracker.create_execution(bob_exec).has_value());
+    yuzu::server::Execution alice_exec;
+    alice_exec.definition_id = "def-list-scope";
+    alice_exec.dispatched_by = "alice";
+    alice_exec.status = "running";
+    REQUIRE(tracker.create_execution(alice_exec).has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":731,"params":{"name":"list_executions","arguments":{"definition_id":"def-list-scope"}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"]["executions"];
+    REQUIRE(sc.size() == 1);
+    CHECK(sc[0]["dispatched_by"] == "bob");
+}
+
 TEST_CASE("MCP Agentic demo: ceo_demo prompt is live-only and ignores injected args (ADR-0016)",
           "[mcp][integration][agentic-demo][prompt-injection][review-1653]") {
     McpTestServer ts;
@@ -7913,6 +8004,52 @@ TEST_CASE("MCP query_responses: management-group scope filters another operator'
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+}
+
+// #1634 (adversarial-review C4/D8): retry_after_ms used to read execution_tracker
+// directly, before the scope filter, so a confined caller with zero visible
+// agents on an out-of-scope execution_id could learn "non-terminal" via the
+// hint's mere presence even though every response row was filtered out.
+TEST_CASE("MCP query_responses: retry_after_ms suppressed for confined caller with no "
+          "visible agent (#1634)",
+          "[pg][mcp][integration][response][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-oracle";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp(exec_id, "def-oracle", "alice-agent", 0, "alice-only", 0));
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.response_store_for_test = &store;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":732,)"
+                    R"("params":{"name":"query_responses","arguments":{"execution_id":")") +
+            exec_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK_FALSE(sc.contains("retry_after_ms"));
+    CHECK(res->body.find("alice-only") == std::string::npos);
 }
 
 TEST_CASE("MCP query_responses: unrestricted fleet gate preserves legacy-open rows",
