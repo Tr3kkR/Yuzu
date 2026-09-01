@@ -155,8 +155,17 @@ void run_pkg_metadata_surface(ProbeHost& host, std::vector<LicRecord>& records,
     if (!dpkg_query.empty()) {
         // license_scan/run_pkg_metadata_surface_linux#2 (docs/agent-spawn-sink-manifest.md)
         // Same byte-identical-queryformat reasoning as the rpm branch above.
+        // Format string is its OWN argv element (never "-f=<value>"): unlike a
+        // GNU long option, dpkg-query's short "-f" does not strip a joined
+        // "=" -- it is taken as a literal leading character of the format
+        // string, so every emitted row silently gained a stray "=" prefix on
+        // its first (package-name) field, which then broke the
+        // "/usr/share/doc/<pkg>/copyright" lookup below for every package
+        // (verified empirically against real dpkg-query on Ubuntu 20.04/
+        // 22.04/24.04 and Debian 11 -- exit 0 in all four, but every line
+        // prefixed with "=").
         const auto res = run_argv(
-            {dpkg_query, "-W", "-f=${Package}\\t${Version}\\t${db:Status-Abbrev}\\n"});
+            {dpkg_query, "-W", "-f", "${Package}\\t${Version}\\t${db:Status-Abbrev}\\n"});
         if (res.truncated) {
             outcomes.push_back({"pkg_metadata", false, 0, "output_truncated"});
             return;

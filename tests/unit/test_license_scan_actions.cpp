@@ -116,6 +116,7 @@ TEST_CASE("license_scan plugin: surfaces reports probe_status diagnostics via Lo
     // so pinning `|ok|` specifically proves the migrated argv actually
     // reached the real tool and succeeded, not merely that the surface was
     // attempted.
+    INFO("full captured output: " << result.captured);
     CHECK(result.captured.find("probe_status|pkg_metadata|ok|") != std::string::npos);
 #endif
 }
