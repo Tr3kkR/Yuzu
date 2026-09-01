@@ -301,11 +301,16 @@ constexpr const char* kCapturePrefix = ".yuzu_cfs_capture_";
 
 std::optional<std::string> make_capture_name() {
     unsigned char raw[8];
-    const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
+    // ScopedFd, not a raw open/close pair: manual cleanup in new code is a
+    // governance policy floor even where no early return currently sits between
+    // acquire and release, because the next edit is what introduces one.
+    ScopedFd urandom{::open("/dev/urandom", O_RDONLY | O_CLOEXEC)};
+    if (!urandom.valid())
         return std::nullopt;
-    ssize_t got = ::read(fd, raw, sizeof raw);
-    ::close(fd);
+    ssize_t got = 0;
+    do {
+        got = ::read(urandom.get(), raw, sizeof raw);
+    } while (got < 0 && errno == EINTR); // short/interrupted read is not a failure to ignore
     if (got != static_cast<ssize_t>(sizeof raw))
         return std::nullopt;
     static const char* kHex = "0123456789abcdef";
