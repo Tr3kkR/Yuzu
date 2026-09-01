@@ -15465,7 +15465,34 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
+            // post-fetch filter on a paginated read can hand a confined caller a short or
+            // empty page even though visible rows exist past the hidden ones LIMIT already
+            // truncated. Mirrors the /aggregate sibling's resolve-then-scope pattern above.
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t export_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++export_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15475,21 +15502,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope rows before export.
-            std::size_t export_dropped = 0;
-            if (gate.scope) {
-                std::unordered_set<std::string> dropped_ids;
-                std::vector<StoredResponse> visible;
-                visible.reserve(results.size());
-                for (auto& r : results) {
-                    if (authz::in_scope(gate.scope, r.agent_id))
-                        visible.push_back(std::move(r));
-                    else
-                        dropped_ids.insert(r.agent_id);
-                }
-                results.swap(visible);
-                export_dropped = dropped_ids.size();
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (export_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
@@ -15577,7 +15589,33 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET — see the /export sibling above
+            // for the full rationale (post-fetch filtering a paginated read can hand a
+            // confined caller a short or empty page).
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t get_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++get_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15587,21 +15625,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope rows before serving.
-            std::size_t get_dropped = 0;
-            if (gate.scope) {
-                std::unordered_set<std::string> dropped_ids;
-                std::vector<StoredResponse> visible;
-                visible.reserve(results.size());
-                for (auto& r : results) {
-                    if (authz::in_scope(gate.scope, r.agent_id))
-                        visible.push_back(std::move(r));
-                    else
-                        dropped_ids.insert(r.agent_id);
-                }
-                results.swap(visible);
-                get_dropped = dropped_ids.size();
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (get_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,

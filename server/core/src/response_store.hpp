@@ -227,14 +227,24 @@ public:
     /// Degrade-distinguishable read: `std::nullopt` on a store/pool/query
     /// failure (see the file header's posture note); an engaged EMPTY vector
     /// is a genuine "no rows" result.
+    /// `scope` (#1634, ADR-0017 INV-3): applied as SQL `agent_id IN (...)` /
+    /// `AND 1=0` BEFORE `ORDER BY`/`LIMIT`/`OFFSET`, same semantics and same
+    /// type as `aggregate()`'s scope below. Post-fetch filtering a paginated
+    /// read is a fail-open pagination bug — a confined caller's page can come
+    /// back short or empty even though visible rows exist past the hidden
+    /// ones a route-level filter would have dropped after the LIMIT already
+    /// truncated them. `nullopt` (the default) is byte-identical to every
+    /// pre-#1634 caller.
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
-    query(const std::string& instruction_id, const ResponseQuery& q = {}) const;
+    query(const std::string& instruction_id, const ResponseQuery& q = {},
+         const AggregateScope& scope = std::nullopt) const;
     /// Exact-correlation lookup keyed on `execution_id` (PR 2). Empty
     /// `execution_id` is rejected (returns an engaged empty vector, NOT
     /// nullopt) — that sentinel is the legacy path; callers must fall back
-    /// to `query()` if they support pre-PR-2 data.
+    /// to `query()` if they support pre-PR-2 data. `scope`: see `query()`.
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
-    query_by_execution(const std::string& execution_id, const ResponseQuery& q = {}) const;
+    query_by_execution(const std::string& execution_id, const ResponseQuery& q = {},
+                       const AggregateScope& scope = std::nullopt) const;
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
     get_by_instruction(const std::string& instruction_id) const;
     [[nodiscard]] std::optional<std::vector<AggregationResult>>
@@ -264,6 +274,12 @@ public:
     /// #1634 unhappy-path UP-2).
     [[nodiscard]] std::optional<std::vector<std::string>>
     distinct_agent_ids(const std::string& instruction_id) const;
+    /// `execution_id`-keyed twin of `distinct_agent_ids` (#1634), same
+    /// nullopt-on-error / fail-closed contract — for callers (MCP
+    /// `query_responses`'s execution_id path) that key their query by
+    /// `execution_id` rather than `instruction_id`.
+    [[nodiscard]] std::optional<std::vector<std::string>>
+    distinct_agent_ids_by_execution(const std::string& execution_id) const;
     /// Total response count. Degrades to 0 (matches the pre-migration
     /// contract; not in the ADR-0039 optional-wrapped set — this is an
     /// operator-facing gauge, not a fan-out/authz decision input).

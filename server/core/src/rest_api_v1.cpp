@@ -6878,7 +6878,17 @@ void RestApiV1::register_routes(
             std::string last_error_detail = e.last_error_detail;
             std::string scope_expression = e.scope_expression;
             std::string parameter_values = e.parameter_values;
-            if (gate.scope && !owns_execution) {
+            // #1634 adversarial-review finding (blocker): `owns_execution` above exists
+            // ONLY to admit a dispatcher to their own execution before any response has
+            // landed (the visibility check has no other way to avoid a false 404 on a
+            // just-dispatched, zero-status-row execution) — it must never also bypass
+            // this projection. `dispatched_by` is historical provenance, not a current
+            // authorization axis: an operator later confined out of a management group
+            // (or reading an execution dispatched before they were ever confined) must
+            // not retain durable full-fidelity access to another agent's counts/errors
+            // just because they happened to be the one who fired the dispatch. Apply the
+            // confined projection whenever `gate.scope` is engaged, dispatcher or not.
+            if (gate.scope) {
                 // #1634 residual: agent status rows are response-arrival seeded, not
                 // dispatch-time target seeded. A confined non-dispatcher can therefore
                 // see a teammate's execution only after an in-scope response lands.

@@ -5458,15 +5458,52 @@ McpServer::HandlerFn McpServer::build_handler(
                 // freshly minted by execute_instruction on this server cannot
                 // have pre-PR-2 untagged rows, so a fallback would only risk
                 // folding in another execution's responses.
-                auto responses_opt = !exec_id.empty()
-                                         ? response_store->query_by_execution(exec_id, rq)
-                                         : response_store->query(instr_id, rq);
                 // Audit target is the primary correlation key actually used:
                 // execution_id when present (the exact-correlation path), else
                 // instruction_id. When both are supplied execution_id wins, so
                 // a dual-id call is recorded under the execution_id it served —
                 // deliberate (execution_id is the agentic-dispatch unit).
                 const std::string& key = !exec_id.empty() ? exec_id : instr_id;
+
+                // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and
+                // push it into the SQL WHERE clause BEFORE LIMIT, not as a post-fetch
+                // filter — a post-fetch filter on a capped read can hand a confined
+                // caller a short or empty result even though visible rows exist past the
+                // hidden ones the LIMIT already truncated. Mirrors aggregate_responses'
+                // resolve-then-scope pattern; `distinct_agent_ids`/`_by_execution` picks
+                // the twin matching whichever id this call used.
+                AggregateScope scope_arg; // nullopt = unrestricted
+                bool scope_filtered = false;
+                std::size_t dropped_agents = 0;
+                if (gate.scope) {
+                    auto distinct = !exec_id.empty()
+                                        ? response_store->distinct_agent_ids_by_execution(exec_id)
+                                        : response_store->distinct_agent_ids(instr_id);
+                    if (!distinct) {
+                        mcp_audit("failure", "store degraded; " + key);
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "Response store degraded — query failed", {},
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    std::vector<std::string> in_scope;
+                    in_scope.reserve(distinct->size());
+                    for (auto& aid : *distinct) {
+                        if (authz::in_scope(gate.scope, aid)) {
+                            in_scope.push_back(std::move(aid));
+                        } else {
+                            scope_filtered = true;
+                            ++dropped_agents;
+                        }
+                    }
+                    scope_arg = std::move(in_scope); // engaged-empty means no rows
+                }
+
+                auto responses_opt = !exec_id.empty()
+                                         ? response_store->query_by_execution(exec_id, rq, scope_arg)
+                                         : response_store->query(instr_id, rq, scope_arg);
                 if (!responses_opt) {
                     mcp_audit("failure", "store degraded; " + key);
                     res.set_content(
@@ -5477,36 +5514,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto responses = std::move(*responses_opt);
 
-                // Did the raw query hit the row cap BEFORE scope filtering? If so the
-                // result is incomplete (more rows exist past the LIMIT). Capture this
-                // pre-filter so we can flag result_truncated_by_cap below — the filter
-                // shrinks `responses`, so `responses.size()` post-filter can't tell us.
+                // The scoped query's own LIMIT now bounds the IN-SCOPE result directly,
+                // so hitting it means this caller's own visible view was truncated —
+                // more precise than the old raw-then-filter signal, which could fire on
+                // a cap hit entirely inside another operator's out-of-scope rows.
                 const bool hit_cap = responses.size() == static_cast<std::size_t>(rq.limit);
-
-                // #1550 / #1634: filter through the fleet-read gate's already-resolved
-                // VisibleSet. A null scope is unrestricted and remains byte-identical.
-                // NOTE: the filter
-                // runs AFTER the store LIMIT, so a fan-out wider than the cap that spans
-                // out-of-scope agents may truncate the in-scope view (keyset follow-up
-                // #1634); the isolation guarantee — never another operator's rows —
-                // holds regardless, and result_truncated_by_cap signals the gap.
-                bool scope_filtered = false;
-                std::size_t dropped_agents = 0;
-                if (gate.scope) {
-                    std::unordered_set<std::string> dropped_ids;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(responses.size());
-                    for (auto& r : responses) {
-                        if (authz::in_scope(gate.scope, r.agent_id)) {
-                            visible.push_back(std::move(r));
-                        } else {
-                            scope_filtered = true;
-                            dropped_ids.insert(r.agent_id);
-                        }
-                    }
-                    responses.swap(visible);
-                    dropped_agents = dropped_ids.size();
-                }
 
                 JArr arr;
                 for (const auto& r : responses) {

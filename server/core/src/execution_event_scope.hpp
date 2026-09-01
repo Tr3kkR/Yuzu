@@ -39,11 +39,25 @@ classify_execution_event_for_scope(const ExecutionEvent& ev, const authz::Visibl
     return ExecutionEventVerdict::kDrop;
 }
 
-/// Preserve the event identity and terminal signal while removing execution-wide
-/// counts and per-agent detail from a confined caller's completed event.
+/// Preserve the event identity and the REAL terminal status while removing
+/// execution-wide counts and per-agent detail from a confined caller's
+/// completed event. Publishers (`ExecutionTracker::refresh_counts_once`,
+/// `mark_cancelled`) stamp a string `status` field — `succeeded`/`completed`
+/// or `cancelled` — that a confined subscriber must still see truthfully:
+/// hard-coding "completed" here would tell an operator a cancelled or failed
+/// execution succeeded, exactly the terminal signal the caller is watching
+/// this stream for. Only when the field is absent or the payload itself is
+/// malformed do we fall back to a fixed value, rather than fail closed and
+/// drop the caller's only terminal signal outright.
 [[nodiscard]] inline ExecutionEvent sanitize_execution_event_for_scope(const ExecutionEvent& ev) {
     ExecutionEvent sanitized = ev;
-    sanitized.data = R"({"status":"completed"})";
+    std::string status = "completed";
+    if (const auto payload = nlohmann::json::parse(ev.data, nullptr, false);
+        !payload.is_discarded() && payload.is_object()) {
+        if (const auto it = payload.find("status"); it != payload.end() && it->is_string())
+            status = it->get_ref<const std::string&>();
+    }
+    sanitized.data = nlohmann::json{{"status", status}}.dump();
     return sanitized;
 }
 

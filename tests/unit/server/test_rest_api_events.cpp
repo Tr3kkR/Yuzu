@@ -1091,18 +1091,24 @@ TEST_CASE("GET /api/v1/executions/{id}: invisible and nonexistent ids share one 
     CHECK(invisible_json == missing_json);
 }
 
-TEST_CASE("GET /api/v1/executions/{id}: confined dispatcher sees own unredacted execution",
+TEST_CASE("GET /api/v1/executions/{id}: confined dispatcher is visible but still projected",
           "[pg][events][executions][scope][owner]") {
+    // #1634 adversarial-review fix: dispatcher ownership admits the caller to their
+    // OWN execution (avoids a false 404 before any response has landed) but must
+    // NEVER bypass the confined projection — a dispatcher later confined out of a
+    // management group (or reading an execution dispatched before they were ever
+    // confined) must not retain durable full-fidelity access to hidden-agent data
+    // just because they fired the dispatch.
     RestEventsHarness h;
     auto exec_id = h.make_exec("running", "tester");
     h.fleet_read_scope = authz::deny_all();
 
     auto res = h.sink.Get("/api/v1/executions/" + exec_id);
     REQUIRE(res);
-    REQUIRE(res->status == 200);
-    CHECK(res->body.find("agent:secret-target") != std::string::npos);
-    CHECK(res->body.find("agent-hidden") != std::string::npos);
-    CHECK(res->body.find("redacted - confined view") == std::string::npos);
+    REQUIRE(res->status == 200); // visible: dispatcher ownership still avoids the 404
+    CHECK(res->body.find("agent:secret-target") == std::string::npos);
+    CHECK(res->body.find("agent-hidden") == std::string::npos);
+    CHECK(res->body.find("redacted - confined view") != std::string::npos);
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: confined non-owner gets visible-only projection",
