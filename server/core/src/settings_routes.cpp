@@ -5626,6 +5626,24 @@ void SettingsRoutes::register_routes(
                       // recovery codes are issued either way, but the
                       // operator-facing message and audit detail must be
                       // honest about which happened).
+                      // A benign concurrency race (a second verify of the same
+                      // code, or a disable+re-init that superseded the secret)
+                      // resolves to MfaAlreadyEnrolled. It is NOT a rejected code
+                      // and NOT a store outage — audit it distinctly so it does
+                      // not inflate bad-code-attempt counts (#3777, CC7.2), and
+                      // tell the operator the true state rather than "code
+                      // rejected". `MfaAlreadyEnrolled` is not in
+                      // is_store_unavailable(), so no false 503/degrade path.
+                      if (codes_res.error() == AuthDBError::MfaAlreadyEnrolled) {
+                          audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
+                                    "already enrolled by a concurrent verify; no duplicate "
+                                    "enrollment");
+                          res.set_content(
+                              render_mfa_fragment(session->username, {}, {}, {}, session->username,
+                                                  "MFA is already enrolled on this account."),
+                              "text/html; charset=utf-8");
+                          return;
+                      }
                       const bool store_unavailable = is_store_unavailable(codes_res.error());
                       if (store_unavailable && metrics_registry_) {
                           metrics_registry_

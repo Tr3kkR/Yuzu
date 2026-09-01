@@ -2484,11 +2484,19 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         std::vector<std::string> recovery_codes;
         bool verified = false;
         bool store_unavailable = false;
+        bool already_enrolled = false;
         if (is_totp) {
             auto r = db->mfa_verify_enrollment(entry.username, code);
             if (r) {
                 recovery_codes = std::move(*r);
                 verified = true;
+            } else if (r.error() == AuthDBError::MfaAlreadyEnrolled) {
+                // A benign concurrency race (a second verify of the same code, or
+                // a disable+re-init that superseded the secret) already resolved
+                // this account's enrollment. NOT a wrong code and NOT an outage —
+                // handled distinctly below so it neither burns a pending attempt
+                // nor emits a false store-unavailable signal (#3777, CC7.2).
+                already_enrolled = true;
             } else if (is_store_unavailable(r.error())) {
                 // ★ SECURITY (architect BLOCK): a decrypt/store failure must
                 // NEVER be treated as "wrong code" here either — same
@@ -2497,6 +2505,27 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // instead of burning an attempt on a transient outage.
                 store_unavailable = true;
             }
+        }
+
+        if (already_enrolled) {
+            // Distinct benign outcome: audit as a race (not a rejected code),
+            // drop the now-moot pending entry, and tell the caller the true
+            // state. No session is minted (as on every non-success path here);
+            // the operator simply completes login normally, now enrolled.
+            audit_log_for_principal(req, "mfa.enroll.race", "ok", entry.username,
+                                    auth::role_to_string(entry.role), "User", entry.username,
+                                    "already enrolled by a concurrent verify; no duplicate "
+                                    "enrollment");
+            {
+                std::lock_guard lock(mfa_pending_mu_);
+                mfa_pending_.erase(pending);
+            }
+            res.status = 409;
+            res.set_content(
+                R"({"error":{"code":409,"message":"MFA is already enrolled on this account"},)"
+                R"("meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
         }
 
         if (store_unavailable) {
