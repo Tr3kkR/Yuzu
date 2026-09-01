@@ -144,6 +144,11 @@ under `server/core/src/` plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
+One known hole, deliberately accepted: event-level `paths:` evaluation
+inspects a bounded diff window (the #1978 limitation that moved `ci.yml`
+onto `detect-code-change.sh`), so a very large PR touching a fuzzed file
+can skip both legs; adopting the detect-code-change pattern here is
+tracked on #3771.
 
 `cflite-batch.yml` (push-to-dev on those paths; manual dispatch once the
 file is on `main` — until then push-to-dev is its only live trigger) grows

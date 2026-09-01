@@ -29,7 +29,13 @@ on:
     # out-of-family include, add the new family glob to both workflows in
     # the same change. Narrowing matters because affected-target pruning
     # fails OPEN (an empty affected set keeps ALL targets), so this filter
-    # is the only mechanism that makes an unrelated PR free.
+    # is the only mechanism that makes an unrelated PR free. KNOWN
+    # EXCEPTION (#1978 class): GitHub evaluates event-level paths: against
+    # a bounded diff window, so a very large PR touching a fuzzed file
+    # can skip BOTH legs entirely - the same limitation that moved ci.yml
+    # onto detect-code-change.sh. Accepted for now (documented in
+    # docs/ci-architecture.md; adopting the detect-code-change pattern is
+    # tracked on #3771).
     paths:
       - 'server/core/src/preflight_parse*'
       - 'server/core/src/deployment_parse*'

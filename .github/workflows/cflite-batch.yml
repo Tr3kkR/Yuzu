@@ -11,7 +11,12 @@
 #              cifuzz-coverage-latest, which cflite-pr.yml's build step uses
 #              for affected-target pruning.
 #   prune    - minimizes the stored corpus (replaces it wholesale); manual
-#              dispatch only, run sparingly.
+#              dispatch only, run sparingly, and INSTEAD OF batch in that
+#              run: the GHA v4 artifact backend rejects a same-name upload
+#              within one run and upstream cifuzz discards its `replace`
+#              flag and swallows the error ("del replace"; catch-log-
+#              continue), so a prune sequenced after batch in the same run
+#              would greenly discard its result forever.
 #
 # Triggers: push to dev, gated on the same fuzzed-closure paths as
 # cflite-pr.yml (KEEP the two lists in lockstep - identical except each
@@ -20,7 +25,12 @@
 # this lands on dev; workflow_dispatch (and with it the prune job) only
 # becomes available once this file reaches the DEFAULT branch (main) -
 # until then push-to-dev is the only live trigger and the corpus goes
-# unminimized. There is deliberately NO
+# unminimized. Once dispatch IS available, the UI defaults its ref to
+# main - every job below is therefore ref-guarded to dev, because a
+# main-ref run would build the months-stale tree and publish a
+# fresh-timestamped, stale-content cifuzz-coverage-latest that misdirects
+# every PR's pruning (the exact hazard the no-cron decision below
+# rejects): ALWAYS select ref=dev when dispatching. There is deliberately NO
 # cron: schedule only fires from the DEFAULT branch (main), which lags dev
 # by months - a cron run would build main's stale tree, its coverage
 # upload would then be the freshest cifuzz-coverage-latest most weeks and
@@ -62,7 +72,7 @@ on:
   workflow_dispatch:
     inputs:
       prune:
-        description: 'Also run corpus prune after batch'
+        description: 'Run corpus prune INSTEAD of batch (select ref=dev)'
         type: boolean
         default: false
 
@@ -80,6 +90,10 @@ permissions: {}
 jobs:
   batch:
     name: Batch fuzz (address sanitizer)
+    # Push runs are dev-only by the trigger; a dispatch must be on the dev
+    # ref (see header) and prune=true dispatches run prune INSTEAD (the
+    # same-run artifact-name collision in the header's prune bullet).
+    if: github.event_name == 'push' || (github.ref == 'refs/heads/dev' && !inputs.prune)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -102,7 +116,7 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           mode: batch
           sanitizer: address
-          # Total budget split across the 4 targets (~450s each);
+          # Total budget split evenly across the retained targets;
           # parallel-fuzzing multiplies throughput within each slice.
           fuzz-seconds: 1800
           parallel-fuzzing: true
@@ -134,14 +148,16 @@ jobs:
 
   prune:
     name: Corpus prune
-    # Explicit dispatch only - prune REPLACES the stored corpus wholesale
-    # (a prune against a broken/flaky target sheds corpus permanently once
-    # prior artifact versions expire), so it never runs unattended and only
-    # after a fresh batch upload. Dispatch requires this file on main (see
-    # header); once available, an occasional (roughly quarterly) prune is
-    # plenty at this corpus size.
-    if: github.event_name == 'workflow_dispatch' && inputs.prune
-    needs: batch
+    # Explicit dispatch only, dev ref only, and INSTEAD of batch - never
+    # `needs: batch`: a batch upload earlier in the same run would make
+    # prune's same-name re-upload collide and be silently discarded (see
+    # header). Prune builds its own fuzzers and downloads the newest
+    # PRIOR run's corpus. It REPLACES the stored corpus wholesale (a prune
+    # against a broken/flaky target sheds corpus permanently once prior
+    # artifact versions expire), so it never runs unattended. Dispatch
+    # requires this file on main (see header); once available, an
+    # occasional (roughly quarterly) prune is plenty at this corpus size.
+    if: github.event_name == 'workflow_dispatch' && inputs.prune && github.ref == 'refs/heads/dev'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -206,8 +222,10 @@ jobs:
               ``,
               `**Run:** ${runUrl}`,
               ``,
-              `While this is open, corpus/coverage artifacts stop updating and`,
-              `PR-side fuzzing silently degrades to seed corpora + keep-all`,
+              `While this is open, corpus/coverage artifacts stop updating;`,
+              `PR-side fuzzing continues on stale corpus/coverage (stale`,
+              `coverage can mis-prune an affected target) until those`,
+              `artifacts expire, then falls back to seed corpora + keep-all`,
               `pruning. Not a merge gate.`,
               ``,
               `(auto-posted by .github/workflows/cflite-batch.yml — close after a green run.)`,
@@ -235,4 +253,62 @@ jobs:
                 labels: [label],
                 body,
               });
+            }
+
+  # Mirror of nightly.yml's close-on-green: a recovered pipeline should not
+  # leave a stale alarm for a human to notice. Plain success() means this is
+  # skipped whenever batch/coverage were skipped (a prune-only dispatch says
+  # nothing about batch health).
+  close-on-green:
+    name: "Close cflite-batch-broken on green"
+    needs: [batch, coverage]
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Close any open cflite-batch-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const label = 'cflite-batch-broken';
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            const sha = '${{ github.sha }}';
+            const body = [
+              `ClusterFuzzLite batch run @ \`${sha.substring(0, 7)}\` is **green** (batch + coverage).`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `Corpus and coverage artifacts are updating again; closing automatically.`,
+              ``,
+              `(auto-closed by .github/workflows/cflite-batch.yml — re-opened by the alert job if a future run fails.)`,
+            ].join('\n');
+
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 100,
+            });
+            if (open.data.length === 0) {
+              core.notice('No open cflite-batch-broken issues to close.');
+              return;
+            }
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.notice(`Closed cflite-batch-broken issue #${issue.number}`);
             }
