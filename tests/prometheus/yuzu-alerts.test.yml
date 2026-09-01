@@ -202,11 +202,12 @@ tests:
         eval_time: 60m
         exp_samples: []
 
-  # CASE Q -- a benign rollout tail must NOT page. A large rollout completes ~20
-  # transfers a minute and loses one every ten to a genuinely slow link: a real
-  # abort stream, but 0.5% of traffic. An operator who silences this during every
-  # rollout has no silent-outage detector left, which is why the bar is a
-  # proportion and not the count of aborts.
+  # CASE Q -- a benign rollout tail must NOT page. A large rollout completes 20
+  # transfers a minute and loses one a minute to a genuinely slow link: a real,
+  # continuous abort stream, but 5% of traffic. An operator who silences this
+  # during every rollout has no silent-outage detector left, which is why the bar
+  # is a proportion and not the count of aborts -- in absolute terms this case
+  # produces MORE aborts per hour than CASE B1 below, which must page.
   - interval: 1m
     name: ota transfers aborting - a benign rollout tail stays quiet
     input_series:
@@ -219,12 +220,12 @@ tests:
         eval_time: 90m
         exp_samples: []
 
-  # CASE Q2 -- THE CASE AN ABSOLUTE BAR COULD NOT SEE, and the reason this rule
-  # is a proportion. A 30-agent site where EVERY device fails to update, forever.
-  # Agents check every 6h, so 30 failing agents produce 30 aborts in 6h — about
-  # 5 an hour, which never clears a bar of 3 per 30m no matter how long the
-  # outage runs. As a proportion it reads 1.0: every transfer that starts,
-  # aborts.
+  # CASE Q2 -- THE CASE AN ABSOLUTE BAR COULD NOT SEE, and the first reason this
+  # rule is a proportion. A small site where EVERY device fails to update,
+  # forever. The fixture runs one abort and one admission per minute; on a real
+  # 30-agent site checking 6-hourly the same shape arrives more slowly, and the
+  # point is identical either way -- the absolute count never clears a fixed bar
+  # while the proportion reads 1.0, because every transfer that starts, aborts.
   - interval: 1m
     name: ota transfers aborting - a small totally-broken fleet fires
     input_series:
@@ -237,6 +238,57 @@ tests:
         eval_time: 120m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
+            value: 1
+
+  # CASE B1 -- THE CASE A 0.2 PROPORTION COULD NOT SEE, and the second reason the
+  # bar is 0.1. A satellite site inside a larger fleet: 1200 transfers an hour
+  # complete, 180 abort on `transfer`, permanently, because the deadline is below
+  # artifact_size/link_throughput for that site. 15% of the fleet can never
+  # update again. At a 0.2 bar this detector stayed green forever; note also that
+  # this fires while CASE Q -- which produces MORE aborts per hour in absolute
+  # terms -- stays quiet, which no fixed count could achieve.
+  - interval: 1m
+    name: ota transfers aborting - a permanently-failing site fires
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+3x180"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+20x180"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 120m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
+            value: 1
+
+  # CASE C1 -- a nearly-idle server must NOT page. One admission and one abort in
+  # the whole hour reads a proportion of 1.0, which is why the rule carries an
+  # `admitted >= 4` guard: a ratio over a denominator of one is not evidence.
+  - interval: 1m
+    name: ota transfers aborting - a nearly-idle server stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0 1 1x180"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0 1 1x180"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE D1 -- a chronically undersized ceiling on a small fleet refuses only a
+  # few agents an hour, indefinitely. A bar of >3/hr left exactly that state
+  # permanently silent, so the capacity bar is >1.
+  - interval: 1m
+    name: ota server capacity - sustained low-rate saturation fires
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0+1x20 20+0x20 20+1x20 40+0x140"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 75m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
 
   # ── YuzuOtaPeerMapEvicting (#935 / UP-8) ─────────────────────────────────

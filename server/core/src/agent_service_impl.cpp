@@ -2328,15 +2328,12 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
         // drift after a mass re-image, which needs no attacker at all and scales
         // with fleet size (UP-4).
         //
-        // So only a rejection that names a RESOLVABLE PRINCIPAL is audited: the
-        // peer presented a certificate we recognise, and the dispute is about which
-        // agent it claims to be. That is the forensically interesting case and it
-        // is bounded by the size of the issued-certificate population.
-        // `no_client_identity` — no cert at all — has no principal to attribute, is
-        // the cheapest case to forge in volume, and is left metric-only. That is
-        // the same split reject_revoked_peer already makes for `heartbeat` ("a
-        // flood must not hammer the WAL") and the no-resolvable-principal carve-out
-        // in docs/observability-conventions.md.
+        // `no_client_identity` — no cert at all — has no principal to attribute,
+        // is the cheapest case to forge in volume, and is left metric-only. That
+        // is the same split reject_revoked_peer already makes for `heartbeat` ("a
+        // flood must not hammer the WAL") and the no-resolvable-principal
+        // carve-out in docs/observability-conventions.md.
+        //
         // RATE-BOUNDED, and the earlier justification for not bounding it was
         // wrong. It claimed the audited reasons were "bounded by the size of the
         // issued-certificate population"; they are bounded by the number of

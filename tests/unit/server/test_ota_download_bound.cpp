@@ -308,7 +308,7 @@ TEST_CASE("OTA identity gate: identity is checked BEFORE admission", "[ota][iden
     CHECK(st.error_code() == grpc::StatusCode::UNAUTHENTICATED);
 }
 
-TEST_CASE("OTA identity gate: the metric counts every rejection, unsampled",
+TEST_CASE("OTA identity gate: the rejection counter is not nested in the audit branch",
           "[ota][identity][grpc]") {
     // THE SAFETY PROPERTY OF THE AUDIT RATE LIMIT. The identity-deny audit write
     // is now gated by a per-peer token bucket, because that write is synchronous,

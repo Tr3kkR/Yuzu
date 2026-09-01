@@ -3850,7 +3850,9 @@ groups:
             docs/user-manual/audit-log.md), so do not look for one. A short burst during a
             fleet-wide rollout is benign; a sustained signal is not.
 
-            Threshold note: a `for:` shorter than the lookback debounces NOTHING —
+            Threshold note (the lookback is [1h] and `for:` is 15m; an earlier
+            form used [15m]/10m, which debounced nothing) — a `for:` shorter than
+            the lookback debounces NOTHING —
             increase() over [15m] stays positive for a full 15m after a single
             event, so `for: 10m` fired on one rejection. The bar is a count, not a
             duration, for that reason.
@@ -3874,8 +3876,11 @@ groups:
             this should be flat at zero, so any sustained signal is either a
             misconfigured agent or an identity being spoofed. The reason label
             says which. Paired forensic evidence is the
-            session.ota_identity_rejected audit row (note `no_client_identity` is
-            metric-only and writes none).
+            session.ota_identity_rejected audit rows for attribution. Read VOLUME from
+            this counter, never from the row count: rows undercount for two
+            separate reasons — `no_client_identity` is metric-only and writes
+            none, and the row is rate-limited per peer, with suppressed rows
+            counted by yuzu_ota_identity_audit_suppressed_total.
 
             Window note: the lookback is an HOUR and `for:` is deliberately SHORTER
             than it. A `for:` at least as long as the lookback can never be
@@ -3919,15 +3924,23 @@ groups:
 
       - alert: YuzuOtaTransfersAborting
         expr: |
-          sum by (job, instance, phase) (
-            increase(yuzu_ota_download_deadline_exceeded_total[1h])
+          (
+            sum by (job, instance, phase) (
+              increase(yuzu_ota_download_deadline_exceeded_total[1h])
+            )
+              / on (job, instance) group_left ()
+            clamp_min(
+              sum by (job, instance) (
+                increase(yuzu_ota_download_admission_total{decision="admitted"}[1h])
+              ), 1
+            ) > 0.1
           )
-            / on (job, instance) group_left ()
-          clamp_min(
+          and on (job, instance)
+          (
             sum by (job, instance) (
               increase(yuzu_ota_download_admission_total{decision="admitted"}[1h])
-            ), 1
-          ) > 0.2
+            ) >= 4
+          )
         for: 15m
         labels:
           severity: warning
@@ -3941,7 +3954,39 @@ groups:
             every aborted transfer refunds its rate token, so the buckets never
             drain, YuzuOtaRefundDivergence stays quiet, and the agent retries on its
             own 6-hourly timer. The fleet simply stops updating while every other
-            dashboard stays green. Check the phase label — `transfer` means the
+            dashboard stays green.
+
+            Threshold note, and it is the whole design of this rule. Two review
+            rounds each proved one half of this from opposite ends.
+
+            An ABSOLUTE count cannot work: agents check every 6h, so N agents all
+            failing produce only N/12 aborts per 30m, and any fixed bar goes blind
+            below some fleet size — a bar of 3 left every fleet under ~36 agents
+            unable to page while 100% of its devices failed, forever. Adding an
+            absolute arm back ALONGSIDE the proportion does not rescue it either: a
+            permanently-broken 15% of a large fleet and a benign 5% rollout tail on a
+            fleet three times larger produce the same absolute count, so no fixed bar
+            separates them. Only the proportion does.
+
+            The bar is 0.1 rather than 0.2 because 0.2 was proved blind to a permanent
+            15%-of-fleet outage — a whole site unable to update, forever, with this
+            detector green. The `admitted >= 4` guard exists because the ratio is
+            meaningless on a nearly-idle server: one admission and one abort in an
+            hour reads 1.0 and would page. The denominator is separately clamped at 1
+            so the division itself is total.
+
+            HONEST RESIDUAL: a fleet where under ~10% of devices fail permanently sits
+            below this bar. That is deliberate — real fleets carry a standing trickle
+            of slow links — but it is a blind spot, not a proof of health.
+
+            Window note: `for:` is deliberately SHORTER than the lookback. A `for:` at
+            least as long as the lookback can never be satisfied by a signal sparser
+            than the window, which is how a 30m-on-[30m] form failed to fire at any
+            evaluation time at all. `phase` is preserved in the aggregation because
+            this description tells the operator to read it; the denominator carries no
+            `phase`, hence the explicit `on (job, instance) group_left ()`.
+
+            Check the phase label — `transfer` means the
             whole-transfer budget was too small for the artifact on that link
             (900s over a 100 MiB binary implies a ~0.93 Mbit/s floor), `write` means
             a single chunk stalled. Correlate with
@@ -3951,7 +3996,7 @@ groups:
         expr: |
           sum by (job, instance) (
             increase(yuzu_ota_download_admission_total{decision="rejected_total"}[1h])
-          ) > 3
+          ) > 1
         for: 30m
         labels:
           severity: warning

@@ -913,9 +913,16 @@ agent's OTA pull is an authentication event; it mirrors
 `yuzu_grpc_revoked_cert_total` and is paired with a
 `session.ota_identity_rejected` audit row (the metric is the signal, the audit
 row is the evidence). **This counter is complete; the audit row is not.** The row
-is rate-limited to roughly two per second per peer, because that write is
+is rate-limited to roughly two per second per (peer, RPC, reason), because that write is
 synchronous, Postgres-backed, and sits ahead of the per-peer admission bound. Use
-this counter to measure volume during a flood, and the rows for attribution. Note that verb is deliberately distinct from
+this counter to measure volume during a flood, and the rows for attribution.
+
+`yuzu_ota_identity_audit_suppressed_total{rpc,reason}` counts the rows that were
+NOT written because that bucket was exhausted, so the sampling is directly
+observable rather than inferred from a gap between two other numbers. The bucket
+key includes the denial `reason` deliberately: without it, a peer holding a
+certificate from another CA in a multi-CA trust bundle could present
+`CN=<victim agent id>` and spend the victim's allowance. Note that verb is deliberately distinct from
 `session.identity_mismatch`, which is the Subscribe binding check and carries a
 different `detail` shape — see `docs/user-manual/audit-log.md`.
 

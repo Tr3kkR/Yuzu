@@ -81,6 +81,17 @@
   claimed `agent_id` to the certificate's CN/SAN, rejecting a mismatch with
   `UNAUTHENTICATED` plus a `session.ota_identity_rejected` audit row and the
   `yuzu_grpc_ota_identity_rejected_total{event="security",rpc,reason}` counter.
+  That audit row is **rate-limited per (peer, RPC, reason)** — the write is
+  synchronous and Postgres-backed and sits ahead of every admission bound, so an
+  enrolled peer looping a mismatched `CheckForUpdate` would otherwise pin a
+  server thread per call on the audit path. Rows are therefore a SAMPLE under a
+  flood while `yuzu_grpc_ota_identity_rejected_total` counts every rejection;
+  suppressed rows are counted by `yuzu_ota_identity_audit_suppressed_total`, so
+  the sampling is directly visible rather than inferred. The bucket key
+  deliberately includes the denial reason: without it, a peer holding a
+  certificate from another CA in a multi-CA trust bundle could present
+  `CN=<victim agent id>` and spend the victim's allowance, suppressing the
+  victim's audit rows on demand.
   A rejection naming no certificate at all (`no_client_identity`) is metric-only:
   it has no principal to attribute and the audit write is synchronous and sits
   ahead of the rate bound, so auditing it would reopen the thread-pinning vector
