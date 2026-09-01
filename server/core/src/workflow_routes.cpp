@@ -885,11 +885,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  auto exec_id = req.matches[1].str();
                  auto exec_opt = execution_tracker->get_execution(exec_id);
-                 auto agents = execution_tracker->get_agent_statuses(exec_id);
+                 // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+                 // statuses when confined — an unrestricted subscriber is always
+                 // visible regardless, so this indexed lookup would be pure
+                 // waste on every SSE subscribe.
                  bool has_visible_agent = false;
-                 for (const auto& a : agents)
-                     has_visible_agent =
-                         authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+                 if (gate.scope) {
+                     auto agents = execution_tracker->get_agent_statuses(exec_id);
+                     for (const auto& a : agents)
+                         has_visible_agent =
+                             authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+                 }
                  const bool owns_execution =
                      exec_opt && exec_opt->dispatched_by == session->username;
                  if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {

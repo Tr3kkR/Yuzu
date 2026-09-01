@@ -6854,13 +6854,21 @@ void RestApiV1::register_routes(
             }
             auto exec_id = req.matches[1].str();
             auto exec_opt = execution_tracker->get_execution(exec_id);
-            // Fetch and scan the same status set for a missing id and an invisible
-            // id. Do not stop on the first visible row: #1634 collapses both cases
-            // to one 404 without a scan-length existence oracle.
-            auto agents = execution_tracker->get_agent_statuses(exec_id);
+            // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+            // statuses when confined — an unrestricted caller (gate.scope ==
+            // nullopt, the common RBAC-off/global-permission case) is always
+            // visible regardless, so this indexed lookup would be pure waste
+            // on every single-execution read. Fetch and scan the same status
+            // set for a missing id and an invisible id when confined. Do not
+            // stop on the first visible row: #1634 collapses both cases to
+            // one 404 without a scan-length existence oracle.
+            std::vector<AgentExecStatus> agents;
             bool has_visible_agent = false;
-            for (const auto& a : agents)
-                has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+            if (gate.scope) {
+                agents = execution_tracker->get_agent_statuses(exec_id);
+                for (const auto& a : agents)
+                    has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+            }
             const bool owns_execution =
                 exec_opt && exec_opt->dispatched_by == session->username;
             const bool visible = !gate.scope || owns_execution || has_visible_agent;
@@ -12154,10 +12162,16 @@ void RestApiV1::register_routes(
         }
 
         auto exec_opt = execution_tracker->get_execution(exec_id);
-        auto agents = execution_tracker->get_agent_statuses(exec_id);
+        // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+        // statuses when confined — an unrestricted subscriber is always
+        // visible regardless, so this indexed lookup would be pure waste on
+        // every SSE subscribe.
         bool has_visible_agent = false;
-        for (const auto& a : agents)
-            has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+        if (gate.scope) {
+            auto agents = execution_tracker->get_agent_statuses(exec_id);
+            for (const auto& a : agents)
+                has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+        }
         const bool owns_execution =
             exec_opt && exec_opt->dispatched_by == session->username;
         const bool visible = !gate.scope || owns_execution || has_visible_agent;

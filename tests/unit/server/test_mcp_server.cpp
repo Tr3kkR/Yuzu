@@ -10836,6 +10836,42 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
     CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
+// #1634 (governance Gate 3 quality-engineer finding): every sibling
+// (query_responses, get_execution_status, list_executions, the legacy list
+// route) has a real-rig test driving the actual AuthRoutes + RbacStore +
+// ManagementGroupStore composition; aggregate_responses only ever had the
+// fake-gate tests above, which cannot catch a wrong securable/operation
+// string or resource-type typo at this specific call site.
+TEST_CASE("MCP aggregate_responses: real fleet-read gate excludes Alice's totals (#1634)",
+          "[pg][mcp][integration][response][aggregate][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{db.dsn()};
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    store.store(mk_resp("exec-1", "instr-1", "bob-agent", 0, "mine", 500));
+    store.store(mk_resp("exec-1", "instr-1", "alice-agent", 0, "not-mine", 501));
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"aggregate_responses","arguments":{"instruction_id":"instr-1","group_by":"status","aggregate":"count"}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto groups = nlohmann::json::parse(
+        nlohmann::json::parse(res->body)["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE(groups.size() == 1);
+    CHECK(groups[0]["group_value"] == "0");
+    CHECK(groups[0]["count"] == 1); // bob-agent only — alice-agent's row never folded in
+}
+
 TEST_CASE("MCP aggregate_responses: unrestricted fleet gate preserves legacy-open totals (#1634)",
           "[pg][mcp][integration][response][aggregate][scope]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

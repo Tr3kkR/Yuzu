@@ -1139,6 +1139,41 @@ TEST_CASE("GET /api/v1/executions/{id}: confined non-owner gets visible-only pro
     CHECK(res->body.find("agent-hidden") == std::string::npos);
 }
 
+// #1634 (governance Gate 3 quality-engineer finding): every sibling
+// single-execution surface (GET /api/v1/executions/{id} above, dashboard
+// GET /sse/executions/{id}, MCP get_execution_status/list_executions) has a
+// real-rig test driving the actual AuthRoutes + RbacStore + ManagementGroupStore
+// composition; this route only ever had the synthetic-fleet_read_fn tests
+// above, which cannot catch a wrong securable/operation string at this call
+// site or a regression in the real-gate composition specifically for SSE.
+TEST_CASE("GET /api/v1/events: real fleet-read gate collapses an invisible "
+          "execution to the missing-id 404",
+          "[pg][events][executions][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz_rig{authz_db.dsn()};
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, /*budget=*/nullptr,
+                        authz_rig.auth_fn(), authz_rig.fleet_read_fn()};
+    auto exec_id = h.make_exec("running", "alice");
+    h.agent_status(exec_id, "alice-agent", "success");
+
+    const auto token = authz_rig.mint_bob();
+    const auto headers = yuzu::test::ResponseExecutionAuthzPgRig::bearer(token);
+    auto invisible = h.sink.Get("/api/v1/events?execution_id=" + exec_id, headers);
+    auto missing = h.sink.Get("/api/v1/events?execution_id=exec-does-not-exist", headers);
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    REQUIRE(invisible->status == 404);
+    REQUIRE(missing->status == 404);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    invisible_json["error"].erase("correlation_id");
+    missing_json["error"].erase("correlation_id");
+    CHECK(invisible_json == missing_json);
+    CHECK(h.event_bus->subscribers_total() == 0);
+    for (const auto& a : h.audit_log)
+        CHECK(a.action != "api.v1.events.subscribe");
+}
+
 TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retry_after_ms",
           "[events][executions][issue-1088][noresources]") {
     RestEventsHarness h(/*with_bus=*/true, /*with_tracker=*/false);

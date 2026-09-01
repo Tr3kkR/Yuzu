@@ -6417,10 +6417,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto exec_id = param_str(args, "execution_id");
                 auto exec = execution_tracker->get_execution(exec_id);
-                auto agents = execution_tracker->get_agent_statuses(exec_id);
+                // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+                // statuses when confined — an unrestricted caller is always
+                // visible regardless, so this indexed lookup would be pure
+                // waste on every poll.
+                std::vector<AgentExecStatus> agents;
                 bool has_visible_agent = false;
-                for (const auto& a : agents)
-                    has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+                if (gate.scope) {
+                    agents = execution_tracker->get_agent_statuses(exec_id);
+                    for (const auto& a : agents)
+                        has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+                }
                 const bool owns_execution = exec && exec->dispatched_by == session->username;
                 const bool visible = !gate.scope || owns_execution || has_visible_agent;
                 if (!exec || !visible) {

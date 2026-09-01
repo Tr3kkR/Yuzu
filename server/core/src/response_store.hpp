@@ -112,13 +112,17 @@ struct ResponseQuery {
     int offset{0};
 };
 
-/// Management-group scope filter for `aggregate()` (#1634) — a DEDICATED
-/// parameter, deliberately NOT a field on `ResponseQuery`. A folded aggregate
-/// cannot be post-filtered, so the caller's in-scope agent set is pushed into
-/// the WHERE clause; the row-returning readers (`query`/`query_by_execution`)
-/// post-filter instead and never consult this, so keeping it off the shared
-/// query struct removes the trap of a `query()` caller silently getting no
-/// scoping from a field the row path ignores (governance #1634 architect review).
+/// Management-group scope filter for `aggregate()`, `query()`, and
+/// `query_by_execution()` (#1634) — a DEDICATED parameter, deliberately NOT a
+/// field on `ResponseQuery`. A folded aggregate cannot be post-filtered, and a
+/// post-fetch filter on a LIMIT-bounded row read is the same ADR-0017 INV-3
+/// defect (a confined caller's page can come back short/empty despite visible
+/// rows past a cap consumed by hidden ones) — so all three push the caller's
+/// in-scope agent set into the SQL WHERE clause before LIMIT/aggregate via the
+/// shared `append_scope_clause` helper. Kept off the shared `ResponseQuery`
+/// struct so a caller can never silently pass an unpopulated/wrong-typed scope
+/// field and get an unintentionally-unrestricted read — this parameter has to
+/// be supplied explicitly at every call site.
 ///   * `nullopt`           = no scoping (legacy-open / RBAC-disabled / global
 ///                           operator — totals over all agents, any scale).
 ///   * engaged + NON-empty = restrict to `agent_id IN (the set)`.
