@@ -226,10 +226,12 @@ public:
     // ── Retention (clock-guarded, single-writer across replicas) ───────────────
 
     /// Outcome of one reap pass. `clock_anomaly` is set when the pass was
-    /// DECLINED because `now_ms` was implausibly ahead of, or behind, the
-    /// persisted anchor — the DB-clock-integrity signal ADR-2002 §4 mitigation
-    /// (a) requires the caller to monitor/alert on (a backward DB clock step is
-    /// exactly this). A declined pass has `deleted == 0`.
+    /// DECLINED because a clock-guard-critical reading (the DB `now()` value or
+    /// the persisted anchor) was unusable — implausibly ahead of, or behind, the
+    /// persisted anchor, OR unparseable/negative/overflowed (#3785) — the
+    /// DB-clock-integrity signal ADR-2002 §4 mitigation (a) requires the caller to
+    /// monitor/alert on (a backward DB clock step is exactly this). A declined
+    /// pass has `deleted == 0`.
     struct ReapOutcome {
         int deleted = 0;
         bool clock_anomaly = false;
