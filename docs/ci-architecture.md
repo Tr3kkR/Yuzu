@@ -171,8 +171,8 @@ quiet period degrades silently. `prune` is dispatch-only — it replaces the
 corpus wholesale, so it never runs unattended. A red batch run auto-files
 a `cflite-batch-broken` issue (the `nightly-broken` pattern, minus the
 merge discipline — it is a repair prompt, not a gate); while it is open,
-coverage staleness silently degrades PR-time pruning, so treat it as
-same-week work.
+coverage staleness silently degrades PR-time pruning **within** the 30-day
+window the age gate above doesn't cover, so treat it as same-week work.
 
 ### Capability matrix drift gate (`check-capability-matrix.sh`, #2204)
 

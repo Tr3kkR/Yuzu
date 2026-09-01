@@ -72,13 +72,22 @@ jobs:
     steps:
       # #3770: a non-empty-but-STALE cifuzz-coverage-latest actively prunes a
       # target that IS affected by this PR (upstream's own fail-open only
-      # protects the EMPTY-match case - see cflite-batch.yml's header). This
-      # step re-runs the SAME name-scoped artifact lookup build_fuzzers itself
-      # uses (`actions: read`, already granted above) and, if the newest match
-      # is older than MAX_AGE_DAYS, forces build_fuzzers into keep-all instead
-      # of letting it prune off a possibly-stale map. No new permission scope:
-      # keep-all only means NOT passing keep-unaffected-fuzz-targets=false, it
-      # never deletes or writes anything.
+      # protects the EMPTY-match case - see docs/ci-architecture.md's
+      # ClusterFuzzLite section). This step re-runs the SAME name-scoped
+      # artifact lookup build_fuzzers itself uses (`actions: read`, already
+      # granted above) and, if the newest match is older than MAX_AGE_DAYS
+      # or its age can't be trusted at all, forces build_fuzzers into
+      # keep-all instead of letting it prune off a possibly-stale map. No
+      # new permission scope: keep-all only means NOT passing
+      # keep-unaffected-fuzz-targets=false, it never deletes or writes
+      # anything. Every failure path below (API error, an unparseable or
+      # future-dated created_at) explicitly writes force_keep_all=true
+      # before exiting rather than relying on the job to hard-fail closed -
+      # a tool hiccup degrades this run to "fuzz everything", it never
+      # silently misreads garbage as fresh (round-1 governance findings
+      # UP-1/CH-1: GNU `date -d` parses non-ISO8601 junk as "now" instead
+      # of erroring, which would have misclassified a corrupted API
+      # response as trustworthy).
       - name: Check coverage-artifact age
         id: coverage_age
         env:
@@ -94,21 +103,41 @@ jobs:
         run: |
           set -euo pipefail
           created_at=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=cifuzz-coverage-latest&per_page=1" \
-            --jq '.artifacts[0].created_at // empty')
+            --jq '.artifacts[0].created_at // empty') || {
+            echo "::warning title=cflite coverage age::could not query the GitHub artifacts API (gh api exit $?) - failing safe to keep-all."
+            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           if [ -z "$created_at" ]; then
             echo "::notice title=cflite coverage age::no cifuzz-coverage-latest artifact found - build_fuzzers will fail open to keep-all on its own (nothing to prune against)."
-            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "force_keep_all=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Reject anything that isn't the exact ISO-8601 shape GitHub's API
+          # documents before handing it to `date -d`: GNU date's fallback
+          # parser accepts strings like "today" or "0" as valid and silently
+          # resolves them to "now", which would misreport a malformed/
+          # schema-drifted API response as a fresh artifact instead of
+          # failing safe.
+          if ! [[ "$created_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+            echo "::warning title=cflite coverage age::cifuzz-coverage-latest's created_at ('$created_at') is not a recognizable ISO-8601 timestamp - failing safe to keep-all."
+            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           created_epoch=$(date -u -d "$created_at" +%s)
           now_epoch=$(date -u +%s)
           age_days=$(( (now_epoch - created_epoch) / 86400 ))
+          if [ "$age_days" -lt 0 ]; then
+            echo "::warning title=cflite coverage age::cifuzz-coverage-latest's created_at ($created_at) is in the future relative to this runner's clock - failing safe to keep-all."
+            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ "$age_days" -gt "$MAX_AGE_DAYS" ]; then
             echo "::notice title=cflite coverage age::cifuzz-coverage-latest is ${age_days}d old (max ${MAX_AGE_DAYS}d) - STALE, falling back to keep-all (no affected-target pruning this run)."
-            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "force_keep_all=true" >> "$GITHUB_OUTPUT"
           else
             echo "::notice title=cflite coverage age::cifuzz-coverage-latest is ${age_days}d old (max ${MAX_AGE_DAYS}d) - within range, affected-target pruning proceeds normally."
-            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "force_keep_all=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build fuzzers
@@ -121,11 +150,12 @@ jobs:
           # coverage report artifact; the input has no default, so omitting
           # it leaves the build container with an empty token and pruning
           # silently keeps all targets. The age check above forces keep-all
-          # when the coverage report is too stale to trust for pruning
-          # (#3770) - a fresh-TIMESTAMP stale-CONTENT artifact (e.g. from a
-          # main-ref dispatch) would still slip this check, but cflite-
-          # batch.yml's dev ref-guards close the known producer of that case.
-          keep-unaffected-fuzz-targets: ${{ steps.coverage_age.outputs.stale }}
+          # when the coverage report is too stale (or its age can't be
+          # trusted) to drive pruning (#3770) - a fresh-TIMESTAMP
+          # stale-CONTENT artifact (e.g. from a main-ref dispatch) would
+          # still slip this check, but cflite-batch.yml's dev ref-guards
+          # close the known producer of that case.
+          keep-unaffected-fuzz-targets: ${{ steps.coverage_age.outputs.force_keep_all }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run fuzzers
