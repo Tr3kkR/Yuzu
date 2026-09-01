@@ -17,6 +17,7 @@
  */
 
 #include "execution_event_bus.hpp"
+#include "execution_event_scope.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,6 +27,7 @@
 #include <atomic>
 #include <cstdint>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -558,5 +560,51 @@ TEST_CASE("visit_terminal - fails closed on an absent channel, runs f on a stale
         CHECK(p.status == VS::kStaleSub);
         CHECK(p.f_ran);  // the barrier still holds; f's record-state checks make it idempotent
         CHECK(p.verdict == TV::kTerminalBuffered);
+    }
+}
+
+TEST_CASE("execution event scope projection filters data-bearing events",
+          "[execution_event_bus][scope][1634]") {
+    const authz::VisibleSet scope{
+        std::unordered_set<std::string>{"agent-visible"}};
+
+    ExecutionEvent visible{1, 10, "agent-transition",
+                           R"({"agent_id":"agent-visible","status":"success"})"};
+    ExecutionEvent hidden{2, 11, "agent-transition",
+                          R"({"agent_id":"agent-hidden","status":"failure"})"};
+    ExecutionEvent malformed{3, 12, "agent-transition", "{"};
+    ExecutionEvent missing_id{4, 13, "agent-transition", R"({"status":"success"})"};
+    ExecutionEvent progress{5, 14, "execution-progress",
+                            R"({"agents_targeted":2,"agents_responded":1})"};
+
+    CHECK(classify_execution_event_for_scope(visible, scope) == ExecutionEventVerdict::kPass);
+    CHECK(classify_execution_event_for_scope(hidden, scope) == ExecutionEventVerdict::kDrop);
+    CHECK(classify_execution_event_for_scope(malformed, scope) == ExecutionEventVerdict::kDrop);
+    CHECK(classify_execution_event_for_scope(missing_id, scope) == ExecutionEventVerdict::kDrop);
+    CHECK(classify_execution_event_for_scope(progress, scope) == ExecutionEventVerdict::kDrop);
+    CHECK(classify_execution_event_for_scope(malformed, std::nullopt) ==
+          ExecutionEventVerdict::kPass);
+}
+
+TEST_CASE("execution event scope projection sanitizes completion but passes synthetics",
+          "[execution_event_bus][scope][1634]") {
+    const authz::VisibleSet scope{
+        std::unordered_set<std::string>{"agent-visible"}};
+    ExecutionEvent completed{42, 99, "execution-completed",
+                             R"({"agents_targeted":7,"agents_failure":2})"};
+
+    REQUIRE(classify_execution_event_for_scope(completed, scope) ==
+            ExecutionEventVerdict::kSanitize);
+    const auto sanitized = sanitize_execution_event_for_scope(completed);
+    CHECK(sanitized.id == completed.id);
+    CHECK(sanitized.timestamp_ms == completed.timestamp_ms);
+    CHECK(sanitized.event_type == "execution-completed");
+    CHECK(sanitized.data == R"({"status":"completed"})");
+    CHECK(sanitized.data.find("agents_targeted") == std::string::npos);
+
+    for (const std::string type : {"replay-gap", "events-dropped", "heartbeat"}) {
+        ExecutionEvent synthetic{1, 1, type, ""};
+        CHECK(classify_execution_event_for_scope(synthetic, scope) ==
+              ExecutionEventVerdict::kPass);
     }
 }
