@@ -2028,6 +2028,75 @@ The server can distribute agent binary updates to enrolled endpoints.
 
 ---
 
+### Signing update binaries (#416)
+
+**The SHA-256 the agent checks is not an authenticity check.** The server supplies
+that hash over the same gRPC channel that delivers the binary, so anything able to
+substitute the binary substitutes the hash beside it. It detects corruption and a
+truncated download; it does not detect a malicious or impersonated server. Since
+the OTA path installs and runs code on every managed endpoint, sign your packages.
+
+A signature is a detached PEM CMS blob over the binary's bytes, produced by a
+certificate carrying the **codeSigning** EKU. Yuzu does not sign for you — the
+party that chooses the binary is the party that must sign it, and on this path
+that is you: packages reach the registry by admin upload.
+
+Produce one with OpenSSL:
+
+```sh
+openssl cms -sign -binary -outform PEM \
+  -signer code-signing-cert.pem -inkey code-signing-key.pem \
+  -in yuzu-agent-0.14.0-x86_64-linux -out yuzu-agent-0.14.0-x86_64-linux.sig
+```
+
+Upload it alongside the binary (the OTA upload form takes an optional signature
+file). The server stores it beside the package and hands it to agents on
+`CheckForUpdate`; it does **not** verify it and is deliberately not trusted to.
+
+**Place the trust anchor out of band.** Agents verify against a PEM bundle you
+install on the endpoint — never fetched over the update channel, because a trust
+anchor delivered by the party being verified anchors nothing. The installers now
+create the directory for it:
+
+| Platform | Path | Ownership |
+|---|---|---|
+| Linux | `/etc/yuzu/certs/` | `root:root`, mode 0755 |
+| macOS | `/etc/yuzu/certs/` | `root:wheel`, mode 0755 |
+| Windows | `C:\ProgramData\Yuzu\certs\` | Administrators + SYSTEM |
+
+The directory is deliberately **not writable by the agent service account**. An
+agent that could rewrite the anchor authorising its own updates would make the
+whole check meaningless.
+
+Then point agents at it:
+
+| Agent flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--update-trust-bundle` | `YUZU_UPDATE_TRUST_BUNDLE` | unset | PEM bundle of CAs permitted to sign update binaries. **Unset disables signature checking entirely.** |
+| `--update-require-signature` | `YUZU_UPDATE_REQUIRE_SIGNATURE` | off | Refuse packages that carry no signature. |
+
+**Roll it out in two stages, and understand what the first stage does not give
+you.** Deploy the bundle with `--update-require-signature` OFF first: an unsigned
+package is then accepted with a loud warning, while a package whose signature is
+present and does not verify is refused — that rejection is unconditional and does
+not depend on this flag. Once every package you serve is signed, turn the flag on.
+
+The permissive stage is a genuine **downgrade oracle** for as long as it lasts.
+There is no capability handshake on this RPC, so an agent cannot tell "this server
+is too old to sign" from "the signature was stripped in transit"; both look like
+an absent signature and both are accepted. Keep the window short.
+
+**Before you enable enforcement, know that a failing agent is silent.** There is
+no status-report RPC on the update path: an agent that refuses a package logs
+locally, keeps its current version, and retries every six hours indefinitely. The
+server cannot tell you how many agents are in that state. Verify on a pilot group
+before a fleet-wide flip.
+
+Signature verification runs after the hash check and before anything irreversible
+— before the execute bit is set on POSIX and before the live binary is moved
+aside on Windows — and reads the already-downloaded file through the descriptor
+that was hashed, so the bytes verified are the bytes that were checked.
+
 ## RBAC Management
 
 Role-Based Access Control adds granular permissions beyond the built-in admin/user roles.
