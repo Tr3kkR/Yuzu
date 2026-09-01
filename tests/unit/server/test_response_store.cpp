@@ -1744,3 +1744,176 @@ TEST_CASE("ResponseStore: finalize_terminal_status writes the typed status onto 
     CHECK((*after)[0].error_detail == "denied by policy");
     CHECK((*after)[0].plugin_result_status == 4);
 }
+
+// ── Scoped facet queries: agent_scope on facet_values/facet_agent_count ────
+//
+// ADR-0017 INV-3 / #1712: the dashboard's visible-agent set must confine the
+// facet aggregate IN SQL, never as a C++ post-filter over an unscoped
+// result. #2691: an engaged-but-empty scope is success-empty, distinct from
+// a genuine store degrade.
+
+TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count return only the scoped "
+          "agent's values and counts (partial scope)",
+          "[pg][response_store][facet_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    // agent-A and agent-B share the "net" category with DIFFERENT line
+    // counts — a mutant that drops the SQL agent_id filter but still groups
+    // by value would return the right value with the wrong SUM (2 vs
+    // 2+3=5). Each agent also has a category the other doesn't ("disk" /
+    // "mem"), so a mutant that ignores scope entirely also fails on the
+    // returned value set, not just the counts.
+    StoredResponse a;
+    a.instruction_id = "cmd-facet-scope-partial";
+    a.agent_id = "agent-A";
+    a.status = 1;
+    a.plugin = "vuln_scan";
+    a.output = "high|net|t1|d1\nhigh|net|t2|d2\nhigh|disk|t3|d3";
+    store.store(a);
+
+    StoredResponse b;
+    b.instruction_id = "cmd-facet-scope-partial";
+    b.agent_id = "agent-B";
+    b.status = 1;
+    b.plugin = "vuln_scan";
+    b.output = "high|net|t4|d4\nhigh|net|t5|d5\nhigh|net|t6|d6\nhigh|mem|t7|d7";
+    store.store(b);
+
+    std::vector<std::string> scope_a{"agent-A"};
+    auto values = store.facet_values("cmd-facet-scope-partial", /*col_idx=*/1, scope_a);
+    REQUIRE(values.has_value());
+    REQUIRE(values->size() == 2); // "mem" (agent-B only) must not appear
+    // ORDER BY SUM(line_count) DESC: "net" (2) before "disk" (1).
+    CHECK((*values)[0].value == "net");
+    CHECK((*values)[0].line_count == 2); // agent-A's 2 lines only, not 2+3=5
+    CHECK((*values)[1].value == "disk");
+    CHECK((*values)[1].line_count == 1);
+
+    FacetFilter net_filter{/*col_idx=*/1, "net"};
+    auto count = store.facet_agent_count("cmd-facet-scope-partial", {net_filter}, scope_a);
+    REQUIRE(count.has_value());
+    CHECK(*count == 1); // agent-B also matches "net" but is out of scope
+}
+
+TEST_CASE("ResponseStore: an engaged-empty agent_scope short-circuits to success-empty "
+          "before any query, distinct from a genuine degrade (#2691)",
+          "[pg][response_store][facet_scope]") {
+    // Unroutable DSN, same idiom as the "bad-path constructor" case above:
+    // the store never opens, so reaching the pool/query would always
+    // produce the same nullopt-degrade. An engaged-but-empty scope must
+    // short-circuit BEFORE that check — proving it precedes any query, not
+    // just that it happens to also return an empty-looking result.
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore store(bad_pool);
+    REQUIRE_FALSE(store.is_open());
+
+    // facet_values: unscoped (nullopt, the default) still degrades...
+    CHECK_FALSE(store.facet_values("cmd-x", /*col_idx=*/0).has_value());
+    // ...but an engaged empty scope is success-empty, not degrade.
+    auto scoped_values = store.facet_values("cmd-x", /*col_idx=*/0, std::vector<std::string>{});
+    REQUIRE(scoped_values.has_value());
+    CHECK(scoped_values->empty());
+
+    // facet_agent_count: a non-empty filters vector defeats the unrelated
+    // "no filter -> 0" short-circuit, isolating the scope short-circuit.
+    FacetFilter any_filter{/*col_idx=*/0, "anything"};
+    CHECK_FALSE(store.facet_agent_count("cmd-x", {any_filter}).has_value());
+    auto scoped_count =
+        store.facet_agent_count("cmd-x", {any_filter}, std::vector<std::string>{});
+    REQUIRE(scoped_count.has_value());
+    CHECK(*scoped_count == 0);
+}
+
+TEST_CASE("ResponseStore: std::nullopt agent_scope on facet_values/facet_agent_count matches "
+          "the legacy unscoped call",
+          "[pg][response_store][facet_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    StoredResponse a;
+    a.instruction_id = "cmd-facet-scope-nullopt";
+    a.agent_id = "agent-A";
+    a.status = 1;
+    a.plugin = "vuln_scan";
+    a.output = "high|net|t1|d1\nhigh|disk|t2|d2";
+    store.store(a);
+
+    StoredResponse b;
+    b.instruction_id = "cmd-facet-scope-nullopt";
+    b.agent_id = "agent-B";
+    b.status = 1;
+    b.plugin = "vuln_scan";
+    b.output = "high|net|t3|d3\nhigh|mem|t4|d4";
+    store.store(b);
+
+    auto legacy_values = store.facet_values("cmd-facet-scope-nullopt", /*col_idx=*/1);
+    auto explicit_nullopt_values =
+        store.facet_values("cmd-facet-scope-nullopt", /*col_idx=*/1, std::nullopt);
+    REQUIRE(legacy_values.has_value());
+    REQUIRE(explicit_nullopt_values.has_value());
+    REQUIRE(legacy_values->size() == explicit_nullopt_values->size());
+    for (std::size_t i = 0; i < legacy_values->size(); ++i) {
+        CHECK((*legacy_values)[i].value == (*explicit_nullopt_values)[i].value);
+        CHECK((*legacy_values)[i].line_count == (*explicit_nullopt_values)[i].line_count);
+    }
+    // Both agents' values present, "net" summed across both (1+1=2).
+    REQUIRE(legacy_values->size() == 3);
+    bool found_net = false;
+    for (const auto& fv : *legacy_values) {
+        if (fv.value == "net") {
+            CHECK(fv.line_count == 2);
+            found_net = true;
+        }
+    }
+    CHECK(found_net);
+
+    FacetFilter net_filter{/*col_idx=*/1, "net"};
+    auto legacy_count = store.facet_agent_count("cmd-facet-scope-nullopt", {net_filter});
+    auto explicit_nullopt_count =
+        store.facet_agent_count("cmd-facet-scope-nullopt", {net_filter}, std::nullopt);
+    REQUIRE(legacy_count.has_value());
+    REQUIRE(explicit_nullopt_count.has_value());
+    CHECK(*legacy_count == *explicit_nullopt_count);
+    CHECK(*legacy_count == 2); // both agents match "net"
+}
+
+TEST_CASE("ResponseStore: scoped facet_values/facet_agent_count apply the WHOLE scope, no "
+          "10000-element truncation",
+          "[pg][response_store][facet_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    StoredResponse resp;
+    resp.instruction_id = "cmd-facet-scope-cap";
+    resp.agent_id = "agent-cap";
+    resp.status = 1;
+    resp.plugin = "vuln_scan";
+    resp.output = "high|net|t1|d1\nhigh|net|t2|d2";
+    store.store(resp);
+
+    // kScopeAgentBindCap (response_store.cpp) bounds the *aggregate()*
+    // scope path at 10000 — the array-bind path this test exercises
+    // (ANY($n::text[])) must apply the WHOLE scope with no such cap. Put
+    // the one agent that actually has facet rows LAST, past where the old
+    // cap would have cut it off.
+    std::vector<std::string> big_scope(10001, "no-such-agent");
+    big_scope[10000] = "agent-cap";
+
+    auto values = store.facet_values("cmd-facet-scope-cap", /*col_idx=*/1, big_scope);
+    REQUIRE(values.has_value());
+    REQUIRE(values->size() == 1);
+    CHECK((*values)[0].value == "net");
+    CHECK((*values)[0].line_count == 2);
+
+    FacetFilter net_filter{/*col_idx=*/1, "net"};
+    auto count = store.facet_agent_count("cmd-facet-scope-cap", {net_filter}, big_scope);
+    REQUIRE(count.has_value());
+    CHECK(*count == 1);
+}
