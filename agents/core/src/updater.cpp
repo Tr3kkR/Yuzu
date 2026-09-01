@@ -9,6 +9,8 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include <yuzu/agent/detached_signature.hpp>
+
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 
@@ -33,7 +35,9 @@
 #define NOMINMAX
 #endif
 // clang-format off
-#include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
+#include <windows.h>
+#include <fcntl.h> // _O_RDONLY/_O_BINARY for the signature-verification handle bridge
+#include <io.h>    // _open_osfhandle, _close  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
 #include <sddl.h>
@@ -720,6 +724,82 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
             UpdateError{"update temp file inode mismatch — possible TOCTOU swap attack detected"});
     }
 #endif
+
+    // ── Step 4.6: Verify the detached signature (#416/#3807) ──────────────
+    //
+    // WHY HERE, precisely. This sits after the SHA-256 compare and after the
+    // inode pre-flight, and BEFORE Step 5 — which is the last point at which
+    // nothing irreversible has happened. Step 5 sets the execute bit on POSIX
+    // (`apply_update`) and moves the LIVE executable aside on Windows; either
+    // is past the point of no return. Everything above this line is still just
+    // bytes in a temp file we can delete.
+    //
+    // WHY THIS IS NOT REDUNDANT WITH THE SHA-256. That hash arrives on the same
+    // gRPC channel that served the bytes, from the same server, so it proves the
+    // download was not corrupted and nothing more: anything able to substitute
+    // the binary substitutes the hash beside it. The signature is checked
+    // against a trust anchor placed on disk at install time, so it survives a
+    // compromised or impersonated server, which is the whole point of #416.
+    if (config_.signature_checking_enabled()) {
+        const std::string& sig = check_resp.update_signature();
+        if (sig.empty()) {
+            if (config_.require_signature) {
+                cleanup_temp();
+                return std::unexpected(UpdateError{
+                    "update package is unsigned and --update-require-signature is set"});
+            }
+            // Transitional mode. This is a genuine downgrade oracle for as long
+            // as it is enabled — the agent cannot distinguish "server too old to
+            // sign" from "signature stripped in transit", because there is no
+            // capability handshake on this RPC surface. Loud on purpose.
+            spdlog::warn("OTA update {} is UNSIGNED and was accepted because "
+                         "--update-require-signature is not set. Authenticity was NOT verified; "
+                         "only the server-supplied hash was checked.",
+                         check_resp.latest_version());
+        } else {
+            // Verified from the HELD descriptor, never a re-opened path: the
+            // bytes checked are then provably the bytes that were hashed, and on
+            // Windows the staged file cannot be re-opened at all (dwShareMode=0).
+#ifdef _WIN32
+            // Bridge the HANDLE to a CRT descriptor through a DUPLICATE, so the
+            // descriptor we close cannot disturb the handle apply_update needs.
+            HANDLE dup_handle = nullptr;
+            if (!::DuplicateHandle(::GetCurrentProcess(), h_guard.h,
+                                   ::GetCurrentProcess(), &dup_handle, 0, FALSE,
+                                   DUPLICATE_SAME_ACCESS)) {
+                cleanup_temp();
+                return std::unexpected(
+                    UpdateError{"cannot duplicate update file handle for signature verification"});
+            }
+            const int sig_fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(dup_handle), _O_RDONLY | _O_BINARY);
+            if (sig_fd < 0) {
+                ::CloseHandle(dup_handle);
+                cleanup_temp();
+                return std::unexpected(
+                    UpdateError{"cannot bind update file handle for signature verification"});
+            }
+            auto sig_err = verify_detached_cms_fd(sig_fd, sig, config_.signature_trust_bundle);
+            ::_close(sig_fd); // closes dup_handle; h_guard's own handle is untouched
+#else
+            auto sig_err = verify_detached_cms_fd(fd_guard.fd, sig, config_.signature_trust_bundle);
+#endif
+            if (sig_err) {
+                // Refused in BOTH modes. require_signature governs whether an
+                // ABSENT signature is tolerated; a signature that is present and
+                // does not verify is always an active integrity failure.
+                spdlog::error("OTA update {} signature verification FAILED ({}): {}",
+                              check_resp.latest_version(),
+                              sig_err->kind == CmsFailure::kUntrusted ? "untrusted chain"
+                                                                      : "invalid signature",
+                              sig_err->detail);
+                cleanup_temp();
+                return std::unexpected(UpdateError{
+                    std::format("update signature verification failed: {}", sig_err->detail)});
+            }
+            spdlog::info("OTA update {} signature verified against {}", check_resp.latest_version(),
+                         config_.signature_trust_bundle.string());
+        }
+    }
 
     // ── Step 5: Apply the update (platform-specific binary replace) ────────
     //

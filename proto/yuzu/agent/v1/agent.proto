@@ -310,6 +310,23 @@ message CheckForUpdateResponse {
   bool   mandatory        = 4;  // If true, agent must update immediately
   bool   eligible         = 5;  // Rollout eligibility for this agent
   int64  file_size        = 6;  // Binary size in bytes
+
+  // Detached PEM CMS signature over the binary's bytes (#416/#3807).
+  //
+  // The SHA-256 above is an INTEGRITY check only: the server supplies it over
+  // the same channel that serves the binary, so anything able to substitute the
+  // binary can substitute the hash beside it. This field carries authenticity
+  // instead — it is produced by whoever built and signed the package, and the
+  // agent verifies it against a trust bundle placed on disk at install time,
+  // out of band of this channel. The server never signs and is not trusted to.
+  //
+  // Empty when the operator has not signed the package. A new agent with
+  // --update-require-signature refuses such a package; without that flag it
+  // warns and proceeds, which is the transitional mode. An OLD agent ignores
+  // this field entirely (unknown fields are dropped), which is why the
+  // signature is carried here rather than by changing DownloadUpdateChunk's
+  // framing — that would have broken every agent already in the field.
+  bytes  update_signature = 7;
 }
 
 message DownloadUpdateRequest {

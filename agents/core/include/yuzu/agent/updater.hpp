@@ -18,6 +18,28 @@ struct UpdateError {
 struct UpdateConfig {
     bool enabled{true};
     std::chrono::seconds check_interval{6 * 3600}; // 6 hours
+
+    /// Detached-signature policy for the downloaded binary (#416/#3807),
+    /// mirroring PluginSigningPolicy so an operator configures both the same way.
+    ///
+    /// The bundle is the operator's code-signing trust anchor, placed on disk at
+    /// install time — deliberately NOT fetched over the update channel, since a
+    /// trust anchor delivered by the party being verified anchors nothing.
+    std::filesystem::path signature_trust_bundle;
+
+    /// When true, a package with no signature is REFUSED. Defaults false because
+    /// a fleet upgrading from a pre-signing release has no signed packages yet,
+    /// and there is no status-report RPC, so a mandatory flag flipped too early
+    /// strands agents silently. An invalid signature is refused in BOTH modes —
+    /// only absence is tolerated.
+    bool require_signature{false};
+
+    /// Signature checking is off entirely when no bundle is configured; there is
+    /// nothing to verify against, and inventing a default anchor would be worse
+    /// than being explicit.
+    [[nodiscard]] bool signature_checking_enabled() const noexcept {
+        return !signature_trust_bundle.empty();
+    }
 };
 
 class YUZU_EXPORT Updater {

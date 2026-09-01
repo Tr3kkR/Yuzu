@@ -1937,7 +1937,9 @@ public:
                 // Publish the fresh Updater, then work through the LOCAL copy — the slot can
                 // be re-read by Agent::stop() on another thread at any moment.
                 auto updater = std::make_shared<Updater>(
-                    UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
+                    UpdateConfig{cfg_.auto_update, cfg_.update_check_interval,
+                                 cfg_.update_trust_bundle, cfg_.update_require_signature},
+                    cfg_.agent_id,
                     std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
                     current_executable_path());
                 set_updater(updater);

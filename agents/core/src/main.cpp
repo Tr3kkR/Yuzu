@@ -412,6 +412,17 @@ int main(int argc, char* argv[]) {
                  "Reject plugins that have no .sig sibling file (default: allow unsigned "
                  "if --plugin-trust-bundle is set, for transitional rollouts)")
         ->envname("YUZU_PLUGIN_REQUIRE_SIGNATURE");
+    app.add_option("--update-trust-bundle", cfg.update_trust_bundle,
+                   "PEM CA bundle for verifying the code-signing certificate on OTA update "
+                   "binaries (#416). Place it at install time, NOT over the update channel: a "
+                   "trust anchor delivered by the party being verified anchors nothing. Unset "
+                   "disables signature checking entirely.")
+        ->envname("YUZU_UPDATE_TRUST_BUNDLE");
+    app.add_flag("--update-require-signature", cfg.update_require_signature,
+                 "Reject OTA update packages that carry no signature (default: allow unsigned "
+                 "if --update-trust-bundle is set, for transitional rollouts). A signature that "
+                 "is PRESENT and fails to verify is rejected either way.")
+        ->envname("YUZU_UPDATE_REQUIRE_SIGNATURE");
     app.add_flag("--no-auto-update", "Disable OTA auto-updates")->each([&cfg](const std::string&) {
         cfg.auto_update = false;
     });
@@ -475,6 +486,22 @@ int main(int argc, char* argv[]) {
     cfg.tls_allow_system_trust = yuzu::agent::env_truthy(std::getenv("YUZU_TLS_SYSTEM_ROOTS"));
 
     CLI11_PARSE(app, argc, argv);
+
+    // Fail closed on a combination that would silently fail OPEN.
+    //
+    // Signature checking is gated on a trust bundle being configured, so
+    // --update-require-signature with no --update-trust-bundle would set a flag
+    // that is never read: every update would apply unverified while the operator
+    // believed enforcement was on. Refuse to start instead. This mirrors the
+    // guard --plugin-require-signature carries (agent.cpp, governance hardening
+    // round 1, UP-7), but is sited HERE rather than beside the plugin scan so it
+    // cannot be skipped by a deployment that loads no plugins.
+    if (cfg.update_require_signature && cfg.update_trust_bundle.empty()) {
+        std::cerr << "--update-require-signature is set but --update-trust-bundle is empty. "
+                     "Refusing to start: this combination would silently fail open (every OTA "
+                     "update would be applied unverified).\n";
+        return EXIT_FAILURE;
+    }
 
 #ifdef _WIN32
     if (install_service || remove_service) {
