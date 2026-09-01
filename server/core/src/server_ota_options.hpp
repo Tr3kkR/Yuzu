@@ -26,7 +26,9 @@ namespace yuzu::server {
 
 /// Register the OTA + gRPC bound options onto `app`, bound to `cfg`.
 ///
-/// Every knob is `CLI::PositiveNumber`-validated for the same reason the
+/// Every knob except `--ota-cert-reserve-pct` (which is `CLI::Range(0, 100)`,
+/// where zero is a legitimate "no reserve") is `CLI::PositiveNumber`-validated
+/// for the same reason the
 /// per-principal quota options are: a zero or negative value does not "disable"
 /// these bounds, it configures a server that refuses every OTA pull (or accepts
 /// no streams at all) with no clear signal why. Rejecting at parse time turns a
@@ -77,8 +79,11 @@ inline void register_ota_options(CLI::App& app, Config& cfg) {
     app.add_option("--ota-cert-reserve-pct", cfg.ota_cert_reserve_pct,
                    "Percent of --ota-max-concurrent-total reserved for peers admitted "
                    "on a certificate identity (default: 50). IP-keyed peers may use at "
-                   "most the remainder, so an unauthenticated flood cannot starve an "
-                   "enrolled fleet out of the shared ceiling.")
+                   "most the remainder, so a flood of unenrolled peers cannot starve an "
+                   "enrolled fleet out of the shared ceiling. The remainder is floored "
+                   "at one slot for any non-zero ceiling, so a small ceiling or a high "
+                   "reserve cannot round IP-keyed peers down to no capacity at all; a "
+                   "ceiling of 0 still admits nobody. Set 0 for no reserve.")
         ->default_val(50)
         ->check(CLI::Range(0, 100))
         ->envname("YUZU_OTA_CERT_RESERVE_PCT");

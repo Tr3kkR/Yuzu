@@ -2342,12 +2342,18 @@ grpc::Status AgentServiceImpl::require_positive_ota_identity(grpc::ServerContext
         // CheckForUpdate — which has no admission bound at all — with a mismatched
         // agent_id and drive one synchronous Postgres write per call, ahead of
         // every other bound. That is the vector this change exists to close, so
-        // the write is gated on a small per-key bucket. The METRIC still counts
+        // the write is gated on a small per-PEER bucket. The METRIC still counts
         // every rejection, so suppression is visible as a gap between the counter
         // and the row count, never as a missing signal.
-        const bool audit_worthy = (std::string_view(reason) != "no_client_identity") &&
-                                  ota_identity_audit_limiter_.allow(std::string(rpc) + ":" +
-                                                                    claimed_agent_id);
+        //
+        // The bucket key is the PEER, never the claimed agent_id: see the member's
+        // own comment. Keying on the claim let a caller varying it per request mint
+        // a fresh, always-admitting bucket every time.
+        const auto audit_key = ota_admission_key(*context);
+        const bool audit_worthy =
+            (std::string_view(reason) != "no_client_identity") &&
+            ota_identity_audit_limiter_.allow(std::string(rpc) + ":" + audit_key.mode + ":" +
+                                              audit_key.key);
         if (audit_worthy && audit_store_ && audit_store_->is_open()) {
             const auto ids = extract_peer_identities(*context);
             const std::string cert_id = ids.empty() ? std::string{} : ids.front();

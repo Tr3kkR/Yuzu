@@ -429,12 +429,24 @@ private:
     OtaTransferWatchdog ota_watchdog_;
     bool require_positive_ota_identity_{false};
 
-    /// Bounds the identity-deny AUDIT write per (rpc, claimed agent_id). The write
-    /// is synchronous and Postgres-backed and sits ahead of every admission bound,
-    /// so an enrolled peer looping a mismatched CheckForUpdate would otherwise pin
-    /// a server thread per call on the audit path. A few per second per key is far
-    /// above any legitimate rate (an agent checks every 6h by default) and far
-    /// below a flood. The metric counts every rejection regardless.
+    /// Bounds the identity-deny AUDIT write. The write is synchronous and
+    /// Postgres-backed and sits ahead of every admission bound, so an enrolled peer
+    /// looping a mismatched CheckForUpdate would otherwise pin a server thread per
+    /// call on the audit path. A few per second per key is far above any legitimate
+    /// rate (an agent checks every 6h by default) and far below a flood. The metric
+    /// counts every rejection regardless, so suppression shows as a gap between the
+    /// counter and the row count, never as a missing signal.
+    ///
+    /// KEYED ON THE PEER, NEVER ON THE CLAIM — and this is the whole correctness
+    /// of the bound. An earlier version keyed on `(rpc, claimed_agent_id)`, which
+    /// is the caller's own request field. `RateLimiter::allow` admits any NEW key
+    /// unconditionally (`try_emplace` + return true), so a caller varying the
+    /// claimed id per request minted a fresh bucket every time and was never
+    /// throttled at all — the bound existed only against a caller obliging enough
+    /// to reuse one id. It also inserted an unbounded map entry per request, keyed
+    /// on an unclamped attacker string, on a map whose `purge_stale()` has no
+    /// production caller. The key is now the peer's certificate identity, or its
+    /// source IP where it presented none: values a caller cannot vary at will.
     RateLimiter ota_identity_audit_limiter_{2};
 
     /// One in this many admission rejections is logged (the first always is).

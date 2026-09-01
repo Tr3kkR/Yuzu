@@ -3829,7 +3829,7 @@ groups:
       - alert: YuzuOtaConcurrencyRejections
         expr: |
           sum by (job, instance) (
-            increase(yuzu_ota_download_admission_total{decision="rejected_concurrency"}[15m])
+            increase(yuzu_ota_download_admission_total{decision="rejected_concurrency"}[1h])
           ) > 5
         for: 15m
         labels:
@@ -3920,9 +3920,15 @@ groups:
       - alert: YuzuOtaTransfersAborting
         expr: |
           sum by (job, instance, phase) (
-            increase(yuzu_ota_download_deadline_exceeded_total[30m])
-          ) > 3
-        for: 30m
+            increase(yuzu_ota_download_deadline_exceeded_total[1h])
+          )
+            / on (job, instance) group_left ()
+          clamp_min(
+            sum by (job, instance) (
+              increase(yuzu_ota_download_admission_total{decision="admitted"}[1h])
+            ), 1
+          ) > 0.2
+        for: 15m
         labels:
           severity: warning
         annotations:
@@ -3944,15 +3950,20 @@ groups:
       - alert: YuzuOtaServerCapacityRejections
         expr: |
           sum by (job, instance) (
-            increase(yuzu_ota_download_admission_total{decision="rejected_total"}[15m])
-          ) > 0
-        for: 10m
+            increase(yuzu_ota_download_admission_total{decision="rejected_total"}[1h])
+          ) > 3
+        for: 30m
         labels:
           severity: warning
         annotations:
           summary: "OTA transfers refused by the SERVER-WIDE capacity ceiling"
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
+            Window note: `for:` is shorter than the lookback (so the rule can
+            actually be satisfied), and the bar is >3 over an hour rather than >0,
+            because a single transient refusal at the ceiling is not a page — the
+            group already excludes `rejected_rate` for the same reason.
+
             --ota-max-concurrent-total is saturated, so agents are being refused
             regardless of their own per-peer budget. Two very different causes look
             identical here and the log line distinguishes them by `cert_keyed`.

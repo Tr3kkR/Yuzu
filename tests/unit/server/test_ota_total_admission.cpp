@@ -134,3 +134,18 @@ TEST_CASE("OTA total gate: an occupying IP-keyed caller cannot starve a certific
     // ...but the reserved half is still there for an enrolled agent.
     CHECK(gate.try_acquire(10, 50, /*cert_keyed=*/true).admitted);
 }
+
+TEST_CASE("OTA total gate: a very large ceiling does not overflow", "[ota][bound][total]") {
+    // --ota-max-concurrent-total is only CLI::PositiveNumber-checked, so an
+    // operator may legitimately configure a value whose product with the reserve
+    // percentage exceeds int. Computed in int that multiply is undefined behaviour
+    // — the UBSan nightly leg traps it — and in practice lands on a NEGATIVE
+    // product, which then floors to 1: the operator asks for enormous capacity and
+    // silently receives a single slot.
+    CHECK(OtaTotalAdmission::effective_cap(1'000'000'000, 50, false) == 500'000'000);
+    CHECK(OtaTotalAdmission::effective_cap(2'000'000'000, 50, false) == 1'000'000'000);
+    CHECK(OtaTotalAdmission::effective_cap(2'147'483'647, 50, false) == 1'073'741'823);
+    CHECK(OtaTotalAdmission::effective_cap(2'147'483'647, 0, false) == 2'147'483'647);
+    // A certificate-keyed peer bypasses the arithmetic entirely, so it is exact.
+    CHECK(OtaTotalAdmission::effective_cap(2'147'483'647, 50, true) == 2'147'483'647);
+}

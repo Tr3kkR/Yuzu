@@ -88,6 +88,13 @@ TEST_CASE("OTA options: defaults match the documented values", "[ota][options]")
     CHECK(cfg.ota_max_peers_tracked == 50000);
     CHECK(cfg.grpc_max_concurrent_streams == 128);
     CHECK(cfg.grpc_max_resource_memory_mb == 512);
+    CHECK(cfg.ota_max_concurrent_total == 64);
+    CHECK(cfg.ota_cert_reserve_pct == 50);
+    // 8192, not 256. This is a FLEET-SIZE ceiling — Subscribe pins one sync
+    // thread per connected agent for the life of its stream — so a default that
+    // drifts back down is a fleet-wide ResourceExhausted outage, not a slower
+    // server. Pinned here because that is not visible from reading the flag.
+    CHECK(cfg.grpc_max_threads == 8192);
 }
 
 TEST_CASE("OTA options: each flag binds to its own Config field", "[ota][options]") {
@@ -97,7 +104,9 @@ TEST_CASE("OTA options: each flag binds to its own Config field", "[ota][options
     REQUIRE(parse({"--ota-max-concurrent-per-peer=7", "--ota-rate-capacity=11",
                    "--ota-rate-refill-per-min=3", "--ota-transfer-deadline-secs=123",
                    "--ota-chunk-write-deadline-secs=45", "--ota-max-peers-tracked=999",
-                   "--grpc-max-concurrent-streams=64", "--grpc-max-resource-memory-mb=256"},
+                   "--grpc-max-concurrent-streams=64", "--grpc-max-resource-memory-mb=256",
+                   "--ota-max-concurrent-total=33", "--ota-cert-reserve-pct=25",
+                   "--grpc-max-threads=1234"},
                   cfg));
     CHECK(cfg.ota_max_concurrent_per_peer == 7);
     CHECK(cfg.ota_rate_capacity == 11.0);
@@ -107,6 +116,9 @@ TEST_CASE("OTA options: each flag binds to its own Config field", "[ota][options
     CHECK(cfg.ota_max_peers_tracked == 999);
     CHECK(cfg.grpc_max_concurrent_streams == 64);
     CHECK(cfg.grpc_max_resource_memory_mb == 256);
+    CHECK(cfg.ota_max_concurrent_total == 33);
+    CHECK(cfg.ota_cert_reserve_pct == 25);
+    CHECK(cfg.grpc_max_threads == 1234);
 }
 
 TEST_CASE("OTA options: env var spellings are exactly as documented", "[ota][options]") {
@@ -135,6 +147,24 @@ TEST_CASE("OTA options: env var spellings are exactly as documented", "[ota][opt
         ScopedEnv e{"YUZU_GRPC_MAX_RESOURCE_MEMORY_MB", "2048"};
         REQUIRE(parse({}, cfg));
         CHECK(cfg.grpc_max_resource_memory_mb == 2048);
+    }
+    {
+        Config cfg;
+        ScopedEnv e{"YUZU_OTA_CERT_RESERVE_PCT", "30"};
+        REQUIRE(parse({}, cfg));
+        CHECK(cfg.ota_cert_reserve_pct == 30);
+    }
+    {
+        Config cfg;
+        ScopedEnv e{"YUZU_OTA_MAX_CONCURRENT_TOTAL", "17"};
+        REQUIRE(parse({}, cfg));
+        CHECK(cfg.ota_max_concurrent_total == 17);
+    }
+    {
+        Config cfg;
+        ScopedEnv e{"YUZU_GRPC_MAX_THREADS", "4096"};
+        REQUIRE(parse({}, cfg));
+        CHECK(cfg.grpc_max_threads == 4096);
     }
 }
 
@@ -193,4 +223,49 @@ TEST_CASE("gRPC bounds: a non-positive config is clamped, never zero", "[ota][op
     const auto b = grpc_bounds_from_config(cfg);
     CHECK(b.max_concurrent_streams >= yuzu::server::kMinConcurrentStreams);
     CHECK(b.resource_quota_bytes >= yuzu::server::kMinResourceQuotaBytes);
+}
+
+TEST_CASE("OTA options: the reserve accepts 0 and 100 but not beyond", "[ota][options]") {
+    // Range(0, 100), NOT PositiveNumber: zero is a legitimate "no reserve", so the
+    // validator here differs from every other knob in this file on purpose.
+    Config a;
+    CHECK(parse({"--ota-cert-reserve-pct=0"}, a));
+    CHECK(a.ota_cert_reserve_pct == 0);
+    Config b;
+    CHECK(parse({"--ota-cert-reserve-pct=100"}, b));
+    CHECK(b.ota_cert_reserve_pct == 100);
+    Config c;
+    CHECK_FALSE(parse({"--ota-cert-reserve-pct=101"}, c));
+    Config d;
+    CHECK_FALSE(parse({"--ota-cert-reserve-pct=-1"}, d));
+}
+
+TEST_CASE("OTA options: normalize_ota_options applies the tracked-peers floor",
+          "[ota][options]") {
+    // The floor exists so that every operator-facing surface — the capacity gauge,
+    // the settings page, the alert that divides by that gauge — reports the value
+    // the server will ACTUALLY enforce. Without this call the raw configured number
+    // is published and an operator who set 500 is paged at 400 tracked keys against
+    // a real ceiling of 1024, with a runbook remedy that does nothing.
+    Config low;
+    REQUIRE(parse({"--ota-max-peers-tracked=500"}, low));
+    CHECK(low.ota_max_peers_tracked == 500); // parse alone does not floor
+    yuzu::server::normalize_ota_options(low);
+    CHECK(low.ota_max_peers_tracked == static_cast<int>(yuzu::server::kMinPeersTracked));
+
+    // At and above the floor the operator's value is left exactly alone — the
+    // floor must not become a silent rewrite of a deliberate setting.
+    Config high;
+    REQUIRE(parse({"--ota-max-peers-tracked=90000"}, high));
+    yuzu::server::normalize_ota_options(high);
+    CHECK(high.ota_max_peers_tracked == 90000);
+
+    Config exact;
+    REQUIRE(parse({"--ota-max-peers-tracked=1024"}, exact));
+    yuzu::server::normalize_ota_options(exact);
+    CHECK(exact.ota_max_peers_tracked == 1024);
+
+    // Idempotent: main.cpp calls it once, but a second call must not drift.
+    yuzu::server::normalize_ota_options(low);
+    CHECK(low.ota_max_peers_tracked == static_cast<int>(yuzu::server::kMinPeersTracked));
 }

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <optional>
 
 namespace yuzu::server::detail {
@@ -63,9 +64,13 @@ class OtaTotalAdmission {
     ///
     /// Two ceilings, not one. An IP-keyed caller — which is what an
     /// unauthenticated peer is on a deployment where the identity gate is inert
-    /// — may occupy only the unreserved share, so it cannot starve enrolled
-    /// agents no matter how many addresses it commands. A certificate-keyed peer
-    /// may use the whole cap.
+    /// — may occupy only the unreserved share, so commanding more addresses buys
+    /// it no more of the ceiling. A certificate-keyed peer may use the whole cap.
+    ///
+    /// The protection is proportional, not absolute, and the floor below is where
+    /// it runs out: at `max_concurrent_total = 1` there is one slot and the floor
+    /// gives it to whoever asks first, IP-keyed or not. A deployment that needs
+    /// the reserve to mean anything needs a ceiling with room to divide.
     ///
     /// FLOORED AT ONE, for the reserve arithmetic ONLY. Integer division makes
     /// the unreserved share round to zero for a small cap — at
@@ -82,9 +87,15 @@ class OtaTotalAdmission {
             return max_total;
         if (max_total <= 0)
             return 0;
-        const int unreserved =
-            (max_total * std::clamp(100 - cert_reserve_pct, 0, 100)) / 100;
-        return std::max(1, unreserved);
+        // Widened before multiplying. `max_total` is only `CLI::PositiveNumber`-
+        // checked, so anything above ~21.4 million overflows the multiply in `int`
+        // — undefined behaviour, which the UBSan nightly leg traps, and which lands
+        // on a NEGATIVE product in practice. That product then floors to 1, handing
+        // an IP-keyed caller an effective ceiling of one: the operator asked for
+        // more capacity and silently received almost none.
+        const auto unreserved = static_cast<std::int64_t>(max_total) *
+                                std::clamp(100 - cert_reserve_pct, 0, 100) / 100;
+        return static_cast<int>(std::max<std::int64_t>(1, unreserved));
     }
 
     struct Decision {

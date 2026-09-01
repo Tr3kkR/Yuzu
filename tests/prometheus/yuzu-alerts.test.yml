@@ -121,6 +121,8 @@ tests:
     input_series:
       - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
         values: "0+1x120"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+1x120"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
         eval_time: 90m
@@ -134,6 +136,8 @@ tests:
     input_series:
       - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
         values: "0+0x120"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+1x120"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
         eval_time: 90m
@@ -163,10 +167,13 @@ tests:
     name: ota server capacity - saturation fires
     input_series:
       - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
-        values: "0+1x60"
+        values: "0+1x90"
     promql_expr_test:
+      # The bar clears within minutes; `for: 30m` then holds it pending, so the
+      # earliest firing evaluation is a little past 30m. Asserting at 45m proves
+      # the rule fires without pinning the exact debounce boundary.
       - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
-        eval_time: 30m
+        eval_time: 45m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
@@ -182,18 +189,55 @@ tests:
         eval_time: 30m
         exp_samples: []
 
-  # CASE Q -- a benign rollout tail must NOT page. Three deadline aborts in the
-  # window is the trickle a large rollout's slowest links produce; the bar is >3
-  # so this stays quiet while CASE J's sustained storm fires.
+  # CASE P2 -- one transient brush against the ceiling is not a page. The group
+  # already excludes rejected_rate for this reason; a >0 bar here would have
+  # reproduced exactly the noise this file's own comments condemn.
+  - interval: 1m
+    name: ota server capacity - a single transient refusal stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0 1 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE Q -- a benign rollout tail must NOT page. A large rollout completes ~20
+  # transfers a minute and loses one every ten to a genuinely slow link: a real
+  # abort stream, but 0.5% of traffic. An operator who silences this during every
+  # rollout has no silent-outage detector left, which is why the bar is a
+  # proportion and not the count of aborts.
   - interval: 1m
     name: ota transfers aborting - a benign rollout tail stays quiet
     input_series:
       - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
-        values: "0 1 2 3 3x120"
+        values: "0+1x12 12+1x12 24+1x120"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+20x144"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
         eval_time: 90m
         exp_samples: []
+
+  # CASE Q2 -- THE CASE AN ABSOLUTE BAR COULD NOT SEE, and the reason this rule
+  # is a proportion. A 30-agent site where EVERY device fails to update, forever.
+  # Agents check every 6h, so 30 failing agents produce 30 aborts in 6h — about
+  # 5 an hour, which never clears a bar of 3 per 30m no matter how long the
+  # outage runs. As a proportion it reads 1.0: every transfer that starts,
+  # aborts.
+  - interval: 1m
+    name: ota transfers aborting - a small totally-broken fleet fires
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0+1x240"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0+1x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 120m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
+            value: 1
 
   # ── YuzuOtaPeerMapEvicting (#935 / UP-8) ─────────────────────────────────
 

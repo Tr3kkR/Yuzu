@@ -221,7 +221,7 @@ TEST_CASE("DownloadUpdate: the server-wide slot is released on every exit path",
     }
 }
 
-TEST_CASE("DownloadUpdate: the certificate reserve bounds IP-keyed peers, not enrolled ones",
+TEST_CASE("DownloadUpdate: an IP-keyed peer is held to the unreserved share",
           "[ota][bound][grpc]") {
     // A flat shared ceiling is itself exhaustible: without a reserve, a handful of
     // source addresses holding slow transfers can occupy every slot and deny the
@@ -243,7 +243,7 @@ TEST_CASE("DownloadUpdate: the certificate reserve bounds IP-keyed peers, not en
     CHECK(st.error_code() == grpc::StatusCode::UNAVAILABLE);
 }
 
-TEST_CASE("DownloadUpdate: a zero reserve gives IP-keyed peers the whole ceiling",
+TEST_CASE("DownloadUpdate: a zero reserve leaves a zero ceiling admitting nobody",
           "[ota][bound][grpc]") {
     OtaHarness h;
     AgentServiceImpl::OtaBoundConfig cfg;
@@ -306,4 +306,40 @@ TEST_CASE("OTA identity gate: identity is checked BEFORE admission", "[ota][iden
     // first, so this status proves the identity gate came before it.
     auto st = h.download();
     CHECK(st.error_code() == grpc::StatusCode::UNAUTHENTICATED);
+}
+
+TEST_CASE("OTA identity gate: the metric counts every rejection, unsampled",
+          "[ota][identity][grpc]") {
+    // THE SAFETY PROPERTY OF THE AUDIT RATE LIMIT. The identity-deny audit write
+    // is now gated by a per-peer token bucket, because that write is synchronous,
+    // Postgres-backed, and sits ahead of every admission bound. Suppressing a
+    // security audit row is a real trade, and it is only acceptable because the
+    // METRIC is not suppressed: the operator still sees every rejection, and a gap
+    // between this counter and the audit-row count reads as suppression rather
+    // than as a missing signal. If this counter were ever moved inside the
+    // limiter's branch, a flood would go quiet on both surfaces at once.
+    OtaHarness h;
+    h.svc.set_require_positive_ota_identity(true);
+    h.start();
+
+    const yuzu::Labels labels{
+        {"event", "security"}, {"rpc", "check_for_update"}, {"reason", "no_client_identity"}};
+    const double before = h.metrics.counter("yuzu_grpc_ota_identity_rejected_total", labels).value();
+
+    constexpr int kCalls = 12; // comfortably past the 2/s bucket
+    for (int i = 0; i < kCalls; ++i) {
+        auto st = h.check_for_update();
+        CHECK(st.error_code() == grpc::StatusCode::UNAUTHENTICATED);
+    }
+
+    const double after = h.metrics.counter("yuzu_grpc_ota_identity_rejected_total", labels).value();
+    CHECK(after - before == static_cast<double>(kCalls));
+
+    // HONEST SCOPE. This harness speaks over an insecure channel, so every
+    // rejection it can provoke is `no_client_identity` — which is metric-only by
+    // design and never reaches the audit limiter at all. What is proven here is
+    // the unsampled-counter half of the contract. Exercising the limiter's own
+    // branch needs a peer bearing a certificate this server recognises, which
+    // means an mTLS harness with a test CA; that is not built here and the gap is
+    // deliberate rather than overlooked.
 }
