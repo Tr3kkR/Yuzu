@@ -2300,3 +2300,44 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
     CHECK(push_done.load(std::memory_order_acquire));
     CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
 }
+
+// ---------------------------------------------------------------------------
+// #2233 item 3: the OTHER half of the liveness fix - a genuinely failed (timed
+// out) arm must be COUNTED, so apply_rules' policy_generation hold-on-failure
+// gate sees it and the server retries, rather than the push being silently
+// treated as fully applied. This is the fix for the reconcile_failures
+// asymmetry Fable's review of the bounded-wait design flagged: attach_rule's
+// new timeout error flows through the exact call site that used to discard a
+// returned (non-thrown) arm failure entirely. Real time: this rides out the
+// PRODUCTION backend_op_deadline (5s, GuardianSparkRuntime::Config's default -
+// this fixture wires GuardianEngine's own spark_runtime_, which has no test
+// seam to shrink it), same order of magnitude as this file's other liveness
+// tests' REQUIRE(..., seconds(30)) waits.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not "
+          "silently applied",
+          "[spark][guardian][reconcile][liveness]") {
+    SparkReconcileFixture f;
+    f.mechanism->hang_next_watch();
+    REQUIRE(f.engine->policy_generation() == 0);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(5);
+    *p.add_rules() = make_service_rule("r1");
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+
+    REQUIRE(dr.exit_code == 0); // the push ITSELF still dispatches cleanly - no crash, no hang
+    // The rule's arm timed out (never released - see below): NOT armed, held for
+    // retry, unlike an Unsupported/disabled rule (see the sibling
+    // "an all-unsupported push still advances policy_generation" test above,
+    // whose whole point is the opposite outcome for a routine, non-failure gap).
+    CHECK(f.engine->policy_generation() == 0); // held, NOT advanced to 5
+    CHECK(f.engine->rule_count() == 1);        // persisted (put_rule_locked ran)
+    CHECK(f.engine->spark_armed_rule_count() == 0);
+
+    // Cleanup: release the still-parked mechanism so the detached worker can
+    // finish before the fixture tears down SparkEngine/GuardianEngine.
+    f.mechanism->release_hang();
+}

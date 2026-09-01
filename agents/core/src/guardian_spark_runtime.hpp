@@ -48,6 +48,7 @@
 #include <yuzu/plugin.h>        // YUZU_EXPORT
 #include <yuzu/agent/spark.hpp> // SparkSpec, SparkEvent, SparkType, ServiceRunState
 
+#include "guardian_io_executor.hpp" // GuardianIoExecutor, IoClass (#2233 item 3)
 #include "guardian_journal_format.hpp" // JournalRecord + caps (item 7 PR-Ag)
 #include "guardian_outbox.hpp"
 #include "guardian_rule_eval.hpp"
@@ -163,6 +164,20 @@ public:
 
     struct Config {
         std::size_t outbox_capacity{4096};
+        /// #2233 item 3: bound on the wall-clock a caller (GuardianEngine::apply_rules
+        /// / start_local / stop, all still holding their own mtx_ throughout) waits
+        /// for one backend arm/disarm. Matches GuardianStateReader's Registry/Service
+        /// state-read deadline (guardian_state_reader.hpp) - generous for local
+        /// TP_WAIT setup and SCM admission, well under what a dead UNC path or a
+        /// wedged SCM/sd-bus can hold a mechanism's own lock for. A logical deadline
+        /// only: it cannot cancel the OS call itself (RegOpenKeyExW,
+        /// WaitForThreadpoolWaitCallbacks, an SCM query, or a File probe already
+        /// inside SparkEngine's per-type lock) - it bounds how long THIS caller waits
+        /// for it, not the call's own lifetime (io_executor_'s orphan-exit contract,
+        /// wired through GuardianEngine::active_io_workers(), covers the rest).
+        /// Configurable (unlike a compile-time constant) so a test can shrink it for
+        /// fast, deterministic timeout coverage without a real multi-second sleep.
+        std::chrono::milliseconds backend_op_deadline{5000};
         /// M1 item (a): minutes-cadence backstop re-emission of guard.unhealthy for a
         /// rule still stuck Unknown, so a lost/coalesced edge cannot leave the server's
         /// errored view stale forever (edge-only emission made the edge the SOLE source
@@ -209,8 +224,15 @@ public:
     /// mapping for the same rule_id (a fresh generation + fresh eval state - the
     /// reconcile op at rung 7 is what preserves state across an identical
     /// re-push). Returns the new generation on success; an error string if the
-    /// backend refused to arm (the rule is left errored, NOT silently legacy -
-    /// mutual exclusion). IO-free apart from the backend arm.
+    /// backend refused to arm, timed out (cfg_.backend_op_deadline), or a same-key arm
+    /// was already in flight (the rule is left errored, NOT silently legacy -
+    /// mutual exclusion; a timeout/busy rejection retries on the next push like
+    /// any other arm failure). #2233 item 3: for File/Registry/Service, the actual
+    /// backend call runs OFF registry_mu_ (bounded, io_executor_) - every OTHER
+    /// rule's attach/detach and evaluate_key proceed while this one's arm is
+    /// pending; only a second attach on the SAME key is blocked (fails fast, does
+    /// not wait - see InFlightArm). Interval/Startup/Disk stay synchronous/inline
+    /// (never blocking OS watches).
     std::expected<std::uint64_t, std::string> attach_rule(std::string rule_id, SparkSpec spec,
                                                           RuleAssertion assertion,
                                                           bool emit_compliant_edge);
@@ -408,11 +430,34 @@ public:
     [[nodiscard]] std::uint64_t priority_demoted() const noexcept {
         return priority_demoted_.load(std::memory_order_relaxed);
     }
+    /// #2233 item 3: attach_rule calls that hit cfg_.backend_op_deadline waiting on a
+    /// backend arm (the rule is left errored, retried on the next push - never
+    /// silently dropped; see attach_rule). Lock-free.
+    [[nodiscard]] std::uint64_t backend_op_timeouts() const noexcept {
+        return backend_op_timeouts_.load(std::memory_order_relaxed);
+    }
+    /// #2233 item 3: attach_rule calls rejected because their spark_key already had
+    /// an arm in flight from a different rule_id (fail-fast, never a wait or a
+    /// duplicate backend arm - see InFlightArm's doc). Unreachable via
+    /// GuardianEngine's mtx_-serialised production callers; exercised by direct
+    /// concurrent callers of this class only (tests). Lock-free.
+    [[nodiscard]] std::uint64_t backend_op_busy() const noexcept {
+        return backend_op_busy_.load(std::memory_order_relaxed);
+    }
+    /// Live backend I/O workers for #2233 item 3's bounded arm/disarm executor - a
+    /// second source GuardianEngine::active_io_workers() must sum alongside the
+    /// state reader's own count for the process orphan-exit contract to stay
+    /// accurate (hard_exit.hpp / guardian_io_executor.hpp).
+    [[nodiscard]] std::size_t active_backend_op_workers() const {
+        return io_executor_.active_worker_count();
+    }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
     /// Does NOT join threads (the SparkEngine consumer join is phase 2, owned by
-    /// the caller at rung 7). Idempotent.
+    /// the caller at rung 7). Idempotent. #2233 item 3: also stops io_executor_,
+    /// waking any attach_rule/detach_rule currently parked in a bounded backend
+    /// wait immediately rather than making it ride out the full deadline.
     void begin_stop();
 
     // --- Telemetry / introspection (rung 3: enough to test; rung 8 adds the
@@ -556,8 +601,41 @@ private:
         std::map<std::string, PendingState> pending_initial;
     };
 
+    /// #2233 item 3: the shared watcher on a spark_key still awaiting its FIRST
+    /// arm() (arm_edge==true) - `backend_->arm()` runs OFF registry_mu_ now (see
+    /// attach_rule), so a key in this state has no PerKey/keys_ entry yet. Exactly
+    /// one rule_id ever "owns" an in-flight arm (a second attach_rule on the same
+    /// key fails fast rather than joining - see attach_rule); `withdrawn` records
+    /// whether THAT rule_id was detached while its own arm was still resolving, so
+    /// the arm's completion abandons + disarms instead of committing a rule nobody
+    /// wants any more.
+    struct InFlightArm {
+        std::string rule_id;
+        bool withdrawn{false};
+    };
+
+    /// A backend disarm still owed after detach_rule_locked's confirmed-state
+    /// mutation already committed (#2233 item 3: the actual `backend_->disarm()`
+    /// call runs OFF registry_mu_, submitted by the caller after it unlocks).
+    struct DisarmWork {
+        IoClass io_class{};
+        std::string key;
+        std::uint64_t subscription{0};
+    };
+
     // Helpers (all assume the documented lock discipline; see the .cpp).
-    void detach_rule_locked(const std::string& rule_id); // registry_mu_ held
+    /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
+    /// rule's key ->0 edge) for the CALLER to submit off-lock once it unlocks - see
+    /// the class comment above and attach_rule/detach_rule/detach_all's own docs.
+    std::optional<DisarmWork> detach_rule_locked(const std::string& rule_id);
+    /// Submit a disarm and discard/count its outcome - detach's audit trail and
+    /// confirmed-state mutation are already committed by the time this runs (see
+    /// DisarmWork's doc); this is best-effort teardown of the OS watcher only,
+    /// exactly as unconfirmed as the void `ISparkBackend::disarm()` call it replaces
+    /// (that call was never awaited for success either - moving it off-lock changes
+    /// WHERE it runs, not whether anyone confirms it). Never called with either
+    /// runtime lock held.
+    void submit_disarm_off_lock(const DisarmWork& work);
     EvalOutcome eval_rule(const SparkSpec& spec, const RuleAssertion& a, RuleEvalState& state,
                           std::chrono::steady_clock::time_point now, bool edge,
                           const ReadResult<FileSnapshot>* file,
@@ -629,6 +707,21 @@ private:
     std::unique_ptr<SparkKeyRuleIndex> index_;                          // key <-> rule fan-out + refcount
     std::unordered_map<std::string, std::shared_ptr<RuleGeneration>> rules_; // rule_id -> generation
     std::unordered_map<std::string, std::shared_ptr<PerKey>> keys_;          // spark_key -> per-key
+    /// #2233 item 3: spark_keys with a backend arm currently resolving off-lock
+    /// (registry_mu_-guarded, same as keys_/index_/rules_ above). See InFlightArm's
+    /// doc; empty in steady state, populated only between releasing registry_mu_
+    /// for the backend call in attach_rule and reacquiring it to commit/abandon.
+    std::unordered_map<std::string, InFlightArm> arming_keys_;
+    /// #2233 item 3: bounded off-lock executor for File/Registry/Service arm/disarm
+    /// (Interval/Startup/Disk stay inline/synchronous under registry_mu_ - they are
+    /// not backed by a blocking OS watch, matching GuardianIoExecutor's own
+    /// kIoClassCount==3 scope). A DEDICATED instance, never shared with the state
+    /// reader's own executor: a hung Registry arm and a hung Registry state read are
+    /// independent failures and must not share a capacity budget or a single-flight
+    /// key namespace with each other.
+    GuardianIoExecutor io_executor_;
+    std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
+    std::atomic<std::uint64_t> backend_op_busy_{0};       ///< attach_rule rejected: key already arming
 
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;

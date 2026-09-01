@@ -20,9 +20,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <latch>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -76,13 +78,42 @@ struct FakeBackend : ISparkBackend {
     std::atomic<int> disarms{0};
     std::atomic<bool> fail_arm{false};
     std::atomic<bool> throw_arm{false}; ///< arm() throws (a backend that throws, not just fails)
+    // #2233 item 3: park the NEXT arm() call (on whichever thread calls it - the
+    // GuardianIoExecutor detached worker in production/these tests) until
+    // release_hang() is called. Mirrors FakeServiceMechanism's hang idiom in
+    // test_guardian_engine_spark_reconcile.cpp: the gate is a SEPARATE lock from
+    // nothing here (FakeBackend has no other lock), so release_hang() never blocks.
+    std::atomic<bool> hang_next_arm{false};
+    std::mutex gate_mu_;
+    std::condition_variable gate_cv_;
+    bool entered_hang_{false};
+    bool released_{false};
     std::expected<std::uint64_t, std::string> arm(const SparkSpec&) override {
+        if (hang_next_arm.exchange(false)) {
+            std::unique_lock<std::mutex> lk{gate_mu_};
+            entered_hang_ = true;
+            gate_cv_.notify_all();
+            gate_cv_.wait(lk, [this] { return released_; });
+        }
         if (throw_arm.load()) throw std::runtime_error("arm boom");
         if (fail_arm.load()) return std::unexpected(std::string{"no mechanism"});
         arms.fetch_add(1);
         return next.fetch_add(1);
     }
     void disarm(std::uint64_t) override { disarms.fetch_add(1); }
+    /// Blocks until a hung arm() has actually entered its wait (avoids a racy
+    /// sleep-based poll for "is the worker parked yet").
+    bool wait_entered_hang(std::chrono::seconds timeout) {
+        std::unique_lock<std::mutex> lk{gate_mu_};
+        return gate_cv_.wait_for(lk, timeout, [this] { return entered_hang_; });
+    }
+    void release_hang() {
+        {
+            std::lock_guard<std::mutex> lk{gate_mu_};
+            released_ = true;
+        }
+        gate_cv_.notify_all();
+    }
 };
 
 SparkSpec file_spec(const std::string& path) {
@@ -1533,13 +1564,21 @@ TEST_CASE("attach_rule: a THROWING backend arm() rolls back with no ghost index 
     // arm(), so a THROWING arm() left the rule in the index with no subscription. That
     // ghost then corrupted a LATER successful attach of a sibling rule on the same key
     // (a false 0->1 edge -> double-arm / untracked subscription).
+    //
+    // #2233 item 3: File/Registry/Service now run backend_->arm() on a detached
+    // GuardianIoExecutor worker, off registry_mu_ - a throw there can no longer
+    // propagate as a C++ exception across the thread boundary (GuardianIoExecutor
+    // contains it by design, converting it to IoFailure::WorkerThrew). attach_rule
+    // returns an error instead of throwing; the rollback guarantee below (no ghost
+    // index entry, a sibling arms cleanly after) is otherwise unchanged.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b);
 
     b->throw_arm = true;
-    CHECK_THROWS_AS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true),
-                    std::runtime_error);
+    auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE_FALSE(gen);
+    CHECK(gen.error() == "arm worker threw");
     b->throw_arm = false;
 
     // Rolled back clean: no armed watcher, the throwing arm did not count, nothing to
@@ -1591,6 +1630,206 @@ TEST_CASE("attach_rule: a throw AFTER arm() (waker copy) disarms and leaves no p
     REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
     CHECK(rt->armed_key_count() == 1);
     CHECK(b->arms.load() == 2);
+}
+
+TEST_CASE("attach_rule: a throw AFTER joining an ALREADY-armed key leaves no ghost rule",
+          "[spark][runtime]") {
+    // #2233 item 3: distinct from the "throw AFTER arm()" test above, which only
+    // covers the arm_edge==true (this call is the key's pioneer) rollback path.
+    // This exercises the arm_edge==false (an existing shared watcher) path's OWN
+    // rollback, which the #2233 item 3 restructure initially dropped (no backend
+    // call happens here, so it is easy to assume nothing needs undoing - but
+    // rules_/pending_initial were still mutated before the throw).
+    struct ThrowOnCopy {
+        ThrowOnCopy() = default;
+        ThrowOnCopy(const ThrowOnCopy&) { throw std::runtime_error("waker copy boom"); }
+        ThrowOnCopy(ThrowOnCopy&&) noexcept = default;
+        ThrowOnCopy& operator=(ThrowOnCopy&&) noexcept = default;
+        void operator()() const {}
+    };
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true)); // pioneer, clean
+    CHECK(rt->rule_count() == 1);
+
+    rt->set_pending_initial_waker(ThrowOnCopy{});
+    CHECK_THROWS_AS(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true),
+                    std::runtime_error);
+    rt->set_pending_initial_waker({});
+
+    // r2 never committed: no ghost rule, no phantom "armed" audit, and the SHARED
+    // watcher (which this call never touched - arm_edge was false) is untouched -
+    // still exactly one armed key, one arm() call total, no disarm.
+    CHECK(rt->rule_count() == 1); // r1 only
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1);
+    CHECK(b->disarms.load() == 0);
+    auto lc = drain_lifecycle(*rt);
+    REQUIRE(lc.size() == 1); // r1's own "armed" only - no r2 entry
+    CHECK(lc[0].rule_id == "r1");
+
+    // r1 is still healthy: a fresh detach/attach cycle on it works cleanly.
+    rt->detach_rule("r1");
+    CHECK(rt->armed_key_count() == 0);
+}
+
+// ── #2233 item 3: arm/disarm liveness (bounded, off-registry_mu_ backend calls) ──
+
+TEST_CASE("#2233 item 3: a bounded arm that never returns times out, leaves no state, "
+          "and is counted",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+
+    const auto t0 = clk::now();
+    auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    const auto elapsed = clk::now() - t0;
+
+    REQUIRE_FALSE(gen);
+    CHECK(gen.error() == "arm timed out");
+    // Bounded, not the old unbounded wedge: returns close to the configured
+    // deadline, not never and not near-instantly (which would mean the deadline
+    // was not actually applied).
+    CHECK(elapsed >= std::chrono::milliseconds(50));
+    CHECK(elapsed < std::chrono::seconds(10));
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->backend_op_timeouts() == 1);
+    CHECK(drain_lifecycle(*rt).empty()); // no phantom "armed" for a rule that never armed
+
+    // Cleanup: release the still-parked detached worker so it does not outlive the
+    // test (io_executor_'s own shared_ptr<State> keeps it memory-safe regardless,
+    // but leaving it parked would leak a real OS thread across tests).
+    b->wait_entered_hang(std::chrono::seconds(30));
+    b->release_hang();
+}
+
+TEST_CASE("#2233 item 3: a parked arm on one key does not block a DIFFERENT key's attach",
+          "[spark][runtime][liveness]") {
+    // The actual defect this PR fixes: pre-fix, backend_->arm() ran INSIDE
+    // registry_mu_, so a parked arm on key A blocked every other registry_mu_
+    // operation - including an attach on an entirely unrelated key B - until it
+    // returned. Proving key B's attach completes promptly WHILE key A's arm is
+    // still parked is the direct proof registry_mu_ is genuinely released during
+    // the bounded wait, not just released sooner.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    std::atomic<bool> a_done{false};
+    std::thread a_thread{[&] {
+        rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        a_done.store(true, std::memory_order_release);
+    }};
+    struct Cleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~Cleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } cleanup{b.get(), &a_thread};
+
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    CHECK_FALSE(a_done.load(std::memory_order_acquire)); // still parked
+
+    // key B is a DIFFERENT spark_key (different path) - must complete promptly,
+    // well under key A's 30s deadline, while A is still parked.
+    const auto t0 = clk::now();
+    auto gen_b = rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
+    const auto elapsed_b = clk::now() - t0;
+    REQUIRE(gen_b);
+    CHECK(elapsed_b < std::chrono::seconds(5));
+    CHECK(rt->armed_key_count() == 1); // only B so far - A is still parked
+
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return a_done.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->armed_key_count() == 2);
+}
+
+TEST_CASE("#2233 item 3: a same-key attach while another is in flight fails fast, "
+          "never double-arms",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    std::thread a_thread{[&] { rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    struct Cleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~Cleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } cleanup{b.get(), &a_thread};
+
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    // r2 targets the SAME key ("/a") while r1's arm is still parked - must fail
+    // fast (not wait, not launch a second backend arm() call).
+    const auto t0 = clk::now();
+    auto gen_r2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    const auto elapsed = clk::now() - t0;
+    REQUIRE_FALSE(gen_r2);
+    CHECK(gen_r2.error() == "arm already in progress for this key");
+    CHECK(elapsed < std::chrono::seconds(1)); // fail-fast, not a wait
+    CHECK(rt->backend_op_busy() == 1);
+    CHECK(rt->rule_count() == 0); // r2 was never installed
+    CHECK(b->arms.load() == 0);   // no second (or first, yet) backend arm() call
+
+    b->release_hang();
+    a_thread.join(); // Cleanup's dtor no-ops afterward (t->joinable() is false post-join)
+    CHECK(b->arms.load() == 1); // r1's single arm(), once it finally resolved
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1); // r1 only - r2 never attached
+}
+
+TEST_CASE("#2233 item 3: begin_stop() wakes a parked arm before its deadline elapses",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    // A long deadline - begin_stop() must wake the wait well before this, not by
+    // riding it out.
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    std::atomic<int> outcome_ok{-1};
+    const auto t0 = clk::now();
+    std::thread a_thread{[&] {
+        auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        outcome_ok.store(gen.has_value() ? 1 : 0, std::memory_order_release);
+    }};
+    struct Cleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~Cleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } cleanup{b.get(), &a_thread};
+
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->begin_stop(); // must wake the parked wait promptly, not after 30s
+
+    a_thread.join(); // Cleanup's dtor no-ops afterward (t->joinable() is false post-join)
+    const auto elapsed = clk::now() - t0;
+    CHECK(elapsed < std::chrono::seconds(5)); // woken, not ridden out to the 30s deadline
+    CHECK(outcome_ok.load(std::memory_order_acquire) == 0); // rejected (stopping)
+
+    b->release_hang(); // the still-parked backend worker itself (io_executor_.stop()
+                       // wakes the WAITER, not the underlying OS call - see begin_stop's doc)
 }
 
 TEST_CASE("Lifecycle audit entries are NOT coalesced or purged like compliance/health",
@@ -1809,7 +2048,10 @@ TEST_CASE("a throwing arm stages no durable record (no phantom)", "[spark][runti
     auto b = std::make_shared<FakeBackend>();
     b->throw_arm.store(true);
     auto rt = make_rt(r, b);
-    CHECK_THROWS(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    // #2233 item 3: File runs off registry_mu_ via GuardianIoExecutor, which contains
+    // a worker throw and returns it as an error rather than propagating it - see the
+    // "a THROWING backend arm() rolls back..." test above for the full rationale.
+    CHECK_FALSE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true).has_value());
     CHECK(rt->snapshot_pending().records.empty()); // rollback undid the arm; nothing staged
 }
 

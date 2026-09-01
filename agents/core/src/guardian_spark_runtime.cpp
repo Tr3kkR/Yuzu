@@ -20,6 +20,25 @@
 namespace yuzu::agent {
 
 namespace {
+
+/// #2233 item 3: which of GuardianIoExecutor's three bounded-I/O lanes backs a
+/// SparkType's arm/disarm, or nullopt for a type whose mechanism is never a
+/// blocking OS watch (Interval/Startup/Disk - timer/poll-based, matches
+/// GuardianIoExecutor's own kIoClassCount==3 scope). attach_rule/detach_rule_locked
+/// use nullopt to mean "keep the call inline under registry_mu_, as before".
+[[nodiscard]] constexpr std::optional<IoClass> io_class_for_spark_type(SparkType t) noexcept {
+    switch (t) {
+    case SparkType::File:     return IoClass::File;
+    case SparkType::Registry: return IoClass::Registry;
+    case SparkType::Service:  return IoClass::Service;
+    case SparkType::Interval:
+    case SparkType::Startup:
+    case SparkType::Disk:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 /// A random 64-bit hex token fixed once per runtime construction. Folded into
 /// every event_id so a restart (which resets event_seq_ and can revisit a wall_ms)
 /// cannot reproduce a prior id and have the server's event_id PK drop it.
@@ -82,19 +101,52 @@ GuardianSparkRuntime::make_handler(std::shared_ptr<GuardianSparkRuntime> rt) {
     return [rt = std::move(rt)](const SparkEvent& ev) { rt->on_event(ev); };
 }
 
+void GuardianSparkRuntime::submit_disarm_off_lock(const DisarmWork& work) {
+    // fn's own return value is discarded below - disarm() is void and was never
+    // awaited for success even in the old inline call this replaces (see the
+    // header doc). Only Timeout/CapacityExhausted/etc are worth counting: they
+    // mean the OS watcher's fate is now genuinely unknown to us (still armed?
+    // torn down mid-flight?), which the old synchronous call never risked.
+    auto result =
+        io_executor_.run(work.io_class, work.key, cfg_.backend_op_deadline,
+                         [backend = backend_, sub = work.subscription]() -> int {
+                             backend->disarm(sub);
+                             return 0;
+                         });
+    if (!result)
+        backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::expected<std::uint64_t, std::string>
 GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAssertion assertion,
                                   bool emit_compliant_edge) {
     const std::string key = spark_key(spec);
+    // #2233 item 3: File/Registry/Service arm off registry_mu_, bounded; every other
+    // type stays inline (see io_class_for_spark_type's doc).
+    const std::optional<IoClass> io_class = io_class_for_spark_type(spec.type);
     std::function<void()> waker;
     std::function<void()> outbox_waker;
     std::uint64_t new_gen = 0;
+    std::optional<DisarmWork> prior_disarm;
     // Snapshot BEFORE taking registry_mu_ (same outside-lock pattern evaluate_key uses
     // for its own now-snapshot): this is PendingState::first_seen, the M1 item (b)
     // elapsed-time demotion clock. A fresh attach always starts un-demoted regardless
     // of how long a PRIOR generation on this rule_id sat pending (detach_rule_locked
     // below drops that generation's PendingState entirely).
     const auto attach_now = clock_();
+
+    // Built once, reused by both the fast (reuse-existing-watcher / inline-type) path
+    // and the slow (bounded off-lock arm) path's post-wait commit.
+    const std::string rule_name = assertion.rule_name;
+    const char* guard_type = guard_type_for(assertion.kind);
+    auto rg = std::make_shared<RuleGeneration>();
+    rg->active = true;
+    rg->emit_compliant_edge = emit_compliant_edge;
+    rg->assertion = std::move(assertion);
+    rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
+
+    std::uint64_t gen = 0;
+    bool need_bounded_arm = false;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (stopping_)
@@ -102,123 +154,230 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
         // Fresh generation: drop any prior mapping for this rule first. This
         // rebuilds eval state from scratch on every push, identical re-push
-        // included - there is no diff-skip that preserves it (a possible future
-        // optimization, not implemented; matches the legacy path's own
-        // tear-down-and-rebuild-every-push behavior, so this is not a
-        // regression - consistency-auditor Gate 4 finding, this PR: an earlier
-        // version of this comment claimed the opposite in present tense). If a
-        // prior generation existed, this already enqueued its "disarmed"
-        // lifecycle entry - the "armed" entry below covers the new one, so ONE
+        // included - there is no diff-skip that preserves it (matches the legacy
+        // path's own tear-down-and-rebuild-every-push behavior). If a prior
+        // generation existed, this already enqueued its "disarmed" lifecycle entry
+        // (and, #2233 item 3, may return backend work this function submits below,
+        // off-lock) - the "armed" entry below covers the new one, so ONE
         // outbox-waker firing at the end of this call covers both.
-        detach_rule_locked(rule_id);
+        prior_disarm = detach_rule_locked(rule_id);
 
-        const std::uint64_t gen = ++gen_counter_;
-        // Capture the lifecycle metadata before `assertion` is moved into rg below;
-        // the "armed" audit entry (and any prior "disarmed" from detach above) needs it.
-        const std::string rule_name = assertion.rule_name;
-        const char* guard_type = guard_type_for(assertion.kind);
-        auto rg = std::make_shared<RuleGeneration>();
+        gen = ++gen_counter_;
         rg->generation = gen;
-        rg->active = true;
-        rg->emit_compliant_edge = emit_compliant_edge;
-        rg->assertion = std::move(assertion);
-        rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
 
-        // `pk`/`sub`/`armed_here` are declared BEFORE `rollback` so they outlive its
-        // destructor (reverse construction order): the rollback lambda reads them by
-        // reference. ONE rollback is installed BEFORE index_->add and backend_->arm, so a
-        // GUARDIAN-side throw - the index add, or any map/set insertion after arm()
-        // RETURNED a subscription (armed_here=true) - unwinds every Guardian-side mutation
-        // and disarms that subscription. The prior code assigned the rollback only AFTER
-        // arm() and per-branch, so a throwing arm() (or a throwing rollback-closure
-        // assignment after the arm) leaked the subscription and left a ghost index entry
-        // that corrupted a future sibling attach. Every undo is a safe no-op if its
-        // mutation never ran, and GuardianRollback's destructor is terminate-safe.
-        // If backend_->arm() itself THROWS (a bad_alloc inside arm_impl, no subscription
-        // returned), armed_here stays false and this rollback undoes only the
-        // Guardian-side mutations. That is sufficient for the engine's OWN bookkeeping:
-        // as of #2270 a bad_alloc can escape arm_impl only from its pre-commit/in-lock
-        // phase, which restores armed_/sub_keys_ exactly, so there is no partial armed_
-        // entry left for anyone to clean (arm_impl enumerates the residuals; they are
-        // not duplicated here). It does NOT make a failed arm
-        // invisible - a watch that fails to arm still fails for every rule sharing that spark key
-        // (#2270 UP-9, unchanged and pre-existing), and Guardian learns of it through
-        // the returned error, not through this rollback.
-        // (Fable rung-7.7b M3; extends Sol rung-7.5 finding 1.)
-        std::shared_ptr<PerKey> pk;
-        std::uint64_t sub = 0;
-        bool armed_here = false;
-        GuardianRollback rollback;
-        rollback.fn = [this, rule_id, key, &sub, &armed_here, &pk] {
-            index_->remove_rule(rule_id); // no-op if add() never ran or threw clean
-            if (armed_here) {
-                // THIS attach created the watcher (0->1 edge under registry_mu_, so it is
-                // the sole rule on the key): tear the new subscription + PerKey down.
-                keys_.erase(key); // no-op if the new PerKey was not yet emplaced
-                backend_->disarm(sub);
-            }
-            rules_.erase(rule_id); // no-op if not yet inserted
-            if (pk)
-                pk->pending_initial.erase(rule_id);
-        };
+        // #2233 item 3 fail-fast: a DIFFERENT rule_id's arm is already resolving for
+        // this key off-lock (unreachable via GuardianEngine's mtx_-serialised
+        // production callers - start_local/apply_rules hold mtx_ for their entire
+        // body, so no second attach_rule call can even start while this one's is
+        // in flight; matters only for a caller that invokes this class directly
+        // across threads, e.g. a test). Never wait, never double-arm: registry_mu_
+        // alone used to make this impossible by construction (arm() ran inside it);
+        // now that the backend call is off-lock, this closes the gap explicitly.
+        if (const auto in_flight = arming_keys_.find(key); in_flight != arming_keys_.end()) {
+            backend_op_busy_.fetch_add(1, std::memory_order_relaxed);
+            return std::unexpected(std::string{"arm already in progress for this key"});
+        }
 
-        const bool arm_edge = index_->add(key, rule_id);
-        if (arm_edge) {
+        const bool arm_edge = index_->add(key, rule_id); // may throw; nothing mutated yet on throw
+        if (arm_edge && io_class) {
+            // Slow path: mark in-flight and return to the caller below WITHOUT
+            // touching keys_/rules_/pending_initial/lifecycle - all deferred to the
+            // post-wait commit phase, so a same-key racer's arming_keys_ check above
+            // never sees a half-built PerKey.
+            GuardianRollback index_rollback;
+            index_rollback.fn = [this, rule_id] { index_->remove_rule(rule_id); };
+            arming_keys_.emplace(key, InFlightArm{rule_id, false}); // may throw -> rollback
+            index_rollback.committed = true;
+            need_bounded_arm = true;
+        } else if (arm_edge) {
+            // Inline type (Interval/Startup/Disk): unchanged synchronous arm, still
+            // under registry_mu_ - these are never a blocking OS watch.
+            std::shared_ptr<PerKey> pk;
+            std::uint64_t sub = 0;
+            bool armed_here = false;
+            GuardianRollback rollback;
+            rollback.fn = [this, rule_id, key, &sub, &armed_here, &pk] {
+                index_->remove_rule(rule_id);
+                if (armed_here) {
+                    keys_.erase(key);
+                    backend_->disarm(sub);
+                }
+                rules_.erase(rule_id);
+                if (pk)
+                    pk->pending_initial.erase(rule_id);
+            };
             auto armed = backend_->arm(spec); // may THROW -> rollback undoes the index add
             if (!armed)
                 return std::unexpected(armed.error()); // rollback undoes the index add
             sub = *armed;
-            armed_here = true; // from here a throw also disarms the watcher
+            armed_here = true;
             pk = std::make_shared<PerKey>();
             pk->spec = spec;
             pk->subscription = sub;
             keys_.emplace(key, pk);
-        } else {
-            pk = keys_.at(key); // an existing shared watcher for this key (armed_here stays false)
-        }
 
-        rules_.insert_or_assign(rule_id, std::move(rg));
-        pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
-        // Copy the wakers (throwing std::function copies) BEFORE the lifecycle enqueue so
-        // a throw here rolls back with NO audit entry yet. The lifecycle log is
-        // append-only and never purged (guardian_outbox.hpp), so a phantom "armed"
-        // enqueued before a throwing waker copy would be permanent evidence of an arm
-        // that actually rolled back (Sol/Fable SHOULD, rung 7.7b).
-        waker = pending_initial_waker_;   // copy; call after releasing registry_mu_
-        outbox_waker = outbox_enqueue_waker_;
-        // Audit-on-arm (rung 7, finding 8): a successful arm - spark or legacy - must not
-        // go unaudited. Failure here is counted, never rolls back the arm itself (the
-        // audit trail must not compromise real detection capability); see
-        // enqueue_lifecycle_locked's doc. This is the LAST potentially-throwing step, and
-        // it is all-or-nothing (std::list::push_back is strong), so only the noexcept
-        // commit below follows a successful enqueue.
-        enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
-        rollback.committed = true;
+            rules_.insert_or_assign(rule_id, std::move(rg));
+            pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
+            waker = pending_initial_waker_;
+            outbox_waker = outbox_enqueue_waker_;
+            enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
+            rollback.committed = true;
+        } else {
+            // An existing shared watcher for this key (armed or, #2233 item 3, itself
+            // mid-arm - the arming_keys_ check above already rejected that case, so
+            // reaching here with arm_edge==false means keys_ genuinely has it). No
+            // backend call, but a throw below (map insert, or a throwing
+            // waker/outbox_waker COPY) must still undo the index_->add - mirrors the
+            // original unified rollback's armed_here=false shape (never disarms;
+            // there is no new watcher to tear down, only this rule's own bookkeeping).
+            auto pk = keys_.at(key);
+            GuardianRollback rollback;
+            rollback.fn = [this, rule_id, pk] {
+                index_->remove_rule(rule_id);
+                rules_.erase(rule_id);
+                pk->pending_initial.erase(rule_id);
+            };
+            rules_.insert_or_assign(rule_id, std::move(rg));
+            pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
+            waker = pending_initial_waker_;
+            outbox_waker = outbox_enqueue_waker_;
+            enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
+            rollback.committed = true;
+        }
         new_gen = gen;
     }
-    // Outside the lock (avoids a registry_mu_ -> scheduler_mu_ inversion): let the
-    // convergence scheduler service the new rule's initial eval promptly, and let
-    // the drain worker (rung 7.5) send the fresh armed/health/compliance entries.
-    if (waker)
-        waker();
-    if (outbox_waker)
-        outbox_waker();
-    return new_gen;
+
+    // Off-lock: any watcher a superseded prior generation owed a disarm to. Fire
+    // this before the new arm below so a redeploy that keeps the SAME key (rare -
+    // most redeploys change the spec) does not race its own teardown against its
+    // own re-arm; SparkEngine's per-type mechanism lock orders the two regardless,
+    // but there is no reason to invite it.
+    if (prior_disarm)
+        submit_disarm_off_lock(*prior_disarm);
+
+    if (!need_bounded_arm) {
+        if (waker)
+            waker();
+        if (outbox_waker)
+            outbox_waker();
+        return new_gen;
+    }
+
+    // The actual backend arm, OFF both runtime locks, bounded by cfg_.backend_op_deadline.
+    // A caller (GuardianEngine::apply_rules/start_local, still holding mtx_ for its
+    // whole body) waits at most this long for THIS rule; every other rule's
+    // attach/detach and every evaluate_key proceed freely in the meantime, since
+    // registry_mu_ is not held here at all.
+    // T = std::expected<uint64_t, string> (backend_->arm's own return type) - two
+    // layers to unwrap below: the OUTER expected is io_executor_'s own bounded-wait
+    // outcome (timeout/capacity/etc, IoFailure), the INNER is backend_->arm()'s own
+    // synchronous refusal, exactly as returned before this call moved off-lock.
+    auto io_result = io_executor_.run(*io_class, key, cfg_.backend_op_deadline,
+                                      [backend = backend_, spec]() { return backend->arm(spec); });
+
+    std::optional<DisarmWork> stale_disarm; // set below iff we must undo a LATE success
+    std::expected<std::uint64_t, std::string> outcome = new_gen;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        const auto it = arming_keys_.find(key);
+        const bool withdrawn = it != arming_keys_.end() && it->second.withdrawn;
+        arming_keys_.erase(key); // this in-flight episode is over either way
+        const bool armed_live = io_result && io_result->has_value(); // both layers succeeded
+
+        if (stopping_ || withdrawn) {
+            index_->remove_rule(rule_id); // no-op if detach already removed it (withdrawn path)
+            if (armed_live) {
+                // A live subscription nobody wants any more - disarm it, off-lock,
+                // after this block unlocks. No "armed" audit: this generation never
+                // committed (matches the existing "pending arm withdrawn -> no
+                // lifecycle entry" contract - it was never armed from the runtime's
+                // point of view).
+                stale_disarm = DisarmWork{*io_class, key, **io_result};
+            }
+            outcome = std::unexpected(std::string{stopping_ ? "stopping" : "withdrawn"});
+        } else if (!io_result) {
+            index_->remove_rule(rule_id);
+            std::string reason;
+            switch (io_result.error()) {
+            case IoFailure::Timeout:            reason = "arm timed out"; break;
+            case IoFailure::Stopped:            reason = "stopping"; break;
+            case IoFailure::CapacityExhausted:  reason = "arm capacity exhausted"; break;
+            case IoFailure::AlreadyRunning:     reason = "arm already in progress for this key"; break;
+            case IoFailure::LaunchFailed:       reason = "arm worker launch failed"; break;
+            case IoFailure::WorkerThrew:        reason = "arm worker threw"; break;
+            }
+            if (io_result.error() == IoFailure::Timeout)
+                backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
+            outcome = std::unexpected(reason);
+        } else if (!armed_live) {
+            // The bounded wait completed and backend_->arm() itself returned an
+            // error (io_result->error()) - the SAME synchronous-refusal outcome the
+            // old inline call could always produce, just observed after the
+            // off-lock wait instead of under registry_mu_.
+            index_->remove_rule(rule_id);
+            outcome = std::unexpected(io_result->error());
+        } else {
+            // Mirrors attach_rule's fast-path rollback (same armed_here=true shape):
+            // index_->add already ran in phase 1, and we now hold a live subscription
+            // - a throw from here down (keys_/rules_/pending_initial insert, or a
+            // throwing waker/outbox_waker COPY, exactly as the fast path's own
+            // "throw AFTER arm()" test exercises) must not leave keys_/rules_/index_
+            // desynced or leak the watcher. Calls backend_->disarm() synchronously,
+            // still under registry_mu_ (unlike the normal off-lock disarm path) -
+            // this is the SAME tradeoff the pre-#2233 code always made for this exact
+            // rare unwind case (a map-insert bad_alloc or a throwing waker copy, not
+            // the common path), so it does not reopen the liveness hazard this PR
+            // fixes.
+            const std::uint64_t sub = **io_result;
+            GuardianRollback rollback;
+            rollback.fn = [this, rule_id, key, sub] {
+                index_->remove_rule(rule_id); // undo phase 1's index_->add
+                keys_.erase(key);
+                backend_->disarm(sub);
+                rules_.erase(rule_id);
+            };
+            auto pk = std::make_shared<PerKey>();
+            pk->spec = spec;
+            pk->subscription = sub;
+            keys_.emplace(key, pk);
+            rules_.insert_or_assign(rule_id, std::move(rg));
+            pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
+            waker = pending_initial_waker_;
+            outbox_waker = outbox_enqueue_waker_;
+            enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
+            rollback.committed = true;
+        }
+    }
+    if (stale_disarm)
+        submit_disarm_off_lock(*stale_disarm);
+    if (outcome) {
+        if (waker)
+            waker();
+        if (outbox_waker)
+            outbox_waker();
+    }
+    return outcome;
 }
 
 void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
     std::function<void()> outbox_waker;
+    std::optional<DisarmWork> work;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
-        detach_rule_locked(rule_id);
+        work = detach_rule_locked(rule_id);
         outbox_waker = outbox_enqueue_waker_;
     }
+    // #2233 item 3: off both locks - the confirmed-state mutation + "disarmed" audit
+    // above are already committed regardless of what follows here.
+    if (work)
+        submit_disarm_off_lock(*work);
     if (outbox_waker)
         outbox_waker();
 }
 
 void GuardianSparkRuntime::detach_all() {
     std::function<void()> outbox_waker;
+    std::vector<DisarmWork> works;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         std::vector<std::string> rule_ids;
@@ -226,14 +385,40 @@ void GuardianSparkRuntime::detach_all() {
         for (const auto& [rid, rg] : rules_)
             rule_ids.push_back(rid);
         for (const auto& rid : rule_ids)
-            detach_rule_locked(rid);
+            if (auto work = detach_rule_locked(rid))
+                works.push_back(std::move(*work));
         outbox_waker = outbox_enqueue_waker_;
     }
+    // #2233 item 3: submitted sequentially, off-lock, each bounded by
+    // cfg_.backend_op_deadline - full_sync teardown already tolerates this class of
+    // latency (see apply_rules' full_sync branch, which counts+holds the generation
+    // for the server to retry on a firewalled throw); this is the same trade,
+    // bounded instead of unbounded.
+    for (const auto& work : works)
+        submit_disarm_off_lock(work);
     if (outbox_waker)
         outbox_waker();
 }
 
-void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
+std::optional<GuardianSparkRuntime::DisarmWork>
+GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
+    // #2233 item 3: rule_id belongs to a key whose FIRST arm is still resolving
+    // off-lock (attach_rule released registry_mu_ before the backend call) - it has
+    // no rules_/keys_ entry to withdraw yet. Mark the in-flight episode withdrawn so
+    // its own completion abandons + disarms rather than committing a rule nobody
+    // wants any more, and drop it from the index NOW (matches the immediate-index-
+    // cleanup semantics the confirmed path below already has). No "disarmed" audit -
+    // the rule was never actually armed (same "pending arm withdrawn -> no lifecycle
+    // entry" contract the confirmed path's `known` gate already encodes).
+    if (const auto key_opt = index_->key_for_rule(rule_id); key_opt) {
+        if (auto it = arming_keys_.find(*key_opt);
+            it != arming_keys_.end() && it->second.rule_id == rule_id) {
+            it->second.withdrawn = true;
+            index_->remove_rule(rule_id);
+            return std::nullopt; // nothing to disarm yet; the in-flight attach's completion does
+        }
+    }
+
     const auto rit = rules_.find(rule_id);
     const bool known = (rit != rules_.end());
     const std::uint64_t gen = known ? rit->second->generation : 0;
@@ -250,16 +435,20 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
         std::lock_guard<std::mutex> ob{outbox_mu_};
         outbox_.drop_rule(rule_id); // compliance/health only - Lifecycle lives in lifecycle_log_
     }
-    // Disarm the shared watcher BEFORE the "disarmed" audit enqueue. enqueue_lifecycle_locked
-    // allocates; in the OLD order a throw there left the watcher ARMED while the rule was
-    // already gone from the index - a leaked OS watcher + keys_/index_ desync that breaks a
-    // future same-key re-attach (keys_.emplace no-ops on the stale key) (Gate 2 security
-    // LOW). A throw AFTER the disarm merely loses the audit entry; audit-after-teardown is
-    // the correct causal order anyway.
+    // #2233 item 3: the confirmed-state mutation above (index_/rules_/keys_) and the
+    // "disarmed" audit below are the durable commit; the actual backend_->disarm()
+    // call is now the CALLER's job, off-lock (submit_disarm_off_lock). This changes
+    // WHERE that call runs, not whether its success is confirmed - disarm() is void
+    // and was never awaited for success even in the old inline call (see the header
+    // doc's DisarmWork comment), so this is not a new unconfirmed-teardown gap.
+    std::optional<DisarmWork> work;
     if (disarm_key) {
         const auto kit = keys_.find(*disarm_key);
         if (kit != keys_.end()) {
-            backend_->disarm(kit->second->subscription);
+            if (const auto ioc = io_class_for_spark_type(kit->second->spec.type))
+                work = DisarmWork{*ioc, *disarm_key, kit->second->subscription};
+            else
+                backend_->disarm(kit->second->subscription); // inline type: unchanged, synchronous
             keys_.erase(kit); // the in-flight pass (if any) holds its own shared_ptr; safe
         }
     } else if (key_opt) {
@@ -269,6 +458,7 @@ void GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id) {
     }
     if (known)
         enqueue_lifecycle_locked(rule_id, gen, "disarmed", guard_type, rule_name);
+    return work;
 }
 
 void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
@@ -992,6 +1182,18 @@ void GuardianSparkRuntime::begin_stop() {
     // begin_stop() also runs from ~GuardianSparkRuntime().
     if (reader)
         reader->request_stop();
+    // #2233 item 3: wake any attach_rule/detach_rule currently parked in a bounded
+    // backend wait immediately, rather than making it ride out cfg_.backend_op_deadline.
+    // GuardianIoExecutor::stop() is idempotent, non-throwing, and safe to call from
+    // ~GuardianSparkRuntime() same as request_stop() above. NOTE this does not make
+    // GuardianEngine::stop() itself instant: stop() takes GuardianEngine::mtx_
+    // BEFORE calling begin_stop() (guardian_engine.cpp), so if apply_rules() is
+    // currently the one parked in a bounded wait, stop() cannot even reach this
+    // call until that wait resolves - bounded by cfg_.backend_op_deadline, same as
+    // apply_rules() itself, not instant. This DOES matter for a caller that already
+    // holds mtx_ across a DIFFERENT blocking section calling begin_stop() directly,
+    // and for the runtime's own destructor path.
+    io_executor_.stop();
 }
 
 std::size_t GuardianSparkRuntime::armed_key_count() const {
