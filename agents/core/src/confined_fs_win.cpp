@@ -354,6 +354,12 @@ OpenDirResult open_dir_at(HANDLE parent, const std::string& name, const FileIden
     return result;
 }
 
+// C003: the delete handle deliberately omits FILE_SHARE_WRITE. Measuring the
+// size and then setting the delete disposition are separate steps, so admitting
+// a concurrent writer would let the file grow past the charged cap between them
+// -- the Windows twin of the POSIX swap this primitive already defends against.
+// Without FILE_SHARE_WRITE an incompatible existing writer makes the open fail,
+// which is the fail-closed outcome a blast-radius cap requires.
 UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
                         std::uint64_t max_bytes_remaining,
                          const FileIdentity& root_id) {
@@ -370,7 +376,7 @@ UnlinkOutcome unlink_at(HANDLE parent, const std::string& name, UnlinkKind kind,
 
     NtOpenResult opened = nt_open_relative(
         parent, wide, DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+        FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_OPEN,
         FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT | type_option);
 
     if (opened.reason == Reason::Unsupported || opened.reason == Reason::InvalidName) {

@@ -441,7 +441,10 @@ TEST_CASE("walk_delete: an enumerate OsError fails that directory and siblings s
 
     DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, kOpenLimits);
 
-    REQUIRE(result.stop_reason == Reason::None);
+    // NOT None: the broken child's subtree was never visited, so claiming an
+    // exhaustive walk here would be a false completion signal. This assertion
+    // previously required None and thereby pinned the defect.
+    REQUIRE(result.stop_reason == Reason::OsError);
     bool found_broken_failed = false;
     bool found_sibling_deleted = false;
     for (auto& e : result.entries) {

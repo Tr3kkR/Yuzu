@@ -184,18 +184,29 @@ void run_mid_walk_junction_swap(int depth) {
     REQUIRE(root_opened.root.has_value());
     const FileIdentity root_id = root_opened.root->identity();
 
-    // Chain of HELD handles down to `parent_path` (levels 1..depth-1).
+    // Chain of HELD handles all the way DOWN TO the directory that will be
+    // swapped (levels 1..depth). C004: an earlier version stopped one level
+    // short, so `current` was the swap target's PARENT and the test merely
+    // re-observed the planted junction by name -- the pre-walk shape wearing a
+    // mid-walk label. The property that actually needs proving is that a handle
+    // opened BEFORE the swap stays bound to the inode it opened, not to the path.
     std::vector<OpenDirResult> chain;
-    HANDLE current = root_opened.root->h_.get();
-    for (int i = 1; i < depth; ++i) {
-        OpenDirResult next = open_dir_at(current, "level" + std::to_string(i), root_id);
+    HANDLE parent_of_swap = root_opened.root->h_.get();
+    HANDLE held_swap = INVALID_HANDLE_VALUE;
+    for (int i = 1; i <= depth; ++i) {
+        const std::string level = (i == depth) ? swap_name : ("level" + std::to_string(i));
+        OpenDirResult next = open_dir_at(parent_of_swap, level, root_id);
         REQUIRE(next.reason == Reason::None);
-        current = next.h.get();
+        if (i == depth)
+            held_swap = next.h.get();
+        else
+            parent_of_swap = next.h.get();
         chain.push_back(std::move(next));
     }
-    // `current` is the HELD handle to the entry's parent -- opened BEFORE
-    // the swap below.
+    REQUIRE(held_swap != INVALID_HANDLE_VALUE);
 
+    // Now interpose: move the held directory aside and plant a junction to an
+    // outside tree at the path it used to occupy.
     yuzu::test::TempDir aside{"yuzu_test_confined_win_aside_"};
     std::filesystem::create_directories(aside.path);
     const std::filesystem::path aside_path = aside.path / "moved";
@@ -204,23 +215,42 @@ void run_mid_walk_junction_swap(int depth) {
     JunctionCleanup cleanup{swap_path};
 
     EnumBudget budget{100, std::chrono::steady_clock::now() + std::chrono::seconds(30)};
-    EnumerateResult enumerated = enumerate_at(current, root_id, budget);
-    REQUIRE(enumerated.reason == Reason::None);
-    const auto found = std::find_if(enumerated.entries.begin(), enumerated.entries.end(),
+
+    // THE MID-WALK ASSERTION: enumerate and delete through the handle held since
+    // before the swap. It must still see the MOVED directory's own contents --
+    // not the junction's target -- and the unlink must remove the file that
+    // travelled with the inode.
+    EnumerateResult through_held = enumerate_at(held_swap, root_id, budget);
+    REQUIRE(through_held.reason == Reason::None);
+    const auto inner = std::find_if(through_held.entries.begin(), through_held.entries.end(),
+                                    [](const DirEntry& e) { return e.name == "inner.txt"; });
+    REQUIRE(inner != through_held.entries.end());
+
+    UnlinkOutcome removed = unlink_at(held_swap, "inner.txt", UnlinkKind::File,
+                                      std::numeric_limits<std::uint64_t>::max(), root_id);
+    CHECK(removed.status == EntryStatus::Deleted);
+    CHECK_FALSE(std::filesystem::exists(aside_path / "inner.txt")); // the moved inode's file
+    CHECK(std::filesystem::exists(victim.path / "victim.txt"));     // outside tree untouched
+
+    // The parent-side view is still worth asserting: from the parent, the newly
+    // planted junction must be seen as a reparse point and refused, never traversed.
+    EnumerateResult from_parent = enumerate_at(parent_of_swap, root_id, budget);
+    REQUIRE(from_parent.reason == Reason::None);
+    const auto found = std::find_if(from_parent.entries.begin(), from_parent.entries.end(),
                                      [&](const DirEntry& e) { return e.name == swap_name; });
-    REQUIRE(found != enumerated.entries.end());
+    REQUIRE(found != from_parent.entries.end());
     CHECK(found->meta.type == EntryType::Reparse);
 
-    OpenDirResult reopened = open_dir_at(current, swap_name, root_id);
+    OpenDirResult reopened = open_dir_at(parent_of_swap, swap_name, root_id);
     CHECK_FALSE(reopened.h.valid());
     CHECK(reopened.reason == Reason::ReparseRejected);
 
-    UnlinkOutcome unlinked = unlink_at(current, swap_name, UnlinkKind::EmptyDirectory, std::numeric_limits<std::uint64_t>::max(), root_id);
+    UnlinkOutcome unlinked = unlink_at(parent_of_swap, swap_name, UnlinkKind::EmptyDirectory,
+                                       std::numeric_limits<std::uint64_t>::max(), root_id);
     CHECK(unlinked.status == EntryStatus::Failed);
     CHECK(unlinked.reason == Reason::ReparseRejected);
 
     CHECK(std::filesystem::exists(victim.path / "victim.txt"));
-    CHECK(std::filesystem::exists(aside_path / "inner.txt"));
 }
 
 } // namespace

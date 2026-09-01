@@ -50,7 +50,10 @@
  *       - `EnumerateResult::reason == OsError`: append
  *         `EntryOutcome{<this dir's rel_path>, Failed, OsError, os_error}`
  *         and continue on to the NEXT sibling on the stack (the walk is
- *         not stopped by one unreadable directory).
+ *         not stopped by one unreadable directory) -- but the walk REMEMBERS
+ *         that a subtree went unvisited and reports `OsError` as its
+ *         `stop_reason` at the end rather than `None`, which would claim an
+ *         exhaustive visit.
  *  4. Per collected entry, in order:
  *       - `stat_error != 0` -> append `Failed(OsError, stat_error)`,
  *         `entries_seen++`, continue to the next entry.
@@ -160,6 +163,14 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
     DeleteResult result{};
     result.stop_reason = Reason::None;
 
+    // C001: a directory we could not enumerate or open leaves a subtree
+    // UNVISITED. Recording a Failed entry for it is useful diagnostics but does
+    // not repair the top-level signal: callers are entitled to read
+    // stop_reason == None as "the tree was exhaustively visited", so a walk that
+    // skipped a subtree must not report None. The first such reason is retained
+    // here and applied at the end if nothing more specific stopped the walk.
+    Reason incomplete = Reason::None;
+
     try {
         // B005: saturate rather than overflow. `now() + max_wall` is signed
         // chrono arithmetic, so an extreme caller-supplied max_wall is UB and
@@ -194,6 +205,8 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
             if (enum_result.reason == Reason::OsError) {
                 result.entries.push_back(EntryOutcome{frame.rel_prefix, EntryStatus::Failed,
                                                         Reason::OsError, enum_result.os_error});
+                if (incomplete == Reason::None)
+                    incomplete = Reason::OsError; // subtree unvisited -- see C001 above
                 continue; // move on to sibling directories still on the stack
             }
             // Any OTHER non-None reason means enumeration did not complete for a
@@ -282,6 +295,8 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                     } else if (opened.reason == Reason::OsError) {
                         result.entries.push_back(EntryOutcome{
                             rel_path, EntryStatus::Failed, Reason::OsError, opened.os_error});
+                        if (incomplete == Reason::None)
+                            incomplete = Reason::OsError; // subtree unvisited -- C001
                     } else if (detail::is_policy_refusal(opened.reason)) {
                         result.entries.push_back(
                             EntryOutcome{rel_path, EntryStatus::Skipped, opened.reason, 0});
@@ -333,6 +348,10 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
             }
         }
 
+        // Nothing stopped the walk, but if a subtree was skipped the walk was
+        // NOT exhaustive and must not claim it was.
+        if (result.stop_reason == Reason::None)
+            result.stop_reason = incomplete;
         return result;
     } catch (...) {
         result.stop_reason = Reason::Internal;

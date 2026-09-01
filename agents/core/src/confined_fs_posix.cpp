@@ -279,30 +279,82 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
     }
 }
 
+// Unpredictable capture name. The byte cap cannot be enforced by measuring a
+// NAME and then unlinking that name: fstatat and unlinkat are separate calls,
+// and an attacker who controls the tree can swap a large file over the measured
+// name in between. Reproduced: a 1-byte entry measured, replaced with a
+// 4096-byte file, deleted under a 10-byte remaining budget and charged 1.
+//
+// The fix is capture-then-measure: renameat the entry to a name the attacker
+// cannot predict, THEN measure and unlink that name. rename is atomic, so after
+// it the inode is bound to a name only this process knows.
+//
+// A separate staging DIRECTORY was considered and deliberately not used: on
+// POSIX a same-UID attacker can reach any directory we can create, so it adds
+// no confidentiality, while adding cross-directory rename, orphan purging and
+// enumeration-exclusion failure modes. The unpredictability of the name is what
+// closes the window, and that works in the entry's own parent.
+//
+// Residual, documented: a hard kill between the rename and the unlink leaves one
+// orphan named with the prefix below. Every non-crash path restores or removes it.
+constexpr const char* kCapturePrefix = ".yuzu_cfs_capture_";
+
+std::optional<std::string> make_capture_name() {
+    unsigned char raw[8];
+    const int fd = ::open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return std::nullopt;
+    ssize_t got = ::read(fd, raw, sizeof raw);
+    ::close(fd);
+    if (got != static_cast<ssize_t>(sizeof raw))
+        return std::nullopt;
+    static const char* kHex = "0123456789abcdef";
+    std::string out = kCapturePrefix;
+    for (unsigned char b : raw) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0x0f]);
+    }
+    return out;
+}
+
 UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
                         std::uint64_t max_bytes_remaining) {
     if (is_invalid_component(name, /*windows_separators=*/false))
         return UnlinkOutcome{EntryStatus::Failed, Reason::InvalidName, 0, 0};
 
-    // Re-measure NOW, not at enumeration time. An attacker who controls this
-    // tree can replace a small file with a large one after we enumerated it,
-    // and a cap charged the stale size would let the delete blow straight
-    // through the blast-radius limit it exists to enforce. A regular file
-    // whose LIVE size exceeds what is left of the budget is refused, not
-    // deleted. Directories are not byte-charged.
+    // CAPTURE. Bind the directory entry to an unpredictable name before doing
+    // anything else, so the object we measure is provably the object we delete.
+    const auto captured = make_capture_name();
+    if (!captured) {
+        const int err = errno;
+        spdlog::warn("confined_fs::unlink_at: cannot generate a capture name ({}) -- refusing",
+                     std::strerror(err));
+        return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};
+    }
+    if (::renameat(dir_fd, name.c_str(), dir_fd, captured->c_str()) != 0) {
+        const int err = errno;
+        spdlog::debug("confined_fs::unlink_at: capture rename of '{}' failed: {}", name,
+                      std::strerror(err));
+        return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};
+    }
+
+    // Restores the entry to its original name on any refusal path below, so a
+    // declined delete leaves the tree exactly as it was found.
+    const auto restore = [&]() {
+        if (::renameat(dir_fd, captured->c_str(), dir_fd, name.c_str()) != 0) {
+            spdlog::warn("confined_fs::unlink_at: could not restore '{}' after refusing it; it "
+                         "remains as '{}'", name, *captured);
+        }
+    };
+
+    // MEASURE the captured name. Nothing can substitute for it: the attacker
+    // cannot guess it, and it never existed under a name they controlled.
     std::uint64_t live_bytes = 0;
     if (kind == UnlinkKind::File) {
         struct stat st{};
-        if (g_fstatat_fn(dir_fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
-            // FAIL CLOSED. An earlier revision deleted anyway and charged the
-            // tally 0, reasoning that the entry is inside the confined parent
-            // so the delete is still safe. That conflates two SEPARATE
-            // controls: confinement bounds WHERE we may delete, this cap bounds
-            // HOW MUCH. Measured on that revision: a 4096-byte file was deleted
-            // under a 1-byte remaining budget and reported Deleted/bytes=0, so
-            // the cap was not weakened but wholly bypassed, and invisibly. If
-            // we cannot measure an entry, we do not delete it.
+        if (g_fstatat_fn(dir_fd, captured->c_str(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
             const int err = errno;
+            restore();
             spdlog::warn("confined_fs::unlink_at: cannot measure '{}' before deleting ({}) -- "
                          "refusing rather than deleting it uncharged", name, std::strerror(err));
             return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};
@@ -310,23 +362,21 @@ UnlinkOutcome unlink_at(int dir_fd, const std::string& name, UnlinkKind kind,
         if (S_ISREG(st.st_mode)) {
             live_bytes = static_cast<std::uint64_t>(st.st_size);
             if (live_bytes > max_bytes_remaining) {
-                spdlog::warn("confined_fs::unlink_at: '{}' grew past the byte cap since "
-                             "enumeration -- refusing", name);
+                restore();
+                spdlog::warn("confined_fs::unlink_at: '{}' exceeds the remaining byte cap -- "
+                             "refusing", name);
                 return UnlinkOutcome{EntryStatus::Skipped, Reason::ByteCap, 0, 0};
             }
         }
     }
 
-    // Accepted benign race (documented per spec): a symlink swapped in
-    // between this entry's `fstatat` (in enumerate_at) and this `unlinkat`
-    // can at worst cause `unlinkat` to remove the ATTACKER'S OWN symlink
-    // entry inside this already-confined parent directory -- a name-level
-    // operation against a name we were already about to act on. `unlinkat`
-    // never traverses the symlink; it removes the directory entry by name.
+    // DELETE the captured name -- the same object that was just measured.
     const int flags = (kind == UnlinkKind::EmptyDirectory) ? AT_REMOVEDIR : 0;
-    if (::unlinkat(dir_fd, name.c_str(), flags) != 0) {
+    if (::unlinkat(dir_fd, captured->c_str(), flags) != 0) {
         const int err = errno;
-        spdlog::debug("confined_fs::unlink_at: unlinkat('{}') failed: {}", name, std::strerror(err));
+        restore();
+        spdlog::debug("confined_fs::unlink_at: unlinkat('{}') failed: {}", name,
+                      std::strerror(err));
         return UnlinkOutcome{EntryStatus::Failed, Reason::OsError, err, 0};
     }
     return UnlinkOutcome{EntryStatus::Deleted, Reason::None, 0, live_bytes};

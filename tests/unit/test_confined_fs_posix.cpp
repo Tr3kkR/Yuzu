@@ -15,6 +15,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <limits>
+#include <system_error>
 
 #include <algorithm>
 #include <cerrno>
@@ -320,6 +321,49 @@ TEST_CASE("a symlink entry inside the root is skipped and its target survives", 
 // time. An earlier revision deleted anyway and charged the tally 0: measured, a
 // 4096-byte file was removed under a 1-byte remaining budget while reporting
 // Deleted/bytes=0, so the cap was bypassed invisibly rather than weakened.
+// Reproduces the attack an external reviewer demonstrated against the previous
+// measure-by-name implementation: a 1-byte entry was measured, a 4096-byte file
+// was swapped over that name, and unlinkat removed 4096 bytes under a 10-byte
+// remaining budget while charging 1. Capture-then-measure closes it -- by the
+// time the swap lands, our inode is already bound to an unpredictable name and
+// the attacker has only replaced a name we no longer act on.
+TEST_CASE("unlink_at cannot be made to delete a file swapped in after measurement",
+          "[confined_fs]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_swapcap_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "victim.tmp", "x");                       // 1 byte, the target
+    write_file(root_dir / "big.tmp", std::string(4096, 'x'));       // the attacker's payload
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    static fs::path s_root;
+    s_root = root_dir;
+    UnlinkOutcome outcome{};
+    {
+        // The seam fires during the measurement, which is the exact instant the
+        // attacker gets to act. It renames the large file over the ORIGINAL name.
+        FstatatSeamGuard guard{[](int dirfd, const char* nm, struct stat* st, int flags) -> int {
+            std::error_code ec;
+            fs::rename(s_root / "big.tmp", s_root / "victim.tmp", ec);
+            return ::fstatat(dirfd, nm, st, flags);
+        }};
+        outcome = unlink_at(opened.root->fd_.get(), "victim.tmp", UnlinkKind::File, 10);
+    }
+
+    // The 1-byte inode we captured is what got deleted, and it is what we charged.
+    CHECK(outcome.status == EntryStatus::Deleted);
+    CHECK(outcome.bytes == 1);
+    // The attacker's 4096-byte file was NOT deleted under the 10-byte budget --
+    // it is still sitting at the name they moved it to.
+    CHECK(fs::exists(root_dir / "victim.tmp"));
+    CHECK(fs::file_size(root_dir / "victim.tmp") == 4096);
+    // And no capture-prefixed orphan was left behind.
+    for (const auto& e : fs::directory_iterator(root_dir))
+        CHECK(e.path().filename().string().rfind(".yuzu_cfs_capture_", 0) != 0);
+}
+
 TEST_CASE("unlink_at refuses to delete when it cannot measure the entry", "[confined_fs]") {
     yuzu::test::TempDir tmp{"yuzu_test_confined_posix_measfail_"};
     const fs::path root_dir = tmp.path / "root";
