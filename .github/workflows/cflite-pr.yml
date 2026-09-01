@@ -87,7 +87,8 @@ jobs:
       # to hard-fail closed - a tool hiccup degrades this run to "fuzz
       # everything", it never silently misreads garbage as fresh (round-1
       # governance findings UP-1/CH-1: GNU `date -d` parses non-ISO8601
-      # junk as "now" instead of erroring; round-2 findings: a
+      # junk as a plausible-looking timestamp near "now" instead of
+      # erroring; round-2 findings: a
       # shape-valid-but-calendar-invalid timestamp still reached the
       # unguarded `date -d` call, and a present-but-malformed artifact
       # record collapsed into the same branch as "no artifact at all").
