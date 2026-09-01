@@ -38,8 +38,12 @@
  *       - Enumeration truncated with `WallTimeCap`: stop IMMEDIATELY --
  *         the entries collected before truncation are NOT processed --
  *         `stop_reason = WallTimeCap`.
- *       - Enumeration truncated with `EntryCap` and zero entries were
- *         collected: `stop_reason = EntryCap`.
+ *       - Enumeration truncated with `EntryCap`: the entries it DID
+ *         return are processed normally, and the walk then stops with
+ *         `stop_reason = EntryCap`. This holds whether the truncated
+ *         batch was empty or not -- a directory larger than the budget
+ *         must never report `stop_reason = None`, which a caller is
+ *         entitled to read as "the tree was exhaustively visited".
  *       - `EnumerateResult::reason == OsError`: append
  *         `EntryOutcome{<this dir's rel_path>, Failed, OsError, os_error}`
  *         and continue on to the NEXT sibling on the stack (the walk is
@@ -159,10 +163,6 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                 result.stop_reason = Reason::WallTimeCap;
                 return result;
             }
-            if (enum_result.reason == Reason::EntryCap && enum_result.entries.empty()) {
-                result.stop_reason = Reason::EntryCap;
-                return result;
-            }
             if (enum_result.reason == Reason::OsError) {
                 result.entries.push_back(EntryOutcome{frame.rel_prefix, EntryStatus::Failed,
                                                         Reason::OsError, enum_result.os_error});
@@ -257,6 +257,17 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
 
             if (stopped)
                 return result;
+
+            // The entry budget truncated this directory's listing. Whatever it did
+            // return has now been processed, but the directory was NOT fully
+            // enumerated, so the walk must report the cap rather than complete
+            // silently — a caller that sees stop_reason None is entitled to treat
+            // the tree as exhaustively visited. This is the single EntryCap exit:
+            // an empty truncated batch simply falls through the loop to here.
+            if (enum_result.reason == Reason::EntryCap) {
+                result.stop_reason = Reason::EntryCap;
+                return result;
+            }
         }
 
         return result;

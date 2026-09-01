@@ -202,6 +202,26 @@ TEST_CASE("walk_delete lazy match: MatchFn not called past the entry cap", "[con
     REQUIRE(result.stop_reason == Reason::EntryCap);
 }
 
+// Regression: a NON-EMPTY batch truncated by the entry budget must still report
+// EntryCap. The walker previously reported the cap only when the truncated batch
+// came back empty, so a directory larger than max_entries processed its capped
+// entries and then returned stop_reason None — telling the caller the tree had
+// been exhaustively visited when it had not.
+TEST_CASE("walk_delete: a non-empty truncated batch still reports EntryCap", "[confined_fs]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+    ops.dir(root).entries = {file_entry("a.txt"), file_entry("b.txt"), file_entry("c.txt"),
+                             file_entry("d.txt"), file_entry("e.txt")};
+
+    DeleteLimits limits = kOpenLimits;
+    limits.max_entries = 3;
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, always_match, limits);
+    REQUIRE(result.stop_reason == Reason::EntryCap);
+    REQUIRE(result.tally.entries_seen <= 3);
+    REQUIRE(result.entries.size() <= 3);
+}
+
 TEST_CASE("walk_delete: MatchFn throwing stops the walk with MatchError and keeps partial results",
           "[confined_fs]") {
     FakeOps ops{std::chrono::steady_clock::now()};
