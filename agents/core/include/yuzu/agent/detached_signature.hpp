@@ -17,6 +17,8 @@
 /// allowlist, and the updater does so with the server-supplied SHA-256 and the
 /// semver downgrade check, both of which it applies BEFORE getting here.
 
+#include <yuzu/plugin.h> // YUZU_EXPORT
+
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -53,7 +55,7 @@ struct CmsVerifyError {
 /// the same root: without the purpose, trusting that root for signing would make
 /// every cert it ever issued a signing authority. (plugin governance sec-LOW-2 /
 /// UP-8, preserved in the lift.)
-[[nodiscard]] std::optional<CmsVerifyError>
+[[nodiscard]] YUZU_EXPORT std::optional<CmsVerifyError>
 verify_detached_cms(const std::filesystem::path& artifact_path, std::string_view signature_pem,
                     const std::filesystem::path& trust_bundle_path);
 
@@ -73,7 +75,7 @@ verify_detached_cms(const std::filesystem::path& artifact_path, std::string_view
 /// The descriptor's file offset is saved and restored, and the descriptor is NOT
 /// closed; the caller keeps ownership. On Windows, pass a CRT descriptor obtained
 /// from a DUPLICATED handle, so closing it cannot disturb the caller's own.
-[[nodiscard]] std::optional<CmsVerifyError>
+[[nodiscard]] YUZU_EXPORT std::optional<CmsVerifyError>
 verify_detached_cms_fd(int artifact_fd, std::string_view signature_pem,
                        const std::filesystem::path& trust_bundle_path);
 
