@@ -6529,6 +6529,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #1634 (governance Gate 5 chaos-injector finding, CH-5): an empty
+                // `dispatched_by` is `ExecutionQuery`'s OWN sentinel for "no filter"
+                // (see execution_tracker.hpp) — if a confined session's username
+                // were ever empty, this would silently widen to an unrestricted
+                // list instead of narrowing to "sees nothing," the wrong direction
+                // for a confinement check to fail in. No live path produces an
+                // authenticated confined session with an empty username today
+                // (session creation rejects it), but fail closed explicitly rather
+                // than rely on that invariant holding forever.
+                if (gate.scope && session->username.empty()) {
+                    spdlog::error("list_executions: confined session has empty username; "
+                                  "failing closed rather than risk an unfiltered list");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
                 ExecutionQuery eq;
                 eq.definition_id = param_str(args, "definition_id");
                 eq.status = param_str(args, "status");
