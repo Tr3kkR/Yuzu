@@ -1699,31 +1699,6 @@ public:
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_discovery_read_degrade_total", {{"reason", reason}});
-        metrics_.describe("yuzu_server_discovery_backfill_total",
-                          "DiscoveryStore legacy-SQLite backfill outcomes by result "
-                          "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
-                          "failed = fail-closed refusal). One-time at boot (ADR-0044)",
-                          "counter");
-        for (const auto result : {"completed", "fresh", "failed"})
-            metrics_.counter("yuzu_server_discovery_backfill_total", {{"result", result}});
-        // NotificationStore observability (ADR-0046). Two-way result split (not
-        // RbacStore/ManagementGroupStore/DiscoveryStore's three-way
-        // fresh/completed/failed) — this store's backfill is a single
-        // transaction with no multi-step outcome to report separately, so
-        // "fresh install" and "already-migrated skip" both collapse into
-        // result="success". This wrapper emits on EVERY boot (including
-        // already-migrated restarts), so a boot that never reaches this line
-        // — the failure mode YuzuNotificationBackfillFailing watches for —
-        // is visible as an absent series, not a "reaper" concern (this store
-        // has no retention/reap pass at all).
-        metrics_.describe("yuzu_server_notification_backfill_total",
-                          "One-time legacy notifications.db -> notification_store PostgreSQL "
-                          "backfill outcome on every boot, by result (success = fresh install, "
-                          "already-migrated skip, or a completed migration; failed = fail-closed, "
-                          "boot refused, next start retries). ADR-0046.",
-                          "counter");
-        for (const auto result : {"success", "failed"})
-            metrics_.counter("yuzu_server_notification_backfill_total", {{"result", result}});
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",
