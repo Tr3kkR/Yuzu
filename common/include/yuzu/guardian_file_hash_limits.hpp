@@ -7,7 +7,8 @@
 /// an over-ceiling value at authoring time, `server/core/src/guardian_rule_spec.cpp`)
 /// so the two cannot drift apart on the ceiling value the way two independent
 /// hand-rolled clamps would (this repo's established pattern for exactly this class
-/// of bug; see #3388's jitter fix for precedent).
+/// of bug; see `common/include/yuzu/audit_retention_rules.hpp`'s `classify` for the
+/// precise same-directory precedent of a server+agent shared decision constant).
 ///
 /// A footgun guard, not a tight resource limit: an authored value previously had NO
 /// upper bound on either side, so an operator (deliberately or by typo) could direct
