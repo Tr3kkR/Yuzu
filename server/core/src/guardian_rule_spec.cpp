@@ -134,7 +134,7 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
                     "set assertion.params.max_bytes >= 1 (bytes), or omit it for the default cap"};
             if (n > yuzu::guardian::kMaxFileHashBytes)
                 return ResilienceParamError{
-                    "max_bytes exceeds the 1 GiB agent-side ceiling (#2233 item 6)",
+                    "max_bytes exceeds the 1 GiB agent-side ceiling",
                     "set assertion.params.max_bytes to at most 1073741824 (1 GiB) - a "
                     "larger value would only be silently clamped on the agent"};
         }
