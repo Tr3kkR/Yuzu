@@ -353,6 +353,46 @@ private:
     pb::CommandRequest cmd_;
 };
 
+/// #3687 (Gate 6 governance fix): the per-action kill-switch DECISION
+/// `finalize_classified_command` applies (below), extracted to its own
+/// function for the IDENTICAL reason `finalize_classified_command` itself was
+/// extracted from `ServerImpl::build_classified_command` — see that
+/// function's own doc comment immediately below: "a from-scratch copy inside
+/// a test/caller is how a shared rule silently drifts from what production
+/// actually enforces". This PR's own first round reintroduced that exact
+/// shape once already (the MCP pre-dispatch dry run's production wiring,
+/// `server.cpp`, re-expressed this boolean inline instead of sharing code —
+/// caught by governance, this extraction is the fix), which is the concrete
+/// proof this class of drift is not hypothetical.
+///
+/// `action_allowed`'s contract is IDENTICAL to `classify_and_authorize_
+/// dispatch`'s `has_permission`: injected, not looked up — the production
+/// binder wraps `PluginConfigStore::action_allowed`, fail-closed by that
+/// store's own contract (a closed store, a lease timeout, or a query failure
+/// all report "not allowed"). An empty/unset callback means no kill-switch
+/// store is wired at all (legacy-open for THIS gate ONLY, mirroring how an
+/// absent `plugin_config_store_` behaves in `server.cpp`) — never call this
+/// with a callback that unconditionally returns `true` "to be safe"; that
+/// reintroduces exactly the ZERO-callers gap `finalize_classified_command`'s
+/// own extraction (M6, wave1 remediation) closed.
+///
+/// Returns `std::nullopt` when the action is allowed (including when
+/// `action_allowed` is unset — legacy-open); a populated `DispatchDenial`
+/// (always `DispatchDenialReason::KillSwitched`) otherwise. Every caller of
+/// `classify_and_authorize_dispatch` that also needs the kill-switch
+/// dimension — today `finalize_classified_command` and the MCP pre-dispatch
+/// dry run (server.cpp's `authorize_dispatch_fn_` production closure) — calls
+/// this directly rather than re-deriving the condition.
+[[nodiscard]] inline std::optional<DispatchDenial> kill_switch_denial(
+    const CommandCapability& cap,
+    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed) {
+    if (action_allowed && !action_allowed(cap.plugin, cap.action)) {
+        return DispatchDenial{DispatchDenialReason::KillSwitched, std::string(cap.securable),
+                              cap.operation};
+    }
+    return std::nullopt;
+}
+
 /// The composition step `ServerImpl::build_classified_command` runs AFTER
 /// `classify_and_authorize_dispatch` succeeds — extracted for the identical
 /// reason that function was: a from-scratch copy inside a test is how a
@@ -360,16 +400,9 @@ private:
 /// until this extraction NOTHING unit-tested it directly (M6, wave1
 /// remediation). Two behaviours live here, both revert-survivor-sensitive:
 ///
-/// 1. **The per-action kill switch.** `action_allowed` is injected exactly
-///    like `classify_and_authorize_dispatch`'s `has_permission` — the
-///    production binder wraps `PluginConfigStore::action_allowed`, fail-closed
-///    by that store's own contract (a closed store, a lease timeout, or a
-///    query failure all report "not allowed"). An empty/unset callback means
-///    no kill-switch store is wired at all (legacy-open for THIS gate,
-///    mirroring how an absent `plugin_config_store_` behaves in
-///    `server.cpp`) — never call this with a callback that unconditionally
-///    returns `true` "to be safe"; that reintroduces exactly the ZERO-callers
-///    gap this composition exists to close.
+/// 1. **The per-action kill switch** — delegates to `kill_switch_denial`
+///    (above); see that function's own doc comment for the injection
+///    contract.
 /// 2. **BR-009 canonical wire names.** The wire command is built from `cap`'s
 ///    catalogue-resolved spelling (`cap.plugin`/`cap.action`), never the
 ///    caller's raw strings — `classify()` is case-insensitive but the agent
@@ -387,10 +420,8 @@ private:
     const std::unordered_map<std::string, std::string>& parameters,
     const std::string& payload, int stagger_seconds, int delay_seconds,
     const std::string& target_arm, const std::string& execution_id) {
-    if (action_allowed && !action_allowed(cap.plugin, cap.action)) {
-        return std::unexpected(
-            DispatchDenial{DispatchDenialReason::KillSwitched, std::string(cap.securable),
-                           cap.operation});
+    if (auto denial = kill_switch_denial(cap, action_allowed)) {
+        return std::unexpected(*denial);
     }
 
     pb::CommandRequest cmd;

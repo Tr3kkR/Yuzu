@@ -23,8 +23,7 @@
  * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite TEST_CASE suite
  * was removed as part of a fresh-start-by-default policy change (ADR-0009 amendment) -- no
  * production fleet has ever run a pre-Postgres build. ProductPackStore::migrate_from_sqlite()
- * itself is UNCHANGED and still present in production code; only this file's test coverage of
- * it was removed.
+ * itself was retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  */
 
 #include "product_pack_store.hpp"
@@ -222,8 +221,6 @@ TEST_CASE("ProductPackStore reports !is_open on an unreachable pool, and every m
         "x", [](const std::string&, const std::string&) -> std::expected<void, std::string> { return {}; });
     CHECK_FALSE(uninstall_res.has_value());
     CHECK(uninstall_res.error().starts_with(yuzu::server::kProductPackDbErrorPrefix));
-
-    CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/does/not/matter"));
 }
 
 // ── #802 / W7.4 signature enforcement ───────────────────────────────────────

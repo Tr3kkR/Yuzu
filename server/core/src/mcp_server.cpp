@@ -817,7 +817,12 @@ static const ToolDef kTools[] = {
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
      "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
-     "ticket is minted or consumed, matching REST POST /api/command.",
+     "ticket is minted or consumed, matching REST POST /api/command. "
+     "DENIAL DISCRIMINATION (#3687): a dispatch-authorization denial is a JSON-RPC error whose "
+     "error.data.reason is one of the six machine-readable values \"unclassified\", "
+     "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
+     "\"kill_switched\" - branch on this field, not on error.message text, which is prose and may "
+     "change.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
      // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the
@@ -2903,6 +2908,135 @@ bool reject_unsupported_protocol_version(const httplib::Request& req, httplib::R
     return true;
 }
 
+/// #3687: the (code, message, remediation) execute_instruction's pre-dispatch
+/// authorization dry run answers with for each
+/// `yuzu::server::detail::DispatchDenialReason` the shared chokepoint can
+/// produce. `kApprovalRequired` (-32006) is deliberately NOT used for
+/// `ApprovalRequired` here — that code's established contract (this file's
+/// `approval_required_error` closure) MUST carry `approval_id`/`status_url`
+/// for a caller to poll, and this dry run mints no ticket (Decision 7: "no
+/// new ticket-mint surface"); `kPermissionDenied` plus the machine-readable
+/// `error.data.reason` (added by the caller of this function) carries the
+/// discrimination instead. Every interpolated value below is either a
+/// server literal, an already-classified `securable`/`operation` (bounded,
+/// closed vocabularies — never caller text), or the caller's OWN `plugin`/
+/// `action` arguments already bounds-checked and lower-cased above this
+/// call site — none of it needs escaping for a JSON-RPC `message` string.
+struct DispatchDenialText {
+    int code;
+    std::string message;
+    std::string remediation;
+};
+
+[[nodiscard]] DispatchDenialText
+describe_dispatch_denial(yuzu::server::detail::DispatchDenialReason reason,
+                         const std::string& plugin, const std::string& action,
+                         const yuzu::server::detail::DispatchDenial& denial) {
+    using Reason = yuzu::server::detail::DispatchDenialReason;
+    switch (reason) {
+    case Reason::Unclassified:
+    case Reason::Ambiguous:
+        // Byte-identical message to the C8 pre-mint site's own ClassifyMiss
+        // arm and to REST's `/api/command` classification-error arm
+        // (server.cpp) — one literal, three call sites.
+        return {kInvalidParams, "unknown or ambiguous plugin.action",
+                "confirm the plugin/action name via discover_plugins or "
+                "discover_instructions and re-call"};
+    case Reason::AnonymousOperator:
+        // `denial.securable`/`.operation` ARE populated for this reason
+        // (DispatchDenial's own doc comment, agent_registry.hpp) but an
+        // empty principal reaching here means caller_fn/derive_dispatch_caller
+        // failed to resolve an identity for an authenticated MCP session —
+        // a wiring fault, not a caller mistake, so the remediation says so.
+        return {kPermissionDenied,
+                "dispatch denied: the caller has no resolved identity for " +
+                    denial.securable + ":" +
+                    std::string(yuzu::server::authz::to_string(denial.operation)),
+                "this indicates a server-side identity-derivation fault, not a caller "
+                "mistake; contact an administrator"};
+    case Reason::Forbidden:
+        // Same "permission denied: securable:operation" wording REST's
+        // generic bucket already uses for this reason (server.cpp) — kept
+        // identical so an operator who has seen the REST message recognizes
+        // this one.
+        return {kPermissionDenied,
+                "permission denied: " + denial.securable + ":" +
+                    std::string(yuzu::server::authz::to_string(denial.operation)),
+                "the dispatching caller lacks this grant; request it, or dispatch as "
+                "a caller who holds it"};
+    case Reason::ApprovalRequired:
+        return {kPermissionDenied,
+                "approval required for " + plugin + "." + action +
+                    " — this action requires either an admin caller or a redeemed "
+                    "approval ticket that this dispatch does not carry",
+                "re-call using a supervised-tier MCP token, which mints and polls an "
+                "approval ticket for this class of call, or dispatch as an admin caller"};
+    case Reason::KillSwitched:
+        return {kPermissionDenied,
+                "dispatch denied: the per-action kill switch is OFF for " + plugin + "." +
+                    action,
+                "an operator has thrown an emergency stop for this plugin.action "
+                "(set_plugin_kill_switch / PUT .../kill-switch); it must be re-enabled "
+                "before this call can dispatch"};
+    }
+    // No default: arm — matches this file's own doctrine
+    // (evaluate_destructive_targeting's switch, to_string(DispatchDenialReason)'s
+    // own no-default doctrine) so a future 7th reason is a -Werror=switch
+    // build failure here, not a silent generic fallback.
+    return {kInternalError, "dispatch denied", {}};
+}
+
+// #3893 fix round (Doomgoose review, blocking findings 1+2): the ONE place
+// that names which MCP tools are dispatch-capable, for the C8 pre-mint dry
+// run and the per-tool main-handler pre-checks alike — issue #3687's own
+// acceptance criterion 2 named "any future dispatch-capable tool"; this is
+// where a future one gets registered, not a new scattered tool-name check at
+// each call site. Returns the (plugin, action) pairs `tool_name`'s call will
+// actually dispatch through the shared `dispatch_fn` chokepoint
+// (`ServerImpl::dispatch_confined` → `build_classified_command`).
+//
+// Empty is a deliberate, silent "skip the pre-check" signal, for two
+// distinct reasons a caller must not conflate:
+//   - `tool_name` is not dispatch-capable at all (e.g. revoke_certificate,
+//     rotate_kek — both approval-gated via the SAME generic C8 flow, but
+//     neither calls dispatch_fn/bundle_orch->dispatch). The fail-closed
+//     "authorizer unavailable" guard must NOT fire for these — they proceed
+//     exactly as they did before this round.
+//   - `tool_name` IS dispatch-capable but its own args do not yet parse
+//     (e.g. execute_bundle's `steps` missing or malformed). That tool's
+//     EXISTING validation (schema check, `validate_bundle_steps` itself)
+//     denies with its own, clearer message later in the flow — this helper
+//     must never itself reject with a generic error on bad input; it only
+//     ever answers "here is what would dispatch" or "nothing to pre-check
+//     yet".
+std::vector<std::pair<std::string, std::string>>
+dispatch_pairs_for(const std::string& tool_name, const nlohmann::json& args) {
+    if (tool_name == "execute_instruction") {
+        return {{param_str(args, "plugin"), param_str(args, "action")}};
+    }
+    if (tool_name == "quarantine_device") {
+        // "quarantine"/"quarantine" is the one fixed pair every
+        // quarantine_device call dispatches — not caller-supplied.
+        return {{"quarantine", "quarantine"}};
+    }
+    if (tool_name == "execute_bundle") {
+        std::vector<std::pair<std::string, std::string>> pairs;
+        if (args.contains("steps")) {
+            if (auto specs = validate_bundle_steps(args["steps"].dump())) {
+                pairs.reserve(specs->size());
+                for (const auto& s : *specs)
+                    pairs.emplace_back(s.plugin, s.action);
+            }
+            // A parse failure here is NOT this helper's problem to report —
+            // execute_bundle's own handler re-runs validate_bundle_steps and
+            // returns ITS OWN, more precise error. Empty pairs here just
+            // means "nothing to pre-check yet".
+        }
+        return pairs;
+    }
+    return {};
+}
+
 } // namespace
 
 namespace detail {
@@ -3964,6 +4098,71 @@ McpServer::HandlerFn McpServer::build_handler(
                 return error_response(id, code, message, data);
             };
 
+            // #3687 (Gate 6 UP-5 fix): the ONE place a DispatchDenial from
+            // authorize_dispatch_fn_'s pre-dispatch dry run becomes a
+            // JSON-RPC response — shared by the C8 pre-mint dry run (below)
+            // and the main-handler dry run (execute_instruction's own
+            // section, further down) so the two call sites cannot spell the
+            // metric/audit/envelope shape differently. Same series
+            // build_classified_command's own denial increments
+            // (yuzu_server_dispatch_denied_total{reason}) — dispatch_fn is
+            // never called on either path this feeds, so no double count for
+            // the same request. Not built on top of a4_error: this family
+            // carries one extra field (`reason`, the machine-readable
+            // DispatchDenialReason) a4_error's other ~40 call sites have no
+            // use for — see describe_dispatch_denial's own doc comment for
+            // why that stays a dedicated shape rather than widening a4_error.
+            auto deny_dispatch_authorization =
+                [&](const std::string& plugin, const std::string& action,
+                    const yuzu::server::detail::DispatchDenial& denial) {
+                    const std::string_view reason_label =
+                        yuzu::server::detail::to_string(denial.reason);
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_denied_total",
+                                          {{"reason", std::string(reason_label)}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                    // #3893 fix round (Doomgoose review, Important finding):
+                    // this dry run denies BEFORE dispatch_fn is ever called, so
+                    // build_classified_command's own spdlog::warn (server.cpp,
+                    // its `if (!decision)` arm — "dispatch denied: {}:{}
+                    // reason={} securable={} caller={}") never fires for a
+                    // request refused here. Without a matching line here, an
+                    // operator tailing logs live saw FEWER denial log lines
+                    // after #3687 than before it for the same underlying
+                    // denials — same fields, `caller` sourced from `session`
+                    // (an MCP dispatch caller is always a resolved session,
+                    // never `.system`, so no system/anonymous ternary is
+                    // needed beyond the empty-username case).
+                    spdlog::warn("dispatch denied: {}:{} reason={} securable={} caller={}", plugin,
+                                 action, reason_label,
+                                 denial.securable.empty() ? "(none)" : denial.securable,
+                                 session->username.empty() ? std::string("(anonymous)")
+                                                           : session->username);
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    const bool audit_ok = mcp_audit(
+                        "denied", std::string("reason=") + std::string(reason_label) + " " +
+                                      yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
+                                      yuzu::server::detail::sanitize_detail_value(action) +
+                                      " correlation_id=" + cid);
+                    const auto text =
+                        describe_dispatch_denial(denial.reason, plugin, action, denial);
+                    std::string data = R"({"correlation_id":")" + cid +
+                                       R"(","retry_after_ms":null,"remediation":)";
+                    data += text.remediation.empty() ? std::string("null")
+                                                     : json_quoted_string(text.remediation);
+                    data += R"(,"reason":")" + std::string(reason_label) + R"(")";
+                    if (!audit_ok)
+                        data += R"(,"audit_persisted":false)";
+                    data += "}";
+                    res.set_content(error_response(id, text.code, text.message, data),
+                                    "application/json");
+                };
+
             // Deny a fleet-wide tool call to a service-scoped API token, with
             // a denial audit. MCP sibling of REST's
             // deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
@@ -4451,16 +4650,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                 break;
                             case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss: {
                                 // #3685 governance-round-2 (Doomgoose colleague review,
-                                // item 3): C8-ONLY deviation from Policy B. REST's
-                                // `/api/command` switch (server.cpp) and this same
-                                // handler's main-handler backstop switch below (~7896)
-                                // both keep Policy B UNCHANGED — explicit fall-through
-                                // to the shared dispatch chokepoint's own unconditional
-                                // classify-miss denial — because an independent early
-                                // denial there would only DUPLICATE evidence the
-                                // chokepoint already produces (it denies a classify-miss
-                                // unconditionally either way; there is no escape to
-                                // close, only evidence to not duplicate).
+                                // item 3): C8-ONLY deviation from Policy B, as it stood
+                                // at #3685 time. REST's `/api/command` switch (server.cpp)
+                                // STILL keeps Policy B unchanged today — explicit
+                                // fall-through to the shared dispatch chokepoint's own
+                                // unconditional classify-miss denial, because an
+                                // independent early denial there would only DUPLICATE
+                                // evidence the chokepoint already produces (it denies a
+                                // classify-miss unconditionally either way; there is no
+                                // escape to close, only evidence to not duplicate).
+                                // #3687 UPDATE: this same handler's main-handler backstop
+                                // (below, ~8203) no longer keeps Policy B — it is now
+                                // dry-run-mediated (`AuthorizeDispatchFn`), denying a
+                                // classify-miss locally before `dispatch_fn`, same as C8
+                                // already did. So as of #3687, C8 and the main-handler
+                                // backstop AGREE (both deny locally, no ticket / no
+                                // dispatch attempt); only REST still differs by falling
+                                // through to the chokepoint.
                                 //
                                 // C8 is different: it runs BEFORE a supervised-tier
                                 // approval ticket is minted. Falling through here does
@@ -4584,6 +4790,82 @@ McpServer::HandlerFn McpServer::build_handler(
                             }
                             }
                         }
+                    }
+
+                    // #3893 fix round (Doomgoose review, blocking findings
+                    // 1+2): generalized from the #3687 Gate 6 UP-5 fix,
+                    // execute_instruction-only, to every dispatch-capable
+                    // tool reaching C8's approval-gated flow — see
+                    // dispatch_pairs_for's own doc comment for the tool
+                    // roster and the non-dispatch-tool ("no pairs") carve
+                    // out. A supervised-tier caller who fails
+                    // specific-securable RBAC (Forbidden) or hits a kill
+                    // switch (KillSwitched) still minted (or consumed) a
+                    // real human-approved ticket before being denied at the
+                    // main-handler backstop — reopening, for those two
+                    // reasons, the exact ticket-waste class this C8
+                    // extension exists to prevent — this closes that gap
+                    // for execute_bundle and quarantine_device exactly as
+                    // it already did for execute_instruction.
+                    //
+                    // CRITICAL: `ApprovalRequired` is NOT a denial to act on
+                    // here — a supervised-tier caller reaching C8 for an
+                    // approval-gated row is AT C8 SPECIFICALLY BECAUSE the
+                    // pair requires approval. `pre_mint_caller` is derived
+                    // fresh, before any ticket is minted OR consumed — this
+                    // block runs before ANY tool's mint/consume fork, so
+                    // `pre_mint_caller.approval_provenance` is ALWAYS `None`
+                    // here, for every tool. A WIRED authorizer therefore
+                    // legitimately reports `ApprovalRequired` for every
+                    // approval-gated pair reaching this point — that is the
+                    // REASON minting/consuming is about to happen, not a
+                    // fault. Every OTHER reason denies locally, no ticket
+                    // minted or consumed — reusing the same
+                    // `deny_dispatch_authorization` shaping this block's
+                    // sibling denials above.
+                    //
+                    // Guarded on a non-empty pairs list so a non-dispatch
+                    // approval-gated tool (revoke_certificate, rotate_kek,
+                    // ...) is completely unaffected: no pairs, no
+                    // fail-closed check, mint proceeds exactly as before
+                    // this round.
+                    if (const auto pairs = dispatch_pairs_for(tool_name, args);
+                        !pairs.empty()) {
+                        if (!authorize_dispatch_fn_) {
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            mcp_audit("denied", std::string("dispatch authorizer "
+                                                            "unavailable correlation_id=") +
+                                                    cid);
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "dispatch authorization is unavailable; "
+                                         "this tool is refused until it is restored",
+                                         kClassifierUnavailableRemediation, -1, cid),
+                                "application/json");
+                            return;
+                        }
+                        const auto pre_mint_caller =
+                            caller_fn
+                                ? caller_fn(*session)
+                                : DispatchCaller{.exec_visible =
+                                                     yuzu::server::authz::deny_all()};
+                        for (const auto& [p, a] : pairs) {
+                            if (auto authz_decision =
+                                    authorize_dispatch_fn_(pre_mint_caller, p, a);
+                                !authz_decision &&
+                                authz_decision.error().reason !=
+                                    yuzu::server::detail::DispatchDenialReason::
+                                        ApprovalRequired) {
+                                deny_dispatch_authorization(p, a, authz_decision.error());
+                                return;
+                            }
+                        }
+                        // Every pair either succeeded or is ApprovalRequired
+                        // (the reason a ticket is about to be minted — same
+                        // carve-out as before, now applied per-pair): fall
+                        // through to the existing mint/recall logic below
+                        // unchanged.
                     }
 
                     if (supplied_id.empty()) {
@@ -8123,8 +8405,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         // Both proceed to dispatch unchanged.
                         break;
                     case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
-                        // Policy B: defers to the existing dispatch chokepoint,
-                        // which denies a real miss on its own terms.
+                        // Policy B, updated by #3687: a classify-miss reaching
+                        // this site is no longer left to fall all the way
+                        // through to dispatch_fn's own internal chokepoint —
+                        // the pre-dispatch authorization dry run immediately
+                        // below denies it locally (Unclassified/Ambiguous),
+                        // discriminated rather than collapsed into
+                        // `no_agents_reached`. This arm still has nothing of
+                        // its own to do: it "breaks" out of the switch and
+                        // lets that dry run be the one that decides.
                         break;
                     case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
                         // #3685 (checkpoint 3, commit 6): same series + label as
@@ -8165,6 +8454,79 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     }
+                }
+
+                // ── Pre-dispatch authorization dry run (#3687) ─────────────────
+                // Generalizes the Destructive-targeting backstop immediately
+                // above to EVERY DispatchDenialReason the shared chokepoint
+                // (classify_and_authorize_dispatch + the per-action kill
+                // switch, agent_registry.hpp / plugin_config_store.hpp) can
+                // produce — without this, a Forbidden/AnonymousOperator/
+                // ApprovalRequired/KillSwitched/Unclassified/Ambiguous denial
+                // was reachable only by falling all the way through to
+                // dispatch_fn, which enforces it correctly but reports it as
+                // the SAME `agents_reached:0`/`no_agents_reached` envelope an
+                // offline/unreachable agent also produces — indistinguishable
+                // from "nobody was in scope" (design doc Decision 7 F fix,
+                // docs/security-reviews/1398-dispatch-approval-gate-design.md;
+                // sign-off table's 2026-08-28 correction admitting the gap).
+                //
+                // #1788/PLAN-006: the caller identity + approval provenance is
+                // derived HERE — once — rather than immediately before
+                // dispatch_fn as before #3687: this dry run and the eventual
+                // dispatch_fn call must see the IDENTICAL `caller`, and
+                // deriving it before any denial can return means a refused
+                // call never reaches execution-row creation or bridge
+                // reservation below (no phantom `running`-then-cancelled
+                // execution row, matching the #3685 backstop immediately
+                // above and the sign-off correction's own complaint about a
+                // "phantom cancelled execution row").
+                auto caller =
+                    caller_fn ? caller_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED on exec_visible. A
+                                    // present EMPTY set (not nullopt) means "no target
+                                    // visible" -> nothing dispatched. ADR-0033 §1 forbids
+                                    // inferring unfiltered authority from an omitted
+                                    // applicable filter (same posture as the tag
+                                    // ScopedPermFn, K-06). Production always wires it
+                                    // (server.cpp); a test wanting unfiltered wires a
+                                    // callback whose exec_visible is nullopt.
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                // #1398: a supervised-tier call reaches here only after C8
+                // consumed a real ticket for THIS request
+                // (approval_ticket_just_consumed); an operator-tier call
+                // (auto-approved, no ticket ever minted) or a non-MCP-tiered
+                // caller relies solely on caller.principal_is_admin (already
+                // stamped by caller_fn/derive_dispatch_caller above) at the
+                // chokepoint's ExecuteGate::AdminOrApproval arm.
+                caller.approval_provenance = approval_ticket_just_consumed
+                                                 ? yuzu::server::ApprovalProvenance::Ticket
+                                                 : yuzu::server::ApprovalProvenance::None;
+
+                if (!authorize_dispatch_fn_) {
+                    // #3687: FAIL CLOSED, same posture as the classify_fn_
+                    // unwired check above (checkpoint 2) — an unwired
+                    // authorizer means this handler cannot determine whether
+                    // THIS caller may dispatch THIS pair at all, so every
+                    // call is refused rather than silently reaching
+                    // dispatch_fn unauthorized-by-this-gate's-own-terms.
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    mcp_audit("denied", std::string("dispatch authorizer unavailable "
+                                                    "correlation_id=") +
+                                            cid);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "dispatch authorization is unavailable; execute_instruction "
+                                 "is refused until it is restored",
+                                 kClassifierUnavailableRemediation, -1, cid),
+                        "application/json");
+                    return;
+                }
+
+                if (auto authz_decision = authorize_dispatch_fn_(caller, plugin, action);
+                    !authz_decision) {
+                    deny_dispatch_authorization(plugin, action, authz_decision.error());
+                    return;
                 }
 
                 // ── Progress bridge, GET-only mode (2f PR 3a, S1') ────────────
@@ -8551,29 +8913,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the REST sibling at workflow_routes.cpp:1427-1444.
                 // #1788 / PLAN-006: confine the dispatch to the caller's
                 // Execution:Execute visible device set AND identify who asked,
-                // mirroring /api/command. Fail closed on visibility when the
-                // derivation is unwired (CDX-R6-02, see below).
-                auto caller =
-                    caller_fn ? caller_fn(*session)
-                                    // CDX-R6-02: unwired == FAIL CLOSED on exec_visible. A
-                                    // present EMPTY set (not nullopt) means "no target
-                                    // visible" -> nothing dispatched. ADR-0033 §1 forbids
-                                    // inferring unfiltered authority from an omitted
-                                    // applicable filter (same posture as the tag
-                                    // ScopedPermFn, K-06). Production always wires it
-                                    // (server.cpp); a test wanting unfiltered wires a
-                                    // callback whose exec_visible is nullopt.
-                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
-                // #1398: a supervised-tier call reaches here only after C8
-                // consumed a real ticket for THIS request
-                // (approval_ticket_just_consumed); an operator-tier call
-                // (auto-approved, no ticket ever minted) or a non-MCP-tiered
-                // caller relies solely on caller.principal_is_admin (already
-                // stamped by caller_fn/derive_dispatch_caller above) at the
-                // chokepoint's ExecuteGate::AdminOrApproval arm.
-                caller.approval_provenance = approval_ticket_just_consumed
-                                                 ? yuzu::server::ApprovalProvenance::Ticket
-                                                 : yuzu::server::ApprovalProvenance::None;
+                // mirroring /api/command. `caller` was derived (and stamped
+                // with approval_provenance) earlier, above the #3687
+                // pre-dispatch authorization dry run — the dry run and this
+                // call MUST see the identical caller, so it is not
+                // re-derived here.
                 std::string command_id;
                 int agents_reached = 0;
                 try {
@@ -8642,29 +8986,41 @@ McpServer::HandlerFn McpServer::build_handler(
                             // is withheld by the containment gate before
                             // dispatch, which is a permanent policy denial,
                             // not transient unreachability. #1398 (governance
-                            // Gate 6 enterprise-readiness finding): a THIRD
-                            // cause collapses into this same envelope —
-                            // ExecuteGate::AdminOrApproval/AlwaysApproval
-                            // denying a non-admin, non-ticketed caller at the
-                            // dispatch chokepoint reaches this exact code
-                            // path too (mcp_server.cpp has no
-                            // classify_and_authorize_dispatch call of its own;
-                            // the shared dispatch_fn's internal chokepoint
-                            // denial surfaces as command_id/sent=0, same as
-                            // offline or quarantined). The dispatch closure's
-                            // return carries only (command_id, sent), so this
-                            // handler cannot yet tell any of the three apart;
-                            // naming all three is better than asserting one,
-                            // because an agentic caller that reads only
-                            // "unreachable" retries a permanent denial
-                            // forever. The authoritative answer is the
+                            // Gate 6 enterprise-readiness finding) used to add
+                            // a THIRD cause here — ExecuteGate::AdminOrApproval
+                            // /AlwaysApproval denying a non-admin, non-ticketed
+                            // caller reached this exact code path too, since
+                            // mcp_server.cpp had no classify_and_authorize_
+                            // dispatch call of its own and the shared
+                            // dispatch_fn's internal chokepoint denial
+                            // surfaced as command_id/sent=0, same as offline
+                            // or quarantined. #3687 closes that for the
+                            // ORDINARY case: the pre-dispatch authorization
+                            // dry run above (authorize_dispatch_fn_) now
+                            // denies Unclassified/Ambiguous/AnonymousOperator/
+                            // Forbidden/ApprovalRequired/KillSwitched with a
+                            // discriminated JSON-RPC error BEFORE dispatch_fn
+                            // is ever called, so this code path is no longer
+                            // reached for any of those six reasons on a
+                            // request whose RBAC/approval/kill-switch state
+                            // is unchanged between the dry run and the real
+                            // dispatch a moment later. The message below still
+                            // names approval-required as a POSSIBLE cause
+                            // because that race — state changing in the
+                            // narrow window between the two checks — is not
+                            // eliminated, only made rare; a wider DispatchFn
+                            // return (never landing on this issue — see
+                            // #3687's own scope note) would be needed to
+                            // discriminate it from quarantine/offline
+                            // programmatically even in that residual case.
+                            // The authoritative answer for the common case is
+                            // now the discriminated pre-dispatch error itself;
+                            // for the residual race, it remains the
                             // quarantine.dispatch_denied audit row,
                             // yuzu_server_dispatch_target_rejected_total
                             // {reason="quarantined"}, or
                             // yuzu_server_dispatch_denied_total
-                            // {reason="approval_required"}. A programmatic
-                            // discriminator needs a wider DispatchFn return —
-                            // tracked as a follow-up (#1398 Rung 4 / #3687).
+                            // {reason="approval_required"}.
                             .add("message",
                                  "No agents reached: every target was either unreachable, "
                                  "withheld by the quarantine containment gate, or denied "
@@ -9456,6 +9812,90 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "Security", "Execute", agent_id))
                     return;
+                // governance UP-9: thread a set CONFINED to the single
+                // scope-gate-checked target, not an unfiltered VisibleSet{} —
+                // defense in depth matching the bundle/execute_instruction
+                // dispatch arms (this was the last arm still passing
+                // unfiltered on a single already-authorized target).
+                // PLAN-006: `session` was authenticated at handler entry;
+                // identify the caller to dispatch_confined too, not just its
+                // visible set.
+                //
+                // #3893 fix round (Doomgoose review, blocking finding 2):
+                // hoisted from immediately before the two dispatch_fn call
+                // sites further down to HERE — before the store write at
+                // `quarantine_store->quarantine_device(...)` below — so the
+                // new pre-check immediately following it can run BEFORE that
+                // write. Nothing between here and the write (the
+                // reason/whitelist length + charset validation) depends on
+                // this caller, so the hoist is behavior-preserving for
+                // everything except the new pre-check itself.
+                const DispatchCaller quarantine_caller{
+                    .principal = session->username,
+                    .principal_role = auth::role_to_string(session->role),
+                    .exec_visible =
+                        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}},
+                    // #1398: JIT-elevation-aware, matching every other
+                    // session-derived caller. Applies to BOTH branches below
+                    // (the already-existing-record reapply via
+                    // redispatch_stored_containment, and the newly-created
+                    // record) — this shared caller is exactly why a single
+                    // fix here covers both, where the pre-#3425-refactor code
+                    // this diff originally targeted only touched the
+                    // newly-created branch's own inline construction.
+                    .principal_is_admin =
+                        auth::effective_role(*session) == auth::Role::admin,
+                    // #1398: quarantine.quarantine is AdminOrApproval-gated.
+                    // A supervised-tier MCP token reaches here only after C8
+                    // consumed a real ticket for THIS request
+                    // (approval_ticket_just_consumed); a non-MCP-tiered
+                    // caller (requires_approval short-circuits false for an
+                    // empty tier, so no ticket is ever minted) relies solely
+                    // on principal_is_admin above. The background
+                    // QuarantineContainmentReconciler's OWN redispatch calls
+                    // through a SEPARATE `.system = true` closure
+                    // (CommandDispatchFn, quarantine_containment_reconciler.hpp)
+                    // and bypasses this gate entirely via the chokepoint's
+                    // system-caller early return — it is not this caller and
+                    // needs no equivalent stamp.
+                    .approval_provenance =
+                        approval_ticket_just_consumed
+                            ? yuzu::server::ApprovalProvenance::Ticket
+                            : yuzu::server::ApprovalProvenance::None};
+                // #3893 fix round (Doomgoose review, blocking finding 2):
+                // pre-check BEFORE the store write below — a denial AFTER
+                // the write would leave a persisted-but-undispatched
+                // quarantine record, the same phantom-isolation class #3127
+                // already fixed once for this handler (see the
+                // record_persisted=1 audit-detail precedent near the write
+                // failure branch below). Same non-carve-out `ApprovalRequired`
+                // handling as execute_instruction's own main-handler
+                // backstop (~8489): no ticket exists to poll at this point,
+                // so ANY denial reason — ApprovalRequired included — is
+                // genuinely refused here, not just a C8-style fall-through.
+                if (!authorize_dispatch_fn_) {
+                    // Fail-closed, same shape as C8's own guard: an unwired
+                    // authorizer means this handler cannot determine whether
+                    // THIS caller may dispatch quarantine.quarantine at all.
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    mcp_audit("denied", "agent_id=" + agent_id +
+                                             ", dispatch authorizer unavailable correlation_id=" +
+                                             cid);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "dispatch authorization is unavailable; quarantine_device "
+                                 "is refused until it is restored",
+                                 kClassifierUnavailableRemediation, -1, cid),
+                        "application/json");
+                    return;
+                }
+                if (auto authz_decision =
+                        authorize_dispatch_fn_(quarantine_caller, "quarantine", "quarantine");
+                    !authz_decision) {
+                    deny_dispatch_authorization("quarantine", "quarantine",
+                                                authz_decision.error());
+                    return;
+                }
                 // Server-side input validation BEFORE any store write or dispatch
                 // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
                 // reaches the agent's netsh/iptables/pf sink; the agent already
@@ -9580,46 +10020,6 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::string command_id;
                 int agents_reached = 0;
                 bool dispatch_threw = false;
-                // governance UP-9: thread a set CONFINED to the single
-                // scope-gate-checked target, not an unfiltered VisibleSet{} —
-                // defense in depth matching the bundle/execute_instruction
-                // dispatch arms (this was the last arm still passing
-                // unfiltered on a single already-authorized target).
-                // PLAN-006: `session` was authenticated at handler entry and
-                // is already used for the store write above — identify the
-                // caller to dispatch_confined too, not just its visible set.
-                const DispatchCaller quarantine_caller{
-                    .principal = session->username,
-                    .principal_role = auth::role_to_string(session->role),
-                    .exec_visible =
-                        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}},
-                    // #1398: JIT-elevation-aware, matching every other
-                    // session-derived caller. Applies to BOTH branches below
-                    // (the already-existing-record reapply via
-                    // redispatch_stored_containment, and the newly-created
-                    // record) — this shared caller is exactly why a single
-                    // fix here covers both, where the pre-#3425-refactor code
-                    // this diff originally targeted only touched the
-                    // newly-created branch's own inline construction.
-                    .principal_is_admin =
-                        auth::effective_role(*session) == auth::Role::admin,
-                    // #1398: quarantine.quarantine is AdminOrApproval-gated.
-                    // A supervised-tier MCP token reaches here only after C8
-                    // consumed a real ticket for THIS request
-                    // (approval_ticket_just_consumed); a non-MCP-tiered
-                    // caller (requires_approval short-circuits false for an
-                    // empty tier, so no ticket is ever minted) relies solely
-                    // on principal_is_admin above. The background
-                    // QuarantineContainmentReconciler's OWN redispatch calls
-                    // through a SEPARATE `.system = true` closure
-                    // (CommandDispatchFn, quarantine_containment_reconciler.hpp)
-                    // and bypasses this gate entirely via the chokepoint's
-                    // system-caller early return — it is not this caller and
-                    // needs no equivalent stamp.
-                    .approval_provenance =
-                        approval_ticket_just_consumed
-                            ? yuzu::server::ApprovalProvenance::Ticket
-                            : yuzu::server::ApprovalProvenance::None};
                 if (record_pre_existing) {
                     // #3425: the shared recipe (quarantine_reapply.hpp) owns
                     // the read-stored-row + validate + dispatch sequence —
@@ -9924,12 +10324,62 @@ McpServer::HandlerFn McpServer::build_handler(
                                     // (server.cpp); a test wanting unfiltered wires a
                                     // callback whose exec_visible is nullopt.
                               : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                // #3893 fix round (Doomgoose review, blocking finding 1):
+                // authorize_dispatch_fn_ (below) reads caller.approval_provenance
+                // DIRECTLY — it has no notion of the `approval_ticket_just_consumed`
+                // local, which `bundle_orch->dispatch(...)` is instead passed as a
+                // SEPARATE parameter, further down. Stamp it here, the same way
+                // quarantine_caller does, so an already-ticket-consumed
+                // supervised-tier bundle call doesn't get denied ApprovalRequired
+                // again by the pre-check below.
+                if (approval_ticket_just_consumed)
+                    caller.approval_provenance = yuzu::server::ApprovalProvenance::Ticket;
                 if (!yuzu::server::authz::in_scope(caller.exec_visible, agent_id)) {
                     mcp_audit("failure", "agent_id=" + agent_id + " out_of_scope");
                     res.set_content(
                         error_response(id, kInvalidParams, "target agent not in your visible scope"),
                         "application/json");
                     return;
+                }
+                // #3893 fix round (Doomgoose review, blocking finding 1):
+                // pre-check EVERY step BEFORE bundle_orch->dispatch(...) —
+                // BundleOrchestrator::DispatchResult carries only
+                // {correlation_id, expected}, no per-step outcome, so without
+                // this the handler unconditionally returns a JSON-RPC SUCCESS
+                // with `expected` = the step count even when the real
+                // chokepoint (dispatch_confined -> build_classified_command)
+                // is about to deny every one of those steps — the exact
+                // "looks like a success" gap #3687's own acceptance criteria
+                // named execute_bundle for. All-or-nothing: if ANY step would
+                // be denied, refuse the WHOLE call upfront rather than
+                // attempt partial per-step dispatch/denial (that would
+                // require widening BundleOrchestrator::DispatchResult — out
+                // of scope for this fix). Same non-carve-out `ApprovalRequired`
+                // handling as quarantine_device's own pre-check and
+                // execute_instruction's main-handler backstop: no ticket
+                // exists to poll here either, so it is a genuine denial, not
+                // a C8-style fall-through.
+                if (!authorize_dispatch_fn_) {
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    mcp_audit("denied", "agent_id=" + agent_id +
+                                             ", dispatch authorizer unavailable correlation_id=" +
+                                             cid);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "dispatch authorization is unavailable; execute_bundle "
+                                 "is refused until it is restored",
+                                 kClassifierUnavailableRemediation, -1, cid),
+                        "application/json");
+                    return;
+                }
+                for (const auto& step : *specs) {
+                    if (auto authz_decision =
+                            authorize_dispatch_fn_(caller, step.plugin, step.action);
+                        !authz_decision) {
+                        deny_dispatch_authorization(step.plugin, step.action,
+                                                    authz_decision.error());
+                        return;
+                    }
                 }
                 BundleOrchestrator::DispatchResult r;
                 try {

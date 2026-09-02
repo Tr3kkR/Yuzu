@@ -946,6 +946,12 @@ an `IGuard` and a spark (invariant test: no unit appears in both `guards_` and t
 spark arm set). (UP-2, security-guardian LOW-4.) The final rung deletes the legacy
 guards and the switch becomes a hard on/off for spark detection.
 
+*Rung numbers in the paragraph below (not this one, nor the rung 2-4 cutover-window
+paragraph above it) predate the implementation ladder's later resequencing: "rung 2"
+there is impl-rung-7 (the `prefer_spark` flip, rung 7.7); "rung 3"/"rung 5" are the
+P3 enforce cutover / P5 legacy deletion in the post-flip programme. Current gate
+state: `docs/spark-flip-gate.md`.*
+
 `--spark-disable` default posture: **observe rung (2)** defaults to the spark path
 (safe, detection-only); the **enforce and deletion rungs (3, 5)** default to the
 legacy path until burn-in, so a first-customer fleet is not switched onto new

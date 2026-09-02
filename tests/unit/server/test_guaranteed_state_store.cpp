@@ -20,8 +20,8 @@
  * suite (5 cases, ADR-0038's 5-table shape) was removed (2026-08-25) as part
  * of a fresh-start-by-default policy change (ADR-0009 amendment) — no
  * production fleet has ever run a pre-Postgres build.
- * GuaranteedStateStore::migrate_from_sqlite() itself is UNCHANGED and still
- * present; its removal is a separate, later step. The unrelated "legacy
+ * GuaranteedStateStore::migrate_from_sqlite() itself was retired
+ * (chore/retire-migrate-from-sqlite-batch-b, #3623). The unrelated "legacy
  * slice-1 crash keys" test (PR #1311 JSON field-naming compat, nothing to do
  * with the SQLite backfill) is kept.
  */

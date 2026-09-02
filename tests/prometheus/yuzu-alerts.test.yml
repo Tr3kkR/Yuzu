@@ -48,6 +48,378 @@ rule_files:
 evaluation_interval: 1m
 
 tests:
+  # ── YuzuOtaRefundDivergence (#913 / #911) ────────────────────────────────
+  #
+  # The invariant this pins is the one that keeps issues #934 and #941 closed:
+  # a transfer aborted by a SERVER-imposed deadline must refund the rate token
+  # it was charged at admission. If a future refactor drops a refund_token()
+  # call from one of the DownloadUpdate deadline branches, charges outrun
+  # refunds and a slow-link agent can spend itself into a lockout again --
+  # silently, because nothing else observes it.
+
+  # CASE A -- divergence fires: deadlines abort but nothing refunds. This is
+  # exactly the shape a dropped refund_token() produces.
+  #
+  # This case also pins the AGGREGATION. The two sides of the rule carry
+  # different labels (phase= on the deadline counter, decision= on the
+  # admission counter), so an unaggregated vector comparison matches nothing
+  # and the rule silently never fires no matter how far the two diverge. The
+  # first draft of this rule shipped exactly that bug and this case is what
+  # caught it -- it goes RED again if the sum by (job, instance) is removed.
+  - interval: 1m
+    name: ota refund divergence - deadline aborts with no refunds fires
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+1x60"
+      - series: 'yuzu_ota_download_refund_total{job="yuzu",instance="s1",reason="transfer_deadline"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+
+  # CASE B -- the healthy path must stay quiet: every deadline abort refunds,
+  # one for one. RED if the rule were written with the comparison inverted or
+  # with a `>=`, which would fire on a correctly-behaving server forever.
+  - interval: 1m
+    name: ota refund divergence - matched charges and refunds stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+1x60"
+      - series: 'yuzu_ota_download_refund_total{job="yuzu",instance="s1",reason="transfer_deadline"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaRefundDivergence", alertstate="firing"}'
+        eval_time: 50m
+        exp_samples: []
+
+  # CASE I -- the single-increment quiet case. This is the one that was MISSING,
+  # and its absence is why an inert `for:` shipped: `for: 10m` against a [15m]
+  # lookback debounces nothing, so one benign rejection paged. The bar is now a
+  # COUNT (>5), and this case is RED against the old duration-only form.
+  - interval: 1m
+    name: ota concurrency - a single benign rejection stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_concurrency"}'
+        values: "0 1 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuOtaTransfersAborting (#911 / UP-7) ───────────────────────────────
+
+  # CASE J -- the silent-outage detector fires. A misconfigured transfer deadline
+  # aborts every transfer, and because each abort REFUNDS its token the buckets
+  # never drain and RefundDivergence stays quiet — so without this rule the fleet
+  # stops updating with every other dashboard green.
+  - interval: 1m
+    name: ota transfers aborting - sustained deadline aborts fire
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+1x120"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
+            value: 1
+
+  # CASE K -- a healthy fleet completing its transfers stays quiet.
+  - interval: 1m
+    name: ota transfers aborting - no aborts stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+0x120"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE N -- the low-and-slow identity probe. THIS is the case the previous
+  # window could not see: with `for:` >= the lookback, increase() decays before
+  # the `for:` elapses, so a sparse signal never fires. One rejection every 20
+  # minutes is exactly the shape a spoof probe takes, and it must alert.
+  - interval: 1m
+    name: ota identity - a low-and-slow probe still fires
+    input_series:
+      - series: 'yuzu_grpc_ota_identity_rejected_total{job="yuzu",instance="s1",event="security",rpc="download_update",reason="agent_id_mismatch"}'
+        values: "0 0x19 1 1x19 2 2x19 3 3x19"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
+        eval_time: 75m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", instance="s1", job="yuzu", reason="agent_id_mismatch", severity="warning"}'
+            value: 1
+
+  # ── YuzuOtaServerCapacityRejections (UP8-1) ──────────────────────────────
+
+  # CASE O -- the server-wide ceiling saturating fires. Without this rule the
+  # fleet-wide denial it represents is entirely silent.
+  - interval: 1m
+    name: ota server capacity - saturation fires
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0+1x90"
+    promql_expr_test:
+      # The bar clears within minutes; `for: 30m` then holds it pending, so the
+      # earliest firing evaluation is a little past 30m. Asserting at 45m proves
+      # the rule fires without pinning the exact debounce boundary.
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE P -- a fleet inside the ceiling stays quiet.
+  - interval: 1m
+    name: ota server capacity - within the ceiling stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE P2 -- one transient brush against the ceiling is not a page. The group
+  # already excludes rejected_rate for this reason; a >0 bar here would have
+  # reproduced exactly the noise this file's own comments condemn.
+  - interval: 1m
+    name: ota server capacity - a single transient refusal stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0 1 1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE Q -- a benign rollout tail must NOT page. A large rollout completes 20
+  # transfers a minute and loses one a minute to a genuinely slow link: a real,
+  # continuous abort stream, but 5% of traffic. An operator who silences this
+  # during every rollout has no silent-outage detector left, which is why the bar
+  # is a proportion and not the count of aborts -- in absolute terms this case
+  # produces MORE aborts per hour than CASE B1 below, which must page.
+  - interval: 1m
+    name: ota transfers aborting - a benign rollout tail stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+1x12 12+1x12 24+1x120"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+20x144"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # CASE Q2 -- THE CASE AN ABSOLUTE BAR COULD NOT SEE, and the first reason this
+  # rule is a proportion. A small site where EVERY device fails to update,
+  # forever. The fixture runs one abort and one admission per minute; on a real
+  # 30-agent site checking 6-hourly the same shape arrives more slowly, and the
+  # point is identical either way -- the absolute count never clears a fixed bar
+  # while the proportion reads 1.0, because every transfer that starts, aborts.
+  - interval: 1m
+    name: ota transfers aborting - a small totally-broken fleet fires
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0+1x240"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0+1x240"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 120m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
+            value: 1
+
+  # CASE B1 -- THE CASE A 0.2 PROPORTION COULD NOT SEE, and the second reason the
+  # bar is 0.1. A satellite site inside a larger fleet: 1200 transfers an hour
+  # complete, 180 abort on `transfer`, permanently, because the deadline is below
+  # artifact_size/link_throughput for that site. 15% of the fleet can never
+  # update again. At a 0.2 bar this detector stayed green forever; note also that
+  # this fires while CASE Q -- which produces MORE aborts per hour in absolute
+  # terms -- stays quiet, which no fixed count could achieve.
+  - interval: 1m
+    name: ota transfers aborting - a permanently-failing site fires
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+3x180"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+20x180"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 120m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
+            value: 1
+
+  # CASE C1 -- a nearly-idle server must NOT page. One admission and one abort,
+  # placed INSIDE the trailing [1h] window at eval time (unlike a stale version
+  # of this case that put both events at t=1m and evaluated at 90m, so the [1h]
+  # window excluded them entirely and the case passed for the wrong reason: a
+  # zero/zero ratio, not the guard). Here the ratio genuinely reads 1.0 -- well
+  # above the 0.1 bar -- so only the `admitted >= 4` guard keeps this quiet;
+  # weakening the guard to `>= 1` flips this case to firing.
+  - interval: 1m
+    name: ota transfers aborting - a nearly-idle server stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
+        values: "0+0x30 1+0x100"
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
+        values: "0+0x30 1+0x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
+        eval_time: 60m
+        exp_samples: []
+
+  # CASE D1 -- a chronically undersized ceiling on a small fleet refuses only a
+  # few agents an hour, indefinitely. A bar of >3/hr left exactly that state
+  # permanently silent, so the capacity bar is >1. A stale version of this
+  # fixture ramped continuously (0 -> 40 over ~70m), which reads an in-window
+  # increase of ~35 at its eval point -- comfortably clearing >1 AND >3 alike,
+  # so it never actually pinned the >1 choice. This one steps by exactly 1
+  # every 30 minutes, so any trailing 1h window sees exactly 2 steps: >1 (true)
+  # but not >3 (false) -- mutating the bar to >3 reddens this case.
+  - interval: 1m
+    name: ota server capacity - sustained low-rate saturation fires
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
+        values: "0+0x30 1+0x30 2+0x30 3+0x30 4+0x30 5+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
+        eval_time: 120m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # ── YuzuOtaPeerMapEvicting (#935 / UP-8) ─────────────────────────────────
+
+  # CASE L -- sustained eviction fires. Continuous eviction silently DISABLES the
+  # rate dimension, because a re-inserted key is minted with a full burst.
+  - interval: 1m
+    name: ota peer map evicting - sustained eviction fires
+    input_series:
+      - series: 'yuzu_ota_download_peers_evicted_total{job="yuzu",instance="s1"}'
+        values: "0+2x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapEvicting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaPeerMapEvicting", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE M -- a map comfortably under its ceiling never evicts, stays quiet.
+  - interval: 1m
+    name: ota peer map evicting - no eviction stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_peers_evicted_total{job="yuzu",instance="s1"}'
+        values: "0+0x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapEvicting", alertstate="firing"}'
+        eval_time: 90m
+        exp_samples: []
+
+  # ── YuzuOtaIdentityRejections (#416) ─────────────────────────────────────
+
+  # CASE E -- any sustained identity rejection fires. On a fully-enrolled fleet
+  # this series should sit flat at zero, so the bar is deliberately low.
+  - interval: 1m
+    name: ota identity - sustained rejections fire
+    input_series:
+      - series: 'yuzu_grpc_ota_identity_rejected_total{job="yuzu",instance="s1",event="security",rpc="download_update",reason="agent_id_mismatch"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing", instance="s1", job="yuzu", reason="agent_id_mismatch", severity="warning"}'
+            value: 1
+
+  # CASE F -- a fleet with no identity failures stays quiet. RED if the rule
+  # were ever written against absent() or a `>= 0` comparison.
+  - interval: 1m
+    name: ota identity - a clean fleet stays quiet
+    input_series:
+      - series: 'yuzu_grpc_ota_identity_rejected_total{job="yuzu",instance="s1",event="security",rpc="download_update",reason="agent_id_mismatch"}'
+        values: "0+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaIdentityRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # ── YuzuOtaPeerMapNearCapacity (#935) ────────────────────────────────────
+
+  # CASE G -- occupancy is a RATIO of the configured ceiling, not a hardcoded
+  # count. 900/1000 = 90% fires even though 900 is far below the old literal
+  # 40000 threshold -- which is precisely the operator-retuned case the
+  # hardcoded form got wrong.
+  - interval: 1m
+    name: ota peer map - fires at 90% of a retuned ceiling
+    input_series:
+      - series: 'yuzu_ota_download_peers_tracked{job="yuzu",instance="s1"}'
+        values: "900+0x60"
+      - series: 'yuzu_ota_download_peers_capacity{job="yuzu",instance="s1"}'
+        values: "1000+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapNearCapacity", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaPeerMapNearCapacity", alertstate="firing", instance="s1", job="yuzu", severity="info"}'
+            value: 1
+
+  # CASE H -- a large map well under a large ceiling stays quiet. 30000/50000 =
+  # 60%. Under the old hardcoded `> 40000` this same shape was also quiet, but
+  # only by luck; this case pins the ratio semantics.
+  - interval: 1m
+    name: ota peer map - large but comfortable stays quiet
+    input_series:
+      - series: 'yuzu_ota_download_peers_tracked{job="yuzu",instance="s1"}'
+        values: "30000+0x60"
+      - series: 'yuzu_ota_download_peers_capacity{job="yuzu",instance="s1"}'
+        values: "50000+0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaPeerMapNearCapacity", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuOtaConcurrencyRejections (#913) ──────────────────────────────────
+
+  # CASE C -- the primary bound firing: a peer repeatedly refused for holding
+  # too many parallel transfers. RED if the rule were pointed at
+  # decision="rejected_rate" instead, which is the loose secondary bound and
+  # deliberately NOT alerted.
+  - interval: 1m
+    name: ota concurrency - sustained rejections fire
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_concurrency"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE D -- rate-only rejections must NOT wake anyone. This is the
+  # deliberate non-alert recorded in the rule group's comment: the bucket is
+  # expected to reject during a fleet-wide rollout.
+  - interval: 1m
+    name: ota concurrency - rate-only rejections stay quiet
+    input_series:
+      - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_rate"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuOtaConcurrencyRejections", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
   # ── YuzuServerRestartLoop ─────────────────────────────────────────────────
   #
   # #2854 rung C: the crash-loop signal in its own right, previously only a
@@ -1819,57 +2191,6 @@ tests:
       - expr: 'ALERTS{alertname="YuzuRuntimeConfigReadDegraded"}'
         eval_time: 20m
         exp_samples: []
-
-  # ── YuzuTagStoreBackfillNotCompleted (ADR-0050) ─────────────────────────
-  #
-  # `absent_over_time(..._backfill_total{result=~"success|fresh"}[15m])`,
-  # for: 5m, critical. The rule is ABSENCE-keyed because a failed backfill
-  # sets startup_failed_ and /metrics is never served -- a result="failed"
-  # sample is unscrappable, so a failed-keyed expression could never fire
-  # (governance sre-1). These two cases pin both halves of that design.
-
-  # CASE 59 -- a scraped success outcome (the pre-seeded counter incremented
-  # once at boot) suppresses the alert for as long as it stays in the window.
-  - interval: 1m
-    name: tag store backfill - a scraped success outcome is quiet
-    input_series:
-      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="success"}'
-        values: "1x40"
-      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="failed"}'
-        values: "0x40"
-    promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted"}'
-        eval_time: 30m
-        exp_samples: []
-
-  # CASE 60 -- the sre-1 pin: even with a result="failed" series PRESENT
-  # (hypothetically scraped), the rule fires on the ABSENCE of the two good
-  # outcomes -- it must never be rewritten to key on result="failed", which
-  # a refused boot never serves. The absent series carries no result label
-  # (regex matchers do not populate absent()-family label sets).
-  - interval: 1m
-    name: tag store backfill - absent good outcomes fire even with a failed series present
-    input_series:
-      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="failed"}'
-        values: "0+1x40"
-    promql_expr_test:
-      # for: 5m pinned both sides: absence is true from the first evaluation
-      # (absent_over_time needs no window population), so pending starts at
-      # t=0 and firing begins at exactly t=5m -- quiet at 4m, firing at 5m
-      # and still at 25m.
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
-        eval_time: 4m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
-        eval_time: 5m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing", severity="critical"}'
-            value: 1
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
-        eval_time: 25m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing", severity="critical"}'
-            value: 1
 
   # ── YuzuDispatchTargetRejected: the reason="quarantined" exclusion (#881) ──
   #

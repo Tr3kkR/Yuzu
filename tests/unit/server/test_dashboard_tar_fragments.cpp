@@ -41,6 +41,7 @@
 #include "dashboard_routes.hpp"
 #include "management_group_store.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
+#include "test_real_capability_registry.hpp"
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -210,6 +211,18 @@ struct FragmentHarness {
         // FIRST call's dependencies while the members hold the second call's.
         // Nothing else would fail, so pin the count.
         REQUIRE(sink.route_count() == 12);
+
+        // PR6.0b: `/api/dashboard/execute` now consults a `ClassifyFn` for the
+        // Destructive TARGETING gate, and an UNWIRED one refuses every
+        // dispatch (fail-closed, matching `McpServer::ClassifyFn`). Wire the
+        // REAL production classifier here so the cases below keep testing what
+        // they claim — caller/exec_visible threading and the CDX-R8-01
+        // supplied-vs-omitted scope rule — rather than silently becoming six
+        // more assertions about the classifier being absent. The pairs they
+        // use are classify-misses, which take the gate's Policy-B
+        // fall-through and dispatch unchanged; the gate's own behaviour is
+        // bound in test_dashboard_destructive_gate.cpp.
+        routes.set_capability_classify_fn(yuzu::test::real_classify_fn());
     }
 
     static std::unordered_map<std::string, std::string> same_site_headers() {

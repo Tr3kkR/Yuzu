@@ -110,7 +110,6 @@ async function generate() {
     grafanaPass: val('grafana-pass'),
     gateway: chk('include-gateway'),
     gwAgentPort: num('gw-agent-port'),
-    gwMgmtPort: num('gw-mgmt-port'),
     gwHealthPort: num('gw-health-port'),
     gwMetricsPort: num('gw-metrics-port'),
     gwPoolSize: num('gw-pool-size'),
@@ -189,7 +188,6 @@ YUZU_GRAFANA_ADMIN_PASSWORD=${c.grafanaPass}` : ''}
 ${c.gateway ? `
 # ── Gateway ──
 YUZU_GW_AGENT_PORT=${c.gwAgentPort}
-YUZU_GW_MGMT_PORT=${c.gwMgmtPort}
 YUZU_GW_HEALTH_PORT=${c.gwHealthPort}
 YUZU_GW_METRICS_PORT=${c.gwMetricsPort}
 # Erlang distribution cookie — the gateway fail-closes on the insecure default.
@@ -303,7 +301,12 @@ ${c.tlsMode === 'plaintext'
     y += `              {circuit_breaker_reset_timeout_ms, 10000},\n`;
     y += `              {circuit_breaker_max_reset_timeout_ms, 300000},\n`;
     y += `              {backpressure_threshold, 1000},\n`;
-    y += `              {hash_ring_vnodes, 256}\n`;
+    y += `              {hash_ring_vnodes, 256},\n`;
+    y += `              %% #1422 escape hatch: this generated stack's mgmt listener is\n`;
+    y += `              %% plaintext on 0.0.0.0 and the gateway otherwise refuses to\n`;
+    y += `              %% boot. Safe only while :50063 stays unpublished on this\n`;
+    y += `              %% compose network. Never copy into production.\n`;
+    y += `              {allow_insecure_mgmt, true}\n`;
     y += `          ]},\n`;
     // Plaintext gateway: gateway + TLS isn't generated yet (see the C1/N2 guard),
     // so this path is only reached in plaintext mode — the gateway dials the server
@@ -671,7 +674,13 @@ ${c.tlsMode === 'plaintext'
     y += `    restart: unless-stopped\n`;
     y += `    ports:\n`;
     y += `      - "${c.gwAgentPort}:50051"   # Agent-facing gRPC (mapped to avoid conflict with server)\n`;
-    y += `      - "${c.gwMgmtPort}:50063"   # Management/command forwarding\n`;
+    // #1422: NEVER publish :50063 (management/command fan-out) from this
+    // generator — the wizard's gateway is plaintext (no TLS mode generated
+    // yet), so its mgmt plane is unauthenticated and must stay reachable only
+    // on the compose network (the server dials gateway:50063 internally).
+    y += `      # :50063 (management/command fan-out) is deliberately NOT published:\n`;
+    y += `      # this gateway's mgmt plane is plaintext+unauthenticated, safe only\n`;
+    y += `      # inside the compose network. See #1422.\n`;
     y += `      - "${c.gwHealthPort}:8081"     # Health/readiness\n`;
     y += `      - "${c.gwMetricsPort}:9568"     # Prometheus metrics\n`;
     y += `    environment:\n`;

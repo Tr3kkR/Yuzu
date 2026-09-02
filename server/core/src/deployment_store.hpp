@@ -36,20 +36,13 @@
 ///
 /// One table, no foreign keys: `deployment_jobs`.
 ///
-/// **Mandatory backfill** (ADR-0009): `migrate_from_sqlite()` is a one-time
-/// copy from the legacy `deployment-jobs.db` SQLite file, idempotent PER
-/// DISTINCT LEGACY-FILE CONTENT (a SHA-256 fingerprint of the local file's
-/// rows, or a sourceless sentinel when no/an empty file is present) rather
-/// than a single fleet-wide completion flag — see the `.cpp`'s file header
-/// for why a single-row marker is unsafe (a fileless replica's stamp could
-/// otherwise permanently wave through a holder replica's real data) and why
-/// this store's fix is deliberately simpler than `RbacStore`'s reference
-/// shape. Fails CLOSED on any error — an in-flight or completed deployment
-/// job is real operator intent and must not be silently dropped.
+/// `migrate_from_sqlite()` retired (chore/retire-migrate-from-sqlite-batch-b,
+/// #3623): no production fleet ever ran a pre-Postgres build of this store —
+/// see ADR-0043's Update. `server.cpp` now runs a detect-and-warn probe over
+/// the legacy file instead.
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -92,20 +85,6 @@ public:
     DeploymentStore& operator=(const DeploymentStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
-
-    /// Legacy-SQLite backfill (ADR-0009). Call once at server startup,
-    /// BEFORE the server serves, after construction has proven the Postgres
-    /// schema is open. Idempotent PER DISTINCT LEGACY-FILE CONTENT (see the
-    /// file header and the `.cpp`'s function-header comment) — never a
-    /// single fleet-wide flag, and never inferred from `deployment_jobs`
-    /// being empty. Fails CLOSED on any error — the caller must treat
-    /// `false` as a fatal startup error, same as `!is_open()` (authoritative
-    /// store: never serve on top of a partially-migrated schema). Returns
-    /// true (no-op) when `legacy_db_path` does not exist or holds no
-    /// `deployment_jobs` table/rows (fresh install). Opens the legacy file
-    /// READ-ONLY and never deletes/moves it — the one-release
-    /// rollback-window file is retained by the caller.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// Validates target_host (DNS-safe chars only, <=253 chars — defense in
     /// depth against a future caller templating a shell/SSH command from

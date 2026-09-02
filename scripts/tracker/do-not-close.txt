@@ -27,3 +27,11 @@
 1634   # P0: response/execution reads not management-group-scoped -- PR #1711 says in bold "does NOT close #1634"
 2011   # P1: PR #2074 closed the lock half only ("Closes #2011 (lock half)")
 2014   # P1: PR #2051 resolved "by policy" in prose, not in code
+
+# Preventive: consolidated multi-item issues, filed as the fresh replacement for #2233
+# after #2233 itself was auto-closed by this same automation with 8 of 10 checklist
+# items still open (#3849 tracks that failure mode generally). No PR has closed these
+# wrong yet -- listed pre-emptively because their shape (several distinct items batched
+# into one issue, closed piecemeal across several PRs) is exactly what triggered #2233:
+3847   # PR-2a scope: 3 items (#2233 1/4/6) -- a PR closing only one must not close this
+3848   # PR-2c scope: multi-part acceptance criteria (#2233 item 9) -- same risk

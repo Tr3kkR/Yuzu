@@ -24,11 +24,12 @@
 ##
 ## Mgmt-plane reachability: the gateway co-hosts the agent edge (:50051) and the
 ## privileged mgmt plane (:50063) on 0.0.0.0, so on this single demo bridge an
-## agent could reach :50063 at the network layer. Strict mutual TLS (#1314) is the
-## control that rejects it (no CA-issued cert → no handshake). A *production*
-## deployment additionally isolates/firewalls the mgmt plane from agents at the
-## infra layer; binding the enrolled-agent residual to the server's identity (not
-## just any CA cert) is tracked as #1422.
+## agent could reach :50063 at the network layer. Two controls reject it: strict
+## mutual TLS (#1314 — no CA-issued cert, no handshake) and the SPKI peer pin
+## (#1422 — a CA-issued cert that is not the server's default-server leaf, an
+## enrolled agent's included, gets UNAUTHENTICATED before any handler runs). A
+## *production* deployment additionally isolates/firewalls the mgmt plane from
+## agents at the infra layer.
 ##
 ## Usage:
 ##   export YUZU_VERSION=0.12.0
