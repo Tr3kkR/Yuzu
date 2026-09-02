@@ -4042,6 +4042,54 @@ McpServer::HandlerFn McpServer::build_handler(
                 return error_response(id, code, message, data);
             };
 
+            // #3687 (Gate 6 UP-5 fix): the ONE place a DispatchDenial from
+            // authorize_dispatch_fn_'s pre-dispatch dry run becomes a
+            // JSON-RPC response — shared by the C8 pre-mint dry run (below)
+            // and the main-handler dry run (execute_instruction's own
+            // section, further down) so the two call sites cannot spell the
+            // metric/audit/envelope shape differently. Same series
+            // build_classified_command's own denial increments
+            // (yuzu_server_dispatch_denied_total{reason}) — dispatch_fn is
+            // never called on either path this feeds, so no double count for
+            // the same request. Not built on top of a4_error: this family
+            // carries one extra field (`reason`, the machine-readable
+            // DispatchDenialReason) a4_error's other ~40 call sites have no
+            // use for — see describe_dispatch_denial's own doc comment for
+            // why that stays a dedicated shape rather than widening a4_error.
+            auto deny_dispatch_authorization =
+                [&](const std::string& plugin, const std::string& action,
+                    const yuzu::server::detail::DispatchDenial& denial) {
+                    const std::string_view reason_label =
+                        yuzu::server::detail::to_string(denial.reason);
+                    if (metrics != nullptr) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_denied_total",
+                                          {{"reason", std::string(reason_label)}})
+                                .increment();
+                        } catch (...) { // NOLINT(bugprone-empty-catch)
+                        }
+                    }
+                    const std::string cid = yuzu::server::detail::make_correlation_id();
+                    const bool audit_ok = mcp_audit(
+                        "denied", std::string("reason=") + std::string(reason_label) + " " +
+                                      yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
+                                      yuzu::server::detail::sanitize_detail_value(action) +
+                                      " correlation_id=" + cid);
+                    const auto text =
+                        describe_dispatch_denial(denial.reason, plugin, action, denial);
+                    std::string data = R"({"correlation_id":")" + cid +
+                                       R"(","retry_after_ms":null,"remediation":)";
+                    data += text.remediation.empty() ? std::string("null")
+                                                     : json_quoted_string(text.remediation);
+                    data += R"(,"reason":")" + std::string(reason_label) + R"(")";
+                    if (!audit_ok)
+                        data += R"(,"audit_persisted":false)";
+                    data += "}";
+                    res.set_content(error_response(id, text.code, text.message, data),
+                                    "application/json");
+                };
+
             // Deny a fleet-wide tool call to a service-scoped API token, with
             // a denial audit. MCP sibling of REST's
             // deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
@@ -4668,6 +4716,88 @@ McpServer::HandlerFn McpServer::build_handler(
                                 return;
                             }
                             }
+                        }
+
+                        // #3687 (Gate 6 UP-5 fix): C8 pre-mint parity — extend
+                        // the SAME "check before minting, deny locally if it
+                        // fails" shape #3685 established immediately above for
+                        // ClassifyMiss/RefuseUntargeted to the FULL dispatch
+                        // chokepoint decision, via the SAME AuthorizeDispatchFn
+                        // pre-dispatch dry run the main-handler backstop
+                        // (execute_instruction's own section, further down)
+                        // already calls. Without this, a supervised-tier
+                        // caller who fails specific-securable RBAC
+                        // (Forbidden) or hits a kill switch (KillSwitched)
+                        // still minted (or consumed) a real human-approved
+                        // ticket before being denied at the main-handler
+                        // backstop — reopening, for those two reasons, the
+                        // exact ticket-waste class this C8 extension exists
+                        // to prevent.
+                        //
+                        // CRITICAL: `ApprovalRequired` is NOT a denial to act
+                        // on here — a supervised-tier caller reaching C8 for
+                        // an approval-gated row is AT C8 SPECIFICALLY BECAUSE
+                        // the pair requires approval. `pre_mint_caller` is
+                        // derived fresh, before any ticket is minted OR
+                        // consumed: `approval_ticket_just_consumed` (this
+                        // function's own local, read by the caller derivation
+                        // at the main-handler site below) is stamped `true`
+                        // only AFTER `consume_ticket()` succeeds, further down
+                        // past the mint/recall fork this block runs before —
+                        // so `pre_mint_caller.approval_provenance` is ALWAYS
+                        // `None` at this point in the flow, for both a fresh
+                        // mint attempt (supplied_id empty) and a recall that
+                        // has not yet consumed its ticket (supplied_id
+                        // non-empty). A WIRED authorizer therefore
+                        // legitimately reports `ApprovalRequired` for every
+                        // approval-gated pair reaching this point — that is
+                        // the REASON minting/consuming is about to happen,
+                        // not a fault. Every OTHER reason denies locally, no
+                        // ticket minted or consumed — reusing the SAME
+                        // `deny_dispatch_authorization` shaping this block's
+                        // sibling denials above do NOT reuse only because
+                        // they predate this fix (own metric series
+                        // `yuzu_server_dispatch_target_rejected_total`/
+                        // `yuzu_server_dispatch_denied_total` with a
+                        // classify-miss-specific message); this new check
+                        // reuses it directly since it IS the general
+                        // DispatchDenial shape.
+                        if (!authorize_dispatch_fn_) {
+                            const std::string cid =
+                                yuzu::server::detail::make_correlation_id();
+                            mcp_audit("denied", std::string("dispatch authorizer "
+                                                            "unavailable correlation_id=") +
+                                                    cid);
+                            res.set_content(
+                                a4_error(kInternalError,
+                                         "dispatch authorization is unavailable; "
+                                         "execute_instruction is refused until it is "
+                                         "restored",
+                                         kClassifierUnavailableRemediation, -1, cid),
+                                "application/json");
+                            return;
+                        }
+                        {
+                            const auto p = param_str(args, "plugin");
+                            const auto a = param_str(args, "action");
+                            const auto pre_mint_caller =
+                                caller_fn
+                                    ? caller_fn(*session)
+                                    : DispatchCaller{.exec_visible =
+                                                         yuzu::server::authz::deny_all()};
+                            if (auto authz_decision =
+                                    authorize_dispatch_fn_(pre_mint_caller, p, a);
+                                !authz_decision &&
+                                authz_decision.error().reason !=
+                                    yuzu::server::detail::DispatchDenialReason::
+                                        ApprovalRequired) {
+                                deny_dispatch_authorization(p, a, authz_decision.error());
+                                return;
+                            }
+                            // Success, OR ApprovalRequired (the expected reason
+                            // C8 is about to mint/consume a ticket): fall
+                            // through to the existing mint/recall logic below
+                            // unchanged.
                         }
                     }
 
@@ -8328,42 +8458,7 @@ McpServer::HandlerFn McpServer::build_handler(
 
                 if (auto authz_decision = authorize_dispatch_fn_(caller, plugin, action);
                     !authz_decision) {
-                    const auto& denial = authz_decision.error();
-                    const std::string_view reason_label =
-                        yuzu::server::detail::to_string(denial.reason);
-                    // SAME series `build_classified_command`'s own denial
-                    // increments (yuzu_server_dispatch_denied_total{reason}) —
-                    // dispatch_fn is never called on this path, so no double
-                    // count for the same request.
-                    if (metrics != nullptr) {
-                        try {
-                            metrics
-                                ->counter("yuzu_server_dispatch_denied_total",
-                                          {{"reason", std::string(reason_label)}})
-                                .increment();
-                        } catch (...) { // NOLINT(bugprone-empty-catch)
-                        }
-                    }
-                    const std::string cid = yuzu::server::detail::make_correlation_id();
-                    const bool audit_ok = mcp_audit(
-                        "denied", std::string("reason=") + std::string(reason_label) + " " +
-                                      yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
-                                      yuzu::server::detail::sanitize_detail_value(action) +
-                                      " correlation_id=" + cid);
-                    const auto text = describe_dispatch_denial(denial.reason, plugin, action, denial);
-                    // #3687: the ONE extra field beyond a4_error's shape — see
-                    // describe_dispatch_denial's doc comment for why this is a
-                    // dedicated envelope rather than widening a4_error itself.
-                    std::string data = R"({"correlation_id":")" + cid +
-                                       R"(","retry_after_ms":null,"remediation":)";
-                    data += text.remediation.empty() ? std::string("null")
-                                                     : json_quoted_string(text.remediation);
-                    data += R"(,"reason":")" + std::string(reason_label) + R"(")";
-                    if (!audit_ok)
-                        data += R"(,"audit_persisted":false)";
-                    data += "}";
-                    res.set_content(error_response(id, text.code, text.message, data),
-                                    "application/json");
+                    deny_dispatch_authorization(plugin, action, authz_decision.error());
                     return;
                 }
 

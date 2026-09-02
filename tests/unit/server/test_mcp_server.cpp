@@ -8076,6 +8076,135 @@ TEST_CASE("MCP #3687: a denial happens BEFORE execution-row creation — no phan
     CHECK(tracker.query_executions({}).empty()); // no execution row was ever created
 }
 
+// ── 35d. #3687 Gate 6 UP-5: the pre-dispatch dry run ALSO runs at C8 ────────
+//
+// Governance (unhappy-path, happy-path, chaos-injector, compliance-officer,
+// enterprise-readiness, converged independently): the tests above all drive
+// the MAIN-HANDLER dry run (post-C8, post-mint/consume). C8's own pre-mint
+// block — where #3685 already denies ClassifyMiss/RefuseUntargeted before a
+// ticket exists — did NOT call authorize_dispatch_fn_ at all. So a
+// supervised-tier caller who fails specific-securable RBAC (Forbidden) or
+// hits a kill switch (KillSwitched) still minted (or consumed) a real
+// human-approved ticket before being denied at the main-handler backstop —
+// reopening, for those two reasons, the exact ticket-waste class #3685's own
+// C8 extension exists to prevent. These three tests exercise the fix.
+
+TEST_CASE("MCP #3687 (Gate 6 UP-5): a Forbidden pair is denied AT C8 PRE-MINT — no ticket "
+          "minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — refused before a ticket exists at all, same
+    // convention as every other C8 pre-mint denial in this file.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() ==
+          1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=forbidden") != std::string::npos);
+}
+
+TEST_CASE("MCP #3687 (Gate 6 UP-5): a KillSwitched pair is denied AT C8 PRE-MINT — no ticket "
+          "minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::KillSwitched, "Execution",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "kill_switched");
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP #3687 (Gate 6 UP-5): ApprovalRequired at C8 pre-mint is NOT a denial — a "
+          "legitimate fresh-mint call for an approval-gated pair still mints normally",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    // The critical subtlety: a supervised-tier caller reaching C8 for an
+    // approval-gated row is AT C8 SPECIFICALLY BECAUSE the pair requires
+    // approval. Wiring authorize_dispatch_fn_for_test to report
+    // ApprovalRequired here proves the fix does NOT treat that as a denial —
+    // it falls through to the pre-existing mint logic, exactly as before
+    // this fix existed.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"registry","action":"set_value"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // kApprovalRequired (-32006), the TICKET-MINT code — NOT kPermissionDenied
+    // (what deny_dispatch_authorization would answer). Proves ApprovalRequired
+    // at C8 pre-mint falls through to "mint a ticket", not "deny locally".
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    REQUIRE(body["error"].contains("data"));
+    CHECK_FALSE(body["error"]["data"]["approval_id"].get<std::string>().empty());
+    CHECK(appr.pending_count() == 1); // a REAL ticket was minted
+    CHECK_FALSE(dispatched); // not consumed either — this is the mint response
+}
 
 // ── 36. Audit on success ─────────────────────────────────────────────────
 
