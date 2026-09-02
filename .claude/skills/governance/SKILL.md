@@ -1355,6 +1355,42 @@ here, which is the right shape. Its disposition rule for MEDIUM/SHOULD findings 
 restated rather than deferred, so it can contradict this section — closing that is
 for whoever owns that runner.
 
+### Why the pipeline is run as a pipeline
+
+Use `/governance <range>`, not hand-run gates: **waves 1-4 shipped 4 CRITICAL
+command-injection vulnerabilities without it.**
+
+### The copies, enumerated — and why the list itself matters
+
+All four standing rules, and the ledger schema, are defined ONCE: here. These are
+POINTERS and lose on conflict:
+
+- `CLAUDE.md` and `AGENTS.md` (the "Agent Team & Governance" section)
+- `governance.d/README.md`
+- every agent brief in `.claude/agents/`
+- any `changelog.d/` fragment describing a governance change
+- `docs/governance-skill-tuning-2026-07.md`
+
+The last two were originally omitted from this list, and they are exactly the copies
+that drifted — **a copy-currency rule only reaches the copies it enumerates.** Adding a
+new restatement anywhere means adding it to this list in the same change.
+
+### What the Codex runner defers, and what it does not
+
+`.codex/skills/governance/SKILL.md` genuinely defers for **severity and the ledger
+only.** It carries its own text for standing rules 1 and 4:
+
+- **Rule 1:** there is **no routed-concerns walk at all** on that leg — its
+  `## Domain Routing` is an independently-authored heuristic list, and neither
+  `.claude/routed-concerns.md` nor `.claude/routed-concerns-access-control.md` is
+  referenced anywhere in that file. Tracked as **#2684**. This is the only record of
+  that gap in the tree.
+- **Rule 4:** a weaker Gate 8 phrasing ("re-run affected gates") — precisely the
+  formulation that shipped the broken macOS leg on #2580.
+
+A runner never told to load a rule has no conflict to lose, which is why this is a gap
+to close rather than a contradiction to adjudicate.
+
 ## Gate 8 — Iterate And Ledger
 
 1. **Re-run every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose
