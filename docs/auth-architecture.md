@@ -2766,6 +2766,111 @@ resulting latency bounds.
   distinct from the tier a *human/automation caller* needs to invoke the
   lifecycle surface itself — see "Lifecycle surface (PR 4.3)" below.
 
+
+#### Catastrophic invariants (routed-concern detail)
+
+These are the clauses `.claude/routed-concerns-access-control.md` routes here. A service-scoped API
+token (`session->token_scope_service` non-empty) **must never reach fleet-wide data or actions
+unfiltered.**
+
+1. **`AuthRoutes::require_permission`'s service-scoped branch is the PRIMARY closure mechanism.**
+   ITServiceOwner is the authority ceiling only; a `(securable_type, operation)` pair must ALSO clear
+   the seeded-EMPTY `kServiceScopeGlobalSafe` allow-list (`service_scope_policy.hpp`) or it 403s.
+   **Widening that allow-list is a security decision** — security-guardian sign-off plus a
+   policy-table entry, never inferred from one route being changed.
+
+2. **Branch order in `require_permission`/`require_scoped_permission` is fixed — `elevated → engine →
+   mcp_tier → service → RBAC-enforced → legacy` — never reorder it.** The elevated branch is guarded
+   (`is_elevated && token_scope_service.empty()`); the `mcp_tier` branch must never `return true` on
+   its own (deny, or fall through into the service branch only). A tier-admit that bypasses the
+   service check reopens the flip on every route at once.
+
+3. **MCP's mirror is C8's `ServiceScopeClass`** — `denied` by default; `confined` requires a REAL
+   downstream confinement mechanism (a label with none is the same lie this concern exists to
+   prevent); `global_safe` boot-validates against the same allow-list.
+
+4. **A route reaching agent/fleet data via NO `require_permission`/`require_scoped_permission`/C8 call
+   at all is untouched by the flip and needs its OWN explicit deny — EXTEND an existing per-file
+   helper, never fork a new one.** The helpers: `AuthRoutes::deny_service_scoped_session`
+   (`server.cpp`), `ComplianceRoutes::deny_service_scoped_`, `WorkflowRoutes`' local
+   `deny_service_scoped_schedule_list`/`deny_service_scoped_scope_estimate`,
+   `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.*`), `deny_service_scoped_`
+   (`dex_routes.*`, `deployment_routes.*`, `preflight_routes.*`), the shared
+   `deny_fleet_wide_service_scoped` lambda (`rest_api_v1.cpp`, `mcp_server.cpp`), plus inline checks in
+   `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp`/`tar_tree_routes.cpp`.
+
+   These per-file helpers are now a SECOND, largely-redundant layer for routes the flip already
+   covers — scheduled for Phase 2 retirement, not removed here. `schedule_routes.*`'s
+   `deny_service_scoped_schedule` was the first FULLY retired (#3290 Phase 2 bucket 1a, 2026-08-21):
+   all four of its call sites were provably dead (they fired *after* `require_permission`), unlike the
+   still-live-but-redundant helpers above, which fire *before* their route's gate and so are a
+   different, more cautious retirement class.
+
+5. **A blanket deny's A4 error body MUST NOT name a `.permission` the caller does not currently hold**
+   if holding it would not, by itself, admit the caller — omit the field rather than claim a false
+   self-remediation grant. (Found live in PR 3's own `require_permission`/`require_scoped_permission`
+   service branches, and fixed in the same round that wrote the clause.)
+
+   This MUST binds: every branch inside the service-scoped path of
+   `require_permission`/`require_scoped_permission`; every NEW gate-less-route deny added after this
+   clause was written; and every site in (4) already migrated to the no-`.permission` `a4_denial`
+   shape — as of that round: `AuthRoutes::deny_service_scoped_session`,
+   `ComplianceRoutes::deny_service_scoped_`, `WorkflowRoutes`'
+   `deny_service_scoped_schedule_list`/`deny_service_scoped_scope_estimate`,
+   `GuardianRoutes::deny_service_scoped_`/`deny_service_scoped_mutation_`,
+   `DexRoutes::deny_service_scoped_`, `DeploymentRoutes::deny_service_scoped_`. #3167 closed the
+   remainder — `PreflightRoutes::deny_service_scoped_`'s 3 call sites plus its separate inline deny on
+   the MUTATING `POST /fragments/auto/run`, `schedule_routes.*`'s `deny_service_scoped_schedule` and
+   its 4 call sites (each already passed a correctly-typed permission per operation — the defect was
+   unactionability, not a wrong permission TYPE, a claim the routed row previously made in error), and
+   the inline checks in `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp` (×2)/
+   `tar_tree_routes.cpp` (×2).
+
+   **One known, tracked exception, not retroactively bound:** pre-existing
+   `deny_fleet_wide_service_scoped` call sites that fire AFTER the route's own `perm_fn` already
+   confirmed the caller holds that exact grant, where `.permission` names a grant the caller
+   demonstrably already has — a different, informational claim. `GET /api/v1/inventory/software` no
+   longer illustrates this (#3290 retired its after-gate deny entirely, migrating the route onto
+   `require_fleet_read`). **NO LIVE EXAMPLE CURRENTLY EXISTS:** an exhaustive check of every remaining
+   `deny_fleet_wide_service_scoped` call site — all 20 in `rest_api_v1.cpp` and, as of #3290 Phase 2
+   bucket 1a, all 5 remaining in `mcp_server.cpp` — found every REST site fires BEFORE its route's
+   `perm_fn`, not after (see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`'s
+   migration checklist). `deny_service_scoped_schedule` (previously 4 sites, `permission` param
+   defaulting empty) and the one MCP site whose surrounding `perm_fn` fired first
+   (`get_dex_group_app_perf`) are no longer part of this count at all — both were retired outright in
+   bucket 1a as provably dead, not merely candidates that failed to match the exception shape.
+
+   Do not read "no current instance" as "no longer needed": the next route to add an after-gate
+   `deny_fleet_wide_service_scoped` call with a non-empty `.permission` becomes the example, and this
+   clause still governs it. **A gate-less-route deny not yet audited against this clause is NOT
+   assumed compliant.**
+
+6. **The tag being read to decide admission must never be mutable by that same admission (#3289).**
+   `require_scoped_permission`'s service branch reads the target agent's `service` tag to decide
+   whether to admit a `Tag:Write`/`Tag:Delete` — so without a separate guard it would authorize the
+   very write that changes that tag, letting a service-scoped token move an agent out of (or a
+   different agent into) its own confinement.
+
+   **EXTEND `authz::service_scope_may_mutate_tag_key`** (`service_scope_policy.hpp`) at every
+   tag-mutation site — REST v1 PUT/DELETE `/api/v1/tags`, the legacy dashboard
+   `/api/tags/set`/`/api/tags/delete` (via `AuthRoutes::deny_service_scoped_service_tag_mutation`), and
+   MCP `set_tag`/`delete_tag` — checked BEFORE the scoped gate, **value-blind** (no read-compare
+   TOCTOU: even a no-op rewrite of the token's own current value is denied).
+
+   The agent's own gRPC `Register`→`TagStore::sync_agent_tags` path is the same class of gap on a
+   DIFFERENT axis (no gate at all, not a TOCTOU) — `authz::is_service_tag_key` is filtered there too,
+   silently dropping an agent-claimed `service` value rather than refusing the whole sync (a
+   pre-existing agent-authored row self-heals on the next sync).
+
+   A live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation
+   (`agent_registry.cpp`) was a THIRD, distinct mechanism this clause did not cover, tracked separately
+   as #3295 — now CLOSED: the `tag:<key>` resolver is store-first (a TagStore row of any source wins
+   over a connected agent's live claim; the session value answers only when the store has no row at
+   all), and `register_agent` drops an agent-claimed `service` key from the session at ingest,
+   mirroring this clause's own store-side purge.
+
+Full design, decisions, and the closed route inventory: `docs/adr/1006-service-scope-default-deny.md`
+and `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 ### Lifecycle surface (PR 4.3)
 
 Operator-facing CRUD for engine-principal identities and their credentials —

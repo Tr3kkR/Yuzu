@@ -51,7 +51,8 @@ out of that path; if you enable it there, that mount is what you are testing.
 
 THE PUBLISHED STATUS CHECK IS NAMED "Prometheus alert rules", not
 `prometheus-rules`. The latter is the JOB ID; branch protection matches on the
-name. CLAUDE.md points here for this fact, so it must stay.
+name. docs/testing/unit-test-conventions.md points here for this fact, so it
+must stay.
 
 `--selftest` exercises the pure logic - version parsing, docker argv
 construction, the vacuity verdict, and the assertion COUNTER itself against

@@ -1,14 +1,31 @@
 #!/usr/bin/env python3
-"""Repo-hygiene checks for the issue-lifecycle standard (ADR-3001, Amendment A1).
+"""Repo-hygiene checks for the issue-lifecycle standard (ADR-3001, Amendment A1)
+and the instruction-file standard (docs/instruction-file-standard.md).
 
-Three invariants that must hold on every platform:
+Invariants that must hold on every platform:
 
-1. CLAUDE.md stays under its self-imposed 40,000-CHARACTER cap. Counted
-   UTF-8-decoded in Python deliberately: the file is dense with multi-byte
-   punctuation, so byte counts (`wc -c`, and `wc -m` on Windows Git Bash,
-   which degrades to bytes) read ~300 higher than the character count -- the
-   exact confusion Amendment A1 par.8 corrects. This check is the durable
-   floor; PR-time reviews additionally hold edits to net-negative.
+1. The four ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
+   two routed-concern tables CLAUDE.md @-imports -- each stay under a 32,000
+   character budget, behind the 40,000 hard cap. Counted UTF-8-decoded in
+   Python deliberately: these files are dense with multi-byte punctuation, so
+   byte counts (`wc -c`, and `wc -m` on Windows Git Bash, which degrades to
+   bytes) read ~300 higher than the character count -- the exact confusion
+   Amendment A1 par.8 corrects.
+
+   The budget sits below the cap so the next approach is caught with runway.
+   Previously only CLAUDE.md was measured, and the ceiling was hit three times;
+   the second breach was found at 39,996 of 40,000 bytes, and the unmeasured
+   routed-concern tables had independently reached 38,545 and 37,808 while
+   AGENTS.md sat 25% over a cap nothing applied to it.
+
+   Also enforced on those four files:
+     - EXPIRES: markers -- a temporary section whose date has passed fails the
+       build. A workstreams block outlived its stated window by four weeks,
+       with its own teardown procedure already written, because nothing checked.
+     - Dead pointers -- a backticked repo path that resolves nowhere fails.
+       Three citations pointed into a private memory directory and resolved
+       nowhere, not even on the author's own machine. Deliberate absences go in
+       ABSENT_BY_DESIGN with a reason.
 
 2. scripts/tracker/do-not-close.txt parses -- integers only (one per line,
    '#' comments allowed), no duplicates, never empty. Every automated close
@@ -24,11 +41,57 @@ Wired into tests/meson.build (suite: docs), mirroring test_changelog_order.py.
 
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 CLAUDE_MD_CHAR_CAP = 40_000
+
+# Budget sits below the hard cap so the next approach is caught with runway to
+# plan an extraction, not at the wall. Both prior breaches were discovered with
+# nothing left to give -- the second at 39,996 of 40,000 bytes -- and both were
+# resolved by splitting, which is now exhausted. See
+# docs/instruction-file-standard.md.
+INSTRUCTION_FILE_BUDGET = 32_000
+
+# Every file here loads into an agent session before any work starts: CLAUDE.md
+# and AGENTS.md directly, the two routed-concern tables via CLAUDE.md's
+# @-imports. Only CLAUDE.md was measured before; the routed-concern tables had
+# reached 38,545 and 37,808 unmeasured, and AGENTS.md 49,859 -- already 25% over
+# the cap nothing was applying to it.
+# The two routed-concern tables, checked for column structure as well as size.
+# A cell containing an unescaped "|" silently shifts every column to its right,
+# which is how a CATASTROPHIC row's "Loaded by" agent list was once overwritten
+# by a copy of its own "Doc" column -- leaving a credential-revocation surface
+# with no review trigger, while the table still looked well-formed.
+ROUTED_CONCERN_FILES = (
+    ".claude/routed-concerns.md",
+    ".claude/routed-concerns-access-control.md",
+)
+
+INSTRUCTION_FILES = (
+    "CLAUDE.md",
+    "AGENTS.md",
+    ".claude/routed-concerns.md",
+    ".claude/routed-concerns-access-control.md",
+)
+
+# <!-- EXPIRES: YYYY-MM-DD owner:@who -->
+EXPIRES_RE = re.compile(r"EXPIRES:\s*(\d{4})-(\d{2})-(\d{2})")
+
+# Backticked paths that look like repo paths: contain a '/' or a known suffix,
+# no spaces, no glob/placeholder metacharacters.
+BACKTICK_PATH_RE = re.compile(r"`([A-Za-z0-9_./-]+\.(?:md|hpp|cpp|py|sh|json|yml|yaml|ini|h|txt))`")
+
+# Paths that are deliberately absent from the repo. Each needs a reason: an
+# entry here is an assertion that the citation is correct and the file's
+# absence is intended, not that the check is inconvenient.
+ABSENT_BY_DESIGN = {
+    # Commercially sensitive; kept local-only and untracked on purpose. The
+    # routed-concern row citing it already tells the reader to ask the operator.
+    "docs/dex-brd-coverage.md",
+}
 
 # ASCII digits only, no leading zero: `isdigit()` alone accepts Arabic-Indic
 # numerals a grep/bash consumer would miss, and `0318` would int() to 318 while
@@ -36,20 +99,138 @@ CLAUDE_MD_CHAR_CAP = 40_000
 ISSUE_NUMBER_RE = re.compile(r"0|[1-9][0-9]*")
 
 
+_BASENAMES: set[str] = set()
+
+
+def _tracked_basenames() -> set[str]:
+    """Basenames of every tracked file, for resolving bare-filename citations."""
+    if not _BASENAMES:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        _BASENAMES.update(pathlib.PurePosixPath(p).name for p in out.splitlines())
+    return _BASENAMES
+
+
 def main() -> int:
     failures = []
 
-    # 1. CLAUDE.md character budget
-    claude = (ROOT / "CLAUDE.md").read_text(encoding="utf-8")
-    n_chars = len(claude)
-    if n_chars >= CLAUDE_MD_CHAR_CAP:
-        failures.append(
-            f"CLAUDE.md is {n_chars} characters -- at/over its self-imposed "
-            f"{CLAUDE_MD_CHAR_CAP} cap (see 'CLAUDE.md updates' in the file itself). "
-            f"Route detail to docs/ and keep only invariants + pointers. "
-            f"If this PR did not touch CLAUDE.md, dev is already over cap -- "
-            f"land a trim PR first; this failure is not your change's fault."
-        )
+    # 1. Always-loaded instruction files: budget, expiry, dead pointers
+    import datetime
+
+    today = datetime.date.today()
+    sizes = {}
+    for rel in INSTRUCTION_FILES:
+        path = ROOT / rel
+        if not path.exists():
+            failures.append(f"{rel} is missing")
+            continue
+        text = path.read_text(encoding="utf-8")
+        n = len(text)
+        sizes[rel] = n
+
+        if n >= CLAUDE_MD_CHAR_CAP:
+            failures.append(
+                f"{rel} is {n} characters -- at/over the {CLAUDE_MD_CHAR_CAP} "
+                f"hard cap. Route detail to docs/ and keep only invariants + "
+                f"pointers (docs/instruction-file-standard.md). If this PR did "
+                f"not touch {rel}, dev is already over cap -- land a trim PR "
+                f"first; this failure is not your change's fault."
+            )
+        elif n >= INSTRUCTION_FILE_BUDGET:
+            failures.append(
+                f"{rel} is {n} characters -- over the {INSTRUCTION_FILE_BUDGET} "
+                f"budget (hard cap {CLAUDE_MD_CHAR_CAP}). This file loads into "
+                f"every agent session. Extract to a docs/ file and leave a "
+                f"pointer; see docs/instruction-file-standard.md for the "
+                f"placement ladder."
+            )
+
+        # Expiry markers. A temporary section must say when it dies, and the
+        # date must be enforced -- a workstreams block outlived its own stated
+        # window by four weeks, with its teardown procedure already written,
+        # because nothing checked.
+        for match in EXPIRES_RE.finditer(text):
+            y, m, d = (int(g) for g in match.groups())
+            try:
+                expiry = datetime.date(y, m, d)
+            except ValueError:
+                failures.append(f"{rel}: unparseable EXPIRES date {y}-{m:02d}-{d:02d}")
+                continue
+            if expiry < today:
+                failures.append(
+                    f"{rel}: a section expired on {expiry} and is still present. "
+                    f"Remove it, or move its expiry out deliberately."
+                )
+
+        # Dead pointers. A committed instruction file must not cite a path no
+        # collaborator can open -- three citations pointed at a private memory
+        # directory and resolved nowhere, not even on the author's machine.
+        for match in BACKTICK_PATH_RE.finditer(text):
+            cited = match.group(1)
+            if cited.startswith(("http", "//")) or cited in ABSENT_BY_DESIGN:
+                continue
+            if "/" in cited:
+                # Path-shaped: must resolve exactly.
+                if not (ROOT / cited).exists():
+                    failures.append(
+                        f"{rel} cites `{cited}`, which does not exist in the repo."
+                    )
+            else:
+                # A bare filename is still a pointer -- `STREAM.md` named a file
+                # that existed nowhere, and read as authoritative for months. It
+                # cannot be resolved to one location, so require only that some
+                # tracked file carries that name; a citation matching nothing is
+                # dead by any reading.
+                if cited not in _tracked_basenames():
+                    failures.append(
+                        f"{rel} cites `{cited}`, and no file with that name "
+                        f"exists in the repo."
+                    )
+
+    # 1b. Routed-concern tables: column structure
+    #
+    # test_issue_docs.py cannot judge whether a row routes to the RIGHT agents,
+    # but it can prove every row still has three distinct, populated columns.
+    for rel in ROUTED_CONCERN_FILES:
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.startswith("|"):
+                continue
+            if set(line.strip()) <= {"|", "-", " ", ":"}:
+                continue  # header separator
+            cells = line.split("|")
+            if len(cells) != 5:
+                failures.append(
+                    f"{rel}:{lineno}: routed-concern row has {len(cells) - 2} "
+                    f"columns, expected 3. A literal '|' inside a cell must be "
+                    f"escaped as '\\|' -- an unescaped one shifts every column "
+                    f"to its right and silently corrupts the row."
+                )
+                continue
+            concern, doc, loaded_by = (c.strip() for c in cells[1:4])
+            if concern.lower().startswith("concern"):
+                continue  # header row
+            for name, value in (
+                ("Concern", concern), ("Doc", doc), ("Loaded by", loaded_by)
+            ):
+                if not value:
+                    failures.append(
+                        f"{rel}:{lineno}: routed-concern row has an empty "
+                        f"'{name}' column."
+                    )
+            if doc and doc == loaded_by:
+                failures.append(
+                    f"{rel}:{lineno}: routed-concern row's 'Loaded by' column is "
+                    f"a verbatim copy of its 'Doc' column -- the row names no "
+                    f"review trigger. Standing rule 1: the matrix decides WHICH "
+                    f"agents, never WHETHER."
+                )
 
     # 2. do-not-close.txt parses clean
     dnc_path = ROOT / "scripts" / "tracker" / "do-not-close.txt"
@@ -109,7 +290,10 @@ def main() -> int:
             print(f"  - {f}")
         return 1
 
-    print(f"issue-docs checks OK (CLAUDE.md {n_chars}/{CLAUDE_MD_CHAR_CAP} chars)")
+    summary = ", ".join(
+        f"{rel} {n}/{INSTRUCTION_FILE_BUDGET}" for rel, n in sizes.items()
+    )
+    print(f"issue-docs checks OK ({summary})")
     return 0
 
 
