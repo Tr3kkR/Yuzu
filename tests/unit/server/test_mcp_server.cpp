@@ -808,6 +808,38 @@ struct McpTestServer {
             return kBenignRow;
         }};
 
+    /// #3687: the pre-dispatch authorization dry run `execute_instruction`
+    /// now consults BEFORE `dispatch_fn`, in addition to (and independently
+    /// of) `classify_fn_for_test` above — production wires both from the
+    /// same `capability_registry_`, but the two test seams are deliberately
+    /// separate stubs, exactly like `classify_fn_for_test` and `dispatch_fn`
+    /// itself already are, so a test exercising one denial family need not
+    /// also reason about the other. `McpServer::AuthorizeDispatchFn`'s
+    /// contract is FAIL-CLOSED-WHEN-UNWIRED (mcp_server.hpp) — the SAME
+    /// posture as `classify_fn_for_test` — so the harness DEFAULT wires an
+    /// authorizer that unconditionally SUCCEEDS (a benign row, kill switch
+    /// implicitly "on"), preserving every pre-#3687 test's behaviour. A
+    /// denial-reason test overrides this with a stub returning the specific
+    /// `DispatchDenial` under test; a fail-closed test sets it to `{}`
+    /// (genuinely unwired).
+    yuzu::server::mcp::McpServer::AuthorizeDispatchFn authorize_dispatch_fn_for_test{
+        [](const yuzu::server::DispatchCaller&, std::string_view,
+           std::string_view) -> std::expected<yuzu::server::CommandCapability,
+                                              yuzu::server::detail::DispatchDenial> {
+            static constexpr yuzu::server::CommandCapability kBenignRow{
+                .plugin = "unused",
+                .action = "unused",
+                .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+                .mutability = yuzu::server::Mutability::None,
+                .securable = "Execution",
+                .operation = yuzu::server::authz::Operation::Read,
+                .risk_tier = yuzu::server::authz::RiskTier::Low,
+                .system_reserved = false,
+                .execute_gate = yuzu::server::ExecuteGate::None,
+            };
+            return kBenignRow;
+        }};
+
     /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
     /// real ExecutionTracker so the create_execution / set_agents_targeted
     /// / mark_cancelled lifecycle is exercised end-to-end on the MCP path.
@@ -1149,6 +1181,16 @@ private:
         // preserves every pre-#3685 test's behaviour instead of tripping
         // the new fail-closed-when-unwired gate.
         mcp.set_capability_classify_fn(classify_fn_for_test);
+
+        // #3687: the pre-dispatch authorization dry run ALSO rides a setter,
+        // same pattern as classify_fn_for_test immediately above — wire
+        // before the handlers are built. UNCONDITIONAL, but NOT a no-op
+        // default like most siblings: authorize_dispatch_fn_for_test's own
+        // default is a WIRED (non-empty), unconditionally-succeeding
+        // authorizer (see its doc comment above) precisely so this call
+        // preserves every pre-#3687 test's behaviour instead of tripping
+        // the new fail-closed-when-unwired gate.
+        mcp.set_authorize_dispatch_fn(authorize_dispatch_fn_for_test);
 
         // M5 remediation: the plugin-config/upload-grant stores ALSO ride
         // setters, same pattern as the two above — wire before the handlers
@@ -6898,18 +6940,36 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
 // #1398 (quality-engineer, Gate 3): no prior test wired a fake dispatch_fn
 // that consults the REAL chokepoint (classify_and_authorize_dispatch) rather
 // than fabricating a bare {command_id, 0} directly — so nothing pinned what
-// an MCP caller ACTUALLY experiences today when a gated pair denies at the
-// chokepoint, as opposed to when an agent is genuinely offline. Production's
+// an MCP caller ACTUALLY experiences when a gated pair denies AT DISPATCH_FN
+// ITSELF, as opposed to when an agent is genuinely offline. Production's
 // dispatch_confined (server.cpp) does exactly this: `if (!classified) return
 // {command_id, 0};` — a chokepoint denial and an unreachable agent are
-// indistinguishable at this boundary. This test locks that collapse in
-// explicitly, as a known-imperfect but INTENTIONAL regression guard: #1398
-// Rung 4 (tracked, not yet shipped) is the closure that gives a gate denial
-// its own discriminated JSON-RPC error instead of this shared envelope. If
-// this test starts failing because the envelope changed shape WITHOUT Rung 4
-// having shipped a real discriminator, that is a regression, not progress.
-TEST_CASE("MCP execute_instruction: a real chokepoint ApprovalRequired denial "
-          "collapses into the same no_agents_reached envelope as an offline agent (#1398)",
+// indistinguishable at THAT boundary.
+//
+// #3687 UPDATE: #1398 Rung 4 has now shipped — for the ORDINARY case, a real
+// MCP caller no longer experiences this collapse at all. The pre-dispatch
+// authorization dry run (`authorize_dispatch_fn_`, consulted before
+// dispatch_fn is ever called) now denies an ApprovalRequired-shaped call with
+// its own discriminated JSON-RPC error, and dispatch_fn's internal chokepoint
+// is never reached. This test's OWN construction, however, does not exercise
+// that ordinary path: it fabricates the ApprovalRequired denial inside the
+// fake `dispatch_fn` closure below, against a registry (`kGatedFixture`) the
+// dry run seam (`authorize_dispatch_fn_for_test`, left at its default —
+// unconditionally-succeeding — stub) is never told about. So the dry run
+// here says "allow" while `dispatch_fn`'s own internal check denies — the
+// residual case where the two checks (necessarily separate in production
+// too: the dry run and dispatch_fn's real chokepoint are two calls, not one,
+// racing over the same live state) can disagree. What this test now pins is
+// that residual: when dispatch_fn's own chokepoint denies something the
+// pre-dispatch dry run did not catch, the caller still gets the pre-#3687
+// collapsed `no_agents_reached` envelope, not a discriminated error — because
+// the dry run is a UX improvement layered in front of the real enforcement
+// point, not a second copy of it. If this test starts failing because the
+// envelope changed shape for THIS specific dry-run-allows/dispatch_fn-denies
+// scenario, that is a regression in the documented residual, not progress.
+TEST_CASE("MCP execute_instruction: a chokepoint ApprovalRequired denial the pre-dispatch dry "
+          "run did not catch still collapses into the no_agents_reached envelope (#1398, "
+          "residual post-#3687)",
           "[mcp][integration][execute][1398]") {
     using yuzu::server::CommandCapability;
     using yuzu::server::CommandCapabilityRegistry;
@@ -6964,10 +7024,14 @@ TEST_CASE("MCP execute_instruction: a real chokepoint ApprovalRequired denial "
 
     auto body = nlohmann::json::parse(res->body);
     auto& sc = body["result"]["structuredContent"];
-    // Rung-4-pending: today this is IDENTICAL to the offline-agent envelope
-    // asserted in "MCP Integration: execute_instruction zero agents reached"
-    // above — no `approval_required`/`ApprovalRequired` discriminator exists
-    // in this response yet.
+    // Residual post-#3687 (see the TEST_CASE-level comment above): IDENTICAL
+    // to the offline-agent envelope asserted in "MCP Integration:
+    // execute_instruction zero agents reached" above — no `approval_required`
+    // /`ApprovalRequired` discriminator exists in THIS response, because this
+    // test's fake dispatch_fn denies against a registry the pre-dispatch dry
+    // run (left at its default-allow stub) was never told about. A caller
+    // whose ApprovalRequired-ness IS visible to authorize_dispatch_fn_ gets
+    // the new discriminated error instead — see the "[3687]" test cases.
     CHECK(sc["status"] == "no_agents_reached");
     CHECK(sc["agents_reached"] == 0);
     CHECK_FALSE(sc.contains("approval_required"));
@@ -7686,6 +7750,509 @@ TEST_CASE("MCP #3685: a Targeted Destructive call is NOT refused and still reach
     CHECK(dispatched);
     REQUIRE(seen.has_value());
     CHECK(*seen == std::unordered_set<std::string>{"dev-1", "dev-2"});
+}
+
+// ── 35c. #3687: pre-dispatch authorization dry run — discriminated denials ──
+//
+// classify_and_authorize_dispatch/PluginConfigStore::action_allowed (the
+// shared dispatch chokepoint) can refuse a call for six reasons
+// (DispatchDenialReason, agent_registry.hpp). Before this fix EVERY one of
+// them, reached via execute_instruction's main handler, was indistinguishable
+// from an empty target set — dispatch_fn still enforced the denial correctly,
+// but reported it as the same agents_reached:0/no_agents_reached envelope an
+// offline/unreachable agent also produces. These tests prove each reason now
+// surfaces as a discriminated JSON-RPC error (code + error.data.reason,
+// naming the denial per Decision 7's F fix) with dispatch_fn NEVER invoked.
+
+TEST_CASE("MCP #3687: unwired authorizer fails CLOSED — every execute_instruction call refused, "
+          "dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    McpTestServer ts;
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(dispatched);
+}
+
+namespace {
+/// Builds an AuthorizeDispatchFn stub that unconditionally denies with the
+/// given reason/securable/operation, for the table-style tests below.
+yuzu::server::mcp::McpServer::AuthorizeDispatchFn
+deny_with(yuzu::server::detail::DispatchDenialReason reason, std::string securable = {},
+         yuzu::server::authz::Operation operation = yuzu::server::authz::Operation::Read) {
+    return [reason, securable, operation](const yuzu::server::DispatchCaller&, std::string_view,
+                                          std::string_view)
+        -> std::expected<yuzu::server::CommandCapability, yuzu::server::detail::DispatchDenial> {
+        return std::unexpected(
+            yuzu::server::detail::DispatchDenial{reason, securable, operation});
+    };
+}
+} // namespace
+
+TEST_CASE("MCP #3687: Unclassified denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Unclassified);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"nope","action":"nope"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "unknown or ambiguous plugin.action");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "unclassified");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "unclassified"}})
+              .value() == 1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=unclassified") != std::string::npos);
+}
+
+TEST_CASE("MCP #3687: Ambiguous denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Ambiguous);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"dup","action":"dup"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "ambiguous");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "ambiguous"}}).value() ==
+          1.0);
+}
+
+TEST_CASE("MCP #3687: AnonymousOperator denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test = deny_with(
+        yuzu::server::detail::DispatchDenialReason::AnonymousOperator, "Execution",
+        yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    // Gate 6 quality-engineer mutation finding: without a message-content
+    // assertion, swapping AnonymousOperator's and Forbidden's message bodies
+    // in describe_dispatch_denial() breaks the Forbidden test below but NOT
+    // this one — pin the message text too, matching the pattern already used
+    // for Forbidden/ApprovalRequired/KillSwitched.
+    CHECK(body["error"]["message"].get<std::string>() ==
+          "dispatch denied: the caller has no resolved identity for Execution:Execute");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "anonymous_operator");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "anonymous_operator"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP #3687: Forbidden denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>() == "permission denied: Infrastructure:Write");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() ==
+          1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=forbidden") != std::string::npos);
+}
+
+TEST_CASE("MCP #3687: ApprovalRequired denial is discriminated (NOT the kApprovalRequired "
+          "ticket-mint code — no ticket exists to poll), dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Operator tier: skips C8 entirely (auto-approved tier, no ticket ever
+    // minted), so this proves the main-handler dry run denies on its own —
+    // not a fall-through from the C8 approval-tier gate.
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired (-32006): that code's contract mandates
+    // approval_id/status_url, which this dry run — minting no ticket — never
+    // carries.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("approval required for os_info.version") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    CHECK_FALSE(body["error"]["data"].contains("approval_id"));
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "approval_required"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP #3687: KillSwitched denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::KillSwitched, "Execution",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("kill switch is OFF for os_info.version") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "kill_switched");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP #3687: a genuinely-authorized call still dispatches normally (no regression)",
+          "[mcp][integration][execute][3687]") {
+    // Default authorize_dispatch_fn_for_test unconditionally succeeds — this
+    // test only pins that the dry run is a true pass-through on success,
+    // naming the scenario explicitly rather than relying on it being an
+    // unstated side effect of every other execute_instruction test.
+    McpTestServer ts;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        dispatched = true;
+        CHECK(plugin == "os_info");
+        CHECK(action == "version");
+        return {"cmd-3687", 3};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(dispatched);
+}
+
+TEST_CASE("MCP #3687: a denial happens BEFORE execution-row creation — no phantom row",
+          "[mcp][pg][integration][execute][3687]") {
+    // Mirrors #3685's identically-named-in-spirit test at ~7624 ("operator-tier
+    // Destructive refusal happens BEFORE execution-row creation and
+    // dispatch") — the sign-off correction that produced #3687 explicitly
+    // named "a phantom cancelled execution row" as part of the defect (a
+    // denial reached inside dispatch_fn's own chokepoint left behind a
+    // created-then-cancelled row); this proves the #3687 dry run denies
+    // before any row is ever created, not merely before dispatch_fn runs.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Execution",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(dispatched);
+    CHECK(tracker.query_executions({}).empty()); // no execution row was ever created
+}
+
+// ── 35d. #3687 Gate 6 UP-5: the pre-dispatch dry run ALSO runs at C8 ────────
+//
+// Governance (unhappy-path, happy-path, chaos-injector, compliance-officer,
+// enterprise-readiness, converged independently): the tests above all drive
+// the MAIN-HANDLER dry run (post-C8, post-mint/consume). C8's own pre-mint
+// block — where #3685 already denies ClassifyMiss/RefuseUntargeted before a
+// ticket exists — did NOT call authorize_dispatch_fn_ at all. So a
+// supervised-tier caller who fails specific-securable RBAC (Forbidden) or
+// hits a kill switch (KillSwitched) still minted (or consumed) a real
+// human-approved ticket before being denied at the main-handler backstop —
+// reopening, for those two reasons, the exact ticket-waste class #3685's own
+// C8 extension exists to prevent. These three tests exercise the fix.
+
+TEST_CASE("MCP #3687 (Gate 6 UP-5): a Forbidden pair is denied AT C8 PRE-MINT — no ticket "
+          "minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — refused before a ticket exists at all, same
+    // convention as every other C8 pre-mint denial in this file.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() ==
+          1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=forbidden") != std::string::npos);
+}
+
+TEST_CASE("MCP #3687 (Gate 6 UP-5): a KillSwitched pair is denied AT C8 PRE-MINT — no ticket "
+          "minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::KillSwitched, "Execution",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "kill_switched");
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP #3687 (Gate 6 UP-5): ApprovalRequired at C8 pre-mint is NOT a denial — a "
+          "legitimate fresh-mint call for an approval-gated pair still mints normally",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    // The critical subtlety: a supervised-tier caller reaching C8 for an
+    // approval-gated row is AT C8 SPECIFICALLY BECAUSE the pair requires
+    // approval. Wiring authorize_dispatch_fn_for_test to report
+    // ApprovalRequired here proves the fix does NOT treat that as a denial —
+    // it falls through to the pre-existing mint logic, exactly as before
+    // this fix existed.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"registry","action":"set_value"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // kApprovalRequired (-32006), the TICKET-MINT code — NOT kPermissionDenied
+    // (what deny_dispatch_authorization would answer). Proves ApprovalRequired
+    // at C8 pre-mint falls through to "mint a ticket", not "deny locally".
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    REQUIRE(body["error"].contains("data"));
+    CHECK_FALSE(body["error"]["data"]["approval_id"].get<std::string>().empty());
+    CHECK(appr.pending_count() == 1); // a REAL ticket was minted
+    CHECK_FALSE(dispatched); // not consumed either — this is the mint response
+}
+
+TEST_CASE("MCP #3687 (Gate 6 quality-engineer gap): unwired authorizer fails CLOSED AT C8 "
+          "PRE-MINT too — supervised tier, no ticket minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    // The pre-existing "unwired authorizer fails CLOSED" test above only
+    // covers the main-handler backstop (tier "operator", which never reaches
+    // C8 at all). C8's OWN fail-closed guard (mcp_server.cpp, immediately
+    // before pre_mint_caller is derived) is a separate `if
+    // (!authorize_dispatch_fn_)` block introduced by the UP-5 fix — nothing
+    // previously exercised it independently. A regression scoped to only
+    // that guard (e.g. an inverted condition) would go undetected without
+    // this test.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr; // wired, so C8 reaches the authorize_dispatch_fn_ check
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK(appr.pending_count() == 0); // no ticket minted at the C8 fail-closed guard either
+    CHECK_FALSE(dispatched);
 }
 
 // ── 36. Audit on success ─────────────────────────────────────────────────
@@ -8576,6 +9143,58 @@ TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a tick
     // Ticket minted, cert NOT revoked, no CRL until the approval is consumed.
     CHECK_FALSE(store.is_revoked("BEEF"));
     CHECK(ts.crl_publish_calls_ == 0);
+    CHECK(appr.pending_count() == 1);
+}
+
+// #3893 fix round (Doomgoose review, blocking findings 1+2): a non-dispatch,
+// approval-gated tool must be COMPLETELY UNAFFECTED by the C8 generalization
+// (point 2 of the fix) — proves dispatch_pairs_for("revoke_certificate", ...)
+// correctly returns empty (revoke_certificate calls no dispatch_fn/
+// bundle_orch->dispatch at all) so the new `if (!pairs.empty())` guard never
+// fires for it: no fail-closed-authorizer check, no per-pair authorize_dispatch_fn_
+// call, mint proceeds exactly as the pre-#3893 test immediately above already
+// pins. authorize_dispatch_fn_for_test is wired to unconditionally DENY here —
+// the opposite of that test's default-succeeds stub — specifically so a
+// regression that made the C8 generalization fire for every kKnownRegistered
+// tool (not just dispatch-capable ones) would turn this ticket mint into a
+// denial and fail this test.
+TEST_CASE("MCP #3893: revoke_certificate (non-dispatch tool) is unaffected by the generalized "
+          "C8 pre-mint dry run even when authorize_dispatch_fn_for_test always denies",
+          "[mcp][integration][pki][security][approval][pg][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "3893";
+    rec.subject = "agent-3893";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    // Would deny EVERY (plugin, action) pair if the C8 pre-check ever ran for
+    // this tool — it must not, since revoke_certificate dispatches nothing.
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    ts.start("supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3893,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"3893"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // kApprovalRequired, the TICKET-MINT code — proves the always-deny
+    // authorizer stub never got a chance to fire deny_dispatch_authorization
+    // (which would answer kPermissionDenied instead).
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    CHECK(body["error"]["data"].contains("approval_id"));
+    CHECK_FALSE(store.is_revoked("3893"));
     CHECK(appr.pending_count() == 1);
 }
 
@@ -9916,6 +10535,160 @@ TEST_CASE("MCP execute_bundle threads the caller's principal_is_admin into Dispa
         R"({"jsonrpc":"2.0","method":"tools/call","id":1398,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
     REQUIRE(res);
     CHECK(captured_admin);
+}
+
+// ── #3893 fix round (Doomgoose review, blocking finding 1) ────────────────
+//
+// Before this fix, BundleOrchestrator::DispatchResult carried only
+// {correlation_id, expected} — no per-step outcome — so a denied
+// execute_bundle call unconditionally returned a JSON-RPC SUCCESS naming the
+// requested step count, even when every step was about to be denied by the
+// real chokepoint. This test proves the new per-step pre-check catches a
+// denial on ANY step and refuses the WHOLE call, all-or-nothing, before
+// bundle_orch->dispatch(...) is ever reached for any step (not just the
+// denied one).
+TEST_CASE("MCP #3893: execute_bundle refuses the WHOLE call when ANY step is denied — "
+          "all-or-nothing, dispatch_fn NOT invoked for any step",
+          "[pg][mcp][bundle][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    // Step 1 (os_info.uptime) would be authorized; step 2 (registry.set_value)
+    // is denied. Proves the loop does not stop at "first step OK".
+    ts.authorize_dispatch_fn_for_test =
+        [](const yuzu::server::DispatchCaller&, std::string_view plugin,
+           std::string_view action)
+        -> std::expected<yuzu::server::CommandCapability,
+                        yuzu::server::detail::DispatchDenial> {
+        if (plugin == "registry" && action == "set_value") {
+            return std::unexpected(yuzu::server::detail::DispatchDenial{
+                yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                yuzu::server::authz::Operation::Write});
+        }
+        static constexpr yuzu::server::CommandCapability kBenignRow{
+            .plugin = "unused",
+            .action = "unused",
+            .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+            .mutability = yuzu::server::Mutability::None,
+            .securable = "Execution",
+            .operation = yuzu::server::authz::Operation::Read,
+            .risk_tier = yuzu::server::authz::RiskTier::Low,
+            .system_reserved = false,
+            .execute_gate = yuzu::server::ExecuteGate::None,
+        };
+        return kBenignRow;
+    };
+    bool dispatched = false;
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::DispatchCaller&)
+                               -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    });
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38932,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"registry","action":"set_value"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result")); // no bundle_id — the false-success gap this closes
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    // Neither step reached bundle_orch->dispatch(...) — the SAME dispatch_fn
+    // spy every other bundle test in this file uses to observe fan-out.
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() >=
+          1.0);
+}
+
+// #3893 fix round, folded in from adversarial review (Kimi K1/K2, Codex
+// CDX-P2-02): the all-or-nothing test above pins the Forbidden-denial path;
+// this one pins execute_bundle's own fail-closed branch at the same
+// main-handler site — a regression scoped to only this new call site's
+// `if (!authorize_dispatch_fn_)` guard would go undetected without it.
+TEST_CASE("MCP #3893: execute_bundle unwired authorizer fails CLOSED at the MAIN-HANDLER site "
+          "too — dispatch_fn NOT invoked for any step",
+          "[pg][mcp][bundle][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::DispatchCaller&)
+                               -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    });
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38936,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): ApprovalRequired at C8 pre-mint for execute_bundle "
+          "is NOT a denial — a legitimate fresh-mint call still mints normally",
+          "[pg][mcp][bundle][approval][3893]") {
+    // Mirrors execute_instruction's own "ApprovalRequired at C8 pre-mint is
+    // NOT a denial" test — the same critical subtlety, now proven for
+    // execute_bundle: a supervised-tier caller reaching C8 for an
+    // approval-gated pair is there BECAUSE the pair requires approval, not
+    // because it is being denied.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    ts.start_with_dispatch(
+        [&dispatched](const std::string&, const std::string&, const std::vector<std::string>&,
+                     const std::string&, const std::unordered_map<std::string, std::string>&,
+                     const std::string&, const yuzu::server::DispatchCaller&)
+            -> std::pair<std::string, int> {
+            dispatched = true;
+            return {"cmd", 1};
+        },
+        "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38933,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"registry","action":"set_value"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // kApprovalRequired (-32006), the TICKET-MINT code — NOT kPermissionDenied
+    // (what deny_dispatch_authorization would answer). Proves ApprovalRequired
+    // at C8 pre-mint falls through to "mint a ticket", not "deny locally", for
+    // execute_bundle exactly as it already did for execute_instruction.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    REQUIRE(body["error"].contains("data"));
+    CHECK_FALSE(body["error"]["data"]["approval_id"].get<std::string>().empty());
+    CHECK(appr.pending_count() == 1); // a REAL ticket was minted
+    CHECK_FALSE(dispatched);          // not consumed either — this is the mint response
 }
 
 TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is unwired (CDX-R6-02)",
@@ -13709,6 +14482,210 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
         REQUIRE(st.has_value()); // read succeeded
         CHECK(st->has_value()); // ...and found the record
     }
+}
+
+// ── #3893 fix round (Doomgoose review, blocking finding 2) ────────────────
+//
+// quarantine_device's own pre-dispatch dry run, mirroring execute_instruction's
+// #3687 two-site coverage: the main-handler pre-check (this test) and the C8
+// pre-mint check (the next test). BOTH are required for the same reason
+// #3687 needed both for execute_instruction — a supervised-tier caller
+// reaches the ticket flow via C8, while a caller whose tier does not require
+// approval for Security:Execute (an empty/non-MCP-tiered session, same as a
+// dashboard/admin caller) skips C8 entirely and reaches this handler's body
+// directly.
+//
+// This first test is the PHANTOM-ISOLATION check that is the whole point of
+// pre-checking BEFORE the store write (point 3 of the fix): if the denial
+// were still applied after `quarantine_store->quarantine_device(...)`, a
+// denied call would leave a persisted-but-undispatched quarantine record —
+// the exact #3127 class this handler already fought once.
+TEST_CASE("MCP #3893: quarantine_device Forbidden denial at the MAIN-HANDLER site happens "
+          "BEFORE the store write — no phantom record, dispatch_fn NOT invoked",
+          "[mcp][integration][quarantine][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.metrics_for_test = &reg;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Security",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Empty tier ("" — not an MCP-tiered token, e.g. a dashboard/admin
+    // session): tier_allows("", ...) admits it and requires_approval("", ...)
+    // is unconditionally false (mcp_policy.hpp), so this call skips C8
+    // entirely and reaches quarantine_device's own handler body directly —
+    // the SAME reason execute_instruction's main-handler backstop needed its
+    // own independent fail-closed/denial coverage, not just C8's.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3893,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-3893","reason":"test"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK_FALSE(dispatched);
+    // The phantom-isolation check: no record was ever persisted for this denied call.
+    {
+        auto st = quar.get_status("agent-3893");
+        REQUIRE(st.has_value());       // read succeeded
+        CHECK_FALSE(st->has_value());  // ...and found NOTHING — no phantom record
+    }
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() >=
+          1.0);
+}
+
+TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): a Forbidden quarantine.quarantine pair is denied AT "
+          "C8 PRE-MINT — no ticket minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][quarantine][approval][3893]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    // quarantine_device declares its own approval_id schema property (unlike
+    // most gated tools, which tolerate it as undeclared) — no other args are
+    // required by the schema for C8's #2405 validation to pass, so agent_id
+    // alone is enough to reach the pairs check.
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Security",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // supervised: requires_approval("supervised", "Security", "Execute") is
+    // unconditionally true (mcp_policy.hpp) — quarantine.quarantine is live
+    // device isolation, "as destructive as it gets".
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38931,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-3893"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — refused before a ticket exists at all, same
+    // convention as every other C8 pre-mint denial in this file.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
+    CHECK_FALSE(dispatched);
+}
+
+// #3893 fix round, folded in from adversarial review (Kimi K1/K2, Codex
+// CDX-P2-02): the two tests above pin quarantine_device's main-handler
+// Forbidden-before-write behavior and its C8 Forbidden-no-mint behavior, but
+// neither exercises the main-handler site's OWN fail-closed branch or its
+// (non-carve-out) ApprovalRequired denial independently of execute_instruction's
+// analogous, already-covered branches — a regression scoped to only the new
+// quarantine_device call site would go undetected without these.
+TEST_CASE("MCP #3893: quarantine_device unwired authorizer fails CLOSED at the MAIN-HANDLER "
+          "site too — no phantom record, dispatch_fn NOT invoked",
+          "[mcp][integration][quarantine][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Empty tier skips C8 entirely, same as the Forbidden-before-write test
+    // above — reaches quarantine_device's own fail-closed guard directly.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38934,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-38934","reason":"test"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+    auto st = quar.get_status("agent-38934");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->has_value()); // no phantom record from the fail-closed path either
+}
+
+TEST_CASE("MCP #3893: quarantine_device ApprovalRequired denial at the MAIN-HANDLER site is a "
+          "GENUINE denial (not a C8-style carve-out) — no ticket exists to poll there",
+          "[mcp][integration][quarantine][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Security",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Empty tier: skips C8's carve-out entirely, reaching the main-handler
+    // check directly — unlike C8, this site has no pending ticket to poll,
+    // so ApprovalRequired here is a real denial, matching
+    // execute_instruction's own main-handler-backstop precedent.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38935,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-38935","reason":"test"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired (-32006) — no ticket was minted here to poll.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    CHECK_FALSE(body["error"]["data"].contains("approval_id"));
+    CHECK_FALSE(dispatched);
+    auto st = quar.get_status("agent-38935");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->has_value());
 }
 
 TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (governance UP-9)",

@@ -33,6 +33,7 @@
  * off-platform against synthetic reads.
  */
 
+#include <yuzu/guardian_file_hash_limits.hpp> // kMaxFileHashBytes, clamp_max_hash_bytes (#2233 item 6)
 #include <yuzu/plugin.h>        // YUZU_EXPORT
 #include <yuzu/agent/guard.hpp> // GuardDrift
 #include <yuzu/agent/spark.hpp> // ServiceRunState
@@ -95,6 +96,18 @@ struct RuleAssertion {
     std::string value_name;  ///< the registry value the reader reads + memoises per key across rules that
                              ///< watch the same value_name; NOT part of the compliance verdict here.
 };
+
+/// #2233 item 6: hard ceiling on an AUTHORED max_bytes, applied (after the existing
+/// 0->default normalisation above) on both the spark (guardian_spark_bridge.hpp) and
+/// legacy (guardian_engine.cpp) file-hash-equals arm paths, AND at authoring time on
+/// the server (guardian_rule_spec.cpp) - single-sourced in
+/// common/include/yuzu/guardian_file_hash_limits.hpp so none of the three can drift
+/// apart on the ceiling the way independent hand-rolled clamps would (this repo's
+/// established pattern for exactly this class of bug; see #3388's jitter fix for
+/// precedent). Re-exported into yuzu::agent here so existing agent-side call sites
+/// stay unqualified.
+using yuzu::guardian::clamp_max_hash_bytes;
+using yuzu::guardian::kMaxFileHashBytes;
 
 /// Intrinsic file state read once per spark_key from a single owned handle (the
 /// #807 handle-scoped read, a later rung). Compliance is key-relative EXCEPT

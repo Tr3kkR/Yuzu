@@ -480,7 +480,17 @@ agent_test_exe = executable(
   # agent_test_native_args carries darwin's -DYUZU_HAVE_SECURITY_FRAMEWORK
   # (Wave 4 PR4.3a) so test_installed_apps_macos_enrich.cpp compiles the real
   # SecStaticCode path instead of the header's no-op.
-  cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args,
+  # YUZU_AGENT_SRC_DIR (#2233 item 1 / #3831 source-tripwire tests): mirrors
+  # YUZU_SERVER_SRC_DIR below - mechanically scans the real agents/core/src tree at
+  # test run time rather than hand-copying a snippet that would go stale exactly like
+  # the ordering property it proves. Same backslash-normalisation requirement as that
+  # define: on Windows meson.project_source_root() is a native path, and unescaped
+  # backslashes either fail to compile or silently mangle the path (see that define's
+  # own comment for the full reasoning).
+  cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
+            ['-DYUZU_AGENT_SRC_DIR="' +
+             (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
+             '"'],
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
@@ -940,6 +950,7 @@ if build_server
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
+      'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
@@ -988,6 +999,7 @@ if build_server
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
@@ -1939,14 +1951,23 @@ test('capability gate consistency',
 # docker-dependent test registered here puts a container registry on all three;
 # an earlier version of this wiring did exactly that and was reverted. Without
 # YUZU_TEST_ENABLE_PROMTOOL_DOCKER the harness needs a native promtool of the
-# pinned major and skips (77) otherwise. Timeout matches the workflow's own
-# 10-minute budget for the same work: under the opt-in this pulls a ~110 MB
-# image before it runs anything.
+# pinned major and skips (77) otherwise.
+#
+# TIMEOUT (#2340 PR-4): the harness now runs TWO full gates per invocation -
+# the shipped RULES/TESTS pair, then the marker-extracted yuzu-guardian-journal
+# group (CH-2 + CH-5-PROM) - each up to 4x120s (check + test + the canary's own
+# test + check) = 480s worst case, plus ~225s for the docker daemon probe and
+# pull ladder under the opt-in (0 under a native promtool). Worst case is
+# 225 + 480x2 = 1185s; 1500 keeps ~300s of margin over that, the same
+# methodology run_promtool_tests.py's own pull_with_retry() comment uses for
+# its ladder ("must fit inside the timeouts that enclose it") - see that
+# comment for the full arithmetic and how it composes with the CI job's own
+# `timeout-minutes` in docs-lint.yml.
 test('prometheus alert rules',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py')],
   suite: 'docs',
-  timeout: 600,
+  timeout: 1500,
 )
 
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv

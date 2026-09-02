@@ -44,7 +44,8 @@ Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRI
 
 ### First: confirm you are running the current pipeline
 
-This skill and the routed-concern table are read **from your working tree**, so a branch
+This skill and **both** routed-concern tables (`.claude/routed-concerns.md` and
+`.claude/routed-concerns-access-control.md`) are read **from your working tree**, so a branch
 that predates a change to either silently runs the old pipeline. At the time #2604
 merged, 81 of 81 local branches predated it.
 
@@ -116,7 +117,7 @@ Check existing memory that might apply — at minimum:
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
 
-### Load and MATCH the routed-concern table — do not rely on memory
+### Load and MATCH both routed-concern tables — do not rely on memory
 
 ```bash
 # Every changed path, against every routed-concern row.
@@ -1355,6 +1356,42 @@ here, which is the right shape. Its disposition rule for MEDIUM/SHOULD findings 
 restated rather than deferred, so it can contradict this section — closing that is
 for whoever owns that runner.
 
+### Why the pipeline is run as a pipeline
+
+Use `/governance <range>`, not hand-run gates: **waves 1-4 shipped 4 CRITICAL
+command-injection vulnerabilities without it.**
+
+### The copies, enumerated — and why the list itself matters
+
+All four standing rules, and the ledger schema, are defined ONCE: here. These are
+POINTERS and lose on conflict:
+
+- `CLAUDE.md` and `AGENTS.md` (the "Agent Team & Governance" section)
+- `governance.d/README.md`
+- every agent brief in `.claude/agents/`
+- any `changelog.d/` fragment describing a governance change
+- `docs/governance-skill-tuning-2026-07.md`
+
+The last two were originally omitted from this list, and they are exactly the copies
+that drifted — **a copy-currency rule only reaches the copies it enumerates.** Adding a
+new restatement anywhere means adding it to this list in the same change.
+
+### What the Codex runner defers, and what it does not
+
+`.codex/skills/governance/SKILL.md` genuinely defers for **severity and the ledger
+only.** It carries its own text for standing rules 1 and 4:
+
+- **Rule 1:** there is **no routed-concerns walk at all** on that leg — its
+  `## Domain Routing` is an independently-authored heuristic list, and neither
+  `.claude/routed-concerns.md` nor `.claude/routed-concerns-access-control.md` is
+  referenced anywhere in that file. Tracked as **#2684**. This is the only record of
+  that gap in the tree.
+- **Rule 4:** a weaker Gate 8 phrasing ("re-run affected gates") — precisely the
+  formulation that shipped the broken macOS leg on #2580.
+
+A runner never told to load a rule has no conflict to lose, which is why this is a gap
+to close rather than a contradiction to adjudicate.
+
 ## Gate 8 — Iterate And Ledger
 
 1. **Re-run every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose
@@ -1363,7 +1400,10 @@ for whoever owns that runner.
    that agent raised nothing in round 1**.
 
    Concretely, against the **fix diff** (not the original):
-   - **Gate 3** — re-run the decision matrix, including the routed-concern table.
+   - **Gate 3** — re-run the decision matrix, including **both** routed-concern
+     tables: `.claude/routed-concerns.md` AND
+     `.claude/routed-concerns-access-control.md`. Opening only the first misses
+     every auth, access-control and request-admission invariant.
    - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
      a doc, a changelog fragment, a user-facing string, or in-code prose.
    - **Gates 4 and 6** — re-run an agent when the fix changes behaviour in its

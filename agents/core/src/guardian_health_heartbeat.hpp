@@ -31,6 +31,14 @@ inline constexpr char kGuardianUnhealthyRefreshedTag[] = "yuzu.guardian_unhealth
 /// type-lane cadence (pending_demote_sweeps / pending_demote_ms) - the read-flood guard.
 inline constexpr char kGuardianPriorityDemotedTag[] = "yuzu.guardian_priority_demoted";
 
+/// #2993: GuardianSparkRuntime::outbox_backpressure_drops() - compliance/health entries
+/// rejected at the MAIN outbox's capacity (distinct from the lifecycle log's own
+/// backpressure counter, already surfaced via guardian_journal_heartbeat.hpp) - had zero
+/// production consumer before this tag: an on-call operator had no fleet-visible signal
+/// for a chronic main-outbox jam at all. Sparse: 0 omits the tag.
+inline constexpr char kGuardianOutboxBackpressureDropsTag[] =
+    "yuzu.guardian_outbox_backpressure_drops";
+
 /// M1 health-stream telemetry (F5: widened from a single scalar to a stats struct, mirroring
 /// GuardianJournalStats in guardian_journal_heartbeat.hpp, now that there are three sibling
 /// counters instead of one).
@@ -38,6 +46,7 @@ struct GuardianHealthStats {
     std::uint64_t unhealthy_suppressed{0};
     std::uint64_t unhealthy_refreshed{0};
     std::uint64_t priority_demoted{0};
+    std::uint64_t outbox_backpressure_drops{0}; ///< #2993
 };
 
 /// Populate `tags` with the (sparse) Guardian health telemetry. `TagMap` is any map with a
@@ -50,6 +59,8 @@ void emit_guardian_health_heartbeat_tags(TagMap& tags, const GuardianHealthStats
         tags[kGuardianUnhealthyRefreshedTag] = std::to_string(s.unhealthy_refreshed);
     if (s.priority_demoted != 0)
         tags[kGuardianPriorityDemotedTag] = std::to_string(s.priority_demoted);
+    if (s.outbox_backpressure_drops != 0)
+        tags[kGuardianOutboxBackpressureDropsTag] = std::to_string(s.outbox_backpressure_drops);
 }
 
 } // namespace yuzu::agent

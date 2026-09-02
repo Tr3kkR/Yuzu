@@ -29,17 +29,13 @@
 /// preserved, and a re-scan of an already-managed device cannot un-manage it
 /// (that is `mark_managed`'s job alone).
 ///
-/// Backfill (ADR-0009) is MANDATORY, not skippable: the `managed` flag is
-/// operator-set state, not purely TTL'd ephemeral data. Fingerprint-verified
-/// (ADR-0040 pattern, `RbacStore`/#2703 the reference implementation) so a
-/// process finding no local `discovery.db` cannot mistake "genuine fresh
-/// install" for "a sibling replica holds the real file" and foreclose that
-/// sibling's real migration — see `docs/postgres-store-playbook.md` "Local
-/// source absence never creates terminal migration state on its own".
+/// `migrate_from_sqlite()` retired (chore/retire-migrate-from-sqlite-batch-b,
+/// #3623): no production fleet ever ran a pre-Postgres build of this store —
+/// see ADR-0044's Update. `server.cpp` now runs a detect-and-warn probe over
+/// the legacy file instead.
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -81,8 +77,8 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_discovery_backfill_total{result}`). Set ONCE during
+    /// Wire a metrics registry for the read-degrade counter
+    /// (`yuzu_server_discovery_read_degrade_total{reason}`). Set ONCE during
     /// single-threaded startup, before serving; a null registry (default,
     /// e.g. unit tests) disables emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
@@ -120,16 +116,6 @@ public:
     /// failure.
     [[nodiscard]] std::expected<void, std::string>
     clear_results(const std::string& subnet = {});
-
-    /// MANDATORY one-time, idempotent backfill (ADR-0009) of a legacy
-    /// `discovery.db` SQLite file into this Postgres schema, fingerprint-
-    /// verified against the RbacStore/#2703 reference shape (ADR-0040
-    /// pattern — see the header doc). Runs at startup, before serving; the
-    /// caller (server.cpp) fails closed on a `false` return, matching every
-    /// other MANDATORY-backfill store. Returns true when already migrated
-    /// (idempotent short-circuit), when a fresh install has no legacy file,
-    /// or when the migration completed and reconciled successfully.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
 private:
     pg::PgPool& pool_;

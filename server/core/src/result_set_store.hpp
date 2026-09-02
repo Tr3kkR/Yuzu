@@ -3,8 +3,9 @@
 /// @file result_set_store.hpp
 /// Migrated Postgres store (ADR-0006, ADR-0036, schema `result_set_store`) for
 /// the scope-walking result-set primitive (design: docs/scope-walking-design.md).
-/// Was `result_sets.db` (SQLite); migrated per the ADR-0009 one-time backfill
-/// mechanism — see `migrate_from_sqlite()`.
+/// Was `result_sets.db` (SQLite). `migrate_from_sqlite()` retired
+/// (chore/retire-migrate-from-sqlite-batch-b, #3623) — see ADR-0036's Update;
+/// `server.cpp` now runs a detect-and-warn probe over the legacy file instead.
 ///
 /// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and
 /// runtime. The database IS the source of truth for scope-walking lineage —
@@ -56,7 +57,6 @@
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -156,19 +156,6 @@ public:
     ResultSetStore& operator=(const ResultSetStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
-
-    /// One-time, idempotent legacy-SQLite backfill (ADR-0009). Call once at
-    /// server startup, BEFORE the server serves, after construction has
-    /// proven the Postgres schema is open. Idempotency is tracked by a
-    /// dedicated marker row (never inferred from `result_sets` being empty —
-    /// GC legitimately empties it over the store's lifetime). Fails CLOSED on
-    /// any error — the caller must treat `false` as a fatal startup error,
-    /// same as `!is_open()` (authoritative store: never serve on top of a
-    /// partially-migrated schema). Returns true (no-op) when
-    /// `legacy_db_path` does not exist (fresh install) after stamping the
-    /// marker. Opens the legacy file READ-ONLY and never deletes it — the
-    /// one-release rollback-window file is retained by the caller.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Create ───────────────────────────────────────────────────────────────
     /// Synchronous create: members are known now; lands `materialized`.

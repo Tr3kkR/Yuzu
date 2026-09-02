@@ -206,6 +206,11 @@ public:
     /// normal type-lane cadence. Surfaced as `yuzu.guardian_priority_demoted`. Zero
     /// when prefer_spark is off / no runtime.
     [[nodiscard]] std::uint64_t priority_demoted() const;
+    /// #2993: compliance/health entries rejected at the MAIN outbox's capacity (distinct
+    /// from journal_stats().lifecycle_backpressure_drops, a different log's own
+    /// counter). Surfaced as `yuzu.guardian_outbox_backpressure_drops`. Zero when
+    /// prefer_spark is off / no runtime.
+    [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
 
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.
