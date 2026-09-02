@@ -254,7 +254,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        narrower, pre-existing shortcut (`dispatched_by`-only visibility,
        not the SQL EXISTS-pushdown this PR introduces on the REST side).
        The two surfaces are consequently NOT confined identically today —
-       tracked as a follow-up to backport the pushdown onto
+       tracked as follow-up #3833 to backport the pushdown onto
        `list_executions`, not a twin-existence gap (the twin exists; its
        confinement mechanism is merely weaker).
      - **This fix does not itself trigger re-evaluation against Decision

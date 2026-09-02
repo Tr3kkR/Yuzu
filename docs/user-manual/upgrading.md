@@ -1147,13 +1147,13 @@ than discovering gaps after the fact. `GET /api/executions` defaults to the
 100 most recent rows (`?limit=<N>` to raise it — there is no offset/cursor
 parameter) — for a fleet with more history than that, raise the limit
 before relying on this as a full capture. **This capture step runs on the
-pre-upgrade binary**, so `?limit` here is bounded only by whatever cap that
-binary shipped with at the time; a binary carrying #3789 or later caps
-`limit` at 500 regardless of the value requested — if your fleet has more
-than 500 executions of history to preserve, this single-request capture is
-no longer sufficient (there is still no offset/cursor parameter to page
-past the cap) and you should query by narrower `definition_id`/`status`
-filters to capture in batches instead. The retired `instructions.db` file is **left on disk,
+pre-upgrade binary, which necessarily predates #3789** — the ADR-0065 Postgres cutover this
+section documents shipped before #3789 did, so any binary old enough to still need this
+procedure cannot yet carry #3789's `limit` cap; raise `?limit` as high as needed for this
+specific step. (A binary that already carries #3789, by contrast, caps `GET /api/executions`'
+`limit` at 500 regardless of the value requested, with no offset/cursor to page past it — see
+`docs/user-manual/rest-api.md`'s "Executions" section — but that cap cannot bite on this
+already-completed cutover's capture step.) The retired `instructions.db` file is **left on disk,
 not deleted** — if you need to recover consumed-approval audit evidence
 (the `submitted_by → reviewed_by → consumed_by` chain) after upgrading,
 that file is the most complete source (the audit store also carries

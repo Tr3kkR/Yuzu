@@ -7060,7 +7060,9 @@ parameters and targets. Under a confined grant, every targeted agent must be vis
 caller — a partially-visible or not-yet-fully-reported execution is refused, with a `404`
 (deliberately non-distinguishing from a nonexistent id, to avoid disclosing a hidden cohort). A
 global (unconfined) grant is unaffected by this check and keeps the pre-existing `400 {"error":
-"original execution not found"}` response for an unknown id.
+"original execution not found"}` response for an unknown id. **Escape hatch:** same as `cancel`
+below — an execution whose targeted cohort never fully reports can permanently fail the
+complete-cohort admission check for a confined caller; a **global** grant is never subject to it.
 
 #### `POST /api/executions/{id}/cancel`
 
