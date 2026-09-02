@@ -151,11 +151,14 @@ if [[ "$role_exists" != "1" ]]; then
   # world-readable via /proc/<pid>/cmdline and ps for the psql child's
   # lifetime (F7/#3859). It never touches raw SQL — :'yuzu_pass' still goes
   # through psql's own SQL-literal quoting, same S2 property as above.
+  # -X/--no-psqlrc: the postgres OS user's ~/.psqlrc is untrusted input to
+  # this script — an `ECHO all` setting there would otherwise echo the raw
+  # \set line (password included) to stdout (gov Gate 2, #3859).
   printf '%s\n' \
     "\\set yuzu_pass '${DB_PASSWORD}'" \
     "SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'yuzu_user', :'yuzu_pass')" \
     '\gexec' \
-    | run_as_postgres psql -v ON_ERROR_STOP=1 -v yuzu_user="$DB_USER"
+    | run_as_postgres psql -X -v ON_ERROR_STOP=1 -v yuzu_user="$DB_USER"
   echo "ok: created role '${DB_USER}'"
 else
   echo "ok: role '${DB_USER}' already exists — password left unchanged"
