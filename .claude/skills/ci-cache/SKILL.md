@@ -54,13 +54,20 @@ Each job starts on a fresh disk. The cache lives in GitHub's blob storage and is
 
 `<progressively-shorter-fallback-prefixes>` above is a CORRECTNESS-safe shape for a
 content-hash key — an older prefix match is strictly worse (staler content) but never
-*wrong* content, so restoring it can't corrupt the build. It does NOT follow that an
-open-ended prefix is risk-free: every fallback hit still refreshes GitHub's last-accessed
-clock, so if the key's inputs ever change (a new manifest, a new pinned commit, a key-format
-migration), the ENTRIES BEHIND that fallback stop being reachable by a fresh primary key but
-stay immortal via the open prefix — the same quota-crowding failure mode as below, just
-gated on how often that key's inputs change rather than guaranteed on every run. The vcpkg
-example further down carries this risk today, tracked but not yet fixed (#3888).
+*wrong* content, so restoring it can't corrupt the build **on its own**. That guarantee
+is not free-standing, though: it holds only as long as something downstream actually
+reconciles a stale restore against the current inputs (vcpkg's own sentinel does this —
+see `scripts/ci/vcpkg-triplet-sentinel.sh` — wiping and rebuilding on drift rather than
+trusting the restored tree as-is). Copy this shape onto a coherent-artifact cache with no
+such reconciliation step and "correctness-safe" stops being true.
+
+It also does NOT follow that an open-ended prefix is risk-free even where correctness does
+hold: every fallback hit still refreshes GitHub's last-accessed clock, so if the key's
+inputs ever change (a new manifest, a new pinned commit, a key-format migration), the
+ENTRIES BEHIND that fallback stop being reachable by a fresh primary key but stay immortal
+via the open prefix — the same quota-crowding failure mode as below, just gated on how
+often the key's inputs change rather than guaranteed on every run. The vcpkg example
+further down carries this risk today, tracked but not yet fixed (#3888).
 
 It is a WRONG shape outright — correctness-safe or not — for a time-bucket key (see "For
 ccache" below), where the key's inputs change on every run by construction: a bare
@@ -78,9 +85,9 @@ part-way saves a half-populated tree, and because the key inputs (manifest + bas
 claim it is complete, the next run restores it as an exact hit, rebuilds everything anyway, and
 then **skips its own save** because `cache-hit == 'true'` — so the good tree is discarded and
 the poison persists. GHA cache keys are immutable, so nothing can overwrite it; only
-out-of-band deletion recovers (`gh cache list` + `gh api -X DELETE`, recipe under "For
-ccache" below — the command is the same regardless of which failure mode put the entry
-there). This is not hypothetical: it cost the canary ~65 min per run until #3229.
+out-of-band deletion recovers (`gh cache delete <id>`, recipe under "For ccache" below —
+the command is the same regardless of which failure mode put the entry there). This is not
+hypothetical: it cost the canary ~65 min per run until #3229.
 
 Note the split is about CONTENT VALIDITY, not about key occupancy. The
 `cache-hit != 'true'` skip means ANY entry — additive or not — locks its key for
@@ -134,10 +141,15 @@ restore-keys: |
   vcpkg-<triplet>-
 ```
 
-The bare `vcpkg-<triplet>-` second-tier fallback is correctness-safe (see the caveat above)
-but carries the same quota-crowding risk as an unfixed time-bucket key, gated on how often
-`VCPKG_COMMIT` or the manifest/triplet hash actually changes rather than guaranteed every
-run. The canary's live copy of this pattern has this risk today, tracked as #3888.
+The bare `vcpkg-<triplet>-` second-tier fallback is correctness-safe here specifically
+because `scripts/ci/vcpkg-triplet-sentinel.sh` wipes and rebuilds on any drift rather than
+trusting a restored tree as-is (see the caveat above) — but it still carries the same
+quota-crowding risk as an unfixed time-bucket key. That risk is gated on how often
+`VCPKG_COMMIT` itself changes, not the manifest or triplet hash: a manifest-only change is
+already absorbed by the first tier (`vcpkg-<triplet>-<COMMIT>-`, still matching since
+`VCPKG_COMMIT` is unchanged), so the bare tier only gets reached when `VCPKG_COMMIT` moves
+or every first-tier entry has aged out. The canary's live copy of this pattern has this
+risk today, tracked as #3888.
 
 For ccache: a TIME-BUCKET key, not a source hash. ccache hashes the real
 preprocessed input per object, so the GHA cache key needs no source identity —

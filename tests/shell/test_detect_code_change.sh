@@ -288,9 +288,12 @@ if [ -f "$workflow" ]; then
   # restore-keys line — the exact hazard this test exists to catch,
   # reintroduced further down instead of in place. Anchor the WHOLE
   # restore-keys block instead: nothing may appear between the correct
-  # value and the next step.
+  # value and the next step, EXCEPT an inline `#` comment on the fallback
+  # line itself (`( #[^-]*)?` below) — a maintainer annotating this exact
+  # line is the single most likely harmless edit here, and this test
+  # exists to catch a real regression, not to red on a comment.
   expect_caller true  "canary ccache restore-key fallback is the previous bucket and nothing else" \
-    'restore-keys: \| *ccache-canary-x64-linux-\$\{\{ env\.CCACHE_PREV_BUCKET \}\} *- name'
+    'restore-keys: \| *ccache-canary-x64-linux-\$\{\{ env\.CCACHE_PREV_BUCKET \}\}( #[^-]*)? *- name'
   # #3269: a cancelled run must not write a thin ccache entry that later
   # same-source runs exact-hit and then decline to replace.
   expect_caller true  "canary ccache save is gated on the Build step outcome" \
