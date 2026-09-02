@@ -32,7 +32,7 @@ issue auto-closing on a partial-scope PR) is tracked separately as **#3849**.
 | Sign-off | _(blank - filled by PR-6 once every §2 criterion is green **AND** every §3 row not at a terminal disposition (RULED closed / DONE with no residual / Moved to P3 / Fixed) is itself resolved or explicitly risk-accepted - §2 alone is not the whole gate. As of this PR that's rows 1/4/6 (#3847), row 7 (#2993), row 9 (#3848), and row 3's #3816 residual - checked here, not folded into a 10th criterion)_ |
 | This PR | PR-1 of 7 (+ 1 unscheduled, see below): PR-1 (this doc) → PR-2a (#2233 items 1/4/6 → #3847; item 7 → #2993; + #3831 batch) → PR-2c (fault-injection seams + item-9 TSan rerun, #3848) → [PR-2d, contingency only, if PR-2c's seams demonstrate a real defect - resolves before PR-5, per §5's risk register] → **PR-4 (promtool CH-2/CH-5-PROM) - DONE, merged as #3858, 2026-09-02T13:00:49Z** → [**#3816's design PR, unscheduled** - `GuardianIoExecutor` abandonment-signal API, shared by `GuardianSparkRuntime` + `GuardianStateReader`, no slot assigned; filed 2026-09-01, predating this doc, missing from this doc's first draft and added only after a PR review caught the omission (see §3 row 3); gates PR-5 only, per #3816's own filed text - OR an explicit risk-accept ruling in its place, see §3 row 3] → PR-5 (the flip) → PR-6 (evidence closeout). Sequencing note for §8: PR-4 landed independently of #3816 (neither blocked the other), so Rig A/B provisioning (which follows PR-2a/PR-2c per §8) is not itself delayed by #3816 being unscheduled - only PR-5 is. PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
 | Re-verified against | `origin/dev @ bd387afec` (2026-09-02); the kickoff plan's citations were pinned to `880900f1e1` - every file:line citation below was re-checked against the newer HEAD, not copied blind. Drift is called out inline where found. |
-| Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. |
+| Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A third round, this PR's own PR-4-merged update, re-based this branch on `origin/dev` post-#3857-merge and re-verified its new citations (`tests/prometheus/yuzu-guardian-journal-extracted.test.yml`'s CH-2a/b/c and CH-5-PROM cases 1-6, `docs/prometheus/yuzu-alerts.yml`'s `TelemetryDark` rule expression) directly against `origin/dev` at that later point, not against `e333b6cb2`. A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. |
 
 ## 2. Flip-green criteria (1)–(9)
 
@@ -129,20 +129,26 @@ series is present (proving the no-`for:` design works - a future accidental `for
 should turn this red), and (b) it resolves once the reporting agent goes stale, **while the
 underlying loss stays unhealed**. That gap - healthy-looking alert state hiding an unhealed
 loss - is the actual characterized defect CH-2 exists to demonstrate, not literal "zero
-alerts, ever." This unblocks PR-4.
+alerts, ever." This unblocked PR-4 (now merged, see §1/§4 below).
 
 **CH-5-PROM vs CH-5-UAT - same scenario ID, two different documents, two different meanings.
 Do not conflate them:**
 - **CH-5-PROM** (this doc + PR-4): promtool synthetic time-series proving the currently-shipped
   metric-family set is absent for 7 days, and `YuzuGuardianJournalTelemetryDark` fires within 15
   minutes while nothing else does. **DONE - PR-4 merged as #3858** (2026-09-02T13:00:49Z):
-  `tests/prometheus/yuzu-guardian-journal-extracted.test.yml` implements 6 CH-5-PROM cases,
-  including the exact `_reporting`-exclusion scoping this doc flagged - case 1 ("reporting dark
-  with a healthy fleet") and case 3 ("reporting dark with zero healthy agents stays quiet") are
-  the two halves of the `yuzu_fleet_guardian_journal_reporting == 0 and on()
-  yuzu_fleet_agents_healthy > 0` expression, confirming the "metric-family set absent" case does
-  not mis-fire on `_reporting`'s own steady-state 0 reading. CH-2 is also DONE in the same PR:
-  cases CH-2a/CH-2b implement the ruled fires-then-resolves verdict (§4 above), plus a CH-2c
+  `tests/prometheus/yuzu-guardian-journal-extracted.test.yml` implements 6 CH-5-PROM cases. The
+  actual 7-day-metric-family-absent scenario this bullet describes is case 2 ("reporting dark
+  sustained for 7 days stays firing" - `_reporting` modeled present-at-zero for 168h alongside a
+  healthy fleet, the rest of the metric-family set absent by omission). Cases 1 ("reporting dark with a
+  healthy fleet") and 3 ("reporting dark with zero healthy agents stays quiet") are a related but
+  distinct property - the exact `_reporting`-exclusion scoping this doc flagged, exercising the
+  two halves of the `yuzu_fleet_guardian_journal_reporting == 0 and on()
+  yuzu_fleet_agents_healthy > 0` guard directly. Together the three confirm the "metric-family
+  set absent" case does not mis-fire on `_reporting`'s own steady-state 0 reading. Per-case
+  discrimination (this doc's original PR-4 scoping note: "mutation-red evidence required, not
+  whole-suite") was verified manually at authorship time per the test file's own header comment
+  (`:45-58`), not automated in CI - a scope decision, not a gap. CH-2 is also DONE in the same
+  PR: cases CH-2a/CH-2b implement the ruled fires-then-resolves verdict (§4 above), plus a CH-2c
   refinement (a never-healing loss fires only within its first 15 minutes, found via adversarial
   review) not anticipated when this doc was first written.
 - **CH-5-UAT** (design-doc item 7, `docs/guardian-c0-thread-reloc-design.md`): a live UAT-rig
