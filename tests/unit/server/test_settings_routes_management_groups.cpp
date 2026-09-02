@@ -127,7 +127,10 @@ TEST_CASE("management-groups fragment escapes a name that breaks out of an HTML 
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("onmouseover=\"alert(1)") == std::string::npos);
-    CHECK(res->body.find("&quot;") != std::string::npos);
+    // Pin the specific escaped payload, not just any "&quot;" in the
+    // fragment — a bare substring check would trivially pass once any
+    // other markup in the page emits one.
+    CHECK(res->body.find("x&quot; onmouseover=&quot;alert(1)") != std::string::npos);
 }
 
 TEST_CASE("create-group form's parent <option> list escapes group names",
@@ -145,5 +148,10 @@ TEST_CASE("create-group form's parent <option> list escapes group names",
     CHECK(res->status == 200);
     CHECK(res->body.find("<option value=\"" + *created + "\"><b>evil</b></option>") ==
           std::string::npos);
-    CHECK(res->body.find("&lt;b&gt;evil&lt;/b&gt;") != std::string::npos);
+    // Pin the escaped payload to this specific <option>, not just anywhere
+    // in the fragment — the tree-row text (test above) also escapes the
+    // same name, so a bare substring check wouldn't discriminate the two
+    // render sites.
+    CHECK(res->body.find("<option value=\"" + *created +
+                          "\">&lt;b&gt;evil&lt;/b&gt;</option>") != std::string::npos);
 }

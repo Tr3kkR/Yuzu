@@ -2050,7 +2050,7 @@ std::string SettingsRoutes::render_management_groups_fragment() {
         if (!is_root) {
             html += "<button class=\"btn btn-sm\" "
                     "hx-delete=\"/api/settings/management-groups/" +
-                    g->id +
+                    html_escape(g->id) +
                     "\" "
                     "hx-target=\"#mgmt-groups-section\" "
                     "hx-confirm=\"Delete group '" +
