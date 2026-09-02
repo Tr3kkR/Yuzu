@@ -241,6 +241,29 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        client sees"); wire reference: `docs/user-manual/rest-api.md` (`GET
        /api/v1/guaranteed-state/status`).
 
+   - **2026-09-01 — legacy `/api/executions*` seven-route family (#3789).**
+     REST-only surface, pre-existing since before ADR-1005; not a new
+     capability, so Decision 1's both-surfaces requirement does not attach —
+     same "hardening an existing gate is maintenance, not a violation"
+     reasoning as the #3038 entry above.
+     - **The MCP twin (`list_executions`) already exists and predates this
+       PR.** #3789 hardens the REST surface's authorization gate
+       (`require_permission` → `require_fleet_read`, ADR-0017
+       admit-then-filter) to close a management-group confinement gap; it
+       does not touch `list_executions`, whose own confinement takes a
+       narrower, pre-existing shortcut (`dispatched_by`-only visibility,
+       not the SQL EXISTS-pushdown this PR introduces on the REST side).
+       The two surfaces are consequently NOT confined identically today —
+       tracked as a follow-up to backport the pushdown onto
+       `list_executions`, not a twin-existence gap (the twin exists; its
+       confinement mechanism is merely weaker).
+     - **This fix does not itself trigger re-evaluation against Decision
+       1/4** — it hardens an EXISTING surface's access control, it does not
+       add a capability or a new consumer.
+     - Design record: `docs/auth-architecture.md`'s "Fourth migration
+       (#3789)"; wire reference: `docs/user-manual/rest-api.md`'s
+       "Executions" section.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

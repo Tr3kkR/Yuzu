@@ -7013,6 +7013,14 @@ sees/acts on executions it dispatched itself or that involve at least one agent 
 global grant is unrestricted. An execution outside the caller's visibility and a nonexistent one
 return the identical `404` (no existence oracle).
 
+**Response (503):** any of the seven routes returns `503` with `retry_after_ms` on either (a) the
+RBAC/management-group store being degraded when a confinement decision must be made
+(`require_fleet_read` fails closed, replacing the pre-#3789 flat `403`), (b) the execution tracker
+itself being unreadable (`ExecutionTracker`'s `_checked` accessors), or (c) — under a confined
+grant only — the caller's session identity failing to resolve after admission, which fails closed
+rather than silently falling through to agent-only visibility. Retry after the given interval; a
+persistent `503` indicates a store outage, not a permission problem.
+
 #### `GET /api/executions`
 
 **Permission:** `Execution:Read`. List executions. Accepts `definition_id`, `status`, and `limit`
@@ -7058,7 +7066,11 @@ global (unconfined) grant is unaffected by this check and keeps the pre-existing
 
 **Permission:** `Execution:Execute` AND `Execution:Read`, same confinement rule as `rerun`.
 **Response (404):** unknown execution id (this route no longer reports a false success for a
-nonexistent id), outside-scope, or an incomplete/partial target cohort.
+nonexistent id), outside-scope, or an incomplete/partial target cohort. **Escape hatch:** an
+execution whose targeted cohort never fully reports (an agent gone offline mid-run, for example)
+can permanently fail the complete-cohort admission check for a confined caller — cancel it with a
+**global** `Execution:Execute`+`Execution:Read` grant instead, which is never subject to this
+confinement rule.
 
 ---
 

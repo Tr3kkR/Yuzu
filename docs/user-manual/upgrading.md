@@ -166,6 +166,17 @@ on read shape. Everyone sees the following response-shape changes regardless of 
 - `GET /api/executions` (list) now caps `limit` at 500 (previously unbounded).
 - A gate failure caused by a degraded RBAC/management-group store now returns `503` with
   `retry_after_ms` instead of a flat `403`.
+- **`rerun`'s unknown-id response differs by grant scope, deliberately.** A confined caller
+  attempting a rerun always gets the uniform `404` above. An UNCONFINED (global-grant) caller
+  hitting a genuinely unknown execution id instead keeps the pre-existing
+  `400 {"error":"original execution not found"}` from `create_rerun` — unchanged from before
+  #3789, and intentionally not unified with the new `404`, to minimize behavior change for
+  existing global-grant automation. `cancel` has no equivalent asymmetry: it returns `404` for an
+  unknown id under every grant scope.
+- An execution whose targeted cohort never fully reports (an agent that went permanently offline
+  mid-run, for example) can permanently fail `rerun`/`cancel`'s complete-cohort check for a
+  confined caller. The escape hatch is a **global** `Execution:Execute`+`Execution:Read` grant,
+  which is never subject to this confinement rule.
 
 **What to do:** if you have automation with a group-scoped (not global) `Execution:Read`/`Execute`
 grant, re-verify it still sees the executions it depends on — a confined caller now sees only
@@ -175,7 +186,8 @@ false-success or the old zero-filled `/summary` response for an unknown id, upda
 
 **Verify:** `GET /api/executions/{id}` for an execution outside your management-group scope should
 return `404`, not the previously-unfiltered full record. `docs/auth-architecture.md`'s "Fourth
-migration (#3789)" section has the full design.
+migration (#3789)" section has the full design; `docs/user-manual/rest-api.md`'s "Executions"
+section has the per-route reference including the `503` shape and the `rerun` escape hatch above.
 
 ## Behaviour change: Destructive-class dispatch now requires explicit `agent_ids` on REST and MCP (#3685)
 
@@ -1134,7 +1146,14 @@ tickets before you cut over, so you know what to re-create afterward rather
 than discovering gaps after the fact. `GET /api/executions` defaults to the
 100 most recent rows (`?limit=<N>` to raise it — there is no offset/cursor
 parameter) — for a fleet with more history than that, raise the limit
-before relying on this as a full capture. The retired `instructions.db` file is **left on disk,
+before relying on this as a full capture. **This capture step runs on the
+pre-upgrade binary**, so `?limit` here is bounded only by whatever cap that
+binary shipped with at the time; a binary carrying #3789 or later caps
+`limit` at 500 regardless of the value requested — if your fleet has more
+than 500 executions of history to preserve, this single-request capture is
+no longer sufficient (there is still no offset/cursor parameter to page
+past the cap) and you should query by narrower `definition_id`/`status`
+filters to capture in batches instead. The retired `instructions.db` file is **left on disk,
 not deleted** — if you need to recover consumed-approval audit evidence
 (the `submitted_by → reviewed_by → consumed_by` chain) after upgrading,
 that file is the most complete source (the audit store also carries
