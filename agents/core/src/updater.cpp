@@ -37,9 +37,9 @@
 #define NOMINMAX
 #endif
 // clang-format off
-#include <windows.h>
+#include <windows.h> // must precede bcrypt.h (defines NTSTATUS)
 #include <fcntl.h> // _O_RDONLY/_O_BINARY for the signature-verification handle bridge
-#include <io.h>    // _open_osfhandle, _close  // must precede bcrypt.h (defines NTSTATUS)
+#include <io.h>    // _open_osfhandle, _close
 // clang-format on
 #include <bcrypt.h>
 #include <sddl.h>

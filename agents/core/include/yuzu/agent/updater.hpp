@@ -45,6 +45,19 @@ struct UpdateConfig {
         return !signature_trust_bundle.empty();
     }
 
+    /// True when the configuration would set enforcement that nothing reads.
+    ///
+    /// `require_signature` is only consulted inside the
+    /// `signature_checking_enabled()` branch, so requiring signatures with no
+    /// bundle configured sets a flag that never fires: every update would apply
+    /// unverified while the operator believed enforcement was on. `main()`
+    /// refuses to start on this. It is a predicate rather than an inline check
+    /// so it is testable — `main.cpp` is not part of any test target, which is
+    /// how two external reviewers came to flag the guard as unproven.
+    [[nodiscard]] bool would_fail_open() const noexcept {
+        return require_signature && !signature_checking_enabled();
+    }
+
     /// Optional metrics sink, so a signature refusal is visible to something
     /// other than a local log line.
     ///

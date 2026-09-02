@@ -187,7 +187,7 @@ inline SigningFixtures build_signing_fixtures() {
     // (#482 / Windows MSVC Defender-flake fix). Bare random_device +
     // mt19937_64 has no monotonic counter and can collide under
     // Defender-induced I/O serialisation.
-    f.dir = yuzu::test::unique_temp_path("yuzu_test_plugin_sign_");
+    f.dir = yuzu::test::unique_temp_path("yuzu_test_cms_sign_");
     fs::create_directories(f.dir);
 
     // Trusted CA + leaf

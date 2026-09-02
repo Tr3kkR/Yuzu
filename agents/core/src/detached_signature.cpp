@@ -107,10 +107,6 @@ openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_pat
     return store;
 }
 
-} // namespace
-
-namespace {
-
 /// The whole verification, parameterised only by how the CONTENT is presented.
 /// Both public entry points funnel through here so the CMS policy exists once.
 std::optional<CmsVerifyError> verify_with_content_bio(BIO* content_bio,

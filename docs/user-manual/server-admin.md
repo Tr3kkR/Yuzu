@@ -2162,6 +2162,41 @@ Every flag below has the environment variable shown beside it:
 Setting `--update-require-signature` **without** a trust bundle refuses to start,
 rather than running with enforcement silently inert.
 
+### Rotating the signing key
+
+The spec for this feature asked for custody and rotation guidance, and rotation
+is worth doing deliberately because the naive sequence strands a fleet.
+
+**The trap.** Agents verify against whatever is in the trust bundle at the moment
+they check. If you sign new packages with a new key and have not yet distributed
+the new anchor, every agent that has the old anchor refuses them — and refusal
+is unconditional for a signature that is present and does not verify, so the
+transitional mode does not help.
+
+**The safe order:**
+
+1. **Distribute the new anchor alongside the old one, and wait.** A PEM bundle
+   may hold several certificates; append the new one rather than replacing it, so
+   an agent trusts both keys at once. Do not sign anything with the new key yet.
+   Wait until you are confident every endpoint has the updated bundle — the fleet
+   gauge cannot tell you this, so use your configuration-management tooling.
+2. **Start signing with the new key.** Both old and new packages verify, because
+   every agent trusts both.
+3. **Re-sign anything you still serve.** A package uploaded under the old key
+   keeps its old signature; it stays valid only while the old anchor is trusted.
+4. **Remove the old certificate from the bundle**, last.
+
+**Re-signing an existing package.** Upload it again with the new `.sig`. Do NOT
+re-upload the binary without a signature intending to add one afterwards — the
+upload replaces the sidecar along with the binary, so the package would be served
+unsigned in between, and `--update-require-signature` agents would refuse it for
+as long as that window lasts. The **Signed** column in Settings → OTA Updates
+shows what agents are actually being served.
+
+**Custody.** The signing key never needs to touch a Yuzu server — the server
+stores and forwards the signature but never produces or verifies one. Keep it
+wherever you keep your other code-signing material.
+
 **Roll it out in two stages, and understand what the first stage does not give
 you.** Deploy the bundle with `--update-require-signature` OFF first: an unsigned
 package is then accepted with a loud warning, while a package whose signature is
@@ -2174,11 +2209,19 @@ is too old to sign" from "the signature was stripped in transit"; both look like
 an absent signature and both are accepted. Keep the window short.
 
 **Watch `yuzu_fleet_ota_signature_refusing_agents`.** The server derives this
-gauge from the agents' heartbeats: it counts how many endpoints are currently
-reporting at least one refused update. Any sustained non-zero reading means those
-machines have stopped patching. It counts AGENTS rather than refusals on purpose
-— one wedged endpoint retrying every six hours would otherwise dominate a
-refusal count and hide how much of the fleet is affected.
+gauge from the agents' heartbeats: it counts how many endpoints have refused at
+least one update **since the agent process last started**. It counts AGENTS
+rather than refusals on purpose — one wedged endpoint retrying every six hours
+would otherwise dominate a refusal count and hide how much of the fleet is
+affected.
+
+**Read it as "has refused", not "is currently failing".** The underlying counter
+is cumulative and never resets, so an endpoint that refused once and has since
+updated cleanly keeps contributing until it restarts — and conversely, an agent
+restart zeroes one that is still failing. A rising number is a real signal and
+worth acting on; a flat non-zero number is not proof that those machines are
+still stuck. To confirm current state, check whether the affected endpoints'
+reported agent version is advancing.
 
 **A refusing agent still cannot tell you WHY.** There is no status-report RPC on the update path, so the reason (missing,
 untrusted chain, or invalid signature) appears only in that endpoint's own log —

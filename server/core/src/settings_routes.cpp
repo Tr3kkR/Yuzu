@@ -2171,11 +2171,12 @@ std::string SettingsRoutes::render_updates_fragment() {
 
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Platform</th><th>Arch</th><th>Version</th>"
-            "<th>Size</th><th>Rollout</th><th>Mandatory</th><th></th></tr></thead>"
+            "<th>Size</th><th>Signed</th><th>Rollout</th><th>Mandatory</th><th></th>"
+            "</tr></thead>"
             "<tbody>";
 
     if (packages.empty()) {
-        html += "<tr><td colspan=\"7\" style=\"color:#484f58\">"
+        html += "<tr><td colspan=\"8\" style=\"color:#484f58\">"
                 "No update packages uploaded</td></tr>";
     } else {
         for (const auto& pkg : packages) {
@@ -2195,6 +2196,20 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "</code></td>"
                     "<td style=\"font-size:0.75rem\">" +
                     size_str +
+                    "</td>"
+                    // Read from disk, not from a stored flag: the sidecar is the
+                    // artifact an agent is actually served, so this shows what the
+                    // fleet will see rather than what the upload intended. Without
+                    // it an operator has no way to tell a signed package from an
+                    // unsigned one short of reading server logs.
+                    "<td style=\"font-size:0.75rem\">" +
+                    (update_registry_ && std::filesystem::exists(
+                                             update_registry_->signature_path(pkg))
+                         ? std::string("<span title=\"A detached signature is stored "
+                                       "for this package\">signed</span>")
+                         : std::string("<span style=\"color:#8b949e\" title=\"No signature "
+                                       "stored. Agents running --update-require-signature "
+                                       "will refuse this package.\">unsigned</span>")) +
                     "</td>"
                     "<td>"
                     "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
@@ -2261,7 +2276,10 @@ std::string SettingsRoutes::render_updates_fragment() {
             // operator would ship an unsigned package believing it signed.
             "<div class=\"form-row\">"
             "<label>Signature <span class=\"muted\">(optional, .sig)</span></label>"
-            "<input type=\"file\" name=\"signature\" accept=\".sig\"></div>"
+            // No accept filter: ".sig" is only convention — ".p7s" and ".pem" are
+            // common names for the same detached CMS blob, and filtering the picker
+            // to one suffix hides the operator's actual file.
+            "<input type=\"file\" name=\"signature\"></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
             "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:50px\"></div>"

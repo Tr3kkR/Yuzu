@@ -10,6 +10,7 @@
 __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_init)() = diag_before_static_init;
 #endif
 
+#include <yuzu/agent/updater.hpp>
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/env_util.hpp>
 #include <yuzu/agent/identity_store.hpp>
@@ -496,7 +497,9 @@ int main(int argc, char* argv[]) {
     // guard --plugin-require-signature carries (agent.cpp, governance hardening
     // round 1, UP-7), but is sited HERE rather than beside the plugin scan so it
     // cannot be skipped by a deployment that loads no plugins.
-    if (cfg.update_require_signature && cfg.update_trust_bundle.empty()) {
+    if (yuzu::agent::UpdateConfig{/*enabled=*/true, {}, cfg.update_trust_bundle,
+                                 cfg.update_require_signature}
+            .would_fail_open()) {
         std::cerr << "--update-require-signature is set but --update-trust-bundle is empty. "
                      "Refusing to start: this combination would silently fail open (every OTA "
                      "update would be applied unverified).\n";

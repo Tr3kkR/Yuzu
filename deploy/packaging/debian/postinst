@@ -37,8 +37,10 @@ case "$1" in
         #
         # root-owned: on Linux the agent runs unprivileged, so it genuinely
         # cannot rewrite the anchor that authorises its own updates.
-        install -d -m 0755 -o root -g root /etc/yuzu-agent
-        install -d -m 0755 -o root -g root /etc/yuzu-agent/certs
+        if [[ "$COMPONENT" != "yuzu-server" ]]; then
+            install -d -m 0755 -o root -g root /etc/yuzu-agent
+            install -d -m 0755 -o root -g root /etc/yuzu-agent/certs
+        fi
 
         if [[ "$COMPONENT" == "yuzu-server" ]]; then
             install -d -m 0750 -o "$SVC_USER" -g "$SVC_USER" /etc/yuzu

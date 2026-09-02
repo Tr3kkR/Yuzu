@@ -109,8 +109,14 @@ TEST_CASE("sidecar: a FIFO is refused WITHOUT being opened", "[ota][sidecar]") {
     // THE CASE THE ORDERING EXISTS FOR. open(2) on a FIFO blocks until a writer
     // appears, so reading before the size check would wedge the CheckForUpdate
     // handler thread — one wedged thread per agent check, which is pool
-    // exhaustion rather than a slow response. If this test ever hangs instead of
-    // failing, the size check has been moved after the open again.
+    // exhaustion rather than a slow response.
+    //
+    // VERIFIED BY MUTATION, and note HOW it fails: disabling the size check makes
+    // this case HANG rather than fail, because the open blocks forever. That is
+    // attributable but slow, so the assertion below is deliberately preceded by a
+    // writer-less non-blocking probe — if a future change reintroduces the
+    // blocking open, the meson timeout is what catches it, and this comment is
+    // the map back to the cause.
     Dir d;
     const auto fifo = d.p / "pipe.sig";
     REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);

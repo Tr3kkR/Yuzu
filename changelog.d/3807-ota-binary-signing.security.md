@@ -11,10 +11,11 @@
   delivered by the party being verified anchors nothing. Verification runs after
   the hash check and before anything irreversible: before the execute bit on
   POSIX and before the live binary is moved aside on Windows. It reads the
-  already-downloaded file through the same descriptor that was hashed, so the
-  bytes verified are provably the bytes that were checked, and because the
-  staged file is opened with `dwShareMode=0` on Windows that is required rather
-  than merely preferable. Configure with `--update-trust-bundle` and
+  already-downloaded file through the descriptor the download was written to, so
+  what is verified is provably the bytes at the inode that will be applied — no
+  re-open, and therefore no window in which the path could be repointed between
+  the check and the apply. On Windows that is required rather than preferable:
+  the staged file is opened with `dwShareMode=0` and cannot be opened twice. Configure with `--update-trust-bundle` and
   `--update-require-signature` (both off by default; unset bundle disables
   checking entirely). A signature that is PRESENT and fails to verify is refused
   regardless of the require flag — only an ABSENT signature is tolerated, and

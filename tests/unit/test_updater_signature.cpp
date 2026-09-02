@@ -27,6 +27,8 @@
 #include <string>
 
 #include "agent.grpc.pb.h"
+#include <openssl/evp.h>
+
 #include "cms_test_fixtures.hpp"
 #include "test_helpers.hpp"
 
@@ -302,4 +304,31 @@ TEST_CASE("updater: with no trust bundle configured, signatures are not checked 
     auto r = updater.check_and_apply(h.stub.get());
     REQUIRE(r.has_value());
     CHECK(*r);
+}
+
+TEST_CASE("updater config: require without a bundle is a fail-OPEN configuration",
+          "[updater][signing]") {
+    // The predicate main() refuses to start on. It exists as a predicate because
+    // main.cpp is in no test target, so the guard itself was unproven — two
+    // external reviewers flagged that independently, and a manual probe is not a
+    // regression test.
+    UpdateConfig bad;
+    bad.require_signature = true;
+    bad.signature_trust_bundle.clear();
+    CHECK(bad.would_fail_open()); // enforcement set, nothing reads it
+
+    UpdateConfig ok;
+    ok.require_signature = true;
+    ok.signature_trust_bundle = "/etc/yuzu-agent/certs/update-trust-bundle.pem";
+    CHECK_FALSE(ok.would_fail_open());
+
+    UpdateConfig permissive;
+    permissive.require_signature = false;
+    permissive.signature_trust_bundle.clear();
+    CHECK_FALSE(permissive.would_fail_open()); // checking off entirely is legitimate
+
+    UpdateConfig transitional;
+    transitional.require_signature = false;
+    transitional.signature_trust_bundle = "/etc/yuzu-agent/certs/update-trust-bundle.pem";
+    CHECK_FALSE(transitional.would_fail_open());
 }
