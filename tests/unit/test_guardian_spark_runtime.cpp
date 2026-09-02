@@ -21,6 +21,8 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <filesystem>
+#include <fstream>
 #include <future>
 #include <latch>
 #include <memory>
@@ -1720,6 +1722,49 @@ TEST_CASE("attach_rule: a throw AFTER joining an ALREADY-armed key leaves no gho
     CHECK(rt->armed_key_count() == 0);
 }
 
+TEST_CASE("source tripwire: arming_rollback's .fn is assigned before "
+          "arming_keys_.emplace(), not after (#3831)",
+          "[spark][runtime][liveness][source_tripwire]") {
+    // #3831: a bad_alloc during arming_rollback's OWN .fn= assignment (a 3-capture
+    // closure exceeding libstdc++'s std::function SBO) is not injectable from this
+    // ordinary test binary - it would need allocator fault-injection at a specific
+    // call site, which this repo's only such mechanism (test_spark_alloc_budget.cpp)
+    // is a SEPARATE executable for precisely because global operator new replacement
+    // cannot coexist with normal test infrastructure (see that file's own "WHY THIS IS
+    // A SEPARATE EXECUTABLE" doc comment). Absent that, this pins the textual property
+    // the fix actually depends on: .fn is assigned before the mutation it protects, so
+    // a throw during the assignment has nothing left to roll back. Mutation-verified:
+    // swapping the two lines' relative order makes this fail.
+    std::ifstream input(std::filesystem::path(YUZU_AGENT_SRC_DIR) / "guardian_spark_runtime.cpp");
+    REQUIRE(input.is_open());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+
+    const auto fn_assign_pos = source.find("arming_rollback.fn =");
+    REQUIRE(fn_assign_pos != std::string::npos);
+    // The real call, not a mention in prose - several comments near both markers say
+    // "arming_keys_.emplace()" in passing, and a bare "arming_keys_.emplace(" matches
+    // those too (verified: it found one of those comments, which sits ABOVE the real
+    // .fn= assignment, and the test FAILED on already-correct code). InFlightArm is the
+    // call's own second argument type - it does not appear in any comment mentioning
+    // arming_keys_.emplace().
+    const auto emplace_pos = source.find("arming_keys_.emplace(key, InFlightArm");
+    REQUIRE(emplace_pos != std::string::npos);
+    CHECK(fn_assign_pos < emplace_pos);
+
+    // Ordering alone isn't the whole property: a future edit could move this guard's
+    // declaration back INSIDE the locked block (reintroducing the pre-#3831 lock-order
+    // hazard the block-scope comment above it warns against) while keeping .fn= textually
+    // before .emplace() - still "passing" the check above. Pin scope too: .fn= must
+    // precede the FIRST std::unique_lock<std::mutex> lk{registry_mu_} in this file (the
+    // one attach_rule's locked block opens with; a second, unrelated one exists later
+    // for the post-io_executor commit and is not what this line finds, since find()
+    // returns the first match).
+    const auto lock_pos = source.find("std::unique_lock<std::mutex> lk{registry_mu_}");
+    REQUIRE(lock_pos != std::string::npos);
+    CHECK(fn_assign_pos < lock_pos);
+}
+
 // ── PR #3821 review (fjarvis): prior_disarm dropped on an early exit ───────────
 // attach_rule captures prior_disarm (the OWED backend disarm for whatever
 // generation this call supersedes) BEFORE deciding which of three branches this
@@ -2406,6 +2451,14 @@ TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking
         rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
 
     CHECK(rt->lifecycle_backpressure_drops() > 0);
+    // #2233 item 7: 5 attaches each drop at capacity (5 rejected "armed" entries), but
+    // the log-once branch (enqueue_lifecycle_locked's own == 1 gate) must fire exactly
+    // ONCE - proving the log-once logic actually gates repeats, not just that it
+    // doesn't crash under repetition. Direct proof via the _for_test observable
+    // (LogCapture cannot see this: guardian_spark_runtime.cpp is compiled into
+    // libyuzu_agent_core.so, and its own doc comment documents the logger-swap not
+    // reliably crossing that shared-library boundary).
+    CHECK(rt->lifecycle_backpressure_log_fires_for_test() == 1);
     // The arm itself still succeeded throughout - the audit trail never blocks
     // the real detection-capability change.
     CHECK(rt->rule_count() == 1);

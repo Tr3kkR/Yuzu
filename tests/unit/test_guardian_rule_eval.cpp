@@ -10,6 +10,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <limits>
 #include <string>
 
 using namespace yuzu::agent;
@@ -317,4 +318,26 @@ TEST_CASE("recovery from Unknown FORCES a drift even inside the debounce window"
         REQUIRE(recovered.status == EvalStatus::Emit);
         REQUIRE_FALSE(recovered.drift.compliant);
     }
+}
+
+// ── clamp_max_hash_bytes (#2233 item 6) ──────────────────────────────────────
+
+TEST_CASE("clamp_max_hash_bytes: over the ceiling clamps to it", "[guardian][rule_eval]") {
+    CHECK(clamp_max_hash_bytes(kMaxFileHashBytes + 1) == kMaxFileHashBytes);
+    CHECK(clamp_max_hash_bytes(std::numeric_limits<std::uint64_t>::max()) == kMaxFileHashBytes);
+}
+
+TEST_CASE("clamp_max_hash_bytes: at or under the ceiling passes through unchanged",
+          "[guardian][rule_eval]") {
+    CHECK(clamp_max_hash_bytes(kMaxFileHashBytes) == kMaxFileHashBytes);
+    CHECK(clamp_max_hash_bytes(kMaxFileHashBytes - 1) == kMaxFileHashBytes - 1);
+    CHECK(clamp_max_hash_bytes(0) == 0); // the ceiling is not the 0->default normalizer's job
+    CHECK(clamp_max_hash_bytes(64ull * 1024 * 1024) == 64ull * 1024 * 1024); // the default itself
+}
+
+TEST_CASE("kMaxFileHashBytes: generous relative to the default, bounded well under a "
+          "32-bit size_t (guard_file.cpp's static_cast truncation point)",
+          "[guardian][rule_eval]") {
+    CHECK(kMaxFileHashBytes > 64ull * 1024 * 1024); // strictly above the default - a real ceiling
+    CHECK(kMaxFileHashBytes < 4ull * 1024 * 1024 * 1024); // headroom under the 32-bit size_t boundary
 }

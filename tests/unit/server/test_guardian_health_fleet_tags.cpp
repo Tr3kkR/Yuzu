@@ -1,10 +1,10 @@
 /**
  * test_guardian_health_fleet_tags.cpp - Guardian M1 health-stream fleet-telemetry
- * contract (#2298 gate 3, item 6d).
+ * contract (#2298 gate 3, item 6d; #2993 added the 4th counter).
  *
- * Mirrors test_guardian_journal_fleet_tags.cpp's four-way bind for the smaller
- * 3-counter health family (no age/MAX sibling table here - all three of these are
- * plain sparse cumulative counters, none a staleness clock):
+ * Mirrors test_guardian_journal_fleet_tags.cpp's four-way bind for the health family
+ * (no age/MAX sibling table here - all of these are plain sparse cumulative counters,
+ * none a staleness clock):
  *
  *  - STRUCTURAL: sizeof(GuardianHealthStats) pins the field count to the table row
  *    count, so adding a counter without a fleet gauge is a COMPILE error.
@@ -61,6 +61,7 @@ GuardianHealthStats all_nonzero_stats() {
     s.unhealthy_suppressed = 1;
     s.unhealthy_refreshed = 2;
     s.priority_demoted = 3;
+    s.outbox_backpressure_drops = 4;
     return s;
 }
 
@@ -93,6 +94,7 @@ TEST_CASE("guardian health: agent emit keys bind exactly to the server table",
         {"yuzu.guardian_unhealthy_suppressed", "1"},
         {"yuzu.guardian_unhealthy_refreshed", "2"},
         {"yuzu.guardian_priority_demoted", "3"},
+        {"yuzu.guardian_outbox_backpressure_drops", "4"},
     };
     // Per-key, NOT `CHECK(tags == expected)` - see the guardian-journal pin test's
     // comment for why a whole-map compare hides which key drifted.
