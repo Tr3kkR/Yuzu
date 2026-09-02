@@ -312,3 +312,25 @@ no small-human-chosen-identifier collision risk `RbacStore` has to guard against
   every other migrated store's concurrency model; no separate follow-up needed.
 - The store's dormancy is now a recorded, deliberate fact (this ADR + the ladder row) rather than
   something a future reader has to re-derive from a two-commit pickaxe search.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+**Supersedes the "Backfill is NOT skippable on the strength of that dormancy" caution above.**
+That caution reasoned that the `acc6c481a..2fcfb95b5` window meant a real `license.db` with
+genuinely activated licenses *could* exist even though the store is dormant today. ADR-0009's
+fresh-start-by-default amendment (2026-08-25) establishes the blanket program-wide fact this
+per-store hedge did not yet have available: no production Yuzu fleet has ever run a pre-Postgres
+build of *any* store (`project_no-production-fleet-fresh-build` standing fact) — this store's
+historical SQLite-era construction window included, since Yuzu had no production deployments
+during it either.
+
+`LicenseStore::migrate_from_sqlite()`, its `LegacyLicenseRow`/`LegacyAlertRow` helper types, and
+the `sqlite_backfill_source` marker table are removed
+(`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623). This store's `migrations()`
+were never run against any real database at all — nothing in production ever constructed
+`LicenseStore` even after this ADR's PG migration merged (see "Dormancy" above) — so schema
+version 1 was edited in place (the `sqlite_backfill_source` `CREATE TABLE` deleted from it)
+rather than issuing a version-bumped `DROP TABLE IF EXISTS` migration, the same practical
+justification PolicyStore's removal used (ADR-0009 §"authoring contract"), reached the same way
+DeviceTokenStore's (ADR-0052) was: that store's v1 had never *shipped*; this store's v1 had never
+*run*.
