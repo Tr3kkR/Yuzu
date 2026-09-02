@@ -1461,7 +1461,7 @@ public:
         metrics_.describe("yuzu_server_gateway_forward_total",
                           "Gateway SendCommand forwards by terminal outcome (ok / "
                           "unauthenticated = rejected by the gateway's #1422 mgmt-plane "
-                          "peer pin / unavailable = dropped after 3 retries / other). "
+                          "peer pin / unavailable = dropped after 3 attempts / other). "
                           "Any non-ok movement means commands to gateway-connected "
                           "agents are being lost.",
                           "counter");
