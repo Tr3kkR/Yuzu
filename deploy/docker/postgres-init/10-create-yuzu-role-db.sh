@@ -50,12 +50,23 @@ fi
 
 # psql variable substitution (:'var' literal / :"var" identifier) + format()
 # with %I/%L handles quoting safely — role/db names and the password are
-# never spliced into SQL by the shell.
-psql -v ON_ERROR_STOP=1 \
+# never spliced into SQL by the shell. The password is read by psql from its
+# own environment (\getenv, psql 15+; this image ships 18) rather than -v,
+# so it is never in argv, which the HOST process table exposes even for
+# container processes (F7/#3859) — environ is owner-only, argv is not.
+# -X/--no-psqlrc: \getenv keeps the password out of the ECHOED INPUT LINE,
+# but \gexec separately echoes the fully-substituted query text under an
+# active ECHO setting — so a .psqlrc under the postgres OS user's $HOME
+# (the same /var/lib/postgresql this image tells operators to mount a
+# volume at) setting `\set ECHO all` would still print the password via
+# \gexec's echo, same disclosure class as the native script's -X fix
+# (gov Gate 4, #3859). Any FUTURE psql call in this file that ever
+# handles a secret needs -X too — it is per-invocation, not file-wide.
+psql -X -v ON_ERROR_STOP=1 \
      -v yuzu_user="${YUZU_DB_USER}" \
-     -v yuzu_pass="${YUZU_DB_PASSWORD}" \
      -v yuzu_db="${YUZU_DB_NAME}" \
      --username "${POSTGRES_USER}" --dbname postgres <<'EOSQL'
+\getenv yuzu_pass YUZU_DB_PASSWORD
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'yuzu_user', :'yuzu_pass')
 WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'yuzu_user')
 \gexec
