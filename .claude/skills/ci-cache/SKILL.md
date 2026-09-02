@@ -52,6 +52,13 @@ Each job starts on a fresh disk. The cache lives in GitHub's blob storage and is
     key: ${{ steps.cache-<thing>.outputs.cache-primary-key }}
 ```
 
+`<progressively-shorter-fallback-prefixes>` above is fine for a content-hash key, where an
+older prefix match is strictly worse (staler) but never *wrong* to keep finding forever. It
+is the WRONG shape for a time-bucket key (see "For ccache" below): a bare open-ended prefix
+there matches every entry the cache name has ever produced, including one left by a
+since-changed key format, and GitHub refreshes the last-accessed clock on every fallback
+hit — the only thing that ever ages a cache out. Name the specific previous bucket instead.
+
 **Additive vs coherent-artifact caches — `always()` is not always right:**
 
 The `if: always()` above is correct for an **additive** cache, where every object saved is
@@ -63,8 +70,9 @@ part-way saves a half-populated tree, and because the key inputs (manifest + bas
 claim it is complete, the next run restores it as an exact hit, rebuilds everything anyway, and
 then **skips its own save** because `cache-hit == 'true'` — so the good tree is discarded and
 the poison persists. GHA cache keys are immutable, so nothing can overwrite it; only
-out-of-band deletion recovers. This is not hypothetical: it cost the canary ~65 min per run
-until #3229.
+out-of-band deletion recovers (`gh cache list` + `gh api -X DELETE`, recipe under "For
+ccache" below — the command is the same regardless of which failure mode put the entry
+there). This is not hypothetical: it cost the canary ~65 min per run until #3229.
 
 Note the split is about CONTENT VALIDITY, not about key occupancy. The
 `cache-hit != 'true'` skip means ANY entry — additive or not — locks its key for
@@ -131,19 +139,40 @@ recipe). Bucket by TIME — one saved entry per bucket per scope; later
 same-bucket runs exact-hit and skip the save. Pick the bucket width from the
 trade: shorter = fresher cache (hit-rate decay is capped at the bucket width)
 but more live entries against the 10 GB repo quota. The canary uses a rolling
-3-day bucket (~2-3 live entries; a weekly bucket risked heavy-week Thu/Fri
-decay, daily would hold up to 7 entries):
+3-day bucket (~2-3 live entries — but only because restore-keys below is
+scoped to the previous bucket; an open-ended prefix defeats the bound, see
+next paragraph. A weekly bucket risked heavy-week Thu/Fri decay, daily would
+hold up to 7 entries):
 
 ```yaml
 - name: Compute ccache time bucket
-  run: echo "CCACHE_BUCKET=$(( $(date -u +%s) / 259200 ))" >> "$GITHUB_ENV"
+  run: |
+    now="$(date -u +%s)"
+    echo "CCACHE_BUCKET=$(( now / 259200 ))" >> "$GITHUB_ENV"
+    echo "CCACHE_PREV_BUCKET=$(( now / 259200 - 1 ))" >> "$GITHUB_ENV"
 # 259200 s = 3 days. (If you prefer a calendar week: date -u +%G-W%V —
 # %G ISO year pairs with %V ISO week; %Y mispairs at year boundaries.)
+# Read the clock ONCE — two independent `date` calls can straddle the
+# bucket boundary and desync BUCKET from PREV_BUCKET.
 ...
 key: ccache-<leg>-${{ env.CCACHE_BUCKET }}
 restore-keys: |
-  ccache-<leg>-
+  ccache-<leg>-${{ env.CCACHE_PREV_BUCKET }}
 ```
+
+**Never leave a time-bucket key's restore-keys as a bare prefix** (`ccache-<leg>-`
+with nothing after it). Unlike a content-hash key, a bare prefix here matches
+every entry this cache name has EVER produced — including one left by a
+since-abandoned key format — and every fallback hit refreshes GitHub's
+last-accessed clock, the only thing that ever ages a cache out. That makes a
+dead entry immortal instead of merely stale: one survived a full day past a
+key-format migration, ~2.4 GB of dead weight pinning the pool back near the
+10 GB quota a prior fix had just cleared (measured 2026-09-02). Name the
+specific previous bucket, as above — anything else then ages out on GitHub's
+own 7-day-unused clock instead of living forever. **Recovering from an
+already-immortal entry:** `gh cache list --repo <owner>/<repo> --limit 100`
+to find it, then `gh api -X DELETE "repos/<owner>/<repo>/actions/caches?key=<key>&ref=<ref>"`
+to remove it (the `ref` is required and comes from the same listing).
 
 Pair the bucket with a job-level `CCACHE_MAXSIZE` sized for ONE build of that
 leg (the workflow-level value may be a self-hosted budget orders of magnitude
