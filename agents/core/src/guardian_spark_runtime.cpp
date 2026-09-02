@@ -105,12 +105,34 @@ void GuardianSparkRuntime::submit_disarm_off_lock(const DisarmWork& work) {
     // fn's own return value is discarded below - disarm() is void and was never
     // awaited for success even in the old inline call this replaces (see the
     // header doc).
-    auto result =
-        io_executor_.run(work.io_class, work.key, cfg_.backend_op_deadline,
-                         [backend = backend_, sub = work.subscription]() -> int {
-                             backend->disarm(sub);
-                             return 0;
-                         });
+    //
+    // Gate 4 unhappy-path re-review (PR #3821 scoped governance): io_executor_.run()
+    // itself can throw std::system_error from its own internal "second lock
+    // acquisition" (the UP-1 gap documented at attach_rule's own bounded-arm call
+    // site - a pre-existing property of the shared GuardianIoExecutor class, not
+    // introduced here). Every caller of THIS function treats a disarm as best-
+    // effort and never awaited for success anyway (see the comment above); letting
+    // that same best-effort posture extend to "the attempt itself threw" - rather
+    // than letting the exception propagate out of a caller that has already
+    // committed unrelated state (e.g. attach_rule's own new generation, already
+    // live in rules_/keys_/index_ by the time it calls this on the normal-exit
+    // path) - is strictly more consistent than leaving exactly one of this
+    // function's several call sites exposed. Swallow-and-log, not swallow-and-
+    // silence: an operator debugging a stuck key still has a log line, unlike a
+    // silently dropped exception would give them.
+    std::expected<int, IoFailure> result;
+    try {
+        result = io_executor_.run(work.io_class, work.key, cfg_.backend_op_deadline,
+                                  [backend = backend_, sub = work.subscription]() -> int {
+                                      backend->disarm(sub);
+                                      return 0;
+                                  });
+    } catch (const std::exception& e) {
+        spdlog::error("Guardian spark: submit_disarm_off_lock's own io_executor_.run() threw "
+                     "({}) for key '{}' - the disarm attempt itself failed, not just the "
+                     "backend call; the watcher's fate is unknown", e.what(), work.key);
+        return;
+    }
     // backend_op_timeouts_ is documented (guardian_spark_runtime.hpp) as counting
     // deadline hits specifically - only IoFailure::Timeout, matching attach_rule's
     // own increment site (adversarial review C3/k1: this previously counted EVERY
@@ -174,27 +196,23 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         if (stopping_)
             return std::unexpected(std::string{"stopping"});
 
-        // Fresh generation: drop any prior mapping for this rule first. This
-        // rebuilds eval state from scratch on every push, identical re-push
-        // included - there is no diff-skip that preserves it (matches the legacy
-        // path's own tear-down-and-rebuild-every-push behavior). If a prior
-        // generation existed, this already enqueued its "disarmed" lifecycle entry
-        // (and, #2233 item 3, may return backend work this function submits below,
-        // off-lock) - the "armed" entry below covers the new one, so ONE
-        // outbox-waker firing at the end of this call covers both.
-        prior_disarm = detach_rule_locked(rule_id);
-
-        // PR #3821 review (fjarvis): prior_disarm above is the backend disarm OWED
-        // to whatever generation this attach just superseded, deferred to the
-        // caller and submitted off-lock at the normal exit below (271-272). Every
-        // return or throw between here and there previously dropped it silently -
-        // a permanent, untracked live watcher, and a real regression vs.
-        // pre-#2233's inline disarm (which no later step in this function could
-        // skip). This guard closes every such exit uniformly: lk.unlock() before
-        // the off-lock submission, matching this function's own established
-        // discipline (the success-commit rollback below does the same). Declared
-        // right after prior_disarm is populated so it protects every branch that
-        // follows; committed once we reach the normal end of this locked block.
+        // PR #3821 review (fjarvis, cpp-safety re-review): armed BEFORE
+        // prior_disarm is even populated below, not after - fn is a std::function
+        // ASSIGNMENT (a separate throwing operation from this guard's own
+        // construction; a 3-capture closure exceeds libstdc++'s SBO and heap-
+        // allocates), so a guard armed only once prior_disarm already held a real
+        // value would itself have a bad_alloc-sized gap where the mutation was
+        // real but the guard protecting it did not exist yet. Safe to install
+        // this early: fn checks `if (prior_disarm)` at fire-time and correctly
+        // no-ops on every exit before the assignment below actually runs (that
+        // includes the stopping_ return just above - fn simply never fires there,
+        // since the guard itself isn't even constructed yet at that point).
+        // Protects every return/throw between here and this locked block's normal
+        // end (the off-lock submission that follows this block on the fall-
+        // through path) uniformly: lk.unlock() before the off-lock submission,
+        // matching this function's own established discipline (the success-
+        // commit rollback below does the same). Committed only once that normal
+        // end is reached.
         GuardianRollback prior_disarm_rollback;
         prior_disarm_rollback.fn = [this, &prior_disarm, &lk] {
             if (prior_disarm) {
@@ -202,6 +220,19 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                 submit_disarm_off_lock(*prior_disarm);
             }
         };
+
+        // Fresh generation: drop any prior mapping for this rule first. This
+        // rebuilds eval state from scratch on every push, identical re-push
+        // included - there is no diff-skip that preserves it (matches the legacy
+        // path's own tear-down-and-rebuild-every-push behavior). If a prior
+        // generation existed, this already enqueued its "disarmed" lifecycle entry
+        // (and, #2233 item 3, may return backend work submitted off-lock either
+        // way: prior_disarm_rollback above fires it on an early return/throw,
+        // committed=true suppresses it and the explicit call after this locked
+        // block fires it instead on the normal path - exit-path-exclusive, never
+        // both) - the "armed" entry below covers the new one, so ONE outbox-waker
+        // firing at the end of this call covers both.
+        prior_disarm = detach_rule_locked(rule_id);
 
         gen = ++gen_counter_;
         rg->generation = gen;
@@ -219,16 +250,34 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             return std::unexpected(std::string{"arm already in progress for this key"});
         }
 
-        const bool arm_edge = index_->add(key, rule_id); // may throw; nothing mutated yet on throw
+        // Gate 4 unhappy-path re-review (PR #3821 scoped governance): armed BEFORE
+        // index_->add() runs, same reasoning and same fix shape as
+        // prior_disarm_rollback above - a guard whose .fn is assigned only AFTER
+        // the mutation it protects has a bad_alloc-sized gap during that
+        // assignment itself. index_added starts false and is set true immediately
+        // after index_->add() returns (a bool assignment, cannot throw), so fn
+        // correctly no-ops if the assignment below never runs. Covers index_->add's
+        // effect uniformly for every branch below - each branch's OWN rollback
+        // (still correctly armed-before-mutation within its own branch, unlike
+        // this one previously was) now protects only ITS OWN additional state,
+        // not this shared one, so nothing double-removes it.
+        bool index_added = false;
+        GuardianRollback index_add_rollback;
+        index_add_rollback.fn = [this, rule_id, &index_added] {
+            if (index_added)
+                index_->remove_rule(rule_id);
+        };
+        const bool arm_edge = index_->add(key, rule_id); // may throw; index_added still false then
+        index_added = true;
         if (arm_edge && io_class) {
             // Slow path: mark in-flight and return to the caller below WITHOUT
             // touching keys_/rules_/pending_initial/lifecycle - all deferred to the
             // post-wait commit phase, so a same-key racer's arming_keys_ check above
-            // never sees a half-built PerKey.
-            GuardianRollback index_rollback;
-            index_rollback.fn = [this, rule_id] { index_->remove_rule(rule_id); };
-            arming_keys_.emplace(key, InFlightArm{rule_id, gen, false}); // may throw -> rollback
-            index_rollback.committed = true;
+            // never sees a half-built PerKey. index_add_rollback above already
+            // covers arming_keys_.emplace's own throw (undoing index_->add is the
+            // full undo needed here, matching this branch's pre-#3821-round-3 own
+            // rollback exactly - no separate guard needed for this branch).
+            arming_keys_.emplace(key, InFlightArm{rule_id, gen, false}); // may throw -> index_add_rollback
             need_bounded_arm = true;
         } else if (arm_edge) {
             // Inline type (Interval/Startup/Disk): unchanged synchronous arm, still
@@ -238,7 +287,6 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             bool armed_here = false;
             GuardianRollback rollback;
             rollback.fn = [this, rule_id, key, &sub, &armed_here, &pk] {
-                index_->remove_rule(rule_id);
                 if (armed_here) {
                     keys_.erase(key);
                     backend_->disarm(sub);
@@ -247,9 +295,9 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
                 if (pk)
                     pk->pending_initial.erase(rule_id);
             };
-            auto armed = backend_->arm(spec); // may THROW -> rollback undoes the index add
+            auto armed = backend_->arm(spec); // may THROW -> rollback + index_add_rollback undo it
             if (!armed)
-                return std::unexpected(armed.error()); // rollback undoes the index add
+                return std::unexpected(armed.error()); // rollback + index_add_rollback undo it
             sub = *armed;
             armed_here = true;
             pk = std::make_shared<PerKey>();
@@ -267,11 +315,11 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             // backend call, but a throw below (map insert, or a throwing
             // waker/outbox_waker COPY) must still undo the index_->add - mirrors the
             // original unified rollback's armed_here=false shape (never disarms;
-            // there is no new watcher to tear down, only this rule's own bookkeeping).
+            // there is no new watcher to tear down, only this rule's own bookkeeping;
+            // index_add_rollback above handles the index_->add undo).
             auto pk = keys_.at(key);
             GuardianRollback rollback;
             rollback.fn = [this, rule_id, pk] {
-                index_->remove_rule(rule_id);
                 rules_.erase(rule_id);
                 pk->pending_initial.erase(rule_id);
             };
@@ -280,6 +328,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             rollback.committed = true;
         }
         new_gen = gen;
+        index_add_rollback.committed = true;
         prior_disarm_rollback.committed = true;
     }
 
@@ -303,9 +352,10 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // A caller (GuardianEngine::apply_rules/start_local, still holding mtx_ for its
     // whole body) waits at most this long for THIS rule's arm - PLUS, if this
     // rule_id had a prior generation on a bounded (F/R/S) key, up to another
-    // cfg_.backend_op_deadline for that generation's disarm above (271-272), since
-    // the two are sequential, not concurrent (deliberately: see that call site's own
-    // comment on why disarm-before-arm is ordered this way). A same-key redeploy is
+    // cfg_.backend_op_deadline for that generation's disarm above (the off-lock
+    // submission immediately following this locked block), since the two are
+    // sequential, not concurrent (deliberately: see that call site's own comment
+    // on why disarm-before-arm is ordered this way). A same-key redeploy is
     // therefore up to 2x this deadline, not 1x. Every OTHER rule's attach/detach and
     // every evaluate_key proceed freely throughout, since registry_mu_ is not held
     // here at all.

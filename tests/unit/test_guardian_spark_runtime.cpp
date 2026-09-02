@@ -1865,6 +1865,35 @@ TEST_CASE("#2233 item 3: a bounded arm that never returns times out, leaves no s
     b->release_hang();
 }
 
+TEST_CASE("#2233 item 3: a bounded disarm that never returns is counted too - "
+          "backend_op_timeouts() is not arm-only (sre, PR #3821 scoped-governance)",
+          "[spark][runtime][liveness]") {
+    // The arm-side timeout test above only pins half of backend_op_timeouts()'s
+    // documented contract (guardian_spark_runtime.hpp: "attach_rule calls... PLUS
+    // submit_disarm_off_lock calls... - one shared counter for both directions").
+    // This pins the disarm side via the simplest submit_disarm_off_lock caller,
+    // detach_rule().
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(rt->backend_op_timeouts() == 0); // arming cleanly does not touch this counter
+
+    b->hang_next_disarm.store(true);
+    const auto t0 = clk::now();
+    rt->detach_rule("r1"); // blocks up to backend_op_deadline waiting on the hung disarm
+    const auto elapsed = clk::now() - t0;
+
+    CHECK(elapsed >= std::chrono::milliseconds(50));
+    CHECK(elapsed < std::chrono::seconds(10));
+    CHECK(rt->backend_op_timeouts() == 1);
+
+    // Cleanup: release the still-parked detached worker.
+    b->wait_entered_disarm_hang(std::chrono::seconds(30));
+    b->release_disarm_hang();
+}
+
 TEST_CASE("#2233 item 3: a parked arm on one key does not block a DIFFERENT key's attach",
           "[spark][runtime][liveness]") {
     // The actual defect this PR fixes: pre-fix, backend_->arm() ran INSIDE

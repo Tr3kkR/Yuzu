@@ -454,7 +454,9 @@ public:
     /// silently dropped; see attach_rule), PLUS submit_disarm_off_lock calls that
     /// hit the same deadline waiting on a backend disarm (detach_rule/detach_all/
     /// the prior-generation and rollback disarm paths) - one shared counter for
-    /// both directions, not just arm. Lock-free.
+    /// both directions, not just arm. Lock-free. Does NOT distinguish this from
+    /// other executor rejection classes (AlreadyRunning, CapacityExhausted) at
+    /// this surface - tracked separately, see #3813.
     [[nodiscard]] std::uint64_t backend_op_timeouts() const noexcept {
         return backend_op_timeouts_.load(std::memory_order_relaxed);
     }
