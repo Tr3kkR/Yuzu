@@ -377,3 +377,26 @@ than letting them go silent.
   already lives with; it is documented here for agentic-client authors
   who write reconnect logic against the executions ladder rather than
   the dashboard's bootstrap path.
+
+## Catastrophic invariants (routed-concern detail)
+
+These are the clauses `.claude/routed-concerns.md` routes here (#1634, PR #3793 review).
+
+**(a) Admission grants VISIBILITY, never a redaction bypass.** Dispatcher/owner admission on a
+management-group-confined execution read grants visibility only — it never bypasses the confined-
+projection redaction (`scope_expression`, `parameter_values`, counts) applied to every OTHER confined
+caller. A new admission path — dispatcher ownership, a future service-token carve-out — that skips
+this redaction reopens the exact class of leak found in PR #3793's review, where the dashboard
+`/fragments/executions/{id}/detail` sidebar rendered `scope_expression`/`parameter_values`
+unconditionally with no `gate.scope` check at all.
+
+**(b) Every bus consumer sanitizes.** Every `ExecutionEventBus` consumer reachable by a confinable
+principal — REST `/api/v1/events`, the dashboard `/sse/executions/{id}`, and any future consumer —
+MUST route every event through `execution_event_scope.hpp`'s
+`classify_execution_event_for_scope` / `sanitize_execution_event_for_scope`. A consumer that reads
+the bus directly without this call leaks agent-transition and progress events to an out-of-scope
+subscriber.
+
+Both call sites are pinned by source-tripwire tests
+(`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
+**A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.

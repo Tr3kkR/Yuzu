@@ -1,9 +1,10 @@
-- Reduced the always-loaded agent instruction files by 44% (161,845 → 90,817 characters) and
+- Reduced the always-loaded agent instruction files by 44% (161,845 → 90,451 characters) and
   documented the standard that keeps them there. `CLAUDE.md` and `AGENTS.md` are now contents pages
   that route to `docs/`, rather than carrying the detail themselves: `CLAUDE.md` 35,633 → 15,218 and
   `AGENTS.md` 49,859 → 16,395, with the two routed-concern tables dropping from 38,545 and 37,808 to
-  30,886 and 28,318. Detail moved to three new documents — `docs/testing/unit-test-conventions.md`,
-  `docs/build-guide.md` and `docs/clock-guarded-retention.md` — plus the existing
+  30,520 and 28,318. Detail moved to six new documents — `docs/testing/unit-test-conventions.md`,
+  `docs/build-guide.md`, `docs/clock-guarded-retention.md`, `docs/ota-pull-bounds.md`,
+  `docs/command-dedup.md` and `docs/instruction-file-standard.md` — plus the existing
   `docs/auth-architecture.md`, the governance skill, and the Guardian design document. No invariant,
   issue reference or ADR citation was dropped: all 83 issue references and 28 ADR references in the
   previous files still resolve.
