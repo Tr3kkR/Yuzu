@@ -97,7 +97,8 @@ services:
       - YUZU_GW_ALLOW_DEFAULT_COOKIE=1
     ports:
       - "50051:50051"
-      - "50063:50063"
+      # :50063 (mgmt/command fan-out) deliberately NOT published — plaintext
+      # unauthenticated plane, compose-network only (#1422).
       - "9568:9568"
       - "8081:8081"
     volumes:

@@ -208,6 +208,31 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
+
+The gateway's `:50063` command plane requires, on any network-reachable
+listener, strict mTLS **plus** an SPKI peer pin
+(`auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` and
+`{yuzu_gw, mgmt_peer_pins}`) — and the gateway **refuses to boot** without
+them. Two upgrade orderings fail, in opposite directions:
+
+- **New gateway image + your old custom mTLS mgmt config** → boot refusal.
+  Add the `auth_fun` and `mgmt_peer_pins` entries (copy the shape from
+  `gateway/config/sys.config.prod`) before pulling the image. The refusal
+  log names every missing piece.
+- **New repo-checkout config + an old (pre-pin) gateway image** → the config
+  references `yuzu_gw_authz`, which the old image does not ship: every mgmt
+  stream dies with `undef` and command forwarding is silently dead. Update
+  the image and the mounted config **together** — a dev checkout's
+  `reference-gateway-sys.config` is ahead of the pinned release image until
+  the next release ships.
+
+BYO-cert installs: point `mgmt_peer_pins` at your server certificate — which
+**must carry the `serverAuth` EKU** — or paste its SPKI SHA-256; pin-list
+edits take effect on gateway restart. `{allow_insecure_mgmt, true}` is a
+lab-rig acknowledgement only; never set it where `:50063` is reachable from
+untrusted networks.
+
 ### vNEXT — the `wifi` plugin's Linux output changes shape (breaking)
 
 The `wifi` plugin moves to reading NetworkManager directly over D-Bus on Linux
@@ -3285,7 +3310,7 @@ A GitHub Actions check (`scripts/check-compose-versions.sh`) runs as the first s
 | 50051 | gRPC (agent connections) | Always -- server in standalone, gateway in scaled |
 | 50052 | gRPC (management) | Always |
 | 50055 | gRPC (gateway upstream) | Gateway deployments only |
-| 50063 | gRPC (gateway command forwarding) | Gateway deployments only |
+| 50063 | gRPC (gateway command forwarding) | **Compose-network only — never host-published** (#1422). The privileged fleet-command plane; the server dials `gateway:50063` over the compose network, no shipped compose publishes it, and none should. See `security-hardening.md` "Gateway TLS" |
 | 8081 | Gateway health/readiness | Gateway deployments only |
 | 9568 | Gateway Prometheus metrics | Gateway deployments only |
 | 9090 | Prometheus | Monitoring stack |
