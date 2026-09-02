@@ -16,6 +16,9 @@
 -module(yuzu_gw_authz_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% cert-mint helpers shared with yuzu_gw_authz_rpc_tests
+-export([setup_certs/0, cleanup_certs/1, der/2]).
+
 %%%-------------------------------------------------------------------
 %%% Fixture
 %%%-------------------------------------------------------------------
