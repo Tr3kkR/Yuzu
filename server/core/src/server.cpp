@@ -1425,13 +1425,21 @@ public:
         // on today.
         metrics_.describe("yuzu_server_dispatch_denied_total",
                           "Dispatches refused by the classification/authorization chokepoint "
-                          "(`build_classified_command`) or, for `unclassified`/`ambiguous` on "
-                          "MCP's `execute_instruction` specifically, by the C8 pre-mint gate "
-                          "(`mcp_server.cpp`) denying a classify-miss locally before an "
-                          "approval ticket is minted (#3685) - a second, independent emitter "
-                          "on the same series, labelled by which gate refused. "
-                          "`kill_switched` is an operator-thrown emergency stop, deliberately "
-                          "distinct from the `forbidden` authorization verdict.",
+                          "(`build_classified_command`), labelled by which gate refused. "
+                          "MCP's `execute_instruction`, `execute_bundle`, and `quarantine_device` "
+                          "(#3687; widened from `execute_instruction`-only by #3893) each have "
+                          "two ADDITIONAL, independent emitters on this same series that refuse "
+                          "BEFORE dispatch_fn/bundle_orch->dispatch is ever called: the C8 "
+                          "pre-mint gate (#3685 for execute_instruction's own ClassifyMiss/"
+                          "RefuseUntargeted switch; as of #3687/#3893, every reason EXCEPT "
+                          "`approval_required`, which at C8 is the cue to mint a ticket, not a "
+                          "denial) denying locally before an approval ticket is minted or "
+                          "consumed, and each tool's own main-handler pre-dispatch authorization "
+                          "dry run (#3687/#3893, all six reasons, including `approval_required` "
+                          "for tiers that never reach C8) denying locally before the real "
+                          "chokepoint would otherwise be reached. `kill_switched` is an "
+                          "operator-thrown emergency stop, deliberately distinct from the "
+                          "`forbidden` authorization verdict.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
                             "approval_required", "kill_switched"}) {
@@ -10770,6 +10778,30 @@ private:
         return ok;
     }
 
+    /// #3687: the `has_permission` binder `classify_and_authorize_dispatch`
+    /// needs, extracted so `build_classified_command`'s authoritative check
+    /// and the MCP pre-dispatch dry run (`authorize_dispatch_fn_` below, the
+    /// production closure wired into `mcp_server_`) call the SAME code
+    /// rather than two independently-spelled copies — exactly the drift this
+    /// file's own doc comments warn about elsewhere (#1788), and what
+    /// Decision 7's F fix requires ("the exact injected RBAC binder",
+    /// `docs/security-reviews/1398-dispatch-approval-gate-design.md`).
+    /// Mirrors every other dispatch-adjacent RBAC read in this file (e.g.
+    /// derive_exec_visible's own `legacy_open` composition): a
+    /// loaded-and-explicitly-disabled store is legacy-open, and legacy-open
+    /// means "RBAC off, everyone may do everything" — the SAME bypass every
+    /// other securable already grants here, not a new one minted for this
+    /// chokepoint.
+    [[nodiscard]] bool dispatch_has_permission(std::string_view principal,
+                                               std::string_view securable,
+                                               yuzu::server::authz::Operation op) const {
+        if (!rbac_enforcement_in_effect(rbac_store_.get()))
+            return true;
+        return rbac_store_ != nullptr &&
+               rbac_store_->check_permission(std::string(principal), std::string(securable),
+                                             std::string(yuzu::server::authz::to_string(op)));
+    }
+
     std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
         const yuzu::server::DispatchCaller& caller, const std::string& plugin,
         const std::string& action, const std::string& command_id,
@@ -10780,18 +10812,7 @@ private:
             capability_registry_, caller, plugin, action,
             [this](std::string_view principal, std::string_view securable,
                    yuzu::server::authz::Operation op) {
-                // Mirrors every other dispatch-adjacent RBAC read in this file
-                // (e.g. derive_exec_visible's own `legacy_open` composition):
-                // a loaded-and-explicitly-disabled store is legacy-open, and
-                // legacy-open means "RBAC off, everyone may do everything" —
-                // the SAME bypass every other securable already grants here,
-                // not a new one minted for this chokepoint.
-                if (!rbac_enforcement_in_effect(rbac_store_.get()))
-                    return true;
-                return rbac_store_ != nullptr &&
-                       rbac_store_->check_permission(std::string(principal),
-                                                     std::string(securable),
-                                                     std::string(yuzu::server::authz::to_string(op)));
+                return dispatch_has_permission(principal, securable, op);
             });
 
         if (!decision) {
@@ -22414,6 +22435,59 @@ private:
             mcp_server_->set_capability_classify_fn(
                 [this](std::string_view p, std::string_view a) {
                     return capability_registry_.classify(p, a);
+                });
+            // #3687 — wired UNCONDITIONALLY, same reasoning as
+            // set_capability_classify_fn immediately above (capability_registry_
+            // is a plain ServerImpl member, never conditional on another store's
+            // presence). Composes the SAME two DECISIONS build_classified_command
+            // makes, in the SAME order, and NEITHER is a re-implemented slice:
+            // the classify+authorize half calls classify_and_authorize_dispatch
+            // via the SAME has_permission binder (dispatch_has_permission
+            // above); the kill-switch half calls the SAME kill_switch_denial
+            // (agent_registry.hpp) finalize_classified_command itself calls —
+            // Gate 6 governance fix: an earlier round of this PR re-expressed
+            // that boolean inline instead of sharing code with
+            // finalize_classified_command, reintroducing the exact
+            // "from-scratch copy drifts from what production enforces" shape
+            // that function's own M6/wave1 extraction closed once already;
+            // this wiring now shares the extracted function instead.
+            // `action_allowed`'s construction (nullptr-guarded
+            // plugin_config_store_ wrap) is the SAME literal composition
+            // build_classified_command uses ahead of its own
+            // finalize_classified_command call, above. `plugin_config_store_`
+            // is read live through `this` (not captured by value), so this
+            // wiring is safe regardless of construction order relative to
+            // that store; an unset store means legacy-open for the
+            // kill-switch gate ONLY, mirroring build_classified_command's own
+            // unwired contract. Per McpServer::AuthorizeDispatchFn's
+            // fail-closed contract (mcp_server.hpp), omitting this whole call
+            // refuses every execute_instruction call outright, not merely a
+            // degraded tool.
+            mcp_server_->set_authorize_dispatch_fn(
+                [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+                       std::string_view action)
+                    -> std::expected<yuzu::server::CommandCapability,
+                                     yuzu::server::detail::DispatchDenial> {
+                    auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
+                        capability_registry_, caller, plugin, action,
+                        [this](std::string_view principal, std::string_view securable,
+                               yuzu::server::authz::Operation op) {
+                            return dispatch_has_permission(principal, securable, op);
+                        });
+                    if (!decision)
+                        return decision;
+                    const std::function<bool(std::string_view, std::string_view)> action_allowed =
+                        plugin_config_store_ != nullptr
+                            ? std::function<bool(std::string_view, std::string_view)>(
+                                  [this](std::string_view p, std::string_view a) {
+                                      return plugin_config_store_->action_allowed(p, a);
+                                  })
+                            : std::function<bool(std::string_view, std::string_view)>{};
+                    if (auto denial =
+                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed)) {
+                        return std::unexpected(*denial);
+                    }
+                    return decision;
                 });
             // #3290 Phase 2 — the SAME fleet_read_fn lambda wired into the REST
             // registration's trailing fleet_read_fn param below, so the REST and MCP

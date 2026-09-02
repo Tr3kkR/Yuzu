@@ -2800,11 +2800,23 @@ surface dispatched it**:
   `result=denied`, `detail=reason=approval_required`) and counted
   (`yuzu_server_dispatch_denied_total{reason="approval_required"}`).
 - **MCP** (`execute_instruction` at `operator` tier — `supervised` tier already goes through the
-  approval workflow): the denial collapses into the SAME `no_agents_reached` tool result an
-  offline/unreachable agent gets, not a discriminated error — the JSON-RPC error-shaping closure
-  for this specific case is tracked separately (not yet shipped). If an MCP-driven automation
-  starts reporting "no agents reached" for a target you know is online, check whether the pair
-  it's calling is now gated before assuming a connectivity problem.
+  approval workflow): the denial is now a discriminated JSON-RPC error naming the reason
+  (`error.data.reason: "approval_required"`), not the `no_agents_reached` tool result an
+  offline/unreachable agent gets (CLOSED by #3687 — a `no_agents_reached` result no longer needs a
+  manual check for whether a pair is gated before you trust it, aside from the same narrow
+  dry-run-then-real-check TOCTOU window every pre-dispatch authorization check in this codebase
+  accepts). **`approval_required` is one of six discriminated reasons, not the only one** — the
+  same fix discriminates `Unclassified`/`Ambiguous`/`AnonymousOperator`/`Forbidden`/`KillSwitched`
+  too, so a caller that only added handling for this release's `approval_required` change gets no
+  warning that `Forbidden` (the most common denial in practice — a caller with no covering grant
+  at all, not just an ungated approval gap) now arrives as the same kind of discriminated
+  JSON-RPC error rather than the old `no_agents_reached`/ambiguous-success shape. **This coverage
+  is no longer `execute_instruction`-only**: #3893 extended the identical pre-dispatch dry run
+  (both the C8 pre-mint check and the main-handler backstop) to `execute_bundle` (a denied step
+  now refuses the whole bundle call up front — previously an entirely-denied bundle returned a
+  false JSON-RPC success naming the requested step count) and `quarantine_device` (a denial now
+  runs before the quarantine record is written, and before dispatch, instead of mapping every
+  denial reason to the same "retry" hint an offline device gets).
 - **Schedules**: a schedule dispatching a gated pair now requires an approval ticket exactly like
   the interactive governed path (`ScheduleRunner` mints one and holds the occurrence until an
   admin approves it via the existing `/api/approvals` workflow) — this was already the behavior

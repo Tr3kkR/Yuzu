@@ -2,6 +2,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "agent_registry.hpp" // #3687: DispatchDenial / DispatchDenialReason — AuthorizeDispatchFn's error type
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
@@ -274,15 +275,91 @@ public:
     /// fn reaching a live request means the wiring itself regressed.
     ///
     /// A WIRED fn returning `Unclassified`/`Ambiguous` (an honest classify
-    /// miss, not an absent fn) is the DIFFERENT, unchanged Policy-B case:
-    /// `execute_instruction` falls through and the existing dispatch
-    /// chokepoint denies a real miss on its own terms, exactly as before
-    /// this fn existed — see `dispatch_destructive_gate.hpp`'s
-    /// `DestructiveTargetingVerdict::ClassifyMiss`.
+    /// miss, not an absent fn) is the DIFFERENT Policy-B case — see
+    /// `dispatch_destructive_gate.hpp`'s `DestructiveTargetingVerdict::
+    /// ClassifyMiss`. Pre-#3687 this fell all the way through to the
+    /// existing dispatch chokepoint, which denied a real miss on its own
+    /// terms. #3687 changed WHERE that denial happens on the main-handler
+    /// path: `AuthorizeDispatchFn`'s own pre-dispatch dry run (below) now
+    /// denies a classify-miss locally, with a discriminated error, before
+    /// `dispatch_fn` is ever called — the chokepoint itself is unchanged,
+    /// only reached one call earlier. REST's `/api/command` still falls
+    /// through to that chokepoint unchanged (Policy B, as before).
     using ClassifyFn =
         std::function<std::expected<yuzu::server::CommandCapability,
                                     yuzu::server::ClassificationError>(
             std::string_view plugin, std::string_view action)>;
+
+    /// #3687 (widened by #3893): the pre-dispatch DRY RUN of the shared
+    /// dispatch chokepoint's full classify+authorize+kill-switch decision —
+    /// the same decision `ServerImpl::build_classified_command` makes,
+    /// minus the wire-command construction a dry run has no use for. Every
+    /// dispatch-capable MCP tool's handler calls this BEFORE `dispatch_fn`/
+    /// `bundle_orch->dispatch` — `execute_instruction`, `execute_bundle`
+    /// (per step, all-or-nothing), and `quarantine_device` (before its
+    /// store write) today, plus the generalized C8 pre-mint block, which
+    /// loops over `dispatch_pairs_for(tool_name, args)`
+    /// (`mcp_server.cpp`) — the ONE place a future dispatch-capable tool is
+    /// registered. No target-agent list is needed for any of them —
+    /// classification and authorization are decided from `(plugin, action,
+    /// caller)` alone, before any scope/group target resolution happens.
+    ///
+    /// Every `yuzu::server::detail::DispatchDenialReason` the chokepoint can
+    /// produce (`Unclassified`/`Ambiguous`/`AnonymousOperator`/`Forbidden`/
+    /// `ApprovalRequired`/`KillSwitched`) is reachable here — production
+    /// wires a closure that calls `classify_and_authorize_dispatch`
+    /// (`agent_registry.hpp`, the SAME pure function + the SAME injected
+    /// RBAC binder `build_classified_command` itself consults, never a
+    /// re-implemented slice — Decision 7 F fix,
+    /// `docs/security-reviews/1398-dispatch-approval-gate-design.md`) and
+    /// then, only on success, `kill_switch_denial` (`agent_registry.hpp`) —
+    /// the SAME extracted function `finalize_classified_command` itself
+    /// calls for the per-action kill switch, not a re-implemented slice of
+    /// that decision either (Gate 6 governance fix: an earlier round of this
+    /// change re-expressed the kill-switch boolean inline instead of sharing
+    /// `finalize_classified_command`'s own extracted check — the class of
+    /// drift `finalize_classified_command`'s own M6/wave1 extraction exists
+    /// to prevent, reintroduced once and caught by governance; this seam now
+    /// shares the extracted function like the classify+authorize half
+    /// always did). Kill switch checked AFTER classify+authorize, so it can
+    /// never mask a `Forbidden`/`ApprovalRequired` verdict with a
+    /// weaker-sounding one. Because the kill-switch half now calls the SAME
+    /// `kill_switch_denial` function `finalize_classified_command` calls (and
+    /// the classify+authorize half already called the SAME
+    /// `classify_and_authorize_dispatch` function `build_classified_command`
+    /// calls), the existing
+    /// `finalize_classified_command`/`kill_switch_denial` tests in
+    /// `tests/unit/server/test_dispatch_chokepoint.cpp` (KillSwitched refusal,
+    /// legacy-open-when-unwired, canonical-plugin/action consultation) cover
+    /// this seam's kill-switch behavior too — there is no separate "the two
+    /// paths agree" claim left to verify, because there is only one
+    /// implementation of the decision.
+    ///
+    /// FAIL-CLOSED contract, matching `ClassifyFn` immediately above (the
+    /// OPPOSITE default posture from most `*Fn` seams in this file): an
+    /// unset (`{}`) fn means NONE of the dispatch-capable tools above (nor
+    /// the generalized C8 block, for any tool `dispatch_pairs_for` returns a
+    /// non-empty pair list for) can determine whether a caller may dispatch
+    /// a given pair at all, so EVERY such call is refused with a
+    /// distinguishable "dispatch authorization unavailable" denial — never
+    /// a silent fall-through to the pre-#3687 collapsed-envelope behaviour.
+    /// Production always wires this (server.cpp, unconditionally,
+    /// next to `set_capability_classify_fn`); an unset fn reaching a live
+    /// request means the wiring itself regressed.
+    ///
+    /// A WIRED fn returning success here is NOT the sole enforcement point —
+    /// `dispatch_fn` still re-runs the identical chokepoint decision
+    /// internally a moment later (cheap: no I/O beyond the same RBAC read
+    /// this call already made) and is the surface that actually dispatches.
+    /// This seam exists purely so a caller this dispatch was always going to
+    /// refuse gets a discriminated, reason-naming error instead of the
+    /// generic `agents_reached:0`/`no_agents_reached` envelope an empty
+    /// target set also produces — it does not change what dispatch_fn itself
+    /// enforces.
+    using AuthorizeDispatchFn = std::function<std::expected<yuzu::server::CommandCapability,
+                                                             yuzu::server::detail::DispatchDenial>(
+        const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+        std::string_view action)>;
 
     /// Injects the engine-principal + engine-credential store pointers and
     /// the owner-FK predicate via SETTERS rather than growing the already
@@ -311,6 +388,11 @@ public:
     /// above (the handler's `[=]` lambda captures `this`, so the injection
     /// is a live read on the next request).
     void set_capability_classify_fn(ClassifyFn fn) { classify_fn_ = std::move(fn); }
+    /// #3687: see `AuthorizeDispatchFn`'s doc comment above for the
+    /// fail-closed contract. Same setter idiom as `set_capability_classify_fn`
+    /// immediately above (the handler's `[=]` lambda captures `this`, so the
+    /// injection is a live read on the next request).
+    void set_authorize_dispatch_fn(AuthorizeDispatchFn fn) { authorize_dispatch_fn_ = std::move(fn); }
 
     /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
     /// set_engine_principal_store above (the handler's `[=]` lambda captures
@@ -588,6 +670,10 @@ private:
     // execute_instruction fails closed at BOTH gate sites (mcp_server.cpp),
     // never a silent fall-through to the pre-#3685 unconfined behaviour.
     ClassifyFn classify_fn_;
+    // #3687 — see AuthorizeDispatchFn's doc comment above: unset means the
+    // pre-dispatch dry run in mcp_server.cpp fails closed rather than
+    // silently reverting to the pre-#3687 collapsed-envelope behaviour.
+    AuthorizeDispatchFn authorize_dispatch_fn_;
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
