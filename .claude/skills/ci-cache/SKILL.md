@@ -52,12 +52,20 @@ Each job starts on a fresh disk. The cache lives in GitHub's blob storage and is
     key: ${{ steps.cache-<thing>.outputs.cache-primary-key }}
 ```
 
-`<progressively-shorter-fallback-prefixes>` above is fine for a content-hash key, where an
-older prefix match is strictly worse (staler) but never *wrong* to keep finding forever. It
-is the WRONG shape for a time-bucket key (see "For ccache" below): a bare open-ended prefix
-there matches every entry the cache name has ever produced, including one left by a
-since-changed key format, and GitHub refreshes the last-accessed clock on every fallback
-hit — the only thing that ever ages a cache out. Name the specific previous bucket instead.
+`<progressively-shorter-fallback-prefixes>` above is a CORRECTNESS-safe shape for a
+content-hash key — an older prefix match is strictly worse (staler content) but never
+*wrong* content, so restoring it can't corrupt the build. It does NOT follow that an
+open-ended prefix is risk-free: every fallback hit still refreshes GitHub's last-accessed
+clock, so if the key's inputs ever change (a new manifest, a new pinned commit, a key-format
+migration), the ENTRIES BEHIND that fallback stop being reachable by a fresh primary key but
+stay immortal via the open prefix — the same quota-crowding failure mode as below, just
+gated on how often that key's inputs change rather than guaranteed on every run. The vcpkg
+example further down carries this risk today, tracked but not yet fixed (#3888).
+
+It is a WRONG shape outright — correctness-safe or not — for a time-bucket key (see "For
+ccache" below), where the key's inputs change on every run by construction: a bare
+open-ended prefix there matches every entry the cache name has ever produced, including one
+left by a since-changed key format. Name the specific previous bucket instead.
 
 **Additive vs coherent-artifact caches — `always()` is not always right:**
 
@@ -126,6 +134,11 @@ restore-keys: |
   vcpkg-<triplet>-
 ```
 
+The bare `vcpkg-<triplet>-` second-tier fallback is correctness-safe (see the caveat above)
+but carries the same quota-crowding risk as an unfixed time-bucket key, gated on how often
+`VCPKG_COMMIT` or the manifest/triplet hash actually changes rather than guaranteed every
+run. The canary's live copy of this pattern has this risk today, tracked as #3888.
+
 For ccache: a TIME-BUCKET key, not a source hash. ccache hashes the real
 preprocessed input per object, so the GHA cache key needs no source identity —
 a stale entry can only lower the hit rate, never yield a wrong object. A
@@ -172,7 +185,12 @@ specific previous bucket, as above — anything else then ages out on GitHub's
 own 7-day-unused clock instead of living forever. **Recovering from an
 already-immortal entry:** `gh cache list --repo <owner>/<repo> --limit 100`
 to find it, then `gh api -X DELETE "repos/<owner>/<repo>/actions/caches?key=<key>&ref=<ref>"`
-to remove it (the `ref` is required and comes from the same listing).
+to remove it. `ref` is technically optional on this endpoint — omitting it
+deletes EVERY cache matching `key` across every ref — but always supply it
+(from the same listing) for a time-bucket key like this one: it has no
+branch component, so `push` and `pull_request` runs routinely produce
+identical-key entries on different refs, and an unscoped delete takes all
+of them.
 
 Pair the bucket with a job-level `CCACHE_MAXSIZE` sized for ONE build of that
 leg (the workflow-level value may be a self-hosted budget orders of magnitude

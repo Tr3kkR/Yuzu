@@ -282,10 +282,15 @@ if [ -f "$workflow" ]; then
   # near the 10 GB quota #3797 had just cleared (measured 2026-09-02).
   expect_caller true  "canary derives CCACHE_PREV_BUCKET from the same single clock read" \
     'CCACHE_PREV_BUCKET=\$\(\( now / 259200 - 1 \)\)'
-  expect_caller true  "canary ccache restore-key fallback names the specific previous bucket" \
-    'ccache-canary-x64-linux-\$\{\{ env\.CCACHE_PREV_BUCKET \}\}'
-  expect_caller false "canary ccache restore-key fallback is not left as a bare open prefix" \
-    'restore-keys: \| ccache-canary-x64-linux- - name'
+  # A pair of assertions checking only "the right value appears somewhere"
+  # and "a bare prefix isn't the first line" both pass even if a bare
+  # `ccache-canary-x64-linux-` fallback is ADDED as a trailing second
+  # restore-keys line — the exact hazard this test exists to catch,
+  # reintroduced further down instead of in place. Anchor the WHOLE
+  # restore-keys block instead: nothing may appear between the correct
+  # value and the next step.
+  expect_caller true  "canary ccache restore-key fallback is the previous bucket and nothing else" \
+    'restore-keys: \| *ccache-canary-x64-linux-\$\{\{ env\.CCACHE_PREV_BUCKET \}\} *- name'
   # #3269: a cancelled run must not write a thin ccache entry that later
   # same-source runs exact-hit and then decline to replace.
   expect_caller true  "canary ccache save is gated on the Build step outcome" \
