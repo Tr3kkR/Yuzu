@@ -10610,6 +10610,44 @@ TEST_CASE("MCP #3893: execute_bundle refuses the WHOLE call when ANY step is den
           1.0);
 }
 
+// #3893 fix round, folded in from adversarial review (Kimi K1/K2, Codex
+// CDX-P2-02): the all-or-nothing test above pins the Forbidden-denial path;
+// this one pins execute_bundle's own fail-closed branch at the same
+// main-handler site — a regression scoped to only this new call site's
+// `if (!authorize_dispatch_fn_)` guard would go undetected without it.
+TEST_CASE("MCP #3893: execute_bundle unwired authorizer fails CLOSED at the MAIN-HANDLER site "
+          "too — dispatch_fn NOT invoked for any step",
+          "[pg][mcp][bundle][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::DispatchCaller&)
+                               -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    });
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38936,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+}
+
 TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): ApprovalRequired at C8 pre-mint for execute_bundle "
           "is NOT a denial — a legitimate fresh-mint call still mints normally",
           "[pg][mcp][bundle][approval][3893]") {
@@ -14555,6 +14593,99 @@ TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): a Forbidden quarantine.quarantine pai
     CHECK(body["error"]["data"]["reason"] == "forbidden");
     CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
     CHECK_FALSE(dispatched);
+}
+
+// #3893 fix round, folded in from adversarial review (Kimi K1/K2, Codex
+// CDX-P2-02): the two tests above pin quarantine_device's main-handler
+// Forbidden-before-write behavior and its C8 Forbidden-no-mint behavior, but
+// neither exercises the main-handler site's OWN fail-closed branch or its
+// (non-carve-out) ApprovalRequired denial independently of execute_instruction's
+// analogous, already-covered branches — a regression scoped to only the new
+// quarantine_device call site would go undetected without these.
+TEST_CASE("MCP #3893: quarantine_device unwired authorizer fails CLOSED at the MAIN-HANDLER "
+          "site too — no phantom record, dispatch_fn NOT invoked",
+          "[mcp][integration][quarantine][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Empty tier skips C8 entirely, same as the Forbidden-before-write test
+    // above — reaches quarantine_device's own fail-closed guard directly.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38934,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-38934","reason":"test"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+    auto st = quar.get_status("agent-38934");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->has_value()); // no phantom record from the fail-closed path either
+}
+
+TEST_CASE("MCP #3893: quarantine_device ApprovalRequired denial at the MAIN-HANDLER site is a "
+          "GENUINE denial (not a C8-style carve-out) — no ticket exists to poll there",
+          "[mcp][integration][quarantine][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Security",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Empty tier: skips C8's carve-out entirely, reaching the main-handler
+    // check directly — unlike C8, this site has no pending ticket to poll,
+    // so ApprovalRequired here is a real denial, matching
+    // execute_instruction's own main-handler-backstop precedent.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38935,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-38935","reason":"test"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired (-32006) — no ticket was minted here to poll.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    CHECK_FALSE(body["error"]["data"].contains("approval_id"));
+    CHECK_FALSE(dispatched);
+    auto st = quar.get_status("agent-38935");
+    REQUIRE(st.has_value());
+    CHECK_FALSE(st->has_value());
 }
 
 TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (governance UP-9)",

@@ -290,11 +290,17 @@ public:
                                     yuzu::server::ClassificationError>(
             std::string_view plugin, std::string_view action)>;
 
-    /// #3687: the pre-dispatch DRY RUN of the shared dispatch chokepoint's
-    /// full classify+authorize+kill-switch decision — the same decision
-    /// `ServerImpl::build_classified_command` makes, minus the wire-command
-    /// construction a dry run has no use for. `execute_instruction`'s
-    /// handler calls this BEFORE `dispatch_fn`, with no target-agent list —
+    /// #3687 (widened by #3893): the pre-dispatch DRY RUN of the shared
+    /// dispatch chokepoint's full classify+authorize+kill-switch decision —
+    /// the same decision `ServerImpl::build_classified_command` makes,
+    /// minus the wire-command construction a dry run has no use for. Every
+    /// dispatch-capable MCP tool's handler calls this BEFORE `dispatch_fn`/
+    /// `bundle_orch->dispatch` — `execute_instruction`, `execute_bundle`
+    /// (per step, all-or-nothing), and `quarantine_device` (before its
+    /// store write) today, plus the generalized C8 pre-mint block, which
+    /// loops over `dispatch_pairs_for(tool_name, args)`
+    /// (`mcp_server.cpp`) — the ONE place a future dispatch-capable tool is
+    /// registered. No target-agent list is needed for any of them —
     /// classification and authorization are decided from `(plugin, action,
     /// caller)` alone, before any scope/group target resolution happens.
     ///
@@ -331,11 +337,13 @@ public:
     ///
     /// FAIL-CLOSED contract, matching `ClassifyFn` immediately above (the
     /// OPPOSITE default posture from most `*Fn` seams in this file): an
-    /// unset (`{}`) fn means `execute_instruction` cannot determine whether
-    /// this caller may dispatch this pair at all, so it refuses EVERY call
-    /// with a distinguishable "dispatch authorization unavailable" denial —
-    /// never a silent fall-through to the pre-#3687 collapsed-envelope
-    /// behaviour. Production always wires this (server.cpp, unconditionally,
+    /// unset (`{}`) fn means NONE of the dispatch-capable tools above (nor
+    /// the generalized C8 block, for any tool `dispatch_pairs_for` returns a
+    /// non-empty pair list for) can determine whether a caller may dispatch
+    /// a given pair at all, so EVERY such call is refused with a
+    /// distinguishable "dispatch authorization unavailable" denial — never
+    /// a silent fall-through to the pre-#3687 collapsed-envelope behaviour.
+    /// Production always wires this (server.cpp, unconditionally,
     /// next to `set_capability_classify_fn`); an unset fn reaching a live
     /// request means the wiring itself regressed.
     ///
