@@ -948,7 +948,9 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        "cannot be decided)",
                                        plugin, action);
                          audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   "reason=classifier_unavailable " + plugin + ":" + action);
+                                   "reason=classifier_unavailable " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
                              " style=\"font-size:0.75rem;color:#f85149\">"
@@ -1020,7 +1022,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          audit_fn_(req, "command.dispatch", "denied", "command", "",
                                    "reason=" +
                                        std::string(yuzu::server::kReasonDestructiveUntargeted) +
-                                       " " + plugin + ":" + action);
+                                       " " + onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
                          // In-surface denial shape: every other refusal in this
                          // handler is a 200 carrying an OOB result-context
                          // span, because the caller is htmx swapping fragments
@@ -1048,6 +1051,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          std::optional<std::vector<std::string>> vis;
                          if (mgmt_group_store_)
                              vis = mgmt_group_store_->get_visible_agents(caller.principal);
+                         // Kept for the refusal log below: confinement
+                         // overwrites agent_ids, so the requested set is
+                         // otherwise unrecoverable by the time we know it was
+                         // emptied.
+                         const std::vector<std::string> requested_ids = agent_ids;
                          agent_ids = yuzu::server::confine_destructive_targets(
                              agent_ids, yuzu::server::DestructiveVisibleAgents{std::move(vis)});
                          if (agent_ids.empty()) {
@@ -1059,8 +1067,33 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              // than /api/command, which audits nothing on this
                              // arm — an operator dropped by confinement is
                              // exactly the event an incident review looks for.
+                             // Log the requested target. Without this the
+                             // agent an operator actually asked for is in
+                             // NEITHER channel on this arm: the audit row
+                             // carries an empty target_id, and the only other
+                             // gate-arm log (the RefuseUntargeted warn above)
+                             // records scope_expr, which is empty precisely
+                             // when the caller named one explicit agent. An
+                             // incident responder reconstructing the attempted
+                             // blast radius of a refused Destructive dispatch
+                             // would find nothing and could reasonably read the
+                             // absence as log loss or tampering. Sanitised and
+                             // capped like every other operator-supplied field
+                             // that reaches a log here.
+                             std::string requested;
+                             for (const auto& id : requested_ids) {
+                                 if (!requested.empty()) requested += ",";
+                                 requested += onbehalf::sanitize_for_log(id, 128);
+                             }
+                             spdlog::warn(
+                                 "dashboard execute: destructive '{}:{}' refused -- none of the "
+                                 "requested agents [{}] are in the caller's visible set",
+                                 onbehalf::sanitize_for_log(plugin, 128),
+                                 onbehalf::sanitize_for_log(action, 128), requested);
                              audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                       "reason=scope_violation " + plugin + ":" + action);
+                                       "reason=scope_violation " +
+                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                           onbehalf::sanitize_for_log(action, 128));
                              res.set_content(
                                  "<span id=\"result-context\" hx-swap-oob=\"true\""
                                  " style=\"font-size:0.75rem;color:#f85149\">" +

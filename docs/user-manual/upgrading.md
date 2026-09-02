@@ -138,17 +138,31 @@ confined list is empty and the dispatch is refused with `no reachable in-scope a
 agents they administer. Note the message names in-scope reachability, not connectivity — an agent
 shown as online in the console can still produce it.
 
-**What to do:** switch any such call to explicit, non-empty `agent_ids`, and confirm the calling
-operator's management-group roles cover those agents if RBAC is enforced.
+**What to do — the field to send differs by surface, so do not apply one remediation to both:**
+
+- **MCP `execute_instruction`** (and REST `/api/command`): send an explicit, non-empty
+  `agent_ids` array.
+- **Dashboard `POST /api/dashboard/execute`**: this endpoint has **no `agent_ids` field** and
+  ignores one if sent. It takes a single `scope` form field, and one explicit agent is expressed
+  as `scope=<agent-id>` (a management group is `scope=group:<id>`, the fleet is `scope=__all__` —
+  the latter two are what the gate now refuses for Destructive rows). Console automation must
+  therefore send `scope=<agent-id>`. The browser UI already does this and needs no change.
+
+In both cases, if RBAC is enforced, also confirm the calling operator's management-group roles
+cover the agents named — see the confinement note above.
 `POST /api/instructions/{id}/execute` and MCP `execute_bundle` do not yet enforce the gate — a
 tracked follow-up, not a gap this release closes.
 
-**Verify:** re-run the affected dispatch with explicit `agent_ids` and confirm it succeeds as
-before; a scope, broadcast, or untargeted call to one of the 17 rows should now return the refusal
-above rather than dispatching.
-`yuzu_server_dispatch_target_rejected_total{route="command"|"mcp"|"dashboard",reason="destructive_untargeted"}`
-counts the untargeted refusals on all three surfaces if you want to confirm the gate is exercising
-in your environment. The visible-agent confinement refusal is deliberately **not** on that counter —
+**Verify:** re-run the affected dispatch with an explicit single target — `agent_ids` on
+MCP/REST, `scope=<agent-id>` on the dashboard — and confirm it succeeds as before; a group-scope,
+broadcast, or untargeted call to one of the 17 rows should now return the refusal above rather
+than dispatching. To confirm the gate is exercising in your environment:
+
+```promql
+yuzu_server_dispatch_target_rejected_total{route=~"command|mcp|dashboard",reason="destructive_untargeted"}
+```
+
+Note the regex matcher (`=~`): a label matcher cannot take an alternation of quoted strings. The visible-agent confinement refusal is deliberately **not** on that counter —
 look for the `command.dispatch|denied` audit row carrying `reason=scope_violation` instead.
 
 ## Behaviour change: SAML login gains a new availability coupling to `rbac_store` (#1832)
