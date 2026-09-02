@@ -9736,15 +9736,22 @@ private:
     // talks only to the real gateway. Gateway→server (the listener's acceptance
     // policy): verify_peer authenticates to the CA, NOT to a specific identity.
     //
-    // Residual (tracked, PKI-ladder): because the gateway side authenticates to
-    // the CA only, ANY holder of ANY CA-issued cert+key passes — an enrolled
-    // agent's stolen per-agent leaf, or the default-server/default-gateway leaves
-    // (0600, need filesystem compromise to extract). There is also no CRL/OCSP
-    // check on this path yet, so a revoked-but-stolen leaf still passes. Pinning
-    // the mgmt peer to the server's identity (CN/SAN or a dedicated EKU) + mgmt
-    // revocation is the cryptographic-identity-binding item that lands with the
-    // QUIC-era rework; through-gateway identity stays app-layer until then. mTLS
-    // still closes the far larger hole: the plaintext, no-cert-required plane.
+    // #1422: the gateway side no longer stops at the CA check. Its mgmt
+    // listener's grpcbox auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
+    // peer to THIS server's key — SPKI SHA-256 of the presented leaf against
+    // {yuzu_gw, mgmt_peer_pins} (default: the default-server.pem in the shared
+    // cert volume), plus a serverAuth-EKU requirement agent leaves can never
+    // satisfy (sign_agent_csr grants clientAuth only). So a stolen agent leaf,
+    // an enrollment-minted CN-collision leaf, or the group-readable
+    // default-gateway leaf all get UNAUTHENTICATED. Consequence for THIS
+    // function: the cert presented here must stay the leaf the gateway pins —
+    // rotating the server leaf out-of-band without updating the pin (or using
+    // BYO certs without pointing mgmt_peer_pins at them) kills command
+    // forwarding with UNAUTHENTICATED, not a TLS error.
+    //
+    // Residual (tracked on #1422): no CRL/OCSP check on this path yet, so a
+    // revoked-but-stolen SERVER leaf still passes until rotation; and
+    // through-gateway operator identity stays app-layer.
     [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
     build_gateway_command_credentials() const {
         if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
