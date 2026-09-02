@@ -47,7 +47,7 @@ After **any** cross-platform change, always run `bash scripts/run-tests.sh all` 
 
 ## Per-OS build directory
 
-The Yuzu source tree is built from multiple hosts (WSL2 Linux + native Windows on the same physical machine, plus this macOS dev box). `scripts/setup.sh` selects the canonical `build-macos` directory automatically and refuses to reconfigure a directory whose recorded source path looks like a different host's. See CLAUDE.md `## Build` → `### Per-OS build directory convention` for the full rule.
+The Yuzu source tree is built from multiple hosts (WSL2 Linux + native Windows on the same physical machine, plus this macOS dev box). `scripts/setup.sh` selects the canonical `build-macos` directory automatically and refuses to reconfigure a directory whose recorded source path looks like a different host's. See `docs/build-guide.md` → `### Per-OS build directory convention` for the full rule.
 
 ## macOS `/test` prerequisites
 
