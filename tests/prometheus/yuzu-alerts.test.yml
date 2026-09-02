@@ -261,32 +261,41 @@ tests:
           - labels: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing", instance="s1", job="yuzu", phase="transfer", severity="warning"}'
             value: 1
 
-  # CASE C1 -- a nearly-idle server must NOT page. One admission and one abort in
-  # the whole hour reads a proportion of 1.0, which is why the rule carries an
-  # `admitted >= 4` guard: a ratio over a denominator of one is not evidence.
+  # CASE C1 -- a nearly-idle server must NOT page. One admission and one abort,
+  # placed INSIDE the trailing [1h] window at eval time (unlike a stale version
+  # of this case that put both events at t=1m and evaluated at 90m, so the [1h]
+  # window excluded them entirely and the case passed for the wrong reason: a
+  # zero/zero ratio, not the guard). Here the ratio genuinely reads 1.0 -- well
+  # above the 0.1 bar -- so only the `admitted >= 4` guard keeps this quiet;
+  # weakening the guard to `>= 1` flips this case to firing.
   - interval: 1m
     name: ota transfers aborting - a nearly-idle server stays quiet
     input_series:
       - series: 'yuzu_ota_download_deadline_exceeded_total{job="yuzu",instance="s1",phase="transfer"}'
-        values: "0 1 1x180"
+        values: "0+0x30 1+0x100"
       - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="admitted"}'
-        values: "0 1 1x180"
+        values: "0+0x30 1+0x100"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaTransfersAborting", alertstate="firing"}'
-        eval_time: 90m
+        eval_time: 60m
         exp_samples: []
 
   # CASE D1 -- a chronically undersized ceiling on a small fleet refuses only a
   # few agents an hour, indefinitely. A bar of >3/hr left exactly that state
-  # permanently silent, so the capacity bar is >1.
+  # permanently silent, so the capacity bar is >1. A stale version of this
+  # fixture ramped continuously (0 -> 40 over ~70m), which reads an in-window
+  # increase of ~35 at its eval point -- comfortably clearing >1 AND >3 alike,
+  # so it never actually pinned the >1 choice. This one steps by exactly 1
+  # every 30 minutes, so any trailing 1h window sees exactly 2 steps: >1 (true)
+  # but not >3 (false) -- mutating the bar to >3 reddens this case.
   - interval: 1m
     name: ota server capacity - sustained low-rate saturation fires
     input_series:
       - series: 'yuzu_ota_download_admission_total{job="yuzu",instance="s1",decision="rejected_total"}'
-        values: "0 0 0 0 0 0 0 0 0 0 0+1x20 20+0x20 20+1x20 40+0x140"
+        values: "0+0x30 1+0x30 2+0x30 3+0x30 4+0x30 5+0x60"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing"}'
-        eval_time: 75m
+        eval_time: 120m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuOtaServerCapacityRejections", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1

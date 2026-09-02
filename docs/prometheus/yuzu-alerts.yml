@@ -3867,12 +3867,12 @@ groups:
             docs/user-manual/audit-log.md), so do not look for one. A short burst during a
             fleet-wide rollout is benign; a sustained signal is not.
 
-            Threshold note (the lookback is [1h] and `for:` is 15m; an earlier
-            form used [15m]/10m, which debounced nothing) — a `for:` shorter than
-            the lookback debounces NOTHING —
-            increase() over [15m] stays positive for a full 15m after a single
-            event, so `for: 10m` fired on one rejection. The bar is a count, not a
-            duration, for that reason.
+            Threshold note: the lookback is [1h] and `for:` is 15m. An earlier
+            form used [15m]/10m — increase() over [15m] stays positive for a
+            full 15m after a single event, so a `for:` window that is short
+            relative to its lookback only debounces gaps shorter than `for:`
+            itself, not the full lookback, and `for: 10m` there fired on one
+            rejection. The bar is a count, not a duration, for that reason.
 
       - alert: YuzuOtaIdentityRejections
         expr: |
@@ -4022,7 +4022,7 @@ groups:
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
           description: >-
             Window note: `for:` is shorter than the lookback (so the rule can
-            actually be satisfied), and the bar is >3 over an hour rather than >0,
+            actually be satisfied), and the bar is >1 over an hour rather than >0,
             because a single transient refusal at the ceiling is not a page — the
             group already excludes `rejected_rate` for the same reason.
 
