@@ -8,8 +8,9 @@ scope: server -- target access-control architecture for RBAC + Management Groups
 depends-on: ADR-0017, ADR-0033, ADR-1006 (this document's decisions must compose with, not
   re-decide, the frozen contracts in these three)
 context-refs: ADR-0006, ADR-0031 (presentation-core-engine-decomposition), ADR-0032, ADR-0041,
-  ADR-0042, ADR-1005, docs/auth-engine-principals-design.md, #388, #480, #1362, #1453, #1496,
-  #1715, #1842, #2485, #2665, #2670, #2677, #2721, #2809, #3290, #3489
+  ADR-0042, ADR-1005, docs/auth-engine-principals-design.md,
+  docs/enterprise-readiness-soc2-first-customer.md (Workstream B), #388, #480, #1362, #1453,
+  #1496, #1715, #1836, #1842, #2485, #2665, #2670, #2677, #2721, #2809, #3290, #3489
 supersedes: nothing (net-new target-architecture record; ADR-0017/0033/1006 remain the accepted
   contracts this one builds forward from)
 ---
@@ -193,7 +194,9 @@ underlying table it lands in. `validate_assignment` already serves both `RbacSto
 than an earlier draft claimed: the chokepoint already exists and is shared; what is missing is
 (a) deriving the grantable-role set from the grantor's actual authority (D4) instead of a
 hardcoded allow-list, and (b) a shared assignment record shape (principal, role, scope, granted_by,
-justification, audit correlation id) so the two tables present one API contract even if they
+justification, audit correlation id -- the same correlation id D9's `assignment-authority` axis
+consumes, so a D4 or D11 denial at this chokepoint is D9-covered by construction, not a second
+evidence mechanism) so the two tables present one API contract even if they
 remain two tables.
 
 **A per-assignment `effect` (allow/deny) is a new model element, not a formatting choice, and
@@ -546,7 +549,20 @@ sentence.
    operator-visible sign anything stopped working. This decision requires a "last successful
    sweep completed" timestamp or gauge, alerted on after N missed cycles, the same way any other
    safety-critical background process in this codebase is expected to prove it is still running,
-   not merely that it is scheduled to run.
+   not merely that it is scheduled to run. **A completion timestamp proves the last pass
+   finished, not that passes are keeping pace with fleet growth (Gate-6 governance finding):**
+   this decision's own tick/grace/floor bound (above) constrains cadence, not the cost of a
+   single pass, which scales with the count of currently-deployed Baselines and Schedules. This
+   decision requires a duration histogram for the sweep's own pass time, the metric shape this
+   codebase's observability conventions already use to detect exactly this kind of degradation,
+   not only a liveness gauge. **On more than one server replica, the sweep also needs a
+   single-writer discipline (Gate-6 governance finding), the same pattern this codebase already
+   uses for background processes with an identical shape** -- the session-store reap and the
+   #2964 rotation sweep are both single-writer-by-construction via a store-wide advisory lock,
+   specifically because an unelected sweep's effect (here, a fleet-wide `full_sync=true` push) is
+   wrong to fire from every replica independently. This decision does not specify the lock itself
+   -- that is implementation -- but requires that one exists before this mechanism runs on more
+   than one replica.
 4. **Credential recheck.** For Schedules, ADR-0032 Decision 7 already decides this: its text
    names "a schedule" outright, requires recording the arming credential (not only the arming
    human), and states plainly that revocation, expiry, or deletion of that credential stops the
@@ -801,14 +817,26 @@ decision core exists to extract from yet, for either gate family.
 ### D9 -- Every authorization decision emits one structured, queryable record, and a record that cannot be written fails the request closed
 
 Every gate's admit/deny/degrade decision -- across `authorize_list_read`, `require_fleet_read`,
-`require_scoped_permission`, `require_permission`, and the service-scope and MCP-tier branches
--- emits one shared decision shape: axis (management-group / service-scope / RBAC-legacy /
-engine), outcome (admit-all / admit-scoped / deny / degrade), and a reason drawn from a closed
-taxonomy, to both the audit log (with correlation id) and a Prometheus counter. Per-gate bespoke
-logging that cannot be aggregated is non-conforming. Consistent with the codebase's existing
-audit-failure posture (ADR-0033 §9, mutations fail closed on audit-write failure): **a mutating
-authorization decision whose record cannot be durably written is itself denied, not admitted
-with a missing record.**
+`require_scoped_permission`, `require_permission`, `validate_assignment` (D3's write chokepoint),
+and the service-scope and MCP-tier branches -- emits one shared decision shape: axis
+(management-group / service-scope / RBAC-legacy / engine / **assignment-authority**), outcome
+(admit-all / admit-scoped / deny / degrade), and a reason drawn from a closed taxonomy, to both
+the audit log (with correlation id) and a Prometheus counter. Per-gate bespoke logging that
+cannot be aggregated is non-conforming. Consistent with the codebase's existing audit-failure
+posture (ADR-0033 §9, mutations fail closed on audit-write failure): **a mutating authorization
+decision whose record cannot be durably written is itself denied, not admitted with a missing
+record.**
+
+**"Every authorization decision" must include the write chokepoint, not only the read/dispatch
+gates (Gate-6 governance finding).** An earlier draft's enumerated gate list omitted
+`validate_assignment` entirely, which is where D4's escalation-safety delta check and D11's SoD
+check actually run -- so a blocked privilege-escalation attempt or a blocked SoD-violating
+assignment would have produced no structured, queryable evidence at all under this decision as
+first written, exactly the kind of proof a SOC 2 CC6.1/CC6.3 reviewer would ask for first. The
+new `assignment-authority` axis above, and closed-taxonomy reason codes that distinguish a D4
+delta-denial from a D11 SoD-denial from an ordinary permission denial, close this. D3, D4, and
+D11 each route their decision through this axis; this decision does not ask them to build a
+second, parallel evidence mechanism.
 
 **A fail-closed mutation denial must be distinguishable from an ordinary permission denial
 (Gate-4 governance finding).** `rest_audit.hpp` already gives REST behavioural-PII reads a
@@ -844,7 +872,35 @@ review).** Durably recording every admitted read authorization decision, not onl
 be substantial write volume on a busy fleet. Whatever implements D9 must specify batching,
 bounded queues, and low-cardinality Prometheus label sets up front, and decide explicitly
 whether admitted reads are sampled rather than recorded at 100% -- silently discovering this
-under load in production is not an acceptable way to make that call.
+under load in production is not an acceptable way to make that call. **That sampling rate is
+also bounded by `audit_store`'s own capped retention pass (Gate-6 governance finding, if these
+records land in that store, the natural reading): a sampling rate chosen without reference to
+the reaper's own per-pass cap can grow the store faster than the reaper's steady-state throughput
+even while the reaper runs healthily every cycle.** This decision does not specify a retention
+posture for its own records either, and should: whether they inherit `audit_store`'s existing
+clock-guarded default or need a longer window is a real question given a SOC 2 Type II audit
+period runs roughly 12 months with fieldwork after the period closes -- a shorter default window
+can prune period-start evidence (D2's own enable/disable event is the sharpest instance) before
+an auditor ever examines it. This decision requires that whoever implements it states the chosen
+posture explicitly, not that it picks one here.
+
+**The existing `AuditEvent` envelope this decision would write into does not yet have the fields
+this decision's schema needs (Gate-6 governance finding).** `AuditEvent` has no correlation-id
+column today (only a free-text `detail` field, and `docs/observability-conventions.md` already
+forbids adding `detail` to any queryable filter) and no `degrade` value in its `result` field --
+so "queryable... with correlation id" and the `degrade` outcome this decision names both require
+a schema addition to the existing envelope, not a mapping onto its current columns. This is
+implementation, properly left to the store playbook per D3's own precedent, but it is not free:
+whoever builds D9 needs a migration, not just a new write path.
+
+**A fail-closed mutation-write's durability confirmation needs a stated mechanism, distinct from
+the read-path's own batching design above (Gate-6 governance finding).** The read-path
+operational-cost design (batching, bounded queues, sampling) trades latency-to-durability for
+throughput -- correct for reads, unsafe for the mutation path, where a fail-closed gate must
+confirm durability *before* admitting the mutation. This decision does not say whether that
+confirmation is a synchronous per-request round-trip or a group-committed batch with a bounded
+flush SLA, and therefore does not bound the latency this adds to every RBAC-gated write in the
+product. Whoever implements the mutation-side fail-closed clause must choose and state one.
 
 A decision engine built to D8 is expected to expose its winning grant/deny and reason as a
 normal return value; an "explain this decision" surface (effective-permissions view, a
@@ -982,7 +1038,50 @@ consulting the SoD table on either write shape, not just the roles the current w
   fail-closed audit path in this codebase already is.
 - **The open model decisions (#2665 additive-vs-deny-precedence for admitted runs; #2670/#2677
   derived-state confinement) are not resolved by this document** and are referenced, not
-  restated.
+  restated. **Neither is #1836** (Gate-6 governance finding): a live session/token can retain a
+  stale IdP-derived role until its next SSO login, since nothing invalidates a cached role on
+  IdP-side group removal -- the mirror case of the latent-widening problem D4/D10 both address
+  (there, a cached fact fails to *shrink*; here, a session fails to *shrink* to match an already-
+  shrunk IdP fact). This document does not absorb #1836 as new scope; it is named here for the
+  same reason #2665/#2670/#2677 are.
+- **This document is silent on point-in-time-restore interaction with the durable state D2, D6,
+  and D10 introduce (Gate-6 governance finding), and that silence is itself worth naming even
+  without solving it** -- unlike D3's table-layout deferral, which states its reason, this gap
+  was simply absent from every draft until Gate 6. A restore predating a Guardian orphan
+  transition resurrects a Baseline as rooted under authority already revoked in the lost window;
+  a restore predating a legitimate `adopt_baseline` re-pauses a correctly-adopted one; a restore
+  predating a D10 grant's `valid_until` expiry resurrects an already-expired enforcement window.
+  This document defers the mechanism to the store playbook, the same way it defers D3's table
+  layout, but flags the topic rather than leaving it wholly unaddressed.
+- **D2's atomic enable/disable has no stated rollout lever for a change of this blast radius**
+  (Gate-6 governance finding) -- no shadow/audit-only third state, no staged or canary
+  enablement across a fleet, despite this document's own Context section proving the blast
+  radius is severe (every non-elevated principal 403s on five unseeded securable types today).
+  D8's decision core and D9's decision record are exactly the primitives that would make a
+  "log what would be denied, without denying" shadow state cheap to build on top of D2's binary
+  toggle; this document does not add one, nor does it explicitly defer the question to a named
+  follow-on decision the way D3 defers table layout. Flagged here as a gap in this document,
+  not resolved by it.
+- **D10's export/attestation composition is not automatic (Gate-6 governance finding): the
+  already-shipped `AccessReviewStore` export schema has no field for a validity window today.**
+  A completed access-review campaign would list a 3-day temporary grant identically to a
+  standing one once D10 ships, with no field for a reviewer to tell them apart, unless the
+  export schema gains one. Generalizing: any new assignment-record dimension D1-D11 introduces
+  (D10's window here; D4's rejected-but-noted durable-ceiling option would be another) needs the
+  same schema addition before that dimension is complete, not only a store-side implementation.
+- **The already-shipped Periodic Access Review feature's export is evidentially void under
+  today's shipped default, and this document is the right place to name that (Gate-6 governance
+  finding, BLOCKING).** `RbacStore` seeds `rbac_enabled` to `false` by default, and per this
+  document's own Context, no code path can flip it (#388) -- so on every install today, the
+  grant table that feature's export reads has no bearing on actual access, which the legacy
+  session-role model governs instead. The export artifact itself carries no caveat to that
+  effect, and a completed attestation campaign is durable, no-prune evidence by design (per that
+  feature's own routed concern) -- meaning a campaign closed today would certify a grant
+  population with no relationship to real enforcement, with nothing on the artifact saying so.
+  This is not new scope for D1-D11 to absorb: it is an additional, customer-facing reason (beyond
+  the ones already given for sequencing D1/D2 first) that this feature's compliance claim is not
+  meaningful until RBAC can actually be enabled, and it belongs in this document because nowhere
+  else currently states it.
 
 ## Rejected alternatives
 
@@ -1409,10 +1508,51 @@ ordinary review" rule going forward.
     sre/enterprise-readiness) remains. Verdict: not ready without this round's fixes; ready once
     they land, which they now have.
 
-Gates 2 through 5 have now run against this document as ADR-1008, per entries 13-15 above.
-Remaining before acceptance: Gate 6 (compliance-officer/sre/enterprise-readiness) and Dave's
-final sign-off -- the same gates every accepted architecture decision in this codebase goes
-through, not a heightened bar specific to this document. D6's implementers
+16. **Fold `/governance` Gate 6 (2026-09-02) -- the last mandatory review gate.** `sre` returned
+    PASS with 7 MEDIUM findings, no BLOCKING -- the first Gate 6 sub-reviewer in this run to clear
+    without a block: D9's proposed schema doesn't map onto the real `AuditEvent` envelope's actual
+    columns (no correlation-id field, no `degrade` result value); D6's sweep bounds cadence but
+    not per-tick cost as fleet size grows, and has no multi-replica single-writer discipline
+    despite this codebase's own precedent for the identical process shape; D9's admitted-read
+    sampling decision doesn't reference the existing `audit_store` retention cap it would share
+    load with; D9's fail-closed mutation-write names no durability-confirmation mechanism or
+    latency bound, a materially different problem from the read-path's own batching design; D2,
+    D6, and D10 are silent on point-in-time-restore interaction with the durable, time-sensitive
+    state they introduce; D2's atomic enable has no shadow/staged/canary rollout lever for a
+    change of this blast radius. All six fixed. `compliance-officer` found one BLOCKING issue,
+    verified directly against the text: D9's own heading claims "**every** authorization
+    decision," but its enumerated gate list never included `validate_assignment` -- D3's own
+    named write chokepoint, where D4's escalation-delta check and D11's SoD check actually run --
+    so a blocked privilege-escalation attempt or SoD violation would have produced no structured
+    evidence at all, the exact false-assurance shape this governance run has now found and fixed
+    five separate times across five different decisions (D10 twice, D4, D6 twice, now D9). Fixed
+    by adding `validate_assignment` and a new `assignment-authority` axis with dedicated reason
+    codes, cross-referenced from D3. Also found and fixed: no stated retention posture for D9's
+    records against a SOC 2 Type II audit period; D10's `valid_from`/`valid_until` not reflected
+    in the shipped `AccessReviewStore` export schema; #1836 (IdP-deprovisioning staleness) never
+    added to the Consequences "referenced, not restated" list alongside #2665/#2670/#2677; and
+    that this document's own Governance-log narrative, while unusually rich change-traceability
+    evidence with real preserved dissent (entry 3), uses entry numbers as its only identifiers --
+    stable in this file, but not the `finding_id`/`governance.d/` ledger-fragment shape this
+    codebase's own code-change governance runs produce, and not mintable yet since this document
+    has no PR number; flagged for Dave to action at the point this is actually proposed as a PR,
+    not fixed in this text. `enterprise-readiness` found one BLOCKING issue, also verified
+    directly: the already-shipped Periodic Access Review feature's export is evidentially void
+    under `RbacStore`'s own shipped default (`rbac_enabled=false`) plus #388 (no path to change
+    it) -- a completed, durable-by-design attestation campaign would certify a grant population
+    with no bearing on actual access, with nothing on the export artifact itself saying so. Fixed
+    as a Consequences bullet naming this as an additional, customer-facing reason for the
+    sequencing this document already argues, not new scope for D1-D11 to absorb. Three companion
+    findings (stale RBAC rows in `docs/enterprise-parity-plan.md`/`docs/capability-map.md`;
+    `docs/user-manual/rbac.md`'s fictional `[rbac]`-config/Settings-page claims, already tracked
+    as #388; an `rbac_enforcement_active` field for the access-review export itself) are real but
+    out of this document's scope -- filed here for whoever picks them up, not fixed in this text.
+    Verdict: not ready without this round's fixes; ready once they land, which they now have. No
+    further governance gates remain; Dave's final sign-off is the only step left.
+
+Gates 2 through 6 -- the full mandatory pipeline -- have now run against this document as
+ADR-1008, per entries 13-16 above. Nothing remains before acceptance except Dave's final
+sign-off. D6's implementers
 should still read ADR-0032 Decision 7's text directly before building the Guardian mechanism, the
 same way any implementer reads the ADR they are building a novel extension of, but that is
 ordinary diligence, not a precondition on the decision itself. Given how much of D6's mechanics
