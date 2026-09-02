@@ -1547,12 +1547,18 @@ ordinary review" rule going forward.
     `docs/user-manual/rbac.md`'s fictional `[rbac]`-config/Settings-page claims, already tracked
     as #388; an `rbac_enforcement_active` field for the access-review export itself) are real but
     out of this document's scope -- filed here for whoever picks them up, not fixed in this text.
-    Verdict: not ready without this round's fixes; ready once they land, which they now have. No
-    further governance gates remain; Dave's final sign-off is the only step left.
+    Verdict: not ready without this round's fixes; those fixes are in this text, but **Gate 8
+    (re-review of every gate whose domain the fix diff touched, plus the ledger and final
+    decision) had not yet run when this entry was first written -- that sentence was itself a
+    premature completeness claim, corrected here rather than silently edited away.** This fix
+    round touched 8 of 11 decisions (D2, D3, D4, D6, D8, D9, D10, D11); assuming the largest fix
+    commit of the whole run needed no further check would have repeated, in the governance record
+    itself, the exact false-assurance pattern this run found and fixed five separate times in the
+    decisions above.
 
-Gates 2 through 6 -- the full mandatory pipeline -- have now run against this document as
-ADR-1008, per entries 13-16 above. Nothing remains before acceptance except Dave's final
-sign-off. D6's implementers
+Gates 2 through 6 have run against this document as ADR-1008, per entries 13-16 above. Gate 8
+(re-review of the fix diff's touched domains, ledger, final decision) is the next entry below;
+until it lands clean, Dave's sign-off is not yet the only remaining step. D6's implementers
 should still read ADR-0032 Decision 7's text directly before building the Guardian mechanism, the
 same way any implementer reads the ADR they are building a novel extension of, but that is
 ordinary diligence, not a precondition on the decision itself. Given how much of D6's mechanics
