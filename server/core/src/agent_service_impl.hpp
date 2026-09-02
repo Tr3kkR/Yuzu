@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -28,6 +29,10 @@
 #include "agent_registry.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
+#include "ota_transfer_watchdog.hpp"
+#include "ota_total_admission.hpp"
+#include "principal_quota.hpp"
+#include "rate_limiter.hpp"
 
 // Forward declarations to avoid pulling in full store headers
 namespace yuzu::server {
@@ -69,6 +74,90 @@ public:
                      UpdateRegistry* update_registry = nullptr);
 
     void set_update_registry(UpdateRegistry* reg) { update_registry_ = reg; }
+
+    /// Bounds on the agent OTA pull path (issue #913 + #911). Defaults are the
+    /// SHIPPED defaults, not placeholders: the path is bounded even when an
+    /// operator configures nothing and when a test constructs this service
+    /// without calling the setter below.
+    ///
+    /// The CONCURRENCY cap is the primary defence and the rate bucket is
+    /// deliberately loose. #913's attack is N parallel streams, which a
+    /// per-peer semaphore stops exactly; a tight bucket would instead meter
+    /// RETRIES, which is what produced the lockout pathologies recorded on
+    /// #934 (7.5h) and #941 (75min). At capacity 20 / refill 1-per-minute a
+    /// flapping mobile agent reconnecting five times spends five tokens and
+    /// recovers them in five minutes, so neither lockout is reachable.
+    struct OtaBoundConfig {
+        int max_concurrent_per_peer{2};
+        double rate_capacity{20.0};
+        double rate_refill_per_min{1.0};
+        /// Whole-transfer bound, enforced by cancelling the RPC from the
+        /// watchdog thread — the only thing that unblocks a `ServerWriter::Write`
+        /// stalled on a zero receive window (#911 UP-101).
+        std::chrono::seconds transfer_deadline{900};
+        /// Per-chunk bound. Catches the slow-drip peer, whose every Write
+        /// completes but slowly, before the whole-transfer deadline would.
+        std::chrono::seconds chunk_stall_deadline{30};
+        /// #935: the admission key falls back to peer IP when no client
+        /// certificate is presented, so the key space is attacker-influenced
+        /// and MUST be capped.
+        ///
+        /// FLOOR, deliberately: a value below `kMinPeersTracked` is clamped up.
+        /// Setting it near or below the live peer count does not merely shrink a
+        /// cache — every insert then evicts, and `locate_locked` mints a FULL
+        /// burst for the re-inserted key, so the rate dimension silently stops
+        /// limiting anything (at 1 it is off entirely). A cap that disables the
+        /// limiter it exists to protect is worse than no cap.
+        std::size_t max_peers_tracked{50000};
+
+        /// Server-wide ceiling on concurrent transfers across ALL peers. The
+        /// per-peer cap bounds one identity; where the identity gate is inert the
+        /// key falls back to source IP, so that bound scales with the caller's
+        /// address space. This one does not.
+        int max_concurrent_total{64};
+
+        /// Percentage of `max_concurrent_total` reserved for CERTIFICATE-keyed
+        /// peers. A flat shared ceiling is itself exhaustible: a handful of source
+        /// addresses holding slow transfers to the transfer deadline can occupy
+        /// every slot and deny the fleet — cheaper than the address-space scaling
+        /// the flat cap was added to prevent. IP-keyed peers may therefore occupy
+        /// at most `(100 - this)%` of the cap; enrolled peers may use all of it,
+        /// so an unauthenticated flood cannot starve an enrolled fleet.
+        int cert_reserve_pct{50};
+    };
+
+    /// Reconfigure the OTA bounds. SET BEFORE TRAFFIC — call it before
+    /// `BuildAndStart`, which is what every current caller does.
+    ///
+    /// The QUOTA half is safe at any time: `PrincipalQuota::set_config`
+    /// reconfigures in place under its own mutex and never replaces the object, so
+    /// an in-flight `DownloadUpdate` holding a `QuotaSlot` keeps a valid owner. (An
+    /// earlier revision rebuilt the quota through a `unique_ptr`, orphaning exactly
+    /// that back-pointer — a use-after-free that only the absence of a mid-flight
+    /// caller kept unreachable.)
+    ///
+    /// `ota_cfg_` ITSELF IS NOT. It is a plain struct with no synchronisation, and
+    /// the handler reads `chunk_stall_deadline` once per chunk and
+    /// `transfer_deadline` once per transfer. A concurrent write is a data race, so
+    /// an earlier version of this comment ("safe to call at any time") was an
+    /// invitation to write one. Making it safe means an atomic snapshot or a
+    /// seqlock, which is unwarranted while no runtime caller exists — but a future
+    /// caller must add it rather than trust this comment.
+    void set_ota_bound_config(const OtaBoundConfig& cfg);
+
+    /// #416: require a POSITIVE peer identity on the two agent-initiated OTA
+    /// RPCs, and bind the client-supplied `agent_id` to the certificate.
+    ///
+    /// Gated on the LISTENER being strict (`tls_enabled && !using_default_agent_certs`),
+    /// NOT on `require_client_identity_`. The two differ exactly where it matters:
+    /// on default agent certs the listener deliberately relaxes to
+    /// request-but-do-not-require so an unenrolled agent can bootstrap
+    /// (see server.cpp's agent-listener credential block), while
+    /// `require_client_identity_` is `tls_enabled && !tls_ca_cert.empty()` and is
+    /// TRUE there. Gating on the latter would reject every bootstrapping agent's
+    /// OTA pull. Default false = inert, which is also what a plain-TLS or
+    /// no-TLS deployment gets.
+    void set_require_positive_ota_identity(bool v) { require_positive_ota_identity_ = v; }
     /// #1128: operator-declared multi-egress NAT/proxy CIDRs for the NAT-aware
     /// Subscribe binding relaxation. Empty (default) keeps strict exact-match.
     void set_trusted_nat_cidrs(std::vector<std::string> cidrs) {
@@ -328,6 +417,82 @@ private:
     // affirms per-agent certs. See Config::nat_trust_mtls_identity.
     bool nat_trust_mtls_identity_{false};
     UpdateRegistry* update_registry_{nullptr};
+
+    // ── OTA pull bounds (#913 / #911 / #416) ────────────────────────────────
+    OtaBoundConfig ota_cfg_{};
+    // A DIRECT member, deliberately not a unique_ptr. PrincipalQuota holds a
+    // mutex so it is neither movable nor assignable, but it never needs to be
+    // replaced: `set_config` reconfigures it in place. Holding it by value makes
+    // the lifetime hazard structurally impossible rather than merely documented —
+    // there is no pointer to reseat, so no live QuotaSlot can be orphaned.
+    PrincipalQuota ota_quota_;
+    OtaTransferWatchdog ota_watchdog_;
+    bool require_positive_ota_identity_{false};
+
+    /// Bounds the identity-deny AUDIT write. The write is synchronous and
+    /// Postgres-backed and sits ahead of every admission bound, so an enrolled peer
+    /// looping a mismatched CheckForUpdate would otherwise pin a server thread per
+    /// call on the audit path. A few per second per key is far above any legitimate
+    /// rate (an agent checks every 6h by default) and far below a flood. The metric
+    /// counts every rejection regardless, so suppression shows as a gap between the
+    /// counter and the row count, never as a missing signal.
+    ///
+    /// KEYED ON THE PEER AND THE REASON, NEVER ON THE CLAIM. The key is built by
+    /// `ota_identity_audit_key` (ota_audit_key.hpp), which carries the full
+    /// history of what went wrong here twice; the short version is that keying on
+    /// the caller's `claimed_agent_id` did not bound anything, and keying on the
+    /// peer alone let a foreign-CA holder squat a victim's bucket.
+    ///
+    /// WHAT THIS DOES AND DOES NOT BOUND. A new bucket now costs a certificate
+    /// the listener accepts plus a TLS handshake, so it is no longer free to mint
+    /// — but it is not impossible either, and this is deliberately not described
+    /// as a value the caller cannot influence. The map itself is still unbounded:
+    /// `RateLimiter::purge_stale()` has no production caller, so entries live for
+    /// the process lifetime. That is tolerable only because the handshake cost
+    /// dominates: nobody exhausts memory here more cheaply than they exhaust the
+    /// TLS path. `kMaxAuditKeyIdentity` clamps the per-entry cost. Wiring an
+    /// eviction sweep is tracked separately.
+    ///
+    /// Every path reaching this limiter has already presented a certificate: the
+    /// certless case is `no_client_identity`, which short-circuits above. So the
+    /// key's mode is "cert" in practice, and the peer_ip arm exists for the
+    /// composer's completeness rather than as a reachable branch here.
+    RateLimiter ota_identity_audit_limiter_{2};
+
+    /// One in this many admission rejections is logged (the first always is).
+    /// See should_log_ota_rejection for why the log is sampled but the metric is not.
+    static constexpr std::uint64_t kOtaRejectionLogSample = 100;
+    std::atomic<std::uint64_t> ota_rejection_log_seq_{0};
+
+    /// Rate-samples the admission-rejection log line. Not const: it advances a
+    /// counter.
+    bool should_log_ota_rejection();
+
+    /// Server-wide transfer gate (OtaBoundConfig::max_concurrent_total plus the
+    /// certificate reserve). Lives in its own header because the counter is the
+    /// one part of this gate a live-wire test cannot observe — see
+    /// ota_total_admission.hpp.
+    OtaTotalAdmission ota_total_admission_;
+
+    /// The admission key for one OTA call, plus which keying produced it.
+    ///
+    /// Certificate identity when the peer presented one, else the peer IP. The
+    /// fallback is load-bearing, not a convenience: the agent listener does not
+    /// always require a client certificate, and keying every certless peer on a
+    /// single empty string would collapse the whole unenrolled fleet onto ONE
+    /// bucket, where one agent's pulls lock out every other (issue #935). Peer
+    /// IP is the same keying the HTTP-side RateLimiter already uses.
+    struct AdmissionKey {
+        std::string key;   ///< the value the per-peer quota is bucketed on
+        const char* mode;  ///< "cert" | "peer_ip" | "unknown" — the metric label
+    };
+    AdmissionKey ota_admission_key(const grpc::ServerContext& ctx) const;
+
+    /// #416 — see set_require_positive_ota_identity. Returns OK when the gate is
+    /// off. `claimed_agent_id` is the request-body value, which is unverified
+    /// until this binds it to the certificate.
+    grpc::Status require_positive_ota_identity(grpc::ServerContext* context, std::string_view rpc,
+                                               const std::string& claimed_agent_id);
     ResponseStore* response_store_{nullptr};
     TagStore* tag_store_{nullptr};
     std::weak_ptr<AnalyticsEventStore> analytics_store_;
@@ -385,10 +550,25 @@ private:
     /// in-process map) and calls `ExecutionTracker::update_agent_status`
     /// with a synthesised
     /// `AgentExecStatus` (status, exit_code, error_detail, timestamps).
-    /// No-op if the tracker isn't wired or the command_id has no
-    /// execution mapping (out-of-band dispatch). Each call publishes an
-    /// `agent-transition` SSE event the drawer's client listens to for
-    /// live-updates without a page reload.
+    /// Each call publishes an `agent-transition` SSE event the drawer's
+    /// client listens to for live-updates without a page reload.
+    ///
+    /// No-op on the executions-drawer/SSE side if the tracker isn't wired
+    /// or `lookup_execution_id` finds no mapping — ordinary out-of-band
+    /// dispatch, a workflow-step dispatch (CONSIST-2/sec-M2, which never
+    /// records one), a genuine degrade on the correlation table's own
+    /// write/read side, or the correlation table's own bounded (24h)
+    /// retention aging a mapping out from under a still-legitimately-
+    /// running command (ADR-1007, originally UP-1, unhappy-path Gate 4
+    /// finding, PR #3784 fix round — reconciled onto HA WS-1(1b) above,
+    /// which closed this fallback's ORIGINAL restart-survival case by
+    /// persisting the correlation itself). Those remaining cases are NOT a
+    /// full no-op, though: per-device concurrency-claim release/renewal is
+    /// routed around the unresolved correlation via
+    /// `ExecutionTracker::release_concurrency_claim_by_command`/
+    /// `renew_concurrency_claim_by_command`, keyed on `command_id` alone
+    /// (rides the wire response independent of the correlation table). See
+    /// those methods' doc comments.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp);
 

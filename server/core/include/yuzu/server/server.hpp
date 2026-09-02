@@ -259,6 +259,64 @@ struct Config {
     int principal_max_concurrency{16};    // per-engine-principal in-flight cap
     double principal_rate_limit{20.0};    // per-engine-principal requests/second
 
+    // Agent OTA pull bounds (issue #913 per-peer limit, #911 deadlines).
+    // `DownloadUpdate` was previously unbounded in every dimension: any
+    // mTLS-authenticated agent could open unlimited parallel streams, each
+    // pinning a gRPC thread on blocking disk reads and network writes.
+    //
+    // The CONCURRENCY cap is the primary defence; the rate bucket is
+    // deliberately loose. The attack is N parallel streams, which a semaphore
+    // stops exactly, whereas a tight bucket meters RETRIES and produces the
+    // lockout pathologies recorded on #934 and #941. Raise the rate knobs only
+    // with that in mind. See agent_service_impl.hpp's OtaBoundConfig.
+    int ota_max_concurrent_per_peer{2};   // parallel DownloadUpdate streams per peer
+    double ota_rate_capacity{20.0};       // token-bucket burst per peer
+    double ota_rate_refill_per_min{1.0};  // tokens restored per minute per peer
+    int ota_transfer_deadline_secs{900};  // whole-transfer bound (watchdog TryCancel)
+    int ota_chunk_write_deadline_secs{30};// single-chunk stall bound
+    // Cardinality ceiling on the per-peer map. The admission key falls back to
+    // peer IP when no client certificate is presented, so this key space is
+    // attacker-influenced (issue #935) and must be capped.
+    int ota_max_peers_tracked{50000};
+
+    // gRPC server-wide resource bounds. Before these, the one ServerBuilder set
+    // keepalive/ping args and NOTHING else — no ResourceQuota, no stream cap —
+    // which is what made the unbounded OTA path severe rather than theoretical.
+    // A repo-wide search found no other gRPC resource bound anywhere on the
+    // server; the governance ledger row for #3401 (finding UP-4) records the
+    // same absence.
+    int grpc_max_concurrent_streams{128};  // per-connection HTTP/2 stream cap
+    int grpc_max_resource_memory_mb{512};  // gRPC ResourceQuota ceiling
+    // Thread ceiling for the gRPC sync server.
+    //
+    // THIS IS A FLEET-SIZE CEILING, NOT A WORK CEILING, and it must be set above
+    // your concurrently-connected agent count. AgentService is a SYNCHRONOUS
+    // service and Subscribe blocks for the life of each agent's command stream, so
+    // every connected agent permanently occupies one thread. Once the quota is
+    // exhausted gRPC answers ResourceExhausted to EVERY rpc on every service
+    // sharing it — agent, management and gateway-upstream alike — so a value below
+    // the fleet size is a fleet-wide outage, not back-pressure.
+    //
+    // The default is therefore generous rather than tight. It exists to stop
+    // pathological runaway (and to give the OTA admission map's overshoot a real
+    // bound), not to size the fleet.
+    int grpc_max_threads{8192};
+
+    // Fraction of ota_max_concurrent_total reserved for peers admitted on a
+    // CERTIFICATE identity, expressed as a percentage. The server-wide cap is a
+    // shared exhaustible resource, so without a reserve a handful of source
+    // addresses holding slow transfers can starve the whole fleet — a cheaper
+    // denial than the address-space scaling the cap was added to prevent. Peers
+    // keyed on source IP may occupy at most (100 - this)% of the cap; enrolled
+    // peers may use all of it.
+    int ota_cert_reserve_pct{50};
+    // Server-wide ceiling on concurrent DownloadUpdate transfers, across ALL peers.
+    // The per-peer cap bounds one identity; on a deployment where the identity gate
+    // is inert the admission key falls back to source IP, so the per-peer bound
+    // scales with the caller's address space (a /24 buys 256 buckets). This is the
+    // bound that does not.
+    int ota_max_concurrent_total{64};
+
     // Account lockout — `/auth-and-authz` skill gap matrix P0 #2, SOC 2
     // CC6.3. After `auth_lockout_threshold` consecutive failed local-password
     // attempts the account is locked for `auth_lockout_window_secs`. The

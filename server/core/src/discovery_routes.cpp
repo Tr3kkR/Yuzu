@@ -94,6 +94,25 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
 
                      auto result = directory_sync->sync_entra(ec);
                      if (!result) {
+                         // ADR-1007: the re-entrancy guard's specific refusal
+                         // is a distinguishable, typed condition — a
+                         // concurrent sync in progress is not a server
+                         // failure, and collapsing it into 500 both mis-tells
+                         // the caller (retry-after-backoff is the correct
+                         // response, not "something broke") and makes it
+                         // indistinguishable from a real Graph/store error in
+                         // any 5xx-based alerting.
+                         if (result.error() == yuzu::server::kEntraSyncAlreadyInProgress) {
+                             res.status = 409;
+                             res.set_content(
+                                 nlohmann::json({{"error", result.error()}}).dump(),
+                                 "application/json");
+                             auto session = auth_fn(req, res);
+                             if (session)
+                                 audit_fn(req, "directory.sync", "denied", "Directory", "entra",
+                                          std::string(yuzu::server::kEntraSyncAlreadyInProgress));
+                             return;
+                         }
                          res.status = 500;
                          res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                          "application/json");

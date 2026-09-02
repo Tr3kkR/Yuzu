@@ -34,9 +34,18 @@ inline PgTestTemplate response_execution_authz_tpl{
             throw std::runtime_error("response/execution authz template failed to migrate");
     }};
 
-/// Real AuthRoutes fleet-read rig shared by the #1634 route tests. Bob has
-/// Response:Read and Execution:Read only through Bob's management group;
-/// Alice's agent is deliberately outside that subtree.
+/// Real AuthRoutes fleet-read rig shared by the #1634/#3789 route tests. Bob
+/// has Response:Read and Execution:Read only through Bob's management
+/// group; Alice's agent is deliberately outside that subtree. Bob ALSO
+/// holds Execution:Execute — GLOBALLY (`RbacStore::assign_role`, not
+/// `ManagementGroupStore::assign_role`) — for the #3789 mutation-rule
+/// tests: `require_permission` resolves grants ONLY via
+/// `RbacStore::collect_roles`'s `rbac_store.principal_roles` union, which
+/// never joins management-group assignments (verified against
+/// `rbac_store.cpp`'s `authorize_list_read` vs `check_permission` split —
+/// only the former reads groups). A group-scoped Execute role would 403 at
+/// `require_permission` before a mutation test ever reached the
+/// confinement rule under test.
 struct ResponseExecutionAuthzPgRig {
     using FleetReadFn = std::function<server::authz::FleetReadGate(
         const httplib::Request&, httplib::Response&, const std::string&, const std::string&)>;
@@ -68,6 +77,13 @@ struct ResponseExecutionAuthzPgRig {
         REQUIRE(rbac.create_role({"ExecutionReader1634", "", false, 0}).has_value());
         REQUIRE(rbac.set_permission({"ExecutionReader1634", "Execution", "Read", "allow"})
                     .has_value());
+        // #3789: mutation-rule coverage needs Execute — assigned GLOBALLY
+        // below (RbacStore::assign_role), never via ManagementGroupStore —
+        // see this struct's doc comment.
+        REQUIRE(rbac.create_role({"ExecutionExecutor3789", "", false, 0}).has_value());
+        REQUIRE(rbac.set_permission({"ExecutionExecutor3789", "Execution", "Execute", "allow"})
+                    .has_value());
+        REQUIRE(rbac.assign_role({"user", "bob", "ExecutionExecutor3789"}).has_value());
 
         bob_group = make_group("Bob-1634");
         alice_group = make_group("Alice-1634");

@@ -89,6 +89,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -96,6 +97,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -157,6 +159,14 @@ struct LdapConfig {
 
 // ── DirectorySync ────────────────────────────────────────────────────────────
 
+/// The exact `sync_entra` busy-rejection string, shared with
+/// `discovery_routes.cpp` so its 409-vs-500 classification is keyed off a
+/// single symbol rather than two independent string literals (Gate 3
+/// cpp-expert / consistency-auditor: a docs-writer wording pass on one copy
+/// used to silently revert the 409 mapping back to 500 with no compiler
+/// diagnostic).
+inline constexpr std::string_view kEntraSyncAlreadyInProgress = "sync already in progress";
+
 class DirectorySync {
 public:
     /// Borrows the shared pool (ADR-0008 "Connection model"). Runs the
@@ -176,7 +186,23 @@ public:
     /// Sync users and groups from Microsoft Entra ID (Azure AD) via Graph API.
     /// Uses OAuth2 client credentials flow to obtain an access token, then
     /// fetches /users and /groups from Microsoft Graph.
+    ///
+    /// ADR-1007: re-entrancy guarded — two concurrent callers racing this
+    /// method previously both proceeded (the deleted `mtx_`, see the file
+    /// header's self-deadlock note, never guarded the OPERATION as a whole,
+    /// only individual data-structure mutations that no longer exist post-
+    /// port). A busy call returns `std::unexpected("sync already in
+    /// progress")` immediately rather than queuing or blocking — callers
+    /// map this to HTTP 409, not 500 (see `discovery_routes.cpp`).
     std::expected<void, std::string> sync_entra(const EntraConfig& config);
+
+    /// Fires once, synchronously, immediately after `sync_entra` wins the
+    /// re-entrancy guard and before any network/store work — TEST ONLY, a
+    /// deterministic way to hold a sync "in progress" while a second call is
+    /// attempted concurrently. `nullptr` (default) in production: zero
+    /// overhead, matches this codebase's `test_hook_*` convention
+    /// (`ApiTokenStore`/`EnginePrincipalStore`).
+    std::function<void()> test_hook_after_entra_guard_acquired_;
 
     /// Sync from on-prem AD via LDAP (stub — full LDAP requires a library not
     /// in vcpkg. Entra ID is available now; LDAP support planned).
@@ -213,6 +239,11 @@ public:
 private:
     pg::PgPool& pool_;
     bool open_{false};
+
+    /// ADR-1007 re-entrancy guard for `sync_entra` — see its doc comment.
+    /// `compare_exchange_strong` at entry, reset via RAII on every exit path
+    /// (the function has several early `return std::unexpected(...)`s).
+    std::atomic<bool> entra_sync_in_progress_{false};
 
     /// Complete remote snapshot fetched from Microsoft Graph before any
     /// database write — see the file header's transaction-shape note.

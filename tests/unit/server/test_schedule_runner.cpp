@@ -50,6 +50,21 @@ struct DispatchCall {
     std::unordered_map<std::string, std::string> params;
 };
 
+// ADR-1007: records a call through the OTHER dispatch fn — the one
+// `dispatch_tracked` uses instead of `DispatchCall`'s `dispatch_fn` when a
+// concurrency gate is wired. Separate from `DispatchCall` so a test can
+// assert "the gated fn ran with THESE (definition_id, mode)" without also
+// having to prove the ungated one did NOT run — the two vectors staying
+// disjoint is itself part of the assertion.
+struct ConcurrencyCall {
+    std::string plugin;
+    std::string action;
+    std::string scope;
+    std::string execution_id;
+    std::string definition_id;
+    std::string concurrency_mode;
+};
+
 // InstructionStore is now a migrated Postgres store (ADR-0058). ADR-0065
 // migration-programme PR 5 grew this same template/database (ADR-0008
 // schema-per-store-on-one-connection) across all 3 commits — this key has
@@ -106,6 +121,7 @@ struct Harness {
     InstructionStore is{instr_pool};
 
     std::vector<DispatchCall> calls;
+    std::vector<ConcurrencyCall> concurrency_calls;
     int reach{1};        // agents "reached" by the fake dispatch
     bool throw_on_dispatch{false};
     // #3495: settable AFTER construction (mirrors throw_on_dispatch above) so
@@ -126,7 +142,8 @@ struct Harness {
                               return true;
                           },
                       AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr,
-                      InstructionStore* instruction_store_override = nullptr)
+                      InstructionStore* instruction_store_override = nullptr,
+                      bool wire_concurrency_gate = false)
         : runner(ScheduleRunner::Deps{
               .schedule_engine = &engine,
               .instruction_store = instruction_store_override ? instruction_store_override : &is,
@@ -145,6 +162,30 @@ struct Harness {
                       calls.push_back({plugin, action, scope, execution_id, caller, params});
                       return {"cmd-" + std::to_string(calls.size()), reach};
                   },
+              // ADR-1007 (finding #3, reviewer): before this, NO test ever
+              // wired dispatch_fn_concurrency — a reverted fix, a swapped
+              // (definition_id, concurrency_mode) argument order, or a
+              // deleted call site all shipped with the whole suite green.
+              // `wire_concurrency_gate` opts a test into the gated fn
+              // instead of the plain one, mirroring `throw_on_dispatch`'s
+              // set-a-flag-before-tick() shape.
+              .dispatch_fn_concurrency =
+                  wire_concurrency_gate
+                      ? ScheduleRunner::ConcurrencyDispatchFn{
+                            [this](const std::string& plugin, const std::string& action,
+                                   const std::vector<std::string>&, const std::string& scope,
+                                   const std::unordered_map<std::string, std::string>&,
+                                   const std::string& execution_id, const DispatchCaller&,
+                                   const std::string& definition_id,
+                                   const std::string& concurrency_mode) -> std::pair<std::string, int> {
+                                if (throw_on_dispatch)
+                                    throw std::runtime_error("dispatch boom");
+                                concurrency_calls.push_back({plugin, action, scope, execution_id,
+                                                             definition_id, concurrency_mode});
+                                return {"cmd-concurrency-" + std::to_string(concurrency_calls.size()),
+                                       reach};
+                            }}
+                      : ScheduleRunner::ConcurrencyDispatchFn{},
               // #3133 review fix: resolve_caller re-resolves a real,
               // non-system caller from the schedule's creator at fire time —
               // this fake mirrors that shape rather than a stale/system
@@ -875,4 +916,88 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
     const auto sb = h.get(id_b);
     CHECK(sa.next_execution_at != 1);
     CHECK(sb.next_execution_at != 1);
+}
+
+// ADR-1007 (reviewer finding #3): before this test, NOTHING wired
+// `dispatch_fn_concurrency` — a reverted fix, a swapped
+// (definition_id, concurrency_mode) argument order, or the whole call site
+// being deleted all shipped with the suite green. Pins the actually-observed
+// contract: a `per-device` definition's fire goes through the GATED fn (never
+// the plain one) carrying the correct plugin/action/definition_id/mode.
+TEST_CASE("ScheduleRunner: a per-device definition fires through the concurrency-gated "
+          "dispatch fn with the correct (definition_id, concurrency_mode)",
+          "[schedule][runner][concurrency][adr1007]") {
+    Harness h(
+        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
+        nullptr, nullptr, /*wire_concurrency_gate=*/true);
+
+    InstructionDefinition d;
+    d.id = "test.per-device";
+    d.name = "test.per-device";
+    d.version = "1.0.0";
+    d.type = "question";
+    d.plugin = "tar";
+    d.action = "snapshot";
+    d.enabled = true;
+    d.concurrency_mode = "per-device";
+    REQUIRE(h.is.create_definition(d).has_value());
+
+    auto id = h.make_due("test.per-device", "interval");
+    h.runner.tick();
+
+    // The PLAIN dispatch fn must never have been reached — a regression that
+    // swapped the ternary's two branches would still show one dispatch call
+    // and a naive `calls.size() == 1` assertion would miss it.
+    CHECK(h.calls.empty());
+    REQUIRE(h.concurrency_calls.size() == 1);
+    CHECK(h.concurrency_calls[0].plugin == "tar");
+    CHECK(h.concurrency_calls[0].action == "snapshot");
+    CHECK(h.concurrency_calls[0].definition_id == "test.per-device");
+    CHECK(h.concurrency_calls[0].concurrency_mode == "per-device");
+
+    auto s = h.get(id);
+    CHECK(s.execution_count == 1); // advanced normally, same as the ungated path
+}
+
+// Sibling of the above: a definition whose concurrency_mode is NOT
+// "per-device" still fires through the gated fn (it is wired for every
+// fire once opted in, per `dispatch_tracked`'s ternary), but carries that
+// OTHER mode through unchanged — the signal `wire_and_dispatch_confined`
+// reads as "no claim for this dispatch" (only the literal string
+// "per-device" arms the gate). Distinguishes "gate wired but mode says no"
+// from the happy path above ("gate wired and mode says yes"), which a
+// mutation swapping `concurrency_mode` for a hardcoded `"per-device"` would
+// pass undetected without this second case. Uses an explicit "unlimited"
+// definition rather than an unset field: `InstructionStore::create_definition`
+// coalesces an EMPTY `concurrency_mode` to `"per-device"` at write time (it
+// IS the platform default — `test.def`, created with no explicit value,
+// persists as `"per-device"`), so relying on emptiness here would silently
+// test the happy-path value instead of the "no" case.
+TEST_CASE("ScheduleRunner: a non-per-device definition still reaches the gated dispatch fn, "
+          "carrying its own (non-per-device) concurrency_mode",
+          "[schedule][runner][concurrency][adr1007]") {
+    Harness h(
+        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
+        nullptr, nullptr, /*wire_concurrency_gate=*/true);
+
+    InstructionDefinition d;
+    d.id = "test.unlimited";
+    d.name = "test.unlimited";
+    d.version = "1.0.0";
+    d.type = "question";
+    d.plugin = "procs";
+    d.action = "list";
+    d.enabled = true;
+    d.concurrency_mode = "unlimited";
+    REQUIRE(h.is.create_definition(d).has_value());
+
+    auto id = h.make_due("test.unlimited", "interval");
+
+    h.runner.tick();
+
+    CHECK(h.calls.empty());
+    REQUIRE(h.concurrency_calls.size() == 1);
+    CHECK(h.concurrency_calls[0].definition_id == "test.unlimited");
+    CHECK(h.concurrency_calls[0].concurrency_mode == "unlimited");
+    CHECK(h.get(id).execution_count == 1);
 }
