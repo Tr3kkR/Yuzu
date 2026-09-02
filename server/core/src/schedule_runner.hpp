@@ -86,6 +86,20 @@ public:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id, const yuzu::server::DispatchCaller& caller)>;
 
+    /// ADR-1007 — a deliberate SIBLING of `CommandDispatchFn`, not a
+    /// widening (same rationale as `WorkflowRoutes::ConcurrencyDispatchFn`,
+    /// whose doc comment this mirrors): `CommandDispatchFn` here is bound
+    /// from the SAME shared `command_dispatch_caller_fn` lambda server.cpp
+    /// wires into dashboard/REST/MCP too, so widening it would ripple far
+    /// beyond this file. Default-constructed (unwired) ⇒ `dispatch_tracked`
+    /// falls back to `dispatch_fn` with no concurrency gate.
+    using ConcurrencyDispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+        const std::string& definition_id, const std::string& concurrency_mode)>;
+
     /// Resolves the CURRENT `DispatchCaller` for a stored username at fire
     /// time — re-resolving live permissions, never trusting a stale
     /// creation-time snapshot (a schedule's creator may have gained or lost
@@ -118,6 +132,7 @@ public:
         AuditStore* audit_store{nullptr};               // optional forensic sink
         yuzu::MetricsRegistry* metrics{nullptr};        // optional observability sink
         CommandDispatchFn dispatch_fn;                  // required
+        ConcurrencyDispatchFn dispatch_fn_concurrency;   // optional (ADR-1007) — see doc comment
         ResolveCallerFn resolve_caller;                 // required
         ArmingCheckFn arming_check;                      // fail-closed when unset — see above
         // #3495: lets a shutdown request stop tick() from firing further due

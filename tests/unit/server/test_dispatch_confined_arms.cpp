@@ -590,6 +590,170 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
     CHECK(pending[0].agent_id == "dev-A");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ADR-1007 — the per-device concurrency GATE ACTIVATION itself (Gate 3
+// quality-engineer SHOULD): every existing test above passes
+// execution_tracker=nullptr with definition_id/concurrency_mode defaulted
+// empty, so none of them ever reaches the claim_fn construction branch in
+// wire_and_dispatch_confined. A swapped/wrong definition_id or
+// concurrency_mode argument at a real call site (workflow_routes.cpp,
+// schedule_runner.cpp) would compile clean and silently never activate the
+// gate — this is the exact "marked Done, never wired" failure mode this
+// whole PR exists to close, and it deserves its own regression proof against
+// a REAL ExecutionTracker, not just ExecutionTracker's own unit tests.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "test_execution_tracker_pg_helper.hpp"
+
+TEST_CASE("wire_and_dispatch_confined: concurrency_mode=\"per-device\" with a live "
+          "ExecutionTracker excludes an already-claimed agent",
+          "[server][dispatch][scope][integration][pg][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    registry.set_gateway_route(
+        "dev-A", "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("wiring-concurrency-cmd");
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    std::vector<std::string> agent_ids{"dev-A"};
+
+    // First dispatch: claims the slot, reaches the agent.
+    const auto first = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+        /*command_id=*/"wiring-concurrency-cmd-1", /*execution_id=*/"exec-1",
+        /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+        yuzu::server::authz::VisibleSet{std::nullopt}, /*broadcast_on_none=*/false, kNoContainment,
+        classified, /*definition_id=*/"def-wiring-test", /*concurrency_mode=*/"per-device");
+    CHECK(first.sent == 1);
+
+    // Second dispatch of the SAME definition to the SAME agent, still
+    // claimed (no terminal response recorded) — must be excluded.
+    const auto second = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+        /*command_id=*/"wiring-concurrency-cmd-2", /*execution_id=*/"exec-2",
+        /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+        yuzu::server::authz::VisibleSet{std::nullopt}, /*broadcast_on_none=*/false, kNoContainment,
+        classified, /*definition_id=*/"def-wiring-test", /*concurrency_mode=*/"per-device");
+    CHECK(second.sent == 0);
+}
+
+TEST_CASE("wire_and_dispatch_confined: a non-\"per-device\" concurrency_mode leaves the gate "
+          "inert even with a live ExecutionTracker",
+          "[server][dispatch][scope][integration][pg][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    registry.set_gateway_route(
+        "dev-A", "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("wiring-unlimited-cmd");
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    std::vector<std::string> agent_ids{"dev-A"};
+
+    // Both dispatches use concurrency_mode="unlimited" — neither should ever
+    // be excluded, proving the gate genuinely no-ops for a non-per-device
+    // mode rather than merely "not yet tested to exclude."
+    for (int i = 0; i < 2; ++i) {
+        const auto outcome = yuzu::server::wire_and_dispatch_confined(
+            registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+            "wiring-unlimited-cmd-" + std::to_string(i), "exec-unlimited-" + std::to_string(i),
+            /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+            yuzu::server::authz::VisibleSet{std::nullopt}, /*broadcast_on_none=*/false,
+            kNoContainment, classified, /*definition_id=*/"def-wiring-test",
+            /*concurrency_mode=*/"unlimited");
+        CHECK(outcome.sent == 1);
+    }
+}
+
+// ADR-1007 fix round (PR #3784 external review, important-finding-#1, converged on
+// independently by security-guardian/cpp-expert/architect/quality-engineer in the
+// governance re-review of the fix itself): a per-device claim is taken in
+// resolve_and_dispatch_confined BEFORE dispatch_confined_arms attempts the send —
+// if the send then fails, the claim previously leaked (stayed open) with nothing
+// to release it until the reconciler's expires_at. This is the BEHAVIORAL proof
+// the fix actually releases the claim, not just that a mock observed a call: no
+// registered gateway route on dev-A makes AgentRegistry::send_to fail
+// deterministically (agent_registry.cpp: gateway_node empty AND no live stream ->
+// false), so the first dispatch's claim, once taken, is guaranteed to hit the
+// not_sent path. The second dispatch — same definition, same agent, gateway route
+// now wired so the send can succeed — proves the release actually happened: if it
+// hadn't, this dispatch would ALSO be excluded by the still-open first claim.
+TEST_CASE("wire_and_dispatch_confined: a per-device claim is released when the send itself "
+          "fails, not left open until the reconciler",
+          "[server][dispatch][scope][integration][pg][concurrency][adr1007]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-A"));
+    // Deliberately NOT calling set_gateway_route — dev-A has no gateway_node and
+    // no live Subscribe stream, so send_to() returns false deterministically.
+
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("wiring-leak-cmd");
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    std::vector<std::string> agent_ids{"dev-A"};
+
+    // First dispatch: claims the slot, but the send itself fails (no route).
+    const auto first = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+        /*command_id=*/"wiring-leak-cmd-1", /*execution_id=*/"exec-leak-1",
+        /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+        yuzu::server::authz::VisibleSet{std::nullopt}, /*broadcast_on_none=*/false, kNoContainment,
+        classified, /*definition_id=*/"def-leak-test", /*concurrency_mode=*/"per-device");
+    CHECK(first.sent == 0);
+    REQUIRE(first.not_sent.size() == 1);
+    CHECK(first.not_sent[0] == "dev-A");
+
+    // Fix the transport and dispatch again. If the fix works, the released claim
+    // lets this second dispatch through; if the claim had leaked, this would also
+    // report sent == 0, indistinguishable from a stale open claim.
+    registry.set_gateway_route(
+        "dev-A", "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    const auto second = yuzu::server::wire_and_dispatch_confined(
+        registry, nullptr, nullptr, nullptr, nullptr, &tracker, noop_audit, noop_audit,
+        /*command_id=*/"wiring-leak-cmd-2", /*execution_id=*/"exec-leak-2",
+        /*principal_role=*/"", agent_ids, /*scope_expr=*/"",
+        yuzu::server::authz::VisibleSet{std::nullopt}, /*broadcast_on_none=*/false, kNoContainment,
+        classified, /*definition_id=*/"def-leak-test", /*concurrency_mode=*/"per-device");
+    CHECK(second.sent == 1);
+    CHECK(second.not_sent.empty());
+}
+
 // ===================================================================================
 // PR6.0b — the D3 DECISION PIN: the shared confined-dispatch seam must NOT
 // refuse a Destructive-class fan-out.

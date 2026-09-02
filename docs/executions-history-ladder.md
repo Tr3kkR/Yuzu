@@ -151,24 +151,40 @@ partial-index predicate. Every query against this index must include
 scan. See `query_by_execution`'s SQL in `response_store.cpp` for the
 canonical form.
 
-**Management-group scope is applied AFTER the LIMIT, in the handler — not in the
-SQL.** The MCP `query_responses` collect path runs a per-agent
-`check_scoped_permission` filter on the returned rows (#1550), *after* the store
-has applied `ORDER BY timestamp DESC LIMIT`. **NOTE (#1634): this filter is INERT
-under the current global `Response:Read` gate** — a holder of global `Response:Read`
-(the only principal that passes the gate) admits every agent, so no rows are
-dropped, while a management-group-confined operator is 403'd at the gate before the
-filter runs. So it does **not** today provide cross-operator isolation: a normal
-caller sees all agents' rows. Its only active effect is failing **closed** on a
-corrupt/load-failed `rbac.db`. When the #1634 admit-then-filter gate makes scoping
-effective, this after-LIMIT placement means an execution that fans out wider than
-the row cap and spans both in- and out-of-scope agents can have the cap consumed by
-out-of-scope rows, truncating the in-scope caller's view (or a row present in one
-poll vanishes from the next as the window shifts) — at that point the isolation
-holds (never another operator's rows) but completeness does not. The handler flags
-truncation with `result_truncated_by_cap:true`; the durable fix (scope-aware keyset
-pagination + pushing the predicate into the WHERE clause) is part of the #1634
-follow-up. The same applies to every other operator-facing reader of this store.
+**Management-group scope is now applied BEFORE the LIMIT, in the SQL (#1634,
+ADR-0017 INV-3).** The MCP `query_responses` collect path — and the legacy REST
+`/api/responses/{id}/export` and catch-all list — resolve the caller's visible-agent
+set (`ResponseStore::distinct_agent_ids`/`distinct_agent_ids_by_execution`) and push
+it into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)`
+**before** `ORDER BY ... LIMIT`, via a new optional scope parameter (mirroring
+`aggregate()`'s existing `AggregateScope`). This closes a real defect the first
+#1634 migration pass shipped: filtering *after* `LIMIT` meant an execution that
+fans out wider than the row cap and spans both in- and out-of-scope agents could
+have the cap consumed entirely by out-of-scope rows, handing a confined caller a
+short or empty page despite visible rows existing further back — found by an
+adversarial review (Kimi + Codex) citing this exact INV-3 text. `result_truncated_by_cap:true`
+now signals that the CALLER'S OWN scoped query hit the cap, not a raw-then-filtered
+cap hit that could fire entirely inside another operator's rows. The gate itself
+(`require_fleet_read`/`fleet_read_fn_`) replaced the old flat `Response:Read` check
+these readers sat behind, so a management-group-confined operator is admitted and
+narrowed rather than 403'd outright. **NOT true of every reader (correction, PR review
+2026-09-01):** the executions-drawer detail fragment (`workflow_routes.cpp`, `limit=500`)
+and the dashboard's `/fragments/results` (`dashboard_routes.cpp`, `limit=10000`) both
+predate #1634 and still call `query_by_execution`/`query` with no scope argument,
+post-fetch-filtering the raw (capped) result instead — the same INV-3 shape this
+paragraph describes as closed elsewhere. Isolation still holds (under-display only,
+never over-disclosure: a confined caller can see fewer in-scope rows than exist past
+the cap, never an out-of-scope row), so this is not a security regression, but it is
+not migrated onto the SQL-pushdown pattern above. Not the same surfaces as #3789/#3526;
+tracked separately as #3805.
+
+**#3789 (closed):** the legacy pre-v1 `/api/executions*` route family (`server.cpp`) — the one
+execution-reading surface with NO confinement of any kind, not even a post-fetch filter — is now
+on `require_fleet_read`, and its LIST route uses the SQL-pushdown pattern this paragraph describes
+(a correlated `EXISTS` over `agent_exec_status`, since `executions` carries no per-row `agent_id`
+column). Full design: `docs/auth-architecture.md`'s "Fourth migration (#3789)" /
+`docs/adr/0017-management-group-confinement-list-reads.md`'s "Executions (legacy pre-v1 routes)"
+bullet.
 
 ## PR 3 — SSE live updates
 
@@ -361,3 +377,86 @@ than letting them go silent.
   already lives with; it is documented here for agentic-client authors
   who write reconnect logic against the executions ladder rather than
   the dashboard's bootstrap path.
+
+## Catastrophic invariants (routed-concern detail)
+
+These are the clauses `.claude/routed-concerns.md` routes here (#1634, PR #3793 review).
+
+**(a) Admission grants VISIBILITY, never a redaction bypass.** Dispatcher/owner admission on a
+management-group-confined execution read grants visibility only — it never bypasses the confined-
+projection redaction (`scope_expression`, `parameter_values`, counts) applied to every OTHER confined
+caller. A new admission path — dispatcher ownership, a future service-token carve-out — that skips
+this redaction reopens the exact class of leak found in PR #3793's review, where the dashboard
+`/fragments/executions/{id}/detail` sidebar rendered `scope_expression`/`parameter_values`
+unconditionally with no `gate.scope` check at all.
+
+**(b) Every bus consumer sanitizes.** Every `ExecutionEventBus` consumer reachable by a confinable
+principal — REST `/api/v1/events`, the dashboard `/sse/executions/{id}`, and any future consumer —
+MUST route every event through `execution_event_scope.hpp`'s
+`classify_execution_event_for_scope` / `sanitize_execution_event_for_scope`. A consumer that reads
+the bus directly without this call leaks agent-transition and progress events to an out-of-scope
+subscriber.
+
+Both call sites are pinned by source-tripwire tests
+(`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
+**A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
+## HA WS-2a — durable event outbox (ADR-2002 §5)
+
+The "Restart loss" characteristic above is what WS-2a closes. `ExecutionTracker`
+gains a durable, append-only `event_outbox` table (migration v4) that shadows
+every event `ExecutionEventBus` fans out in-memory. The bus stays the *local*
+fan-out; the outbox is the durable, cross-replica feed. **2a-1 lands the outbox
+and its atomic write only — there is no consumer yet** (the in-memory bus still
+serves live SSE exactly as before). A later slice (2a-2) drives a
+LISTEN/NOTIFY-plus-cursor-poll loop from it.
+
+- **Atomic-write invariant (§5 invariant 1).** Each event is appended
+  (`append_event_outbox`, `execution_tracker.cpp`) on the **caller's live
+  transaction connection**, inside the same `with_txn_for` as the state
+  mutation that produced it — the `agent_exec_status` upsert
+  (`upsert_agent_status_once`), the aggregate recompute / terminal transition
+  (`refresh_counts_once`), and the cancel (`mark_cancelled`). A failed append
+  returns false, which rolls the whole transaction back, so the store can never
+  hold state without its event or an event without its state. The append takes
+  no lease of its own (nesting a pool acquire inside an open `with_txn` would
+  deadlock). It is decoupled from `event_bus_`: the durable append happens
+  regardless of whether a local SSE bus is attached; only the post-commit
+  in-memory fan-out is bus-gated.
+- **Durable monotonic ids.** `event_id` is a global `BIGINT` IDENTITY,
+  replacing the per-process ring-buffer counter. `created_at` is authored from
+  Postgres `now()` in-SQL so the retention cutoff and the row share one DB clock
+  domain.
+- **ID-ORDERING CONTRACT for future consumers.** An IDENTITY id is assigned at
+  INSERT but the row is visible only at COMMIT, so a transaction holding a lower
+  id can commit *after* one holding a higher id, and rolled-back appends/state
+  writes leave permanent id gaps. A cross-execution forward poll (2a-2) **MUST
+  NOT** use a bare `event_id > cursor ORDER BY event_id`, or it silently skips a
+  slower-committing lower id forever. **A trailing `created_at` time-lookback is
+  NOT a sufficient fix** and must not be specified as one: `created_at` is
+  authored from `now()`, which in Postgres is TRANSACTION-START time, so it does
+  not linearize COMMIT order — a late-starting transaction can commit a higher id
+  before an early-starting transaction commits a lower one, and no finite time
+  window closes that straddle. The two sound approaches (algorithm left to the
+  2a-2 design) are: **(a)** an id-gap-pending advance — never step past a missing
+  id until it is proven committed OR proven rolled back (aborted-txn gaps are
+  permanent); or **(b)** a txid/snapshot-horizon cursor — poll only rows whose
+  inserting xid is below the database's all-committed xmin horizon
+  (`pg_snapshot_xmin(pg_current_snapshot())`). The per-execution `Last-Event-ID`
+  reconnect replay (`execution_id = $1 AND event_id > $since`) is safe with a
+  bare id cursor — those rows are long-committed by reconnect time; the hazard is
+  the live-edge forward poll. The authoritative statement of this contract lives
+  at `append_event_outbox`.
+- **No FK, deliberately.** `event_outbox` carries no foreign key to
+  `executions(id)` and no UNIQUE/CHECK beyond the PK — `execution_id`
+  legitimately holds non-`executions` ids (`polchk-`/`preflight-`/…), and a
+  constraint would turn a benign append into an unrecoverable, differential
+  failure of the paired state write.
+- **Retention.** `reap_event_outbox` is a clock-guarded sweep (24h window,
+  `reap_meta` key `event_outbox_reap_anchor`) mirroring
+  `reap_command_execution_mappings`: advisory-lock single-writer, one in-SQL DB
+  `now()` read, sanitised persisted anchor, forward/backward-anomaly decline,
+  unconditional cap, and the same would-wipe + fact-set-dedup carve-outs.
+  Missing anchor **PROCEEDs** (an outbox row is a regenerable live-update frame,
+  not compliance evidence; the reap never touches authoritative state). Metrics:
+  `yuzu_exec_outbox_reap_total`, `yuzu_exec_outbox_reap_clock_anomaly_total`,
+  `yuzu_exec_outbox_store_degrade_total`.

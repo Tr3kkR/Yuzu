@@ -28,7 +28,7 @@ tier — not the tracking mechanism — decides the remediation posture:
   server, agent, or gateway: vcpkg deps, Docker base images, rebar3 deps,
   and the vendored JS assets embedded into the server binary. Security
   advisories here follow the vulnerability-management commitments in
-  `docs/enterprise-readiness-soc2-first-customer.md` (Workstream F).
+  `docs/enterprise-readiness-soc2-first-customer.md` (Workstream C).
 - **Tier 2 — repo tooling.** Build/test/docs/demo tooling that never
   ships in a product artifact: the three npm directories and the pip CI
   tooling. Advisories are tracked, surfaced, and auto-patched through the
@@ -133,6 +133,17 @@ UAT-harness smoke before approval**, because nothing in CI exercises
 that harness. The docs site pins its toolchain floor in
 `site/package.json` `engines` (mirrors Astro's own floor — currently
 Node ≥ 22.12.0, npm ≥ 9.6.5; the docs-site job runs Node 22).
+
+**Standing convention — puppeteer launch args.** Every script in
+`tests/puppeteer/` passes `--no-sandbox` in its `puppeteer.launch` args (all
+seven do, as of the fix that closed this gap). On hosts where user-namespace/
+AppArmor restrictions block Chromium's own sandbox, its absence is an
+outright launch failure — not a puppeteer-version problem — which is exactly
+what blocked the manual pre-approval smoke this doc mandates above for
+puppeteer majors: four of the seven scripts silently diverged from the other
+three and none of them could launch a browser at all until the flag was
+added back. A new script in this directory must carry the flag from
+creation.
 
 **Standing convention — new npm directories.** A directory gaining a
 `package.json` ships, in the same PR: a committed `package-lock.json`,

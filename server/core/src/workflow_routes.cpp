@@ -4,6 +4,7 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
+#include "execution_event_scope.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
@@ -142,6 +143,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
+    auto cmd_dispatch_concurrency = std::move(deps.command_dispatch_fn_concurrency);
     // K-R7-02 / PLAN-006: per-request DispatchCaller derivation. A missing
     // callback fails CLOSED on visibility at each dispatch site (empty
     // principal, present-empty set, deny all).
@@ -336,17 +338,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // to exact `execution_id` correlation transparently).
     sink.Get(
         R"(/fragments/executions/([A-Za-z0-9_-]{1,128})/detail)",
-        [fleet_read_fn, audit_fn, execution_tracker, instruction_store,
+        [auth_fn, fleet_read_fn, audit_fn, execution_tracker, instruction_store,
          response_store](const httplib::Request& req, httplib::Response& res) {
             // #1712 / #3290 Phase 2 — migrated onto require_fleet_read
             // (fleet_read_fn), mirroring query_installed_software / the REST
             // /api/v1/inventory/software twin exactly: the gate is now the
             // SOLE auth+authz check for this route (it calls require_auth
-            // internally, so the previous standalone auth_fn existence
-            // check is retired too — its only use was the existence check
-            // itself, the body never read the session) — never stacked with
-            // perm_fn (the BLOCKING defect require_fleet_read's own doc
-            // comment warns against). Scopes the "Responses" section below
+            // internally). It is never stacked with perm_fn (the BLOCKING defect
+            // require_fleet_read's own doc comment warns against). auth_fn is
+            // re-read only to obtain the admitted principal for the dispatcher
+            // ownership rule below. Scopes the "Responses" section below
             // (#1712); the per-agent status grid above it reads from
             // ExecutionTracker, a distinct store from ResponseStore -- it is
             // filtered too, once, immediately after fetch (see the grid
@@ -365,6 +366,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             auto gate = fleet_read_fn(req, res, "Execution", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the A4 error body + status.
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
             if (!execution_tracker) {
                 res.status = 503;
                 res.set_content("<div class=\"empty-state\">Tracker not available</div>",
@@ -373,14 +377,53 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             auto exec_id = req.matches[1].str();
             auto exec_opt = execution_tracker->get_execution(exec_id);
-            if (!exec_opt) {
+            // #1634 (Doomgoose review finding, important): fail closed on a
+            // transient tracker degrade rather than silently treat it as
+            // "zero agents" — see get_agent_statuses_checked's doc comment.
+            // Fetched unconditionally (not gated on gate.scope): every
+            // downstream consumer of `agents` below (KPI counts, decile
+            // bucketing, the per-agent table, the legacy-fallback in_set
+            // join) needs the real set for BOTH restricted and unrestricted
+            // callers — only the visibility/audit decision below is
+            // scope-conditional.
+            auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+            if (!agents_opt) {
+                res.status = 503;
+                res.set_content(
+                    "<div class=\"empty-state\">Execution tracker degraded — retry "
+                    "shortly.</div>",
+                    "text/html; charset=utf-8");
+                return;
+            }
+            auto agents = std::move(*agents_opt);
+            bool has_visible_agent = false;
+            if (gate.scope) {
+                for (const auto& a : agents)
+                    has_visible_agent = authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+            }
+            const bool owns_execution =
+                exec_opt && exec_opt->dispatched_by == session->username;
+            if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
+                // #1634 (governance Gate 6 compliance-officer finding): a
+                // suppressed cross-operator read attempt is CC7.2-evidence-worthy
+                // the same way the REST twin (GET /api/v1/executions/{id},
+                // action execution.detail.fetch) and MCP get_execution_status
+                // already audit their own denials — this route keeps its own
+                // pre-existing action name (execution.detail.view, matching
+                // its success row below) rather than adopting the REST twin's,
+                // but uses the SAME non-distinguishing detail text so no
+                // enumeration oracle is reopened via query_audit_log.
+                (void)audit_fn(req, "execution.detail.view", "denied", "Execution", exec_id,
+                               "not found or outside caller's fleet-read scope");
                 res.status = 404;
                 res.set_content("<div class=\"empty-state\">Execution not found</div>",
                                 "text/html; charset=utf-8");
                 return;
             }
             const auto& exec = *exec_opt;
-            auto agents = execution_tracker->get_agent_statuses(exec_id);
+            // #1634 residual: status rows are response-arrival seeded. A confined
+            // non-dispatcher sees a teammate's in-scope execution only after the
+            // first visible response lands; this fails safe and avoids metadata leaks.
             // #1712 adversarial-review finding (blocker): migrating this route's
             // gate onto require_fleet_read admits a caller class (confined-only
             // via the #1715(a) additive grant) the OLD flat perm_fn gate denied
@@ -788,13 +831,22 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     html_escape(format_iso_utc(exec.dispatched_at)) + "</div>";
             html += "<h4>Completed at</h4><div>" + html_escape(format_iso_utc(exec.completed_at)) +
                     "</div>";
-            if (!exec.scope_expression.empty()) {
+            // #1634 (Doomgoose review finding, blocking): this sidebar must
+            // apply the same confined projection as the REST twin
+            // (rest_api_v1.cpp GET /api/v1/executions/{id}) — ownership
+            // admits VISIBILITY only, never a bypass of this redaction,
+            // dispatcher included (mirrors that route's own comment).
+            const std::string scope_display =
+                gate.scope ? "(redacted - confined view)" : exec.scope_expression;
+            const std::string params_display =
+                gate.scope ? "(redacted - confined view)" : exec.parameter_values;
+            if (!scope_display.empty()) {
                 html += "<h4>Scope</h4><code class=\"exec-detail-scope\">" +
-                        html_escape(exec.scope_expression) + "</code>";
+                        html_escape(scope_display) + "</code>";
             }
-            if (!exec.parameter_values.empty()) {
+            if (!params_display.empty()) {
                 html += "<h4>Parameters</h4><pre class=\"exec-detail-params\">" +
-                        html_escape(exec.parameter_values) + "</pre>";
+                        html_escape(params_display) + "</pre>";
             }
             html += "</aside>";
 
@@ -815,18 +867,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     //
     // SSE channel that fans out per-execution transitions to subscribed
     // browser EventSources. The handler:
-    //   1. Authenticates + checks `Read` on `Execution` (same securable as
-    //      detail) — denials short-circuit before the chunked provider is
-    //      attached so RBAC matches the rest of the surface.
+    //   1. Applies the fleet-read gate for `Read` on `Execution` (same
+    //      securable as detail). Denials short-circuit before the chunked
+    //      provider is attached so RBAC matches the rest of the surface.
     //   2. Resolves the execution via `execution_tracker->get_execution`;
     //      404 for unknown id, 410 (Gone) when the execution is already
     //      terminal so the client closes its EventSource without spinning
     //      a reconnect loop on the auto-reconnect path.
-    //   3. On HTTP `Last-Event-ID` request header, replays the per-execution
-    //      ring buffer's events with id > Last-Event-ID before subscribing
-    //      to live transitions — bounded by `kBufferCap` (1000 events,
-    //      ~30 s window). Replay runs on the SSE thread (server-push), not
-    //      the request thread, so it is interleaved with live events.
+    //   3. On HTTP `Last-Event-ID` request header, atomically subscribes and
+    //      replays ring-buffer events with id > Last-Event-ID, bounded by
+    //      `kBufferCap` (1000 events, ~30 s window).
     //   4. Subscribes to the per-execution channel; the listener
     //      queues events onto the per-connection `SseSinkState`. Heartbeat
     //      every 3 s comes from the existing `sse_content_provider`.
@@ -846,12 +896,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // `execution.detail.view`.
     auto* stream_budget = deps.stream_budget;
     sink.Get(R"(/sse/executions/([A-Za-z0-9_-]{1,128}))",
-             [auth_fn, perm_fn, audit_fn, execution_tracker, execution_event_bus,
+             [auth_fn, fleet_read_fn, audit_fn, execution_tracker, execution_event_bus,
               stream_budget](const httplib::Request& req, httplib::Response& res) {
+                 if (!fleet_read_fn) {
+                     spdlog::error("/sse/executions/{{id}}: fleet_read_fn unwired");
+                     res.status = 503;
+                     res.set_content("live updates not available", "text/plain; charset=utf-8");
+                     return;
+                 }
+                 auto gate = fleet_read_fn(req, res, "Execution", "Read");
+                 if (!gate.admitted)
+                     return;
                  auto session = auth_fn(req, res);
                  if (!session)
-                     return;
-                 if (!perm_fn(req, res, "Execution", "Read"))
                      return;
                  if (!execution_tracker) {
                      res.status = 503;
@@ -869,7 +926,42 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  }
                  auto exec_id = req.matches[1].str();
                  auto exec_opt = execution_tracker->get_execution(exec_id);
-                 if (!exec_opt) {
+                 // #1634 perf (governance Gate 3 finding): only fetch/scan agent
+                 // statuses when confined — an unrestricted subscriber is always
+                 // visible regardless, so this indexed lookup would be pure
+                 // waste on every SSE subscribe.
+                 bool has_visible_agent = false;
+                 if (gate.scope) {
+                     // #1634 (Doomgoose review finding, important): fail
+                     // closed on a transient tracker degrade rather than
+                     // silently treat it as "zero agents" — see
+                     // get_agent_statuses_checked's doc comment.
+                     auto agents_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                     if (!agents_opt) {
+                         res.status = 503;
+                         res.set_content("live updates unavailable — tracker degraded, retry "
+                                        "shortly",
+                                        "text/plain; charset=utf-8");
+                         return;
+                     }
+                     for (const auto& a : *agents_opt)
+                         has_visible_agent =
+                             authz::in_scope(gate.scope, a.agent_id) || has_visible_agent;
+                 }
+                 const bool owns_execution =
+                     exec_opt && exec_opt->dispatched_by == session->username;
+                 if (!exec_opt || (gate.scope && !owns_execution && !has_visible_agent)) {
+                     // #1634 (governance Gate 6 compliance-officer finding): a
+                     // suppressed cross-operator subscribe attempt is
+                     // CC7.2-evidence-worthy the same way the REST twin
+                     // (GET /api/v1/events, action api.v1.events.subscribe)
+                     // already audits its own denials — this route keeps its
+                     // own pre-existing action name (execution.live_subscribe,
+                     // matching its success row below), but uses the SAME
+                     // non-distinguishing detail text so no enumeration oracle
+                     // is reopened via query_audit_log.
+                     (void)audit_fn(req, "execution.live_subscribe", "denied", "Execution",
+                                    exec_id, "not found or outside caller's fleet-read scope");
                      res.status = 404;
                      res.set_content("execution not found", "text/plain; charset=utf-8");
                      return;
@@ -931,38 +1023,33 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          since_id = 0;
                      }
                  }
-                 // Capture replay events into the per-connection queue under
-                 // the connection's mutex so they precede any live event a
-                 // concurrent publisher emits while we're attaching.
-                 execution_event_bus->replay_since(
-                     exec_id, since_id, [sink_state](const ExecutionEvent& ev) {
-                         detail::SseEvent sse;
-                         sse.event_type = ev.event_type;
-                         // Browser MUST see `id:` so it can populate
-                         // Last-Event-ID on the next reconnect. The
-                         // existing format_sse helper emits event/data only —
-                         // we prepend `id:` by piggybacking on event_type's
-                         // line-buffered queue: append a control-prefixed
-                         // entry the listener picks up.
-                         sse.data = std::to_string(ev.id) + "\n" + ev.data;
-                         std::lock_guard<std::mutex> lk(sink_state->mu);
-                         sink_state->queue.push_back(std::move(sse));
-                     });
-
-                 // Subscribe BEFORE returning from this handler so no
-                 // post-handler publish can be missed. The listener body
-                 // is non-blocking: queue + notify.
                  auto* bus = execution_event_bus;
-                 sink_state->sub_id =
-                     bus->subscribe(exec_id, [sink_state](const ExecutionEvent& ev) {
-                         detail::SseEvent sse;
-                         sse.event_type = ev.event_type;
-                         sse.data = std::to_string(ev.id) + "\n" + ev.data;
-                         {
-                             std::lock_guard<std::mutex> lk(sink_state->mu);
-                             sink_state->queue.push_back(std::move(sse));
+                 // Install the listener and replay atomically, using one scope
+                 // projection for both buffered and live events.
+                 sink_state->sub_id = bus->subscribe_and_replay(
+                     exec_id, since_id,
+                     [sink_state, scope = gate.scope](const ExecutionEvent& ev) noexcept {
+                         try {
+                             const auto verdict = classify_execution_event_for_scope(ev, scope);
+                             if (verdict == ExecutionEventVerdict::kDrop)
+                                 return;
+                             ExecutionEvent sanitized;
+                             const ExecutionEvent* served = &ev;
+                             if (verdict == ExecutionEventVerdict::kSanitize) {
+                                 sanitized = sanitize_execution_event_for_scope(ev);
+                                 served = &sanitized;
+                             }
+                             detail::SseEvent sse;
+                             sse.event_type = served->event_type;
+                             sse.data = std::to_string(served->id) + "\n" + served->data;
+                             {
+                                 std::lock_guard<std::mutex> lk(sink_state->mu);
+                                 sink_state->queue.push_back(std::move(sse));
+                             }
+                             sink_state->cv.notify_one();
+                         } catch (...) {
+                             // A projection failure drops the event for this stream.
                          }
-                         sink_state->cv.notify_one();
                      });
                  std::string captured_exec_id = exec_id;
 
@@ -1475,7 +1562,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/workflows/:id/execute -- execute workflow against agents
     sink.Post(R"(/api/workflows/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                     workflow_engine, instruction_store,
-                                                    cmd_dispatch, caller_fn,
+                                                    cmd_dispatch, cmd_dispatch_concurrency,
+                                                    caller_fn,
                                                     approval_manager](const httplib::Request& req,
                                                                       httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -1613,7 +1701,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // synchronously below, but a value capture is lifetime-safe
         // regardless) so every step narrows to AND identifies the operator.
         auto dispatch_fn =
-            [instruction_store, &cmd_dispatch, caller](
+            [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller](
                 const std::string& instruction_id, const std::string& agent_ids_json,
                 const std::string& parameters_json) -> std::expected<std::string, std::string> {
             // Look up the instruction definition to get plugin + action
@@ -1682,8 +1770,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // record_execution_id is skipped and responses arrive with
             // the legacy sentinel (legacy fallback in detail handler
             // covers the rendering).
-            auto [command_id, sent] = cmd_dispatch(def.plugin, def.action, target_ids, "", params,
-                                                   /*execution_id=*/"", caller);
+            // ADR-1007: per-device concurrency gate, when wired — falls back
+            // to the ungated dispatch when unwired (test harnesses that
+            // don't construct an ExecutionTracker), matching the
+            // ConcurrencyDispatchFn doc contract.
+            auto [command_id, sent] =
+                cmd_dispatch_concurrency
+                    ? cmd_dispatch_concurrency(def.plugin, def.action, target_ids, "", params,
+                                              /*execution_id=*/"", caller, def.id,
+                                              def.concurrency_mode)
+                    : cmd_dispatch(def.plugin, def.action, target_ids, "", params,
+                                   /*execution_id=*/"", caller);
 
             if (sent == 0)
                 return std::unexpected<std::string>("no agents reached for " + instruction_id);
@@ -1794,8 +1891,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                        instruction_store, cmd_dispatch,
-                                                       caller_fn, execution_tracker,
-                                                       approval_manager,
+                                                       cmd_dispatch_concurrency, caller_fn,
+                                                       execution_tracker, approval_manager,
                                                        metrics](const httplib::Request& req,
                                                                 httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
@@ -2059,9 +2156,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 caller_fn ? caller_fn(req)
                           : yuzu::server::DispatchCaller{
                                 .exec_visible = yuzu::server::authz::deny_all()};
-            std::tie(command_id, sent) = cmd_dispatch(def.plugin, def.action, agent_ids,
-                                                      dispatch_scope, params, execution_id,
-                                                      caller);
+            // ADR-1007: per-device concurrency gate, when wired.
+            std::tie(command_id, sent) =
+                cmd_dispatch_concurrency
+                    ? cmd_dispatch_concurrency(def.plugin, def.action, agent_ids, dispatch_scope,
+                                              params, execution_id, caller, def.id,
+                                              def.concurrency_mode)
+                    : cmd_dispatch(def.plugin, def.action, agent_ids, dispatch_scope, params,
+                                   execution_id, caller);
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created
@@ -2094,10 +2196,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // sent count, so the discriminator is not available here (#3424);
             // until it is, the message must not assert unreachability, which
             // is what sends an operator to the agent/networking team during a
-            // Postgres incident.
+            // Postgres incident. ADR-1007 adds a FOURTH: for a `per-device`
+            // definition, every target may have been excluded by an already-open
+            // concurrency claim rather than being unreachable at all — check
+            // yuzu_server_dispatch_concurrency_skipped_total too.
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, or withheld because containment state could not be read. Check GET /api/v1/quarantine and yuzu_server_quarantine_gate_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, withheld because containment state could not be read, or excluded by an in-flight per-device concurrency claim. Check GET /api/v1/quarantine, yuzu_server_quarantine_gate_total, and yuzu_server_dispatch_concurrency_skipped_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

@@ -229,6 +229,10 @@ agent_test_exe = executable(
     'unit/test_updater.cpp',
     'unit/test_filesystem_read.cpp',
     'unit/test_filesystem_actions.cpp',
+    'unit/test_confined_fs_rules.cpp',
+    'unit/test_confined_fs_walk.cpp',
+    'unit/test_confined_fs_posix.cpp',
+    'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
     'unit/test_metrics.cpp',
@@ -800,6 +804,8 @@ if build_server
       'unit/server/test_schedule_runner.cpp',
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_list_read_confinement.cpp',
+      'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
+      'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
@@ -811,7 +817,6 @@ if build_server
       'unit/server/test_saml_scim_link.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
-      'unit/server/test_concurrency_manager.cpp',
       'unit/server/test_legacy_shim.cpp',
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',
@@ -969,6 +974,14 @@ if build_server
       'unit/server/test_security_headers.cpp',
       'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
       'unit/server/test_principal_quota.cpp', # PR 4.4 per-principal quota cap primitive
+      'unit/server/test_ota_transfer_watchdog.cpp', # OTA transfer deadline watchdog (#911 UP-101)
+      'unit/server/test_ota_download_bound.cpp', # OTA admission + identity gates over real gRPC (#913/#416)
+      'unit/server/test_ota_transfer_rules.cpp', # OTA chunk-write outcome decision (#911/#934/#941)
+      'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
+      'unit/server/test_ota_audit_key.cpp', # OTA identity-deny audit bucket key (#416/#913)
+      'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
+      'unit/server/test_ota_stalled_write.cpp', # TryCancel unblocks a stalled sync Write (#911 UP-101)
+      'unit/server/test_server_ota_options.cpp', # OTA CLI/env contract + gRPC bound derivation (#913/#911)
       'unit/server/test_principal_quota_denial.cpp', # PR 4.4 dual-transport classifier lock (#2291)
       'unit/server/test_principal_quota_chokepoint.cpp', # PR 4.4 chokepoint wiring coverage
       'unit/server/test_grpc_on_behalf_enforce.cpp', # ADR-1005 PR 1.1 gRPC end-to-end enforcement
@@ -1106,7 +1119,9 @@ if build_server
     # catch2_nomain_dep (#1648/#3507): yuzu_server_tests supplies its own
     # main() via unit/test_runner_main.cpp (shared with yuzu_agent_tests), so
     # it links Catch2 without Catch2Main.
-    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, dependency('openssl', required: true, include_type: 'system')],
+    # cli11_dep: test_server_ota_options.cpp parses real CLI::App argv in-process
+    # to pin the OTA flag/env contract (header-only, no link cost).
+    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system')],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
   # promised): test() entries over the SAME binary, partitioned by Catch2
@@ -1925,14 +1940,23 @@ test('capability gate consistency',
 # docker-dependent test registered here puts a container registry on all three;
 # an earlier version of this wiring did exactly that and was reverted. Without
 # YUZU_TEST_ENABLE_PROMTOOL_DOCKER the harness needs a native promtool of the
-# pinned major and skips (77) otherwise. Timeout matches the workflow's own
-# 10-minute budget for the same work: under the opt-in this pulls a ~110 MB
-# image before it runs anything.
+# pinned major and skips (77) otherwise.
+#
+# TIMEOUT (#2340 PR-4): the harness now runs TWO full gates per invocation -
+# the shipped RULES/TESTS pair, then the marker-extracted yuzu-guardian-journal
+# group (CH-2 + CH-5-PROM) - each up to 4x120s (check + test + the canary's own
+# test + check) = 480s worst case, plus ~225s for the docker daemon probe and
+# pull ladder under the opt-in (0 under a native promtool). Worst case is
+# 225 + 480x2 = 1185s; 1500 keeps ~300s of margin over that, the same
+# methodology run_promtool_tests.py's own pull_with_retry() comment uses for
+# its ladder ("must fit inside the timeouts that enclose it") - see that
+# comment for the full arithmetic and how it composes with the CI job's own
+# `timeout-minutes` in docs-lint.yml.
 test('prometheus alert rules',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py')],
   suite: 'docs',
-  timeout: 600,
+  timeout: 1500,
 )
 
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv

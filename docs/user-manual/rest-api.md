@@ -1628,7 +1628,14 @@ Quarantine a device.
 > (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
 > do **not** yet carry this split — they answer their existing
 > "no agents reached" shapes for all three conditions, because the shared
-> dispatch closure returns only a sent count. Tracked as #3424. The quarantine
+> dispatch closure returns only a sent count. Tracked as #3424. ADR-1007 added
+> a fourth cause to that same undifferentiated message on
+> `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
+> named target may have been excluded by an already-open concurrency claim
+> rather than being unreachable at all — the response text now says so, and
+> points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
+> this is still prose inside the one undifferentiated 503 body, not a fourth
+> structured `error.reason` value — the same #3424 gap applies to it. The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —
@@ -2733,8 +2740,9 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `auth.admin_required` | Centralised denial event emitted by `AuthRoutes::require_admin` on every privileged-endpoint 403. `target_type=endpoint`, `target_id={req.path}`. SOC 2 CC7.2 evidence chain — captures rejected attempts that previously surfaced only in the request log. |
 | `auth.lockout.applied` | Account locked after `--auth-lockout-threshold` consecutive failed local-password logins (SOC 2 CC6.3). Emitted **once** at the threshold crossing — not once per blocked attempt (those are tracked only by `yuzu_auth_lockout_blocked_total` to avoid audit flooding). `result=ok` (the lock was applied; the warning severity is carried by the metric + analytics event, not the audit result), `target_type=User`, `detail=threshold=<N> window_secs=<S>`. |
 | `auth.lockout.cleared` | Account-lockout counter reset. `result` ∈ {`ok`, `error`}, `target_type=User`. `detail=admin_unlock` for `POST /api/v1/users/{name}/unlock`, or `reset_on_successful_login` when the user's next successful login clears a non-zero counter. |
-| `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result=success`. Emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
-| `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
+| `execution.detail.fetch` | `GET /api/v1/executions/{id}` (REST v1 single-execution lookup). `result=denied` only (#1634) — emitted on the 404 branch, execution genuinely nonexistent OR out of the caller's management-group scope, non-distinguishing detail text. There is currently no `result=success` row on this route's 200 path — only the denial is audited. |
+| `execution.live_subscribe` | Server-Sent Events subscribe to `/sse/executions/{id}`. `result` ∈ {`success`, `denied`}. `success` emitted on every successful subscribe (no per-session-per-execution dedup currently — see #700). `denied` emitted (#1634) on the 404 branch — execution genuinely nonexistent OR out of the caller's management-group scope, using non-distinguishing detail text so the two cases stay audit-indistinguishable. The forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`. |
+| `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result` ∈ {`success`, `denied`}. `success` detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). `denied` emitted (#1634) on the 404 branch (unknown execution OR out of scope), using non-distinguishing detail text — corrects an earlier version of this row, which predated #1634 and said this 404 branch never audits. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). `error` detail `db_error` on a genuine InstructionStore DB/lease failure (503, ADR-0058) — distinct from `denied`, since an infra degrade is not an operator denial. |
 | `instruction.update` | Instruction definition updated via `PUT /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). A plain 400 validation error is not audited (matches `instruction.create`'s equivalent branch). |
 | `instruction.delete` | Instruction definition deleted via `DELETE /api/instructions/{id}`. `result` ∈ {`success`, `denied`, `error`}. Denied detail value: `not_found` (404, unknown id). `error` detail `db_error` on a genuine DB/lease failure (503). |
@@ -4100,6 +4108,67 @@ Recent delivery attempts for a target (default 50, override via `?limit=N`). Eac
 
 ---
 
+### Directory Sync
+
+AD/Entra directory integration (Phase 7). Backed by `DirectorySync` (`directory_sync.{hpp,cpp}`).
+
+#### `POST /api/directory/sync`
+
+Trigger a directory sync. Requires `Directory:Write`.
+
+**Request (`provider: "entra"`):**
+
+```json
+{
+  "provider": "entra",
+  "tenant_id": "...",
+  "client_id": "...",
+  "client_secret": "..."
+}
+```
+
+`tenant_id`/`client_id`/`client_secret` are all required for `entra`; a `provider: "ldap"` request instead takes `server`/`port`/`base_dn`/`bind_dn`/`bind_password`/`use_ssl`, but `sync_ldap` is not yet implemented and always returns `501`. Any other `provider` value is `400`.
+
+**Response (200):** `{"status": "completed", "provider": "entra", "user_count": <n>, "group_count": <n>}`
+
+**Response (409, ADR-1007):** `{"error": "sync already in progress"}` — `sync_entra` holds a single in-process re-entrancy guard for the duration of one sync call; a second `POST` that arrives while a sync is already running is rejected immediately rather than racing it. See "Diagnosing a stuck directory sync" in `docs/user-manual/server-admin.md` for how long a legitimate sync can hold the guard and what a stuck one looks like. Not queued or retried automatically — the caller decides when to retry.
+
+**Response (400):** malformed body, or a missing required Entra field.
+
+**Response (503):** `directory_sync` is unavailable (store not open).
+
+**Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result.
+
+#### `GET /api/directory/users`
+
+List directory-synced users from the last successful sync. Requires `Directory:Read`. Optional `?group_id=` query param filters to members of one synced group.
+
+**Response (200):** `{"users": [{"id","display_name","email","upn","enabled","groups":[...],"synced_at"}], "count": <n>}`
+
+**Response (503):** `directory_sync` unavailable.
+
+#### `GET /api/directory/status`
+
+Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`.
+
+**Response (200):** `{"provider","status","last_sync_at","user_count","group_count","last_error","groups":[{"id","display_name","description","mapped_role","synced_at"}]}`
+
+**Response (503):** `directory_sync` unavailable.
+
+#### `PUT /api/directory/group-mappings`
+
+Configure group-to-role mappings (which RBAC role a synced group's members receive). Requires `Directory:Write`.
+
+**Request:** `{"mappings": [{"group_id": "...", "role_name": "..."}]}`. `role_name` is NOT required per entry — an entry with an empty/omitted `role_name` REMOVES that group's mapping rather than being rejected; a non-empty `role_name` configures (creates or overwrites) it. An entry with an empty `group_id` is silently skipped and not counted.
+
+**Response (200):** `{"mappings": [{"group_id","role_name"}], "count": <n>}` — the FULL current mapping set after applying this request's changes (not the size of the batch just submitted).
+
+**Response (400):** malformed body, or a missing `mappings` array.
+
+**Response (503):** `directory_sync` unavailable.
+
+---
+
 ### Network Discovery
 
 Network-discovered devices (Issue 7.18) — raw scan results agents report before an operator promotes a device to a managed agent. Backed by `discovery_store` on the shared PostgreSQL substrate (ADR-0044). Not to be confused with [Discovery (A2)](#discovery-a2) above, which is the unrelated agentic self-discovery family (`/api/v1/discover/*`).
@@ -4891,9 +4960,9 @@ Render an execution's response set as chart-ready JSON, using the `spec.visualiz
 
 #### `GET /api/v1/executions/{id}/visualization`
 
-**Permission:** `Response:Read`
+**Permission:** `require_fleet_read("Response","Read")` (ADR-0017 admit-then-filter — #1634, replaced the flat `Response:Read` gate)
 
-**Hardening (#1634, partial).** Under a **corrupt or unavailable RBAC store** this endpoint now fails **closed** (returns no rows) rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of this endpoint for normal operators is **not yet effective** — a holder of global `Response:Read` currently sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). `rows_capped` (below) is computed on the raw pre-filter result. When rows are dropped (today, the fail-closed path), the success audit detail carries ` scope_dropped=<N>`.
+**Confined (#1634).** A management-group-confined operator is admitted and sees only their in-scope agents' rows in the rendered chart — real cross-operator isolation, not the earlier inert per-row filter. The visible-agent set is resolved and pushed into the underlying SQL query before the row cap (ADR-0017 INV-3), so `rows_capped` (below) reflects the CALLER's own scoped cap hit, not a raw-then-filtered one that could fire entirely inside another operator's rows. On a **corrupt or unavailable RBAC store** the endpoint still fails **closed** (`403`/`503`) rather than exposing the whole fleet. When rows are dropped, a SEPARATE `result=denied` audit row fires (`detail` carries `scope_dropped=<N>`), paired with the `result=success` row for the same request — this fires under ordinary operation for a confined caller whose execution spans agents outside their groups, not only on RBAC-store corruption.
 
 **Path parameters:**
 
@@ -4942,7 +5011,7 @@ When the underlying response set exceeds the per-request row cap (10000), the re
 | `500` | The visualization spec parses but cannot be applied (invalid processor / invalid chart type). |
 | `503` | Response store or instruction store unavailable, or the response store's read degraded (transient Postgres outage — retryable, `retry_after_ms:5000` in the A4 body; audited as `reason=response_store_degraded`). |
 
-**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id> index=<N>` on success (with ` scope_dropped=<N>` appended when out-of-scope agents' rows were dropped), or `<definition_id> reason=<r>` on the failure path.
+**Audit:** every successful and failed render emits an `execution.visualization.fetch` audit event with `target_type=execution`, `target_id=<execution_id>`, `detail=<definition_id> index=<N>` on success, or `<definition_id> reason=<r>` on the failure path. When out-of-scope agents' rows were dropped, a SEPARATE `result=denied` row on the same action fires alongside the success row, `detail=<definition_id> scope_dropped=<N>` — not appended to the success detail.
 
 **Example:**
 
@@ -6452,7 +6521,7 @@ These endpoints drive the **Settings → Multi-Factor Authentication** card. The
 - **Effect on success:** Sets `mfa_enrolled_at = CURRENT_TIMESTAMP`, advances `mfa_last_counter` to the matched counter (replay defence), generates 10 single-use recovery codes (PBKDF2-SHA256 hashed in `mfa_recovery_codes`).
 - **Response (200, success):** HTML fragment with the 10 recovery codes as a one-time reveal (`XXXX-XXXX-XXXX-XXXX`, 80 bits each). Same `Cache-Control: no-store` headers as `init`.
 - **Response (200, failure):** Re-renders the verify form with an instruction to wait for the next 30 s code. Provisional row survives so the operator's authenticator app keeps working; the secret is NOT re-revealed.
-- **Audit:** `mfa.enroll.verified` + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection.
+- **Audit:** `mfa.enroll.verified` + `mfa.recovery_codes.generated` on success; `mfa.enroll.failed` on rejection; `mfa.enroll.race` when a concurrent verify already enrolled the account (benign race, distinct from a rejected code — CC7.2).
 
 **`POST /api/settings/mfa/recovery-codes`** — Regenerate the 10 recovery codes.
 
@@ -7017,33 +7086,72 @@ table entry above).
 
 ### Executions
 
+All seven routes below are management-group confined as of #3789 (`docs/auth-architecture.md`'s
+"Fourth migration"): a caller holding `Execution:Read`/`Execute` through a management group only
+sees/acts on executions it dispatched itself or that involve at least one agent it can see. A
+global grant is unrestricted. An execution outside the caller's visibility and a nonexistent one
+return the identical `404` (no existence oracle).
+
+**Response (503):** any of the seven routes returns `503` with `retry_after_ms` on either (a) the
+RBAC/management-group store being degraded when a confinement decision must be made
+(`require_fleet_read` fails closed, replacing the pre-#3789 flat `403`), (b) the execution tracker
+itself being unreadable (`ExecutionTracker`'s `_checked` accessors), or (c) — under a confined
+grant only — the caller's session identity failing to resolve after admission, which fails closed
+rather than silently falling through to agent-only visibility. Retry after the given interval; a
+persistent `503` indicates a store outage, not a permission problem.
+
 #### `GET /api/executions`
 
-List executions. Accepts `definition_id`, `status`, and `limit` as query parameters.
+**Permission:** `Execution:Read`. List executions. Accepts `definition_id`, `status`, and `limit`
+(capped at 500) as query parameters. Under a confined grant, `agents_targeted`/`agents_responded`/
+`agents_success`/`agents_failure` are recomputed from only the caller's visible agents.
 
 #### `GET /api/executions/{id}`
 
-Get details of a single execution.
+**Permission:** `Execution:Read`. Get details of a single execution. Under a confined grant,
+`scope_expression` and `parameter_values` are redacted (`"(redacted - confined view)"`) and the
+four agent counts are recomputed from only the visible agents; `status`/`dispatched_by`/
+`dispatched_at`/`completed_at`/lineage stay truthful. **Response (404):** unknown or
+outside-scope id.
 
 #### `GET /api/executions/{id}/summary`
 
-Get an execution summary (counts of targeted, responded, success, failure agents).
+**Permission:** `Execution:Read`. Get an execution summary (counts of targeted, responded,
+success, failure agents, `progress_pct`). **Response (404):** unknown or outside-scope id.
 
 #### `GET /api/executions/{id}/agents`
 
-List agents involved in an execution.
+**Permission:** `Execution:Read`. List agents involved in an execution, filtered to the caller's
+visible agents under a confined grant. **Response (404):** unknown or outside-scope id.
 
 #### `GET /api/executions/{id}/children`
 
-List child executions spawned from a parent execution.
+**Permission:** `Execution:Read`. List child executions spawned from a parent execution. Each
+child is independently checked against the caller's visibility — a visible parent does not by
+itself disclose a child dispatched by, or targeting, someone else. **Response (404):** unknown or
+outside-scope parent id.
 
 #### `POST /api/executions/{id}/rerun`
 
-Re-execute a previously run instruction with the same parameters and targets.
+**Permission:** `Execution:Execute` AND `Execution:Read` (the mutation's target-visibility check
+runs through the Read fleet gate). Re-execute a previously run instruction with the same
+parameters and targets. Under a confined grant, every targeted agent must be visible to the
+caller — a partially-visible or not-yet-fully-reported execution is refused, with a `404`
+(deliberately non-distinguishing from a nonexistent id, to avoid disclosing a hidden cohort). A
+global (unconfined) grant is unaffected by this check and keeps the pre-existing `400 {"error":
+"original execution not found"}` response for an unknown id. **Escape hatch:** same as `cancel`
+below — an execution whose targeted cohort never fully reports can permanently fail the
+complete-cohort admission check for a confined caller; a **global** grant is never subject to it.
 
 #### `POST /api/executions/{id}/cancel`
 
-Cancel a running execution.
+**Permission:** `Execution:Execute` AND `Execution:Read`, same confinement rule as `rerun`.
+**Response (404):** unknown execution id (this route no longer reports a false success for a
+nonexistent id), outside-scope, or an incomplete/partial target cohort. **Escape hatch:** an
+execution whose targeted cohort never fully reports (an agent gone offline mid-run, for example)
+can permanently fail the complete-cohort admission check for a confined caller — cancel it with a
+**global** `Execution:Execute`+`Execution:Read` grant instead, which is never subject to this
+confinement rule.
 
 ---
 
@@ -7202,7 +7310,7 @@ Aggregate response data for a command (counts, summaries).
 
 Export response data in CSV format.
 
-**Hardening (#1634, partial).** On a **corrupt or unavailable RBAC store**, these three readers fail **closed** — `GET /api/responses/{id}` and `/export` return no rows; `/aggregate` returns `503` — rather than exposing the whole fleet via the legacy read fallback. Per-management-group scoping of these readers for normal operators is **not yet effective**: a holder of global `Response:Read` sees all agents' rows (the per-agent filter is in place but inert under the current global gate; the gate change is tracked under #1634). Scripted/Grafana consumers of `/aggregate` that start receiving `503`/empty after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
+**Confined (#1634).** All three readers are gated by `require_fleet_read` (ADR-0017 admit-then-filter) — a management-group-confined operator is admitted and sees only their in-scope agents' rows, real cross-operator isolation rather than the earlier inert per-row filter. `/export` and the catch-all GET push the visible-agent set into the underlying SQL query before `LIMIT`/`OFFSET` (ADR-0017 INV-3), so a confined caller's page reflects only their own visible rows. All three now share ONE gate's failure posture: a **null/unopened response store** returns `503`; an **open but corrupt RBAC store** fails **closed** with `403` (`rbac_enforcement_in_effect` holds, so `require_fleet_read`'s underlying permission check denies rather than falling through to the legacy read path) — for all three readers alike, not the differentiated no-rows-vs-503 split of the pre-migration gate. Scripted/Grafana consumers that start receiving `503`/`403` after an upgrade should check `/readyz` and the server log for `RbacStore` open/migrate errors.
 
 ---
 
@@ -7368,6 +7476,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 - **Content-Type:** `text/event-stream`
 - **Headers:** `Cache-Control: no-cache`, `X-Accel-Buffering: no` (so reverse proxies don't buffer the stream into chunks).
 
+**Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** — it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream.
+
 **Reconnect / replay:** the server keeps a per-execution ring buffer of up to 1000 events covering ~30 seconds of activity. Browsers' `EventSource` automatically sends `Last-Event-ID` on reconnect; the server replays events whose monotonic id is greater than that value before resuming live publication.
 
 **Event types:**
@@ -7378,6 +7488,14 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | `execution-progress` | Every `refresh_counts` recompute | counts snapshot — `total`, `succeeded`, `failed`, `running`, `pending` |
 | `execution-completed` | Crossing the all-agents-responded threshold OR `mark_cancelled` | terminal status — `{"status":"succeeded"\|"completed"\|"cancelled"}`. Client should close the EventSource after this event. |
 
+**Confined-subscriber event projection (#1634).** A management-group-confined subscriber (not the execution's dispatcher) does not receive the raw event stream verbatim — a shared projector (`execution_event_scope.hpp`) applies one of three treatments per event, so a subscriber can never learn about agents outside their visible set:
+
+| Event | Confined treatment |
+|---|---|
+| `agent-transition` | Filtered by `agent_id` — only transitions for agents in the caller's visible set are forwarded; others are silently dropped. |
+| `execution-progress` | Dropped entirely — the counts snapshot is execution-wide and carries no `agent_id` to filter by, so it cannot be safely narrowed. |
+| `execution-completed` | Sanitized, not dropped — the real terminal `status` is preserved (so the client still knows to close its stream) but nothing else is added. |
+
 **Status-code map:**
 
 | HTTP status | Condition |
@@ -7385,7 +7503,7 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 | 200 | Stream attached; events follow |
 | 401 | No session / token |
 | 403 | RBAC `Execution:Read` denied |
-| 404 | `{id}` does not exist in the execution tracker |
+| 404 | `{id}` does not exist in the execution tracker, **or exists but is not visible within the caller's management-group scope** — the two are deliberately indistinguishable (no existence oracle, #1634) |
 | 410 | Execution is already in a terminal status (succeeded / completed / cancelled / failed). Tells `EventSource` to stop reconnecting. |
 | 429 | Shared held-open-stream budget exhausted (ADR-0034). Body is plain text (`too many live streams open — close a tab and retry`) with a `Retry-After: 5` header — note this surface predates the A4 envelope and does not use it. |
 | 503 | The per-execution event bus is not configured (test harness opt-out, or a configuration path that omits the bus). Returned at request time so the operator does not silently freeze waiting on a missing publisher. |
@@ -7396,7 +7514,7 @@ from the **same** `--max-sse-streams` budget as `GET /mcp/v1/`, MCP streamed POS
 drawers — or enough traffic on any of the other surfaces — can cause a *new* drawer to be
 refused with `429`. A live stream is never evicted to make room.
 
-**Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
+**Audit:** every successful subscribe emits one `execution.live_subscribe` audit event (`target_type=Execution, target_id={id}, result=success`). A subscribe request against an execution that is genuinely nonexistent OR merely out of the caller's scope (the 404 case above) also emits a `result=denied` row on the same action, using non-distinguishing detail text — the two cases must remain audit-indistinguishable, matching the response HTTP status. Per-session-per-execution dedup is **not** currently implemented (#700) — operators on the SOC 2 evidence chain receive a row per reconnect; the forensic-grade audit on first-load remains on `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
 **Example (curl):**
 
@@ -7446,6 +7564,8 @@ The browser-oriented `/sse/executions/{id}` route is preserved for the dashboard
 **Permission:** `Execution:Read`.
 **Auth:** Bearer token, `X-Yuzu-Token` header, or session cookie. Same auth surface as every other `/api/v1/*` endpoint.
 
+**Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The execution's dispatcher is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), never a bypass of the per-event redaction below. RBAC-off → unrestricted (legacy-open). This route shares one event projector (`execution_event_scope.hpp`) with the dashboard's `/sse/executions/{id}` sibling — see that section for the drop/sanitize table (`agent-transition` filtered by `agent_id`, `execution-progress` dropped, `execution-completed` sanitized to `status` only), and for the same subscribe-time-only gate staleness caveat (tracked: #3788) — this route shares that gap.
+
 **Required query parameter:**
 
 | Parameter | Type | Description |
@@ -7487,7 +7607,7 @@ The `type` field is the canonical taxonomy: `agent-transition`, `execution-progr
 | 400 | A4 envelope | Missing or malformed `execution_id` |
 | 401 | (auth layer) | No session / token |
 | 403 | (perm layer) | RBAC `Execution:Read` denied |
-| 404 | A4 envelope | Execution does not exist |
+| 404 | A4 envelope | Execution does not exist, **or exists but is not visible within the caller's management-group scope** — deliberately indistinguishable (no existence oracle, #1634) |
 | 410 | A4 envelope | Execution already terminal |
 | 429 | A4 envelope with `retry_after_ms:5000` | Shared held-open-stream budget exhausted (ADR-0034). Remediation text: `close an existing /api/v1/events stream, or raise --max-sse-streams` |
 | 503 | A4 envelope with `retry_after_ms:5000` | Tracker or event bus not initialised (server warmup window) |
@@ -7522,7 +7642,7 @@ A4 envelope shape:
 | `X-Content-Type-Options` | `nosniff` | Belt-and-braces against MIME sniffing. |
 | `Sec-Audit-Failed` | `true` (only when audit persist failed) | SOC 2 CC6.6 evidence contract: subscription proceeded even though the audit row failed to persist (matches the PR #883 / W1.1 partial-failure pattern). |
 
-**Audit:** every successful subscribe emits one `api.v1.events.subscribe` audit event (separate verb from the dashboard sibling's `execution.live_subscribe` so SIEM filters can distinguish browser vs agentic consumers). Per-session-per-execution dedup is **not** currently implemented (Deferred-5 / #700); a worker reconnecting frequently generates one row per reconnect.
+**Audit:** every successful subscribe emits one `api.v1.events.subscribe` audit event (separate verb from the dashboard sibling's `execution.live_subscribe` so SIEM filters can distinguish browser vs agentic consumers). A subscribe request against an execution that is genuinely nonexistent OR merely out of the caller's scope (the 404 case above) also emits a `result=denied` row on the same action, using non-distinguishing detail text — the two cases must remain audit-indistinguishable, matching the response HTTP status. Per-session-per-execution dedup is **not** currently implemented (Deferred-5 / #700); a worker reconnecting frequently generates one row per reconnect.
 
 **Restart behaviour:** the bus is in-process and in-memory. On server restart, every `Last-Event-ID` is invalidated — replays against an event id assigned by a previous process instance return nothing even if the execution is still active. Workers should fall back to `GET /api/v1/executions/<id>` to recover terminal state after a 503 or a long disconnect.
 
@@ -8117,10 +8237,11 @@ Only a 6-digit TOTP code is accepted (recovery codes do not exist until enrollme
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted; enrollment complete, session minted | `{"status":"ok","recovery_codes":["XXXX-XXXX-XXXX-XXXX", … 10 total]}` — revealed **once**; save them |
 | `401` | Invalid/expired pending token, wrong token type, malformed or rejected code, attempts exhausted, **or the auth store is not configured at all** (null DB) | `{"error":{"code":401,"message":"Invalid verification code"}}` (uniform body; discriminator in the audit `detail`) |
 | `503` | Auth store reachable but the secret could not be verified — decrypt/store failure (e.g. KEK unresolvable) | `{"error":{"code":503,"message":"authentication store is temporarily unavailable"}}` |
+| `409` | The account was already enrolled by a concurrent verify before this pending token committed — a benign race, not a rejected code | `{"error":{"code":409,"message":"MFA is already enrolled on this account"}}` — no session minted; complete login normally |
 
-A null auth store returns `401`, **not** `503`, deliberately: a distinct status would confirm "this pending token is valid" to an attacker holding one during a store outage. The reason is recorded in the audit `detail` only. The `503` above is reserved for the case where the store answered but the secret could not be decrypted or verified — that one is fail-closed and never burns an enrollment attempt.
+A null auth store returns `401`, **not** `503`, deliberately: a distinct status would confirm "this pending token is valid" to an attacker holding one during a store outage. The reason is recorded in the audit `detail` only. The `503` above is reserved for the case where the store answered but the secret could not be decrypted or verified — that one is fail-closed and never burns an enrollment attempt. The `409` is only reachable by the caller who already holds a valid enrollment-pending token for that account (minted after their own password login), so it discloses nothing new, and it deliberately does **not** burn an enrollment attempt.
 
-**Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on failure `mfa.enroll.failed`.
+**Audit:** on success `mfa.enroll.verified` + `mfa.recovery_codes.generated` + `auth.login`; on a rejected code `mfa.enroll.failed`; on the benign already-enrolled race `mfa.enroll.race` (result `ok`).
 
 #### `POST /login/mfa/stepup`
 

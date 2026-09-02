@@ -50,6 +50,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -398,6 +399,67 @@ TEST_CASE("DirectorySync[pg]: sync_entra rejects an incomplete Entra config",
     auto result = store->sync_entra(cfg);
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error().find("tenant_id") != std::string::npos);
+}
+
+TEST_CASE("DirectorySync[pg]: sync_entra refuses a concurrent call while one is in progress",
+          "[directory_sync][pg]") {
+    // ADR-1007. Deterministic via the test-only hook rather than a raw
+    // thread race (external review, 2026-08-31): the hook fires
+    // synchronously right after the re-entrancy guard is won, BEFORE any
+    // network call, so the mutual-exclusion ASSERTION below never depends on
+    // network I/O. The background thread, once released, does go on to make
+    // a real (bound-to-fail, fake credentials) HTTPS call to Microsoft's
+    // token endpoint — acquire_token has no injectable base URL (unlike
+    // fetch_paginated's LocalGraphServer seam above, out of scope to add
+    // here) — but `client.set_connection_timeout(10)`/`set_read_timeout(15)`
+    // in acquire_token bound that call, and `first_call.join()` below waits
+    // for it rather than detaching (cpp-safety's unjoined-thread floor), so
+    // this test has a bounded, not unbounded, worst case.
+    DirectorySyncPg store;
+    EntraConfig cfg;
+    cfg.tenant_id = "11111111-1111-1111-1111-111111111111";
+    cfg.client_id = "22222222-2222-2222-2222-222222222222";
+    cfg.client_secret = "not-a-real-secret";
+
+    std::promise<void> guard_acquired;
+    std::future<void> guard_acquired_future = guard_acquired.get_future();
+    std::promise<void> release_first_call;
+    std::future<void> release_first_call_future = release_first_call.get_future();
+
+    store->test_hook_after_entra_guard_acquired_ = [&] {
+        guard_acquired.set_value();
+        release_first_call_future.wait();
+    };
+
+    std::thread first_call([&] {
+        auto result = store->sync_entra(cfg); // will fail downstream (fake creds) — irrelevant
+        (void)result;
+    });
+
+    guard_acquired_future.wait();
+    // The first call now holds the guard, parked in the hook. A second call
+    // MUST be refused immediately — this is the actual assertion, and it
+    // does not touch the network at all.
+    auto second_result = store->sync_entra(cfg);
+    REQUIRE_FALSE(second_result.has_value());
+    CHECK(second_result.error() == "sync already in progress");
+
+    // Gate 3 cpp-safety NICE: release the hook body BEFORE clearing the
+    // std::function that holds it — resetting it to nullptr while
+    // first_call may still be mid-execution of the hook's own body (parked
+    // on the wait() just above) destroys the callable's target during its
+    // own call. Benign here (a trivially-destructible lambda touching
+    // nothing after wait() returns) but the correct order is release then
+    // join then reset, not reset-before-release.
+    release_first_call.set_value();
+    first_call.join(); // never detached — cpp-safety's unjoined-thread floor
+    store->test_hook_after_entra_guard_acquired_ = nullptr;
+
+    // The guard must have been released (RAII) once the first call finished,
+    // whatever its outcome — a third call is not busy.
+    auto third_result = store->sync_entra(cfg);
+    if (!third_result.has_value())
+        CHECK(third_result.error() != "sync already in progress");
 }
 
 TEST_CASE("DirectorySync[pg]: sync_ldap reports not-yet-implemented", "[directory_sync][pg]") {

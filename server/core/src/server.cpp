@@ -59,6 +59,7 @@
 #include "discovery_store.hpp"
 #include "engine_principal_store.hpp"
 #include "execution_event_bus.hpp"
+#include "execution_scope_rules.hpp"
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
@@ -191,6 +192,7 @@
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
 #include "process_health.hpp"
+#include "grpc_bounds_rules.hpp"
 #include "rate_limiter.hpp"
 #include "security_headers.hpp"
 
@@ -572,6 +574,90 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+
+        // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
+        // per docs/observability-conventions.md so absent() alerts stay
+        // meaningful. Bounded labels only — never a peer identity or IP.
+        //
+        // The admission and deadline counters are OPERATIONAL, not security:
+        // a rate/concurrency rejection is expected steady-state behaviour under
+        // a fleet-wide update, not an attack signal (same reasoning as the
+        // per-principal quota counters below). The IDENTITY counter is the
+        // exception and carries event="security", because a failed certificate
+        // bind on an already-enrolled agent's OTA pull is an authentication
+        // event — it mirrors yuzu_grpc_revoked_cert_total.
+        metrics_.describe("yuzu_ota_download_admission_total",
+                          "Agent OTA DownloadUpdate admission decisions by outcome", "counter");
+        // `decision` is a genuine PARTITION over calls that REACH the admission
+        // gate — exactly one of these each. It is deliberately NOT a partition of
+        // every received DownloadUpdate: the on-behalf, revoked-certificate and
+        // positive-identity gates all return before admission and are counted by
+        // their own families, so this sum is legitimately lower than
+        // yuzu_grpc_requests_total{method="DownloadUpdate",status="received"}.
+        // Refunds are a separate family below precisely so they cannot break that.
+        for (auto d : {"admitted", "rejected_concurrency", "rejected_rate", "rejected_total"})
+            metrics_.counter("yuzu_ota_download_admission_total", {{"decision", d}});
+
+        metrics_.describe("yuzu_ota_download_refund_total",
+                          "Agent OTA rate tokens returned after a server-attributable failure, "
+                          "by reason",
+                          "counter");
+        for (auto r : {"registry_unavailable", "version_not_found", "package_missing",
+                       "transfer_deadline", "chunk_deadline"})
+            metrics_.counter("yuzu_ota_download_refund_total", {{"reason", r}});
+
+        metrics_.describe("yuzu_ota_download_deadline_exceeded_total",
+                          "Agent OTA DownloadUpdate transfers aborted by a server-imposed "
+                          "deadline, by phase",
+                          "counter");
+        for (auto ph : {"transfer", "write"})
+            metrics_.counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", ph}});
+
+        metrics_.describe("yuzu_ota_admission_key_mode_total",
+                          "Agent OTA admission keying actually used, by mode", "counter");
+        for (auto m : {"cert", "peer_ip", "unknown"})
+            metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", m}});
+
+        metrics_.describe("yuzu_grpc_ota_identity_rejected_total",
+                          "Agent OTA RPCs rejected for a missing or mismatched client "
+                          "certificate identity, by rpc and reason",
+                          "counter");
+        for (auto rpc : {"check_for_update", "download_update"})
+            for (auto reason :
+                 {"no_client_identity", "foreign_ca", "agent_id_missing", "agent_id_mismatch"})
+                metrics_.counter(
+                    "yuzu_grpc_ota_identity_rejected_total",
+                    {{"event", "security"}, {"rpc", rpc}, {"reason", reason}});
+
+        // Pre-seeded for the same reason as the rejection counter above: an alert
+        // or dashboard that divides by a series which does not exist yet reads as
+        // "no data", not as zero.
+        metrics_.describe("yuzu_ota_identity_audit_suppressed_total",
+                          "Identity-deny audit rows NOT written because the per-peer "
+                          "audit rate limit was exhausted, by rpc and reason",
+                          "counter");
+        for (auto rpc : {"check_for_update", "download_update"})
+            for (auto reason : {"foreign_ca", "agent_id_missing", "agent_id_mismatch"})
+                metrics_.counter("yuzu_ota_identity_audit_suppressed_total",
+                                 {{"rpc", rpc}, {"reason", reason}});
+
+        metrics_.describe("yuzu_ota_download_peers_tracked",
+                          "Peers currently tracked by the OTA admission map", "gauge");
+        metrics_.gauge("yuzu_ota_download_peers_tracked").set(0.0);
+
+        // Published so alerts express occupancy as a RATIO of the configured
+        // ceiling rather than hardcoding a threshold that silently becomes wrong
+        // the moment an operator retunes --ota-max-peers-tracked.
+        metrics_.describe("yuzu_ota_download_peers_capacity",
+                          "Configured ceiling on the OTA admission map (--ota-max-peers-tracked)",
+                          "gauge");
+        metrics_.gauge("yuzu_ota_download_peers_capacity")
+            .set(static_cast<double>(cfg_.ota_max_peers_tracked));
+
+        metrics_.describe("yuzu_ota_download_peers_evicted_total",
+                          "Peers evicted from the OTA admission map by its cardinality ceiling",
+                          "counter");
+        metrics_.counter("yuzu_ota_download_peers_evicted_total");
         // Per-principal quota cap exhaustions (PR 4.4, ADR-1005 class engine
         // principals). Pre-seed all 4 closed series to 0 (docs/observability-
         // conventions.md), mirroring yuzu_onbehalf_rejected_total above.
@@ -2602,6 +2688,24 @@ public:
                           "degradation), distinct from a clock-anomaly decline",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_store_degrade_total");
+        // HA WS-2a durable event outbox retention (ADR-2002 §5) — same
+        // clock-guarded-retention shape as the correlation reap above, a
+        // separate table so a separate counter family.
+        metrics_.describe("yuzu_exec_outbox_reap_total",
+                          "Aged-out durable event_outbox rows deleted by the clock-guarded "
+                          "retention sweep (HA WS-2a)",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_reap_total");
+        metrics_.describe("yuzu_exec_outbox_reap_clock_anomaly_total",
+                          "event_outbox reap passes declined due to an implausible (forward or "
+                          "backward) PostgreSQL now() reading vs the persisted anchor",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_reap_clock_anomaly_total");
+        metrics_.describe("yuzu_exec_outbox_store_degrade_total",
+                          "event_outbox reap passes that failed outright (pool/query degradation), "
+                          "distinct from a clock-anomaly decline",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_store_degrade_total");
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
@@ -5219,6 +5323,63 @@ public:
                 startup_failed_ = true;
             } else {
                 execution_tracker_->set_event_bus(execution_event_bus_.get());
+                execution_tracker_->set_metrics(&metrics_); // ADR-1007
+                // ADR-1007: pre-seed to 0 so absent-vs-zero is meaningful —
+                // a healthy fleet with zero concurrency collisions/anomalies
+                // must read as "wired, nothing happened" on a dashboard, not
+                // as "this code never ran." The reconcile-liveness gauge
+                // below needs no VALUE pre-seed: it is set unconditionally on
+                // every reconciler pass, so it self-heals within one tick of
+                // boot — but it still gets its own describe() call here
+                // (HELP/TYPE registration, not a value), same as the
+                // `yuzu_server_audit_retention_last_pass_unixtime` sibling
+                // this shape is copied from: without it the series has no
+                // documented type and no HELP text on /metrics until the
+                // reconciler's first tick calls .gauge() implicitly.
+                metrics_.describe("yuzu_server_concurrency_reconcile_last_pass_unixtime",
+                                  "Unix timestamp of the stale-claim reconciler's last completed "
+                                  "pass. A liveness signal only - pair with absent()/staleness "
+                                  "alerting to catch a reconciler that stopped ticking, same shape "
+                                  "as yuzu_server_audit_retention_last_pass_unixtime. Absent until "
+                                  "the first pass runs (no value pre-seed - see the comment above).",
+                                  "gauge");
+                metrics_.describe("yuzu_server_dispatch_concurrency_skipped_total",
+                                  "per-device dispatch candidates excluded because they already "
+                                  "held an open concurrency claim for the same definition. Zero "
+                                  "means no candidate has ever been excluded.",
+                                  "counter");
+                metrics_.counter("yuzu_server_dispatch_concurrency_skipped_total");
+                // Gate 3 sre finding (this fix round): a fail-CLOSED claim
+                // attempt (Postgres pool exhaustion or a query failure inside
+                // claim_concurrency_slots) also excludes every candidate from
+                // the dispatch, same as a genuinely-busy candidate, but had no
+                // metric of its own -- an operator watching only the sibling
+                // counter above couldn't distinguish "candidates really are
+                // busy" from "Postgres is degraded and every per-device
+                // dispatch is silently excluded regardless of real state".
+                metrics_.describe("yuzu_server_concurrency_claim_unavailable_total",
+                                  "A per-device concurrency claim attempt failed closed (Postgres "
+                                  "pool exhaustion or a query error) and excluded every candidate "
+                                  "from that dispatch, independent of whether any of them were "
+                                  "actually busy. Nonzero alongside a live "
+                                  "yuzu_server_dispatch_concurrency_skipped_total signal points at "
+                                  "store degradation, not real contention.",
+                                  "counter");
+                metrics_.counter("yuzu_server_concurrency_claim_unavailable_total");
+                metrics_.describe("yuzu_server_concurrency_reconcile_declined_total",
+                                  "Stale-claim reconciler passes declined by the clock-guard's "
+                                  "anomaly classification (implausible clock jump, unusable prior "
+                                  "state, or no persisted anchor yet). Zero means every pass so "
+                                  "far has been accepted.",
+                                  "counter");
+                metrics_.counter("yuzu_server_concurrency_reconcile_declined_total");
+                metrics_.describe("yuzu_server_concurrency_claim_force_released_total",
+                                  "Concurrency claims force-released by the stale-claim "
+                                  "reconciler because their owning agent never reported a "
+                                  "terminal status before expires_at. Zero means no orphaned "
+                                  "claim has ever needed force-release.",
+                                  "counter");
+                metrics_.counter("yuzu_server_concurrency_claim_force_released_total");
                 // UAT 2026-05-06 #8: AgentServiceImpl notifies the
                 // tracker on every response so the per-agent KPI
                 // table populates and SSE agent-transition fires
@@ -6891,6 +7052,30 @@ public:
         // OR operator-supplied). Register stays bootstrap-exempt (it issues the
         // first cert); every other RPC requires a verified, non-revoked identity.
         agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
+
+        // #913 / #911: bounds on the agent OTA pull path.
+        agent_service_.set_ota_bound_config(detail::AgentServiceImpl::OtaBoundConfig{
+            .max_concurrent_per_peer = cfg_.ota_max_concurrent_per_peer,
+            .rate_capacity = cfg_.ota_rate_capacity,
+            .rate_refill_per_min = cfg_.ota_rate_refill_per_min,
+            .transfer_deadline = std::chrono::seconds(cfg_.ota_transfer_deadline_secs),
+            .chunk_stall_deadline = std::chrono::seconds(cfg_.ota_chunk_write_deadline_secs),
+            .max_peers_tracked = static_cast<std::size_t>(cfg_.ota_max_peers_tracked),
+            .max_concurrent_total = cfg_.ota_max_concurrent_total,
+            .cert_reserve_pct = cfg_.ota_cert_reserve_pct,
+        });
+
+        // #416: require a positive peer identity on the OTA RPCs, and bind the
+        // request-body agent_id to the certificate.
+        //
+        // Gated on the LISTENER being strict, NOT on require_client_identity_
+        // above. They differ exactly where it matters: on default agent certs the
+        // agent listener deliberately relaxes to request-but-do-not-require so an
+        // unenrolled agent can bootstrap (see the credential block above), while
+        // require_client_identity_ is TRUE there. Gating on that would reject
+        // every bootstrapping agent's OTA pull.
+        agent_service_.set_require_positive_ota_identity(cfg_.tls_enabled &&
+                                                         !cfg_.using_default_agent_certs);
         // Only an install with our OWN issuing CA (built-in defaults today,
         // subordinate in PR6) signs agent CSRs. When the operator brought their
         // own certs there is no root in ca_store → no signer, and agents must carry
@@ -7070,6 +7255,34 @@ public:
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 30000);
+
+        // Server-wide resource bounds (#913's fleet-wide half). Until these, this
+        // builder carried keepalive/ping args and NOTHING else — no ResourceQuota,
+        // no stream cap, no sync-server thread bound anywhere in the tree. That
+        // absence is what turned the unbounded per-peer OTA path into a genuine
+        // capacity-monopolisation P0 rather than a theoretical one: a single
+        // authenticated agent could open unlimited concurrent streams, each
+        // pinning a gRPC thread on blocking disk and network I/O.
+        //
+        // Both bounds REJECT at capacity rather than queueing — queueing would
+        // hold the very threads the caps exist to free.
+        {
+            // Derivation lives in grpc_bounds_rules.hpp so the MiB->bytes
+            // arithmetic and its overflow guard are testable; these two lines are
+            // the thin application of it.
+            const auto bounds = grpc_bounds_from_config(cfg_);
+            builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS,
+                                       bounds.max_concurrent_streams);
+            grpc::ResourceQuota quota("yuzu_grpc");
+            quota.Resize(bounds.resource_quota_bytes);
+            // The THREAD ceiling is the one that bounds concurrent handlers
+            // globally. GRPC_ARG_MAX_CONCURRENT_STREAMS is per-connection and
+            // connections are uncapped, so without this nothing limits how many
+            // sync handlers — Subscribe, DownloadUpdate — run at once.
+            quota.SetMaxThreads(bounds.max_threads);
+            builder.SetResourceQuota(quota);
+        }
+
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, mgmt_creds);
         builder.RegisterService(&agent_service_);
@@ -10972,7 +11185,18 @@ private:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id,
         const yuzu::server::DispatchCaller& caller,
-        bool broadcast_on_none) {
+        bool broadcast_on_none,
+        // ADR-1007: per-device concurrency gate — trailing, defaulted-empty
+        // so every existing caller is unaffected. The callers that actually
+        // resolve an InstructionDefinition before dispatching supply these —
+        // workflow_routes.cpp's `/api/instructions/:id/execute` route AND
+        // its workflow-step dispatch path (both route through
+        // `command_dispatch_concurrency_fn`, wired to
+        // `WorkflowRoutes::Deps::command_dispatch_fn_concurrency`), plus
+        // `ScheduleRunner`. Every OTHER caller (background pushes, raw
+        // plugin/action dispatch with no definition concept) passes neither
+        // and gets no gate, unchanged from today.
+        const std::string& definition_id = {}, const std::string& concurrency_mode = {}) {
         // Normalize action to lowercase — agent plugins register actions in
         // lowercase and match case-sensitively (was implicit on the MCP path
         // via upstream lowercasing; a safe superset here).
@@ -10980,8 +11204,18 @@ private:
         for (auto& c : norm_action)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
-        auto command_id =
-            plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+        // 16 random bytes (128 bits), not 8 (Sol/Fable adversarial-review
+        // finding, PR #3784 fix round): this is the ONE command_id
+        // generation site behind `dispatch_confined`'s concurrency-gated
+        // callers (`definition_id`/`concurrency_mode` above), and
+        // `ExecutionTracker::release_concurrency_claim_by_command`/
+        // `renew_concurrency_claim_by_command` match on `(command_id,
+        // agent_id)` alone — a collision at 8 bytes was only
+        // probabilistically unlikely, not DB-enforced. See the new
+        // `ux_concurrency_claims_command` unique index
+        // (execution_tracker.cpp) for the enforcement half of this fix.
+        auto command_id = plugin + "-" +
+                          auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
 
         // Same classifier as the /api/command handler (#2500): an explicit
         // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
@@ -11059,7 +11293,8 @@ private:
                 audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
             },
             command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
-            caller.exec_visible, broadcast_on_none, containment_gate, *classified);
+            caller.exec_visible, broadcast_on_none, containment_gate, *classified, definition_id,
+            concurrency_mode);
 
         // #881: this seam serves the MAJORITY of dispatch (MCP, workflows,
         // schedules, REST v1) — without this, quarantine enforcement here
@@ -15343,8 +15578,9 @@ private:
         // Aggregate endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/aggregate)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
@@ -15421,46 +15657,29 @@ private:
                 return;
             }
 
-            // #1634 management-group scope (filter-BEFORE-aggregate; same as MCP
-            // aggregate_responses). The flat Response:Read gate is not a per-agent
-            // ownership check, so resolve the in-scope agent set and push it into the
-            // aggregate WHERE clause. Uses an EXPLICIT positive check, never the
-            // "dropped==0 → unrestricted" inference (#1634 UP-1/2/3):
-            //   * RBAC loaded & explicitly disabled → leave scope nullopt (open).
-            //   * Global Response:Read holder → leave scope nullopt (correct totals at
-            //     any scale; also the perf hoist — skips the distinct scan + per-agent
-            //     loop). check_permission (not is_rbac_enabled) gates this, so a corrupt
-            //     store can't take this branch.
-            //   * Otherwise (group-scoped operator) → resolve and ALWAYS set scope,
-            //     even to the empty set (`AND 1=0` → zero rows), never an unrestricted
-            //     read. A distinct_agent_ids() read error returns 503 (store-availability
-            //     failure is NOT "operator sees no agents" — it must not look like empty
-            //     data; observability-conventions + agentic-first A4 + ADR-0016
-            //     authoritative-reads, #1634 sre review).
+            // #1634 management-group scope. Resolve the responding agents only to
+            // retain the existing distinct-drop audit; the gate's VisibleSet is the
+            // authority and the engaged AggregateScope is applied before folding.
             AggregateScope agg_scope; // nullopt = no restriction
             std::size_t agg_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                if (rbac_enforcement_in_effect(rbac_store_.get()) &&
-                    !(rbac_store_ &&
-                      rbac_store_->check_permission(session->username, "Response", "Read"))) {
-                    auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                    if (!distinct) {
-                        res.status = 503;
-                        res.set_content(
-                            R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
-                            "application/json");
-                        return;
-                    }
-                    std::vector<std::string> in_scope;
-                    in_scope.reserve(distinct->size());
-                    for (auto& aid : *distinct)
-                        if (response_agent_in_scope(session->username, aid))
-                            in_scope.push_back(std::move(aid));
-                    agg_dropped = distinct->size() - in_scope.size();
-                    agg_scope = std::move(in_scope); // ALWAYS engaged in this branch
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
-            } else {
-                return; // require_auth already wrote 401
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++agg_dropped;
+                }
+                agg_scope = std::move(in_scope); // engaged-empty means no rows
             }
             // CC7.2 evidence: a scope-drop is a security-relevant filtering event — record
             // it so a cross-operator access attempt that was suppressed is auditable on this
@@ -15500,8 +15719,9 @@ private:
         // Export endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/export)", [this](const httplib::Request& req,
                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
@@ -15534,7 +15754,34 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
+            // post-fetch filter on a paginated read can hand a confined caller a short or
+            // empty page even though visible rows exist past the hidden ones LIMIT already
+            // truncated. Mirrors the /aggregate sibling's resolve-then-scope pattern above.
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t export_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++export_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15544,32 +15791,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope agents' rows before
-            // export (mirrors MCP query_responses / the visualization reader). The
-            // flat Response:Read gate is not a per-agent ownership check.
-            std::size_t export_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
-                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
-                // response_agent_in_scope, rather than skipping it and serving the fleet.
-                if (rbac_enforcement_in_effect(rbac_store_.get())) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(results.size());
-                    for (auto& r : results) {
-                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
-                        if (ins)
-                            m->second = response_agent_in_scope(session->username, r.agent_id);
-                        if (m->second)
-                            visible.push_back(std::move(r));
-                        else if (ins) // count each DISTINCT dropped agent once
-                            ++export_dropped;
-                    }
-                    results.swap(visible);
-                }
-            } else {
-                return; // require_auth already wrote 401
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (export_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
@@ -15614,8 +15835,9 @@ private:
 
         web_server_->Get(R"(/api/responses/(.+))", [this](const httplib::Request& req,
                                                           httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (instruction_id.empty()) {
@@ -15656,7 +15878,33 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET — see the /export sibling above
+            // for the full rationale (post-fetch filtering a paginated read can hand a
+            // confined caller a short or empty page).
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t get_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++get_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15666,32 +15914,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope agents' rows before
-            // serving (mirrors the export sibling above + MCP query_responses). The
-            // flat Response:Read gate is not a per-agent ownership check.
-            std::size_t get_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
-                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
-                // response_agent_in_scope, rather than skipping it and serving the fleet.
-                if (rbac_enforcement_in_effect(rbac_store_.get())) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(results.size());
-                    for (auto& r : results) {
-                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
-                        if (ins)
-                            m->second = response_agent_in_scope(session->username, r.agent_id);
-                        if (m->second)
-                            visible.push_back(std::move(r));
-                        else if (ins) // count each DISTINCT dropped agent once
-                            ++get_dropped;
-                    }
-                    results.swap(visible);
-                }
-            } else {
-                return; // require_auth already wrote 401
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (get_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
@@ -17135,16 +17357,38 @@ private:
         });
 
         // -- Execution API ----------------------------------------------------
+        //
+        // #3789: every route below is gated on `require_fleet_read(...,
+        // "Read")` (mutations additionally keep their pre-existing
+        // `require_permission(..., "Execute")` ahead of it — the fleet gate
+        // structurally rejects any operation but "Read", see
+        // authz_gates.cpp). `gate.scope` engaged means a confined caller;
+        // visibility/count/mutation-admission decisions are delegated to
+        // execution_scope_rules.hpp so every route (and its tests) share ONE
+        // implementation of each rule. See docs/auth-architecture.md's
+        // "Fourth migration (#3789)" note for the full design rationale.
 
         web_server_->Get("/api/executions", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
-                return;
+            // No correlation-id capture here. Unlike the `/api/responses/*`
+            // family (server.cpp aggregate/export/get routes), which
+            // computes a `scope_dropped=N` audit count because it filters
+            // rows in C++ AFTER the query, this route's confinement is a
+            // SQL EXISTS pushdown (execution_tracker.cpp's
+            // append_execution_scope_clause) — dropped rows never reach
+            // this handler, so N is not observable here without a second,
+            // unfiltered COUNT(*) query per confined LIST call (real cost
+            // on the exact route already flagged for scan-depth amplification,
+            // consistency-auditor #3789 Finding 1 / chaos-injector CH-6).
+            // Deliberately deferred, not an oversight — tracked as
+            // follow-up #3832 rather than blocking this migration. a4_error
+            // mints a correlation id lazily on any 503/400 branch below.
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -17158,26 +17402,103 @@ private:
                     q.limit = std::stoi(req.get_param_value("limit"));
             } catch (const std::exception&) {
                 res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            // #3789: the legacy route previously had no upper bound; cap
+            // matches MCP list_executions (mcp_server.cpp).
+            if (q.limit < 1)
+                q.limit = 1;
+            if (q.limit > 500)
+                q.limit = 500;
+
+            yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+                // #3789 (mcp_server.cpp list_executions CH-5 precedent): an
+                // empty username must never silently widen the owner
+                // disjunct to "no owner filter" for a confined caller.
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                yuzu::server::ExecutionListScope s;
+                s.owner = username;
+                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                scope_arg = std::move(s);
+            }
+
+            auto execs_opt = execution_tracker_->query_executions_checked(q, scope_arg);
+            if (!execs_opt) {
+                res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
                     "application/json");
                 return;
             }
+            const auto& execs = *execs_opt;
 
-            auto execs = execution_tracker_->query_executions(q);
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& e : execs) {
-                arr.push_back({{"id", e.id},
-                               {"definition_id", e.definition_id},
-                               {"status", e.status},
-                               {"dispatched_by", e.dispatched_by},
-                               {"dispatched_at", e.dispatched_at},
-                               {"agents_targeted", e.agents_targeted},
-                               {"agents_responded", e.agents_responded},
-                               {"agents_success", e.agents_success},
-                               {"agents_failure", e.agents_failure},
-                               {"completed_at", e.completed_at},
-                               {"rerun_of", e.rerun_of}});
+            if (gate.scope) {
+                // #3789: batched per-row visibility + confined counts, one
+                // round trip (ADR-0017 INV-10) — the SQL scope pushdown
+                // above already restricted `execs` to visible rows; this
+                // re-check is defense-in-depth plus how the per-row confined
+                // counts get derived.
+                std::vector<std::string> ids;
+                ids.reserve(execs.size());
+                for (const auto& e : execs)
+                    ids.push_back(e.id);
+                auto statuses_opt = execution_tracker_->get_agent_statuses_for_executions_checked(ids);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& e : execs) {
+                    auto it = statuses_opt->find(e.id);
+                    const auto& statuses =
+                        it != statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(e, statuses, gate.scope, username))
+                        continue;
+                    auto counts = confined_projection(statuses, gate.scope);
+                    arr.push_back({{"id", e.id},
+                                   {"definition_id", e.definition_id},
+                                   {"status", e.status},
+                                   {"dispatched_by", e.dispatched_by},
+                                   {"dispatched_at", e.dispatched_at},
+                                   {"agents_targeted", counts.agents_targeted},
+                                   {"agents_responded", counts.agents_responded},
+                                   {"agents_success", counts.agents_success},
+                                   {"agents_failure", counts.agents_failure},
+                                   {"completed_at", e.completed_at},
+                                   {"rerun_of", e.rerun_of}});
+                }
+            } else {
+                for (const auto& e : execs) {
+                    arr.push_back({{"id", e.id},
+                                   {"definition_id", e.definition_id},
+                                   {"status", e.status},
+                                   {"dispatched_by", e.dispatched_by},
+                                   {"dispatched_at", e.dispatched_at},
+                                   {"agents_targeted", e.agents_targeted},
+                                   {"agents_responded", e.agents_responded},
+                                   {"agents_success", e.agents_success},
+                                   {"agents_failure", e.agents_failure},
+                                   {"completed_at", e.completed_at},
+                                   {"rerun_of", e.rerun_of}});
+                }
             }
             res.set_content(nlohmann::json({{"executions", arr}, {"count", arr.size()}}).dump(),
                             "application/json");
@@ -17185,85 +17506,317 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+))", [this](const httplib::Request& req,
                                                               httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto exec = execution_tracker_->get_execution(id);
-            if (!exec) {
-                res.status = 404;
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":404,"message":"not found"},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
                     "application/json");
                 return;
             }
+            const auto& exec_opt = *exec_r;
 
-            res.set_content(nlohmann::json({{"id", exec->id},
-                                            {"definition_id", exec->definition_id},
-                                            {"status", exec->status},
-                                            {"scope_expression", exec->scope_expression},
-                                            {"parameter_values", exec->parameter_values},
-                                            {"dispatched_by", exec->dispatched_by},
-                                            {"dispatched_at", exec->dispatched_at},
-                                            {"agents_targeted", exec->agents_targeted},
-                                            {"agents_responded", exec->agents_responded},
-                                            {"agents_success", exec->agents_success},
-                                            {"agents_failure", exec->agents_failure},
-                                            {"completed_at", exec->completed_at},
-                                            {"parent_id", exec->parent_id},
-                                            {"rerun_of", exec->rerun_of}})
+            std::vector<AgentExecStatus> statuses;
+            if (gate.scope) {
+                // #1634 perf precedent: only fetch/scan agent statuses when
+                // confined — an unrestricted caller is always visible
+                // regardless, so this indexed lookup would be pure waste.
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                statuses = std::move(*statuses_opt);
+            }
+
+            const bool visible =
+                exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            if (!exec_opt || !visible) {
+                // #3789: audit ONLY when a confinement decision actually
+                // happened (gate.scope engaged) — a suppressed
+                // cross-operator read attempt is CC7.2-evidence-worthy the
+                // same way the #1634 v1 detail route treats it. An
+                // unconfined caller's genuinely-nonexistent id is ordinary
+                // "not found", not a security event; auditing it as
+                // "denied" would inflate the confinement-denial metric with
+                // routine 404s (compliance-officer #3789 F2). The
+                // caller-visible response stays identical either way (no
+                // oracle) — only the server-side audit trail differs.
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=detail "
+                                    "cid=" +
+                                        cid);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            const auto& exec = *exec_opt;
+            std::string scope_expression = exec.scope_expression;
+            std::string parameter_values = exec.parameter_values;
+            int agents_targeted = exec.agents_targeted;
+            int agents_responded = exec.agents_responded;
+            int agents_success = exec.agents_success;
+            int agents_failure = exec.agents_failure;
+            // #3789: `owns_execution` above exists only to admit a
+            // dispatcher to a just-dispatched, zero-status-row execution —
+            // it must never also bypass this projection (#1634 precedent,
+            // rest_api_v1.cpp). Apply confinement whenever `gate.scope` is
+            // engaged, dispatcher or not.
+            if (gate.scope) {
+                auto counts = confined_projection(statuses, gate.scope);
+                agents_targeted = counts.agents_targeted;
+                agents_responded = counts.agents_responded;
+                agents_success = counts.agents_success;
+                agents_failure = counts.agents_failure;
+                scope_expression = "(redacted - confined view)";
+                parameter_values = "(redacted - confined view)";
+            }
+            // Deliberately keep status, completion time, dispatcher, and
+            // lineage truthful (#1634 precedent) — none directly names
+            // another agent. Deliberately NOT adding last_error_detail:
+            // this legacy payload never carried it, and it is
+            // PII-adjacent (agent stderr) — do not introduce a new
+            // unconfined exposure while closing this gap.
+            res.set_content(nlohmann::json({{"id", exec.id},
+                                            {"definition_id", exec.definition_id},
+                                            {"status", exec.status},
+                                            {"scope_expression", scope_expression},
+                                            {"parameter_values", parameter_values},
+                                            {"dispatched_by", exec.dispatched_by},
+                                            {"dispatched_at", exec.dispatched_at},
+                                            {"agents_targeted", agents_targeted},
+                                            {"agents_responded", agents_responded},
+                                            {"agents_success", agents_success},
+                                            {"agents_failure", agents_failure},
+                                            {"completed_at", exec.completed_at},
+                                            {"parent_id", exec.parent_id},
+                                            {"rerun_of", exec.rerun_of}})
                                 .dump(),
                             "application/json");
         });
 
         web_server_->Get(R"(/api/executions/([^/]+)/summary)", [this](const httplib::Request& req,
                                                                       httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto summary = execution_tracker_->get_summary(id);
-            res.set_content(nlohmann::json({{"id", summary.id},
-                                            {"status", summary.status},
-                                            {"agents_targeted", summary.agents_targeted},
-                                            {"agents_responded", summary.agents_responded},
-                                            {"agents_success", summary.agents_success},
-                                            {"agents_failure", summary.agents_failure},
-                                            {"progress_pct", summary.progress_pct}})
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            std::vector<AgentExecStatus> statuses;
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                statuses = std::move(*statuses_opt);
+            }
+
+            const bool visible =
+                exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            if (!exec_opt || !visible) {
+                // #3789: unknown-id and invisible now collapse to the SAME
+                // 404 for EVERY caller — the legacy route previously
+                // returned a zero-filled 200 for an unknown id even to an
+                // unconfined caller (behavior change; docs/user-manual/
+                // upgrading.md). Audit ONLY under an engaged scope — see
+                // the detail route's identical rationale.
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=summary "
+                                    "cid=" +
+                                        cid);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            const auto& exec = *exec_opt;
+            int agents_targeted = exec.agents_targeted;
+            int agents_responded = exec.agents_responded;
+            int agents_success = exec.agents_success;
+            int agents_failure = exec.agents_failure;
+            if (gate.scope) {
+                auto counts = confined_projection(statuses, gate.scope);
+                agents_targeted = counts.agents_targeted;
+                agents_responded = counts.agents_responded;
+                agents_success = counts.agents_success;
+                agents_failure = counts.agents_failure;
+            }
+            const int progress_pct =
+                agents_targeted > 0 ? (agents_responded * 100 / agents_targeted) : 0;
+
+            res.set_content(nlohmann::json({{"id", exec.id},
+                                            {"status", exec.status},
+                                            {"agents_targeted", agents_targeted},
+                                            {"agents_responded", agents_responded},
+                                            {"agents_success", agents_success},
+                                            {"agents_failure", agents_failure},
+                                            {"progress_pct", progress_pct}})
                                 .dump(),
                             "application/json");
         });
 
         web_server_->Get(R"(/api/executions/([^/]+)/agents)", [this](const httplib::Request& req,
                                                                      httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto agents = execution_tracker_->get_agent_statuses(id);
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+            if (!statuses_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& statuses = *statuses_opt;
+
+            const bool visible =
+                exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
+            if (!exec_opt || !visible) {
+                // #3789: audit ONLY under an engaged scope — see the detail
+                // route's identical rationale (compliance-officer F2).
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=agents "
+                                    "cid=" +
+                                        cid);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            // #3789: this route returns raw agent identities — the worst
+            // leak of the seven pre-migration routes. Filter to in-scope
+            // agents; the projection applies to the dispatcher too, same as
+            // the detail route.
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : agents) {
+            for (const auto& a : statuses) {
+                if (!authz::in_scope(gate.scope, a.agent_id))
+                    continue;
                 arr.push_back({{"agent_id", a.agent_id},
                                {"status", a.status},
                                {"dispatched_at", a.dispatched_at},
@@ -17279,11 +17832,13 @@ private:
                                                                      httplib::Response& res) {
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
@@ -17293,6 +17848,69 @@ private:
 
             auto session = auth_routes_->resolve_session(req);
             auto user = session ? session->username : "unknown";
+            const std::string username = session ? session->username : std::string{};
+
+            if (gate.scope) {
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 (matches the GET routes' identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                auto exec_r = execution_tracker_->get_execution_checked(id);
+                if (!exec_r) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                const auto& exec_opt = *exec_r;
+                // #3789 (adversarial review, Kimi+Codex): fetch statuses
+                // UNCONDITIONALLY here, not only when exec_opt exists — an
+                // id-conditional second query is a timing/work oracle that
+                // lets a confined caller distinguish "nonexistent" from
+                // "exists but hidden" by DB round-trip count, even though
+                // the HTTP response is identical. The GET routes already
+                // fetch unconditionally under gate.scope for the same
+                // reason; mirror that shape here.
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                const bool admitted = exec_opt.has_value() &&
+                                     admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
+                                                            username);
+                if (!admitted) {
+                    // #3789: uniform deny shape — nonexistent, zero-visible,
+                    // partial, and incomplete-target-ledger all collapse to
+                    // the SAME 404 + non-distinguishing audit detail (a
+                    // distinct status for "partial visibility" would be a
+                    // hidden-cohort oracle, Sol/gpt-5.6-sol adversarial
+                    // review).
+                    (void)audit_log(req, "execution.rerun", "denied", "execution", id,
+                                    "not found or outside caller's fleet-read scope cid=" + cid);
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "not found"), "application/json");
+                    return;
+                }
+            }
+            // Unconfined callers (and confined-and-admitted ones) fall
+            // through to create_rerun, which performs its own
+            // (degrade-collapsing) existence check internally — unchanged
+            // from pre-#3789 behavior for an unconfined caller hitting an
+            // unknown id (400 "original execution not found").
 
             auto result = execution_tracker_->create_rerun(id, user, failed_only);
             if (!result) {
@@ -17315,17 +17933,89 @@ private:
                                                                       httplib::Response& res) {
             if (!require_permission(req, res, "Execution", "Execute"))
                 return;
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
             auto session = auth_routes_->resolve_session(req);
             auto user = session ? session->username : "unknown";
+            const std::string username = session ? session->username : std::string{};
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            if (gate.scope) {
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 (matches the GET routes' identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                // #3789 (adversarial review, Kimi+Codex): fetch statuses and
+                // audit UNIFORMLY for a nonexistent id and a
+                // hidden-but-existing/incomplete-cohort id — the earlier
+                // shape short-circuited on `!exec_opt` before this fetch,
+                // which was both a timing/work oracle (one DB round-trip
+                // less for a nonexistent id) and an audit-trail asymmetry
+                // (only the hidden-but-existing case wrote a `denied` row) —
+                // breaking the documented "identical 404 + non-distinguishing
+                // audit detail" guarantee for the two cases a caller sees as
+                // the same response.
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                const bool admitted = exec_opt.has_value() &&
+                                     admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
+                                                            username);
+                if (!admitted) {
+                    (void)audit_log(req, "execution.cancel", "denied", "execution", id,
+                                    "not found or outside caller's fleet-read scope cid=" + cid);
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "not found"), "application/json");
+                    return;
+                }
+            } else if (!exec_opt) {
+                // #3789 + PR #3842: this existence check gives an unknown id a
+                // clean 404. It was originally load-bearing because
+                // `mark_cancelled` reported PGRES_COMMAND_OK (a false "cancelled"
+                // 200) on an UPDATE matching zero rows (Sol/gpt-5.6-sol review);
+                // PR #3842's `RETURNING id` + terminal-status guard now makes
+                // mark_cancelled return FALSE for an unknown OR already-terminal
+                // execution, so this check is now defense-in-depth — it keeps the
+                // common unknown-id case a 404 rather than the 503 a bare
+                // mark_cancelled-false would produce below (a not-found/terminal-
+                // vs-degrade refinement of that 503 is tracked in #3845). A
+                // confined caller's existence check is folded into the branch above.
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
 
             // governance PR review (2026-08-31): mark_cancelled now reports
             // whether the update actually happened — do not tell the
@@ -17334,9 +18024,8 @@ private:
             if (!execution_tracker_->mark_cancelled(id, user)) {
                 (void)audit_log(req, "execution.cancel", "failure", "execution", id);
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"cancel failed - execution store degraded"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "cancel failed - execution store degraded"),
+                                "application/json");
                 return;
             }
             (void)audit_log(req, "execution.cancel", "success", "execution", id);
@@ -17349,22 +18038,124 @@ private:
 
         web_server_->Get(R"(/api/executions/([^/]+)/children)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            if (!require_permission(req, res, "Execution", "Read"))
+            const auto cid = detail::ensure_correlation_id(res);
+            auto gate = require_fleet_read(req, res, "Execution", "Read");
+            if (!gate.admitted)
                 return;
             if (!execution_tracker_) {
                 res.status = 503;
-                res.set_content(
-                    R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
             }
 
             auto id = req.matches[1].str();
-            auto children = execution_tracker_->get_children(id);
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_routes_->resolve_session(req);
+                username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+            }
+
+            auto exec_r = execution_tracker_->get_execution_checked(id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            std::vector<AgentExecStatus> parent_statuses;
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker_->get_agent_statuses_checked(id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                parent_statuses = std::move(*statuses_opt);
+            }
+
+            const bool parent_visible =
+                exec_opt.has_value() &&
+                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+            if (!exec_opt || !parent_visible) {
+                // #3789: audit ONLY under an engaged scope — see the detail
+                // route's identical rationale (compliance-officer F2).
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=children "
+                                    "cid=" +
+                                        cid);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "not found"), "application/json");
+                return;
+            }
+
+            auto children_opt = execution_tracker_->get_children_checked(id);
+            if (!children_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& c : children) {
-                arr.push_back(
-                    {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+            if (gate.scope) {
+                // #3789 (Sol/gpt-5.6-sol adversarial review, overriding an
+                // earlier "truthful lineage" reading of the #1634 detail
+                // precedent): parent visibility does NOT authorize
+                // enumerating separate child execution records — each
+                // child passes the same owner-or-visible-agent predicate
+                // independently. One batched statuses call, not N+1.
+                std::vector<std::string> child_ids;
+                child_ids.reserve(children_opt->size());
+                for (const auto& c : *children_opt)
+                    child_ids.push_back(c.id);
+                auto child_statuses_opt =
+                    execution_tracker_->get_agent_statuses_for_executions_checked(child_ids);
+                if (!child_statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                    {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& c : *children_opt) {
+                    auto it = child_statuses_opt->find(c.id);
+                    const auto& c_statuses =
+                        it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                        continue;
+                    arr.push_back(
+                        {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+                }
+            } else {
+                for (const auto& c : *children_opt) {
+                    arr.push_back(
+                        {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+                }
             }
             res.set_content(nlohmann::json({{"children", arr}}).dump(), "application/json");
         });
@@ -17903,6 +18694,35 @@ private:
                     replace("{{SEL_CC_DEF}}",
                             def.concurrency_mode == "per-definition" ? "selected" : "");
                     replace("{{SEL_CC_SET}}", def.concurrency_mode == "per-set" ? "selected" : "");
+                    // Fifth, dynamic option (Gate 6 enterprise-readiness finding, PR #3784 fix
+                    // round): the four static options above cover every ENFORCED/documented
+                    // mode, but the real content library also ships `global`/`global-singleton`
+                    // (42 catalog-only `plugin: server` definitions, ADR-1007) — neither matches
+                    // any static <option>, so none was ever `selected` and the browser silently
+                    // defaulted to displaying "Unlimited". Form-mode "Convert to YAML" then baked
+                    // that displayed default into the generated YAML, so an ordinary Save on one
+                    // of those 42 definitions silently overwrote its real concurrency_mode. Fixed
+                    // by emitting a raw <option> carrying the actual stored value whenever it
+                    // doesn't match one of the four known modes, so round-tripping never discards
+                    // it. NOT run through the escaping `replace()` lambda above (it HTML-escapes
+                    // the whole substituted string, which would mangle this option's own tags) —
+                    // only the stored value itself is escaped, everything else is a literal
+                    // template.
+                    {
+                        static const std::string kOtherPlaceholder = "{{SEL_CC_OTHER_OPTION}}";
+                        std::string other_option;
+                        if (!def.concurrency_mode.empty() && def.concurrency_mode != "unlimited" &&
+                            def.concurrency_mode != "per-device" &&
+                            def.concurrency_mode != "per-definition" &&
+                            def.concurrency_mode != "per-set") {
+                            const auto escaped = html_escape(def.concurrency_mode);
+                            other_option = "<option value=\"" + escaped + "\" selected>" + escaped +
+                                          " (unrecognized, not enforced)</option>";
+                        }
+                        for (auto pos = tmpl.find(kOtherPlaceholder); pos != std::string::npos;
+                             pos = tmpl.find(kOtherPlaceholder))
+                            tmpl.replace(pos, kOtherPlaceholder.size(), other_option);
+                    }
                 }
             } else {
                 // New definition — clear all placeholders
@@ -17939,6 +18759,7 @@ private:
                 clear("{{SEL_CC_DEV}}");
                 clear("{{SEL_CC_DEF}}");
                 clear("{{SEL_CC_SET}}");
+                clear("{{SEL_CC_OTHER_OPTION}}");
             }
             res.set_content(tmpl, "text/html; charset=utf-8");
         });
@@ -18522,6 +19343,22 @@ private:
                                      execution_id, caller, /*broadcast_on_none=*/false);
         };
 
+        // ADR-1007 — a deliberate SIBLING of command_dispatch_caller_fn, not
+        // a widening of it (see workflow_routes.hpp's ConcurrencyDispatchFn
+        // doc comment for why). Routes through the identical dispatch_confined
+        // seam, two extra trailing arguments.
+        auto command_dispatch_concurrency_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+                   const std::string& definition_id,
+                   const std::string& concurrency_mode) -> std::pair<std::string, int> {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false,
+                                     definition_id, concurrency_mode);
+        };
+
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
         // A background thread ticks it: dispatch due policies' check
         // instructions, collect responses, evaluate the CEL, write status.
@@ -18778,6 +19615,18 @@ private:
                           "which denies fail-closed). Zero means the check ran and passed.",
                           "counter");
         metrics_.counter("yuzu_schedule_arming_denied_total");
+        // ADR-1007: absent-vs-zero carries the same meaning as the arming
+        // counter above — zero means the second definition read always
+        // succeeded and per-device enforcement applied to every fire;
+        // absent means this code never ran (metrics unwired), which must
+        // not read as "always succeeded" on a dashboard.
+        metrics_.describe("yuzu_schedule_concurrency_mode_lookup_failed_total",
+                          "Scheduled fires where the second get_definition() read (needed to "
+                          "learn concurrency_mode) failed or returned empty - per-device "
+                          "concurrency enforcement was NOT applied to that one fire. Zero means "
+                          "the read always succeeded.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_concurrency_mode_lookup_failed_total");
         schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
             .schedule_engine = schedule_engine_.get(),
             .instruction_store = instruction_store_.get(),
@@ -18794,6 +19643,7 @@ private:
             // `command_dispatch_caller_fn` — reverting it to the system
             // closure silently reopens that bypass.
             .dispatch_fn = command_dispatch_caller_fn,
+            .dispatch_fn_concurrency = command_dispatch_concurrency_fn,
             .resolve_caller =
                 [this](const std::string& username) {
                 return derive_dispatch_caller_for_username(username);
@@ -18907,6 +19757,22 @@ private:
                 // so this rides the same 60m cadence as the other non-PII
                 // stores above, not the tighter session cadence.
                 constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // ADR-1007: per-device concurrency claim stale-claim reconciler
+                // cadence — see the call site's own comment for the rationale.
+                constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
+                // The event_outbox drains on a MUCH tighter cadence than the
+                // correlation table above: it receives ~2-3 rows per agent
+                // CommandResponse (agent-transition + progress + terminal),
+                // vs one row per command for command_execution, so on a busy
+                // fleet the hourly 5000-row cap cannot keep up (governance
+                // Gate 3 performance/sre finding — insert rate can exceed a
+                // 5000/hr drain, growing the table unbounded). At ~60s the
+                // same 5000-row cap gives ~300k/hr of drain headroom, well
+                // above any realistic append rate, keeping the table bounded
+                // to a few minutes of backlog beyond the 24h window. The reap
+                // is idempotent, advisory-lock-serialised across replicas, and
+                // a bounded index-scan DELETE, so the tighter cadence is cheap.
+                constexpr int kEventOutboxReapEveryNTicks = 30; // ~60s at 2s/tick
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -19103,6 +19969,47 @@ private:
                                         .increment();
                             } else {
                                 metrics_.counter("yuzu_exec_correlation_store_degrade_total")
+                                    .increment();
+                            }
+                        }
+
+                        // 2f) Per-device concurrency claim stale-claim reconciler
+                        // (ADR-1007) — piggybacks this thread's tick counter like
+                        // the reaps above. A ~5m cadence: frequent enough that a
+                        // crashed/disconnected agent's orphaned claim does not
+                        // block a legitimate re-dispatch of the same definition to
+                        // the same device for too long, without competing for the
+                        // pool anywhere near session/response reap frequency.
+                        // reconcile_stale_concurrency_claims is itself
+                        // clock-guarded (persisted anchor, sanitized reading,
+                        // fact-set anomaly suppression, unconditional cap — see
+                        // its own doc comment) — this call site owns only the
+                        // cadence, not the safety.
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kConcurrencyClaimReconcileEveryNTicks == 0) {
+                            execution_tracker_->reconcile_stale_concurrency_claims(now);
+                        }
+
+                        // 2g) durable event_outbox retention (HA WS-2a, ADR-2002
+                        // §5). Same clock-guarded shape and cadence as the
+                        // correlation reap above, on its own table/metric family.
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kEventOutboxReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_event_outbox()) {
+                                if (reaped->deleted > 0)
+                                    metrics_.counter("yuzu_exec_outbox_reap_total")
+                                        .increment(static_cast<double>(reaped->deleted));
+                                if (reaped->clock_anomaly)
+                                    metrics_.counter("yuzu_exec_outbox_reap_clock_anomaly_total")
+                                        .increment();
+                            } else {
+                                // Log the descriptive PG error, not just bump the
+                                // counter (PR #3842 review): on a ~60s cadence a
+                                // real reap failure is otherwise a climbing counter
+                                // with nothing to grep for.
+                                spdlog::warn("event_outbox reap failed: {}",
+                                             reaped.error());
+                                metrics_.counter("yuzu_exec_outbox_store_degrade_total")
                                     .increment();
                             }
                         }
@@ -20303,6 +21210,7 @@ private:
         // system command_dispatch_fn. Both funnel through the ONE
         // dispatch_confined seam.
         wf_deps.command_dispatch_fn = command_dispatch_caller_fn;
+        wf_deps.command_dispatch_fn_concurrency = command_dispatch_concurrency_fn;
         wf_deps.caller_fn =
             [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
             // Resolve the session from a throwaway Response (never written back);

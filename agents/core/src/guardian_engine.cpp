@@ -278,7 +278,7 @@ std::expected<void, std::string> GuardianEngine::start_local() {
         try {
             if (rearm_fault_hook_for_test_)
                 rearm_fault_hook_for_test_(rule.rule_id());
-            if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
+            if (reconcile_rule_locked(rule) == ReconcileOutcome::Armed) // either backend
                 ++rearmed;
         } catch (const std::exception& e) {
             // Build once, log, and record for last_rearm_degrade_message_for_test - a single
@@ -695,8 +695,9 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // takes for a thread-exhaustion throw. catch(...) not just std::exception, and
         // the log is guarded (spdlog allocates and could itself throw under the bad_alloc
         // that triggered this). (rung 7.7b PR-1 item 3 / Sol B1 + Fable.)
+        ReconcileOutcome outcome = ReconcileOutcome::Inert;
         try {
-            reconcile_rule_locked(rule); // step 4: arm/withdraw via the reconcile op (rung 7)
+            outcome = reconcile_rule_locked(rule); // step 4: arm/withdraw (rung 7)
         } catch (...) {
             ++reconcile_failures;
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -706,6 +707,17 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             } catch (...) {
             }
             continue; // not counted as applied
+        }
+        // #2233 item 3: a genuine arm ATTEMPT that did not succeed (see
+        // ReconcileOutcome's doc) must count the same as a throw here - both mean
+        // this rule did not end up armed this push, and the policy_generation
+        // hold-on-failure gate below must see it. Inert outcomes (disabled,
+        // Unsupported, agent-wide SparkFailed/Unwired, ...) are NOT failures and
+        // must not gate generation advancement - unchanged from before this fix.
+        if (outcome == ReconcileOutcome::Failed) {
+            ++reconcile_failures;
+            arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            continue; // not counted as applied - reconcile_rule_locked already logged why
         }
         ++applied;
     }
@@ -1178,13 +1190,14 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
     return false;
 }
 
-bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
+GuardianEngine::ReconcileOutcome
+GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
     if (!rule.enabled()) {
         if (spark_runtime_)
             spark_runtime_->detach_rule(rule.rule_id());
         withdraw_legacy_guard_locked(rule.rule_id());
         unsupported_rules_.erase(rule.rule_id()); // F7: disabled, not Unsupported
-        return false;
+        return ReconcileOutcome::Inert;
     }
 
     // VALIDATION FIRST, before any capability/preference question: an
@@ -1214,7 +1227,7 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
             spark_runtime_->detach_rule(rule.rule_id());
         withdraw_legacy_guard_locked(rule.rule_id());
         unsupported_rules_.erase(rule.rule_id()); // F7: an authoring fault, not Unsupported
-        return false;
+        return ReconcileOutcome::Inert;
     }
 
     // spark_availability_ is set exactly once by wire_spark_engine() and never
@@ -1225,7 +1238,7 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
                           spark_availability_ == SparkAvailability::Unwired)) {
         withdraw_legacy_guard_locked(rule.rule_id());
         unsupported_rules_.erase(rule.rule_id()); // F7: agent-wide errored/inert, not per-rule Unsupported
-        return false;
+        return ReconcileOutcome::Inert;
     }
 
     const bool try_spark = prefer_spark_ && spark_availability_ == SparkAvailability::Available;
@@ -1247,12 +1260,17 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
                                                    std::move(*assertion),
                                                    /*emit_compliant_edge=*/true);
             if (gen)
-                return true; // armed; attach_rule already enqueued its own "armed" audit entry
-            // Arm failure: errored, NEVER a fallback to legacy (mutual exclusion).
+                return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry
+            // Arm failure: errored, NEVER a fallback to legacy (mutual exclusion). A
+            // genuine arm ATTEMPT that did not succeed - synchronous refusal, a
+            // #2233 item 3 bounded-wait timeout, or a same-key busy rejection - so
+            // this counts (ReconcileOutcome::Failed), unlike this function's other
+            // false-shaped outcomes: the caller's policy_generation hold-on-failure
+            // gate must not treat a timed-out rule's push as fully applied.
             spdlog::warn("Guardian: spark arm failed for rule '{}': {}", rule.rule_id(),
                          gen.error());
             spark_runtime_->detach_rule(rule.rule_id()); // defensive; attach_rule leaves nothing on failure
-            return false;
+            return ReconcileOutcome::Failed;
         }
         if (placement == RulePlacement::Unrecognized) {
             // Structurally unreachable here: spec/assertion validation above
@@ -1265,7 +1283,7 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
                 spark_runtime_->detach_rule(rule.rule_id());
             withdraw_legacy_guard_locked(rule.rule_id());
             unsupported_rules_.erase(rule.rule_id()); // F7: an authoring fault, not Unsupported
-            return false;
+            return ReconcileOutcome::Inert;
         }
         // placement == Unsupported (F7, #2298 rung 2 / design doc §R2 + §Platform-
         // rejection): a known spark type with NO mechanism registered on this host.
@@ -1299,13 +1317,16 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
                              "a routine cross-platform gap, not an error",
                              rule.rule_id(), rule.spark().type());
         }
-        return false;
+        return ReconcileOutcome::Inert; // pinned: "an all-unsupported push still advances
+                                        // policy_generation" (test_guardian_engine_spark_reconcile.cpp)
     }
 
     if (spark_runtime_)
         spark_runtime_->detach_rule(rule.rule_id()); // harmless no-op if never attached
     unsupported_rules_.erase(rule.rule_id()); // F7: legacy-selected path, not Unsupported
-    return start_guard_for_rule_locked(rule); // existing legacy path, UNCHANGED
+    // existing legacy path, UNCHANGED - a legacy arm failure stays Inert here (status
+    // quo before #2233 item 3; not this PR's concern to reclassify).
+    return start_guard_for_rule_locked(rule) ? ReconcileOutcome::Armed : ReconcileOutcome::Inert;
 }
 
 void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_by_config,
@@ -1489,7 +1510,17 @@ GuardianEngine::SparkAvailability GuardianEngine::spark_availability() const {
 
 std::size_t GuardianEngine::active_io_workers() const {
     std::lock_guard lock(mtx_);
-    return spark_reader_ ? spark_reader_->active_io_workers() : 0;
+    // #2233 item 3: spark_runtime_'s own bounded arm/disarm executor is a SECOND
+    // source of live backend I/O workers, distinct from spark_reader_'s state-read
+    // executor (guardian_spark_runtime.hpp - dedicated instance, never shared). Both
+    // must be summed here: this is the orphan-exit contract's sole source of truth
+    // (hard_exit.hpp / guardian_io_executor.hpp) - main.cpp/service_win.cpp refuse
+    // normal C++ teardown while this is nonzero, and a source left out of the sum
+    // would let a detached worker survive teardown undetected.
+    std::size_t n = spark_reader_ ? spark_reader_->active_io_workers() : 0;
+    if (spark_runtime_)
+        n += spark_runtime_->active_backend_op_workers();
+    return n;
 }
 
 // #501: Test-support helper — see guardian_engine.hpp for the full rationale.

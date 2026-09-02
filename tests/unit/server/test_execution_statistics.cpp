@@ -222,6 +222,43 @@ TEST_CASE("ExecutionStatistics: agent stats grouped correctly",
     CHECK(found_agent1);
 }
 
+TEST_CASE("ExecutionStatistics: a 'running' (in-flight) execution is excluded from "
+          "success/failure/total, not counted as a success (consistency-auditor Gate 4 finding, "
+          "PR #3784 fix round)",
+          "[pg][execution_statistics][agent_stats][adr1007]") {
+    // The keepalive thread (ADR-1007, agents/core/src/agent.cpp) sends a bare
+    // RUNNING response every 5 minutes for any long-running per-device
+    // command -- exit_code defaults to 0 on the wire for a non-terminal
+    // response, which used to satisfy this query's old success CASE
+    // (`exit_code = 0 AND status != 'pending'`), counting a still-executing
+    // command as a completed success. Turned this from a rare (only a
+    // plugin crossing the 64KB output-flush threshold) into a routine
+    // misclassification for any per-device dispatch running past 5 minutes.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = now_epoch();
+    auto e1 = make_exec("def-running", "running", 1, 0, 0, now - 100, 0);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+
+    // exit_code=0 mirrors the wire shape of a genuine RUNNING/keepalive
+    // response (unset, proto default) -- exactly the value that used to
+    // satisfy the old success CASE's `exit_code = 0` half.
+    insert_agent_status(tracker, *id1, "agent-running", "running", /*exit_code=*/0, now - 100);
+
+    auto stats = tracker.get_agent_statistics();
+    bool found = false;
+    for (const auto& s : stats) {
+        if (s.agent_id == "agent-running")
+            found = true;
+    }
+    // The running row must not appear at all -- WHERE excludes it, same as
+    // 'pending'/'dispatched'. If this regresses to counting it (success OR
+    // failure), `found` becomes true.
+    CHECK_FALSE(found);
+}
+
 TEST_CASE("ExecutionStatistics: agent stats with agent_id filter",
           "[pg][execution_statistics][agent_stats]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;

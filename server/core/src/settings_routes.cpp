@@ -4,6 +4,8 @@
 
 #include "settings_routes.hpp"
 
+#include <cstdio>
+
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
@@ -261,6 +263,33 @@ std::string SettingsRoutes::render_server_config_fragment() {
             "</code> req/s per IP</td></tr>";
     html += "<tr><td>Login Rate Limit</td><td><code>" + std::to_string(cfg_->login_rate_limit) +
             "</code> req/s per IP</td></tr>";
+
+    // Agent OTA pull bounds (#913 / #911). Read-only, like every row here.
+    html += "<tr><td>OTA Concurrency (per peer)</td><td><code>" +
+            std::to_string(cfg_->ota_max_concurrent_per_peer) +
+            "</code> parallel downloads</td></tr>";
+    // Format the two doubles to one decimal place: std::to_string renders a
+    // double as "1.000000", which is the only row on this fragment that does not
+    // read like a configured value.
+    {
+        char rate_buf[64];
+        std::snprintf(rate_buf, sizeof(rate_buf), "%.1f", cfg_->ota_rate_refill_per_min);
+        char burst_buf[64];
+        std::snprintf(burst_buf, sizeof(burst_buf), "%.1f", cfg_->ota_rate_capacity);
+        html += std::string("<tr><td>OTA Rate (per peer)</td><td><code>") + rate_buf +
+                "</code>/min, burst <code>" + burst_buf + "</code></td></tr>";
+    }
+    html += "<tr><td>OTA Transfers (server-wide)</td><td><code>" +
+            std::to_string(cfg_->ota_max_concurrent_total) + "</code> concurrent</td></tr>";
+    html += "<tr><td>OTA Peer Map Cap</td><td><code>" +
+            std::to_string(cfg_->ota_max_peers_tracked) + "</code> keys</td></tr>";
+    html += "<tr><td>OTA Transfer Deadline</td><td><code>" +
+            std::to_string(cfg_->ota_transfer_deadline_secs) + "</code> s (chunk <code>" +
+            std::to_string(cfg_->ota_chunk_write_deadline_secs) + "</code> s)</td></tr>";
+    html += "<tr><td>gRPC Stream Cap</td><td><code>" +
+            std::to_string(cfg_->grpc_max_concurrent_streams) +
+            "</code> streams/connection, quota <code>" +
+            std::to_string(cfg_->grpc_max_resource_memory_mb) + "</code> MiB</td></tr>";
 
     html += "</tbody></table>";
     return html;
@@ -5626,6 +5655,26 @@ void SettingsRoutes::register_routes(
                       // recovery codes are issued either way, but the
                       // operator-facing message and audit detail must be
                       // honest about which happened).
+                      // The account is already enrolled — a concurrent verify won
+                      // the race (or it was already enrolled). It is NOT a rejected
+                      // code and NOT a store outage — audit it distinctly so it
+                      // does not inflate bad-code-attempt counts (#3777, CC7.2),
+                      // and tell the operator the true state rather than "code
+                      // rejected". `MfaAlreadyEnrolled` is not in
+                      // is_store_unavailable(), so no false 503/degrade path. (A
+                      // bare disable+re-init without a subsequent winning verify
+                      // leaves mfa_enrolled_at NULL, so it does NOT reach here — it
+                      // stays fail-closed WriteFailed.)
+                      if (codes_res.error() == AuthDBError::MfaAlreadyEnrolled) {
+                          audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
+                                    "already enrolled by a concurrent verify; no duplicate "
+                                    "enrollment");
+                          res.set_content(
+                              render_mfa_fragment(session->username, {}, {}, {}, session->username,
+                                                  "MFA is already enrolled on this account."),
+                              "text/html; charset=utf-8");
+                          return;
+                      }
                       const bool store_unavailable = is_store_unavailable(codes_res.error());
                       if (store_unavailable && metrics_registry_) {
                           metrics_registry_

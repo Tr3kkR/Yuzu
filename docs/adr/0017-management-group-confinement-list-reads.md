@@ -245,6 +245,10 @@ gate.
     needed the same filter as the responses section, not just the table). The scan fragment,
     `query_responses`, `aggregate_responses`, and the REST endpoints above remain on the older,
     still-largely-inert `response_scope_fn` mechanism (#1634) — not touched by this migration.
+    **Update (#1634, closed):** `query_responses`, `aggregate_responses`, and the REST
+    `/executions/{id}/visualization` + `/api/responses/{id}` (+`/aggregate`/`/export`) family all
+    migrated onto `require_fleet_read` in a later PR, retiring `response_scope_fn` on these
+    surfaces entirely. The scan fragment is unaffected by this update and remains as described.
     **NOT done, pre-existing (not introduced or worsened by #1712):** the SAME dashboard
     results workflow's sidecar routes — `/fragments/results/filter-bar` (reads
     `ResponseStore::facet_values`), `/fragments/create-group-form` (reads `facet_agent_count`), and
@@ -258,6 +262,19 @@ gate.
     group-write + confined response-read) can use the unscoped facet query to discover and enroll
     out-of-scope agents. Tracked as a follow-up, not fixed by #1712 — see #3489
     (canonical; #3525 tracked the same finding and was closed as its duplicate).
+- **Executions (legacy pre-v1 routes)** — `GET /api/executions` (list), `/{id}` (detail),
+  `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, `POST /{id}/cancel`
+  (`server.cpp`) — absent from every prior version of this coverage map; found during #1634's own
+  Gate 2 review and deliberately deferred to a dedicated issue rather than folded into that PR.
+  **DONE (#3789, closed):** all seven migrated onto `require_fleet_read`/`authz::in_scope`, matching
+  the `GET /api/v1/executions/{id}` shape documented in `docs/auth-architecture.md`'s "Fourth
+  migration (#3789)". The LIST route's confinement predicate is pushed into SQL before `LIMIT`
+  (INV-3) via a correlated `EXISTS` over `agent_exec_status` plus an owner disjunct — a real
+  visible-agent intersection, not the own-dispatches-only shortcut MCP `list_executions` still uses
+  (`docs/auth-architecture.md`'s Third migration paragraph). The two mutating routes keep `require_permission(Execution, Execute)` ahead of
+  `require_fleet_read(..., "Read")` (the fleet gate is structurally Read-only, INV — see
+  `authz_gates.cpp`) and apply a stricter complete-cohort-in-scope rule, not bare visibility, before
+  allowing a rerun/cancel. Coverage: `tests/unit/server/test_legacy_executions_scope_authz.cpp`.
 - **Device list** — `/api/agents` (`server.cpp:5312`), `/fragments/devices/list`, the dashboard
   `get_visible_agents` callers (`dashboard_routes.cpp:989/1159/1889`, `server.cpp:7892`),
   `get_visible_agents_json` (`server.cpp:3784/8543`).
@@ -351,6 +368,14 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   still use the older, still-largely-inert `response_scope_fn`/`response_agent_in_scope` mechanism
   (#1634), a distinct primitive from `require_fleet_read`; see `docs/user-manual/mcp.md`'s
   `query_responses` row for that mechanism's current status.
+  **Update (#1634, closed):** `query_responses`, `aggregate_responses`, and the REST
+  `/executions/{id}/visualization` + `/api/responses` family all migrated onto `require_fleet_read`
+  in a later PR — `response_scope_fn`/`response_agent_in_scope` no longer computes scope on any
+  of these surfaces. "Retired" describes the MECHANISM (nothing calls it to decide visibility
+  anymore), not a completed code deletion: `ResponseScopeFn response_scope_fn` remains an unused
+  parameter accepted and threaded through `rest_api_v1.cpp`'s constructor call chain (found in PR
+  #3793's review, minor, not fixed) — dead plumbing, not a live second gate. The
+  dashboard scan fragment is unaffected by this update and remains as described.
 
   **Also NOT covered by #1712, found during this PR's own governance re-review and previously
   absent from this coverage map entirely — the live streaming twin of the exact data this PR just
@@ -364,6 +389,10 @@ Two corrections are needed whether A or B is chosen and should ship independentl
   sweep did not enumerate, since a streaming `Server::Get` handler is not a request/response
   list-read site in the shape the sweep was designed to find. Not introduced or worsened by #1712;
   tracked as a follow-up — see #3699.
+  **Update (#1634, closed):** both SSE channels migrated onto `require_fleet_read` in a later PR,
+  sharing one event projector (`execution_event_scope.hpp`) that filters `agent-transition` by
+  `agent_id` and drops/sanitizes the execution-wide `execution-progress`/`execution-completed`
+  events for a confined subscriber. #3699 is closed.
 
   **A WRITE-path sibling of the same shape, found during #1712's own governance re-review and
   undisclosed in this coverage map until then — now CLOSED (#3700):** `GET`/`PUT`/

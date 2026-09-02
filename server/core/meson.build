@@ -422,7 +422,6 @@ yuzu_server_core_lib = static_library(
     'src/saml_scim_link.cpp',
     'src/error_codes.cpp',
     'src/result_envelope.cpp',
-    'src/concurrency_manager.cpp',
     'src/legacy_shim.cpp',
     'src/management_group_store.cpp',
     'src/api_token_store.cpp',
@@ -563,6 +562,7 @@ yuzu_server_core_lib = static_library(
     # secret columns. Depends on the yuzu_key_provider leaf target above.
     'src/pg/secret_codec.cpp',
     'src/rate_limiter.cpp',
+    'src/ota_transfer_watchdog.cpp',
     'src/principal_quota.cpp',
     'src/cert_reloader.cpp',
     'src/x509_ca.cpp',
