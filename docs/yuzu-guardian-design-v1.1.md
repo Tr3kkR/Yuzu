@@ -2521,6 +2521,12 @@ Guardian ladder must check these.
   crash surface lands the moment Guardian PR 3 wires fan-out. See #478 for
   the schema/wire fix.
 
+- **Published schema enums and the agent's per-type support arrays are bound by
+  the H2/G9 cross-check tests** — add or remove a guard type in **both or
+  neither**. A one-sided change leaves the published schema advertising a type
+  the agent cannot enforce (or silently drops one it can), and nothing else in
+  the build catches the divergence.
+
 ## 25. Lifecycle-audit journal (ADR-0021 Stage 2, item 7)
 
 Guardian's spark-backed rule engine keeps a durable audit trail of `guard.armed` /

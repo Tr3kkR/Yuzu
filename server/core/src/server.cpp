@@ -2683,6 +2683,24 @@ public:
                           "degradation), distinct from a clock-anomaly decline",
                           "counter");
         metrics_.counter("yuzu_exec_correlation_store_degrade_total");
+        // HA WS-2a durable event outbox retention (ADR-2002 §5) — same
+        // clock-guarded-retention shape as the correlation reap above, a
+        // separate table so a separate counter family.
+        metrics_.describe("yuzu_exec_outbox_reap_total",
+                          "Aged-out durable event_outbox rows deleted by the clock-guarded "
+                          "retention sweep (HA WS-2a)",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_reap_total");
+        metrics_.describe("yuzu_exec_outbox_reap_clock_anomaly_total",
+                          "event_outbox reap passes declined due to an implausible (forward or "
+                          "backward) PostgreSQL now() reading vs the persisted anchor",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_reap_clock_anomaly_total");
+        metrics_.describe("yuzu_exec_outbox_store_degrade_total",
+                          "event_outbox reap passes that failed outright (pool/query degradation), "
+                          "distinct from a clock-anomaly decline",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_store_degrade_total");
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
@@ -17978,12 +17996,17 @@ private:
                     return;
                 }
             } else if (!exec_opt) {
-                // #3789: `mark_cancelled` reports PGRES_COMMAND_OK (success)
-                // on an UPDATE that matched zero rows — without this
-                // existence check an UNCONFINED caller hitting an unknown id
-                // would get a false "cancelled" 200 (Sol/gpt-5.6-sol
-                // adversarial review). A confined caller's existence check
-                // is folded into the unified branch above.
+                // #3789 + PR #3842: this existence check gives an unknown id a
+                // clean 404. It was originally load-bearing because
+                // `mark_cancelled` reported PGRES_COMMAND_OK (a false "cancelled"
+                // 200) on an UPDATE matching zero rows (Sol/gpt-5.6-sol review);
+                // PR #3842's `RETURNING id` + terminal-status guard now makes
+                // mark_cancelled return FALSE for an unknown OR already-terminal
+                // execution, so this check is now defense-in-depth — it keeps the
+                // common unknown-id case a 404 rather than the 503 a bare
+                // mark_cancelled-false would produce below (a not-found/terminal-
+                // vs-degrade refinement of that 503 is tracked in #3845). A
+                // confined caller's existence check is folded into the branch above.
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "not found"), "application/json");
                 return;
@@ -19732,6 +19755,19 @@ private:
                 // ADR-1007: per-device concurrency claim stale-claim reconciler
                 // cadence — see the call site's own comment for the rationale.
                 constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
+                // The event_outbox drains on a MUCH tighter cadence than the
+                // correlation table above: it receives ~2-3 rows per agent
+                // CommandResponse (agent-transition + progress + terminal),
+                // vs one row per command for command_execution, so on a busy
+                // fleet the hourly 5000-row cap cannot keep up (governance
+                // Gate 3 performance/sre finding — insert rate can exceed a
+                // 5000/hr drain, growing the table unbounded). At ~60s the
+                // same 5000-row cap gives ~300k/hr of drain headroom, well
+                // above any realistic append rate, keeping the table bounded
+                // to a few minutes of backlog beyond the 24h window. The reap
+                // is idempotent, advisory-lock-serialised across replicas, and
+                // a bounded index-scan DELETE, so the tighter cadence is cheap.
+                constexpr int kEventOutboxReapEveryNTicks = 30; // ~60s at 2s/tick
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -19947,6 +19983,30 @@ private:
                         if (execution_tracker_ && execution_tracker_->is_open() &&
                             tick % kConcurrencyClaimReconcileEveryNTicks == 0) {
                             execution_tracker_->reconcile_stale_concurrency_claims(now);
+                        }
+
+                        // 2g) durable event_outbox retention (HA WS-2a, ADR-2002
+                        // §5). Same clock-guarded shape and cadence as the
+                        // correlation reap above, on its own table/metric family.
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kEventOutboxReapEveryNTicks == 0) {
+                            if (auto reaped = execution_tracker_->reap_event_outbox()) {
+                                if (reaped->deleted > 0)
+                                    metrics_.counter("yuzu_exec_outbox_reap_total")
+                                        .increment(static_cast<double>(reaped->deleted));
+                                if (reaped->clock_anomaly)
+                                    metrics_.counter("yuzu_exec_outbox_reap_clock_anomaly_total")
+                                        .increment();
+                            } else {
+                                // Log the descriptive PG error, not just bump the
+                                // counter (PR #3842 review): on a ~60s cadence a
+                                // real reap failure is otherwise a climbing counter
+                                // with nothing to grep for.
+                                spdlog::warn("event_outbox reap failed: {}",
+                                             reaped.error());
+                                metrics_.counter("yuzu_exec_outbox_store_degrade_total")
+                                    .increment();
+                            }
                         }
 
                         // 3) Refresh alive gauges.

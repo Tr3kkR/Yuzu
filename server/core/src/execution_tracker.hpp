@@ -188,6 +188,16 @@ struct CommandExecutionReapOutcome {
     bool clock_anomaly{false};
 };
 
+/// HA WS-2a (durable event outbox), ADR-2002 §5. Outcome of an `event_outbox`
+/// retention pass. Same shape/semantics as `CommandExecutionReapOutcome` — a
+/// distinct table and metric family, so a distinct type: `clock_anomaly` true
+/// means the pass declined on an implausible DB `now()` reading, not that rows
+/// were deleted.
+struct EventOutboxReapOutcome {
+    int deleted{0};
+    bool clock_anomaly{false};
+};
+
 class ExecutionTracker {
 public:
     explicit ExecutionTracker(pg::PgPool& pool);
@@ -589,6 +599,35 @@ public:
     /// anchor parameter.
     int reconcile_stale_concurrency_claims(int64_t now);
 
+    /// Clock-guarded retention sweep for the `event_outbox` table (HA WS-2a,
+    /// ADR-2002 §5; routed concern "Clock-guarded retention"). Copies
+    /// `reap_command_execution_mappings`' shape (with one deliberate addition —
+    /// an `ORDER BY event_id` in the delete subquery makes it oldest-first
+    /// deterministic) — advisory lock as its
+    /// OWN statement, one in-SQL DB `now()` read reused for the
+    /// cutoff/anchor-compare/anchor-update, persisted+sanitised anchor
+    /// (`event_outbox_reap_anchor`), forward/backward-anomaly decline, and an
+    /// unconditional per-pass cap — and makes the SAME two clock-guard
+    /// carve-outs, for the SAME reasons that concern records for the
+    /// command_execution sibling: (1) NO would-wipe probe — the outbox drains
+    /// to 100% expiry as routine behaviour (an idle fleet legitimately ages
+    /// every event past the window), so a would-wipe verdict cannot separate a
+    /// true from a false positive; (4) NO fact-set anomaly dedup — a declined
+    /// pass is `spdlog::warn`'d and surfaced via
+    /// `yuzu_exec_outbox_reap_clock_anomaly_total` rather than deduped by fact
+    /// identity. Part-(6) missing-anchor decision is PROCEED (`ResultSetStore`'s
+    /// answer, matching the command_execution sibling): an outbox row is a
+    /// regenerable live-update frame, not compliance evidence — the reap never
+    /// touches the authoritative `executions`/`agent_exec_status` state, which a
+    /// reconnecting consumer re-derives by execution_id (the
+    /// `ExecutionEventBus` `kTerminalKnownLost -> fetch-by-id` fallback
+    /// contract) — so a from-boot skewed clock deleting a batch of frames is an
+    /// acceptable worst case. The window/cap/skew constants are kept in LOCKSTEP
+    /// with the `command_execution` sibling deliberately (same short-lived feed,
+    /// same substrate) — see the recorded reasoning at the definition site in the
+    /// .cpp; revisit both together, do not diverge silently.
+    [[nodiscard]] std::expected<EventOutboxReapOutcome, std::string> reap_event_outbox();
+
     /// Whether the store is usable (schema migrated). False after a failed
     /// migration — feeds the `/readyz` probe so a broken execution-history
     /// schema fails closed instead of serving errors (or silently wedging
@@ -642,6 +681,11 @@ private:
     /// best-effort failure mode in this class (the claim self-heals via
     /// the reconciler either way).
     std::string definition_id_for_execution(const std::string& execution_id) const;
+
+    // HA WS-2a: the durable event_outbox append is a file-local free function
+    // in execution_tracker.cpp (it needs no member state, and keeping it there
+    // keeps the libpq `PGconn` type out of this header). Its contract and the
+    // ID-ORDERING note for future consumers live at its definition.
 
     pg::PgPool& pool_;
     bool open_{false};

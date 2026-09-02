@@ -1,181 +1,158 @@
 # Yuzu — Claude Code Guide
 
-## Active workstreams (temporary — 2026-07-29 → ~2026-08-05)
-
-Four parallel streams are running across three machines. **Read `docs/workstreams.md` and the
-`STREAM.md` at your worktree root before starting work.** Work belongs to exactly one stream:
-`ci` (CI/test revamp) · `adr17` (list-read confinement) · `adr31` (decomposition) ·
-`pg` (SQLite → Postgres). If a task is outside all four, say so and ask rather than starting it.
-
-Shulgi's Windows and WSL2 halves are one shared box and a live runner host — **take the semaphore
-(`~/yz/bin/shulgi-lock`) before any build or test there, and release it when done.**
+**This file is a contents page, not a knowledge base.** Before adding anything, read
+`docs/instruction-file-standard.md` — it defines where a rule belongs and why the default is *not
+here*. This file, `AGENTS.md`, and the two routed-concern tables load into every session; each is
+budgeted at 32,000 characters and capped at 40,000 (`tests/test_issue_docs.py`).
 
 ## What is Yuzu?
 
-Yuzu is an agentic enterprise endpoint management platform — a single control plane where agentic colleagues query, command, scan, patch, and enforce policy compliance on Windows/Linux/macOS fleets in real time; an open-source alternative to commercial endpoint platforms, built in C++23.
+An agentic enterprise endpoint management platform — a single control plane where agentic colleagues
+query, command, scan, patch, and enforce policy compliance on Windows/Linux/macOS fleets in real
+time; an open-source alternative to commercial endpoint platforms, built in C++23.
 
-Goal: match mature-platform capability (`docs/capability-map.md`) with modern architecture — gRPC/Protobuf transport, Prometheus-native metrics, **PostgreSQL server substrate + SQLite on the agent** (ADR-0006), and a compiler-stable plugin ABI.
+Goal: match mature-platform capability (`docs/capability-map.md`) with modern architecture —
+gRPC/Protobuf transport, Prometheus-native metrics, **PostgreSQL server substrate + SQLite on the
+agent** (ADR-0006), and a compiler-stable plugin ABI.
 
-## Target Architecture
+## Target architecture
 
-```
-Operators (agentic AI · browser · REST API · automation)
-    │  ▼
-Yuzu Server — REST API v1 (token/session auth) · HTMX dashboard (server-rendered, **dark-theme-only**) ·
-    Instruction Engine · Policy Engine (Guaranteed State) · Response/Scope/RBAC/Audit ·
-    Scheduler · Metrics (/metrics) · Management Groups
-    │  gRPC / Protobuf / mTLS (bidirectional streaming)  ▼
-Yuzu Agent (per endpoint) — Plugin Host (**stable C ABI** .so/.dll) · Trigger Engine ·
-    KV Storage (SQLite) · Content Distribution (hash-verified stage+execute) ·
-    User Interaction (Windows) · per-plugin Metrics
-```
+Operators (agentic AI · browser · REST API · automation) → **Yuzu Server** (REST API v1, HTMX
+dashboard — server-rendered and **dark-theme-only**, Instruction Engine, Policy Engine, Response /
+Scope / RBAC / Audit, Scheduler, `/metrics`, Management Groups) → gRPC/Protobuf/mTLS bidirectional
+streaming → **Yuzu Agent** per endpoint (Plugin Host over a **stable C ABI**, Trigger Engine, SQLite
+KV, hash-verified content distribution, user interaction on Windows, per-plugin metrics).
+
 Full component reference: `docs/architecture.md`.
 
 ## Glossary — three meanings of "agent"
 
-**Agent** is overloaded — use the disambiguated form in commits, PRs, and new docs:
+Use the disambiguated form in commits, PRs, and new docs:
 
-- **Agent daemon** — the C++ binary in `agents/core/` on each managed endpoint that executes plugins (the usual meaning here).
+- **Agent daemon** — the C++ binary in `agents/core/` on each managed endpoint (the usual meaning).
 - **Governance agent** — the `.claude/agents/*.md` review actors run during `/governance`.
-- **Agentic worker** — an external LLM-driven client driving Yuzu via MCP, REST, or the dashboard (agentic-first, `docs/agentic-first-principle.md`).
+- **Agentic worker** — an external LLM-driven client driving Yuzu via MCP, REST, or the dashboard
+  (`docs/agentic-first-principle.md`).
 
 ## Context discipline
 
 Context is the scarce resource. Keep this thread lean; spend file-reading budget in subagents.
 
-- **Search before reading.** Grep (it *is* ripgrep) skips `.gitignore` (build dirs, `vcpkg_installed/`, generated `*.pb.*`, `*.beam`, `tests-build-*`); then Read only the line ranges you need.
-- **Read / Glob / `find` do NOT honor `.gitignore`** — keep them out of build/vendored/generated trees (`*.pb.h/.cc`, `vcpkg_installed/`) unless required.
-- **Delegate broad reads.** Unknown locations or many-file sweeps → an `Explore` (or `general-purpose`) subagent that returns conclusions, not file dumps.
-- **Summarise and hand off proactively** — long thread: record files touched, facts learned, open questions, next command; continue or spawn a fresh agent.
-- **For code changes:** owning module → its tests → smallest coherent patch → targeted suite (`meson test -C build-<os> --suite <agent|server|tar>`) before the broad one.
+- **Search before reading.** Grep (it *is* ripgrep) honours `.gitignore`; Read / Glob / `find` do
+  **not** — keep those out of build, vendored and generated trees (`*.pb.h/.cc`, `vcpkg_installed/`).
+- **Delegate broad reads.** Unknown locations or many-file sweeps → an `Explore` (or
+  `general-purpose`) subagent that returns conclusions, not file dumps.
+- **Summarise and hand off proactively** — record files touched, facts learned, open questions, next
+  command; then continue or spawn a fresh agent.
+- **For code changes:** owning module → its tests → smallest coherent patch → targeted suite
+  (`meson test -C build-<os> --suite <agent|server|tar>`) before the broad one.
 
-## Agent Team & Governance
+## Agent team & governance
 
-Specialized agents live in `.claude/agents/` (each declares its role, triggers, reference docs). `workflow-orchestrator` owns the gate sequence; `/governance` is the entry point for the full pipeline on a commit range.
+Specialized agents live in `.claude/agents/` (each declares its role, triggers, reference docs).
+`workflow-orchestrator` owns the gate sequence; **`/governance <range>` is the entry point** — never
+hand-run the gates.
 
-Pipeline (8 gates, convention-enforced): Change Summary + Resource Ledger → security-guardian + docs-writer → domain-triggered (`cpp-expert` + `cpp-safety` on any C++) → happy-path + unhappy-path + consistency-auditor → chaos-injector (skipped if no findings) → compliance-officer + sre + enterprise-readiness → findings addressed → iterate. Use `/governance <range>`, not hand-running - waves 1–4 shipped 4 CRITICAL command-injection vulns without it.
+Pipeline (8 gates): Change Summary + Resource Ledger → security-guardian + docs-writer →
+domain-triggered (`cpp-expert` + `cpp-safety` on any C++) → happy-path + unhappy-path +
+consistency-auditor → chaos-injector → compliance-officer + sre + enterprise-readiness → findings
+addressed → iterate.
 
-Four standing rules the skill enforces (#2604), all catastrophic-if-violated:
-1. **Routed-concern triggers are UNCONDITIONAL.** Step 0 and Gate 8 must *open* `.claude/routed-concerns.md` + `.claude/routed-concerns-access-control.md` and match them row by row against the changed paths - never work from recall. **Diff size never gates a routed concern**: the matrix decides WHICH agents, never WHETHER.
-2. **Severity is DERIVED, not chosen.** Every finding states four INDEPENDENT facts — a TRIGGER, an IMPACT (`I1`–`I9`, gives the base band), an EXPOSURE (**every** applicable `E0`–`E6` — `E0` = no actor required, e.g. a timer or boot path; strongest RAISE applies first, then any CAP, and `E6` is applied last and dominates) and an EPISTEMIC STATUS — and **BLOCKING = the derived band is CRITICAL or HIGH**. Agents keep their OWN vocabulary, but where a brief's criteria disagree with the derived band **the derived band governs the gate**. Separately, **policy floors** gate as CONTRACT violations and bypass the derivation — most derive at or below MEDIUM on an ordinary path — several floor at INFO outright — which is exactly why they are not run through it: Resource Ledger omission; a direct `CHANGELOG.md` edit or missing mandated fragment; a build/test leg on any supported platform broken **by this change**; non-RAII manual cleanup in **new** C++; a **false-green test offered as closure evidence** for a blocking finding; an ownership/lifetime defect of the kind `cpp-safety` blocks (leak, UAF, unjoined thread, unsafe shell construction); and **violation of any explicit MUST / never / catastrophic-if-violated invariant** — closed to three sources: a routed-concern row's catastrophic clause, a CLAUDE.md standing-rule/invariant block, or an accepted ADR's normative requirements (narrative prose does not qualify) (a second copy of a single-chokepoint rule has no wrong outcome *today* — that is exactly why the derivation cannot see it). Both `/governance` runners (`.claude/` and `.codex/`) apply this one rule; neither carries its own copy. Unresolved EXPOSURE **gates** pending adjudication (never defaults to no-change). Weak evidence is expressed as EPISTEMIC STATUS, never as a falsely-lowered IMPACT — and only `speculative` (neither code path nor candidate trigger nameable) is exempt from the gate; `likely` is the normal case and gates normally.
-3. **Prose: `docs-writer` owns WORDING** (including in-code comments and log/error strings, scoped to lines the diff changes); **the DOMAIN agent owns TRUTH**. A comment that *contradicts* the code is a truth finding at native severity and any agent may raise it; wording-only is capped at NICE and **only `docs-writer` files it** — routing prose to one reviewer only consolidates if the others stop. **Absence is a third category** — a required doc that is MISSING contradicts nothing, so it is a truth finding derived as `I7`, never capped at NICE. "Required" is defined, not judged — a closed six-item list in the skill (REST reference, user-manual section, changelog fragment, CLAUDE.md/routed-concern row for a new invariant, contract table, or a doc a routed-concern row names as an **update obligation** for the changed surface, never merely as its reading list). Never in-code prose (#2620).
-4. **Gate 8 re-runs every gate whose DOMAIN THE FIX DIFF TOUCHES**, not only those whose findings prompted the fix - the old rule shipped a broken macOS leg on #2580.
+**Four standing rules, all catastrophic-if-violated:**
 
-**All four rules, and the ledger schema, are defined ONCE — in `.claude/skills/governance/SKILL.md`.** This file, `governance.d/README.md`, every agent brief, any `changelog.d/` fragment describing a governance change, and `docs/governance-skill-tuning-2026-07.md` are POINTERS and lose on conflict; the last two were originally omitted from this list, and they are exactly the copies that drifted — a copy-currency rule only reaches the copies it enumerates. `.codex/skills/governance/SKILL.md` genuinely defers for **severity and the ledger only**: it carries its own text for rules 1 and 4 (no routed-concerns walk at all on that leg — tracked as #2684 — and a weaker Gate 8 phrasing), and a runner never told to load a rule has no conflict to lose. Rule 2 already said this of severity; it governs the whole block.
+1. **Routed-concern triggers are UNCONDITIONAL** — open the tables and match row by row against the
+   changed paths; never work from recall. Diff size decides WHICH agents, never WHETHER.
+2. **Severity is DERIVED, not chosen** — from a TRIGGER, an IMPACT, every applicable EXPOSURE, and an
+   EPISTEMIC STATUS. BLOCKING = the derived band is CRITICAL or HIGH. **Policy floors** gate as
+   contract violations and bypass the derivation entirely.
+3. **`docs-writer` owns WORDING; the DOMAIN agent owns TRUTH.** A comment contradicting the code is a
+   truth finding at native severity. A *missing* required doc is a third category — a truth finding,
+   never capped at NICE.
+4. **Gate 8 re-runs every gate whose DOMAIN THE FIX DIFF TOUCHES** — not only those whose findings
+   prompted the fix.
 
-Every finding is recorded to a run ledger — `reporter`, `source`, `pass_ordinal`, stable `finding_id`, `recorded_at`, `provenance`, `disposition`, and the derivation facts. `source` (`governance-agent`/`collaborator`/`external-model`) records the reporter's KIND; a non-agent row must carry a `reporter_ref` the author does not control, because otherwise it is a claim about independent review made by the reviewed. `reviewed_at_sha` — not `source` — is what detects the #2604 failure where three reviewers shared one stale checkout. `refuted` is a distinct disposition from `rejected`, carries its evidence and an independent refuter, and releases nothing on its own (#2619). Rows are **superseded, never edited** — a new row with the same `finding_id`. The live view is a **FIELD-WISE merge** ordered by `recorded_at` (not the latest row alone — a sparse superseding row would otherwise de-gate a floored finding by omission), with list fields replacing wholesale, and **is read at the STRONGER of its facts and its `severity_mapped` label**. Any supersession that weakens **the GATE or the band** — including band-neutral routes like flipping `provenance`, clearing `policy_floor`, or releasing an `unresolved` sentinel — needs an `adjudicated_by` who is not the change's author plus an `adjudication_rationale`. The five attestation fields (incl. `waiver_rationale`) are **row-scoped and exempt from the merge**, so a later row can never null them out — and an attestation counts only on the row that PERFORMS the act it approves, so one cannot be added retroactively either. The enumerated route list is openly INCOMPLETE: a new field must be tested against the property. Adjudication is an audit trail, not a verified control — a subagent of the authoring session is not independent. Every write after the create is an **append** — `>>`, never `>`; the `noclobber` guard covers only the create. It is not a database and not a waiver contract: gating findings are still resolved before the gate passes. Stored as a repo-committed fragment on the `changelog.d` model — `governance.d/<PR-or-issue-number>-<slug>.<random>.jsonl`, `mktemp`-created so concurrent runs cannot collide, one file per RUN. It lives in the repo because the record is evidence for whoever reviews the PR, and a per-machine path is unreadable by them by construction (#2618). `YUZU_GOV_LOG_DIR` redirects a throwaway local run outside the tree. Retention is indefinite by default and not yet by decision.
+**All four rules, the ledger schema, the run-ledger contract, and the enumerated list of files that
+merely POINT at them are defined ONCE — in `.claude/skills/governance/SKILL.md`.** This file loses on
+conflict. The skill is read from your **working tree**, so a branch predating a change to it, or to
+the routed-concern tables, silently runs the old pipeline; Step 0 opens with a per-file currency
+check against `origin/dev`. The same rule governs any claim that a file or row is *absent* — verify
+with `git show origin/dev:<path>`, never a working-tree `ls`.
 
-**The skill is read from your working tree.** A branch predating a change to it, or to `.claude/routed-concerns.md`, silently runs the old pipeline; Step 0 opens with a per-file currency check comparing your **working tree** against `origin/dev` - the tree is what gets read, so a commit-to-commit comparison tests the wrong object. The same rule governs any claim that a file or row is *absent* - verify with `git show origin/dev:<path>`, never a working-tree `ls`.
+## Routed concerns (read the doc, not this file)
 
-## Darwin Compatibility
+One row per concern — catastrophic-if-violated invariants, routed doc, loading agents. Split across
+two files solely for the per-file ceiling: the first holds platform/product/data/observability
+concerns, the second auth, access-control, and request-admission chokepoints. Same authority as this
+file.
 
-This Claude instance is the designated **macOS/Darwin compatibility guardian**. The `cross-platform` agent loads `docs/darwin-compat.md` on any macOS-affecting change — it holds the reconciliation workflow + standing pitfalls table.
+@.claude/routed-concerns.md
+@.claude/routed-concerns-access-control.md
 
-## Erlang Gateway Build & Quality
+## Domain entry points
 
-Touching `gateway/` or any `*.erl`? **Read `docs/erlang-gateway-build.md` first** — build/verify commands, toolchain activation (`source scripts/ensure-erlang.sh`), the always-run-dialyzer rule, the mandatory-`--dir`/#337 and eunit-isolation/#336 gotchas, the pitfalls table. `gateway-erlang` loads it on any `gateway/`/`.erl` change; `/gateway-eunit` + `/gateway-dialyzer` for routine runs.
+Read the named doc **first** when the work touches that surface.
 
-## UAT Environment (Server ↔ Gateway ↔ Agent)
+| Surface | Read first |
+|---|---|
+| macOS / Darwin (this instance is the compatibility guardian) | `docs/darwin-compat.md` |
+| `gateway/` or any `*.erl` | `docs/erlang-gateway-build.md` (`/gateway-eunit`, `/gateway-dialyzer`) |
+| Standing up or debugging the stack | `docs/uat-environment.md` — three mutually-exclusive rigs, all binding 8080 + 50051, so only one runs at a time |
+| Build, vcpkg, test invocation | `docs/build-guide.md` |
+| Unit-test helpers and fixtures | `docs/testing/unit-test-conventions.md` |
+| Guardian / Guaranteed State | `docs/yuzu-guardian-design-v1.1.md` §24 (standing invariants), §9.1 (store schema) |
+| Instruction Engine content plane | `docs/Instruction-Engine.md`; DSL `docs/yaml-dsl-spec.md`; tutorial `docs/getting-started.md` |
+| CI matrix and gates | `docs/ci-architecture.md` |
+| Enterprise / SOC 2 scope | `docs/enterprise-readiness-soc2-first-customer.md` (7 workstreams; Gate 6 agents evaluate every change against it) |
+| Roadmap and capability map | `docs/roadmap.md`, `docs/capability-map.md` (headline progress figure is overstated) |
+| Issues, labels, ADRs | `docs/agents/issue-standard.md`, `docs/agents/triage-labels.md`, `docs/adr/README.md` |
 
-Standing up or debugging the stack? **Read `docs/uat-environment.md` first** — the three mutually-exclusive rigs (`scripts/start-UAT.sh` native; `scripts/start-viz-uat.sh` containerised viz; `scripts/start-demo.sh` release-pinned Cedar & Vale demo, runbook `docs/demo-environment.md`), the port table, gateway command forwarding (`--gateway-upstream`/`--gateway-mode`/`--gateway-command-addr`, `--trusted-nat-cidr`, the `agent_registry.cpp` `send_to()` flow). All three bind 8080 + 50051 — only one runs at a time. `release-deploy` loads it on any compose/UAT-script change.
-
-## Pre-commit testing with /test
-
-The `/test` skill (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate — compiles HEAD, upgrades from the previous release image, runs the standard test surface, persists every gate result + timing to a SQLite DB at `~/.local/share/yuzu/test-runs.db` (survives `git clean`; override `YUZU_TEST_DB=path`). Modes: `--quick` (~10 min), default (~30–45 min), `--full` (~60–120 min — adds OTA, sanitizers, coverage enforcement, perf measure-only). History: `bash scripts/test/test-db-query.sh --latest|--last N|--diff A B|--trend|--flaky`.
-
-CI history is separate and per runner: Big Tam stores `/srv/ci/work-N/_tool/yuzu-test-runs/yuzu-bigtam-linux-N/test-runs.db`; Wee Tam stores `D:\ci\test-runs\yuzu-weetam-windows-N\test-runs.db`. The files persist outside checkouts and are never shared by runner agents. `ci.yml` records job and Meson test-entry outcomes/timings plus recovered known flakes; query via `test-db-query.sh ci-stats|ci-suite-stats|ci-flakes`. See `docs/ci-architecture.md` for provisioning and schema details.
-
-## Instruction Engine
-
-The content plane: YAML-defined `InstructionDefinition` → `InstructionSet` → `ProductPack`, executed via `CommandRequest`; `yaml_source` authoritative, denormalized columns for queries. Architecture: `docs/Instruction-Engine.md`; DSL: `docs/yaml-dsl-spec.md`; tutorial: `docs/getting-started.md`.
-
-**Build-time gotcha:** PyYAML is a **hard build dependency** (`meson setup` fails without it). Shipped content is build-time embedded (`embed_content.py` → `bundled_content.cpp`, reseeded into the Postgres `instruction_store` schema on every boot, ADR-0058); the runtime never reads YAML from disk (no `--content-dir` flag). See `docs/Instruction-Engine.md`.
-
-## Enterprise Readiness and SOC 2
-
-Enterprise-deployable is scoped in `docs/enterprise-readiness-soc2-first-customer.md` across 7 workstreams (GRC, Identity, AppSec, Reliability, Data, Secure SDLC, Customer Assurance); the Gate 6 agents evaluate every change against it.
-
-## Development Roadmap
-
-Roadmap: `docs/roadmap.md`. Capability map: `docs/capability-map.md` — its headline progress figure is overstated (memory `project_capability_map_accuracy.md`). Check the roadmap for dependencies before starting an issue.
+**ADR numbers are author-namespaced**, and `0016`/`0031` each host two accepted ADRs — cite those by
+filename, never number alone.
 
 ## Build
 
-Meson is the sole build system. **Every time you add, remove, or rename a source file, update `meson.build` in the affected directory** and verify the build compiles.
+Meson is the sole build system. **Every time you add, remove, or rename a source file, update
+`meson.build` in the affected directory** and verify the build compiles.
 
-### Prerequisites
-- Meson 1.11.1, Ninja
-- CMake (required by Meson's cmake dependency method — not used as a build system)
-- C++23 compiler: GCC 13+, Clang 18+, MSVC 19.38+, or Apple Clang 15+
-- vcpkg (set `VCPKG_ROOT`)
-- For vcpkg's libpq port (Postgres substrate, ADR-0006; builds postgresql from source): **Linux** needs `bison flex` (apt); **macOS** needs `autoconf automake libtool` (brew); **Windows** none extra (vcpkg auto-acquires winflexbison)
-
-### Quick start (setup script)
 ```bash
 ./scripts/setup.sh                              # debug build, default compiler
 ./scripts/setup.sh --buildtype release --lto    # release + LTO
 ./scripts/setup.sh --tests                      # enable tests
 ```
-(`--native-file meson/native/*.ini` / `--cross-file meson/cross/*.ini` select compilers / cross targets.)
-The script runs `vcpkg install` then `meson setup` automatically.
 
-### Manual configure
-```bash
-vcpkg install --triplet x64-linux --x-manifest-root=.
-meson setup build-linux --buildtype=debug -Dbuild_tests=true \
-  -Dcmake_prefix_path=$PWD/vcpkg_installed/x64-linux \
-  -Dpkg_config_path=$PWD/vcpkg_installed/x64-linux/lib/pkgconfig,/usr/lib/x86_64-linux-gnu/pkgconfig
-meson compile -C build-linux
-```
-**Both paths are load-bearing, and both point INTO THE TREE.** `--x-manifest-root=.` is vcpkg
-*manifest* mode, which installs to `<repo>/vcpkg_installed/<triplet>` — **not** to
-`$VCPKG_ROOT/installed/<triplet>`, which stays near-empty (measured: 7 packages vs 237) and
-makes `meson setup` fail on `Dependency PostgreSQL not found`. `pkg_config_path` is separately
-required because spdlog/fmt resolve via pkg-config, not cmake: with the prefix alone the
-headers are found and the link then fails on `undefined reference to fmt::v12::…`. An
-out-of-tree build dir (a review worktree, a scratch checkout) needs the same two flags
-pointing at a populated `vcpkg_installed`.
+**Per-OS build directories** — `build-linux` / `build-windows` / `build-macos`, so one tree built
+from multiple hosts (WSL2 + native Windows + macOS) never clobbers itself. `setup.sh` auto-picks and
+**refuses to reconfigure** a dir recorded for another host unless `--wipe`; it never auto-wipes.
 
-### Build options
-`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true), `-Dbuild_tests` (default false), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
+**A manual `meson setup` needs two load-bearing flags, both pointing INTO THE TREE** —
+`-Dcmake_prefix_path` *and* `-Dpkg_config_path` against a populated `vcpkg_installed/<triplet>`.
+Neither is optional and neither substitutes for the other; an out-of-tree build dir needs both. The
+full command, the measurements behind it, and the two failure modes it avoids are in
+`docs/build-guide.md`.
 
-### Per-OS build directory convention
-
-Per-OS build dirs prevent clobbering when one tree is built from multiple hosts (WSL2 + native Windows + macOS): `build-linux` / `build-windows` / `build-macos`. Use `scripts/setup.sh` (auto-picks) or `-C build-<os>`. If setup.sh finds a dir recorded for another host it refuses to reconfigure unless `--wipe` (prevents opaque ninja "dyndep is not an input"/Windows-path failures from reusing a Windows builddir under WSL2); it never auto-wipes, defaults to `--reconfigure`.
-
-### Windows build
-
-`docs/windows-build.md` is the source of truth — MSYS2 bash sequence, the `setup_msvc_env.sh` + `scripts/ensure-erlang.sh` activation pair, path inventory, and two hard rules: **never `vcvars64.bat`** (extension exit-1 corrupts wrappers), **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC). `cross-platform` + `build-ci` load this on any Windows-touching change.
-
-**Provisioning a native Windows CI runner** — see `deploy/windows/README.md` (provisioning spec, `toolchain-manifest.json`, runner self-test; gateway toolchain via `YUZU_ESCRIPT`/`YUZU_REBAR3`; the 4 runners share one vcpkg cache via `RUNNER_TOOL_CACHE`).
-
-### Cross-compilation
-`./scripts/setup.sh --cross-file meson/cross/aarch64-linux-gnu.ini`
+**Windows:** `docs/windows-build.md` is the source of truth — two hard rules, **never `vcvars64.bat`**
+and **never Clang from `C:\Program Files\LLVM\bin`** (must be cl.exe/MSVC), both enforced by hooks
+(`.claude/hookify.block-vcvars64.local.md`, `.claude/hookify.warn-clang-windows-compiler.local.md`).
+Provisioning a native runner: `deploy/windows/README.md`.
 
 ## Test
 
-Every test target carries a `suite:` label (`agent`, `tar`, `server`) so `--suite <name>` filters directly:
+Every test target carries a `suite:` label so `--suite` filters directly:
 
 ```bash
 meson test -C build-linux --suite <server|agent|tar> --print-errorlogs   # omit --suite for everything
 ```
 
-Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.
+Tests need `-Dbuild_tests=true`. Catch2 tag filtering and the per-component symlinks are in
+`docs/build-guide.md`. **Do not remove `include_type: 'system'`** on a new dependency — load-bearing
+for build-log readability, and hook-enforced
+(`.claude/hookify.warn-drop-include-type-system.local.md`).
 
-### Direct binary invocation
-
-For Catch2 tag filtering (`[rest][token]`, etc.) or raw output, call the test binary directly via the stable per-component symlinks maintained by `scripts/link-tests.sh`:
-
-```bash
-tests-build-server-linux_x64/yuzu_server_tests "[rest][token]"
-tests-build-agent-linux_x64/yuzu_agent_tests "[metrics]"
-```
-
-`scripts/setup.sh` creates the symlinks; on a plain `meson setup` checkout run `bash scripts/link-tests.sh` once after the first `meson compile`. Triplet suffix derives from the host (`linux_x64`, `linux_arm64`, `macos_arm64`, `windows_x64`). Symlinks point at the real build output, so they stay live across rebuilds. `tests-build-*/` is gitignored.
-
-### Third-party warning suppression
-
-Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/protobuf/Catch2 warnings are `-isystem`-silenced while our code stays `warning_level=3`. **Do not remove `include_type: 'system'`** on new dependencies — load-bearing for build-log readability.
+`/test` (`.claude/skills/test/SKILL.md`) is the single-command pre-commit/pre-push gate — compiles
+HEAD, upgrades from the previous release, runs the standard surface, and persists every result and
+timing to `~/.local/share/yuzu/test-runs.db`. Modes `--quick` / default / `--full`; history via
+`bash scripts/test/test-db-query.sh`. CI history is separate and per runner — see
+`docs/ci-architecture.md`.
 
 ## Project layout
 
@@ -185,85 +162,101 @@ agents/plugins/   49 plugins
 server/core/      Server daemon (sessions, auth, dashboard, REST API, policy engine)
 gateway/          Erlang/OTP gateway (standalone rebar3 project)
 sdk/              Public SDK — stable C ABI (plugin.h) + C++23 wrapper
-common/include/   Shared header-only include root between server/core and agents/ (#2549) —
-                  pure decision code only: no I/O, no store/wire types, no server-trust-
-                  boundary authority. One named exception, not a category: shutdown_watcher.hpp
-                  (#3007) — a self-pipe fd, a dedicated watcher thread, and firewalled failure-
-                  path logging; the signal-handler side stays a single async-signal-safe write().
-                  No store/wire access, no trust-boundary authority. A new I/O-bearing file here
-                  must be named here (amend this annotation) — this does not open the root to
-                  I/O generally
+common/include/   Shared header-only root between server/core and agents/ (#2549)
 proto/            Protobuf definitions (source of truth for wire protocol)
 tests/unit/       Catch2 unit tests
 docs/             Architecture docs, conventions, roadmap, capability map
 ```
 
-`proto/meson.build` invokes `proto/gen_proto.py`, which runs `protoc` and flattens `#include` subdirectory prefixes (headers ship as `"common.pb.h"`). Result: the `yuzu_proto` static library via `yuzu_proto_dep`. `build-ci` owns this codegen flow.
+**`common/include/` firewall (#2549) — pure decision code only:** no I/O, no store/wire types, no
+server-trust-boundary authority. One named exception, not a category: `shutdown_watcher.hpp` (#3007)
+— a self-pipe fd, a dedicated watcher thread, and firewalled failure-path logging, with the
+signal-handler side staying a single async-signal-safe `write()`; no store/wire access, no
+trust-boundary authority. **A new I/O-bearing file here must be named in this annotation** (amend it
+in the same change) — this does not open the root to I/O generally.
+
+`proto/meson.build` invokes `proto/gen_proto.py`, which runs `protoc` and flattens `#include`
+subdirectory prefixes (headers ship as `"common.pb.h"`), producing `yuzu_proto` via
+`yuzu_proto_dep`. `build-ci` owns this codegen flow.
 
 ## vcpkg
-- Manifest `vcpkg.json`; pinned baseline `4b77da7fed37817f124936239197833469f1b9a8` (matches `vcpkgGitCommitId` in CI). `builtin-baseline` is required by the abseil `version>=` constraint — without it vcpkg resolves against HEAD.
-- OpenSSL is **required on every platform including Windows** — gRPC's TLS/JWT/PEM paths compile against OpenSSL headers regardless of linkage, so `grpc.lib` needs `libssl`+`libcrypto`; it is an unconditional top-level dep (the old `!windows`/schannel filter was disproven, #375).
-- `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
-- **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), shipped via the release zip's vcpkg-DLL sweep; `libpq_dep` is gated on `build_server` (agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly.
-- **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND meson's hand-wired `protobuf_dep`/`grpcpp_dep` (`cxx.find_library()`) are the only config that avoids both LNK2038 and LNK2005 — don't simplify either half without reading `.claude/agents/build-ci.md` (full #375 timeline + #376 QUIC escape). Linux/macOS unaffected.
+
+Manifest `vcpkg.json`, pinned `builtin-baseline` (matches `vcpkgGitCommitId` in CI) — required by the
+abseil `version>=` constraint, else vcpkg resolves against HEAD.
+
+**Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake`
+static-linkage override AND meson's hand-wired `protobuf_dep`/`grpcpp_dep` are the only config
+avoiding both LNK2038 and LNK2005 — **don't simplify either half** without reading
+`.claude/agents/build-ci.md` (full #375 timeline). Linux/macOS unaffected.
+
+Per-package rationale — OpenSSL required on every platform including Windows, the libpq DLL/CRT pick
+(ADR-0006/0008), the catch2 platform filter — is in `docs/build-guide.md`.
 
 ## CI architecture
 
-Three-tier split: Tier 1 PR fast-path (`ci.yml`, one Linux + Windows + macOS + `proto-compat`, <10 min), Tier 2 push to dev/main (full matrix, no sanitizers/coverage, #410), Tier 3 nightly (`nightly.yml`, sanitizers + coverage — failure auto-opens `nightly-broken`; **no merge to main while it is open**). `workflow_dispatch`/cron fire only once the workflow file is on `main` — new workflows on `dev` are dormant until merged. Full reference: `docs/ci-architecture.md`; `build-ci` owns the matrix, `cross-platform` the Windows/macOS specifics.
+Three tiers: Tier 1 PR fast-path (`ci.yml`, <10 min), Tier 2 push to dev/main (full matrix), Tier 3
+nightly (sanitizers + coverage; failure auto-opens `nightly-broken` and **no merge to main while it
+is open**). `workflow_dispatch`/cron fire only once the workflow file is on `main`. Full reference:
+`docs/ci-architecture.md`; `build-ci` owns the matrix, `cross-platform` the Windows/macOS specifics.
 
-**Standing invariant — failure-path `if:` guards need an explicit status function.** A GitHub Actions `if:` containing **no** status-check function (`success()`/`failure()`/`always()`/`cancelled()`) has an implicit `success()` ANDed onto it. So `if: steps.X.outcome == 'failure'` is **unsatisfiable** — `success()` is already false the moment X fails. Every failure-path step (diagnostics, stack captures, artifact uploads on red) must lead with `failure() && …` or `failure() || cancelled()` explicitly. This silently skipped the nightly TSan gdb capture on every red nightly for two months (#1038); `grep -n "outcome ==" .github/workflows/` before trusting any failure-path guard.
+**Standing invariant — failure-path `if:` guards need an explicit status function.** An `if:`
+containing no status-check function has an implicit `success()` ANDed on, so
+`if: steps.X.outcome == 'failure'` is **unsatisfiable**. Every failure-path step must lead with
+`failure() && …` or `failure() || cancelled()`. This silently skipped the nightly TSan gdb capture on
+every red nightly for two months (#1038); `grep -n "outcome ==" .github/workflows/` before trusting
+any failure-path guard.
 
-## Release workflow gates
-
-The `release:` job (`.github/workflows/release.yml`) runs `scripts/check-compose-versions.sh` **first** — it rejects any tracked-compose `ghcr.io/<owner>/yuzu-{server,gateway,agent}(-chisel)?:X.Y.Z` that is a bare numeric tag or a `${YUZU_VERSION:-...}` default ≠ the tag being released (floating tags ignored). **Before tagging**, bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file and verify: `bash scripts/check-compose-versions.sh 0.12.0` — else the job fails only after the full build matrix. New compose file ⇒ add it to the script's `FILES` array (auto-discovery is deliberately off).
-
-`docker-publish`/`docker-publish-chisel` also run `scripts/ci/verify-healthcheck-invariants.sh` **between build and push** (#751), so an image whose compose healthcheck tool (bash+`/dev/tcp`, busybox `wget --spider`) has silently gone missing is never published. The same gate runs on PRs via `docker-healthcheck-invariants.yml`. See `docs/ci-architecture.md` → "Gates outside the tier ladder".
+**Release gates:** the `release:` job runs `scripts/check-compose-versions.sh` first, so **before
+tagging** bump the `${YUZU_VERSION:-X.Y.Z}` default in every tracked compose file and verify locally
+— else the job fails only after the full build matrix. A new compose file must be added to the
+script's `FILES` array (auto-discovery is deliberately off). Details and the healthcheck-invariant
+gate: `docs/ci-architecture.md` → "Gates outside the tier ladder".
 
 ## Changelog
 
-**Never edit `CHANGELOG.md`** — add one fragment file `changelog.d/<PR#>-<slug>.<section>.md` (body = the finished `- ` bullet), assembled at release. A hook + the `Changelog fragments` CI job enforce this; see `changelog.d/README.md`.
+**Never edit `CHANGELOG.md`** — add one fragment `changelog.d/<PR#>-<slug>.<section>.md` (body = the
+finished `- ` bullet), assembled at release. A hook and the `Changelog fragments` CI job enforce
+this; see `changelog.d/README.md`.
 
-## Routed concerns (read the doc, not this file)
+## Test conventions
 
-One row per concern — catastrophic-if-violated invariants, routed doc, loading agents — imported from `.claude/routed-concerns.md` + `.claude/routed-concerns-access-control.md` (same authority as this file; split across two files solely for the 40k-per-file ceiling — the former holds platform/product/data/observability concerns, the latter auth, access-control, and request-admission chokepoints):
+Full contract: **`docs/testing/unit-test-conventions.md`**. The rules most often broken:
 
-@.claude/routed-concerns.md
-@.claude/routed-concerns-access-control.md
+- Use `yuzu::test::unique_temp_path` / `TempDbFile` / `TempDir` from `tests/unit/test_helpers.hpp`,
+  with a **`yuzu_test_` (underscore) prefix** so names match the Defender exclusion wildcard.
+  **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock`
+  (#473/#482) — both hook-enforced (`.claude/hookify.warn-temp-path-*.local.md`).
+- **Standing invariant:** both self-hosted CI pools run 4 runner agents as ONE shared OS identity on
+  ONE box (Windows "Wee Tam", Linux "Big Tam"). A fixed registry key, port, named object or path is a
+  cross-JOB shared resource and two concurrent jobs collide (#1871). **Salt every such identifier**
+  per-test/per-process, exactly like `unique_temp_path()`.
+- `sqlite3_changes()` after `step()` on a shared FULLMUTEX connection is a data race — use
+  `RETURNING` or the db mutex (#1033; hook-enforced).
 
-## Guardian engine — stores
+## Product UI and plugin scope
 
-Working on Guardian / Guaranteed State? **Read `docs/yuzu-guardian-design-v1.1.md` first** — §9.1 = `guaranteed-state.db` / `GuaranteedStateStore` schema; §24 = standing invariants (`Push`-seed scope, `__guard__` defence-in-depth, gateway-safe wire payloads, enforce-gate chokepoint). Catastrophic ones: (1) `BaselineStore` (`server/core/src/baseline_store.{hpp,cpp}`) — a **Baseline** is the only deployable unit; push fan-out + heartbeat reconcile gate on `deployed_member_rule_ids()`, sourced from each deploy's **`deployed_snapshot`, NOT the live member set** (what's enforced stays behind `Push`, not `Write`). (2) `dangerous_enforce_in_spec` (`guardian_rule_spec.cpp`) is the **single chokepoint** for dangerous enforce-promotion — **EXTEND it, never fork**. (3) Published schema enums ↔ agent per-type support arrays are bound by the H2/G9 cross-check tests — add/remove a type in **both or neither**. Docs: `docs/user-manual/guaranteed-state.md`, `docs/guardian-baseline-model.md`, `docs/yuzu-guardian-windows-implementation-plan.md`.
+**`frontend-design` is marketing-only.** Its varied light/dark aesthetic fits a standalone pitch
+surface, not the **dark-theme-only** product. Use it on the Cedar & Vale deck
+(`deploy/docker/cedar-vale/app/`) and future marketing pages. **Never on product UI** —
+`server/core/src/*_ui.cpp`, `server/core/static/*`, including in-product fleet viz (`viz_*_ui.cpp`,
+`yuzu-viz*.js` — product despite the name). Product UI stays HTMX-first, server-rendered,
+dark-theme-only.
 
-## Test conventions — shared helpers
-
-Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` / `yuzu::test::TempDir` from `tests/unit/test_helpers.hpp` for any test temp file, SQLite DB, or scratch dir. **Never** salt uniqueness with `std::hash<std::thread::id>` or `std::chrono::steady_clock` — silent collisions under Defender-induced I/O serialisation (flake #473; #482). Pass a **`yuzu_test_` (underscore) prefix** so names land inside the Wee Tam Defender path-exclusion wildcard `yuzu_*` (`scripts/windows-runner-defender-exclusions.ps1`) — the helpers' default `yuzu-test-` (hyphen) prefix does NOT match it; all three helpers take an explicit prefix for this.
-
-**Standing invariant:** both self-hosted CI pools run 4 runner agents as ONE shared OS identity on ONE box — Windows "Wee Tam" (LOCAL SYSTEM, `deploy/windows/README.md`), Linux "Big Tam" (`runner` user sharing `$HOME`, `docs/ci-architecture.md`). A fixed registry key/port/named-object/path is a cross-JOB shared resource — two concurrent CI jobs on one box collide (#1871's `RegistryGuard` family; same bug on Linux gateway eunit `health_port`). Salt every such identifier per-test/per-process like `unique_temp_path()` — see `test_guard_registry.cpp`'s `TempRegKey`/`TempEnforceKey`.
-
-For route-handler tests, `TestRouteSink` (`tests/unit/server/test_route_sink.hpp`, used by 41 files) mirrors `httplib::Server`'s parsing of the path, the query string, and an `application/x-www-form-urlencoded` body into `req.params` (query first, so query wins) — and **nothing else**: no path percent-decoding, no multipart/chunked, no duplicate headers, and none of the pre/post-routing pipeline. So a gate that moves into pre-routing leaves every sink test green. Two traps: `Post(path, body)` defaults to `application/json` and does NOT populate `req.params` (omitting the content-type silently tests a handler's fallback instead of its production branch — the #1786 false-green, re-armable), and fixtures must declare the sink **after** the route owner it registers (its handlers capture the owner's `this`). Contract pinned by `tests/unit/server/test_route_sink_harness.cpp`.
-
-For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use the `TrackerScope` RAII helper in `tests/unit/server/test_agent_service_impl.cpp` — takes a `pg::PgPool&` (ADR-0065; PG-backed, not `:memory:` SQLite), `set_execution_tracker`, nulls the borrowed pointer before the tracker destructs (the production shutdown contract, `agent_service_impl.hpp:113`). Promote to `test_helpers.hpp` once a second file needs it.
-
-For server tests needing live **PostgreSQL**, use `PostgresTestDb` + `YUZU_REQUIRE_PG_DB(var)` from `test_helpers.hpp` (behind `YUZU_TEST_ENABLE_PG`, server suite only). Creates an ephemeral `yuzu_test_<epoch>_<salt>_<n>` DB on `YUZU_TEST_POSTGRES_DSN`, drops it `WITH (FORCE)`; the name-embedded epoch drives a suite-start sweep of databases leaked by killed runs. Skip-vs-fail: env **unset** → skip (local dev); **set but broken** → FAIL (`scripts/ci/ensure-postgres.sh` guarantees a reachable instance on every CI server-test leg). **Store-behaviour tests use the pre-migrated template variant** `YUZU_REQUIRE_PG_DB_TPL(var, tpl)` + a file-local `PgTestTemplate` (clones an already-migrated DB — per-test migration DDL drove the 2026-07-12 Windows server-suite timeout; recipe: `docs/postgres-store-playbook.md` step 7); plain `YUZU_REQUIRE_PG_DB` is only for fresh-DB / pg-substrate behaviour tests. **Migration-in-substance tests** (a real fresh migrate, `!is_open` on failure, backfill/upgrade, drift-detection) use `YUZU_REQUIRE_PG_MIGRATION_DB(var)` instead (#2354, #3443) — same contract, SKIPs on Windows by default (fail-closed; `YUZU_TEST_PG_MIGRATION_DDL=1` overrides), so a new store's migration test belongs on this macro, never plain `YUZU_REQUIRE_PG_DB`. Local: run `postgres:18` on `:5433`, then `export YUZU_TEST_POSTGRES_DSN=postgresql://yuzu:yuzu@localhost:5433/yuzu`.
-
-**Prometheus alert rules are PARSE-checked by `promtool` for all rules, BEHAVIOUR-checked only for the alerts that have cases** in `tests/prometheus/yuzu-alerts.test.yml` (today: the `YuzuAuditRetention*` liveness pair). Nothing enforces that a rule change ships a case, so a green check on an edit to any other rule proves parseability only — and `prometheus-rules` is **not a required status check**, so a red one merges until branch protection says otherwise. The run does refuse to report success vacuously: no rules, no cases, no assertions, a stale `rule_files:` glob, or a behaviour suite that stays green against a deliberately broken copy of the rules file all fail it — `check rules` and `test rules` are handed DIFFERENT paths and otherwise disagree silently while printing a rule count (#2553). The opt-in `YUZU_TEST_ENABLE_PROMTOOL_DOCKER` (**presence-checked, so `=0` also enables it** — matching `YUZU_TEST_ENABLE_PG`) exists because `scripts/ci/flake-retry.py` runs `meson test` with **no `--suite` filter** on three REQUIRED legs, so any docker-dependent `docs`-suite test would put a container registry on all three — that shape was shipped once and reverted (#2553). **A new test here that pulls an image must be opt-in gated the same way.** Everything else — the skip-vs-fail contract, the check name, alert-authoring conventions — is in `tests/prometheus/run_promtool_tests.py`'s docstring and `docs/observability-conventions.md`.
+**No htmx `hx-on`.** Dashboard CSP is `script-src 'self' 'unsafe-inline'` (no `unsafe-eval`); htmx
+compiles `hx-on:*` with `new Function()`, which CSP **blocks at runtime — the handler silently does
+nothing**. Use a plain inline `onclick`/`oninput` calling a JS helper, or an `htmx:afterSettle` body
+listener. Core `hx-*` attributes and the `HX-Trigger` header don't eval. Verify button-driven JS in a
+headless browser for a CSP `pageerror`, not just that the page renders.
 
 ## Agent skills
 
-The Matt Pocock engineering skills are **user-global**, not committed — they follow the operator. Re-run `/setup-matt-pocock-skills` to change.
+**`/dev-team`** is committed project-level (`.claude/skills/dev-team/`) so every collaborator gets it
+via git. Its fleet config, backends and defaults are documented in its own SKILL.md Step 0 — read
+that, not a copy here. Invoke `/dev-team <task>`.
 
-**`/dev-team`** is committed **project-level** (`.claude/skills/dev-team/`), *unlike* the Matt Pocock set above — so every collaborator gets it via git. It runs a configurable senior-led fleet: an Opus senior that plans and delegates to a junior fleet, an optional architect plan-review gate before dispatch, and an optional doc-writer second wave after code lands — all behind `/test` + `/governance`. Fleet config (junior model, architect backend, doc-writer) is read from `~/.claude/skills/dev-team/config.json` (user-global, not committed; gitignored in the skill dir) and confirmed via `AskUserQuestion` at every invocation. Backends: architect = `fable` (Anthropic agent) / `codex-sol` (gpt-5.6-sol, reads repo) / `kimi` (kimi-k2.7-code, static-only); junior = `haiku` / `sonnet` / `opus`. Defaults: `sonnet` juniors, `fable` architect, no doc-writer. Invoke `/dev-team <task>`.
+## Adding to this file
 
-### Plugin scope — `frontend-design` is marketing-only
-
-The `frontend-design` plugin is **marketing / sales / demo surfaces only** — its varied light/dark aesthetic fits a standalone pitch surface, not the **dark-theme-only** product. Use on the Cedar & Vale deck (`deploy/docker/cedar-vale/app/`) + future marketing pages. **Never on product UI** — `server/core/src/*_ui.cpp`, `server/core/static/*`, incl. in-product fleet viz (`viz_*_ui.cpp`, `yuzu-viz*.js` — product despite the name). Product UI stays HTMX-first, server-rendered, dark-theme-only.
-
-**Product UI — no htmx `hx-on`.** Dashboard CSP is `script-src 'self' 'unsafe-inline'` (no `unsafe-eval`); htmx compiles `hx-on:*` with `new Function()`, which CSP **blocks at runtime — the handler silently does nothing**. Use a plain inline `onclick`/`oninput` calling a JS helper, or an `htmx:afterSettle` body listener. Core `hx-*` attrs + the `HX-Trigger` header don't eval — fine. Verify button-driven JS in a headless browser for a CSP `pageerror`, not just that the page renders. See memory `project-dashboard-csp-no-hx-on.md`.
-
-### Issue tracker, triage labels, domain docs
-
-Issues follow `docs/agents/issue-standard.md`: dedupe before filing; automation never closes `security`/`do-not-close` issues. Commands: `docs/agents/issue-tracker.md`; labels: `docs/agents/triage-labels.md`. Domain docs: `CONTEXT.md`, ADRs in `docs/adr/` (`docs/agents/domain.md`). ADR numbers are **author-namespaced** and `0016`/`0031` each host two accepted ADRs — cite those by filename, never number alone: `docs/adr/README.md`.
-
-## CLAUDE.md updates
-
-Architectural decisions, new stores, churning subsystems, and cross-cutting concerns belong here; stable reference material an agent already loads belongs in `docs/` with a pointer here (heuristic: memory `feedback_claude_md_scope.md`; precedent: the Erlang gateway section → `docs/erlang-gateway-build.md`). Keep this file AND each file it imports (the routed-concerns tables, `.claude/routed-concerns.md` + `.claude/routed-concerns-access-control.md`) under 40k characters each — routed-concern rows hold only the catastrophic-if-violated invariants + doc pointers; the detail goes in the routed doc.
+Don't, by default. `docs/instruction-file-standard.md` gives the placement ladder — a hookify rule, a
+header comment at the site, a `docs/` file plus a routed-concern row, a routed-concern row alone, and
+only then this file. Text belongs here only if it is cross-cutting, decision-grade, and needed
+*before* you know which files you will touch.
