@@ -112,25 +112,32 @@ jobs:
   prometheus-rules:
     name: Prometheus alert rules
     runs-on: ubuntu-24.04
-    # 20 -> 30 for #2854 rung D: `YuzuAuditRetentionNeverRan` now exists, so
-    # step 2's `fresh` scenario measures for real and its 3 (scenario,
-    # interval) `measure()` calls double to 6. The budget fits the WORST-CASE
-    # SUM of both steps' own documented ceilings, not their typical runtime -
-    # the same methodology run_promtool_tests.py's pull_with_retry() uses for
-    # its own ladder ("THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT ENCLOSE
-    # IT"). Step 1's own comment states ~465-495s worst case (pull ladder +
-    # two 120s promtool calls). Step 2: its own pull_with_retry ladder (~195s,
+    # 30 -> 45 for #2340 PR-4: marker-extraction added a SECOND full gate()
+    # to step 1 (the shipped RULES/TESTS pair, then the extracted
+    # yuzu-guardian-journal group - CH-2 + CH-5-PROM), each up to 4x120s
+    # (check + test + the canary's own test + check) = 480s worst case. The
+    # budget fits the WORST-CASE SUM of both steps' own documented ceilings,
+    # not their typical runtime - the same methodology
+    # run_promtool_tests.py's pull_with_retry() uses for its own ladder
+    # ("THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT ENCLOSE IT"). Step 1's
+    # own comment now states ~1185s worst case (pull ladder + daemon probe,
+    # ~225s, plus TWO full gates at 480s each) - an earlier version of that
+    # comment stated ~465-495s, counting only one gate's check+test and
+    # omitting its own canary's two calls; corrected in the same change that
+    # added the second gate. Step 2: its own pull_with_retry ladder (~195s,
     # same shared function) plus 6 sequential measure() calls at 30s+90s each
-    # = ~720s, totalling ~915s. Sum: ~1410s (23.5 min). 25 minutes would leave
-    # only ~90s over that sum - thinner than the ~150s margin the rung B
-    # 10->20 derivation deliberately kept - so 30 minutes (1800s). Sizing to
-    # the ~1-minute TYPICAL combined runtime measured locally is what the
-    # original 10->15 bump did, and is exactly the gap that let step 2 ship
-    # with a per-call ceiling the job budget could not actually survive. A
-    # THIRD sweep scenario grows step 2 by another ~360s: re-derive this
-    # number in that PR, don't inherit it (see the warning next to
-    # `SCENARIO_ALERTS` in `blind_band_sweep.py`).
-    timeout-minutes: 30
+    # = ~720s, totalling ~915s. Sum: ~2100s (35 min). 40 minutes would leave
+    # only ~100s over that sum - thinner than the ~150s margin the rung B
+    # 10->20 derivation deliberately kept - so 45 minutes (2700s), a ~1.29x
+    # margin matching the prior 1800/1410 ratio. Sizing to the TYPICAL
+    # combined runtime measured locally is what the original 10->15 bump did,
+    # and is exactly the gap that let step 2 ship with a per-call ceiling the
+    # job budget could not actually survive. A THIRD sweep scenario grows
+    # step 2 by another ~360s, or a THIRD gate on step 1 adds another ~480s:
+    # re-derive this number in that PR, don't inherit it (see the warning
+    # next to `SCENARIO_ALERTS` in `blind_band_sweep.py`, and
+    # run_promtool_tests.py's own pull_with_retry() comment).
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
