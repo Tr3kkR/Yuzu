@@ -95,8 +95,8 @@ own; the budget is only real if it is paid at the point of addition.
 
 CI fails once the date passes. Write the teardown step at the same time as the section.
 
-`docs/workstreams.md` did the human half of this correctly — it declared a one-week life *and* wrote
-its own teardown procedure naming the exact blocks to delete. It was still live four weeks past
+The now-removed `docs/workstreams.md` did the human half of this correctly — it declared a one-week
+life *and* wrote its own teardown procedure naming the exact blocks to delete. It was still live four weeks past
 expiry, and so were both pointer blocks, because nothing checked. Good intentions plus no check is
 the same as no intention.
 
