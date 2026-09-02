@@ -1938,7 +1938,7 @@ unchanged; the `GET`/`DELETE` property routes and `GET` schema route keep their 
 response shapes — only the two write routes' failure-mode status codes changed, as
 described above.
 
-## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
+## Network-discovered device data migrates to Postgres (DiscoveryStore, ADR-0044)
 
 The `DiscoveryStore` — the network-discovered devices behind `POST /api/discovery/scan`
 and `GET /api/discovery/results` — moves from the SQLite `discovery.db` file to the
@@ -1946,66 +1946,33 @@ server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
 `discovery_store`. It reuses the existing shared connection pool — no new connection
 flag or config is required.
 
-**This is NOT a fresh-start cutover.** The `managed` flag an operator has set on a
-discovered device (confirming "this is my enrolled agent") is real, non-regenerable
-operator intent, so the migration performs a **mandatory one-time backfill** on first
-Postgres boot:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `discovery.db` data to carry over — the one-time
+mandatory backfill this section originally described was retired under ADR-0009's
+fresh-start-by-default amendment (see ADR-0044's Update).
 
-- **What is preserved:** every discovered device — IP/MAC/hostname, the `managed`
-  flag and its associated `agent_id`, and first-seen (`discovered_at`/`discovered_by`)
-  provenance — carries over (any field containing invalid UTF-8 or an embedded NUL
-  is scrubbed to U+FFFD on write, matching every other field in this store).
-- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
-  Postgres write error, an unreadable legacy DB, or a fingerprint mismatch (below) —
-  the server **refuses to boot** rather than come up with an empty or partial
-  discovered-device inventory. The backfill marker is only stamped on success, so a
-  failed attempt is **retried on the next start** once the underlying cause is fixed.
-- **Fingerprint-verified, not marker-only.** Unlike a plain "did the marker get
-  stamped" check, the backfill records a fingerprint of the migrated content
-  alongside the completion marker. On a multi-replica deployment sharing one
-  Postgres database, this lets a later-booting replica tell apart "this is the same
-  content I already migrated" from "a different replica's data was migrated, not
-  mine" — the latter fails closed rather than silently accepting a completion this
-  replica's own discovered devices were never part of. If you see a "HOLDER-SIDE
-  VERIFICATION FAILED" log line, do not force-boot around it: this indicates two
-  replicas each hold `discovery.db` files with genuinely different content, and an
-  operator needs to decide which is authoritative before either can proceed.
-- **A 0-byte `discovery.db` is refused, not treated as a fresh install.** SQLite
-  opens a 0-byte file as a valid empty database, which looks identical to "this
-  legacy store was created but never used" — but a genuine fresh install never has
-  a `discovery.db` file at all. If you see a log line saying this is "NOT a fresh
-  install... a truncated/corrupted real database", either delete the empty file and
-  retry (if the legacy store genuinely was never used) or restore `discovery.db`
-  from backup before retrying (if it held real data that got truncated).
-- **A conflict during backfill can also refuse the boot, not just a fingerprint
-  mismatch.** On a multi-replica deployment, if a live scan (or a `mark_managed`
-  call through a sibling replica) lands a row for an IP before this replica's own
-  backfill reaches it, and that legacy row was `managed=true` or had an
-  `agent_id` assigned, the backfill verifies the row already in Postgres carries
-  the same values before trusting the migration — refusing (with a
-  "reconciliation FAILED" log line naming the IP) rather than silently dropping
-  or misattributing an operator's managed-device assignment. **This does NOT
-  resolve itself on its own** — the legacy data is frozen and a retry
-  conflict-skips against the same mismatched row every time, so this replica
-  restart-loops until an operator manually reconciles: check
-  `discovery_store.discovered_devices` for the named IP to see which value is
-  actually correct, then either accept the value already in Postgres (delete the
-  legacy file and let this replica take the sourceless-skip path) or correct the
-  row via `mark_managed` before retrying.
-- **Legacy file moved aside after a verified backfill.** Once the backfill is
-  confirmed complete, `discovery.db` is renamed to
-  `discovery.db.migrated-<epoch>` (the server never reads it again). Keep the
-  renamed file until you have confirmed discovery data looks correct, then dispose
-  of it per your data-retention policy.
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `discovery.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count rows
+  in `discovered_devices` for a diagnostic warning, then boots fresh-started regardless
+  of what it finds. If that table has rows, it logs a `DiscoveryStore` legacy-row-count
+  warning at WARN; boot proceeds unaffected either way. If you see this warning and the
+  environment genuinely has real discovered-device data (particularly the operator-set
+  `managed` flag) to keep, there is no automated recovery path: re-run
+  `POST /api/discovery/scan` and re-apply `mark_managed` against the new Postgres-backed
+  store before relying on it.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Operator-visible behaviour change (fail-closed reads).** `GET /api/discovery/results`
 now returns **503** on a degraded read (store not open, pool-acquire timeout, or query
 error) instead of silently rendering an empty device list — previously, a local SQLite
 read essentially never failed short of file corruption, so this failure mode was not
-practically reachable. Watch the new `yuzu_server_discovery_read_degrade_total{reason}`
+practically reachable. Watch the `yuzu_server_discovery_read_degrade_total{reason}`
 counter — a non-zero rate means the discovery view is degraded, **not** that no devices
-were found. `yuzu_server_discovery_backfill_total{result}` records the one-time
-backfill outcome (`completed` / `fresh` / `failed`).
+were found.
 
 **Breaking — `POST /api/discovery/scan`'s response contract changed.** The endpoint no
 longer always returns `200 {"status":"ok",...}`: the response gains a `devices_failed`
