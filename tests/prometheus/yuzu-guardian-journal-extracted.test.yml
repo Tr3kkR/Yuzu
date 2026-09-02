@@ -30,19 +30,32 @@
 # never healing (CH-2b) - that resolve-while-unhealed gap is the actual
 # characterized defect, not a simple "never fires" bug.
 #
+# CH-2c (added after adversarial review, #2340 PR-4): CH-2a/CH-2b alone never
+# exercise IntegrityGap's OTHER exclusion - `unless (metric offset 15m > 0)` -
+# because their loss window is short-lived, so the offset lookback is always
+# absent at every eval_time either case asserts. Deleting that clause
+# entirely left both cases green (confirmed by mutation, twice, independently,
+# by both adversarial reviewers). CH-2c closes it: a loss that STAYS nonzero
+# (never dies, never heals) fires only within its first 15m, then the offset
+# exclusion suppresses it for good - proving the rule is a rising-edge
+# detector, not a naive `> 0` alert that would page continuously on a single
+# known, ongoing loss (exactly what REASON 2's false-positive analysis rules
+# out for the naive forms).
+#
 # MUTATION COVERAGE (#2340 PR-4 scope, stated explicitly per the kickoff's
 # Sol flag): the harness's own canary (build_canary_tree, run_promtool_tests.py)
 # gives WHOLE-SUITE proof this fixture is read and can redden - it mutates
 # YuzuGuardianJournalTelemetryDark's `and on() yuzu_fleet_agents_healthy > 0`
 # guard and requires at least one case here to go red. Per-case mutation
-# proof (does CH-2a specifically redden against a `for:` clause added to
-# IntegrityGap; does CH-5-PROM case 1 specifically redden against the
-# `and on()` guard removed) was verified MANUALLY at authorship time - flip
-# the rule, rerun, confirm the intended case goes red, revert - and is NOT
-# automated in CI. That is a scope decision, not an oversight: automating
-# per-case discrimination means a mutated rules file PER CASE, which is real
-# additional engineering the kickoff left to a future PR if it turns out to
-# be worth the ongoing cost.
+# proof for every other clause (does CH-2a specifically redden against a
+# `for:` clause added to IntegrityGap; does CH-5-PROM case 1 specifically
+# redden against the `and on()` guard removed; does CH-2c specifically
+# redden against the `unless (... offset 15m > 0)` clause removed) was
+# verified MANUALLY at authorship time - flip the rule, rerun, confirm the
+# intended case goes red, revert - and is NOT automated in CI. That is a
+# scope decision, not an oversight: automating per-case discrimination means
+# a mutated rules file PER CASE, which is real additional engineering the
+# kickoff left to a future PR if it turns out to be worth the ongoing cost.
 rule_files:
   - generated/yuzu-guardian-journal-extracted.rules.yml
 
@@ -104,6 +117,31 @@ tests:
         exp_samples: []
       - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
         eval_time: 20m
+        exp_samples: []
+
+  # CH-2c -- the rule's OTHER exclusion: a loss that never dies and never
+  # heals fires only within its first 15m, then `unless (metric offset 15m
+  # > 0)` suppresses it for good, because the offset lookback starts finding
+  # the SAME earlier nonzero sample. Proves the rising-edge design directly
+  # (not just fire-then-resolve-on-death): a naive `> 0` alert would page
+  # continuously for the whole 40m below; this one pages once, then goes
+  # quiet despite the loss being real, known, and ongoing the entire time.
+  - interval: 1m
+    name: CH-2c - a loss that never heals fires only within its first 15m, then the offset exclusion suppresses it for good
+    input_series:
+      - series: 'yuzu_fleet_guardian_journal_evicted_no_send_evidence'
+        values: "3x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap", alertstate="firing", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGuardianJournalIntegrityGap"}'
+        eval_time: 40m
         exp_samples: []
 
   # ── CH-5-PROM -- YuzuGuardianJournalTelemetryDark ─────────────────────────

@@ -127,8 +127,9 @@ jobs:
     # added the second gate. Step 2: its own pull_with_retry ladder (~195s,
     # same shared function) plus 6 sequential measure() calls at 30s+90s each
     # = ~720s, totalling ~915s. Sum: ~2100s (35 min). 40 minutes would leave
-    # only ~100s over that sum - thinner than the ~150s margin the rung B
-    # 10->20 derivation deliberately kept - so 45 minutes (2700s), a ~1.29x
+    # only ~300s over that sum - thinner than the ~600s the chosen value
+    # keeps, and closer to the ~150s margin the rung B 10->20 derivation
+    # deliberately kept than is comfortable - so 45 minutes (2700s), a ~1.29x
     # margin matching the prior 1800/1410 ratio. Sizing to the TYPICAL
     # combined runtime measured locally is what the original 10->15 bump did,
     # and is exactly the gap that let step 2 ship with a per-call ceiling the

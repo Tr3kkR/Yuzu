@@ -464,6 +464,14 @@ def materialize_extracted_rules() -> None:
     dest = REPO_ROOT / EXTRACTED_RULES
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(wrapped, encoding="utf-8")
+    # Same restrictive-umask hazard `build_canary_tree` chmods for (see its
+    # comment): the container runs as uid 65534, and a 077 umask (a common
+    # hardened-shell/CI default) would otherwise leave this 0700/0600 and
+    # unreadable to it. MEASURED (adversarial review, #2340 PR-4): without
+    # this, `umask 077` makes the second gate fail on a permission error
+    # before promtool ever opens the file.
+    dest.parent.chmod(0o755)
+    dest.chmod(0o644)
 
 
 # The canary mutation. `unless` is what makes YuzuAuditRetentionNotRunning's
