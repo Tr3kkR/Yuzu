@@ -1527,16 +1527,18 @@ TEST_CASE("ExecutionTracker: release_concurrency_claim_by_command / "
           "execution_id correlation is lost (UP-1, unhappy-path Gate 4 finding, PR #3784 "
           "fix round)",
           "[pg][execution_tracker][concurrency][adr1007]") {
-    // cmd_execution_ids_ (agent_service_impl.hpp) is a plain in-memory map,
-    // never persisted — a server restart while a per-device-gated command
-    // is in flight loses the command_id -> execution_id correlation
-    // entirely, even though the agent is alive and its keepalive/terminal
-    // responses still carry the original command_id. These *_by_command
-    // methods are the restart-proof fallback notify_exec_tracker falls
-    // back to on that correlation loss: command_id alone (no definition_id
-    // scoping) is a safe match key because command_id is minted fresh per
-    // dispatch (plugin + "-" + random_bytes(8), server.cpp) and can never
-    // collide the way the empty-string execution_id does for workflow-step
+    // These *_by_command methods are the fallback notify_exec_tracker falls
+    // back to whenever it can't resolve execution_id via the PG-backed
+    // command_id -> execution_id correlation table (HA WS-1(1b),
+    // ExecutionTracker::lookup_execution_id) -- genuinely, today: a
+    // workflow-step dispatch (execution_id is always empty for those,
+    // CONSIST-2/sec-M2), a correlation-table write/read degrade, or the
+    // correlation table's own 24h-window entry aging out from under a
+    // legitimately still-running command (reap_command_execution_mappings).
+    // command_id alone (no definition_id scoping) is a safe match key
+    // because command_id is minted fresh per dispatch
+    // (plugin + "-" + random_bytes(16), server.cpp) and can never collide
+    // the way the empty-string execution_id does for workflow-step
     // dispatch.
     yuzu::test::ExecutionTrackerPg tracker_bundle;
     ExecutionTracker& tracker = *tracker_bundle;

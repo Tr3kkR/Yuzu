@@ -432,8 +432,24 @@ definition's open claim when execution_id collides."
 
 ### CLOSED: a server restart mid-flight silently dropped claim release/renewal for any command still in progress (UP-1/UP-2)
 
-`cmd_execution_ids_` (`agent_service_impl.hpp`) is a plain in-memory `command_id -> execution_id`
-map, never persisted. `notify_exec_tracker` resolves `execution_id` through it and, on a miss,
+**2026-09-02 addendum — written pre-reconciliation, `cmd_execution_ids_` references below are now
+historical.** This section describes the state of the world as it existed when UP-1/UP-2 were fixed,
+BEFORE this branch was reconciled onto 140 commits of `origin/dev` that included HA WS-1(1b)
+(ADR-2002 section 5): a PG-backed `command_id -> execution_id` correlation table
+(`ExecutionTracker::record_command_execution`/`lookup_execution_id`) that fully REPLACED
+`cmd_execution_ids_` — the in-process map named throughout this section no longer exists in the
+shipped code. The by-command fallback this section introduces is still live and still needed, but
+its role narrowed: HA WS-1(1b)'s persisted, replica-safe lookup now handles the restart-survival
+case described below on its own; the fallback's remaining genuine triggers are workflow-step
+dispatch (still empty `execution_id`, CONSIST-2/sec-M2, unaffected by HA WS-1(1b)) and a degrade on
+the correlation table's own write/read side — see the current doc comments on
+`release_concurrency_claim_by_command`/`renew_concurrency_claim_by_command`
+(`execution_tracker.hpp`) and `notify_exec_tracker` (`agent_service_impl.{hpp,cpp}`) for the
+accurate, current framing. The "Gate 8 re-review (reconciliation)" section further below has the
+full account of what changed and why.
+
+`cmd_execution_ids_` (`agent_service_impl.hpp`) was a plain in-memory `command_id -> execution_id`
+map, never persisted. `notify_exec_tracker` resolved `execution_id` through it and, on a miss,
 previously just returned — doing nothing. A server restart while a `per-device`-gated command is in
 flight wipes that map entirely. The agent has no idea the server restarted: its keepalive thread
 (the "CLOSED (agent-core keepalive)" section above) keeps sending periodic `RUNNING` pings, and the
@@ -456,16 +472,20 @@ arrived, the old code would renew the claim based on the reordered response's li
 extending a dead command's claim rather than retrying its release.
 
 **Fixed**:
-- `concurrency_claims` gained a `command_id` column (folded into the still-unshipped migration v2 —
-  this table has zero production rows on any deployed release). `command_id` rides on every
-  `CommandResponse`, including `__keepalive__`, independent of the server's in-memory cache, and is
-  minted fresh per dispatch — so `(command_id, agent_id)` needs no `definition_id` scoping the way
-  `execution_id` does.
+- `concurrency_claims` gained a `command_id` column (folded into the still-unshipped migration v3 —
+  this table has zero production rows on any deployed release; originally authored as v2, renumbered
+  during the HA WS-1(1b) reconciliation since that feature's own new table claimed v2 first on
+  `origin/dev` — see the "Gate 8 re-review (reconciliation)" section below). `command_id` rides on
+  every `CommandResponse`, including `__keepalive__`, independent of the server's in-memory cache,
+  and is minted fresh per dispatch — so `(command_id, agent_id)` needs no `definition_id` scoping the
+  way `execution_id` does.
 - Two new `ExecutionTracker` methods, `release_concurrency_claim_by_command`/
   `renew_concurrency_claim_by_command`, match purely on `(command_id, agent_id)`.
   `notify_exec_tracker` calls them whenever `cmd_execution_ids_` misses, instead of returning
   early — restoring release/renewal for both the restart case above AND, as a side effect, the
-  workflow-step case (see the section above this one).
+  workflow-step case (see the section above this one). Post-reconciliation, the restart case is
+  additionally covered by HA WS-1(1b)'s persisted correlation table on its own — this fallback stays
+  the sole path for the workflow-step case regardless (see the 2026-09-02 addendum above).
 - `upsert_agent_status_once` now returns the row's actually-persisted status (`std::optional
   <std::string>`, from its own `RETURNING` clause) instead of `bool`; `update_agent_status` gates
   release-vs-renew on that, never on the caller-supplied value (UP-2).
@@ -722,6 +742,66 @@ review findings that hardened the UP-1/UP-2 fix (command_id entropy/uniqueness, 
 command_id claim-side asymmetry) existed only in ADR prose and code comments, not as their own
 governance-ledger rows — added retroactively (`pass_ordinal: 3`) for future auditors relying on the
 ledger alone.
+
+### Gate 8 re-review (reconciliation onto `origin/dev`, 2026-09-02)
+
+Between Gate 6 and this point, `origin/dev` was discovered to have moved 140 commits ahead of this
+branch's merge-base, including a change in the exact subsystem ADR-1007 touches: HA WS-1(1b) (ADR-2002
+section 5) shipped a PG-backed `command_id -> execution_id` correlation table
+(`ExecutionTracker::record_command_execution`/`lookup_execution_id`/`reap_command_execution_mappings`)
+that fully replaced the in-process `cmd_execution_ids_` map ADR-1007's UP-1 fix was built around. This
+branch's 15 commits were reconciled onto `origin/dev` as a single squashed patch (operator decision,
+given the same conflict shape would otherwise recur across most of those 15 commits) — see the
+reconciliation commit's own message for the mechanical decisions (migration renumbering,
+by-command-fallback role narrowing, tick-loop restructuring). Full server suite green post-
+reconciliation: 6121/6124 test cases (3 pre-existing skips), 112694/112694 assertions.
+
+Eight agents re-reviewed the reconciliation diff (`git diff origin/dev..HEAD`, one commit):
+**security-guardian, docs-writer, cpp-expert, cpp-safety, sre, compliance-officer, architect,
+consistency-auditor. All eight returned PASS — no CRITICAL/HIGH, no policy floor.** Findings:
+
+- **security-guardian**: confirmed the new `origin/dev` catastrophic-if-violated clause on the
+  executions-history-ladder routed-concern row (#1634, confined-projection redaction + `ExecutionEventBus`
+  consumer sanitization) is untouched — the by-command fallback only ever mutates `concurrency_claims`
+  rows, never reaches an execution-content read, and every file that #1634 gates
+  (`execution_event_scope.hpp`, `execution_event_bus.*`, `rest_a4_envelope.*`, `mcp_stream_bridge.*`)
+  is byte-identical to `origin/dev` — absent from this diff entirely.
+- **consistency-auditor**: verified, not just likely, on all five completeness axes (migration DDL,
+  method declarations, `notify_exec_tracker`'s prefix-skip chain, test-case count arithmetic, tick-loop
+  wiring) — nothing from either feature was dropped, duplicated, or cross-wired. One forward-looking
+  note (not a defect): the four correlation-ID prefix families that `notify_exec_tracker` skips
+  (`polchk-`/`bundle-`/`preflight-`/`deployment-`) return before ever reaching a concurrency-claim
+  release — safe today only because none of their callers dispatch through a `per-device`-gated path;
+  worth a comment if that ever changes.
+- **docs-writer + architect + sre** (converging on the same finding, independently): this ADR's own
+  UP-1/UP-2 section (above) still described `cmd_execution_ids_` in the present tense and cited
+  "migration v2" after the reconciliation moved it to v3 — unlike the code comments, which were
+  correctly updated during the reconciliation itself. **Fixed**: the 2026-09-02 addendum and the
+  v2→v3 correction above. docs-writer additionally found two more sites with the identical pattern —
+  **fixed**: the migration-DDL comment in `execution_tracker.cpp` (was present-tense, now reads
+  historically, matching the corrected text two lines below it) and a new test comment in
+  `test_execution_tracker.cpp` (was present-tense AND cited the pre-hardening `random_bytes(8)`
+  instead of the shipped `random_bytes(16)` — both fixed).
+- **cpp-expert + sre** (converging): a dev/UAT rig that already booted the *pre-reconciliation*
+  ADR-1007 branch against a persisted Postgres volume will fail closed (loudly, not silently) on the
+  reconciled build, since `schema_meta` would record version 2 as already-applied under the OLD
+  meaning. Verified this doesn't apply to any state this session created (every local test run used
+  an ephemeral `PgTestTemplate` database, dropped at run end) — INFO, worth one line in the eventual
+  PR description, not a code fix.
+- **cpp-safety**: SHOULD — the by-command fallback's decision logic (the RUNNING/terminal switch and
+  the `__guard__-` skip in `notify_exec_tracker`) is unit-tested only at the `ExecutionTracker` level,
+  not through `AgentServiceImpl`/`process_gateway_response` end-to-end. **Fixed**: added
+  `test_agent_service_impl.cpp` coverage driving an unresolved-`execution_id` `CommandResponse`
+  through the real dispatch path.
+- **compliance-officer**: recommendation (not a finding) — record this Gate 8 re-review as its own
+  ledger row(s) citing the reconciled commit SHA, since none of the 34 existing rows referenced it.
+  **Done** — see the governance ledger.
+- **docs-writer** (non-blocking completeness note): the by-command fallback's "two remaining cases"
+  enumeration undercounted a real third trigger — `reap_command_execution_mappings` ages a
+  `command_execution` row out on a fixed 24h window independent of a concurrency claim's own
+  keepalive-renewed TTL, so a legitimately still-running command past 24h reaches the fallback via a
+  genuine reap, not just workflow-step dispatch or a degrade. Behavior was already correct either way;
+  folded into the doc comments while touching them for the other fixes above.
 
 ### Retention: released claims are never pruned (deliberate, for now)
 

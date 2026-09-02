@@ -454,12 +454,20 @@ public:
     /// whose `execution_id` is always empty (CONSIST-2/sec-M2) and which
     /// `record_execution_id` therefore never records a mapping for at all
     /// — this is the ONLY release path workflow-step per-device claims
-    /// ever reach; and (2) a genuine degrade on the correlation table's
+    /// ever reach; (2) a genuine degrade on the correlation table's
     /// own write or read side (`record_command_execution`/
     /// `lookup_execution_id` returning false/nullopt under pool exhaustion
     /// or a query failure), which this fallback also transparently covers
     /// as a side effect of matching on `command_id` alone rather than
-    /// needing the table to have succeeded.
+    /// needing the table to have succeeded; and (3) the correlation
+    /// table's own bounded retention (`reap_command_execution_mappings`,
+    /// a fixed 24h window, `kCmdExecutionReapWindowSecs`) aging a mapping
+    /// out from under a command that is STILL legitimately running past
+    /// that window (ADR-1007 deliberately supports unbounded "run until
+    /// finished" dispatch with no wire `expires_at`) — the mapping's own
+    /// reap has nothing to do with whether the command finished, so this
+    /// fallback is what still lets that claim release/renew correctly once
+    /// the mapping is gone.
     ///
     /// Matching on `(command_id, agent_id)` alone needs no `definition_id`
     /// scoping the way `execution_id` does: `command_id` is minted fresh
@@ -476,9 +484,10 @@ public:
                                               const std::string& agent_id);
 
     /// Fallback for `renew_concurrency_claim` keyed on `command_id` alone —
-    /// same rationale and same two remaining cases (workflow-step,
-    /// correlation-table degrade) as `release_concurrency_claim_by_command`
-    /// above, for the keepalive/`running` path instead of the terminal
+    /// same rationale and same three remaining cases (workflow-step,
+    /// correlation-table degrade, correlation-table reap-window expiry) as
+    /// `release_concurrency_claim_by_command` above, for the
+    /// keepalive/`running` path instead of the terminal
     /// path. Fed by the SAME agent-core keepalive thread that drives
     /// `renew_concurrency_claim` (`agent.cpp`'s periodic `__keepalive__`,
     /// which echoes the wire `command_id` unconditionally regardless of

@@ -1797,11 +1797,17 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
         // `record_execution_id` never records a mapping for it and
         // `resolve_execution_id` correctly returns nullopt — this is the
         // ONLY release path a workflow-step per-device claim ever reaches;
-        // and (2) a genuine degrade on `command_execution`'s own write or
+        // (2) a genuine degrade on `command_execution`'s own write or
         // read side (pool exhaustion, a query failure), which this fallback
         // also transparently covers since it doesn't depend on that table
-        // having succeeded. The concurrency-claim safety property does not
-        // have to share either fate: `command_id` rides on every response
+        // having succeeded; and (3) `command_execution`'s own bounded
+        // retention (`reap_command_execution_mappings`, a fixed 24h window)
+        // aging a mapping out from under a command that is STILL
+        // legitimately running past that window (ADR-1007 supports
+        // unbounded "run until finished" dispatch) — the mapping's reap has
+        // nothing to do with whether the command finished. The
+        // concurrency-claim safety property does not have to share any of
+        // these fates: `command_id` rides on every response
         // independent of this table, and `(command_id, agent_id)` is a
         // DB-enforced-unique match key (see
         // release_concurrency_claim_by_command's doc comment) — so route

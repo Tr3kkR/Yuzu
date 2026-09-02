@@ -228,20 +228,30 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX idx_concurrency_claims_execution ON concurrency_claims(execution_id);"
          "CREATE INDEX idx_concurrency_claims_open_expiry ON concurrency_claims(expires_at) "
          "  WHERE released_at IS NULL;"
-         // UP-1 fix (unhappy-path Gate 4 finding, PR #3784 fix round): a
-         // server restart drops `cmd_execution_ids_` (in-memory,
-         // unpersisted — agent_service_impl.hpp), so `execution_id`-keyed
-         // release/renew is unreachable for any command still in flight
-         // across the restart, even though the agent is alive and still
-         // sending keepalives — the server just discards them
+         // UP-1 fix (unhappy-path Gate 4 finding, PR #3784 fix round;
+         // historical framing below, see the by-command fallback methods'
+         // own doc comments in execution_tracker.hpp for the current
+         // picture post-HA-WS-1(1b)-reconciliation): originally, a server
+         // restart dropped `cmd_execution_ids_` (in-memory, unpersisted —
+         // agent_service_impl.hpp), so `execution_id`-keyed release/renew
+         // was unreachable for any command still in flight across the
+         // restart, even though the agent stayed alive and kept sending
+         // keepalives — the server just discarded them
          // (notify_exec_tracker's `execution_id.empty()` early-return).
-         // `command_id` survives that restart: it rides on every
-         // CommandResponse (including `__keepalive__`) independent of any
-         // server-side cache, and is minted fresh per dispatch
-         // (`plugin + "-" + random_bytes(16)`, server.cpp) so — unlike
-         // execution_id, which workflow-step dispatch shares as a literal
-         // empty string across definitions — `(command_id, agent_id)` is a
-         // safe match key with no definition_id scoping needed. See
+         // `cmd_execution_ids_` no longer exists: it was replaced by a
+         // PG-backed, replica-safe correlation table
+         // (`ExecutionTracker::record_command_execution`/`lookup_execution_id`,
+         // HA WS-1(1b)), which now handles that restart case on its own.
+         // `command_id` still rides on every CommandResponse (including
+         // `__keepalive__`) independent of any server-side cache, and is
+         // minted fresh per dispatch (`plugin + "-" + random_bytes(16)`,
+         // server.cpp) so — unlike execution_id, which workflow-step
+         // dispatch shares as a literal empty string across definitions —
+         // `(command_id, agent_id)` is a safe match key with no
+         // definition_id scoping needed; this is why the by-command
+         // fallback below stays load-bearing for the cases that
+         // restart-survival no longer needs it for (workflow-step dispatch,
+         // a correlation-table degrade). See
          // release_concurrency_claim_by_command/renew_concurrency_claim_by_command.
          //
          // UNIQUE, not just an index (Sol/Fable adversarial-review finding,

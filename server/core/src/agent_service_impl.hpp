@@ -556,8 +556,10 @@ private:
     /// No-op on the executions-drawer/SSE side if the tracker isn't wired
     /// or `lookup_execution_id` finds no mapping — ordinary out-of-band
     /// dispatch, a workflow-step dispatch (CONSIST-2/sec-M2, which never
-    /// records one), or a genuine degrade on the correlation table's own
-    /// write/read side (ADR-1007, originally UP-1, unhappy-path Gate 4
+    /// records one), a genuine degrade on the correlation table's own
+    /// write/read side, or the correlation table's own bounded (24h)
+    /// retention aging a mapping out from under a still-legitimately-
+    /// running command (ADR-1007, originally UP-1, unhappy-path Gate 4
     /// finding, PR #3784 fix round — reconciled onto HA WS-1(1b) above,
     /// which closed this fallback's ORIGINAL restart-survival case by
     /// persisting the correlation itself). Those remaining cases are NOT a
