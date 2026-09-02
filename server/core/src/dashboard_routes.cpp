@@ -1078,8 +1078,14 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              // blast radius of a refused Destructive dispatch
                              // would find nothing and could reasonably read the
                              // absence as log loss or tampering. Sanitised and
-                             // capped like every other operator-supplied field
-                             // that reaches a log here.
+                             // capped because these ids ARE operator-supplied:
+                             // `scope` comes straight off the request. (The
+                             // sibling arms above log `plugin`/`action` raw and
+                             // sanitise only `scope_expr` -- correct there,
+                             // because those two are resolved against the
+                             // registry's help_json and cannot carry request
+                             // bytes. Do not read those as the convention for
+                             // an operator-supplied value.)
                              std::string requested;
                              for (const auto& id : requested_ids) {
                                  if (!requested.empty()) requested += ",";
