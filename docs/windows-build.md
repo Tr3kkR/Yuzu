@@ -12,7 +12,7 @@ meson compile -C build-windows       # canonical Windows dir; coexists with buil
 
 **Do NOT use `vcvars64.bat`.** It returns exit code 1 due to optional extension failures (Clang, bundled CMake, ConnectionManager) even though cl.exe is set up correctly. This causes `.bat` wrapper scripts to abort or misbehave. `setup_msvc_env.sh` sets all MSVC paths directly in MSYS2 bash and is the only supported build method.
 
-`scripts/ensure-erlang.sh` is the sibling helper for the Erlang/OTP toolchain (see "Toolchain activation (Erlang on PATH)" in CLAUDE.md's Erlang gateway section). Source both before invoking meson if your build touches the gateway custom_target.
+`scripts/ensure-erlang.sh` is the sibling helper for the Erlang/OTP toolchain (see "Toolchain activation (Erlang on PATH)" in `docs/erlang-gateway-build.md`). Source both before invoking meson if your build touches the gateway custom_target.
 
 ## Toolchain paths
 

@@ -80,8 +80,7 @@ jobs:
           files=(
             vcpkg.json
             vcpkg-configuration.json
-            AGENTS.md
-            CLAUDE.md
+            docs/build-guide.md
             .github/workflows/ci.yml
             .github/workflows/fork-dynamic-review.yml
             .github/workflows/nightly.yml
