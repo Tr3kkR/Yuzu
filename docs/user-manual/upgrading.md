@@ -2899,7 +2899,18 @@ surface dispatched it**:
   offline/unreachable agent gets (CLOSED by #3687 — a `no_agents_reached` result no longer needs a
   manual check for whether a pair is gated before you trust it, aside from the same narrow
   dry-run-then-real-check TOCTOU window every pre-dispatch authorization check in this codebase
-  accepts).
+  accepts). **`approval_required` is one of six discriminated reasons, not the only one** — the
+  same fix discriminates `Unclassified`/`Ambiguous`/`AnonymousOperator`/`Forbidden`/`KillSwitched`
+  too, so a caller that only added handling for this release's `approval_required` change gets no
+  warning that `Forbidden` (the most common denial in practice — a caller with no covering grant
+  at all, not just an ungated approval gap) now arrives as the same kind of discriminated
+  JSON-RPC error rather than the old `no_agents_reached`/ambiguous-success shape. **This coverage
+  is no longer `execute_instruction`-only**: #3893 extended the identical pre-dispatch dry run
+  (both the C8 pre-mint check and the main-handler backstop) to `execute_bundle` (a denied step
+  now refuses the whole bundle call up front — previously an entirely-denied bundle returned a
+  false JSON-RPC success naming the requested step count) and `quarantine_device` (a denial now
+  runs before the quarantine record is written, and before dispatch, instead of mapping every
+  denial reason to the same "retry" hint an offline device gets).
 - **Schedules**: a schedule dispatching a gated pair now requires an approval ticket exactly like
   the interactive governed path (`ScheduleRunner` mints one and holds the occurrence until an
   admin approves it via the existing `/api/approvals` workflow) — this was already the behavior

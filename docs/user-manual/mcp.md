@@ -261,7 +261,9 @@ at the shared dispatch chokepoint regardless of MCP tier, admin-role-holding
 tokens excepted (`principal_is_admin`). That denial — and every other
 dispatch-chokepoint denial reason — is now a discriminated JSON-RPC error
 naming the reason, not the `no_agents_reached`-shaped result an
-offline/unreachable agent also produces (CLOSED by #3687). See
+offline/unreachable agent also produces (CLOSED by #3687 for
+`execute_instruction`, widened to `execute_bundle` and `quarantine_device` —
+every MCP tool that can reach this chokepoint — by #3893). See
 `docs/mcp-server.md` "Security Model" for the full gate list.
 ## Authorization Tiers
 
