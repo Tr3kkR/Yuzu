@@ -2336,7 +2336,13 @@ jobs:
         # heavy week was the residual risk) while keeping live entries to
         # ~2-3 per scope (<= ~6 GB at the 2G cap) — daily buckets would
         # re-crowd the quota this change frees.
-        run: echo "CCACHE_BUCKET=$(( $(date -u +%s) / 259200 ))" >> "$GITHUB_ENV"
+        #
+        # PREV_BUCKET exists only to bound the restore-keys fallback below
+        # to yesterday's bucket — see that step for why an open-ended
+        # prefix fallback defeats the whole design.
+        run: |
+          echo "CCACHE_BUCKET=$(( $(date -u +%s) / 259200 ))" >> "$GITHUB_ENV"
+          echo "CCACHE_PREV_BUCKET=$(( $(date -u +%s) / 259200 - 1 ))" >> "$GITHUB_ENV"
 
       - name: Restore ccache (canary)
         # ccache is `apt-get install`-ed and used as the compiler wrapper
@@ -2353,13 +2359,28 @@ jobs:
         # (it builds merge refs that compile on the required legs), and
         # (c) the blast radius is bounded to 3 days — the source-hash
         # design this replaces had the unbounded-growth failure instead.
+        #
+        # restore-keys names the EXACT previous bucket, never a bare
+        # `ccache-canary-x64-linux-` prefix. An open-ended prefix matches
+        # every entry this cache-type name has ever produced, including a
+        # dead one left behind by a since-changed key format (measured
+        # 2026-09-02: the pre-bucket source-hash entry from before this
+        # design shipped was still alive a day later, because every
+        # fallback hit refreshes GitHub's last-accessed clock and that
+        # clock is the only thing that ever ages a cache out — the entry
+        # was immortal by construction, ~2.4 GB of dead weight pinning the
+        # pool back near the 10 GB quota it took #3797 to clear). Pinning
+        # the fallback to one real, named bucket means anything else —
+        # an old format, an orphaned bucket several rolls back — is never
+        # touched again and ages out on GitHub's own 7-day-unused clock
+        # instead of living forever.
         id: cache-ccache-canary
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ccache
           key: ccache-canary-x64-linux-${{ env.CCACHE_BUCKET }}
           restore-keys: |
-            ccache-canary-x64-linux-
+            ccache-canary-x64-linux-${{ env.CCACHE_PREV_BUCKET }}
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
