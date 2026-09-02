@@ -2410,11 +2410,12 @@ These are two SEPARATE failure/detection behaviors, not one — do not conflate 
   legacy-row-count warning at WARN; boot proceeds unaffected either way.
 - **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
-**This is a stronger warning than it looks.** Unlike the other stores retiring
+**This is a stronger warning than it looks.** Unlike most other stores retiring
 their legacy-SQLite path in this same release, a genuinely non-empty
 `guaranteed-state.db` here means real Guardian rules an operator authored are
 silently NOT loaded — enforcement resumes from an empty rule set, not the
-operator's prior policy. If you see the legacy-row-count warning above and the
+operator's prior policy. (Guardian Baselines carry the same consequence — see
+the BaselineStore section above.) If you see the legacy-row-count warning above and the
 environment genuinely has real rules to keep, there is no automated recovery
 path: re-author the equivalent rules against the new Postgres-backed store via
 the Guardian UI/REST API before relying on it, and confirm the expected rules
