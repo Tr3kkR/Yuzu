@@ -7,10 +7,14 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
+#include <yuzu/audit_retention_rules.hpp>
+#include <yuzu/metrics.hpp>
+
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -59,6 +63,36 @@ double to_d(const char* s) {
     if (s == nullptr || s[0] == '\0')
         return 0.0;
     return std::strtod(s, nullptr);
+}
+
+std::vector<std::string_view> as_views(const std::vector<std::string>& v) {
+    std::vector<std::string_view> out;
+    out.reserve(v.size());
+    for (const auto& s : v)
+        out.emplace_back(s);
+    return out;
+}
+
+// CLAUDE.md clock-guard part 7 — absolute, never scaled to any window.
+// `audit_retention::moved_at_least`'s floor, in EITHER direction, between
+// two ~5-minute-cadence reconciler ticks: ordinary NTP correction is
+// sub-second to a few seconds, so a full hour is comfortably past any
+// legitimate elapsed-time reading and comfortably short of "never fires".
+constexpr int64_t kConcurrencyReconcileBigStepFloorSeconds = 3600; // 1 hour
+
+// Part 5 — the cap applies UNCONDITIONALLY, regardless of detector
+// effectiveness. concurrency_claims is bounded by concurrent per-device
+// dispatch volume (realistically single/low-double-digit open rows at any
+// time), so this is generous headroom, not a routine limit.
+constexpr int kConcurrencyReconcileCapPerPass = 5000;
+
+// Same compact encoding as AuditStore::serialize_facts (audit_store.cpp) —
+// the dedup key is the whole FACT SET, not the classified Anomaly (see
+// audit_retention_rules.hpp's own doc comment on why the enum collapses
+// information the dedup needs).
+std::string serialize_concurrency_facts(const audit_retention::Facts& f) {
+    return std::string(f.has_expired ? "e" : "-") + (f.would_wipe ? "w" : "-") +
+          (f.big_step ? "s" : "-") + (f.prev_unusable ? "u" : "-") + (f.no_anchor ? "b" : "-");
 }
 
 Execution row_to_exec(PGresult* r, int i) {
@@ -163,6 +197,83 @@ const std::vector<pg::PgMigration>& migrations() {
          "  key   TEXT PRIMARY KEY,"
          "  value TEXT NOT NULL"
          ");"},
+        // v3 — per-device concurrency enforcement (ADR-1007). A dedicated
+        // claim table (only the OPEN rows are short-lived — released rows
+        // accumulate forever, see the no-prune note on idx_concurrency_claims_claimed_at
+        // below), deliberately not a reuse of agent_exec_status: that table
+        // only gains a row on an agent's
+        // FIRST RESPONSE, which is too late to exclude a still-executing
+        // duplicate. `ux_concurrency_claims_open` is the actual atomicity
+        // guarantee — race-free under any isolation level, not an
+        // app-level check (see claim_concurrency_slots). `retention_meta`
+        // is the persisted clock anchor + anomaly-fact-set the stale-claim
+        // reconciler needs to survive a restart (CLAUDE.md clock-guard
+        // discipline; shape mirrors audit_store's own retention meta).
+        // Numbered v3, not v2 — this migration and HA WS-1(1b)'s
+        // `command_execution`/`reap_meta` (v2 above) were authored on
+        // parallel branches and originally both claimed id 2; renumbered on
+        // reconciliation, since v2 already shipped on `origin/dev` first.
+        {3,
+         "CREATE TABLE concurrency_claims ("
+         "  definition_id  TEXT    NOT NULL,"
+         "  agent_id       TEXT    NOT NULL,"
+         "  execution_id   TEXT    NOT NULL,"
+         "  command_id     TEXT    NOT NULL,"
+         "  claimed_at     BIGINT  NOT NULL,"
+         "  expires_at     BIGINT  NOT NULL,"
+         "  released_at    BIGINT"
+         ");"
+         "CREATE UNIQUE INDEX ux_concurrency_claims_open ON concurrency_claims "
+         "  (definition_id, agent_id) WHERE released_at IS NULL;"
+         "CREATE INDEX idx_concurrency_claims_execution ON concurrency_claims(execution_id);"
+         "CREATE INDEX idx_concurrency_claims_open_expiry ON concurrency_claims(expires_at) "
+         "  WHERE released_at IS NULL;"
+         // UP-1 fix (unhappy-path Gate 4 finding, PR #3784 fix round): a
+         // server restart drops `cmd_execution_ids_` (in-memory,
+         // unpersisted — agent_service_impl.hpp), so `execution_id`-keyed
+         // release/renew is unreachable for any command still in flight
+         // across the restart, even though the agent is alive and still
+         // sending keepalives — the server just discards them
+         // (notify_exec_tracker's `execution_id.empty()` early-return).
+         // `command_id` survives that restart: it rides on every
+         // CommandResponse (including `__keepalive__`) independent of any
+         // server-side cache, and is minted fresh per dispatch
+         // (`plugin + "-" + random_bytes(16)`, server.cpp) so — unlike
+         // execution_id, which workflow-step dispatch shares as a literal
+         // empty string across definitions — `(command_id, agent_id)` is a
+         // safe match key with no definition_id scoping needed. See
+         // release_concurrency_claim_by_command/renew_concurrency_claim_by_command.
+         //
+         // UNIQUE, not just an index (Sol/Fable adversarial-review finding,
+         // PR #3784 fix round): 128 bits of randomness makes a collision
+         // astronomically unlikely, but "unlikely" is not the same
+         // guarantee as "enforced" — a doc comment claiming this pair
+         // "cannot collide" was an overclaim the schema didn't actually
+         // back up. Full-table (not partial `WHERE released_at IS NULL`
+         // like `ux_concurrency_claims_open`) because the invariant this
+         // protects — one dispatch mints one fresh command_id, ever — holds
+         // for the row's entire lifetime, not just while it's open; a
+         // released row's command_id must never be reused either.
+         // `claim_concurrency_slots`'s INSERT relies on this constraint to
+         // fail CLOSED (a targetless `ON CONFLICT DO NOTHING` covers both
+         // this and `ux_concurrency_claims_open`) rather than letting a
+         // duplicate command_id silently take a second claim.
+         "CREATE UNIQUE INDEX ux_concurrency_claims_command ON concurrency_claims"
+         "  (command_id, agent_id);"
+         // Non-partial, on claimed_at — released rows are NEVER pruned
+         // today (Gate 6 compliance/sre: a deliberate no-prune, recorded in
+         // ADR-1007, not an omission). A future age-based prune pass
+         // (`WHERE claimed_at < cutoff`) needs this index to avoid a full
+         // scan; the partial indexes above are invisible to released rows
+         // (both are `WHERE released_at IS NULL`) so they don't help it.
+         // Adding it now, while this table has zero production rows, is
+         // free; adding it later means `CREATE INDEX CONCURRENTLY` against
+         // a live table.
+         "CREATE INDEX idx_concurrency_claims_claimed_at ON concurrency_claims(claimed_at);"
+         "CREATE TABLE retention_meta ("
+         "  key    TEXT PRIMARY KEY,"
+         "  value  TEXT NOT NULL"
+         ");"},
     };
     return kMigrations;
 }
@@ -254,6 +365,20 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
     for (int i = 0; i < rows; ++i)
         results.push_back(row_to_exec(res.get(), i));
     return results;
+}
+
+std::string ExecutionTracker::definition_id_for_execution(const std::string& execution_id) const {
+    if (!open_ || execution_id.empty())
+        return {};
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return {};
+    pg::PgResult res =
+        pg::exec_params(lease.get(), "SELECT definition_id FROM execution_tracker.executions WHERE id=$1",
+                        std::vector<std::string>{execution_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return {};
+    return col_str(res.get(), 0, 0);
 }
 
 // Single-row reads (`get_execution` / `get_summary`) always opt into the
@@ -435,8 +560,9 @@ std::expected<std::string, std::string> ExecutionTracker::create_execution(const
     return id;
 }
 
-bool ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
-                                                const AgentExecStatus& s) {
+std::optional<std::string>
+ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
+                                           const AgentExecStatus& s) {
     // Snapshot-and-release (governance round perf-B1 / UP-A9), preserved
     // under the pool model: build the SSE payload, release the lease
     // (scope exit), THEN publish. Holding a lease across publish would
@@ -446,11 +572,12 @@ bool ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
     // rationale described, now against pool capacity instead of a mutex.
     bool should_publish = false;
     nlohmann::json payload;
+    std::string persisted_status;
 
     {
         auto lease = pool_.try_acquire_for(kWriteTimeout);
         if (!lease)
-            return false;
+            return std::nullopt;
 
         auto now = now_epoch();
         pg::PgResult res = pg::exec_params(
@@ -460,40 +587,86 @@ bool ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             " exit_code, error_detail, plugin_result_status) "
             "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
             "ON CONFLICT (execution_id, agent_id) DO UPDATE SET "
-            "  status=excluded.status, "
+            // Terminal status is STICKY (CHAOS-TTL-1 keepalive hardening,
+            // security-guardian finding): a stale 'running' write arriving
+            // AFTER a real terminal write — the keepalive thread's
+            // snapshot-then-write has no re-check against a command that
+            // completes mid-sweep, an ordinary race requiring no attacker —
+            // must not flip an already-terminal row back to 'running'. Once
+            // status is in the terminal set, only another TERMINAL status
+            // (a legitimate second/replayed terminal write, e.g. HA WS-0
+            // redelivery) may overwrite it; a 'running' write is a no-op on
+            // every column here once terminal, so completed_at/exit_code/
+            // error_detail/plugin_result_status stay whatever the terminal
+            // write set them to.
+            "  status=CASE WHEN agent_exec_status.status IN "
+            "                 ('success','failure','timeout','rejected') "
+            "                 AND excluded.status = 'running' "
+            "              THEN agent_exec_status.status ELSE excluded.status END, "
             "  first_response_at=CASE WHEN agent_exec_status.first_response_at=0 "
             "                          THEN excluded.first_response_at "
             "                          ELSE agent_exec_status.first_response_at END, "
-            "  completed_at=excluded.completed_at, "
-            "  exit_code=excluded.exit_code, "
-            "  error_detail=excluded.error_detail, "
-            "  plugin_result_status=excluded.plugin_result_status",
+            "  completed_at=CASE WHEN agent_exec_status.status IN "
+            "                        ('success','failure','timeout','rejected') "
+            "                        AND excluded.status = 'running' "
+            "                     THEN agent_exec_status.completed_at ELSE excluded.completed_at END, "
+            "  exit_code=CASE WHEN agent_exec_status.status IN "
+            "                    ('success','failure','timeout','rejected') "
+            "                    AND excluded.status = 'running' "
+            "                 THEN agent_exec_status.exit_code ELSE excluded.exit_code END, "
+            "  error_detail=CASE WHEN agent_exec_status.status IN "
+            "                        ('success','failure','timeout','rejected') "
+            "                        AND excluded.status = 'running' "
+            "                     THEN agent_exec_status.error_detail ELSE excluded.error_detail END, "
+            "  plugin_result_status=CASE WHEN agent_exec_status.status IN "
+            "                                ('success','failure','timeout','rejected') "
+            "                                AND excluded.status = 'running' "
+            "                             THEN agent_exec_status.plugin_result_status "
+            "                             ELSE excluded.plugin_result_status END "
+            // RETURNING the post-write row (CHAOS-TTL-1 keepalive hardening,
+            // security-guardian finding): the SSE payload below must reflect
+            // what was ACTUALLY persisted, not the caller's `s` verbatim —
+            // otherwise a stale 'running' write correctly rejected by the
+            // sticky-terminal CASE above would still publish an
+            // agent-transition event CLAIMING status="running", misleading
+            // every live listener (dashboard, SSE, MCP) even though the row
+            // itself stayed correctly terminal.
+            "RETURNING status, exit_code, completed_at, error_detail, plugin_result_status",
             std::vector<std::string>{
                 execution_id, s.agent_id, s.status,
                 std::to_string(s.dispatched_at > 0 ? s.dispatched_at : now),
                 std::to_string(s.first_response_at > 0 ? s.first_response_at : now),
                 std::to_string(s.completed_at), std::to_string(s.exit_code), s.error_detail,
                 std::to_string(s.plugin_result_status)});
-        if (res.status() != PGRES_COMMAND_OK)
-            return false;
+        if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+            return std::nullopt;
+
+        // UP-2 fix (unhappy-path Gate 4 finding, PR #3784 fix round):
+        // captured unconditionally, not only when event_bus_ is set — the
+        // caller needs the ACTUALLY-PERSISTED status (which the
+        // sticky-terminal CASE above may have kept unchanged from `s.status`)
+        // to gate concurrency-claim release/renewal correctly.
+        persisted_status = col_str(res.get(), 0, 0);
 
         if (event_bus_) {
             should_publish = true;
             payload["agent_id"] = s.agent_id;
-            payload["status"] = s.status;
-            payload["exit_code"] = s.exit_code;
-            payload["completed_at"] = s.completed_at;
-            if (!s.error_detail.empty())
-                payload["error_detail"] = s.error_detail;
-            if (s.plugin_result_status != 0)
-                payload["plugin_result_status"] = s.plugin_result_status;
+            payload["status"] = persisted_status;
+            payload["exit_code"] = to_i64(col(res.get(), 0, 1));
+            payload["completed_at"] = to_i64(col(res.get(), 0, 2));
+            const std::string returned_error = col_str(res.get(), 0, 3);
+            if (!returned_error.empty())
+                payload["error_detail"] = returned_error;
+            const int64_t returned_plugin_status = to_i64(col(res.get(), 0, 4));
+            if (returned_plugin_status != 0)
+                payload["plugin_result_status"] = returned_plugin_status;
         }
     } // lease released here — publish below runs lease-free.
 
     if (should_publish) {
         event_bus_->publish(execution_id, "agent-transition", payload.dump());
     }
-    return true;
+    return persisted_status;
 }
 
 void ExecutionTracker::update_agent_status(const std::string& execution_id,
@@ -509,15 +682,57 @@ void ExecutionTracker::update_agent_status(const std::string& execution_id,
     // the reconciler recomputes FROM agent_exec_status rows, so a row that
     // was never inserted has nothing to reconcile from (the agent does not
     // re-send). Loud logging on final failure at least surfaces the loss.
-    bool ok = false;
-    for (int attempt = 0; attempt < 2 && !ok; ++attempt)
-        ok = upsert_agent_status_once(execution_id, s);
-    if (!ok) {
+    std::optional<std::string> persisted;
+    for (int attempt = 0; attempt < 2 && !persisted; ++attempt)
+        persisted = upsert_agent_status_once(execution_id, s);
+    if (!persisted) {
         spdlog::error("ExecutionTracker::update_agent_status: upsert failed twice for "
                       "execution_id={} agent_id={} — this agent's status is NOT recorded and "
                       "will not be reconciled (agents do not re-send)",
                       execution_id, s.agent_id);
         return;
+    }
+
+    // Per-device concurrency claim release (ADR-1007): the same terminal set
+    // refresh_counts_once uses for agents_responded/agents_failure below —
+    // 'running' is not terminal and must not release a claim early. A
+    // best-effort release; an unreleased claim self-heals via
+    // reconcile_stale_concurrency_claims once past its own expires_at.
+    //
+    // UP-2 fix (unhappy-path Gate 4 finding, PR #3784 fix round): gate on
+    // `*persisted` (what the sticky-terminal CASE in upsert_agent_status_once
+    // actually wrote), NEVER on the caller-supplied `s.status`. A stale
+    // 'running' write that arrives after a real terminal write is correctly
+    // rejected by that CASE — the row stays terminal — but `s.status` still
+    // literally says "running"; branching on it here would call
+    // renew_concurrency_claim for a command whose claim the terminal branch
+    // may already have released, extending a dead command's claim past when
+    // it should self-heal via the reconciler.
+    //
+    // definition_id_for_execution (Gate 2 security-guardian finding, PR #3784
+    // fix round): release/renew MUST be scoped by definition_id, not just
+    // (execution_id, agent_id) — see release_concurrency_claim's doc comment
+    // for why. A missing/unresolvable definition_id (empty execution_id,
+    // pool exhaustion, a row that predates this lookup) skips the release/
+    // renewal outright rather than falling back to the unscoped match that
+    // reopens the exact hazard this fix closes — the claim self-heals via
+    // the reconciler either way, same fallback as every other best-effort
+    // failure mode here.
+    if (*persisted == "success" || *persisted == "failure" || *persisted == "timeout" ||
+        *persisted == "rejected") {
+        if (auto def_id = definition_id_for_execution(execution_id); !def_id.empty())
+            release_concurrency_claim(def_id, execution_id, s.agent_id);
+    } else if (*persisted == "running") {
+        // CHAOS-TTL-1 fix (Gate 5, PR #3784 fix round): a 'running' update
+        // is a live signal from the agent — extend the claim so the
+        // reconciler's crash-detection TTL measures time since the LAST
+        // signal, not time since the claim was first taken. Fed reliably by
+        // the agent-core keepalive thread (agent.cpp, sentinel
+        // "__keepalive__" recognized in agent_service_impl.cpp), not by
+        // plugin cooperation — see renew_concurrency_claim's own doc
+        // comment and ADR-1007's "CLOSED (agent-core keepalive)" section.
+        if (auto def_id = definition_id_for_execution(execution_id); !def_id.empty())
+            renew_concurrency_claim(def_id, execution_id, s.agent_id);
     }
 
     // UAT 2026-05-06: chain refresh_counts so the parent executions row's
@@ -750,6 +965,21 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
         if (event_bus_) {
             should_publish = true;
         }
+
+        // ADR-1007 correctness fix (Gate 4 unhappy-path UP-1): a cancelled
+        // execution's per-device claims are DELIBERATELY NOT released here.
+        // `mark_cancelled` only updates SERVER-side bookkeeping — there is
+        // no gRPC cancel/kill RPC to the agent (grepped: none exists), so
+        // the agent keeps running the plugin regardless of this call.
+        // Releasing the claim on cancel would immediately admit a duplicate
+        // dispatch of the same definition to the same STILL-EXECUTING
+        // agent — exactly the race this whole feature exists to prevent. A
+        // cancelled execution's claims release the same way every other
+        // claim does: a genuine terminal response from the agent
+        // (`update_agent_status`), or the stale-claim reconciler once past
+        // `expires_at` if no response ever comes. This is honest, not
+        // lossy: "cancel requested" is not the same fact as "agent
+        // stopped", and the claim table only ever asserts the latter.
     } // lease released — publish below runs lease-free.
 
     if (should_publish) {
@@ -758,6 +988,510 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
         event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
     }
     return true;
+}
+
+// ── per-device concurrency enforcement (ADR-1007) ──────────────────────
+
+std::vector<std::string>
+ExecutionTracker::claim_concurrency_slots(const std::string& definition_id,
+                                          const std::string& execution_id,
+                                          const std::string& command_id,
+                                          const std::vector<std::string>& candidates,
+                                          int64_t expires_at) {
+    // command_id.empty() rejected at claim time (Sol/Fable adversarial-
+    // review finding, PR #3784 fix round): release/renew_concurrency_
+    // claim_by_command already guard against an empty command_id, but
+    // claim_concurrency_slots didn't — an empty-command claim would have
+    // been silently un-releasable-by-command, an asymmetry that recreates
+    // the same unscoped-match hazard this PR fixed for execution_id=""
+    // if a future caller ever passed a constant/empty command_id.
+    if (!open_ || definition_id.empty() || command_id.empty() || candidates.empty())
+        return {};
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        // Fail CLOSED, matching this dispatch seam's own ContainmentGate
+        // precedent (dispatch_confined_arms.hpp): a degraded read must not
+        // silently read as "nobody is busy". Every candidate is excluded
+        // from this dispatch rather than let through unchecked.
+        spdlog::warn("ExecutionTracker::claim_concurrency_slots: pool exhausted for "
+                     "definition_id={} — excluding all {} candidate(s) from this dispatch",
+                     definition_id, candidates.size());
+        if (metrics_)
+            metrics_->counter("yuzu_server_concurrency_claim_unavailable_total").increment();
+        return {};
+    }
+    const auto now = now_epoch();
+    // Targetless `ON CONFLICT DO NOTHING` (Sol/Fable adversarial-review
+    // finding, PR #3784 fix round): catches a conflict on EITHER unique
+    // index on this table — `ux_concurrency_claims_open` (the real "already
+    // busy" case) or `ux_concurrency_claims_command` (a command_id/agent_id
+    // reuse, which should never happen at 128 bits of randomness but is now
+    // schema-enforced rather than merely assumed). Either way the row is
+    // excluded from `RETURNING`, so the caller's existing "N of M already
+    // busy" accounting stays correct without needing to distinguish which
+    // constraint fired.
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO execution_tracker.concurrency_claims "
+        "  (definition_id, agent_id, execution_id, command_id, claimed_at, expires_at, released_at) "
+        "SELECT $1, a, $2, $3, $4, $5, NULL FROM unnest($6::text[]) AS a "
+        "ON CONFLICT DO NOTHING "
+        "RETURNING agent_id",
+        std::vector<std::string>{definition_id, execution_id, command_id, std::to_string(now),
+                                 std::to_string(expires_at),
+                                 pg::to_text_array(as_views(candidates))});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ExecutionTracker::claim_concurrency_slots: insert failed for "
+                      "definition_id={}: {}",
+                      definition_id, PQerrorMessage(lease.get()));
+        if (metrics_)
+            metrics_->counter("yuzu_server_concurrency_claim_unavailable_total").increment();
+        return {};
+    }
+    std::vector<std::string> claimed;
+    const int rows = PQntuples(res.get());
+    claimed.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        claimed.emplace_back(col_str(res.get(), i, 0));
+    if (claimed.size() != candidates.size()) {
+        // Visibility for the operator/agentic caller (ADR-1007): a busy
+        // agent is silently excluded from the dispatch target list further
+        // up the call chain (dispatch_scope_ladder.hpp), not synchronously
+        // reported as a distinct error — this is the durable signal that a
+        // dispatch was partial because of a concurrency claim, not because
+        // of authz/quarantine/offline.
+        const auto skipped = candidates.size() - claimed.size();
+        spdlog::info("ExecutionTracker::claim_concurrency_slots: {} of {} candidate(s) already "
+                     "busy for definition_id={} — excluded from this dispatch",
+                     skipped, candidates.size(), definition_id);
+        if (metrics_)
+            metrics_->counter("yuzu_server_dispatch_concurrency_skipped_total")
+                .increment(static_cast<double>(skipped));
+    }
+    return claimed;
+}
+
+void ExecutionTracker::release_concurrency_claim(const std::string& definition_id,
+                                                 const std::string& execution_id,
+                                                 const std::string& agent_id) {
+    if (!open_)
+        return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::release_concurrency_claim: pool exhausted for "
+                     "definition_id={} execution_id={} agent_id={} — claim stays open until "
+                     "the stale-claim reconciler releases it past expires_at",
+                     definition_id, execution_id, agent_id);
+        return;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE execution_tracker.concurrency_claims SET released_at=$1 "
+        "WHERE definition_id=$2 AND execution_id=$3 AND agent_id=$4 AND released_at IS NULL",
+        std::vector<std::string>{std::to_string(now_epoch()), definition_id, execution_id,
+                                 agent_id});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::warn("ExecutionTracker::release_concurrency_claim: update failed for "
+                     "definition_id={} execution_id={} agent_id={}: {} — claim stays open "
+                     "until reconciled",
+                     definition_id, execution_id, agent_id, PQerrorMessage(lease.get()));
+    }
+}
+
+void ExecutionTracker::release_concurrency_claims(const std::string& definition_id,
+                                                  const std::string& execution_id,
+                                                  const std::vector<std::string>& agent_ids) {
+    if (!open_ || agent_ids.empty())
+        return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::release_concurrency_claims: pool exhausted for "
+                     "definition_id={} execution_id={} ({} agent id(s)) — claim(s) stay open "
+                     "until the stale-claim reconciler releases them past expires_at",
+                     definition_id, execution_id, agent_ids.size());
+        return;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE execution_tracker.concurrency_claims SET released_at=$1 "
+        "WHERE definition_id=$2 AND execution_id=$3 AND agent_id = ANY($4::text[]) "
+        "AND released_at IS NULL",
+        std::vector<std::string>{std::to_string(now_epoch()), definition_id, execution_id,
+                                 pg::to_text_array(as_views(agent_ids))});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::warn("ExecutionTracker::release_concurrency_claims: update failed for "
+                     "definition_id={} execution_id={} ({} agent id(s)): {} — claim(s) stay "
+                     "open until reconciled",
+                     definition_id, execution_id, agent_ids.size(), PQerrorMessage(lease.get()));
+    }
+}
+
+void ExecutionTracker::renew_concurrency_claim(const std::string& definition_id,
+                                               const std::string& execution_id,
+                                               const std::string& agent_id) {
+    if (!open_)
+        return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::renew_concurrency_claim: pool exhausted for "
+                     "definition_id={} execution_id={} agent_id={} — this renewal is skipped; "
+                     "the claim falls back to the reconciler's ordinary crash-detection "
+                     "behaviour at its current (unextended) expires_at",
+                     definition_id, execution_id, agent_id);
+        return;
+    }
+    const int64_t new_expires_at = now_epoch() + kConcurrencyClaimDefaultTtlSeconds;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE execution_tracker.concurrency_claims SET expires_at=$1 "
+        "WHERE definition_id=$2 AND execution_id=$3 AND agent_id=$4 AND released_at IS NULL",
+        std::vector<std::string>{std::to_string(new_expires_at), definition_id, execution_id,
+                                 agent_id});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::warn("ExecutionTracker::renew_concurrency_claim: update failed for "
+                     "definition_id={} execution_id={} agent_id={}: {} — this renewal is "
+                     "skipped, same fallback as a pool-exhaustion skip above",
+                     definition_id, execution_id, agent_id, PQerrorMessage(lease.get()));
+    }
+}
+
+void ExecutionTracker::release_concurrency_claim_by_command(const std::string& command_id,
+                                                             const std::string& agent_id) {
+    if (!open_ || command_id.empty())
+        return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::release_concurrency_claim_by_command: pool exhausted "
+                     "for command_id={} agent_id={} — claim stays open until the stale-claim "
+                     "reconciler releases it past expires_at",
+                     command_id, agent_id);
+        return;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE execution_tracker.concurrency_claims SET released_at=$1 "
+        "WHERE command_id=$2 AND agent_id=$3 AND released_at IS NULL",
+        std::vector<std::string>{std::to_string(now_epoch()), command_id, agent_id});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::warn("ExecutionTracker::release_concurrency_claim_by_command: update failed "
+                     "for command_id={} agent_id={}: {} — claim stays open until reconciled",
+                     command_id, agent_id, PQerrorMessage(lease.get()));
+    }
+}
+
+void ExecutionTracker::renew_concurrency_claim_by_command(const std::string& command_id,
+                                                           const std::string& agent_id) {
+    if (!open_ || command_id.empty())
+        return;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::renew_concurrency_claim_by_command: pool exhausted for "
+                     "command_id={} agent_id={} — this renewal is skipped; the claim falls "
+                     "back to the reconciler's ordinary crash-detection behaviour at its "
+                     "current (unextended) expires_at",
+                     command_id, agent_id);
+        return;
+    }
+    const int64_t new_expires_at = now_epoch() + kConcurrencyClaimDefaultTtlSeconds;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE execution_tracker.concurrency_claims SET expires_at=$1 "
+        "WHERE command_id=$2 AND agent_id=$3 AND released_at IS NULL",
+        std::vector<std::string>{std::to_string(new_expires_at), command_id, agent_id});
+    if (res.status() != PGRES_COMMAND_OK) {
+        spdlog::warn("ExecutionTracker::renew_concurrency_claim_by_command: update failed for "
+                     "command_id={} agent_id={}: {} — this renewal is skipped, same fallback "
+                     "as a pool-exhaustion skip above",
+                     command_id, agent_id, PQerrorMessage(lease.get()));
+    }
+}
+
+int ExecutionTracker::reconcile_stale_concurrency_claims(int64_t now) {
+    if (!open_)
+        return 0;
+    if (now <= 0) {
+        // Part 3 — sanitise the reading itself before using it anywhere.
+        spdlog::error(
+            "ExecutionTracker::reconcile_stale_concurrency_claims: unsanitary now={} — "
+            "declining this pass",
+            now);
+        return 0;
+    }
+    // Everything below — the anchor read/stamp, the settled marker, the
+    // counts probe, the verdict, and the capped release — runs inside ONE
+    // transaction, mirroring audit_store.cpp::cleanup_once: every query
+    // result is checked, and any failure rolls the WHOLE pass back rather
+    // than partially committing. A counts-probe failure that still stamped
+    // the anchor and the liveness gauge as healthy was the exact silent
+    // failure this closes (reviewer finding, Postgres verified).
+    int released = 0;
+    bool declined = false;
+    int64_t open_total = 0, stale_total = 0;
+    // Definition/agent/execution triples force-released this pass — collected
+    // inside the transaction, but the spdlog::warn per triple is deliberately
+    // deferred until AFTER the `ok` check below (Gate 8 compliance-officer
+    // finding, PR #3784 fix round): warning INSIDE the lambda, before COMMIT,
+    // would log "force-released" for rows a subsequent commit failure then
+    // rolls back — the exact log-vs-durable-state mismatch the transactional
+    // rewrite otherwise closes. Matches where the decline log and the
+    // force-released counter already live.
+    std::vector<std::array<std::string, 3>> released_claims;
+    audit_retention::Anomaly anomaly = audit_retention::Anomaly::None;
+    std::string facts_str;
+
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
+        // Part 2 — a clock reading PERSISTED across restarts, not an
+        // in-process one (an in-process reading is inert on the very pass
+        // that matters: the first after a boot with an already-wrong clock).
+        pg::PgResult anchor_res = pg::exec_params(
+            conn,
+            "SELECT value FROM execution_tracker.retention_meta "
+            "WHERE key='concurrency_last_pass_now'",
+            std::vector<std::string>{});
+        if (anchor_res.status() != PGRES_TUPLES_OK) {
+            spdlog::error(
+                "ExecutionTracker::reconcile_stale_concurrency_claims: anchor read failed: {}",
+                PQerrorMessage(conn));
+            return false;
+        }
+        const bool have_anchor = PQntuples(anchor_res.get()) > 0;
+        const int64_t last_pass_now = have_anchor ? to_i64(col(anchor_res.get(), 0, 0)) : 0;
+
+        // A persisted reading that isn't a plausible epoch (negative, or
+        // to_i64's garbage-parses-to-0 default) is unusable, not merely
+        // absent — BadState outranks the others in classify()'s precedence.
+        const bool prev_unusable = have_anchor && last_pass_now < 946684800; // < year 2000
+
+        // Re-anchor for the NEXT pass BEFORE the probes below, so a decline
+        // still advances the comparison point and a poisoned value
+        // self-heals (matches audit_store.cpp). This alone no longer risks
+        // stamping a "healthy" anchor for a pass that goes on to fail a
+        // probe: a later `return false` in this lambda rolls this INSERT
+        // back along with everything else.
+        pg::PgResult stamp = pg::exec_params(
+            conn,
+            "INSERT INTO execution_tracker.retention_meta (key, value) "
+            "VALUES ('concurrency_last_pass_now', $1) "
+            "ON CONFLICT (key) DO UPDATE SET value=excluded.value",
+            std::vector<std::string>{std::to_string(now)});
+        if (stamp.status() != PGRES_COMMAND_OK) {
+            spdlog::error(
+                "ExecutionTracker::reconcile_stale_concurrency_claims: anchor stamp failed: {}",
+                PQerrorMessage(conn));
+            return false; // fail closed — roll back the whole pass
+        }
+
+        // Durable "has any pass ever reached a verdict" marker (#2579
+        // shape, matches audit_store.cpp's `bootstrap_settled`) —
+        // deliberately NOT derived from anchor presence: the anchor above
+        // is written on every attempt regardless of outcome, so deriving
+        // no_anchor from have_anchor would let a probe failure below spend
+        // the missing-anchor trigger without this pass ever classifying
+        // anything.
+        pg::PgResult settled_res = pg::exec_params(
+            conn,
+            "SELECT 1 FROM execution_tracker.retention_meta "
+            "WHERE key='concurrency_bootstrap_settled'",
+            std::vector<std::string>{});
+        if (settled_res.status() != PGRES_TUPLES_OK) {
+            spdlog::error(
+                "ExecutionTracker::reconcile_stale_concurrency_claims: settled read failed: {}",
+                PQerrorMessage(conn));
+            return false;
+        }
+        const bool bootstrap_settled = PQntuples(settled_res.get()) > 0;
+
+        // Part 1 — probe by OUTCOME: would this pass release every open
+        // claim? Still computed (has_expired feeds classify() directly),
+        // but see below for why would_wipe is deliberately never set true
+        // for this store. A failure here now rolls back the anchor stamp
+        // too, instead of silently reading as "0 claims, nothing expired".
+        pg::PgResult counts_res = pg::exec_params(
+            conn,
+            "SELECT COUNT(*), COUNT(*) FILTER (WHERE expires_at < $1) "
+            "FROM execution_tracker.concurrency_claims WHERE released_at IS NULL",
+            std::vector<std::string>{std::to_string(now)});
+        if (counts_res.status() != PGRES_TUPLES_OK) {
+            spdlog::error(
+                "ExecutionTracker::reconcile_stale_concurrency_claims: counts probe failed: {}",
+                PQerrorMessage(conn));
+            return false;
+        }
+        open_total = to_i64(col(counts_res.get(), 0, 0));
+        stale_total = to_i64(col(counts_res.get(), 0, 1));
+        const bool has_expired = stale_total > 0;
+
+        // DELIBERATE NON-ADOPTION of would_wipe, following api_token_store.cpp's
+        // recorded precedent for this exact shape (routed-concerns "Clock-guarded
+        // retention" row, part 6): audit_store's table accumulates continuously
+        // and always has a healthy mix of recent + old rows in ordinary
+        // operation, so "literally everything looks expired" is a strong
+        // wrong-clock signal there. concurrency_claims is small and ephemeral —
+        // its entirely ordinary steady state is a handful of open claims from
+        // currently in-flight per-device dispatches, and it is completely
+        // routine for ALL of them to be past their expires_at on a given pass
+        // (nothing else was in flight). Feeding a real would_wipe signal here
+        // would decline the reconciler's own routine job on its most common
+        // input — caught by a test written against the naive port of
+        // audit_store's shape before this line existed.
+        constexpr bool kWouldWipe = false;
+
+        const audit_retention::Facts facts{
+            .has_expired = has_expired,
+            .would_wipe = kWouldWipe,
+            .big_step = have_anchor && audit_retention::moved_at_least(
+                                           last_pass_now, now, kConcurrencyReconcileBigStepFloorSeconds),
+            .prev_unusable = prev_unusable,
+            .no_anchor = !bootstrap_settled,
+        };
+        anomaly = audit_retention::classify(facts);
+        facts_str = serialize_concurrency_facts(facts);
+
+        pg::PgResult last_facts_res = pg::exec_params(
+            conn,
+            "SELECT value FROM execution_tracker.retention_meta "
+            "WHERE key='concurrency_last_anomaly_facts'",
+            std::vector<std::string>{});
+        if (last_facts_res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("ExecutionTracker::reconcile_stale_concurrency_claims: last-facts read "
+                          "failed: {}",
+                          PQerrorMessage(conn));
+            return false;
+        }
+        const std::string last_facts = PQntuples(last_facts_res.get()) > 0
+                                            ? col_str(last_facts_res.get(), 0, 0)
+                                            : std::string();
+
+        // The pass has now REACHED A VERDICT — settle the marker HERE, not
+        // at the re-anchor above (see the comment on `settled_res`). Every
+        // early `return false` above this line rolls the whole transaction
+        // back, so a pass that never reached a verdict leaves the trigger
+        // armed for the next one.
+        if (!bootstrap_settled) {
+            pg::PgResult settle = pg::exec_params(
+                conn,
+                "INSERT INTO execution_tracker.retention_meta (key, value) VALUES "
+                "('concurrency_bootstrap_settled', '1') ON CONFLICT (key) DO NOTHING",
+                std::vector<std::string>{});
+            if (settle.status() != PGRES_COMMAND_OK) {
+                spdlog::error(
+                    "ExecutionTracker::reconcile_stale_concurrency_claims: settle failed: {}",
+                    PQerrorMessage(conn));
+                return false;
+            }
+        }
+
+        if (anomaly != audit_retention::Anomaly::None) {
+            // Decline-once per DISTINCT fact set (Part 4): a new anomaly
+            // declines and records; an identical repeat is suppressed and
+            // drains (paced by the cap), so a legitimately all-expired table
+            // still ages out.
+            if (facts_str != last_facts) {
+                pg::PgResult rec = pg::exec_params(
+                    conn,
+                    "INSERT INTO execution_tracker.retention_meta (key, value) "
+                    "VALUES ('concurrency_last_anomaly_facts', $1) "
+                    "ON CONFLICT (key) DO UPDATE SET value=excluded.value",
+                    std::vector<std::string>{facts_str});
+                if (rec.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("ExecutionTracker::reconcile_stale_concurrency_claims: anomaly "
+                                  "record failed: {}",
+                                  PQerrorMessage(conn));
+                    return false;
+                }
+                declined = true;
+                return true; // commit the anchor + settle + anomaly record
+            }
+            // Suppressed repeat of the same fact set — fall through to drain.
+        } else if (!last_facts.empty()) {
+            // A clean pass after an anomaly — clear the fact set so the NEXT
+            // genuine anomaly is not mistaken for a repeat of this one.
+            pg::PgResult clr = pg::exec_params(
+                conn,
+                "DELETE FROM execution_tracker.retention_meta "
+                "WHERE key='concurrency_last_anomaly_facts'",
+                std::vector<std::string>{});
+            if (clr.status() != PGRES_COMMAND_OK) {
+                spdlog::error("ExecutionTracker::reconcile_stale_concurrency_claims: anomaly "
+                              "clear failed: {}",
+                              PQerrorMessage(conn));
+                return false;
+            }
+        }
+        if (!has_expired)
+            return true; // nothing to do — commit the anchor/settle above
+
+        // Part 5 — cap unconditionally. Postgres has no UPDATE ... LIMIT; the
+        // ctid-subselect is the standard idiom for a capped, RETURNING-visible
+        // bulk update.
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "UPDATE execution_tracker.concurrency_claims SET released_at=$1 "
+            "WHERE ctid IN (SELECT ctid FROM execution_tracker.concurrency_claims "
+            "  WHERE released_at IS NULL AND expires_at < $1 LIMIT $2::integer) "
+            "RETURNING definition_id, agent_id, execution_id",
+            std::vector<std::string>{std::to_string(now),
+                                     std::to_string(kConcurrencyReconcileCapPerPass)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error(
+                "ExecutionTracker::reconcile_stale_concurrency_claims: release failed: {}",
+                PQerrorMessage(conn));
+            return false;
+        }
+        released = PQntuples(res.get());
+        released_claims.reserve(static_cast<std::size_t>(released));
+        for (int i = 0; i < released; ++i) {
+            released_claims.push_back(
+                {col_str(res.get(), i, 0), col_str(res.get(), i, 1), col_str(res.get(), i, 2)});
+        }
+        return true;
+    });
+
+    if (!ok) {
+        // A transaction that failed (pool exhaustion, a query error) must
+        // leave the liveness gauge STALE — that is its whole alerting
+        // story. Stamping "healthy" for a pass that never reached a
+        // verdict is exactly the silent failure this rewrite closes.
+        spdlog::error("ExecutionTracker::reconcile_stale_concurrency_claims: pass failed — "
+                      "leaving the liveness gauge stale");
+        return 0;
+    }
+
+    // Liveness gauge (sre, Gate 6): every pass that actually reached a
+    // verdict and committed (declined or not) — the wedge case a bounded
+    // decline-once dedup does NOT self-heal is an ALTERNATING fact set
+    // (each pass differs from the last, so every pass declines forever);
+    // that is invisible in logs alone and is exactly what a staleness
+    // alert on this gauge would catch. Matches AuditStore/
+    // AnalyticsEventStore's identical `..._last_pass_unixtime` idiom.
+    if (metrics_)
+        metrics_->gauge("yuzu_server_concurrency_reconcile_last_pass_unixtime")
+            .set(static_cast<double>(now));
+
+    if (declined) {
+        spdlog::error(
+            "ExecutionTracker::reconcile_stale_concurrency_claims: clock anomaly "
+            "(anomaly={}, facts={}) — declining this pass, {} of {} open claim(s) left "
+            "open past expiry",
+            static_cast<int>(anomaly), facts_str, stale_total, open_total);
+        if (metrics_)
+            metrics_->counter("yuzu_server_concurrency_reconcile_declined_total").increment();
+        return 0;
+    }
+    // Deferred until here (committed, ok == true) so a log line asserting a
+    // release can never be contradicted by a rollback — see released_claims'
+    // own doc comment above.
+    for (const auto& c : released_claims) {
+        spdlog::warn(
+            "ExecutionTracker::reconcile_stale_concurrency_claims: force-released stale "
+            "claim definition_id={} agent_id={} execution_id={} — agent never reported a "
+            "terminal status before the claim's expires_at",
+            c[0], c[1], c[2]);
+    }
+    if (metrics_ && released > 0)
+        metrics_->counter("yuzu_server_concurrency_claim_force_released_total")
+            .increment(static_cast<double>(released));
+    return released;
 }
 
 // ---------------------------------------------------------------------------
@@ -773,18 +1507,34 @@ ExecutionTracker::get_agent_statistics(const ExecutionStatsQuery& q) const {
     if (!lease)
         return results;
 
-    // C5 fix: use status values actually set by update_agent_status/refresh_counts
+    // C5 fix: use status values actually set by update_agent_status/refresh_counts.
+    // consistency-auditor Gate 4 finding (PR #3784 fix round): 'running' was NOT
+    // excluded by the old WHERE clause (only 'pending'/'dispatched' were), so a
+    // still-executing row (exit_code defaults to 0 on the wire, status='running')
+    // satisfied the success CASE's `exit_code = 0 AND status != 'pending'` and was
+    // counted as a completed success while genuinely still in flight -- a
+    // pre-existing classifier gap this PR's own keepalive (agents/core/src/agent.cpp,
+    // notify_exec_tracker -> update_agent_status) turned from rare (only a plugin
+    // crossing the 64KB output-flush threshold) into routine for every per-device
+    // dispatch running past 5 minutes. Excluding 'running' here, alongside
+    // 'pending'/'dispatched', matches this query's own apparent intent: only
+    // terminal, resolved executions are counted toward success/failure at all.
+    // Also dropped the vestigial 'error' value from the failure CASE -- no code
+    // path in agent_service_impl.cpp's status switch ever writes status='error'
+    // (its default branch on an unmapped CommandResponse::Status returns without
+    // writing anything), so it was dead weight left over from this comment's own
+    // stated intent.
     std::string sql = R"(
         SELECT a.agent_id,
                COUNT(*) AS total,
-               SUM(CASE WHEN a.exit_code = 0 AND a.status != 'pending' THEN 1 ELSE 0 END) AS success,
-               SUM(CASE WHEN a.exit_code != 0 OR a.status IN ('failure','timeout','rejected','error') THEN 1 ELSE 0 END) AS failure,
+               SUM(CASE WHEN a.exit_code = 0 AND a.status = 'success' THEN 1 ELSE 0 END) AS success,
+               SUM(CASE WHEN a.exit_code != 0 OR a.status IN ('failure','timeout','rejected') THEN 1 ELSE 0 END) AS failure,
                AVG(CASE WHEN a.completed_at > a.dispatched_at
                         THEN a.completed_at - a.dispatched_at ELSE NULL END) AS avg_dur,
                MAX(a.dispatched_at) AS last_at
         FROM execution_tracker.agent_exec_status a
         JOIN execution_tracker.executions e ON e.id = a.execution_id
-        WHERE a.status NOT IN ('pending','dispatched')
+        WHERE a.status NOT IN ('pending','dispatched','running')
     )";
     std::vector<std::string> params;
     int idx = 1;

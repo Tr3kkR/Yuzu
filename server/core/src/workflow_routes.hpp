@@ -72,6 +72,25 @@ public:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id, const yuzu::server::DispatchCaller& caller)>;
 
+    /// ADR-1007 — a DELIBERATE SIBLING of `CommandDispatchFn`, not a widening
+    /// of it. `CommandDispatchFn`'s shape is shared verbatim by dashboard,
+    /// REST v1, and MCP wiring in server.cpp (all assigned from the SAME
+    /// `command_dispatch_caller_fn` lambda) — changing its signature breaks
+    /// every one of those assignments for a gate that applies to exactly two
+    /// call sites in THIS file. A second, narrowly-scoped type is how the
+    /// #881/#1788 "second copy of a chokepoint" hazard is avoided here: this
+    /// is not a second copy of the confined-dispatch RULE (both closures
+    /// still route through the one `dispatch_confined` seam in server.cpp),
+    /// only a second, additive PARAMETER LIST for the two call sites that
+    /// have a resolved `InstructionDefinition` (and therefore a
+    /// `concurrency_mode`) in hand.
+    using ConcurrencyDispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+        const std::string& definition_id, const std::string& concurrency_mode)>;
+
     /// K-R7-02 / PLAN-006: resolves the caller's DispatchCaller (identity +
     /// Execution:Execute visible set) from the request. Wired in server.cpp to
     /// a closure that resolves the session and calls `derive_dispatch_caller`;
@@ -129,6 +148,14 @@ public:
         InstructionStore* instruction_store{nullptr};
         PolicyStore* policy_store{nullptr};
         CommandDispatchFn command_dispatch_fn;
+        /// ADR-1007. Default-constructed (empty) ⇒ the two call sites that
+        /// use it fall back to `command_dispatch_fn` with no concurrency
+        /// gate — same as today, never a hard failure — matching this
+        /// codebase's "an unwired optional gate is a no-op, not a 503"
+        /// convention for gates that do not universally apply (unlike
+        /// `FleetReadFn`'s deliberate fail-closed-on-unwired contract, which
+        /// gates a universally-required authorization check).
+        ConcurrencyDispatchFn command_dispatch_fn_concurrency;
         /// K-R7-02 / PLAN-006: per-request DispatchCaller derivation for the
         /// execute handlers. nullptr → the handlers fail CLOSED on visibility
         /// (empty principal, present-empty visible set, deny all) rather than

@@ -1238,6 +1238,19 @@ grpc::Status AgentServiceImpl::Subscribe(
                                            html_escape(ms) + " ms</strong>");
                 continue;
             }
+            // CHAOS-TTL-1 (PR #3784 fix round, ADR-1007): the agent's
+            // concurrency-claim keepalive thread (agents/core/src/agent.cpp)
+            // sends a bare RUNNING with this exact output sentinel, on a
+            // fixed interval, independent of any real plugin progress. It
+            // exists SOLELY to feed ExecutionTracker::renew_concurrency_claim
+            // via notify_exec_tracker below — it is not a response row (no
+            // output for the executions drawer/SSE to show) and must not be
+            // stored, published as output, or counted as an analytics event,
+            // same reasoning as the __timing__ intercept above.
+            if (resp.output() == "__keepalive__") {
+                notify_exec_tracker(resp.command_id(), agent_id, resp);
+                continue;
+            }
 
             // Track first response for server-side latency
             {
@@ -1524,6 +1537,13 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
                                        html_escape(ms) + " ms</strong>");
             return;
         }
+        // CHAOS-TTL-1 — see the direct-Subscribe twin of this intercept above
+        // (this function's own doc comment names it "the gateway-streamed
+        // RUNNING" path); same sentinel, same reasoning.
+        if (resp.output() == "__keepalive__") {
+            notify_exec_tracker(resp.command_id(), agent_id, resp);
+            return;
+        }
 
         // Track first response for server-side latency
         {
@@ -1765,8 +1785,64 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     // on a different server instance than the one that dispatched it now
     // still resolves.
     auto execution_id_opt = resolve_execution_id(command_id);
-    if (!execution_id_opt || execution_id_opt->empty())
+    if (!execution_id_opt || execution_id_opt->empty()) {
+        // ADR-1007 by-command concurrency-claim fallback (originally UP-1,
+        // unhappy-path Gate 4 finding, PR #3784 fix round — reconciled onto
+        // HA WS-1(1b) above; the fallback's ORIGINAL trigger, a server
+        // restart losing an in-process `cmd_execution_ids_` map, is now the
+        // PG-backed `command_execution` table's own job and no longer needs
+        // this fallback's help). What still reaches here, genuinely: (1)
+        // every workflow-step dispatch (`workflow_routes.cpp`), which
+        // always passes an empty `execution_id` (CONSIST-2/sec-M2), so
+        // `record_execution_id` never records a mapping for it and
+        // `resolve_execution_id` correctly returns nullopt — this is the
+        // ONLY release path a workflow-step per-device claim ever reaches;
+        // and (2) a genuine degrade on `command_execution`'s own write or
+        // read side (pool exhaustion, a query failure), which this fallback
+        // also transparently covers since it doesn't depend on that table
+        // having succeeded. The concurrency-claim safety property does not
+        // have to share either fate: `command_id` rides on every response
+        // independent of this table, and `(command_id, agent_id)` is a
+        // DB-enforced-unique match key (see
+        // release_concurrency_claim_by_command's doc comment) — so route
+        // release/renewal through it directly. A no-op if no open claim
+        // matches (ordinary out-of-band dispatch that never took one).
+        // Releases immediately on a genuine terminal response rather than
+        // waiting for the reconciler.
+        //
+        // `__guard__-` skip (Fable adversarial-review finding, PR #3784 fix
+        // round): every `__guard__.*` dispatch (push_rules / reconcile,
+        // server.cpp) is minted under this reserved double-underscore
+        // prefix and NEVER goes through the per-device concurrency gate —
+        // confirmed no `__guard__`-plugin definition can carry
+        // `concurrency_mode: per-device` (guard pushes are system-caller,
+        // definition-less dispatch). Skipping it here avoids a wasted
+        // write-pool lease + UPDATE on every guard push/reconcile response
+        // (routine, high-frequency) for a claim that can structurally never
+        // exist. Deliberately NOT extended to `tar-` (Fable's other
+        // candidate): `tar` is also a REAL agent plugin name
+        // (agents/plugins/tar) that a per-device-gated definition could in
+        // principle target — a string-prefix skip there would risk
+        // silently skipping a legitimate release if that ever happens, and
+        // nothing in the code (only today's content library) guarantees it
+        // won't. See ADR-1007 for the fuller note.
+        if (command_id.starts_with("__guard__-"))
+            return;
+        switch (resp.status()) {
+        case pb::CommandResponse::RUNNING:
+            tracker->renew_concurrency_claim_by_command(command_id, agent_id);
+            break;
+        case pb::CommandResponse::SUCCESS:
+        case pb::CommandResponse::FAILURE:
+        case pb::CommandResponse::TIMEOUT:
+        case pb::CommandResponse::REJECTED:
+            tracker->release_concurrency_claim_by_command(command_id, agent_id);
+            break;
+        default:
+            break;
+        }
         return; // out-of-band dispatch, nothing to publish
+    }
     const std::string& execution_id = *execution_id_opt;
 
     // Compliance-check correlation ids ("polchk-…", minted by PolicyEvaluator)

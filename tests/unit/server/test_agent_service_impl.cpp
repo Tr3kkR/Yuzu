@@ -1511,6 +1511,42 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
     CHECK(statuses[0].completed_at == 0);
 }
 
+TEST_CASE("process_gateway_response: the __keepalive__ sentinel renews the concurrency claim "
+          "without storing a response row or tagging an SSE output line (CHAOS-TTL-1)",
+          "[pg][agent_service][executions][concurrency][adr1007]") {
+    // The agent's concurrency-claim keepalive thread (agents/core/src/agent.cpp)
+    // sends a bare RUNNING with this exact output sentinel on a fixed interval,
+    // independent of any real plugin progress — see the twin intercept in
+    // process_agent_response (agent_service_impl.cpp's direct-Subscribe RUNNING
+    // branch) and this function's own. It must reach notify_exec_tracker (so
+    // ExecutionTracker::renew_concurrency_claim fires) but must NOT be treated
+    // as a real output row.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+    auto exec_id = ts.make_exec();
+    h.svc.record_execution_id("cmd-keepalive", exec_id);
+
+    auto ping = GatewayResponseHarness::make_response("cmd-keepalive", apb::CommandResponse::RUNNING,
+                                                       /*output=*/"__keepalive__");
+    h.svc.process_gateway_response("agent-1", ping);
+
+    // Reached notify_exec_tracker: the agent_exec_status row was touched
+    // exactly as a real 'running' CommandResponse would (same assertion shape
+    // as the RUNNING test just above).
+    auto ka_statuses = ts.tracker->get_agent_statuses(exec_id);
+    REQUIRE(ka_statuses.size() == 1);
+    CHECK(ka_statuses[0].status == "running");
+    CHECK(ka_statuses[0].first_response_at > 0);
+    CHECK(ka_statuses[0].completed_at == 0);
+
+    // Did NOT reach ResponseStore::store — no row landed for the drawer/SSE.
+    auto rows_opt = h.responses.query_by_execution(exec_id);
+    REQUIRE(rows_opt.has_value());
+    CHECK(rows_opt->empty());
+}
+
 TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
           "completed_at",
           "[pg][agent_service][executions][issue872]") {

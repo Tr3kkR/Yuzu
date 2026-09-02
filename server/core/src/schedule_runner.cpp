@@ -358,8 +358,42 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
         // below), reused here rather than re-derived.
         caller.approval_provenance =
             approval_id.empty() ? ApprovalProvenance::None : ApprovalProvenance::Ticket;
-        std::tie(command_id, sent) = d_.dispatch_fn(plugin, action, /*agent_ids=*/{},
-                                                    dispatch_scope, parameters, exec_id, caller);
+        // ADR-1007: per-device concurrency gate, when wired. A second
+        // get_definition() read (fire() already did one) rather than
+        // threading concurrency_mode through fire_with_approval's
+        // signature too — schedule fires are not a hot path, and this
+        // keeps dispatch_tracked's own signature/callers unchanged.
+        std::string concurrency_mode;
+        if (d_.dispatch_fn_concurrency && d_.instruction_store) {
+            auto def_result = d_.instruction_store->get_definition(s.definition_id);
+            if (def_result && *def_result) {
+                concurrency_mode = (*def_result)->concurrency_mode;
+            } else {
+                // ADR-1007 correctness fix (Gate 4 unhappy-path UP-5): a
+                // failed or empty second read must not silently leave
+                // concurrency_mode empty — that disarms the per-device gate
+                // for this one fire with zero observability, the exact
+                // false-assurance pattern (advertised as enforced, silently
+                // isn't) this whole PR exists to close. fire() already
+                // succeeded on the FIRST read moments earlier, so a failure
+                // here is a genuine anomaly worth a loud, countable signal —
+                // not a routine "instruction was deleted" case, which would
+                // already have been caught by fire()'s own check.
+                count("yuzu_schedule_concurrency_mode_lookup_failed_total");
+                spdlog::error(
+                    "schedule_runner: schedule '{}' (id={}) second get_definition() read for "
+                    "'{}' failed or returned empty on dispatch — per-device concurrency "
+                    "enforcement is NOT applied to this fire",
+                    s.name, s.id, s.definition_id);
+            }
+        }
+        std::tie(command_id, sent) =
+            d_.dispatch_fn_concurrency
+                ? d_.dispatch_fn_concurrency(plugin, action, /*agent_ids=*/{}, dispatch_scope,
+                                            parameters, exec_id, caller, s.definition_id,
+                                            concurrency_mode)
+                : d_.dispatch_fn(plugin, action, /*agent_ids=*/{}, dispatch_scope, parameters,
+                                 exec_id, caller);
     } catch (const std::exception& e) {
         count("yuzu_schedule_fire_failures_total");
         spdlog::error("schedule_runner: dispatch failed for schedule '{}' (id={}): {}", s.name,

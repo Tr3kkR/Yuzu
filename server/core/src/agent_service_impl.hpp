@@ -550,10 +550,23 @@ private:
     /// in-process map) and calls `ExecutionTracker::update_agent_status`
     /// with a synthesised
     /// `AgentExecStatus` (status, exit_code, error_detail, timestamps).
-    /// No-op if the tracker isn't wired or the command_id has no
-    /// execution mapping (out-of-band dispatch). Each call publishes an
-    /// `agent-transition` SSE event the drawer's client listens to for
-    /// live-updates without a page reload.
+    /// Each call publishes an `agent-transition` SSE event the drawer's
+    /// client listens to for live-updates without a page reload.
+    ///
+    /// No-op on the executions-drawer/SSE side if the tracker isn't wired
+    /// or `lookup_execution_id` finds no mapping — ordinary out-of-band
+    /// dispatch, a workflow-step dispatch (CONSIST-2/sec-M2, which never
+    /// records one), or a genuine degrade on the correlation table's own
+    /// write/read side (ADR-1007, originally UP-1, unhappy-path Gate 4
+    /// finding, PR #3784 fix round — reconciled onto HA WS-1(1b) above,
+    /// which closed this fallback's ORIGINAL restart-survival case by
+    /// persisting the correlation itself). Those remaining cases are NOT a
+    /// full no-op, though: per-device concurrency-claim release/renewal is
+    /// routed around the unresolved correlation via
+    /// `ExecutionTracker::release_concurrency_claim_by_command`/
+    /// `renew_concurrency_claim_by_command`, keyed on `command_id` alone
+    /// (rides the wire response independent of the correlation table). See
+    /// those methods' doc comments.
     void notify_exec_tracker(const std::string& command_id, const std::string& agent_id,
                              const pb::CommandResponse& resp);
 

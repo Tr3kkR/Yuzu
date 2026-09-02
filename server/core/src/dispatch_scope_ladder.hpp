@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -132,6 +135,27 @@ struct DispatchResolvers {
     std::function<ScopeLadderResult(std::string_view scope_expr)> scope_ladder_fn;
 };
 
+/// ADR-1007 — per-device concurrency claim, applied to a resolved candidate
+/// LIST before it becomes a `ConfinedDispatchTargets` field (Group/Scope/Ids
+/// arms only; Broadcast/None are out of reach today — see the ADR's
+/// documented non-goal). Deliberately NOT threaded into
+/// `dispatch_confined_arms` itself: that function is kept pure (no store
+/// access) by design (its own doc comment: "the seam the confinement tests
+/// bind"), and a per-id store call there would also violate the #881 "ONE
+/// store operation per dispatch, never per-agent" discipline. A batched
+/// claim attempt here — one round trip, `unnest()`-based, same shape as
+/// `ExecutionTracker::claim_concurrency_slots` — is the ONE store write for
+/// the whole dispatch, taken once per arm's resolved candidate list.
+///
+/// Returns the SUBSET cleared to dispatch (already claimed the slot);
+/// default-constructed (nullptr) means "no concurrency gate for this
+/// dispatch" — most dispatches are not driven by a `per-device` definition,
+/// so nullable-default is the correct un-set state (unlike
+/// `ContainmentGate`, which is deliberately non-default-constructible
+/// because it always applies).
+using ConcurrencyClaimFn =
+    std::function<std::vector<std::string>(const std::vector<std::string>& candidates)>;
+
 /// Outcome of `resolve_and_dispatch_confined`: `sent` is the count actually
 /// dispatched; `scope_parse_error` is set only when the Scope arm's resolved
 /// expression failed to parse — the one distinction a caller with an HTTP
@@ -162,29 +186,54 @@ struct ConfinedDispatchOutcome {
     /// `ArmDispatchResult` for why the two are separate.
     std::size_t denied_quarantined_count = 0;
     std::string command_id;
+    /// ADR-1007: ids whose claim (taken by `claim_fn` before the send) was
+    /// never actually delivered — mirrors `ArmDispatchResult::not_sent`, see
+    /// its doc comment for why the collection happens there and the release
+    /// happens at `wire_and_dispatch_confined` instead. Empty whenever no
+    /// concurrency claim was in effect for this dispatch.
+    std::vector<std::string> not_sent;
 };
 
 /// The "middle link": classify the arm, resolve ITS targets via the injected
 /// resolvers, and route the actual send through `dispatch_confined_arms` —
 /// the ONE call every arm makes, so the classification + resolution that
 /// feeds it is exercised by the same tests that bind the intersection itself.
-inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
-    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-    const authz::VisibleSet& exec_visible, bool broadcast_on_none, const ContainmentGate& gate,
-    const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink) {
+inline ConfinedDispatchOutcome
+resolve_and_dispatch_confined(const std::vector<std::string>& agent_ids,
+                              const std::string& scope_expr, const authz::VisibleSet& exec_visible,
+                              bool broadcast_on_none, const ContainmentGate& gate,
+                              const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink,
+                              const ConcurrencyClaimFn& claim_fn = nullptr) {
     ConfinedDispatchOutcome outcome;
     const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
 
+    // ADR-1007 correctness fix (Gate 2 security-guardian SHOULD): claim
+    // ONLY against the visible-set-confined candidate list, never the raw
+    // one. Without this, a confined operator naming agent_ids/group/scope
+    // members outside their own visible set could still successfully claim
+    // those agents (the send is later filtered out by the #1788
+    // intersection inside dispatch_confined_arms, unchanged below, but the
+    // claim itself would already be taken) — an availability side-channel
+    // blocking a different operator's legitimate dispatch to those agents
+    // for up to the claim's TTL. `authz::filter_to_scope` is the SAME
+    // function `dispatch_confined_arms` already applies to the Scope/Ids
+    // arms (and an equivalent per-id `in_scope` check for Group) — calling
+    // it here first and letting `dispatch_confined_arms` apply it again is
+    // a safe, idempotent no-op (pure, deterministic set intersection), not
+    // a second copy of the intersection RULE.
     if (arm == DispatchArm::Group) {
         std::vector<std::string> members;
         if (resolvers.group_members_fn)
             members = resolvers.group_members_fn(scope_expr.substr(6));
+        if (claim_fn)
+            members = claim_fn(authz::filter_to_scope(members, exec_visible));
         ConfinedDispatchTargets t;
         t.group_members = &members;
         const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
+        outcome.not_sent = r.not_sent;
         return outcome;
     }
 
@@ -195,22 +244,33 @@ inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
         outcome.scope_parse_error = ladder.parse_error;
         if (!ladder.matched)
             return outcome; // ABORTED — the ladder already audited it
+        if (claim_fn)
+            *ladder.matched = claim_fn(authz::filter_to_scope(*ladder.matched, exec_visible));
         ConfinedDispatchTargets t;
         t.scope_matched = &*ladder.matched;
         const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
+        outcome.not_sent = r.not_sent;
         return outcome;
     }
 
     ConfinedDispatchTargets t;
-    if (arm == DispatchArm::Ids)
-        t.agent_ids = &agent_ids;
+    std::vector<std::string> claimed_ids;
+    if (arm == DispatchArm::Ids) {
+        if (claim_fn) {
+            claimed_ids = claim_fn(authz::filter_to_scope(agent_ids, exec_visible));
+            t.agent_ids = &claimed_ids;
+        } else {
+            t.agent_ids = &agent_ids;
+        }
+    }
     const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
     outcome.sent = r.sent;
     outcome.denied_quarantined = r.denied_quarantined;
     outcome.denied_quarantined_count = r.denied_quarantined_count;
+    outcome.not_sent = r.not_sent;
     return outcome;
 }
 
@@ -245,7 +305,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     const std::string& principal_role, const std::vector<std::string>& agent_ids,
     const std::string& scope_expr, const yuzu::server::authz::VisibleSet& exec_visible,
     bool broadcast_on_none, const ContainmentGate& gate,
-    const yuzu::server::detail::ClassifiedCommand& cmd) {
+    const yuzu::server::detail::ClassifiedCommand& cmd, const std::string& definition_id = {},
+    const std::string& concurrency_mode = {}) {
     DispatchResolvers resolvers;
     resolvers.group_members_fn = [mgmt_group_store](const std::string& group_id) {
         std::vector<std::string> members;
@@ -289,9 +350,104 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry, &cmd] { return registry.send_to_all(cmd); },
         [&registry] { return registry.all_ids(); }};
 
-    auto outcome = resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible,
-                                                  broadcast_on_none, gate, resolvers, sink);
+    // ADR-1007: per-device concurrency claim. Only wired for
+    // concurrency_mode == "per-device" with a definition_id supplied and a
+    // live tracker. Two definition-aware callers DO reach this gated
+    // (workflow_routes.cpp's execute route and workflow-step dispatch,
+    // ScheduleRunner::dispatch_tracked — via a sibling ConcurrencyDispatchFn
+    // closure each, not this function's own default parameters). Every
+    // OTHER dispatch (raw MCP/REST calls with no definition concept,
+    // background system pushes) passes both defaulted-empty here and gets
+    // no gate — a real, documented, deliberate gap (ADR-1007), not an
+    // oversight. The
+    // claim's expires_at mirrors the command's own wire expiry (millis ->
+    // seconds) when the caller set one; a wire command with NO expiry
+    // (`has_expires_at() == false`, "the agent should run this until it
+    // finishes") still needs a FINITE bound for the stale-claim reconciler
+    // to key on, so an unset wire expiry falls back to a fixed default
+    // rather than never expiring.
+    yuzu::server::ConcurrencyClaimFn claim_fn;
+    if (concurrency_mode == "per-device" && !definition_id.empty() && execution_tracker) {
+        // Shared with ExecutionTracker::renew_concurrency_claim — one
+        // constant, so a renewal always extends by the same window the
+        // initial claim used (CHAOS-TTL-1 fix round; a second copy here is
+        // exactly how the two would drift apart).
+        constexpr int64_t kConcurrencyClaimDefaultTtlSeconds =
+            yuzu::server::ExecutionTracker::kConcurrencyClaimDefaultTtlSeconds;
+        // Gate 3 architect NICE finding: the wire expiry is caller-supplied
+        // and was previously trusted unclamped — a garbage/far-past value
+        // made the claim look pre-expired (harmless: it just means the
+        // reconciler's next pass, not this claim itself, releases it
+        // immediately — but a far-FUTURE value pinned a claim past any
+        // practical reconciler reach). Clamp to [now, now+default TTL] so
+        // the reconciler's reach is bounded regardless of what the caller
+        // set.
+        const int64_t now_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                        std::chrono::system_clock::now().time_since_epoch())
+                                        .count();
+        int64_t expires_at_seconds = now_seconds + kConcurrencyClaimDefaultTtlSeconds;
+        if (cmd.wire().has_expires_at() && cmd.wire().expires_at().millis_epoch() > 0) {
+            const int64_t wire_expiry = cmd.wire().expires_at().millis_epoch() / 1000;
+            expires_at_seconds =
+                std::clamp(wire_expiry, now_seconds, now_seconds + kConcurrencyClaimDefaultTtlSeconds);
+        }
+        claim_fn = [execution_tracker, &definition_id, &execution_id, &command_id,
+                   expires_at_seconds](const std::vector<std::string>& candidates) {
+            return execution_tracker->claim_concurrency_slots(
+                definition_id, execution_id, command_id, candidates, expires_at_seconds);
+        };
+    }
+
+    auto outcome = resolve_and_dispatch_confined(
+        agent_ids, scope_expr, exec_visible, broadcast_on_none, gate, resolvers, sink, claim_fn);
     outcome.command_id = command_id;
+
+    // ADR-1007 claim-leak fix: `claim_fn` above ran BEFORE the send, so every
+    // id in `outcome.not_sent` (send attempted, registry reported failure)
+    // and every NAMED id in `outcome.denied_quarantined` (send never
+    // attempted — contained) already holds a fresh, still-open claim that
+    // nothing else will ever release. This is the ONE seam that built
+    // `claim_fn` and therefore the only place that can tell whether a claim
+    // was even taken for this dispatch — `dispatch_confined_arms` stays pure
+    // (no store access) by design, so the release cannot live there.
+    //
+    // `denied_quarantined` is deliberately empty under fail-closed
+    // containment (ArmDispatchResult's own contract — collecting a
+    // fleet-sized id list on the exact path that is already degraded is the
+    // cost that field's comment explains) — those claims are NOT released
+    // here and instead age out via the stale-claim reconciler's own
+    // `expires_at` bound, same as any other orphaned claim.
+    if (claim_fn && execution_tracker) {
+        std::size_t leaked = outcome.not_sent.size() + outcome.denied_quarantined.size();
+        if (leaked > 0) {
+            // One batched UPDATE (#881 discipline — matches `claim_fn`'s own
+            // unnest-batched INSERT), not a per-id loop: a large not_sent set
+            // under a partial gateway outage must not serialize N sequential
+            // pool leases on this request thread.
+            std::vector<std::string> to_release;
+            to_release.reserve(leaked);
+            to_release.insert(to_release.end(), outcome.not_sent.begin(), outcome.not_sent.end());
+            to_release.insert(to_release.end(), outcome.denied_quarantined.begin(),
+                              outcome.denied_quarantined.end());
+            // definition_id scoping (Gate 2 security-guardian finding, PR
+            // #3784 fix round): execution_id alone is NOT a safe match key
+            // here — every workflow-step dispatch (workflow_routes.cpp)
+            // passes the literal empty string as execution_id for EVERY
+            // definition it dispatches (CONSIST-2/sec-M2, pending real
+            // correlation), so releasing by execution_id alone could
+            // release a DIFFERENT, still-genuinely-open definition's claim
+            // on the same agent — admitting the exact concurrent duplicate
+            // dispatch this whole mechanism exists to prevent. definition_id
+            // is already in scope here (used above building claim_fn).
+            execution_tracker->release_concurrency_claims(definition_id, execution_id,
+                                                          to_release);
+            spdlog::info("wire_and_dispatch_confined: released {} per-device concurrency "
+                         "claim(s) for execution_id={} that were taken but never delivered "
+                         "(undelivered={}, quarantine-denied={})",
+                         leaked, execution_id, outcome.not_sent.size(),
+                         outcome.denied_quarantined.size());
+        }
+    }
     return outcome;
 }
 

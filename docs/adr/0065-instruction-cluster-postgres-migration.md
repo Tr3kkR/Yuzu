@@ -545,7 +545,8 @@ only its construction converts (to `ExecutionTrackerPg`); the payload assertions
   (`docs/security-reviews/access-reviews-2026-07-21.md`), any future prune of it needs its own
   explicit, separately-reviewed compliance decision — never a side effect of whatever retention
   pass `executions` gets. `ConcurrencyManager` (test-only dead code, no `server.cpp` construction
-  site) — noted, not deleted in this PR (scope discipline).
+  site) — noted, not deleted in this PR (scope discipline). Deleted in ADR-1007
+  (2026-08-31), which also builds the real replacement for its one live-used mode.
 - **Not fixed here, filed as #3727:** none of the three migrated stores has a
   `MetricsRegistry*`/`set_metrics()` wired, so runtime Postgres degrade paths (lease timeout,
   query failure) have no `yuzu_server_<store>_{read,write}_degrade_total{reason}` counter per

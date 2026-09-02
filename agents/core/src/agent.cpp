@@ -84,6 +84,7 @@ __declspec(allocate(".CRT$XCB"))
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::agent {
@@ -2672,6 +2673,127 @@ public:
                     });
                 }
 
+                // 4d. Spawn the concurrency-claim keepalive thread (CHAOS-TTL-1,
+                // PR #3784 fix round). One central, bounded ticker — NOT one
+                // thread per command — that sends a periodic empty `RUNNING`
+                // response for every command still in `in_flight_ids_`
+                // (populated from queue-accept to terminal write, see
+                // `record_command_terminal`'s erase). This is independent of
+                // plugin cooperation: neither a plugin's own output volume
+                // (`CommandContextImpl::flush_output_locked`'s 64KB threshold)
+                // nor its `report_progress()` calls (a local no-op) are a
+                // reliable mid-execution liveness signal, so a quiet, long-
+                // running, mutating action like `script_exec.*` could otherwise
+                // have its server-side `per-device` concurrency claim
+                // (ADR-1007) force-released by the reconciler's TTL while
+                // still genuinely executing, admitting a duplicate dispatch
+                // that repeats a non-idempotent mutation. The interval is
+                // sparse and well under the server's one-hour TTL default —
+                // this is a liveness ping, not a progress channel, and its
+                // wire cost must stay negligible even for a fleet with
+                // thousands of concurrently in-flight commands.
+                {
+                    keepalive_stop_.store(false, std::memory_order_release);
+                    keepalive_thread_ = std::thread([this, stream]() {
+                        constexpr auto kKeepaliveInterval = std::chrono::seconds(300); // 5 min
+                        auto should_stop = [this]() {
+                            return stop_requested_.load(std::memory_order_acquire) ||
+                                   keepalive_stop_.load(std::memory_order_acquire);
+                        };
+                        spdlog::info("Concurrency-claim keepalive thread started (interval={}s)",
+                                     kKeepaliveInterval.count());
+                        while (!should_stop()) {
+                            auto remaining = kKeepaliveInterval;
+                            while (remaining.count() > 0 && !should_stop()) {
+                                auto step = std::min(remaining, std::chrono::seconds{5});
+                                std::this_thread::sleep_for(step);
+                                remaining -= step;
+                            }
+                            if (should_stop())
+                                break;
+                            // Snapshot under the lock, write outside it — mirrors
+                            // every other stream_write_mu_ site in this file, and
+                            // keeps in_flight_mu_ held only as long as the copy.
+                            std::vector<std::string> ids;
+                            {
+                                std::lock_guard lock(in_flight_mu_);
+                                ids.assign(in_flight_ids_.begin(), in_flight_ids_.end());
+                            }
+                            for (const auto& id : ids) {
+                                pb::CommandResponse ping;
+                                ping.set_command_id(id);
+                                ping.set_status(pb::CommandResponse::RUNNING);
+                                // Recognized sentinel, matching the existing
+                                // __timing__ frame's own intercept pattern —
+                                // the server's agent_service_impl.cpp special-
+                                // cases this exact output on both the direct
+                                // and gateway-streamed RUNNING paths so it
+                                // renews the concurrency claim without landing
+                                // as a response row / SSE output line.
+                                ping.set_output("__keepalive__");
+                                auto epoch = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::system_clock::now().time_since_epoch())
+                                                 .count();
+                                ping.mutable_sent_at()->set_millis_epoch(epoch);
+                                std::lock_guard lock(stream_write_mu_);
+                                // Best-effort: a Write failure here means the
+                                // stream is already dead, which the read loop
+                                // and reconnect logic handle independently —
+                                // this thread does not itself drive reconnect.
+                                stream->Write(ping, grpc::WriteOptions());
+                            }
+                        }
+                        spdlog::info("Concurrency-claim keepalive thread stopped");
+                    });
+                }
+
+                // cpp-safety BLOCKING (Gate re-review, this fix round): the manual
+                // teardown below (stop+join keepalive_thread_) only runs on the
+                // ORDINARY fall-through exit from this connection's scope. An
+                // exception escaping anywhere between here and that teardown —
+                // this file's own thread_pool_ re-creation try/catch a few lines
+                // up exists BECAUSE this exact region has thrown in production
+                // under host resource exhaustion, so this is not a hypothetical
+                // path — unwinds straight past the manual teardown code (it is
+                // plain sequential statements, not itself exception-safe) to the
+                // destructors below: `sub_slot`'s ~CtxSlot only retracts
+                // subscribe_ctx_ to null, it does NOT cancel `sub_ctx`, which is
+                // then destroyed while `keepalive_thread_` may still be inside (or
+                // about to enter) `stream->Write()` — a uses-after-free on
+                // `sub_ctx` through gRPC's internal context reference, exactly the
+                // class `CtxSlot`'s own doc comment three lines up (1955) warns
+                // about for a DIFFERENT ordering mistake.
+                //
+                // Declared AFTER `stream`/`sub_slot`/`sub_ctx` (all above), so
+                // C++'s reverse-destruction-order guarantee makes this the FIRST
+                // thing to run during unwind — stopping and joining
+                // keepalive_thread_ before it, guaranteeing the thread is done
+                // touching `stream`/`sub_ctx` before either becomes invalid.
+                //
+                // cpp-safety BLOCKING (Gate 3 re-review, this fix round): on the
+                // exception-unwind path specifically — as opposed to the two
+                // ordinary manual-teardown join sites below/in
+                // quiesce_run_workers(), both reached only AFTER stream->Read()
+                // has already returned false, proving the connection dead — the
+                // exception can land at ANY point in this scope, including while
+                // the stream is alive but merely STALLED (gateway up, not
+                // draining). If keepalive_thread_ is at that moment blocked
+                // inside stream->Write(), a bare join() below blocks forever
+                // with no rescue. This is the EXACT hazard class stop() already
+                // treats as BLOCKING for guardian_sink_stream_'s writer (see
+                // stop()'s own comment a few hundred lines down): a synchronous
+                // Write() can wedge on a stalled-but-not-dead stream, and the
+                // fix there is TryCancel BEFORE the drain/join, not after.
+                // subscribe_ctx_ is still published here (sub_slot retracts it
+                // only after this guard runs), so the same rescue is available
+                // — cancel it first, same as stop() does, before joining.
+                ScopeExit keepalive_unwind_guard{[this]() {
+                    keepalive_stop_.store(true, std::memory_order_release);
+                    cancel_ctx(subscribe_ctx_);
+                    if (keepalive_thread_.joinable())
+                        keepalive_thread_.join();
+                }};
+
                 // 5. Read commands from server and dispatch to plugins.
                 // Command replay protection is now durable (command_dedup_, HA
                 // WS-0): it survives reconnect AND restart, so there is no
@@ -2849,6 +2971,20 @@ public:
                         continue;
                     }
 
+                    // CHAOS-TTL-1: mark this command in-flight BEFORE submit — the
+                    // keepalive thread must be able to see a command that is still
+                    // sitting in the bounded queue, not just one already inside
+                    // execute(). Removed at the single terminal-write chokepoint,
+                    // record_command_terminal, on every exit path (success/
+                    // failure/rejection/queue-full/dispatch-exception) — see that
+                    // function for the erase. An empty command_id is never tracked
+                    // (nothing to key a keepalive ping on; the dedup path already
+                    // treats it as unprotected).
+                    if (!cmd.command_id().empty()) {
+                        std::lock_guard lock(in_flight_mu_);
+                        in_flight_ids_.insert(cmd.command_id());
+                    }
+
                     // Dispatch execute() via bounded thread pool.
                     // chargen_start blocks until chargen_stop sets the atomic flag,
                     // so concurrent dispatch is required.
@@ -2880,6 +3016,20 @@ public:
                     if (!submitted) {
                         spdlog::warn("Thread pool queue full — rejecting command {}",
                                      cmd.command_id());
+                        // Submission never happened, so record_command_terminal's
+                        // own erase (below) is never reached for this id — remove
+                        // it here instead. Gate 3 architect/cpp-safety review
+                        // (this fix round): in_flight_ids_ has NO reconnect-time
+                        // reset (it deliberately survives reconnect, matching
+                        // command_dedup_'s own durability — a corrected earlier
+                        // draft of this comment claimed otherwise), so skipping
+                        // this erase would leak the entry PERMANENTLY, until
+                        // process exit — a real, not cosmetic, reason this erase
+                        // is required.
+                        if (!cmd.command_id().empty()) {
+                            std::lock_guard lock(in_flight_mu_);
+                            in_flight_ids_.erase(cmd.command_id());
+                        }
                         pb::CommandResponse reject_resp;
                         reject_resp.set_command_id(cmd.command_id());
                         reject_resp.set_status(pb::CommandResponse::REJECTED);
@@ -2937,6 +3087,29 @@ public:
                 cancel_ctx(heartbeat_ctx_);
                 if (heartbeat_thread_.joinable()) {
                     heartbeat_thread_.join();
+                }
+                // Concurrency-claim keepalive thread (CHAOS-TTL-1) is
+                // per-connection like heartbeat — it captures THIS stream by
+                // shared_ptr and must stop before the reconnect loop opens a
+                // new one. This site is reached only AFTER `stream->Read()`
+                // above returned false, i.e. the connection is already known
+                // dead (not merely stalled) — a Write() on it fails fast
+                // rather than blocking (contrast `stop()`'s own comment on
+                // `guardian_sink_stream_`, which documents a synchronous
+                // Write() blocking on a STALLED-but-not-dead stream; that
+                // hazard does not apply here because Read()'s own return
+                // already proves the stream is dead). No dedicated
+                // ClientContext of its own to cancel either way; its
+                // should_stop() poll (5s steps) bounds the join regardless.
+                // The exception-escape gap this reasoning does NOT cover —
+                // an exception unwinding straight past this manual teardown
+                // block, before Read() has necessarily returned false — is
+                // handled separately by `keepalive_unwind_guard` below,
+                // declared after `sub_slot`/`sub_ctx` so it destructs first
+                // on any unwind.
+                keepalive_stop_.store(true, std::memory_order_release);
+                if (keepalive_thread_.joinable()) {
+                    keepalive_thread_.join();
                 }
                 // Daily-sync thread is per-connection (like heartbeat): stop +
                 // join it on disconnect; its state persists in kv_store_.
@@ -3391,6 +3564,16 @@ private:
     // durability, it never propagates into the command path.
     void record_command_terminal(const std::string& command_id,
                                  const pb::CommandResponse& resp) noexcept {
+        // CHAOS-TTL-1: this is the ONE chokepoint every terminal write already
+        // passes through regardless of dedup state, so it is also the correct
+        // place to erase from in_flight_ids_ — unconditional on command_dedup_
+        // (that guard below is scoped to the dedup-store logic only; the
+        // keepalive's in-flight set has nothing to do with it and must not stay
+        // populated just because dedup is degraded).
+        if (!command_id.empty()) {
+            std::lock_guard lock(in_flight_mu_);
+            in_flight_ids_.erase(command_id);
+        }
         if (!command_dedup_ || command_id.empty())
             return;
         try {
@@ -3549,6 +3732,20 @@ private:
         // unchanged: page_journal still takes the engine mtx_ and wakes that worker.)
         if (heartbeat_thread_.joinable())
             heartbeat_thread_.join();
+        // Concurrency-claim keepalive thread (CHAOS-TTL-1): stop_requested_
+        // above already unblocks its should_stop() poll. Both callers of
+        // quiesce_run_workers() (the reconnect-loop teardown and the Run()-
+        // exit ScopeExit) are reached only after the read loop's
+        // `stream->Read()` has already returned false — the connection is
+        // already known dead, not merely stalled, so a Write() on it fails
+        // fast rather than blocking (see the reconnect-teardown site's own
+        // comment for the fuller version of this reasoning, and
+        // `keepalive_unwind_guard` for the exception-escape path this
+        // doesn't cover). Join is bounded by its own ≤5s sleep slice, same
+        // shape as the snapshot pump above.
+        keepalive_stop_.store(true, std::memory_order_release);
+        if (keepalive_thread_.joinable())
+            keepalive_thread_.join();
         sync_stop_.store(true, std::memory_order_release);
         cancel_ctx(sync_ctx_); // unblock an in-flight ReportInventory before joining
         if (sync_thread_.joinable())
@@ -3611,6 +3808,7 @@ private:
 
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
+    std::atomic<bool> keepalive_stop_{false}; // CHAOS-TTL-1 keepalive thread stop flag
     // Consecutive session-rejection-forced re-registrations (#1894). A successful
     // Register resets the normal reconnect backoff, so a server that reaps every
     // fresh session would otherwise drive a fleet-wide re-registration storm; the
@@ -3857,6 +4055,20 @@ private:
     // during startup and never reassigned, so the reader thread and the dispatch
     // workers read the pointer freely; the store serialises its own access.
     std::unique_ptr<CommandDedupStore> command_dedup_;
+
+    // CHAOS-TTL-1 (PR #3784 fix round, governance ledger): a plugin-cooperation-
+    // independent liveness signal for the server's per-device concurrency claim
+    // TTL (ExecutionTracker::renew_concurrency_claim, ADR-1007). Neither a
+    // plugin's own output volume nor its progress-reporting calls are a reliable
+    // mid-execution signal — see the doc comment on keepalive thread spawn below
+    // for the full rationale. `in_flight_ids_` is populated the instant a command
+    // is accepted onto the thread pool (still covers queue-wait time, not just
+    // execute()) and erased at the SAME chokepoint every terminal write already
+    // goes through, `record_command_terminal` — so it can never diverge from the
+    // set of commands this agent still owes a terminal response for.
+    std::mutex in_flight_mu_;
+    std::unordered_set<std::string> in_flight_ids_;
+    std::thread keepalive_thread_;
 };
 
 // Factory
