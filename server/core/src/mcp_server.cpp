@@ -817,7 +817,12 @@ static const ToolDef kTools[] = {
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
      "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
-     "ticket is minted or consumed, matching REST POST /api/command.",
+     "ticket is minted or consumed, matching REST POST /api/command. "
+     "DENIAL DISCRIMINATION (#3687): a dispatch-authorization denial is a JSON-RPC error whose "
+     "error.data.reason is one of the six machine-readable values \"unclassified\", "
+     "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
+     "\"kill_switched\" - branch on this field, not on error.message text, which is prose and may "
+     "change.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
      // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the

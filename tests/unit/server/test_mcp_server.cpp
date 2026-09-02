@@ -7896,6 +7896,13 @@ TEST_CASE("MCP #3687: AnonymousOperator denial is discriminated, dispatch_fn NOT
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    // Gate 6 quality-engineer mutation finding: without a message-content
+    // assertion, swapping AnonymousOperator's and Forbidden's message bodies
+    // in describe_dispatch_denial() breaks the Forbidden test below but NOT
+    // this one — pin the message text too, matching the pattern already used
+    // for Forbidden/ApprovalRequired/KillSwitched.
+    CHECK(body["error"]["message"].get<std::string>() ==
+          "dispatch denied: the caller has no resolved identity for Execution:Execute");
     REQUIRE(body["error"].contains("data"));
     CHECK(body["error"]["data"]["reason"] == "anonymous_operator");
     CHECK_FALSE(dispatched);

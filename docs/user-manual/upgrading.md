@@ -2894,11 +2894,11 @@ surface dispatched it**:
   `result=denied`, `detail=reason=approval_required`) and counted
   (`yuzu_server_dispatch_denied_total{reason="approval_required"}`).
 - **MCP** (`execute_instruction` at `operator` tier — `supervised` tier already goes through the
-  approval workflow): the denial collapses into the SAME `no_agents_reached` tool result an
-  offline/unreachable agent gets, not a discriminated error — the JSON-RPC error-shaping closure
-  for this specific case is tracked separately (not yet shipped). If an MCP-driven automation
-  starts reporting "no agents reached" for a target you know is online, check whether the pair
-  it's calling is now gated before assuming a connectivity problem.
+  approval workflow): the denial is now a discriminated JSON-RPC error naming the reason
+  (`error.data.reason: "approval_required"`), not the `no_agents_reached` tool result an
+  offline/unreachable agent gets (CLOSED by #3687 — a genuine `no_agents_reached` means offline or
+  an empty target, full stop; you no longer need to manually check whether a pair is gated before
+  trusting that result).
 - **Schedules**: a schedule dispatching a gated pair now requires an approval ticket exactly like
   the interactive governed path (`ScheduleRunner` mints one and holds the occurrence until an
   admin approves it via the existing `/api/approvals` workflow) — this was already the behavior
