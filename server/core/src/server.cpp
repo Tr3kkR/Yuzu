@@ -1452,6 +1452,23 @@ public:
             "yuzu_server_gateway_capability_denied_total",
             {{"capability", std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}});
 
+        // #1422: terminal outcomes of gateway command forwarding. Pre-seeded so
+        // the family exports at 0 from boot (absent-vs-zero stays meaningful:
+        // absent = no gateway forwarding configured, zero = configured and
+        // healthy). "unauthenticated" = the gateway's mgmt-plane peer pin
+        // rejected this server's cert - fleet forwarding is down until the pin
+        // and the server leaf agree.
+        metrics_.describe("yuzu_server_gateway_forward_total",
+                          "Gateway SendCommand forwards by terminal outcome (ok / "
+                          "unauthenticated = rejected by the gateway's #1422 mgmt-plane "
+                          "peer pin / unavailable = dropped after 3 attempts / other). "
+                          "Any non-ok movement means commands to gateway-connected "
+                          "agents are being lost.",
+                          "counter");
+        for (const char* st : {"ok", "unauthenticated", "unavailable", "other"}) {
+            metrics_.counter("yuzu_server_gateway_forward_total", {{"status", st}});
+        }
+
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -9243,7 +9260,12 @@ public:
         // below), which is why it no longer belongs in this enumeration -
         // response_store_/notification_store_ remain on the raw-pointer
         // pattern, #3279's reach set for them is unchanged.
-        // #3279 should be updated to name the (now two-store) reach set.
+        // #3279 should be updated to name the (now two-store) reach set,
+        // plus &metrics_ (#1422: the same detached forward thread now also
+        // increments yuzu_server_gateway_forward_total at each terminal
+        // outcome - cpp-safety Gate 8: destruction order puts metrics_
+        // strictly after the pre-existing capture targets, so its dangle
+        // window is a subset of theirs; same envelope, not widened).
         //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
         // makes a few hundred lines up, and for the identical reason - NOT
@@ -9608,15 +9630,22 @@ private:
     // talks only to the real gateway. Gateway→server (the listener's acceptance
     // policy): verify_peer authenticates to the CA, NOT to a specific identity.
     //
-    // Residual (tracked, PKI-ladder): because the gateway side authenticates to
-    // the CA only, ANY holder of ANY CA-issued cert+key passes — an enrolled
-    // agent's stolen per-agent leaf, or the default-server/default-gateway leaves
-    // (0600, need filesystem compromise to extract). There is also no CRL/OCSP
-    // check on this path yet, so a revoked-but-stolen leaf still passes. Pinning
-    // the mgmt peer to the server's identity (CN/SAN or a dedicated EKU) + mgmt
-    // revocation is the cryptographic-identity-binding item that lands with the
-    // QUIC-era rework; through-gateway identity stays app-layer until then. mTLS
-    // still closes the far larger hole: the plaintext, no-cert-required plane.
+    // #1422: the gateway side no longer stops at the CA check. Its mgmt
+    // listener's grpcbox auth_fun (yuzu_gw_authz:check_mgmt_peer/1) pins the
+    // peer to THIS server's key — SPKI SHA-256 of the presented leaf against
+    // {yuzu_gw, mgmt_peer_pins} (default: the default-server.pem in the shared
+    // cert volume), plus a serverAuth-EKU requirement agent leaves can never
+    // satisfy (sign_agent_csr grants clientAuth only). So a stolen agent leaf,
+    // an enrollment-minted CN-collision leaf, or the group-readable
+    // default-gateway leaf all get UNAUTHENTICATED. Consequence for THIS
+    // function: the cert presented here must stay the leaf the gateway pins —
+    // rotating the server leaf out-of-band without updating the pin (or using
+    // BYO certs without pointing mgmt_peer_pins at them) kills command
+    // forwarding with UNAUTHENTICATED, not a TLS error.
+    //
+    // Residual (tracked on #1422): no CRL/OCSP check on this path yet, so a
+    // revoked-but-stolen SERVER leaf still passes until rotation; and
+    // through-gateway operator identity stays app-layer.
     [[nodiscard]] std::shared_ptr<grpc::ChannelCredentials>
     build_gateway_command_credentials() const {
         if (cfg_.tls_server_cert.empty() || cfg_.tls_server_key.empty()) {
@@ -11317,9 +11346,10 @@ private:
             for (auto& gp : gw_pending) {
                 auto* stub = gw_mgmt_stub_.get();
                 auto* svc = &agent_service_;
+                auto* metrics = &metrics_;
                 auto cmd_id = gp.cmd.command_id();
                 spdlog::debug("Forwarding command {} to gateway for agent {}", cmd_id, gp.agent_id);
-                std::thread([stub, svc, gp = std::move(gp), cmd_id]() {
+                std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id]() {
                     ::yuzu::server::v1::SendCommandRequest req;
                     req.add_agent_ids(gp.agent_id);
                     *req.mutable_command() = gp.cmd;
@@ -11348,19 +11378,51 @@ private:
                         if (status.ok()) {
                             spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
                                           cmd_id, resp_count);
+                            metrics->counter("yuzu_server_gateway_forward_total",
+                                             {{"status", "ok"}})
+                                .increment();
                             return; // success — done
+                        }
+                        // #1422: the gateway's mgmt-plane peer pin rejects with
+                        // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
+                        // grpc-message when an auth_fun rejects) — the generic
+                        // warn below would render as "failed:  (16)", which is
+                        // invisible as the fleet-wide forwarding outage it
+                        // actually is. Name the cause and the fix.
+                        if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
+                            spdlog::error(
+                                "Gateway SendCommand for {} REJECTED by the gateway's "
+                                "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
+                                "server presents does not satisfy the gateway's "
+                                "mgmt_peer_pins posture (rotated leaf? BYO cert "
+                                "without repointing the pin, or without the "
+                                "serverAuth EKU?). The gateway log's reason atom "
+                                "names the exact cause. Command forwarding to "
+                                "gateway-connected agents is DOWN until the pin and "
+                                "the server leaf agree. Command dropped.",
+                                cmd_id);
+                            metrics->counter("yuzu_server_gateway_forward_total",
+                                             {{"status", "unauthenticated"}})
+                                .increment();
+                            return; // config defect — retry cannot help
                         }
                         // Only retry on UNAVAILABLE (connection refused / not ready)
                         if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
                             spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
                                          status.error_message(),
                                          static_cast<int>(status.error_code()));
+                            metrics->counter("yuzu_server_gateway_forward_total",
+                                             {{"status", "other"}})
+                                .increment();
                             return; // non-transient error — don't retry
                         }
                         spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
                                      cmd_id, attempt + 1, status.error_message());
                     }
                     spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
+                    metrics->counter("yuzu_server_gateway_forward_total",
+                                     {{"status", "unavailable"}})
+                        .increment();
                 }).detach();
             }
         }

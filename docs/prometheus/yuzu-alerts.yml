@@ -107,6 +107,56 @@ groups:
             send buffers are full. This may cause command delivery delays.
             Consider scaling the gateway or reducing command dispatch rate.
 
+      # The two rules above fire only on series that EXIST; a gateway that is
+      # down (or refusing to boot on the #1422 mgmt-listener posture guard)
+      # produces no series at all and neither can fire. `up` on the gateway
+      # scrape job is present either way.
+      - alert: YuzuGatewayDown
+        expr: |
+          up{job=~".*gateway.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway metrics endpoint is down"
+          description: >-
+            Prometheus cannot scrape the gateway (:9568). The gateway process
+            is down, crash-looping, or refusing to boot — including a #1422
+            mgmt-listener posture refusal (gateway log: "Refusing to start:
+            management listener"). While it is down, agents through this
+            gateway are stranded and command forwarding is dead.
+
+      # #1422 mgmt-plane peer pin: any rejection is either a probing CA-cert
+      # holder (a compromised endpoint's leaf replayed against the command
+      # plane) or a misrotated pin silently killing command forwarding.
+      - alert: YuzuGatewayMgmtAuthRejected
+        expr: |
+          increase(yuzu_gw_mgmt_auth_rejected_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway mgmt-plane peer rejections ({{ $value }} in 1h)"
+          description: >-
+            The gateway's :50063 SPKI peer pin rejected one or more peers
+            (reason label on yuzu_gw_mgmt_auth_rejected_total). pin_mismatch
+            plus failing command forwarding means the server leaf and
+            mgmt_peer_pins diverged (rotation?); other reasons indicate a
+            CA-cert holder that is not the server probing the command plane.
+
+      - alert: YuzuGatewayMgmtPinUnresolved
+        expr: |
+          increase(yuzu_gw_mgmt_auth_pin_unresolved_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway mgmt_peer_pins has an unresolvable entry"
+          description: >-
+            At least one configured mgmt_peer_pins entry cannot be resolved
+            (typo'd fingerprint or unreadable cert file). A dead pin is
+            invisible while another pin still admits the server — and becomes
+            a full command-plane outage at rotation cutover. Fix it now (the
+            gateway log names the entry).
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected
