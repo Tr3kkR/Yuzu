@@ -304,3 +304,21 @@ are infrequent.
   verified by the empirical fix, not just by design review: `tests/unit/server/test_deployment_
   store.cpp`'s backfill test suite covers the sourceless/real/idempotent/mid-scan-corruption
   cases against a live Postgres instance.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes a blanket
+program-wide fact this ADR's backfill design predates: no production Yuzu fleet has
+ever run a pre-Postgres build of any store. The fingerprint-verified,
+IDENTITY/LIFECYCLE-partitioned backfill this ADR designed (and later stores
+copied — DeploymentStore is the "DeploymentStore/TagStore shape" cited across the
+ladder) was real, working code — but it never had real legacy data to protect.
+
+`DeploymentStore::migrate_from_sqlite()` and its private helpers (`sha256_hex`,
+`append_field`, `lifecycle_rank`, `canonicalize_legacy_jobs`, `safe`) are removed
+(`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623). `sqlite_backfill_source`
+is dropped via a version-bumped `{2, "DROP TABLE IF EXISTS sqlite_backfill_source;"}`
+migration, not edited into v1 — this store IS constructed in production, so v1 has
+actually run against real dev/UAT databases. `server.cpp`'s boot path now runs
+`legacy_sqlite_probe::warn_if_legacy_rows` over `deployment_jobs` instead — silent
+unless real rows are found, never blocks boot.

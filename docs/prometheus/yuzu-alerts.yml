@@ -2731,29 +2731,6 @@ groups:
             open at boot. Do not read a props.<key>-scoped rule's empty match
             as authoritative while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/custom-properties-read-degraded"
-      - alert: YuzuCustomPropertiesBackfillFailing
-        # The one-time SQLite->Postgres backfill (ADR-0045) reported a failed
-        # outcome. The server fails closed at boot on a backfill failure
-        # (write error, or a holder-side fingerprint-verification refusal on
-        # a multi-replica boot with divergent legacy content — see
-        # docs/ops-runbooks/custom-properties-store-backfill-recovery.md) and
-        # retries next start, so a failed sample means the server refused to
-        # come up.
-        expr: |
-          sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 0
-        for: 0m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Custom-properties backfill failed (server refused to boot)"
-          description: >-
-            yuzu_server_custom_properties_backfill_total{result="failed"}
-            advanced: the one-time custom-properties backfill could not
-            complete. The server fails closed at boot rather than come up
-            with partial data and retries on the next start — see
-            docs/ops-runbooks/custom-properties-store-backfill-recovery.md
-            for the holder-side-verification recovery procedure.
-          runbook_url: "docs/ops-runbooks/custom-properties-store-backfill-recovery.md"
       - alert: YuzuDiscoveryReadDegraded
         # A discovery_store list_devices read degraded and the caller failed
         # closed (503, per ADR-0044 §Reads), never a silently-empty device
@@ -2776,110 +2753,7 @@ groups:
             failed to open at boot (should not be reachable post-boot given
             fail-closed construction — investigate as a possible regression if
             seen). Do not read a 503 window as "no devices discovered".
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
-      - alert: YuzuDiscoveryBackfillFailing
-        # Mirrors YuzuAuditBackfillFailing's shape, NOT YuzuMgmtGroupBackfillFailing's
-        # (sre Gate 6 finding): the one-time legacy discovery.db -> discovery_store
-        # backfill (ADR-0044) runs during server CONSTRUCTION, and a failure sets
-        # startup_failed_ so run() returns before the HTTP listener starts —
-        # /metrics is never served and a result="failed" sample is never scraped.
-        # An expression keyed on result="failed" (the mgmt-group shape) can
-        # therefore never fire no matter how the counter behaves. What IS
-        # observable from outside is the ABSENCE of a success outcome — a server
-        # that refused to boot publishes no discovery-backfill series at all.
-        #
-        # THIS RULE DEPENDS ON THE PRE-SEED. Unlike AuditStore (whose
-        # set_metrics() owns its own pre-seed), DiscoveryStore::set_metrics()
-        # is a bare pointer assignment — the seed lives in server.cpp's metrics
-        # registration block (the `describe()`/zero-loop right after
-        # DiscoveryStore construction), which initialises the whole `result`
-        # set to 0. That is what makes "series absent" mean "no server is
-        # serving" rather than "no server has this metric registered yet".
-        # Without the seed, the ordinary restart of an already-migrated server
-        # (which returns at the marker check without reaching an outcome this
-        # tick) exports nothing and this rule pages on every routine restart.
-        #
-        # LIMITS: fires only when NO scraped server reports a completed/fresh
-        # backfill, so in a multi-replica deployment one wedged replica among
-        # healthy ones will not trip it (shows up as `up == 0` instead). It ALSO
-        # fires during a legitimately long first-boot backfill on a large
-        # legacy discovery.db — expected during that upgrade window (silence it
-        # for the window). The BOOT LOG carries the actual remediation in every
-        # case (fingerprint mismatch / 0-byte file / reconciliation FAILED);
-        # this is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_discovery_backfill_total{result=~"completed|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed discovery-store backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            discovery.db -> PostgreSQL discovery_store backfill (ADR-0044) in
-            the last 15 minutes. After an upgrade the usual cause is a server
-            that FAILED the backfill: it fails CLOSED, refuses to serve, and
-            retries on the next start — a restart loop with no
-            network-discovered-device inventory available. Read the server BOOT
-            log for the specific refusal reason (fingerprint mismatch / 0-byte
-            legacy file / managed-agent_id reconciliation conflict) — it carries
-            the remediation. See the runbook for what each reason means and how
-            to resolve it.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
-      - alert: YuzuNotificationBackfillFailing
-        # Mirrors YuzuDiscoveryBackfillFailing's shape (same underlying reason,
-        # not YuzuMgmtGroupBackfillFailing's result="failed" shape): the
-        # one-time legacy notifications.db -> notification_store backfill
-        # (ADR-0046) runs during server CONSTRUCTION, and a failure sets
-        # startup_failed_ so run() returns before the HTTP listener starts —
-        # /metrics is never served and a result="failed" sample is never
-        # scraped. An expression keyed on result="failed" can therefore never
-        # fire no matter how the counter behaves. What IS observable from
-        # outside is the ABSENCE of a success outcome — a server that refused
-        # to boot publishes no notification-backfill series at all.
-        #
-        # THIS RULE DEPENDS ON THE PRE-SEED. NotificationStore::set_metrics()
-        # is a bare pointer assignment — the seed lives in server.cpp's
-        # metrics registration block (the describe()/zero-loop right after
-        # DiscoveryStore's own, both pre-seeding their result sets to 0). That
-        # is what makes "series absent" mean "no server is serving" rather
-        # than "no server has this metric registered yet".
-        #
-        # TWO-WAY RESULT SPLIT (not discovery/rbac/mgmt-group's three-way
-        # fresh/completed/failed): this store's backfill is a single
-        # transaction with no multi-step outcome to report separately, so the
-        # wrapper (migrate_from_sqlite in notification_store.cpp) only ever
-        # emits result="success" or result="failed" — expr below matches
-        # "success" only, not "completed|fresh".
-        #
-        # LIMITS: fires only when NO scraped server reports a successful
-        # backfill, so in a multi-replica deployment one wedged replica among
-        # healthy ones will not trip it (shows up as `up == 0` instead). It
-        # ALSO fires during a legitimately long first-boot backfill on a large
-        # legacy notifications.db — expected during that upgrade window
-        # (silence it for the window). The BOOT LOG carries the actual
-        # remediation in every case (holder-side fingerprint mismatch /
-        # sourceless-marker refusal / unreadable legacy file) — this is the
-        # outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_notification_backfill_total{result="success"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed notification-store backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            notifications.db -> PostgreSQL notification_store backfill
-            (ADR-0046) in the last 15 minutes. After an upgrade the usual
-            cause is a server that FAILED the backfill: it fails CLOSED,
-            refuses to serve, and retries on the next start — a restart loop
-            with the whole server down, not just the notification feed. Read
-            the server BOOT log for the specific refusal reason (holder-side
-            fingerprint mismatch / sourceless-marker refusal / unreadable
-            legacy file) — it carries the remediation. See the runbook for
-            what each reason means and how to resolve it.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#notification-feed-moves-to-postgresql--history-preserved-notificationstore-adr-0046"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-discoverystore-adr-0044"
       - alert: YuzuTagStoreReadDegraded
         # A tag_store read degraded and the caller failed CLOSED (ADR-0050):
         # tags are DISPATCH-CRITICAL scope input, so evaluate_scope ABORTS the
@@ -2910,7 +2784,7 @@ groups:
             policy evaluator silently skips tag-scoped checks while this
             fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
             saturation signals; /readyz does not reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#device-tags-migrate-to-postgres-tagstore-adr-0050"
       - alert: YuzuRuntimeConfigReadDegraded
         # A runtime_config_store read degraded (ADR-0060). Two DIFFERENT failure
         # families under one metric, distinguished by `reason`:
@@ -2953,50 +2827,6 @@ groups:
             fail closed on this same secret; see "Key management (secrets
             KEK)" in the server admin guide before it does.
           runbook_url: "https://docs.yuzu.io/runbooks/runtime-config-read-degraded"
-      - alert: YuzuTagStoreBackfillNotCompleted
-        # Mirrors YuzuNotificationBackfillFailing's absent-success shape (NOT
-        # the custom-properties result="failed" shape): the one-time legacy
-        # tags.db -> tag_store backfill (ADR-0050) runs during server
-        # CONSTRUCTION, and a failure sets startup_failed_ so the HTTP
-        # listener never starts — /metrics is never served and a
-        # result="failed" sample is never scraped, making a failed-keyed
-        # expression unfireable (governance sre-1). What IS observable is the
-        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
-        # server.cpp's tag-store construction block (describe() + zero-loop
-        # over fresh/success/failed) — that is what makes "series absent"
-        # mean "no server is serving" rather than "metric not registered".
-        # THREE-WAY result split: fresh | success | failed; expr matches the
-        # two good outcomes. LIMITS: multi-replica — one wedged replica among
-        # healthy ones shows as up == 0, not this; a legitimately long first
-        # boot on a huge tags.db can trip it during the upgrade window
-        # (silence for the window). The BOOT LOG carries the actual
-        # remediation (holder-side fingerprint mismatch / direction-aware
-        # row-conflict refusal / unreadable legacy file). An oversized legacy
-        # file does NOT time out server-side — it makes a LONG boot that an
-        # orchestrator's startup budget may kill mid-backfill (safe, retried
-        # whole) — so also check for a kill loop, not only a refusal line.
-        # This is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed tag-store backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            tags.db -> PostgreSQL tag_store backfill (ADR-0050) in the last
-            15 minutes. After an upgrade the usual cause is a server that
-            FAILED the backfill: it fails CLOSED, refuses to serve, and
-            retries on the next start — a restart loop with the whole server
-            down. A DIRECTION-AWARE row-conflict refusal additionally means
-            the currently-served tag data may be the WRONG SIDE of an
-            operator-authored-data race — treat it as a data-integrity
-            incident, not just an availability one (verify which side is
-            authoritative before clearing anything). Read the server BOOT
-            log for the specific refusal; the runbook maps each message to
-            its recovery.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
       - alert: YuzuProductPackReadDegraded
         # A product_pack_store list()/get() read degraded and the caller failed
         # CLOSED (503 via workflow_routes.cpp's product_pack_error_status),
@@ -3019,47 +2849,7 @@ groups:
             degraded and answered 503 rather than a silently-wrong result.
             Pair with yuzu_pg_pool_* saturation signals; /readyz does not
             reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
-      - alert: YuzuProductPackBackfillNotCompleted
-        # Mirrors YuzuTagStoreBackfillNotCompleted's absent-success shape (NOT
-        # CustomPropertiesStore's result="failed" shape, which is accepted
-        # debt precisely because it cannot fire — see that alert's own
-        # comment): the one-time legacy product-packs.db -> product_pack_store
-        # backfill (ADR-0054) runs during server CONSTRUCTION, and a failure
-        # sets startup_failed_ so the HTTP listener never starts — /metrics is
-        # never served and a result="failed" sample is never scraped, making a
-        # failed-keyed expression unfireable. What IS observable is the
-        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
-        # server.cpp's product-pack-store construction block (describe() +
-        # zero-loop over fresh/success/failed) — that is what makes "series
-        # absent" mean "no server is serving" rather than "metric not
-        # registered". THREE-WAY result split: fresh | success | failed; expr
-        # matches the two good outcomes. LIMITS: multi-replica — one wedged
-        # replica among healthy ones shows as up == 0, not this; a
-        # legitimately long first boot on a huge product-packs.db can trip it
-        # during the upgrade window (silence for the window). The BOOT LOG
-        # carries the actual remediation (which pack/item id conflicted). This
-        # is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed product-pack backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            product-packs.db -> PostgreSQL product_pack_store backfill
-            (ADR-0054) in the last 15 minutes. After an upgrade the usual
-            cause is a server that FAILED the backfill: it fails CLOSED,
-            refuses to serve, and retries on the next start — a restart loop
-            with the whole server down. A differently-valued pack/item
-            conflict across replicas means the currently-served pack catalog
-            may be the WRONG SIDE of an operator-authored-data race — treat
-            it as a data-integrity incident, not just an availability one.
-            Read the server BOOT log for the exact pack/item id and repair or
-            move the losing replica's legacy file aside before restarting.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-productpackstore-adr-0054"
       - alert: YuzuProductPackCompensationPartial
         # #3481: install()'s best-effort compensating rollback (undoing
         # already-installed sibling-store content after a late persist or
@@ -3104,8 +2894,10 @@ groups:
             tracking signal, not alert state.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInstructionBundledContentNotClean
-        # Same absent-success shape as YuzuProductPackBackfillNotCompleted above, adapted
-        # for an EVERY-BOOT (not one-time) outcome (gov Gate 4 UP-4/Gate 8 fix): the
+        # Same absent-success shape used elsewhere on this page for a one-time boot outcome
+        # (alert on the ABSENCE of a good result rather than the PRESENCE of a bad one, since
+        # a refused boot never serves /metrics), adapted here for an EVERY-BOOT (not one-time)
+        # outcome (gov Gate 4 UP-4/Gate 8 fix): the
         # InstructionStore bundled-content reseed loop (232 definitions / 10 sets as of
         # this writing) runs during server CONSTRUCTION, and a genuine DB error on any
         # item sets startup_failed_ — the HTTP listener never starts, /metrics is never
@@ -3827,6 +3619,275 @@ groups:
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. Usually PostgreSQL pool saturation / failover —
             correlate with the pool metrics.
+
+  - name: yuzu-ota
+    # Agent OTA pull bounds (#913 per-peer admission, #911 deadlines, #416
+    # identity). Every series here is zero-seeded at boot, so increase() > 0 is
+    # meaningful and absent() stays a real signal.
+    #
+    # Deliberately NOT alerted: yuzu_ota_download_admission_total
+    # {decision="rejected_rate"} on its own. The rate bucket is the loose,
+    # secondary bound and is expected to reject during a fleet-wide update; a
+    # page on it would be noise. The concurrency rejection is the one that means
+    # a peer is actually trying to monopolise capacity.
+    rules:
+      - alert: YuzuOtaConcurrencyRejections
+        expr: |
+          sum by (job, instance) (
+            increase(yuzu_ota_download_admission_total{decision="rejected_concurrency"}[1h])
+          ) > 5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A peer is repeatedly hitting the per-peer OTA concurrency cap"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            One or more agents are being refused DownloadUpdate because they
+            already hold --ota-max-concurrent-per-peer parallel transfers. This
+            is the primary bound from issue #913 and it firing sustained means
+            a peer is opening more concurrent OTA streams than any healthy
+            agent needs. Investigate which identity: correlate with
+            yuzu_ota_admission_key_mode_total to see whether admission is
+            keyed on certificates or has fallen back to peer IP, and check the
+            server logs, which name the rejected peer — but note that line is
+            SAMPLED 1-in-100 (the first always logs, then every hundredth, on a
+            counter shared with the server-wide rejections), so a short burst may
+            leave one line or none. This counter is the complete record; the log
+            is for attribution only. Admission rejections are
+            deliberately metric-only and write NO audit row (see
+            docs/user-manual/audit-log.md), so do not look for one. A short burst during a
+            fleet-wide rollout is benign; a sustained signal is not.
+
+            Threshold note: the lookback is [1h] and `for:` is 15m. An earlier
+            form used [15m]/10m — increase() over [15m] stays positive for a
+            full 15m after a single event, so a `for:` window that is short
+            relative to its lookback only debounces gaps shorter than `for:`
+            itself, not the full lookback, and `for: 10m` there fired on one
+            rejection. The bar is a count, not a duration, for that reason.
+
+      - alert: YuzuOtaIdentityRejections
+        expr: |
+          sum by (job, instance, reason) (
+            increase(yuzu_grpc_ota_identity_rejected_total[1h])
+          ) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Agent OTA RPCs rejected for a missing or mismatched certificate identity"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            CheckForUpdate or DownloadUpdate was rejected because the peer
+            presented no usable client certificate, presented one from a
+            foreign CA, or claimed an agent_id that does not match its
+            certificate (issue #416). On a fleet where every agent is enrolled
+            this should be flat at zero, so any sustained signal is either a
+            misconfigured agent or an identity being spoofed. The reason label
+            says which. Paired forensic evidence is the
+            session.ota_identity_rejected audit rows for attribution. Read VOLUME from
+            this counter, never from the row count: rows undercount for two
+            separate reasons — `no_client_identity` is metric-only and writes
+            none, and the row is rate-limited per peer, with suppressed rows
+            counted by yuzu_ota_identity_audit_suppressed_total.
+
+            Window note: the lookback is an HOUR and `for:` is deliberately SHORTER
+            than it. A `for:` at least as long as the lookback can never be
+            satisfied by a sparse signal — `increase()>0` decays before the `for:`
+            elapses — which would make this rule blind to exactly the low-and-slow
+            identity probe it exists to catch. `reason` is preserved in the
+            aggregation because the description and runbook both tell the operator
+            to read it.
+
+      - alert: YuzuOtaRefundDivergence
+        expr: |
+          sum by (job, instance) (
+            increase(yuzu_ota_download_deadline_exceeded_total[30m])
+          )
+            > sum by (job, instance) (
+                increase(
+                  yuzu_ota_download_refund_total{reason=~"transfer_deadline|chunk_deadline"}[30m]
+                )
+              )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTA deadline aborts exceed rate-token refunds — lockout regression suspected"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            Every transfer aborted by a SERVER-imposed deadline must refund the
+            rate token it was charged at admission; that invariant is what stops
+            a genuinely slow-link or flapping agent from spending itself into a
+            lockout (the failure mode recorded on issues #934 and #941). Charges
+            running ahead of refunds means a code path is aborting without
+            refunding, which silently re-opens that lockout. Check recent changes
+            to the DownloadUpdate deadline branches in agent_service_impl.cpp.
+
+            SCOPE, honestly: this compares two counters incremented from the same
+            classified outcome, so what it detects is a code path that aborts
+            WITHOUT refunding — a dropped or reordered call site. It cannot see a
+            refund that was issued but did not land inside PrincipalQuota::refund
+            (which is find-not-insert and silently drops an untracked key). That
+            case is covered by the primitive's own unit tests, not by this alert.
+
+      - alert: YuzuOtaTransfersAborting
+        expr: |
+          (
+            sum by (job, instance, phase) (
+              increase(yuzu_ota_download_deadline_exceeded_total[1h])
+            )
+              / on (job, instance) group_left ()
+            clamp_min(
+              sum by (job, instance) (
+                increase(yuzu_ota_download_admission_total{decision="admitted"}[1h])
+              ), 1
+            ) > 0.1
+          )
+          and on (job, instance)
+          (
+            sum by (job, instance) (
+              increase(yuzu_ota_download_admission_total{decision="admitted"}[1h])
+            ) >= 4
+          )
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTA transfers are being aborted by a server-imposed deadline"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            Transfers are hitting --ota-transfer-deadline-secs or
+            --ota-chunk-write-deadline-secs. This is the alert that makes a
+            MISCONFIGURED deadline visible, and without it that failure is silent:
+            every aborted transfer refunds its rate token, so the buckets never
+            drain, YuzuOtaRefundDivergence stays quiet, and the agent retries on its
+            own 6-hourly timer. The fleet simply stops updating while every other
+            dashboard stays green.
+
+            Threshold note, and it is the whole design of this rule. Two review
+            rounds each proved one half of this from opposite ends.
+
+            An ABSOLUTE count cannot work: agents check every 6h, so N agents all
+            failing produce only N/12 aborts per 30m, and any fixed bar goes blind
+            below some fleet size — a bar of 3 left every fleet under ~36 agents
+            unable to page while 100% of its devices failed, forever. Adding an
+            absolute arm back ALONGSIDE the proportion does not rescue it either: a
+            permanently-broken 15% of a large fleet and a benign 5% rollout tail on a
+            fleet three times larger produce the same absolute count, so no fixed bar
+            separates them. Only the proportion does.
+
+            The bar is 0.1 rather than 0.2 because 0.2 was proved blind to a permanent
+            15%-of-fleet outage — a whole site unable to update, forever, with this
+            detector green. The `admitted >= 4` guard exists because the ratio is
+            meaningless on a nearly-idle server: one admission and one abort in an
+            hour reads 1.0 and would page. The denominator is separately clamped at 1
+            so the division itself is total.
+
+            HONEST RESIDUAL: a fleet where under ~10% of devices fail permanently sits
+            below this bar. That is deliberate — real fleets carry a standing trickle
+            of slow links — but it is a blind spot, not a proof of health.
+
+            Window note: `for:` is deliberately SHORTER than the lookback. A `for:` at
+            least as long as the lookback can never be satisfied by a signal sparser
+            than the window, which is how a 30m-on-[30m] form failed to fire at any
+            evaluation time at all. `phase` is preserved in the aggregation because
+            this description tells the operator to read it; the denominator carries no
+            `phase`, hence the explicit `on (job, instance) group_left ()`.
+
+            Check the phase label — `transfer` means the
+            whole-transfer budget was too small for the artifact on that link
+            (900s over a 100 MiB binary implies a ~0.93 Mbit/s floor), `write` means
+            a single chunk stalled. Correlate with
+            yuzu_ota_download_refund_total{reason=~".*deadline"}.
+
+      - alert: YuzuOtaServerCapacityRejections
+        expr: |
+          sum by (job, instance) (
+            increase(yuzu_ota_download_admission_total{decision="rejected_total"}[1h])
+          ) > 1
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OTA transfers refused by the SERVER-WIDE capacity ceiling"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            Window note: `for:` is shorter than the lookback (so the rule can
+            actually be satisfied), and the bar is >1 over an hour rather than >0,
+            because a single transient refusal at the ceiling is not a page — the
+            group already excludes `rejected_rate` for the same reason.
+
+            --ota-max-concurrent-total is saturated, so agents are being refused
+            regardless of their own per-peer budget. Two very different causes look
+            identical here and the log line distinguishes them by `cert_keyed`.
+            EITHER a fleet-wide rollout genuinely wants more concurrency than the
+            ceiling allows — raise it, sizing roughly as
+            `devices x transfer_seconds / rollout_seconds` — OR a few source
+            addresses are holding slow transfers to occupy the shared ceiling,
+            which is a denial attempt: IP-keyed peers are confined to the
+            unreserved share (`--ota-cert-reserve-pct`) so they cannot starve
+            enrolled agents.
+
+            The rejection log's `cert_keyed=` field is the discriminator, with two
+            caveats that matter before you act on it. It means "presented a
+            certificate this listener accepted", NOT "is an enrolled Yuzu agent"
+            (#3828) — on a multi-CA trust bundle a certificate from any other CA
+            in that bundle also reads `cert_keyed=true`, so on such a deployment
+            it does not separate a rollout from an attack on its own. And the log
+            line is sampled 1-in-100, so a short burst may leave one line or none.
+            Correlate with yuzu_ota_admission_key_mode_total, which is complete.
+
+      - alert: YuzuOtaPeerMapEvicting
+        expr: |
+          sum by (job, instance) (increase(yuzu_ota_download_peers_evicted_total[1h])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The OTA admission map is evicting — the rate limiter may be disabled"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            Sustained eviction means --ota-max-peers-tracked is at or below the live
+            peer count. This is not a cache-efficiency concern: an evicted key that
+            returns is re-inserted with a FULL token burst, so continuous eviction
+            silently disables the rate dimension for the peers cycling through it.
+            Raise --ota-max-peers-tracked above the number of distinct admission
+            keys you expect (check yuzu_ota_download_peers_tracked, and
+            yuzu_ota_admission_key_mode_total to see whether keys are certificates
+            or source IPs — the IP fallback inflates the key count).
+
+      - alert: YuzuOtaPeerMapNearCapacity
+        expr: |
+          yuzu_ota_download_peers_tracked
+            / clamp_min(yuzu_ota_download_peers_capacity, 1)
+            > 0.8
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "OTA per-peer admission map is approaching its cardinality ceiling"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/server-admin.md#agent-ota-pull-bounds"
+          description: >-
+            The per-peer OTA admission map is above 80% of
+            --ota-max-peers-tracked (issue #935). Expressed as a ratio against
+            the published yuzu_ota_download_peers_capacity gauge rather than a
+            hardcoded count, so it stays correct when an operator retunes the
+            flag. The map is bounded and evicts the least-recently-seen idle
+            entry, so this is not a memory-exhaustion risk — but on a fleet far
+            smaller than the configured ceiling it indicates admission has
+            fallen back to peer-IP keying for many peers (check
+            yuzu_ota_admission_key_mode_total{mode="peer_ip"}), which is what a
+            NAT'd peer rotating source ports looks like. Correlate with
+            yuzu_ota_download_peers_evicted_total to see whether the cap is
+            actually biting yet.
+
+            STALENESS: yuzu_ota_download_peers_tracked is refreshed only when a
+            DownloadUpdate arrives. On an idle fleet (default update_check_interval
+            is 6h) it holds its last value, so treat a firing instance with no
+            recent admissions as a stale reading rather than a live condition. The
+            map also never shrinks — purge_stale has no periodic caller — so once
+            this fires it stays firing until the process restarts.
 
   - name: yuzu-executions
     # HA WS-1(1b) (ADR-2002 §5) — the command_id -> execution_id correlation

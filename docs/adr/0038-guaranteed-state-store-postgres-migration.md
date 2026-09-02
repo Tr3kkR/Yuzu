@@ -182,6 +182,43 @@ or `PQcmdTuples` on its own single-owner result.
   `YUZU_REQUIRE_PG_DB`. The H2/G9 enum cross-check tests must pass unchanged against the
   PG DDL.
 
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the mandatory 5-table,
+SAVEPOINT-per-row backfill this ADR designed (ADR-0037's SQLSTATE-discrimination shape)
+was real, working code that never had real legacy data to protect.
+
+`GuaranteedStateStore::migrate_from_sqlite()`, its dedicated `SqliteConnGuard` RAII
+wrapper, and its private helpers/types (`LegacyRule`, `LegacyMeta`, `LegacyStatus`,
+`LegacyEvent`, `LegacyObservation`, `backfill_row`, `backfill_row_strict`, `safe`) are
+removed (`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623).
+`sqlite_backfill` — whose entire purpose was the backfill idempotency marker — is
+dropped via a version-bumped `{2, "DROP TABLE IF EXISTS sqlite_backfill;"}` migration,
+not edited into v1: this store IS constructed in production, so v1 has actually run
+against real dev/UAT databases. `gc_meta` (the UNRELATED #2496 retention clock-guard
+durable state) and `guardian_meta` (the UNRELATED `policy_generation` counter) are both
+kept untouched — neither is backfill machinery, despite the superficially similar
+naming. `server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows`
+over the five legacy tables (`guaranteed_state_rules`/`guardian_meta`/
+`guardian_agent_rule_status`/`guaranteed_state_events`/`guardian_observations`) instead
+— silent unless real rows are found, never blocks boot.
+
+**Consequence, specific to this store.** Most other stores in this retirement batch
+lose merely operational or cosmetic state if the "no real legacy data" premise turns
+out to be locally false for some install (a stray notification feed, a stale discovery
+scan). This store is different: a legacy `guaranteed-state.db` genuinely holding real
+Guardian rules now produces a boot-time WARN log line and nothing else — the rules are
+never loaded, and enforcement silently starts from an empty rule set rather than
+resuming the operator's prior policy. `BaselineStore` (also retired in this same batch,
+ADR-0055) carries the identical enforcement-class consequence — a Baseline IS what a
+Guardian deploy enforces (`deployed_snapshot`), so a legacy `guardian-baselines.db` with
+real content is equally never resumed, only warned about. This is a strictly worse
+consequence class than the rest of the batch, and it rests on the same production-fleet
+premise as every other
+store here; if that premise is ever locally wrong for a Guardian install specifically,
+the operator's actual protection posture is what's at stake, not just convenience.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

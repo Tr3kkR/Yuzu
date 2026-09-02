@@ -1,6 +1,8 @@
 #include "dashboard_routes.hpp"
 
-#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
+#include "dispatch_destructive_gate.hpp" // PR6.0b: the shared Destructive targeting gate (#3685)
+#include "on_behalf_guard.hpp"              // sanitize_for_log
+#include "dispatch_target_shape.hpp" // kBroadcastScope (#2500), kReasonDestructiveUntargeted
 
 #include <algorithm>
 #include <chrono>
@@ -910,6 +912,210 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
+
+                 // ── PR6.0b: Destructive-class TARGETING gate ────────────────
+                 // The exec console is the third operator-facing surface that
+                 // resolves a free-form plugin.action and can fan it out
+                 // (`scope=__all__`, `scope=group:<id>`, or `scope` omitted
+                 // entirely — the legacy UI contract read a few lines above as
+                 // "the whole fleet"). #3685 gated the other two, /api/command
+                 // and MCP execute_instruction; this one reaches agents through
+                 // ServerImpl::dispatch_confined instead and was left
+                 // untargeted-fan-out-capable for every Destructive row that
+                 // does not additionally carry ExecuteGate::AdminOrApproval —
+                 // tar.purge_source, registry.delete_key, filesystem
+                 // .delete_lines, tags.clear, storage.clear and the rest.
+                 //
+                 // SAME chokepoint, not a copy: evaluate_destructive_targeting
+                 // and confine_destructive_targets come from
+                 // dispatch_destructive_gate.hpp unchanged, and both refusal
+                 // strings are that header's named constants, so this surface
+                 // cannot drift from the other two. That header's own doc
+                 // comment records why the gate belongs HERE, in route/handler
+                 // code, and NOT in the shared dispatch_confined seam (D3: a
+                 // scheduled Destructive fire legitimately targets by scope,
+                 // and gating the seam would silently kill every one of them).
+                 {
+                     if (!classify_fn_) {
+                         // FAIL-CLOSED, matching McpServer::ClassifyFn's
+                         // contract. A silently-unwired classifier would revert
+                         // this gate while every other test stayed green — the
+                         // ContainmentGate{} class of regression. Production
+                         // wires it unconditionally in server.cpp; reaching
+                         // this branch on a live request means that regressed.
+                         spdlog::error("dashboard execute: capability classifier unwired — "
+                                       "refusing dispatch of {}:{} (Destructive targeting "
+                                       "cannot be decided)",
+                                       plugin, action);
+                         audit_fn_(req, "command.dispatch", "denied", "command", "",
+                                   "reason=classifier_unavailable " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " style=\"font-size:0.75rem;color:#f85149\">"
+                             "Command classification is unavailable. Cannot dispatch.</span>"
+                             "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                     const auto gate = yuzu::server::evaluate_destructive_targeting(
+                         classify_fn_(plugin, action),
+                         /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                         // The handler has already collapsed the supplied-vs-
+                         // omitted question above (CDX-R8-01) and turned a
+                         // group:/__all__ selection into scope_expr, so this is
+                         // the post-validation shape the header's caller
+                         // contract requires — never a raw extraction result.
+                         /*scope_key_present=*/!scope_expr.empty());
+                     // Exhaustive, no `default:` — the same switch shape
+                     // /api/command and MCP's backstop use over this enum, and
+                     // the reason ClassifyMiss is an enumerator rather than a
+                     // skippable `if` branch.
+                     switch (gate.verdict) {
+                     case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                         // ReadOnly / Mutating: this gate does not apply and
+                         // must not narrow anything. Dispatch proceeds byte-
+                         // identically to pre-PR6.0b.
+                         break;
+                     case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                         // Policy B, same as /api/command and MCP's backstop:
+                         // fall through to the shared dispatch chokepoint,
+                         // which denies a real miss unconditionally with its
+                         // own taxonomy, metric and audit shape. An early
+                         // denial here would only duplicate — and risk
+                         // drifting from — that evidence.
+                         break;
+                     case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
+                         // Counted on the SAME series as the /api/command and
+                         // MCP refusals, with this surface's own `route` label
+                         // — not a fourth metric for a third surface, and
+                         // deliberately not the `yuzu_server_dispatch_denied
+                         // _total` family, which means "classification or
+                         // authorization refused this dispatch" and is owned by
+                         // build_classified_command. Guarded like both existing
+                         // sites: an increment failure must never skip the
+                         // audit write or the response below it.
+                         if (metrics_) {
+                             try {
+                                 metrics_
+                                     ->counter("yuzu_server_dispatch_target_rejected_total",
+                                               {{"route", "dashboard"},
+                                                {"reason",
+                                                 std::string(yuzu::server::
+                                                                 kReasonDestructiveUntargeted)}})
+                                     .increment();
+                             } catch (...) { // NOLINT(bugprone-empty-catch)
+                             }
+                         }
+                         // scope_expr is operator-supplied and percent-decoded, so a
+                         // %0a would inject a line break into the server log. The
+                         // sibling /api/command refusal sanitises its logged fields
+                         // for exactly this reason; match it rather than deviate.
+                         spdlog::warn("dashboard execute: refusing {}:{} — Destructive actions "
+                                      "require explicit agent_ids (scope='{}')",
+                                      plugin, action,
+                                      onbehalf::sanitize_for_log(scope_expr, 128));
+                         // Audited under this surface's own command.dispatch
+                         // verb, with the same `reason=` detail prefix
+                         // /api/command's twin refusal writes.
+                         audit_fn_(req, "command.dispatch", "denied", "command", "",
+                                   "reason=" +
+                                       std::string(yuzu::server::kReasonDestructiveUntargeted) +
+                                       " " + onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                       onbehalf::sanitize_for_log(action, 128));
+                         // In-surface denial shape: every other refusal in this
+                         // handler is a 200 carrying an OOB result-context
+                         // span, because the caller is htmx swapping fragments
+                         // into a live page — a 4xx with a JSON envelope would
+                         // leave the console silent. The chart-deck clear
+                         // mirrors the unknown-command arm above.
+                         res.set_content(
+                             "<span id=\"result-context\" hx-swap-oob=\"true\""
+                             " style=\"font-size:0.75rem;color:#f85149\">" +
+                                 html_escape(
+                                     std::string(yuzu::server::kDestructiveUntargetedMessage)) +
+                                 "</span>"
+                                 "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
+                             "text/html; charset=utf-8");
+                         return;
+                     }
+                     case yuzu::server::DestructiveTargetingVerdict::Targeted: {
+                         // Confine to the operator's visible agents, exactly as
+                         // /api/command does. DestructiveVisibleAgents' nullopt
+                         // means FAIL-CLOSED (deny-all) — the OPPOSITE of
+                         // authz::VisibleSet's nullopt; the explicit
+                         // constructor is what forces this call site to say so.
+                         // An absent store or an ADR-0042-degraded read
+                         // therefore empties the list rather than widening it.
+                         std::optional<std::vector<std::string>> vis;
+                         if (mgmt_group_store_)
+                             vis = mgmt_group_store_->get_visible_agents(caller.principal);
+                         // Kept for the refusal log below: confinement
+                         // overwrites agent_ids, so the requested set is
+                         // otherwise unrecoverable by the time we know it was
+                         // emptied.
+                         const std::vector<std::string> requested_ids = agent_ids;
+                         agent_ids = yuzu::server::confine_destructive_targets(
+                             agent_ids, yuzu::server::DestructiveVisibleAgents{std::move(vis)});
+                         if (agent_ids.empty()) {
+                             // /api/command answers 404 here; this surface
+                             // answers in its own idiom for the reason given in
+                             // the RefuseUntargeted arm. Audited as a scope
+                             // violation, matching the sibling destructive
+                             // fragment (tar retention-paused purge) rather
+                             // than /api/command, which audits nothing on this
+                             // arm — an operator dropped by confinement is
+                             // exactly the event an incident review looks for.
+                             // Log the requested target. Without this the
+                             // agent an operator actually asked for is in
+                             // NEITHER channel on this arm: the audit row
+                             // carries an empty target_id, and the only other
+                             // gate-arm log (the RefuseUntargeted warn above)
+                             // records scope_expr, which is empty precisely
+                             // when the caller named one explicit agent. An
+                             // incident responder reconstructing the attempted
+                             // blast radius of a refused Destructive dispatch
+                             // would find nothing and could reasonably read the
+                             // absence as log loss or tampering. Sanitised and
+                             // capped because these ids ARE operator-supplied:
+                             // `scope` comes straight off the request. (The
+                             // sibling arms above log `plugin`/`action` raw and
+                             // sanitise only `scope_expr` -- correct there,
+                             // because those two are resolved against the
+                             // registry's help_json and cannot carry request
+                             // bytes. Do not read those as the convention for
+                             // an operator-supplied value.)
+                             std::string requested;
+                             for (const auto& id : requested_ids) {
+                                 if (!requested.empty()) requested += ",";
+                                 requested += onbehalf::sanitize_for_log(id, 128);
+                             }
+                             spdlog::warn(
+                                 "dashboard execute: destructive '{}:{}' refused -- none of the "
+                                 "requested agents [{}] are in the caller's visible set",
+                                 onbehalf::sanitize_for_log(plugin, 128),
+                                 onbehalf::sanitize_for_log(action, 128), requested);
+                             audit_fn_(req, "command.dispatch", "denied", "command", "",
+                                       "reason=scope_violation " +
+                                           onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                           onbehalf::sanitize_for_log(action, 128));
+                             res.set_content(
+                                 "<span id=\"result-context\" hx-swap-oob=\"true\""
+                                 " style=\"font-size:0.75rem;color:#f85149\">" +
+                                     html_escape(std::string(
+                                         yuzu::server::kDestructiveNoVisibleAgentMessage)) +
+                                     "</span>"
+                                     "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\">"
+                                     "</div>",
+                                 "text/html; charset=utf-8");
+                             return;
+                         }
+                         break;
+                     }
+                     }
+                 }
+
                  auto [command_id, sent] =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
                  if (sent == 0) {
