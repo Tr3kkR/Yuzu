@@ -1,0 +1,1109 @@
+---
+status: proposed (numbered ADR-1008; pending /governance review and Dave's final acceptance)
+date: 2026-09-02
+owner: Dave Rae
+deciders: Dave Rae (pending)
+scope: server -- target access-control architecture for RBAC + Management Groups
+depends-on: ADR-0017, ADR-0033, ADR-1006 (this document's decisions must compose with, not
+  re-decide, the frozen contracts in these three)
+context-refs: ADR-0006, ADR-0031, ADR-0032, ADR-0041, ADR-0042, ADR-1005,
+  docs/auth-engine-principals-design.md, #388, #480, #1362, #1453, #1496, #1715,
+  #1842, #2485, #2665, #2670, #2677, #2721, #2809, #3290, #3489
+supersedes: nothing (net-new target-architecture record; ADR-0017/1006 remain the accepted
+  contracts this one builds forward from)
+---
+
+# ADR-1008 -- RBAC and Management Groups: target access-control architecture
+
+## Binding status
+
+**Proposed, not accepted.** Numbered ADR-1008; committed to the repo for `/governance` review;
+not yet through it. Written in the repo's ADR shape to be evaluated as one before any decision
+to accept it. If accepted, it binds **prospectively**: the "not yet built" and "non-conformance"
+items below become the acceptance bar for calling this subsystem complete, not a retroactive
+claim that today's code already violates a rule that didn't exist yet.
+
+All eleven decisions (D1-D11) are decided by Dave. D6's Guardian extension is the sharpest
+instance of this document exercising its own judgment rather than reading an existing ADR
+directly (applying ADR-0032 Decision 7's credential-recheck mechanism to Guardian, which no
+accepted ADR names -- see D6's own opening for the reasoning), but it is not the only one: D5
+reasons by the same kind of analogy when extending ADR-1006 Decision 2's rationale to a third
+confinement mechanism, and this document names that explicitly in Rejected Alternatives rather
+than pretending D6 is unique in needing this. Five independent read-only reviews were run against successive
+drafts before reaching this text (Codex/Sol twice, two independent Fable passes, and a two-model
+adversarial review with cross-examination); the full history, including several corrections to
+earlier framings of D6, is preserved under Governance below for anyone who wants to see how this
+text was arrived at. It is not restated in the decision text itself.
+
+What remains before this can be proposed as a real, numbered ADR and pushed: the standard
+`/governance` pipeline this codebase requires of every change, and -- separately -- the fact that
+D6 describes a mechanism that does not exist in code at all yet (D1-D5 and D7-D11 are, by
+contrast, mostly gaps in an otherwise-working system). Neither of those is a design question;
+both are the ordinary next steps for any accepted architecture decision.
+
+## Context
+
+Yuzu's RBAC (`RbacStore`) and Management Groups (`ManagementGroupStore`) subsystems have grown
+two very different depths. The **enforcement plane** -- the chokepoints that decide whether a
+request is admitted and what it can see -- is mature: a Postgres-backed store with fail-closed
+boot and deny-on-degrade semantics (ADR-0041/0042), a frozen cross-boundary precedence lattice
+(#1715), an admit-then-filter list-read chokepoint with twelve pinned invariants (ADR-0017), a
+default-deny posture for service-scoped credentials (ADR-1006), and a shipped non-human
+principal class (engine principals, ADR-1005 §5). Several hundred `TEST_CASE`s exist across the
+auth/rbac/scope/authz test files (`rg --files tests/unit | rg '(auth|rbac|scope|authz)' | xargs
+rg -n "TEST_CASE" | wc -l` -- re-run this rather than trust a hardcoded number here, which two
+prior drafts already got wrong in different directions), including a property test for
+visible-set/scoped-check
+equivalence.
+
+The **administration plane** -- how an operator actually configures any of this -- is
+essentially unbuilt. `RbacStore::set_rbac_enabled`, `create_role`, `set_permission`, and
+`remove_permission` have zero production callers on `origin/dev`; no REST route, MCP tool, or
+Settings UI fragment can enable RBAC, create a custom role, or grant a human principal anything
+beyond `Operator`/`Viewer` at a management-group scope. `POST /api/v1/rbac/check` calls the raw
+global permission check and diverges from every real gate's actual decision -- notably it never
+consults `auth::is_elevated`, so a JIT-elevated caller currently gets a *false negative* from
+`check`. The product manual documents an enable toggle and a Settings matrix that do not exist
+(`docs/user-manual/rbac.md`).
+
+A third, more fundamental gap sits underneath both: the RBAC securable-type catalogue
+(`rbac_store.cpp` `types[]`, 26 entries) does not contain `Directory`, `Patch`, `Workflow`,
+`ProductPack`, or `Server` -- five securables that live route handlers already gate on
+(`discovery_routes.cpp`, `workflow_routes.cpp`, `mcp_server.cpp:3468`). Because
+`role_permissions.securable_type` carries a foreign key into `securable_types(name)`, no
+permission on an unseeded type can ever exist, so **enabling RBAC today would 403 every
+non-elevated principal on every route gated by one of those five securables** -- an
+elevated/admin session survives via the `is_elevated` short-circuit, but no ordinary grant ever
+could. This was found while reviewing an earlier draft of this document and independently
+verified twice (Codex/Sol, then Fable) against `origin/dev`.
+
+Management Groups share the same enforcement-ahead-of-operability shape: the hierarchy,
+service-tag-derived dynamic groups, and the descendant-ward visible-set expansion are built and
+tested, but the legacy role-existence visibility resolver (`get_visible_agents`) still coexists
+with the ADR-0017 permission-specific resolver at 7 call sites, dynamic membership only
+evaluates at group creation and never on a later write to an already-existing group (tracked
+in-code as governance finding UP-5, and the code's own comment at that call site currently
+*misdescribes* its own behavior -- a documentation-truth defect independent of the functional
+gap), and group reparenting has a non-atomic check-then-write window (#1362).
+
+This document is not a bug list. It states, as decisions, what "done" looks like for this
+subsystem, splitting two distinct kinds of gap that the codebase's own severity model
+(CLAUDE.md's derived-severity discipline) already treats differently:
+
+- a **defect** -- a rule this document states that the current code actively violates or that
+  makes the system incorrect once a precondition is met (D1, D2's escalation hole, D8's
+  divergence from the real gate); and
+- **not yet built** -- a capability this document requires that simply does not exist yet and
+  is not claimed to (D10, D11, most of D3-D9's forward-looking clauses).
+
+Both matter equally for calling this subsystem gold-standard; only the first should be read as
+"this is already wrong."
+
+## Decision
+
+Eleven architectural decisions, D1-D11. (An earlier draft had twelve, separately numbering D7
+non-human attenuation and D12 explainability; both are kept here as their own headings because
+each names a distinct requirement even though D7 is implemented via D3/D5's primitives and D12
+via D8/D9's, but they are cross-referenced rather than pretended away. A prior revision of this
+document claimed the fold reduced the count to nine and then listed sequencing criteria only
+through "D2-D9" -- both were arithmetic errors, caught in the second Sol review, and are fixed
+throughout this revision.)
+
+### D1 -- The securable catalogue is one source of truth, enforced at every gate, not just tool registration
+
+Every securable string reaching `require_permission` / `require_scoped_permission` /
+`authorize_list_read` / `require_fleet_read` / a REST `perm_fn` / an MCP `resources/read` call /
+a declared MCP tool's permission MUST be a member of `RbacStore::list_securable_types()`, with
+no second, hand-maintained mirror of that list anywhere in the codebase.
+
+Partial coverage already exists and this decision extends it rather than starting from zero:
+`McpServer`'s constructor validates every `kToolSecurity` row against a catalogue at boot
+(`validate_tool_security_registration`), and a binding test pins that catalogue against
+`RbacStore`'s. **That existing catalogue (`kRbacSecurables` in `mcp_server.cpp`) is itself a
+second, hand-maintained mirror of `types[]` and is a non-conformance with this decision as
+stated -- it must collapse into a single source, not be joined by a third.** The coverage gap
+this decision actually closes is everything the tool-registration validator does not reach: the
+direct `perm_fn`/`require_permission`/`scoped_perm_fn` call sites in REST and dashboard routes,
+and MCP's `resources/read` path (which is exactly where the live, unseeded `"Server"` securable
+was found). Add a contract test enumerating every such call site's literal securable string and
+asserting catalogue membership; fail the build otherwise.
+
+This decision is a bridge to ADR-0033 §2's already-accepted direction: securables become
+runtime-registrable data via a capability-declaration registry, with "undeclared means the
+capability does not register on any surface" as the terminal rule. Until that registry exists,
+D1's contract test is the enforcement mechanism; once it exists, the registry subsumes it.
+
+*Non-conformance (defect) today:* `Directory`, `Patch`, `Workflow`, `ProductPack`, `Server` are
+gated live and are not seeded, so no ordinary (non-elevated) grant can ever cover them. The
+`kRbacSecurables` mirror exists and has not been collapsed. REST/dashboard call sites and MCP
+`resources/read` have no catalogue-membership check.
+
+### D2 -- Enabling and disabling RBAC is atomic, escalation-safe, and cannot produce zero active Administrators
+
+Enabling RBAC verifies, in the same transaction, that at least one active, authenticatable human
+principal holds `Administrator` globally, before the toggle commits. Where none exists, the
+system may create that grant for the enabling operator -- but **only when the enabling
+operator's current session already holds the legacy `admin` session role** (via
+`auth::effective_role`), and that self-grant is itself an audited, named bootstrap event
+distinct from an ordinary assignment. Without that condition, the enable endpoint is a
+privilege-escalation path for anyone holding only `UserManagement:Write`: they could enable
+RBAC and be self-granted `Administrator` regardless of their actual standing authority.
+Disabling RBAC is symmetric: audited, MFA-stepped-up, reversible. A failed transaction is
+reported to the caller (`set_rbac_enabled`'s current `void` return must change to support this).
+
+*Non-conformance (defect) today:* no code path can enable RBAC at all (#388); `set_rbac_enabled`
+cannot report failure to a caller. *Not yet built:* the bootstrap-grant conditioning and audit
+event described above have no code to violate them yet, precisely because no enable path exists
+-- they are binding on whatever implements D2, not a claim about current behavior.
+
+### D3 -- One assignment chokepoint for every principal type and scope; deny at assignment level is a decided, not silent, extension of the frozen lattice
+
+**The decision is one write CHOKEPOINT, not one table.** Every role assignment or revocation --
+principal (user | group | engine), role, scope (global | management-group) -- is validated by
+exactly one function (`validate_assignment`, extended, never forked) regardless of which
+underlying table it lands in. `validate_assignment` already serves both `RbacStore` and
+`ManagementGroupStore` today (the latter calls into the former), so this decision is narrower
+than an earlier draft claimed: the chokepoint already exists and is shared; what is missing is
+(a) deriving the grantable-role set from the grantor's actual authority (D4) instead of a
+hardcoded allow-list, and (b) a shared assignment record shape (principal, role, scope, granted_by,
+justification, audit correlation id) so the two tables present one API contract even if they
+remain two tables.
+
+**A per-assignment `effect` (allow/deny) is a new model element, not a formatting choice, and
+this decision does not add one without saying how it composes.** The codebase has already
+frozen the #1715 cross-boundary lattice: a global allow overrides a group deny; a global deny
+does not override a group allow. An assignment-level deny is a third kind of fact competing in
+that same lattice. **This decision does not introduce assignment-level deny.** If a future
+change wants one, it must be its own decision that extends `resolve_perm_groups` (the single
+INV-7 resolver) with an explicit rule for where an assignment-deny sits in the existing
+precedence, reviewed with the same rigor as #1715 was. Until then, an assignment record's
+`effect` field, if built, is `allow`-only.
+
+*Non-conformance (defect) today:* the scoped-assignment route hardcodes its allowed-roles list
+(`role_name != "Operator" && role_name != "Viewer"`) instead of deriving it from D4; there is no
+production write path for a global human assignment at all. *Not yet built:* the shared
+assignment record shape; a decided, tested lattice rule for assignment-level deny (deliberately
+out of this decision's scope, see above).
+
+### D4 -- Grant authority is an explicit administrative model: the grantor must currently hold what they grant, computed as an effective-authority delta
+
+A grantor may only grant authority they themselves currently hold at the target scope, evaluated
+as the delta between the grantee's effective permission set before and after the proposed grant
+-- across the frozen additive lattice (#1715), including deny interactions and descendant-scope
+expansion -- not a per-`(securable, operation)` row lookup. A grantor who holds a permission only
+via a group that does not cover the target scope must not be able to grant it there.
+`visible_agents_for_permission` is the right resolver *primitive* for computing each side of that
+delta, but it operates on currently-persisted state -- it is not a transactional
+before/after simulator, and this decision does not claim the check is free to build; it requires
+either evaluating the delta inside the same transaction as the write (persisted-before vs.
+persisted-after, with rollback on violation) or an equivalent hypothetical-state evaluation this
+document does not further specify.
+
+**A point-in-time check at assignment is necessary but not sufficient (second Sol review): it
+does not prevent authority that widens *after* the grant with no new assignment event.** A grant
+that adds no authority today because a deny currently masks it can become effective the moment
+that deny is later removed by someone else; a management-group hierarchy change can widen the
+descendant set a scoped grant reaches; a later edit to the granted role's own permissions can
+give the grantee more than the grantor verified at grant time. None of these are new assignment
+events, so a check that only runs at assignment time cannot catch them. This decision therefore
+requires one of: (a) a durable ceiling recorded on the assignment (the grantor's authority
+snapshot at grant time, re-verified whenever the assignment's authority is *read*, not only when
+it is written), or (b) revalidation triggered by every mutation that can grow an existing
+assignment's effective reach (deny removal, hierarchy reparenting, role-permission edits). Which
+of these -- or another mechanism -- is chosen is left open; this decision fixes the requirement
+(latent widening must be caught, not only grant-time escalation), not the mechanism.
+
+**This decision deliberately rejects the alternative administrative model -- a dedicated
+`Approve`/administer-without-holding permission -- that ADR-0033 §8 already adopted for
+approvals** ("approvers need `Approve` on the securable and never the underlying permission, so
+a low-privilege reviewer stays possible"). The two are not in conflict because they answer
+different questions: §8's model lets someone *gate* an action they cannot themselves perform;
+D4's model governs *creating standing authority* for someone else, where "I can let you do X
+without being able to do X myself" is the escalation this decision exists to prevent. A future
+`Grant` operation modeled on §8's shape (a dedicated `UserManagement:Grant` permission,
+independent of the granted role's own permissions) is a genuine, different, and rejected
+alternative -- see Rejected Alternatives.
+
+*Non-conformance:* not applicable as a defect -- no production grant-authority check exists at
+all outside the hardcoded Operator/Viewer list, so there is nothing yet to violate D4. Any
+implementation of D3 that ships a per-row check instead of the effective-authority delta
+described here, or that omits the latent-widening handling above, would be a D4 non-conformance
+from the day it ships.
+
+### D5 -- Per-agent data is confined by one of three named mechanisms on every transport, and coverage is proven, not asserted
+
+Yuzu already has three legitimate confinement mechanisms for different shapes of operation, and
+this decision does not merge them (ADR-1006 Decision 2 already rejected merging
+`require_list_read` and `require_fleet_read` for the same reason: they answer different
+questions and merging weakens one or complicates the other):
+
+1. **Single-target writes** -- `require_scoped_permission(..., agent_id)`, the existing
+   per-device pattern.
+2. **Fan-out dispatch** -- `dispatch_confined_arms` / `derive_exec_visible` / `authz::meet`, the
+   existing per-dispatch-arm intersection (ADR-0033 §2's targeting model).
+3. **List/fan-out reads and bulk mutation targets** -- the ADR-0017 admit-then-filter triad
+   (`authorize_list_read` / `require_fleet_read` / `require_list_read`) plus the built-but-unwired
+   `confine_agent_target` for the write-target case ADR-0017 did not cover.
+
+Every per-agent read or write on every transport (REST, MCP, dashboard fragment, SSE stream)
+must reach at least the applicable one(s) of these three for its shape -- **"at least," not
+"exactly one"** (second Sol review's correction: a bulk operation can legitimately need route
+admission via one mechanism, target confinement via a second, and downstream dispatch-arm
+authorization via a third; layered coverage across applicable stages is the goal, not forcing
+every route into a single mechanism) -- or be on a documented, reviewed exception list of
+genuinely fleet-global surfaces (the existing ADR-0017 precedent for the software-catalogue
+rollup). What this decision forbids is a *fourth*, ad hoc mechanism, or a route that reaches
+*none* of the three where one applies. **The new requirement this decision adds is a provable
+coverage check**: a static/CI pass enumerating every registered route and MCP tool, classifying
+each into the applicable mechanism(s) or the exception list, and failing if any per-agent-data
+route reaches none of them.
+"We believe every route is gated" is not sufficient; a governance-blocking test is.
+
+Retiring `ManagementGroupStore::get_visible_agents` in favor of `visible_agents_for_permission`
+is **not a new decision this ADR makes** -- ADR-0017 INV-6 already states PR-C "deletes the
+role-existence narrower... rather than extending it." This document reaffirms that conformance
+with INV-6 is required for a gold-standard claim; it does not re-decide it.
+
+*Non-conformance (defect) today:* `get_visible_agents` still has 7 production call sites (a
+standing INV-6 non-conformance); `confine_agent_target` has zero callers; `/api/scope/estimate`
+has no permission gate of any kind (worse than bare-gated). **Correction (adversarial review,
+2026-09-02): "nine specific bare-gated routes" is not reproducible and was overcounted.** A fresh
+sweep by both external reviewers independently found at least 7 flat, `perm_fn`-only per-agent
+routes with no confinement mechanism at all across `dex_`, `compliance_`, `discovery_`, and
+`inventory_routes` -- not 9, and the exact set the two reviewers found differed slightly, which
+is itself evidence that a hand count in prose is the wrong way to state this. More importantly,
+the original "six route modules... have not migrated" framing conflated two different states:
+`device_routes.cpp` and `tar_tree_routes.cpp` (and part of `inventory_routes.cpp`) already route
+their list surfaces through a legacy `get_visible_agents`-backed scoped provider
+(`devices_fn_`) -- not on ADR-0017's mechanism 3, and therefore still a standing non-conformance
+with INV-6, but not bare-gated or unconfined the way the other four modules' flat routes are.
+This document does not restate a corrected exact count, because the count is exactly what D5's
+own coverage-proving contract test exists to make authoritative rather than asserted in prose --
+that test, once built, replaces this paragraph's inventory. *Not yet built:* the coverage-proving
+contract test.
+
+### D6 -- Every durable or background dispatch resolves to a currently-valid human authority and credential
+
+**The requirement is not in question; only its application to one dispatcher (Guardian) required
+this document's own decision rather than a reading of existing text, and that decision is now
+made.** ADR-0033's narrowing law (§1) is platform-wide: authority is never created out of
+nowhere, and an effect crosses the system only through filters that confirm a real, current
+grant behind it. ADR-0032 Decision 7 is the validated design that satisfies this for Schedules:
+record the credential that armed the dispatch, not only the human; recheck it at execution;
+distinguish routine rotation (rebind, keeps running) from revocation/expiry/deletion (stop); make
+a stopped dispatch loud, not a silent failure. **For Schedules, this document is simply
+compliance** -- Decision 7 names schedules explicitly and already requires exactly this.
+**For Guardian, no accepted ADR names this dispatcher, and this document decides, on its own
+authority as a proposed ADR-0033 extension, to apply the identical mechanism** -- not because an
+existing text already reaches that far, but because Guardian's rule distribution is the same
+shape of problem (a person's decision keeps taking effect long after they made it, with nobody
+re-checking whether they still could) and reusing a mechanism this codebase has already designed,
+reasoned through, and will build once for Schedules is better engineering than inventing a second
+one. Dave decided this directly (2026-09-02) rather than leaving it contingent on a maintainer's
+reading of ADR-0032's text, which is the right place for this decision to sit: whether Guardian
+needs this protection is a product/security judgment, not a question of what a sentence in
+another document happens to say.
+
+The prior drafting history on this exact point -- three rounds of asserting an accepted ADR
+already settled it, having that retracted, and two independent external reviewers splitting on
+the question when asked to check -- is preserved in Governance below, because it is the reason
+this decision is now stated as an owned choice rather than argued as a forced reading. It is not
+restated here; a decision does not need to relitigate its own history to be binding.
+
+**What is this document's own content, decided here, independent of any existing ADR:** how the
+credential-recheck mechanism's *mechanics* apply to a dispatcher that distributes rules built
+from *multiple* Baselines with independently-changing roots and credentials at once -- Decision 7
+was written for a single-armer Schedule and does not by itself resolve what happens when a
+distributed rule set has several roots simultaneously. That multi-root mechanics question, and
+the parallel question of how the same model extends to policy remediation and other background
+dispatchers, is what sub-clauses 1-3 and 5-6 below resolve. It is not implementable as a single
+sentence.
+
+1. **What counts as an "effect" here is each distribution event, not a periodic "push cycle" --
+   Guardian has no timer.** Distribution is event-driven via two paths: an explicit push fired on
+   Baseline deploy/undeploy or a manual REST push, and a separate, rate-limited per-agent
+   heartbeat reconcile that fires only when that agent's generation is behind the current policy
+   generation. The "effect" this decision binds is **each such distribution event** -- the
+   server-side act of handing an agent a rule set it will thereafter evaluate and act on
+   autonomously -- not each individual moment an already-received rule later fires locally on a
+   device. This follows from how Guardian works: agents keep enforcing already-received rules
+   while disconnected from the server, so there is no live round-trip at local-enforcement time
+   to check anyone's current authority against; a distribution event is the only point where a
+   live authorization decision is architecturally possible at all. **Both paths must apply the
+   same per-Baseline root resolution identically** -- an agent reached by the event-driven push
+   and one reached only by the later heartbeat reconcile must not diverge on which Baselines'
+   rules they are currently enforcing. Read-only evaluation (the policy evaluator's compliance
+   tick) is excluded on separate grounds -- it produces no effect at all.
+2. **The authority root per dispatch class, plus a default rule for everything not yet
+   inventoried.** Four classes are settled: direct human action (already rooted, unaffected);
+   scheduled dispatch (the armer, `Schedule.created_by`, re-checked at fire per #3133, adoption
+   gap closed by sub-clause 5); Guardian's distribution events (per-Baseline deployer/adopter,
+   resolved at each event per sub-clauses 1 and 3); and policy remediation (the live requesting
+   operator, per sub-clause 5, with no stored root at all). Not every `system_reserved`
+   capability has been individually inventoried against this table, but neither of the two named
+   in an earlier draft turns out to need it: `tar.fleet_snapshot` declares itself read-only in
+   `core_dispatch_capabilities.hpp`, so D6's own read-only exclusion already covers it the same
+   way policy evaluation is covered; and `asset_tags.sync` fires from a tag-write route gated by
+   `scoped_perm_fn(req, res, "Tag", "Write", agent_id)` against a live session before dispatching
+   system-rooted, so it already has a findable, live root and is not an "unexamined" case at
+   all -- both corrections from an earlier draft that flagged them as unexamined without checking.
+   **The capture-source push is not in this set**: `POST /fragments/tar/capture-sources/push` is
+   session-authenticated, gated by `scoped_perm_fn_("Infrastructure", "Read", device)`, and
+   derives a real, non-system caller that `build_classified_command` enforces
+   `Infrastructure:Write` against -- it is already a correctly-rooted direct human dispatch, not
+   one of the three actual `system_reserved` rows in `core_dispatch_capabilities.hpp`.
+   **The default rule for any dispatcher not in the four settled classes above**: it must
+   resolve to whoever's action created the record or state it is now acting on, re-checked at
+   the moment of dispatch, unless and until it is reviewed and found to genuinely have no such
+   record to root against -- in which case sub-clause 6 governs, and the burden of showing no
+   arm-event root is achievable sits with that dispatcher, never a default assumption that it is
+   exempt. Applying this default: preflight's checks are already read-only by design
+   (`docs/user-manual/preflight.md`'s load-bearing invariant that every check is
+   read-only/idempotent), so preflight is excluded the same way policy evaluation is -- it
+   produces no effect. **Quarantine reconciliation does NOT conform**: `QuarantineContainment
+   Reconciler` dispatches through `command_dispatch_fn`, the same unfiltered `system=true`
+   closure policy remediation uses (a distinct path from Guardian's own `send_system_reserved`,
+   though both are equally system-rooted with no per-human authority, which is the point that
+   matters here). **Correction:** an earlier draft claimed the reconciler's dispatch function
+   type is caller-typed in signature but simply doesn't supply a real caller at its call site --
+   this overstated how close it is to conforming. `QuarantineContainmentReconciler`'s
+   `CommandDispatchFn` is a plain, no-caller shape at its declaration
+   (`quarantine_containment_reconciler.hpp`), the same as `command_dispatch_fn` itself; there is
+   no caller-typed signature to fail to use. The conclusion is unaffected: quarantine
+   reconciliation is squarely inside this sub-clause's default rule, and building the caller-typed
+   path is new work, not a matter of wiring an existing hook. Whatever record establishes
+   a device's quarantine is the candidate root, re-checked at reconciliation time, and building
+   that is in scope for whoever implements D6.
+3. **The Guardian multi-root problem: orphaning pauses enforcement, loudly.** Every distribution
+   event (sub-clause 1) constructs its rule set from `deployed_member_rule_ids()` filtered across
+   *every currently-deployed Baseline*, which may represent several different deployers with
+   different, independently-changing current authority. "Resolve to the deploying operator" has
+   no single answer once more than one Baseline is live simultaneously. Three other candidate
+   answers are rejected: failing the whole distribution over one deployer's status change makes
+   an unrelated HR/RBAC event a fleet-wide enforcement outage; indefinitely retaining
+   last-known-enforced state with no path back to a rooted authority just defers the "unrooted
+   effect" problem this decision exists to close; and **"keep an orphaned Baseline's rules
+   enforced unchanged while pending adoption" is not achievable through the two paths this
+   decision's own re-evaluation mechanism uses, though the push endpoint itself has a broader
+   partial-update mode -- a correction from an earlier draft, which claimed no such mode exists
+   anywhere.** `POST /guaranteed-state/push` accepts a `full_sync` flag defaulting to `false`,
+   and an incremental (`full_sync=false`) push upserts only the delivered rules, leaving
+   everything else on the agent untouched -- so "every distribution event is a full sync" is
+   false as a blanket statement about the push endpoint. What is true, and what this decision's
+   mechanism actually relies on: Baseline deploy/undeploy and the heartbeat reconcile -- the two
+   paths sub-clause 1 names as the ones this decision governs -- are both hardcoded
+   `full_sync=true` in current code, with no operator-facing way to make them incremental. On
+   those two paths specifically, the agent clears its prior rule set and reapplies whatever the
+   event delivers, so exclusion from the delivered set **is** disarming that Baseline's rules.
+   This has two consequences the earlier, overstated version of this paragraph did not name: the
+   periodic re-evaluation sweep (below) must itself trigger a `full_sync=true` distribution when
+   it finds an orphan transition, or the pause it is supposed to enforce simply will not happen;
+   and an operator-initiated incremental push made while a Baseline is orphaned does not enforce
+   the pause either -- it leaves already-armed rules exactly as they were, which is a residual
+   gap this decision accepts rather than closes (closing it would mean either forcing every push
+   to be full-sync, which has its own fleet-convergence cost, or teaching the incremental path to
+   also respect orphan state, which is additional mechanism this document does not specify).
+
+   **The decision:** when a deployed Baseline's original deployer no longer holds the
+   authority under which it was deployed, or the credential they deployed it with is no longer
+   valid (sub-clause 4), the Baseline enters an **orphaned, pending-adoption** state, and its
+   rules are **paused** -- excluded from the rule set at the next distribution event that reaches
+   each affected agent, on both paths (sub-clause 1). This is accepted as the correct trade-off,
+   not a euphemism for it: a paused control that is loud, audited, and immediately adoptable is
+   safer than one of the two alternatives above (silent fleet-wide outage) and more honest than
+   the third (a decision that claims continuity the mechanism cannot deliver). The orphaned state
+   is **loud**: an audit event on transition into it, a Prometheus gauge counting Baselines
+   currently pending adoption, and a surfaced operator-facing signal (dashboard +
+   `list_baselines`/equivalent MCP output) so a paused Baseline cannot go unnoticed. **Resolution
+   is an explicit `adopt_baseline` action**, audited, callable only by an operator whose current
+   effective authority (per D4) covers the Baseline's scope at least as fully as the original
+   deployment required -- adoption cannot itself be an escalation path. Adoption re-roots the
+   Baseline to the adopting operator and clears the pending-adoption state; re-enforcement
+   resumes at the next distribution event that reaches each agent, not instantly on adoption.
+
+   **Shared-Guard rule:** a Guard reached by more than
+   one Baseline is armed once on the agent, and `deployed_member_rule_ids()` returns a flat,
+   Baseline-attribution-free set of rule ids -- so a Guard contributed by both a rooted Baseline A
+   and an orphaned Baseline B must not be paused, because A still legitimately roots it. Exclusion
+   applies at the rule level, computed as: a rule is included if **at least one** currently-rooted
+   (non-orphaned) Baseline contributes it, and excluded only if **every** Baseline contributing it
+   is currently orphaned. Implementing this decision therefore requires adding per-rule
+   Baseline-contribution attribution to the deployed-rule resolution path, which does not exist
+   today -- `deployed_member_rule_ids()`'s flat-set shape is itself *not yet built* against this
+   decision, not merely the `adopt_baseline` action layered on top of it.
+
+   **Re-evaluation trigger:** an orphan transition
+   (an authority or credential loss detected between distribution events) does not, by itself,
+   cause any distribution event to happen -- distribution is event-driven (sub-clause 1) and
+   nothing today ties an RBAC mutation or a credential revocation to a Guardian push or to
+   bumping the policy generation the heartbeat reconcile keys on (`bump_policy_generation`'s only
+   callers today are Baseline deploy/undeploy). Without a fix, "paused, loudly" could mean
+   "paused whenever the next unrelated Guardian change happens to trigger distribution," which
+   could be an arbitrarily long time -- not the bounded, prompt pause the decision intends. This
+   decision therefore requires a periodic sweep (the same shape as `PolicyEvaluator`'s existing
+   tick, not a new architectural pattern) that re-validates every deployed Baseline's current
+   root and credential, and triggers a **`full_sync=true`** distribution on any transition it
+   finds (orphan or adoption) rather than waiting for an unrelated change to surface it --
+   per the correction above, a `full_sync=false` push would not actually enforce anything the
+   sweep just decided. The sweep interval is
+   implementation detail; that a sweep must exist at all is the decision.
+4. **Credential recheck.** For Schedules, ADR-0032 Decision 7 already decides this: its text
+   names "a schedule" outright, requires recording the arming credential (not only the arming
+   human), and states plainly that revocation, expiry, or deletion of that credential stops the
+   dispatch the same way authority loss does. Decision 0's own corollary states the underlying
+   principle Decision 7 applies: "whatever admits a run supplies a credential; if a seam has no
+   credential to filter on, the answer is never 'then that filter is vacuous' -- it is that the
+   seam is under-specified." This is compliance, not invention. For Guardian, Decision 7's own
+   scope statement ("this governs operator-facing runs... it does NOT re-home the autonomous-sync
+   identity") names neither Guardian's case nor excludes it, so this document decides, on its own
+   authority as an ADR-0033 extension, to apply the same mechanism -- see the decision's opening
+   above for why. (ADR-0033 §7's own general text, separately from its four-eyes table, names "a
+   scheduled or background run" without Decision 7's operator-facing qualifier; whether that
+   sentence already reaches Guardian on its own is left unargued here, because D6's mechanism is
+   at least as strict as any such reading would require -- the question has no normative effect
+   on what this document actually does.)
+
+   **Unified in shape across live and durable dispatch:**
+
+   - **Live dispatch (manual policy remediation, any future "act now" flow)** already has a
+     real, current credential presented with the request, and needs no new mechanism -- this is
+     exactly what sub-clause 5's fix for remediation already does by threading the live
+     requester's session/token through to dispatch instead of falling through to the shared
+     system-rooted closure.
+   - **Durable dispatch splits by whether a durable credential exists to record -- a correction
+     to an earlier draft, which proposed recording "the session or API token id" as if the two
+     were interchangeable.** They are not: a `Session` has no addressable credential identity
+     exposed beyond the stable `username`, and every session expires at an absolute 8-hour
+     `kSessionDuration` regardless of activity. Applying expiry-triggers-orphan to a session
+     literally, as the earlier draft did, would auto-orphan every dashboard-deployed Baseline (or
+     dashboard-armed Schedule) within a single workday -- an absurd operational outcome for a
+     mechanism meant to catch genuine authority loss, and it holds for Schedules exactly as much
+     as for Guardian, since ADR-0032 Decision 7's text does not itself distinguish session-armed
+     from token-armed runs. This document resolves the gap Decision 7 leaves open, consistent
+     with its intent rather than in tension with it:
+     - **Armed with an API token**: record that token's id at deploy/arm time (not only the
+       principal's username, as today's `Baseline.deployed_by` / `Schedule.created_by` do). At
+       every distribution event or fire, the recorded token's current validity is rechecked in
+       addition to the principal's current RBAC authority (sub-clauses 2/3/5) -- a revoked,
+       expired, or deleted token triggers the same orphaned/pending-adoption state sub-clause 3
+       defines for authority loss, not a separate failure mode. **Routine credential rotation is
+       not treated as revocation, keyed on the same distinction Decision 7 requires (a recorded
+       successor vs. a compromise revocation with none)**: re-arming with a freshly issued token
+       for the *same* still-authorized principal, recorded as a rotation successor rather than a
+       compromise, is an explicit, audited **rebind** action -- this document's name for what
+       Decision 7 calls re-arming, not a separate mechanism -- lighter-weight than
+       `adopt_baseline`/`adopt_schedule`, since it does not change who roots the Baseline or
+       Schedule, only refreshes the credential recorded against the existing root. This mirrors
+       the existing `Rotate` operation this codebase already has for API tokens
+       (`ApiToken:Rotate`) rather than inventing a new verb from nothing.
+     - **Armed with an interactive session**: there is no durable credential to record or expire
+       -- a session was never designed to represent a standing authorization that should outlive
+       the login, only that a particular browser tab was recently authenticated. For this case,
+       the recheck is the principal's current RBAC authority plus account liveness (below), with
+       no separate credential-expiry component; the 8-hour session lifetime has no bearing on how
+       long the Baseline or Schedule stays rooted. An operator who wants a dispatch immune from
+       needing periodic rebinds should arm it with a token, which is exactly what the token path
+       above is for.
+   - **Account liveness is an explicit, separate check, required in both cases above (and
+     necessary on the token path specifically, not merely a fallback for the session path).**
+     `ApiTokenStore::validate_token` checks only a token's own `revoked`/`expires_at` columns,
+     with no join against the owning account's active status -- deactivating a human account
+     does not, by itself, revoke that account's outstanding API tokens. Treating token validity
+     as sufficient would let a durable controller keep enforcing under a deactivated principal
+     whose token simply hasn't expired yet, which is exactly the unrooted-effect gap this whole
+     decision exists to close. **The rule: durable-controller recheck always includes the root
+     principal's account being active** (`AuthDB::get_user`'s existing active-only predicate, the
+     same one `ScheduleRunner::resolve_caller` already uses), and additionally the recorded
+     token's validity when the dispatch was token-armed -- either check failing triggers the
+     orphaned/pending-adoption state. `locked_until` is explicitly **excluded** from the
+     account-active predicate used here, per its own separate, deliberate trade-off: lockout is a
+     temporary, auto-expiring throttle against brute-forced login attempts, triggered by
+     wrong-password attempts against a known username -- not a fact about whether the account or
+     its existing credentials are still valid. Folding it in would let anyone who learns a
+     Baseline deployer's or Schedule armer's username deliberately trigger their lockout to pause
+     that Baseline's enforcement or that Schedule's fires, turning a login rate-limit into a
+     remote disarm switch.
+
+   Both halves are now variations of one rule -- recheck the credential that authorized this
+   effect, at the moment the effect fires or distributes, where "the credential" is whatever
+   durable authorization fact actually exists for that arm event -- rather than two different
+   rules for two situations. The only thing that differs is what the credential is and how
+   "current" is established: a live session/token for live dispatch, a recorded, rotatable
+   token id (plus account liveness, always) for
+   durable dispatch.
+
+5. **The safe state on reauthorization failure for scheduled dispatch and policy remediation --
+   the two resolve differently because their data models differ, not because the underlying
+   principle changes.** The adoption shape from (3) --
+   orphan-then-loud-surfacing-then-explicit-authorized-hand-off, never silent drop and never
+   silent indefinite continuation -- extends to whichever of these two actually has a stored,
+   aging root to orphan. Only one does.
+
+   **Scheduled dispatch: adoption applies, and part of the machinery already exists.** A
+   `Schedule` already stores its arming principal (`created_by`) and the runner already
+   re-resolves that principal at every fire via `resolve_caller`, which itself calls
+   `AuthDB::get_user` -- filtered to active accounts only, with the code's own comment reading
+   "EXISTENCE IS THE GATE." The account-deprovisioning half of a liveness check is already built
+   for schedules; Guardian has no equivalent check at all. What genuinely is missing: `Schedule` records only
+   `created_by` (a username), not the credential the armer used, so there is nothing yet for a
+   revoked/expired/rotated credential to be checked against, and the RBAC-authority denial
+   `resolve_caller` triggers (counted by `arming_check`'s `yuzu_schedule_arming_denied_total`) is
+   silent per-schedule, visible only in an aggregate counter, not a per-schedule surfaced state.
+   Closing this means: recording
+   the arming credential at arm time (sub-clause 4); on the first denied fire from either RBAC-
+   authority loss or credential invalidity, transitioning the schedule to an audited, surfaced
+   **orphaned** state (visible in the schedule list/API, not just the aggregate metric) rather
+   than silently skipping it release after release; continuing to skip it, not force-firing,
+   while orphaned; and an explicit `adopt_schedule` action (re-rooting, per sub-clause 3's shape)
+   or a lighter **rebind** action (same root, fresh credential, per sub-clause 4) to resume
+   firing from the next occurrence. The same re-evaluation-trigger gap sub-clause 3 names for
+   Guardian applies here too: nothing today ties an authority or credential change to an
+   out-of-band schedule re-check between fires, so the periodic sweep sub-clause 3 requires
+   should cover schedules as well, not only Baselines.
+
+   **Policy remediation: adoption does not apply, because there is no stored root to orphan.**
+   `Policy` (`policy_store.hpp`) has no author/creator field at all, and per this codebase's own
+   standing design, remediation is **operator-gated only** -- there is no automatic,
+   background-triggered remediation effect for a root to go stale on; the background evaluator
+   only computes compliance status (a read, explicitly out of D6's effect-producing scope
+   already). Every remediation is a live operator clicking "remediate now" in their own current
+   session. There is nothing to adopt, because there is no aging root in the first place --
+   the correct fix for this case is the same one sub-clause 4 already requires and #3133 already
+   modeled for schedules: thread the requesting operator's real identity through to the
+   remediation dispatch and recheck their current authority and credential at that exact moment,
+   rather than letting it fall through to the shared system-rooted closure. If a future change
+   ever introduces automatic/background-triggered remediation, that change re-opens this
+   sub-decision and should apply the Baseline/Schedule adoption shape at that time, not before.
+6. **Whether a narrow, explicitly bounded institutional-controller exception is warranted: none
+   is granted to any dispatcher examined in this document, and none is needed.** Every dispatch
+   class this decision actually resolved -- Guardian push,
+   scheduled dispatch, and policy remediation -- now has a real human root (adoption or live
+   recheck), so none of them required falling back to an unaccountable institutional exception in
+   the first place; sub-clause 2's default rule closes the remaining classes the same way. This
+   decision does not foreclose one being proposed later for some dispatcher this document did not
+   examine, but it sets the bar rather than leaving it undefined: this codebase already has a
+   working precedent for exactly this shape of problem -- the auth subsystem's break-glass
+   account and ADR-0031's break-glass Core recovery ingress, both built on the explicit principle
+   that "no filter and no gate is skipped because the surface is called break-glass." Any future
+   institutional-controller exception must be built the same way: narrow, named, individually
+   reviewed as its own ADR-0033 amendment (not silently absorbed into whatever PR implements this
+   ADR), mandatorily audited on every use, and gated by the same fail-closed discipline as every
+   other privileged path in this codebase -- never a bare `system=true` flag doing duty as one by
+   default. A dispatcher proposing such an exception carries the burden of showing that no
+   arm-event root (sub-clause 2's default) is achievable for it at all, not merely that one is
+   inconvenient to build.
+
+A blanket `system=true` flag with no stated root is not a declared exception under this
+decision; it is the absence of a decision, which is the current state. This decision does not
+close that absence -- it names exactly what closing it requires.
+
+*Current state:*
+
+For **Guardian**: the "effect" is each distribution event, not a periodic push (sub-clause 1);
+Baseline root authority resolves via `adopt_baseline` and pauses when orphaned (sub-clause 3);
+credential recheck applies Decision 7's mechanism by this document's own extension (sub-clause
+4). *Not yet built, essentially all of it:* there is no `adopt_baseline`/rebind action, no
+orphaned-Baseline state, no per-baseline (let alone per-rule, per the shared-Guard fix) root or
+credential resolution at any distribution event, no orphaned-Baseline audit/metric/dashboard
+surface, no recorded arming credential on `Baseline` at all (only `deployed_by`, a username), and
+no periodic root/credential-validity sweep to trigger timely re-evaluation. Guardian distribution
+currently dispatches as `system_reserved`/`system = true` with no per-baseline root, no
+credential check, and no re-checked ceiling of any kind -- this decision's mechanism replaces
+this, essentially from zero.
+
+For **schedules**: the runner already re-resolves the arming principal and denies on
+current-RBAC-authority loss or account deprovisioning at fire time (`created_by` +
+`resolve_caller` + `AuthDB::get_user`'s active-only filter, the #3133 fix) -- more of the
+mechanism is shipped here than for Guardian. *Not yet built:* recording the arming credential
+(today only `created_by`, a username, is stored), rechecking that credential's validity per
+sub-clause 4, the surfaced per-schedule orphaned state (today's denial is visible only in the
+aggregate `yuzu_schedule_arming_denied_total` counter), the `adopt_schedule`/rebind actions, and
+schedules' share of the periodic re-evaluation sweep.
+
+For **policy remediation**: adoption does not apply (no stored root exists to orphan,
+remediation is operator-gated only, sub-clause 5); sub-clause 4 for this class is simply the live
+credential on the live request, threaded through to the remediation dispatch instead of falling
+through to the shared system-rooted closure -- *not yet built*.
+
+Per sub-clause 2's default rule: preflight needs no root (read-only by existing design, never in
+scope); **quarantine reconciliation does NOT conform** -- it dispatches through the same
+unfiltered `system=true` closure as remediation (`command_dispatch_fn`), not a caller-typed path,
+and does not share Guardian's own separate `send_system_reserved` path -- so it is squarely
+inside this default rule's scope, not a plausible pre-existing exception; `tar.fleet_snapshot`
+and `asset_tags.sync` remain unexamined against the default rule. The capture-source push is not
+in this list: it is already a settled, correctly-rooted direct-human dispatch and was never a
+default-rule case.
+
+Per sub-clause 6, no institutional-controller exception exists or is proposed for any of these.
+
+**No sub-clause remains open, but the mechanism this decision requires is essentially unbuilt
+from zero** -- the shared-Guard rule attribution, the periodic re-evaluation sweep, recorded
+arming credentials, and rebind as distinct from adoption are all new construction, not small
+patches to something mostly working.
+
+### D7 -- Non-human principal authority composes through the same primitives as D3/D5, never a parallel mechanism
+
+An engine principal's effective authority for any delegated or represented action is the
+intersection of its own grants and the represented operator's current grants -- computed via the
+same `authz::meet` composition D5 already uses for dispatch confinement, and assigned through
+the same D3 chokepoint -- never a union, and never a standing global grant substituting for
+per-run scoping. This is ADR-1005 §5 and ADR-0033 §3's attenuation model, applied without a
+second implementation when management-group-scoped engine assignments are built.
+
+*Non-conformance today:* engine principals (shipped through PR 4.5) can currently only hold
+global grants. The existing dangerous-role guard rejects assignment by both a hardcoded name
+list (`"admin"`, `"Administrator"`) and an `is_system` check on the target role -- but neither
+catches a *custom* role that happens to carry fleet-wide destructive permissions (#2485), which
+is the actual gap D4's effective-authority model, applied to engine grants, would close.
+Delegation/attenuation per ADR-1005 §5 remains design-only.
+
+### D8 -- `can-i` and every real gate share one Request-free decision core; there is no second implementation to keep in sync
+
+The resolution logic behind `require_permission`'s ladder (elevated -> engine ->
+mcp_tier -> service -> RBAC-enforced -> legacy, per ADR-1006) is extracted into a form callable
+without an `httplib::Request` -- a decision core -- and both the real gate wrappers and any
+"can I do X" endpoint (REST, MCP, or internal) call that same core. This is stronger than "call
+the real ladder": today's `rbac/check` shortcut exists specifically because the ladder is
+presently coupled to `AuthRoutes`' request/response types, so simply asking implementers to
+"use the real ladder" without extracting a shared core invites exactly the second,
+divergent implementation this decision forbids.
+
+*Non-conformance (defect) today:* `POST /api/v1/rbac/check` calls raw `check_permission`
+directly, reproducing none of the toggle-off legacy fallback, JIT elevation (it currently
+returns a false negative for an elevated caller the real gate would admit), engine-principal
+branch, management-group scoping, service-token scoping, or MCP tier ordering. No Request-free
+decision core exists to extract from yet.
+
+### D9 -- Every authorization decision emits one structured, queryable record, and a record that cannot be written fails the request closed
+
+Every gate's admit/deny/degrade decision -- across `authorize_list_read`, `require_fleet_read`,
+`require_scoped_permission`, `require_permission`, and the service-scope and MCP-tier branches
+-- emits one shared decision shape: axis (management-group / service-scope / RBAC-legacy /
+engine), outcome (admit-all / admit-scoped / deny / degrade), and a reason drawn from a closed
+taxonomy, to both the audit log (with correlation id) and a Prometheus counter. Per-gate bespoke
+logging that cannot be aggregated is non-conforming. Consistent with the codebase's existing
+audit-failure posture (ADR-0033 §9, mutations fail closed on audit-write failure): **a mutating
+authorization decision whose record cannot be durably written is itself denied, not admitted
+with a missing record.**
+
+**Correction (adversarial review, 2026-09-02): the read-only half of this decision, as originally
+written, overrode an accepted ADR's existing per-surface posture rather than preserving it.**
+ADR-0033 §9 does not say all reads degrade to observability-only on audit-write failure -- its
+table entry for reads is "keep the surface's existing posture (`rest_audit.hpp`): REST
+behavioural-PII fails closed with `Sec-Audit-Failed`; dashboard HTML and MCP set-and-proceed."
+`rest_audit.hpp` implements exactly that split today: HTML fragments proceed (a transient audit
+hiccup must not blank an operator's dashboard), REST JSON integrations reading behavioural-PII
+data fail closed with a 503, specifically so a downstream CMDB integration never records
+evidence-less PII as audited. A uniform "read failure degrades observability, not the decision"
+rule, applied literally, would make a REST JSON behavioural-PII read proceed on an audit-write
+failure -- the exact regression `rest_audit.hpp`'s existing design exists to prevent. **D9's
+read-only clause is corrected to: a read-only authorization *decision* record (the new schema
+this decision defines) failing to write degrades observability and is itself counted, but this
+does NOT touch or override the existing, accepted per-surface posture for behavioural-data audit
+records** -- REST behavioural-PII reads keep failing closed via `rest_audit.hpp`'s established
+mechanism regardless of what this decision's own authorization-decision telemetry does. The two
+audit concerns (a gate's admit/deny/degrade decision record, and a behavioural-data access
+record) are related but distinct, and this decision governs only the former.
+
+**This decision needs an explicit operational-cost design, not just a schema (second Sol
+review).** Durably recording every admitted read authorization decision, not only denials, can
+be substantial write volume on a busy fleet. Whatever implements D9 must specify batching,
+bounded queues, and low-cardinality Prometheus label sets up front, and decide explicitly
+whether admitted reads are sampled rather than recorded at 100% -- silently discovering this
+under load in production is not an acceptable way to make that call.
+
+A decision engine built to D8 is expected to expose its winning grant/deny and reason as a
+normal return value; an "explain this decision" surface (effective-permissions view, a
+dry-run simulator) is a direct consumer of D8 plus this decision's closed reason taxonomy, not a
+separate mechanism requiring its own architectural decision.
+
+*Non-conformance today:* audit logging exists per-gate but is not uniform, and most gate callers
+already ignore the audit helper's own success/failure return today -- **correction (second Sol
+review): the fail-closed-on-audit-failure requirement is not merely prospective with nothing yet
+to violate.** Fire-and-forget audit writes already happen on every existing gate; a store
+outage today already produces exactly the silently-non-durable-record failure mode D9 forbids,
+even though the unified decision-record schema itself doesn't exist yet. A management-group
+confinement axis counter does not exist (ADR-0017's own INV-9 already calls for this and it has
+not shipped, only the service-scope and RBAC-degrade axes have one today); a known audit
+argument-order bug exists (#3219); denied and degraded outcomes are not always distinguishable
+in the audit record -- confirmed concretely: `authz_gates.cpp`'s store-unavailable path returns
+a 503-degraded gate result while auditing it as `"denied"` (#3739/#3256 track this class).
+*Not yet built:* the unified record schema, the missing counter axis, and the effective-
+permissions view and simulator this decision's engine would enable.
+
+### D10 -- Time-bound, scoped grants are a distinct RBAC primitive from session elevation
+
+A grant may carry a validity window (`valid_from`/`valid_until`) enforced at the D3 chokepoint on
+every read of that grant, independent of the existing JIT session-elevation mechanism. JIT
+elevation promotes a session to full admin temporarily; it is neither role-specific nor
+scope-specific and must not be credited as satisfying this decision.
+
+Any cache that memoizes a decision keyed on a validity window or on the D4 effective-authority
+computation is bound by the existing invalidation rule this codebase has already stated twice
+(ADR-0033 §3; ADR-0017 INV-8): no such cache may key on an input unless every path that shrinks
+that input invalidates it. This decision does not introduce a new invalidation mechanism; it
+inherits the existing one and must not skip it.
+
+*Not yet built* (not a defect -- this capability has never existed): only JIT-to-admin exists;
+no assignment record carries a validity window. Access-review's `flagged_revoke` intentionally
+records evidence only and does not itself revoke -- that is existing, correct policy and is
+unaffected by this decision.
+
+### D11 -- Static separation-of-duty is declarative data checked at the D3/D4 chokepoint; dynamic SoD is a separate, unaddressed decision
+
+Mutually-exclusive role pairs (an INCITS 359-style static SoD constraint) are declared as data
+and checked at assignment time by the D3/D4 chokepoint, not a separate validator that can drift
+from the authority model it protects. Dynamic SoD (constraints on simultaneous session
+activation) is a distinct, currently unaddressed decision, explicitly out of scope here.
+
+*Not yet built* (not a defect): no SoD mechanism of either kind exists today.
+
+## Consequences
+
+- **D1 is a correctness and availability defect, independent of everything else here.** It is a
+  class of route that cannot be granted to an ordinary (non-elevated) principal once RBAC is on
+  -- a fail-closed availability gap, not a disclosure. An earlier draft asserted this was
+  unconditionally governance-CRITICAL; the second Sol review correctly pushed back that
+  severity here should be derived through this codebase's own trigger+impact+exposure model
+  when D1 is actually scoped as work, not asserted in the ADR itself.
+- **D1 also retires a second catalogue** (`kRbacSecurables` in `mcp_server.cpp`), not only fixes
+  five missing entries -- collapsing that mirror is part of D1, not a follow-up.
+- **D5's coverage-proof clause changes what "PR-C/PR-E are done" means.** ADR-0017's existing
+  ladder is not re-decided, but conformance with this document requires the CI coverage check in
+  D5, not just "the callers were migrated."
+- **D3 does not mandate merging `principal_roles` and `management_group_roles` into one table.**
+  It mandates one validation chokepoint and one API-facing record shape. Table layout is
+  implementation, not architecture, and is left to the store playbook.
+- **D3 explicitly declines to add assignment-level deny.** A future decision that wants one must
+  extend the frozen #1715 resolver with its own precedence rule -- this document does not do
+  that implicitly via an unexamined `effect` field.
+- **D6 is compliance with ADR-0032 Decision 7 for Schedules, and this document's own extension of
+  the same mechanism to Guardian, decided directly rather than argued as a forced reading of
+  existing text.** Anyone implementing D6 should still check the credential-recheck mechanics
+  against Decision 7's actual text, not just this document's summary of it -- not because the
+  decision is in question, but because it is genuinely new construction and the usual review a
+  new mechanism gets before it ships.
+- **D4 defaults to "grantor must currently hold what they grant," computed as a delta that must
+  also catch authority that widens after the grant with no new assignment event** -- not just
+  escalation visible at grant time. A `Grant` administrative-permission model is not adopted as
+  the default but is left open as a future, separately-bounded primitive -- see Rejected
+  Alternatives.
+- **D7 is not a standalone mechanism.** Anyone implementing management-group-scoped engine
+  assignments is implementing D3 and D5 for a third principal type, not a fourth mechanism.
+- **D9's fail-closed clause means a mutating gate now has a new failure mode** (audit-write
+  failure denies the mutation) that must be load-tested and alerted on, the same way any other
+  fail-closed audit path in this codebase already is.
+- **The open model decisions (#2665 additive-vs-deny-precedence for admitted runs; #2670/#2677
+  derived-state confinement) are not resolved by this document** and are referenced, not
+  restated.
+
+## Rejected alternatives
+
+- **A `Grant` administrative permission (ADR-0033 §8's approve-without-holding model, applied to
+  role assignment), as the DEFAULT for D3/D4.** Rejected as the default, with a correction from
+  the second Sol review: an earlier draft called this shape "inherently a direct escalation
+  path," which is too categorical -- a bounded grant-administrator role (constrained by an
+  explicit, closed list of grantable roles/scopes, with its own ceiling, possibly requiring
+  four-eyes) is a legitimate delegated-administration model in principle, the same way `Approve`
+  is legitimate for approvals. The rejection is narrower: it is not the *correct default* for
+  ordinary assignment, because an approval gates one already-scoped action while a grant creates
+  open-ended standing authority for someone else, and defaulting to "administer without holding"
+  for the latter is a materially larger blast radius than for the former. `Grant` remains
+  available as a future, separately-decided, explicitly-bounded primitive layered on top of the
+  D4 default -- not adopted as the default itself.
+- **Merging the three confinement mechanisms in D5 into one, or requiring every route to reach
+  only one of them.** Rejected on two grounds, one directly decided and one by analogy (kept
+  distinct per the second Sol review): ADR-1006 Decision 2 directly and explicitly rejected
+  merging `require_list_read` and `require_fleet_read`, because they answer different questions.
+  Extending that reasoning to the third, dispatch-fan-out mechanism, and to the "at least the
+  applicable ones, not exactly one" framing D5 uses, is this document's own architectural
+  judgment by analogy, not something ADR-1006 itself decided -- stated as such rather than
+  implied to carry ADR-1006's own authority. Three named, coverage-proven mechanisms, applied in
+  whatever combination a given route's shape genuinely needs, are the target; a fourth, unifying
+  abstraction is not.
+- **Claiming ADR-0032 Decision 7 already covers Guardian by its own text.** Rejected: Decision 7
+  names Schedules and excludes only the autonomous-sync-identity case; Guardian's continuous rule
+  distribution is neither, so the text does not reach that far on its own. Asserting otherwise
+  would have made an unfalsifiable claim about what an accepted ADR requires, rather than the
+  honest one -- that applying the same mechanism to Guardian is a good idea this document adopts
+  on its own authority.
+- **Leaving the Guardian question open pending a future maintainer decision.** Rejected: the
+  underlying facts (what mechanism to reuse, why it fits Guardian's problem shape) do not change
+  by waiting, and this document's own frontmatter already grants Dave the authority to decide it.
+  A maintainer or architect reviewing this document later is still free to push back on the
+  reasoning -- that is what review is for -- but the document does not withhold a position in the
+  meantime.
+- **Row-wise "grantor holds this exact permission" as the no-escalation check.** Rejected in
+  favor of D4's effective-authority-delta comparison, because the codebase has already frozen an
+  additive (not deny-precedence) cross-boundary lattice (#1715); a row check cannot correctly
+  reason about what a grant actually changes under that lattice.
+- **Treating JIT session elevation as satisfying D10.** Rejected: JIT elevation is a temporary
+  full-admin promotion, neither role- nor scope-specific; conflating the two would let the
+  codebase claim a capability it does not have.
+- **Building ABAC conditions, a policy simulator, or least-privilege recommendations now.**
+  Rejected as premature -- each depends on D1-D9 holding first. Revisit under ADR-0033 §5's own
+  stated trigger pattern for when its future auto-approval policy layer is built, not before.
+- **Sequencing all of D2/D3/D4 (administration) to completion before any of D5/D6 (confinement),
+  or the reverse.** Rejected on both sides, with a correction to an earlier draft's reasoning:
+  the claim that an operable-but-underconfined RBAC is unconditionally "a worse state" than an
+  inoperable one is **overstated**. ADR-0017's admit-then-filter design means a confined operator
+  hitting an unmigrated route is denied (403), not over-disclosed -- the residual risk from
+  under-migration is a bounded, enumerable class of genuine over-disclosure (the #3489 pattern:
+  a caller with a *different* global grant plus a confined `Response:Read` reaching out-of-scope
+  agents through an unscoped facet or count-oracle query such as `/api/scope/estimate`), not a
+  blanket "anything unmigrated leaks." The stronger argument for running D1/D2 early rather than
+  after D5 completes is that ADR-0017's own INV-9 ("the filter path is exercised and observable")
+  cannot be verified in production without a confined operator existing at all, and only D2/D3
+  create one. **D1 is not parallel to anything -- it is a precondition for a working enable path
+  and should land as its own blocking change ahead of D2.** D2-D5 and D7-D11 otherwise proceed as
+  independently governed workstreams (D6 held out separately -- see below), gated jointly by
+  concrete, testable criteria before RBAC is described as production-supported: the D1 catalogue
+  contract test passing, the D5 coverage proof passing, the enumerated #3489-class routes closed,
+  and the ADR-0017 confined-operator (`opA`) UAT passing. "Both tracks feel done" is not a
+  criterion; those four checks are. **D6 is excluded from this list on purpose** -- it is decided
+  but, unlike the other decisions in this joint gate, describes a mechanism that does not exist
+  in code at all yet (per D6's own "Current state"), so it has no work-in-progress to gate on
+  today. It is not gate-independent forever, though: `adopt_baseline`'s authorization check is
+  explicitly "per D4" (D6 sub-clause 3), so D6's own implementation cannot ship correctly ahead
+  of D4's effective-authority-delta mechanism landing -- a real dependency, not a coincidence of
+  timing, and D6's implementers should treat D4 as a prerequisite even though D6 sits outside
+  this joint gate.
+
+## Governance
+
+Not run through `/governance`. Review history so far:
+
+1. **Codex (Sol, `gpt-5.6-sol`), read-only opine, 2026-09-02.** Reviewed an earlier
+   delivery-plan-shaped draft. Corrected several overclaims (call-site counts, a claim that the
+   scheduler was still unconfined when #3133 had already fixed it, a stale issue reference to
+   #2809 which was already fixed under #2703) and surfaced the D1 catalogue defect, independently
+   verified. Recommended parallel administration/confinement tracks over strict sequencing.
+2. **Fable (Claude, architect-agent review), read-only, 2026-09-02.** Reviewed this ADR-shaped
+   draft independently, without seeing Sol's review. Corrected further overclaims (D1's "no
+   contract test exists" -- three partial ones do, plus an unremarked second catalogue mirror;
+   D5's restatement of an already-decided ADR-0017 invariant as if new; D6's "unfiltered by
+   default" mischaracterization of an already-declared-but-unrooted dispatch). More
+   significantly, found that **D6 as originally written directly conflicted with ADR-0033 §7 and
+   ADR-0032's already-accepted "no unrooted system principal" rule**, and that **D4 silently
+   picked an administrative model in tension with ADR-0033 §8's approval model** without
+   reconciling the two. Both are folded into the current text. Verdict: not ready to propose
+   until (a) D6's reconciliation is itself reviewed as a potential ADR-0033 amendment rather than
+   asserted here, and (b) a maintainer/architect signs off on D3's explicit no-new-lattice-rule
+   stance and D4's rejection of the `Grant` alternative.
+
+3. **Codex (Sol, `gpt-5.6-sol`), read-only opine, round 2, 2026-09-02.** Given the specific task
+   of adversarially cross-checking round 2's Fable-driven rewrite, not just the document.
+   Independently re-read ADR-0033 §7/§8 and ADR-0032's actual text and found the round-2
+   rewrite of D6 had overextended it: §7's human-root resolution is textually scoped to
+   four-eyes ("must never be reused as a general identity-collapsing rule") and ADR-0032 governs
+   UCE runs specifically, neither of which cleanly covers Guardian's rule push. Traced Guardian
+   push's actual code path and found it aggregates rules from every currently-deployed Baseline
+   before dispatch (`filter_deployed_members` over `deployed_member_rule_ids()`), meaning a
+   single push can represent multiple deployers with independently-changing authority -- a
+   problem round 2's "resolve to the deploying operator" framing had no answer for. Also caught
+   a real arithmetic error (the document claimed nine decisions while containing D1-D11, and its
+   sequencing criteria silently dropped D10/D11), an overclaimed unconditional CRITICAL severity
+   on D1, an overclaimed "inherently an escalation path" characterization of the rejected
+   `Grant` alternative, a gap in D4 around authority that widens *after* grant time with no new
+   assignment event, and a missing operational-cost/audit-write-volume requirement in D9. All
+   folded into the current text; D6 is now framed as an explicit, only-partially-decided
+   extension to ADR-0033 with named open sub-decisions, not as an implementation of an
+   already-settled rule.
+
+The pattern across all three rounds is worth naming: each successive review found the *previous*
+review's correction had itself gone slightly too far in one direction (round 1 found overclaims
+in the original draft; round 2 found round 1 had under-corrected in places and over-corrected
+in others; round 3 found round 2's own correction had overextended its source citations). This
+is not evidence the process is unstable -- it is evidence that a single-pass review, however
+good, should not be the last word on a document this dense with cross-ADR claims. At this point
+in the document's history (three rounds in), this was read as grounds for treating D6 as needing
+a heightened, D6-specific maintainer decision before proceeding; entries 8 and 10 below found
+concrete, code-level defects three more rounds later, which is the actual reason repeated review
+mattered here, not a standing rule that D6 carries a higher bar than any other decision in this
+document -- see the closing paragraph below, which states the ordinary bar once the mechanism has
+substantive content to review, and Governance entry 11 for what changed since this framing.
+
+4. **Dave, 2026-09-02.** Decided D6 sub-clause 3 (Guardian's multi-baseline authority problem):
+   an orphaned Baseline is surfaced loudly and resolved by an explicit, audited
+   `adopt_baseline` hand-off to a currently-authorized operator -- never a silent drop, a
+   fleet-wide push failure, or indefinite unrooted enforcement. Folded into D6 above, including
+   the consequence that push construction must resolve each Baseline's root individually rather
+   than continuing to union all deployed rules into one undifferentiated `system=true` dispatch.
+5. **Dave, 2026-09-02.** Decided D6 sub-clause 5 (extending the same shape to scheduled dispatch
+   and policy remediation) as an explicit non-uniform extension: schedules get the same
+   orphan/surface/`adopt_schedule` shape as Baselines, since `Schedule.created_by` is already a
+   stored, aging root the runner already partially re-checks (#3133); policy remediation does
+   not, because remediation is operator-gated only and `Policy` carries no author field to orphan
+   in the first place -- its fix is threading the live requesting operator's identity and
+   credential through to dispatch, per sub-clause 4, not an adoption mechanism. Folded into D6.
+6. **Dave, 2026-09-02.** Decided D6 sub-clauses 1, 2, and 6 in one round: (1) the "effect" D6
+   binds for an always-on, disconnection-tolerant dispatcher is the point of distribution (the
+   push), not each later moment of on-device enforcement, because push time is the only point a
+   live authorization decision is architecturally possible; (2) the per-dispatch-class root
+   table is settled for the four classes already decided, plus a default rule for every other
+   `system_reserved` capability (root to whoever created the record being acted on, re-checked
+   at dispatch, unless formally found to have none) -- applying that default, preflight needs no
+   root at all (already read-only by design) and quarantine reconciliation's conformance is
+   flagged unverified, not asserted; (6) no institutional-controller exception is granted to
+   anything examined in this document, and any future one must meet the existing break-glass
+   precedent's bar (narrow, individually reviewed, mandatorily audited, no gate skipped for
+   being called an exception) rather than defaulting to a bare `system=true` flag. Folded into
+   D6. **This left D6 with exactly one open item: sub-clause 4, credential recheck.**
+7. **Dave, 2026-09-02.** Decided D6 sub-clause 4, the last one: "credential recheck" splits into
+   two non-interchangeable mechanisms rather than one rule applied uniformly, because a live
+   credential to recheck only exists for some dispatch classes. For live, human-present dispatch
+   (policy remediation, any future "act now" flow), it means exactly ADR-0033 §8's model: the
+   live session/token on the current request is checked, which sub-clause 5's fix for
+   remediation already threads through. For durable dispatch with no live credential by design
+   (Guardian push, Schedule fire, potentially months after the arming/deploying session ended),
+   applying §8 literally would be a category error -- instead it means checking that the root
+   principal's *account* is currently live and authenticatable (not deprovisioned, not
+   deleted, not locked out), verifiable today via `AuthDB::user_exists`'s existing "active only"
+   contract and `locked_until`, as a check independent of and additional to the current-RBAC-
+   authority check sub-clauses 2/3/5 already require -- a principal can hold a fully valid role
+   grant while their account is disabled, and D6 must not treat the grant lookup alone as proof
+   the account behind it still exists. **All six of D6's sub-clauses are now decided. D6 is
+   complete in substance; what remains is implementation and the sign-off below.**
+
+8. **Fable (Claude, architect-agent review), read-only, final pass, 2026-09-02.** A different
+   Fable instance than round 2, with no memory of it, reviewing fresh against a clean worktree
+   checked out at the then-current `origin/dev` tip (code had moved since round 2/3 -- new
+   commits touched `schedule_runner.cpp` and `server.cpp`, verified not to affect any cited
+   mechanism). Explicitly instructed not to assume five prior rounds of correction made the
+   document safe by construction. Confirmed D1-D5 and D7-D11 hold up completely on fresh
+   verification -- every load-bearing code citation checked out. Found D6 had three real
+   problems surviving all four prior rounds: (1) sub-clause 3 was **self-contradictory** --
+   "continues to be pushed and enforced unchanged" and "excluded from that push cycle's rule
+   set" cannot both be true once checked against Guardian's actual full-sync mechanism, where
+   exclusion from a distributed rule set **is** disarming it on the agent; (2) Guardian
+   distribution is event-driven, not a periodic "push cycle" as sub-clauses 1 and 3 assumed --
+   a factual error, not a framing quibble; (3) most seriously, sub-clause 4's account-liveness
+   answer to credential recheck **conflicts with ADR-0032 Decision 7 as imported by ADR-0033's
+   general (not merely four-eyes-scoped) text** -- an accepted ADR this document's own
+   frontmatter says it must compose with, not re-decide, and round 2/3's UCE-scoping objection
+   answered a narrower question than the one it was used to settle. Also found: `Schedule`
+   already has an account-existence check the document had credited as unbuilt (W2); quarantine
+   reconciliation does NOT conform, reversing an earlier round's opposite-direction hedge (W3);
+   a shared-Guard-rule gap (a Guard armed by multiple Baselines has no stated outcome when only
+   some are orphaned); a re-evaluation-trigger gap (nothing ties an authority/credential change
+   to a Guardian distribution event, so "paused" could mean "paused whenever something unrelated
+   happens to trigger distribution"); and a live security critique -- using account lockout as a
+   liveness signal is a spray-to-disarm vector, since lockout is an attacker-triggerable,
+   temporary throttle against a known username, not an account-validity fact. Verdict: not ready
+   for maintainer sign-off, another round scoped to D6 specifically.
+9. **Dave, 2026-09-02.** Decided all three open questions from the final Fable review in one
+   round, each reversing or substantially revising a prior decision: (a) sub-clause 4 now
+   follows ADR-0032 Decision 7 -- record the arming credential (not just the human) on Baseline
+   deploy and Schedule arm, stop enforcement on that credential's revocation/expiry/deletion,
+   and handle routine token rotation via an explicit, lighter-weight **rebind** action distinct
+   from full adoption; (b) sub-clause 3's orphan mechanics now honestly state that orphaning
+   **pauses** enforcement (loudly, audited, immediately adoptable) rather than the
+   self-contradictory "continues unchanged" claim, accepting that a paused-and-alarmed control
+   is the correct trade-off given the mechanism Guardian actually has; (c) account-liveness
+   checks, where they still apply, explicitly **exclude** `locked_until` -- lockout is a
+   temporary, attacker-triggerable throttle, not a liveness fact, and folding it in would let
+   anyone who learns a deployer's or armer's username deliberately disarm their Baselines or
+   Schedules by spraying wrong passwords at their account. All three folded into D6 above,
+   along with the shared-Guard-rule and periodic-re-evaluation-sweep additions the corrected
+   mechanics required, and the quarantine-reconciliation and schedule-liveness factual
+   corrections.
+
+D6 was decided in substance across all six sub-clauses at this point, corrected twice by
+external review after Dave's own decisions (rounds 4-7) were themselves found to need revision
+by round 8 -- a pattern this document took as evidence that no single round of review, including
+its own most recent one, should be treated as the last word. Two more rounds followed this one
+(10, 11) and found further, code-level corrections -- see those entries and the closing paragraph
+below for the actual current state, which does not carry a special "D6 needs more than the
+ordinary review" rule going forward.
+
+10. **Adversarial review (Kimi K2.7 + Codex GPT-5.5, two-phase independent review +
+    cross-examination + synthesis), read-only, static, 2026-09-02.** Run against a fresh
+    `origin/dev` checkout (`bd387afecf8e175f4234fa7e6f3412ac1f8a6b4a`) with the full document as
+    the review target -- no diff exists, so this graded the document against the codebase and
+    against its cited ADRs directly, not a code change. Both reviewers independently reached
+    BLOCK in Phase 1 and held BLOCK through Phase 2 cross-examination, on largely overlapping
+    grounds. Confirmed findings, adjudicated by the synthesizer against the actual code/ADR text
+    (not just accepted from either reviewer): **(a)** D9's read-only audit-failure clause, as
+    written, overrode ADR-0033 §9's accepted per-surface posture (REST behavioural-PII reads
+    fail closed via `rest_audit.hpp`, not merely "degrade observability") -- fixed to scope D9's
+    rule to the new authorization-decision record only, explicitly preserving the existing
+    behavioural-audit posture untouched. **(b)** D6 wrongly listed "the capture-source push" as
+    an unexamined `system_reserved`-class dispatcher, in three places, contradicting D6's own
+    "direct human action is already rooted" text -- the route is in fact already a settled,
+    correctly-rooted direct-human dispatch; removed from all three. **(c)** D5's "nine bare-gated
+    routes" count was not reproducible by either reviewer (both independently found 7, with
+    slightly different specific routes, and found that two of the "six unmigrated modules" use a
+    legacy scoped provider rather than being bare-gated) -- corrected to not assert a hand-counted
+    number the document's own coverage-proving test exists to make authoritative instead. **(d)**
+    D6 misnamed Guardian's dispatch closure as the same one policy remediation and quarantine
+    reconciliation use (`command_dispatch_fn`) -- Guardian actually uses a distinct path
+    (`send_system_reserved`); corrected while preserving the underlying true claim that all three
+    are equally system-rooted. **(e)** D6 sub-clause 4's account-liveness clause claimed
+    credential validity "subsumes" account deprovisioning -- `ApiTokenStore::validate_token`
+    checks only token revocation/expiry with no join to account-active status, so this was an
+    unverified assumption, not a fact; corrected to require both checks independently. **(f)**
+    the ADR-0032 Decision 7 framing was adjudicated directly against Decision 7's own text
+    (synthesizer read it fresh rather than trusting either reviewer): Decision 7 unambiguously
+    covers Schedules by name; it does not, on its own text, cover Guardian, which is neither an
+    "operator-facing run" nor the excluded "autonomous-sync identity" case -- corrected to state
+    this as this document's own extension-by-analogy for Guardian specifically, not a directly
+    dictated consequence of existing text, matching what the disagreement between the two
+    reviewers on this exact point (one held it, one withdrew it) already signaled was genuinely
+    unsettled rather than a plain misreading either could resolve alone. **(g)** the quoted
+    `TEST_CASE` count was stale (663 claimed, 571 reproduced) -- replaced with the reproducible
+    command instead of a number that will drift again. All findings were text/citation
+    corrections; none required a new architectural decision beyond what rounds 4-9 already made.
+    D1-D4, D7, D8, D10, D11 were reverified and confirmed accurate with no changes needed.
+
+11. **Dave, 2026-09-02.** Reworked D6's own text to drop the round-by-round "was this already
+    decided by an existing ADR" narrative from the normative decision (preserved above in this
+    Governance section instead, entries 1-10) and to state the Guardian credential-recheck
+    extension as an owned decision on this document's own authority, not as a claim about what
+    ADR-0032/0033's text already requires. Directed this rework and confirmed the document ships
+    as one document, not split into a settled half (D1-D5, D7-D11) and a held-back half (D6).
+
+12. **Fable (Claude, architect-agent review), read-only, sixth review, 2026-09-02.** A third
+    Fable instance, no memory of rounds 2 or 8, reviewing the reworked D6 fresh against another
+    clean worktree at the then-current `origin/dev` tip. Explicitly asked whether the rework's
+    confident "owned decision" framing actually resolved the underlying instability or just
+    relocated it. Verdict on the reframing itself: it works -- D6's mechanism is at least as
+    strict as any reading of ADR-0033 §1/§7 could require, so "compliance vs. extension" has no
+    normative consequence either way, and stating it as an owned decision is the honest position.
+    But the review found the rework had moved D6's confidence off the ADR-text argument and onto
+    two new, unverified mechanical premises, both of which turned out to be wrong on this
+    worktree -- the most consequential findings across all six review rounds: **(a)** sub-clause
+    3's claim that "every distribution event is a full sync" is false -- Guardian's push endpoint
+    has an incremental (`full_sync=false`, the default) mode that does not wipe prior rules; only
+    Baseline deploy/undeploy and the heartbeat reconcile are hardcoded full-sync, and the periodic
+    re-evaluation sweep sub-clause 3 requires must itself trigger a full-sync distribution or it
+    enforces nothing. **(b)** sub-clause 4's "record the session or API token id" would have
+    auto-orphaned every dashboard-deployed Baseline within a single 8-hour session lifetime,
+    since a `Session` carries no durable credential identity and `kSessionDuration` is an absolute
+    cap -- a design gap serious enough that, taken literally, it would have made the mechanism
+    nearly unusable for the common case of an operator deploying via the dashboard rather than an
+    API token. Also found and independently verified: the quarantine reconciler's dispatch
+    function is a plain no-caller shape, not "caller-typed in signature" as an earlier draft
+    claimed; the "vacuous... under-specified" quote belongs to ADR-0032 Decision 0's corollary,
+    not Decision 7's own text; `yuzu_schedule_arming_denied_total` is emitted by `arming_check`,
+    not `resolve_caller`; `tar.fleet_snapshot` and `asset_tags.sync` were wrongly flagged as
+    having no findable root (the first is already excluded as read-only, the second already has a
+    live-session root); `adopt_baseline`'s authorization depends on D4, which the sequencing
+    section's "D6 has no work-in-progress to gate on" did not acknowledge; and two places where
+    the document's own history read as claiming D6 needs a permanently heightened review bar,
+    which the rest of the document does not actually assert. Every finding was verified directly
+    against this session's own reads of the code and of ADR-0032 Decision 7's and ADR-0033's text
+    before being accepted, not taken on the reviewer's word. All folded into D6 and this
+    Governance section above. D1-D5, D7-D11 held with no changes needed. Verdict: not ready
+    without this round's fixes; ready once they land, which they now have.
+
+Before this is proposed as a real, numbered ADR (Dave's `1xxx` block per the numbering note in
+`docs/adr/README.md`): a `security-guardian` + `architect` review given the subject matter, and
+the standard governance pipeline once an implementation PR ladder is opened against it -- the same
+gates every accepted architecture decision in this codebase goes through, not a heightened bar
+specific to this document. D6's implementers should read ADR-0032 Decision 7's text directly
+before building the Guardian mechanism, the same way any implementer reads the ADR they are
+building a novel extension of, but that is ordinary diligence, not a precondition on the decision
+itself. Given how much of D6's mechanics were still wrong through six rounds of review, whoever
+picks up its implementation should re-verify sub-clauses 3 and 4 against the code one more time
+before writing to them, rather than trusting this document's citations as a substitute for that
+read.
