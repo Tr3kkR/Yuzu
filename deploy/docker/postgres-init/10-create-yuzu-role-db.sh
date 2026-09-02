@@ -56,10 +56,12 @@ fi
 # container processes (F7/#3859) — environ is owner-only, argv is not.
 # -X/--no-psqlrc: \getenv keeps the password out of the ECHOED INPUT LINE,
 # but \gexec separately echoes the fully-substituted query text under an
-# active ECHO setting — so a .psqlrc under this role's $HOME (the same
-# /var/lib/postgresql this image tells operators to mount a volume at)
-# setting `\set ECHO all` would still print the password via \gexec's echo,
-# same disclosure class as the native script's -X fix (gov Gate 4, #3859).
+# active ECHO setting — so a .psqlrc under the postgres OS user's $HOME
+# (the same /var/lib/postgresql this image tells operators to mount a
+# volume at) setting `\set ECHO all` would still print the password via
+# \gexec's echo, same disclosure class as the native script's -X fix
+# (gov Gate 4, #3859). Any FUTURE psql call in this file that ever
+# handles a secret needs -X too — it is per-invocation, not file-wide.
 psql -X -v ON_ERROR_STOP=1 \
      -v yuzu_user="${YUZU_DB_USER}" \
      -v yuzu_db="${YUZU_DB_NAME}" \
