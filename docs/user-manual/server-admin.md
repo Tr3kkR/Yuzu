@@ -3124,11 +3124,12 @@ IP fallback has two consequences worth planning for:
 - The per-peer bound therefore scales with a caller's address space, which is why
   `--ota-max-concurrent-total` exists as a flat ceiling.
 
-**Metrics to watch, and what each one means.** The Prometheus alert RULES for
-these bounds ship separately, because their thresholds are claims about fleet
-behaviour that want tuning against real fleet data rather than guessing — see the
-tracking issue. The metrics below are emitted from this release onward, so you
-can chart them and set your own thresholds in the meantime.
+**Metrics to watch, and what each one means.** These are the raw signals; the
+`yuzu-ota` alert group in `docs/prometheus/yuzu-alerts.yml` pages on them, and
+each alert's own annotations record what its threshold was chosen against and
+where it is known to be blind. Chart these directly if you want to set thresholds
+of your own — the shipped ones are reasoned starting points, not fleet-validated
+numbers.
 
 | Metric | What a rising value means | First action |
 |---|---|---|
@@ -3139,6 +3140,18 @@ can chart them and set your own thresholds in the meantime.
 | `yuzu_ota_download_peers_evicted_total` | `--ota-max-peers-tracked` is at or below the live key count, which silently disables the rate dimension — an evicted key is re-minted with a full burst. | Raise it above your expected distinct-key count. |
 | `yuzu_ota_download_peers_tracked / yuzu_ota_download_peers_capacity` | The admission map is approaching its ceiling. | Same action. Note the map never shrinks in-process, so this stays high until restart. |
 | `yuzu_ota_download_refund_total` vs `yuzu_ota_download_deadline_exceeded_total` | Deadline aborts outrunning refunds is a regression in the refund wiring, not a tuning problem. | Check the deadline branches in `agent_service_impl.cpp`. |
+
+**Alert responses.**
+
+| Alert | What it means | First action |
+|---|---|---|
+| `YuzuOtaConcurrencyRejections` | A peer is repeatedly refused for holding too many parallel transfers. | Find the peer in the server log — the rejection line carries `key=` and `mode=`. **That line is sampled 1-in-100** (the first always logs, then every hundredth, on a counter shared with the server-wide rejections), so a short burst may leave one line or none; the counter is the complete record and the log is for attribution only. There is deliberately no audit row for admission rejections. |
+| `YuzuOtaServerCapacityRejections` | The server-wide ceiling is saturated, so agents are refused regardless of their own per-peer budget. | Two very different causes look identical in the metric. The rejection log's `cert_keyed=` field is the discriminator — but **read it carefully: `cert_keyed` means "presented a certificate this listener accepted", not "is an enrolled Yuzu agent"** (see #3828). On a multi-CA trust bundle a peer holding a certificate from any other CA in that bundle also reads as `cert_keyed=true`, so it does not by itself distinguish a rollout from an attack. That line is also sampled 1-in-100, so correlate with `yuzu_ota_admission_key_mode_total` when it is thin. All-`true` on an enrolled-only trust root means a genuine rollout wants more concurrency: raise `--ota-max-concurrent-total`, sizing roughly as `devices x transfer_seconds / rollout_seconds`. `false` concentrated on a few addresses is a denial attempt against the shared ceiling, which `--ota-cert-reserve-pct` exists to bound. |
+| `YuzuOtaIdentityRejections` | A peer presented no usable certificate, one from a foreign CA, or an `agent_id` that does not match it. | Check the `reason` label first — this counter is complete. Then the `session.ota_identity_rejected` audit rows for attribution, bearing in mind **two** reasons they under-count: `no_client_identity` is metric-only and writes none, and the row is rate-limited to ~2/s per (peer, RPC, reason). `yuzu_ota_identity_audit_suppressed_total` counts what was dropped. Never read row volume as rejection volume. |
+| `YuzuOtaTransfersAborting` | Transfers are hitting a deadline. **This is the silent-outage detector**: every aborted transfer refunds its rate token, so no bucket drains and every other dashboard stays green while the fleet stops updating. | Check the `phase` label. `transfer` usually means `--ota-transfer-deadline-secs` is below `artifact_size / link_throughput` for that fleet — raise it. The rule fires on a PROPORTION of transfers aborting, not a count, because agents check only every six hours and any fixed count goes blind below some fleet size. Its own annotation records the residual blind spot: a fleet where under ~10% of devices fail permanently sits below the bar. |
+| `YuzuOtaPeerMapEvicting` | `--ota-max-peers-tracked` is at or below the live key count, which silently disables the rate dimension — an evicted key is re-minted with a full burst. | Raise it above your expected distinct-key count. Note the floor: values below 1024 are raised at startup, so the effective ceiling may not be what you set. |
+| `YuzuOtaPeerMapNearCapacity` | The admission map is above 80% of its ceiling. | Same action. The map never shrinks in-process, so this stays firing until restart. |
+| `YuzuOtaRefundDivergence` | Deadline aborts are outrunning refunds — a regression in the refund wiring, not a tuning problem. | Check the deadline branches in `agent_service_impl.cpp`. The rule detects a dropped call site, not a refund that fails inside `PrincipalQuota::refund`. |
 
 **Known limitation — keep OTA artifacts on local storage.** The per-chunk read of
 the update binary is blocking and cannot be interrupted; the transfer watchdog

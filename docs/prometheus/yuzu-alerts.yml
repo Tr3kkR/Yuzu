@@ -3845,7 +3845,11 @@ groups:
             agent needs. Investigate which identity: correlate with
             yuzu_ota_admission_key_mode_total to see whether admission is
             keyed on certificates or has fallen back to peer IP, and check the
-            server logs, which name the rejected peer. Admission rejections are
+            server logs, which name the rejected peer — but note that line is
+            SAMPLED 1-in-100 (the first always logs, then every hundredth, on a
+            counter shared with the server-wide rejections), so a short burst may
+            leave one line or none. This counter is the complete record; the log
+            is for attribution only. Admission rejections are
             deliberately metric-only and write NO audit row (see
             docs/user-manual/audit-log.md), so do not look for one. A short burst during a
             fleet-wide rollout is benign; a sustained signal is not.
@@ -4014,13 +4018,20 @@ groups:
             identical here and the log line distinguishes them by `cert_keyed`.
             EITHER a fleet-wide rollout genuinely wants more concurrency than the
             ceiling allows — raise it, sizing roughly as
-            `devices x transfer_seconds / rollout_seconds` — OR a small number of
-            source addresses are holding slow transfers to occupy the shared
-            ceiling, which is a denial attempt: IP-keyed peers are confined to the
-            unreserved share (`--ota-cert-reserve-pct`) precisely so they cannot
-            starve enrolled agents, so check whether the refusals carry
-            `cert_keyed=false` and correlate with
-            yuzu_ota_admission_key_mode_total.
+            `devices x transfer_seconds / rollout_seconds` — OR a few source
+            addresses are holding slow transfers to occupy the shared ceiling,
+            which is a denial attempt: IP-keyed peers are confined to the
+            unreserved share (`--ota-cert-reserve-pct`) so they cannot starve
+            enrolled agents.
+
+            The rejection log's `cert_keyed=` field is the discriminator, with two
+            caveats that matter before you act on it. It means "presented a
+            certificate this listener accepted", NOT "is an enrolled Yuzu agent"
+            (#3828) — on a multi-CA trust bundle a certificate from any other CA
+            in that bundle also reads `cert_keyed=true`, so on such a deployment
+            it does not separate a rollout from an attack on its own. And the log
+            line is sampled 1-in-100, so a short burst may leave one line or none.
+            Correlate with yuzu_ota_admission_key_mode_total, which is complete.
 
       - alert: YuzuOtaPeerMapEvicting
         expr: |
