@@ -8817,29 +8817,41 @@ McpServer::HandlerFn McpServer::build_handler(
                             // is withheld by the containment gate before
                             // dispatch, which is a permanent policy denial,
                             // not transient unreachability. #1398 (governance
-                            // Gate 6 enterprise-readiness finding): a THIRD
-                            // cause collapses into this same envelope —
-                            // ExecuteGate::AdminOrApproval/AlwaysApproval
-                            // denying a non-admin, non-ticketed caller at the
-                            // dispatch chokepoint reaches this exact code
-                            // path too (mcp_server.cpp has no
-                            // classify_and_authorize_dispatch call of its own;
-                            // the shared dispatch_fn's internal chokepoint
-                            // denial surfaces as command_id/sent=0, same as
-                            // offline or quarantined). The dispatch closure's
-                            // return carries only (command_id, sent), so this
-                            // handler cannot yet tell any of the three apart;
-                            // naming all three is better than asserting one,
-                            // because an agentic caller that reads only
-                            // "unreachable" retries a permanent denial
-                            // forever. The authoritative answer is the
+                            // Gate 6 enterprise-readiness finding) used to add
+                            // a THIRD cause here — ExecuteGate::AdminOrApproval
+                            // /AlwaysApproval denying a non-admin, non-ticketed
+                            // caller reached this exact code path too, since
+                            // mcp_server.cpp had no classify_and_authorize_
+                            // dispatch call of its own and the shared
+                            // dispatch_fn's internal chokepoint denial
+                            // surfaced as command_id/sent=0, same as offline
+                            // or quarantined. #3687 closes that for the
+                            // ORDINARY case: the pre-dispatch authorization
+                            // dry run above (authorize_dispatch_fn_) now
+                            // denies Unclassified/Ambiguous/AnonymousOperator/
+                            // Forbidden/ApprovalRequired/KillSwitched with a
+                            // discriminated JSON-RPC error BEFORE dispatch_fn
+                            // is ever called, so this code path is no longer
+                            // reached for any of those six reasons on a
+                            // request whose RBAC/approval/kill-switch state
+                            // is unchanged between the dry run and the real
+                            // dispatch a moment later. The message below still
+                            // names approval-required as a POSSIBLE cause
+                            // because that race — state changing in the
+                            // narrow window between the two checks — is not
+                            // eliminated, only made rare; a wider DispatchFn
+                            // return (never landing on this issue — see
+                            // #3687's own scope note) would be needed to
+                            // discriminate it from quarantine/offline
+                            // programmatically even in that residual case.
+                            // The authoritative answer for the common case is
+                            // now the discriminated pre-dispatch error itself;
+                            // for the residual race, it remains the
                             // quarantine.dispatch_denied audit row,
                             // yuzu_server_dispatch_target_rejected_total
                             // {reason="quarantined"}, or
                             // yuzu_server_dispatch_denied_total
-                            // {reason="approval_required"}. A programmatic
-                            // discriminator needs a wider DispatchFn return —
-                            // tracked as a follow-up (#1398 Rung 4 / #3687).
+                            // {reason="approval_required"}.
                             .add("message",
                                  "No agents reached: every target was either unreachable, "
                                  "withheld by the quarantine containment gate, or denied "
