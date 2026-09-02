@@ -1751,6 +1751,18 @@ TEST_CASE("source tripwire: arming_rollback's .fn is assigned before "
     const auto emplace_pos = source.find("arming_keys_.emplace(key, InFlightArm");
     REQUIRE(emplace_pos != std::string::npos);
     CHECK(fn_assign_pos < emplace_pos);
+
+    // Ordering alone isn't the whole property: a future edit could move this guard's
+    // declaration back INSIDE the locked block (reintroducing the pre-#3831 lock-order
+    // hazard the block-scope comment above it warns against) while keeping .fn= textually
+    // before .emplace() - still "passing" the check above. Pin scope too: .fn= must
+    // precede the FIRST std::unique_lock<std::mutex> lk{registry_mu_} in this file (the
+    // one attach_rule's locked block opens with; a second, unrelated one exists later
+    // for the post-io_executor commit and is not what this line finds, since find()
+    // returns the first match).
+    const auto lock_pos = source.find("std::unique_lock<std::mutex> lk{registry_mu_}");
+    REQUIRE(lock_pos != std::string::npos);
+    CHECK(fn_assign_pos < lock_pos);
 }
 
 // ── PR #3821 review (fjarvis): prior_disarm dropped on an early exit ───────────
@@ -2439,6 +2451,14 @@ TEST_CASE("lifecycle_backpressure_drops counts a full audit log without blocking
         rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
 
     CHECK(rt->lifecycle_backpressure_drops() > 0);
+    // #2233 item 7: 5 attaches each drop at capacity (5 rejected "armed" entries), but
+    // the log-once branch (enqueue_lifecycle_locked's own == 1 gate) must fire exactly
+    // ONCE - proving the log-once logic actually gates repeats, not just that it
+    // doesn't crash under repetition. Direct proof via the _for_test observable
+    // (LogCapture cannot see this: guardian_spark_runtime.cpp is compiled into
+    // libyuzu_agent_core.so, and its own doc comment documents the logger-swap not
+    // reliably crossing that shared-library boundary).
+    CHECK(rt->lifecycle_backpressure_log_fires_for_test() == 1);
     // The arm itself still succeeded throughout - the audit trail never blocks
     // the real detection-capability change.
     CHECK(rt->rule_count() == 1);

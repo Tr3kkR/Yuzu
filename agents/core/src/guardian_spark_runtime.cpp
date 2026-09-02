@@ -197,10 +197,10 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // further down) runs OFF both locks in a separate region after that block has
     // already closed. Promoted to function scope - one object spanning both regions -
     // rather than declared at the io_executor_.run() call site (where it used to live):
-    // that placement meant its .fn ASSIGNMENT (a 3-capture closure exceeding libstdc++'s
-    // std::function SBO) ran AFTER arming_keys_.emplace() had already succeeded, so a
-    // bad_alloc during the assignment itself left the guard's fn empty (a no-op on
-    // destruction) with arming_keys_[key] permanently orphaned - every future
+    // that placement meant its .fn ASSIGNMENT (a multi-capture closure exceeding
+    // libstdc++'s std::function SBO) ran AFTER arming_keys_.emplace() had already
+    // succeeded, so a bad_alloc during the assignment itself left the guard's fn empty
+    // (a no-op on destruction) with arming_keys_[key] permanently orphaned - every future
     // attach_rule on that key failed-fast "busy" forever, no self-heal short of a
     // restart. This reopens governance waiver g8b-saf-1 (which accepted that shape as
     // "idiom-wide, not worth a special-case fix"); see #3831.
@@ -1006,10 +1006,22 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
         // at the moment it happened. Log-once-then-count-only (n==1), mirroring
         // drain_log_unlocked's identical shape for send-side losses just below - the
         // counter, not a latch, still tracks every occurrence.
-        if (!accepted && lifecycle_log_.backpressure_drops() == 1)
-            spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
-                        "rule '{}' dropped (further occurrences counted, not logged)",
-                        kind, rule_id);
+        // Firewalled: this whole line is documented (a few lines above) as the LAST
+        // throwing op before the caller's noexcept commit, but spdlog::warn's own fmt
+        // formatting can allocate and throw. A throw here still rolls back cleanly
+        // (stage_pending_locked hasn't run yet, so attach_rule's rollback/
+        // index_add_rollback undo the arm with no phantom staged record) - firewalled
+        // anyway so a logging-only failure can never surprise a future reader of the
+        // "last throwing op" comment above.
+        if (!accepted && lifecycle_log_.backpressure_drops() == 1) {
+            lifecycle_backpressure_log_fires_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
+                            "rule '{}' dropped (further occurrences counted, not logged)",
+                            kind, rule_id);
+            } catch (...) {
+            }
+        }
         stage_pending_locked(std::move(record));                        // noexcept
         return accepted;
     }
@@ -1041,10 +1053,18 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
         // value) - a genuinely different failure, so it must not double-log here. The
         // separate construction try/catch above (agent_id/event_id/OutboxEntry/record
         // build) already returned early on its own throw and never reaches this line.
-        if (!accepted && lifecycle_log_.backpressure_drops() == 1)
-            spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
-                        "rule '{}' dropped (further occurrences counted, not logged)",
-                        kind, rule_id);
+        if (!accepted && lifecycle_log_.backpressure_drops() == 1) {
+            lifecycle_backpressure_log_fires_.fetch_add(1, std::memory_order_relaxed);
+            // Firewalled (see ARM-side twin): a throw here must not fall into this
+            // try's own catch, which returns false and would misreport `accepted`
+            // (already true) as an enqueue rejection.
+            try {
+                spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
+                            "rule '{}' dropped (further occurrences counted, not logged)",
+                            kind, rule_id);
+            } catch (...) {
+            }
+        }
         return accepted;
     } catch (...) {
         return false; // window enqueue failed post-teardown; the durable record already stands
