@@ -30,7 +30,7 @@ issue auto-closing on a partial-scope PR) is tracked separately as **#3849**.
 | Shipped posture today | `prefer_spark=false`: legacy `IGuard` is the sole live *detection/enforcement* path. Spark itself is **not** dormant - `SparkEngine` is constructed and runs observe-only from boot (`agent.cpp:1207/1225-1226`, logging "instantiated OBSERVE-ONLY"), attempting to register all three mechanisms (`:1222-1224`), though registration is platform-gated and silently no-ops off-platform (`spark_mechanism.hpp:25-31`): all three succeed on Windows, only Service succeeds on Linux-with-libsystemd, and none succeed on macOS or Linux without libsystemd. A Guardian consumer (`guardian-spark`) **is** registered with `SparkEngine` at every boot that instantiates it (not under `--spark-disable`, §6, nor after a boot-time construction failure), independent of `prefer_spark_` (`guardian_engine.cpp:1406`) - what's actually absent is any *armed* rule: `reconcile_rule_locked`'s `try_spark = prefer_spark_ && spark_availability_ == Available` gate (`guardian_engine.cpp:1244`) is always false in production, so the registered consumer's handler is never invoked. This is the fact that determines today's blast radius if `prefer_spark_` were ever flipped outside the documented process: the consumer plumbing is already live, so such a flip would take effect immediately with no additional wiring step in the way - not a safety margin. (Three pre-existing code sites - `agent.cpp:1194/1226`, `:3935-3936` - still say "no consumer at rung 1" in comments/log text; that's now stale relative to the corrected claim above, tracked as a separate doc/code drift, not fixed in this PR.) Nothing in this doc describes current production *enforcement* behavior - it is a readiness gate for a future flip (PR-5, not yet written). |
 | Evidence commit | _(placeholder - filled by PR-6, the evidence closeout PR)_ |
 | Sign-off | _(blank - filled by PR-6 once every §2 criterion is green **AND** every §3 row not at a terminal disposition (RULED closed / DONE with no residual / Moved to P3 / Fixed) is itself resolved or explicitly risk-accepted - §2 alone is not the whole gate. As of this PR that's rows 1/4/6 (#3847), row 7 (#2993), row 9 (#3848), and row 3's #3816 residual - checked here, not folded into a 10th criterion)_ |
-| This PR | PR-1 of 7 (+ 1 unscheduled, see below): PR-1 (this doc) → PR-2a (#2233 items 1/4/6 → #3847; item 7 → #2993; + #3831 batch) → PR-2c (fault-injection seams + item-9 TSan rerun, #3848) → [PR-2d, contingency only, if PR-2c's seams demonstrate a real defect - resolves before PR-5, per §5's risk register] → PR-4 (promtool CH-2/CH-5-PROM; independent of #3816, not blocked by it) → [**#3816's design PR, unscheduled** - `GuardianIoExecutor` abandonment-signal API, shared by `GuardianSparkRuntime` + `GuardianStateReader`, no slot assigned; filed 2026-09-01, predating this doc, missing from this doc's first draft and added only after a PR review caught the omission (see §3 row 3); gates PR-5 only, per #3816's own filed text - OR an explicit risk-accept ruling in its place, see §3 row 3] → PR-5 (the flip) → PR-6 (evidence closeout). Sequencing note for §8: since PR-4 doesn't depend on #3816, Rig A/B provisioning (which follows PR-2a/PR-2c per §8) is not itself delayed by #3816 being unscheduled - only PR-5 is. PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
+| This PR | PR-1 of 7 (+ 1 unscheduled, see below): PR-1 (this doc) → PR-2a (#2233 items 1/4/6 → #3847; item 7 → #2993; + #3831 batch) → PR-2c (fault-injection seams + item-9 TSan rerun, #3848) → [PR-2d, contingency only, if PR-2c's seams demonstrate a real defect - resolves before PR-5, per §5's risk register] → **PR-4 (promtool CH-2/CH-5-PROM) - DONE, merged as #3858, 2026-09-02T13:00:49Z** → [**#3816's design PR, unscheduled** - `GuardianIoExecutor` abandonment-signal API, shared by `GuardianSparkRuntime` + `GuardianStateReader`, no slot assigned; filed 2026-09-01, predating this doc, missing from this doc's first draft and added only after a PR review caught the omission (see §3 row 3); gates PR-5 only, per #3816's own filed text - OR an explicit risk-accept ruling in its place, see §3 row 3] → PR-5 (the flip) → PR-6 (evidence closeout). Sequencing note for §8: PR-4 landed independently of #3816 (neither blocked the other), so Rig A/B provisioning (which follows PR-2a/PR-2c per §8) is not itself delayed by #3816 being unscheduled - only PR-5 is. PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
 | Re-verified against | `origin/dev @ bd387afec` (2026-09-02); the kickoff plan's citations were pinned to `880900f1e1` - every file:line citation below was re-checked against the newer HEAD, not copied blind. Drift is called out inline where found. |
 | Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. |
 
@@ -66,8 +66,10 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
 - [ ] **6. Legacy-vs-spark parity capture**, any diff fully explained by
       `docs/spark-legacy-delta-registry.md`.
 - [ ] **7. Resource evidence** vs `docs/spark-rebuild-baselines/`.
-- [ ] **8. External gates green**: #2340 CH-2 + CH-5-PROM (promtool, PR-4) + CH-5-UAT (UAT rig,
-      Rig A - §8). CH-11 does **not** gate this criterion (ruled 2026-09-01 - see §4).
+- [ ] **8. External gates green**: #2340 CH-2 + CH-5-PROM (promtool) - **done**, PR-4 merged as
+      **#3858** (2026-09-02T13:00:49Z), still needs CH-5-UAT (UAT rig, Rig A - §8) before this
+      criterion is fully green. CH-11 does **not** gate this criterion (ruled 2026-09-01 - see
+      §4).
 - [ ] **9. Rung-3-implementation-ready sign-off** + the enforcement-gap budget recorded. Already
       ruled 2026-08-23: the flip's enforcement gap (§3 row 2) is temporary with no fixed
       remediation budget attached - stated here, not re-litigated. (This ruling is recorded
@@ -132,17 +134,17 @@ alerts, ever." This unblocks PR-4.
 **CH-5-PROM vs CH-5-UAT - same scenario ID, two different documents, two different meanings.
 Do not conflate them:**
 - **CH-5-PROM** (this doc + PR-4): promtool synthetic time-series proving the currently-shipped
-  metric-family set (needs a fresh code-level count before PR-4 scopes - the #2340 issue's
-  claimed "22 metric families" is known-stale, having grown via
-  `docs/spark-stage2-guardian-consumer-design.md` items 3/4/5/6/9 landing since; "six batch-unit
-  counters" also doesn't obviously map to the current table) is absent for 7 days, and
-  `YuzuGuardianJournalTelemetryDark` fires within 15 minutes while nothing else does. **PR-4
-  scoping note**: the rule's own expression is `yuzu_fleet_guardian_journal_reporting == 0 and
-  on() yuzu_fleet_agents_healthy > 0` - per `yuzu-alerts.yml`'s comment (~line 3523),
-  `_reporting` publishes every sweep at 0 by design and is NOT one of the families expected to
-  go absent. The "metric-family set absent for 7 days" test case must exclude `_reporting` from
-  what it drives absent, or the case is mis-specified and fires on a setup artifact rather than
-  the intended scenario.
+  metric-family set is absent for 7 days, and `YuzuGuardianJournalTelemetryDark` fires within 15
+  minutes while nothing else does. **DONE - PR-4 merged as #3858** (2026-09-02T13:00:49Z):
+  `tests/prometheus/yuzu-guardian-journal-extracted.test.yml` implements 6 CH-5-PROM cases,
+  including the exact `_reporting`-exclusion scoping this doc flagged - case 1 ("reporting dark
+  with a healthy fleet") and case 3 ("reporting dark with zero healthy agents stays quiet") are
+  the two halves of the `yuzu_fleet_guardian_journal_reporting == 0 and on()
+  yuzu_fleet_agents_healthy > 0` expression, confirming the "metric-family set absent" case does
+  not mis-fire on `_reporting`'s own steady-state 0 reading. CH-2 is also DONE in the same PR:
+  cases CH-2a/CH-2b implement the ruled fires-then-resolves verdict (§4 above), plus a CH-2c
+  refinement (a never-healing loss fires only within its first 15 minutes, found via adversarial
+  review) not anticipated when this doc was first written.
 - **CH-5-UAT** (design-doc item 7, `docs/guardian-c0-thread-reloc-design.md`): a live UAT-rig
   load/timing gate holding the journal at its hard ceiling (2000 batches / 64 MiB - resolved
   2026-08-18, not reopened here), measuring live-event latency under KV contention, including a
@@ -155,12 +157,10 @@ Do not conflate them:**
 
 Both gate the flip independently; neither substitutes for the other.
 
-**PR sequence for this track** (from the delivery plan, unchanged): PR-1 (this doc, scenario
-contract) → PR-4 (promtool CH-2 + CH-5-PROM, generalizing `run_promtool_tests.py` to
-marker-extract the commented `yuzu-guardian-journal` rule group without enabling the
-production group; per-case mutation-red evidence required, not whole-suite) → the CH-5-UAT
-driver (Rig A, §8) → cutover evidence record (compact Markdown, hashed/artifact-ID raw data,
-not raw logs inline).
+**PR sequence for this track** (from the delivery plan): PR-1 (this doc, scenario contract) →
+**PR-4 (promtool CH-2 + CH-5-PROM) - DONE, merged as #3858** → the CH-5-UAT driver (Rig A, §8,
+still open, blocked on #3850's missing latency threshold) → cutover evidence record (compact
+Markdown, hashed/artifact-ID raw data, not raw logs inline).
 
 ## 5. Risk-accept register
 
