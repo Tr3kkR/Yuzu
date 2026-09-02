@@ -5883,10 +5883,13 @@ public:
         // (ADR-0006/0038, schema `guaranteed_state_store`) — construction fail-CLOSED
         // per ADR-0012 §1 (same template as ResultSetStore above): a reachable
         // database whose schema can't migrate/open is a fatal startup error, never a
-        // serve-degraded state. `migrate_from_sqlite` runs the one-time, idempotent
-        // legacy-`guaranteed-state.db` backfill (ADR-0009) — the rules/meta/status
-        // tables are AUTHORITATIVE/fail-hard, so a backfill failure is ALSO fatal
-        // (never serve on top of a partially-migrated rule set).
+        // serve-degraded state. NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment): the legacy guaranteed-state.db is
+        // never copied; the detect-and-warn obligation still applies (the
+        // rules/meta/status tables are real operator-authored enforcement
+        // config), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(
                 *pg_pool_, cfg_.guardian_event_retention_days);
@@ -5896,25 +5899,17 @@ public:
                               "could not be created/opened)");
                 startup_failed_ = true;
             } else {
-                auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
-                if (!guaranteed_state_store_->migrate_from_sqlite(gs_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: guaranteed-state legacy-SQLite backfill failed "
-                        "(see prior log lines) — rules/meta are authoritative and must not serve "
-                        "partially-migrated data. Operator remediation: repair {} or move it "
-                        "aside to skip the backfill (rules/events/observations in it will NOT "
-                        "carry over)",
-                        gs_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "guaranteed-state.db", "GuaranteedStateStore",
+                    {"guaranteed_state_rules", "guardian_meta", "guardian_agent_rule_status",
+                     "guaranteed_state_events", "guardian_observations"});
             }
             if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                 !startup_failed_) {
                 guaranteed_state_store_->set_metrics(&metrics_);
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
-                             "retention={}d; legacy backfill source {})",
-                             cfg_.guardian_event_retention_days,
-                             (cfg_.db_dir() / "guaranteed-state.db").string());
+                             "retention={}d)",
+                             cfg_.guardian_event_retention_days);
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());

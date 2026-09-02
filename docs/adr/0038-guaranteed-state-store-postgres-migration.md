@@ -182,6 +182,28 @@ or `PQcmdTuples` on its own single-owner result.
   `YUZU_REQUIRE_PG_DB`. The H2/G9 enum cross-check tests must pass unchanged against the
   PG DDL.
 
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the mandatory 5-table,
+SAVEPOINT-per-row backfill this ADR designed (ADR-0037's SQLSTATE-discrimination shape)
+was real, working code that never had real legacy data to protect.
+
+`GuaranteedStateStore::migrate_from_sqlite()`, its dedicated `SqliteConnGuard` RAII
+wrapper, and its private helpers/types (`LegacyRule`, `LegacyMeta`, `LegacyStatus`,
+`LegacyEvent`, `LegacyObservation`, `backfill_row`, `backfill_row_strict`, `safe`) are
+removed (`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623).
+`sqlite_backfill` — whose entire purpose was the backfill idempotency marker — is
+dropped via a version-bumped `{2, "DROP TABLE IF EXISTS sqlite_backfill;"}` migration,
+not edited into v1: this store IS constructed in production, so v1 has actually run
+against real dev/UAT databases. `gc_meta` (the UNRELATED #2496 retention clock-guard
+durable state) and `guardian_meta` (the UNRELATED `policy_generation` counter) are both
+kept untouched — neither is backfill machinery, despite the superficially similar
+naming. `server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows`
+over the five legacy tables (`guaranteed_state_rules`/`guardian_meta`/
+`guardian_agent_rule_status`/`guaranteed_state_events`/`guardian_observations`) instead
+— silent unless real rows are found, never blocks boot.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

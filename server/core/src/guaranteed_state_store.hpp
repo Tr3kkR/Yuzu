@@ -6,7 +6,10 @@
 /// `guaranteed_state_store`); was `guaranteed-state.db` (SQLite). See
 /// docs/yuzu-guardian-design-v1.1.md §9.1 for the schema design and
 /// docs/adr/0038-guaranteed-state-store-postgres-migration.md for the
-/// migration's posture decisions (this header follows that ADR verbatim).
+/// migration's posture decisions (this header follows that ADR verbatim);
+/// its Update records `migrate_from_sqlite()`'s retirement
+/// (chore/retire-migrate-from-sqlite-batch-b, #3623) — `server.cpp` now runs
+/// a detect-and-warn probe over the legacy file instead.
 ///
 /// Responsibilities:
 ///   - Persist GuaranteedStateRule definitions (yaml_source is authoritative;
@@ -71,7 +74,6 @@
 #include <atomic>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -334,26 +336,6 @@ public:
     /// synchronisation on serving threads. A null registry (default, e.g.
     /// unit tests) disables emission; every emit site is null-guarded.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
-
-    /// One-time, idempotent legacy-SQLite backfill (ADR-0009/0038). Call once
-    /// at server startup, before serving, after construction proved the
-    /// Postgres schema is open. All FIVE tables (rules, guardian_meta,
-    /// guardian_agent_rule_status, guaranteed_state_events,
-    /// guardian_observations) in ONE transaction, idempotent via a dedicated
-    /// `sqlite_backfill` marker row (never row-count-inferred — the reaper
-    /// legitimately empties the event/observation tables over the store's
-    /// lifetime). Per-row SAVEPOINT + SQLSTATE discrimination exactly as
-    /// ADR-0037 settled it (22xxx/23xxx/54xxx = skip + counted in
-    /// `skipped_bad`; anything else aborts UNSTAMPED — the next boot
-    /// retries). Event/observation rows are copied UNCONDITIONALLY, including
-    /// already-TTL-expired ones (#2663, security-guardian review) — the
-    /// guarded `reap_expired()` is the sole authority on what has expired;
-    /// migration never makes that decision. FAILS CLOSED on any
-    /// infrastructure error (initial connection, the backfill transaction's
-    /// own BEGIN/SAVEPOINT/COMMIT, a non-row-data SQLSTATE, or a failed
-    /// ROLLBACK TO SAVEPOINT) — the caller MUST treat `false` as fatal
-    /// (`startup_failed_ = true` in server.cpp), same as `!is_open()`.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // Rule CRUD. Mutating methods return `std::expected<void, std::string>`
     // (fail-hard — ADR-0038 posture). Duplicate-UNIQUE collisions (name or
