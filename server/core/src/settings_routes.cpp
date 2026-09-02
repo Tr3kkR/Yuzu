@@ -2042,7 +2042,8 @@ std::string SettingsRoutes::render_management_groups_fragment() {
         }
 
         html += "<tr>";
-        html += "<td>" + indent + "<span style=\"" + name_style + "\">" + g->name + "</span></td>";
+        html += "<td>" + indent + "<span style=\"" + name_style + "\">" + html_escape(g->name) +
+                "</span></td>";
         html += "<td>" + type_badge + "</td>";
         html += "<td>" + std::to_string(member_count) + "</td>";
         html += "<td>";
@@ -2053,7 +2054,7 @@ std::string SettingsRoutes::render_management_groups_fragment() {
                     "\" "
                     "hx-target=\"#mgmt-groups-section\" "
                     "hx-confirm=\"Delete group '" +
-                    g->name +
+                    html_escape(g->name) +
                     "' and all children?\" "
                     "style=\"font-size:0.7rem;padding:1px 6px;color:#f85149;border-color:#f85149"
                     "\">Delete</button>";
@@ -2094,7 +2095,7 @@ std::string SettingsRoutes::render_management_groups_fragment() {
             "padding:4px 8px;border-radius:4px;font-size:0.8rem\">"
             "<option value=\"\">— root —</option>";
     for (const auto& g : groups) {
-        html += "<option value=\"" + g.id + "\">" + g.name + "</option>";
+        html += "<option value=\"" + html_escape(g.id) + "\">" + html_escape(g.name) + "</option>";
     }
     html += "</select></div>"
             "<div><label style=\"font-size:0.7rem;color:#8b949e\">Type</label>"
