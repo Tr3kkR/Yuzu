@@ -1628,7 +1628,14 @@ Quarantine a device.
 > (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
 > do **not** yet carry this split — they answer their existing
 > "no agents reached" shapes for all three conditions, because the shared
-> dispatch closure returns only a sent count. Tracked as #3424. The quarantine
+> dispatch closure returns only a sent count. Tracked as #3424. ADR-1007 added
+> a fourth cause to that same undifferentiated message on
+> `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
+> named target may have been excluded by an already-open concurrency claim
+> rather than being unreachable at all — the response text now says so, and
+> points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
+> this is still prose inside the one undifferentiated 503 body, not a fourth
+> structured `error.reason` value — the same #3424 gap applies to it. The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —
@@ -4098,6 +4105,67 @@ Recent delivery attempts for a target (default 50, override via `?limit=N`). Eac
 **Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the entire JSON payload — including potentially sensitive instruction response data (file paths, registry values, software inventory, security findings) — is transmitted in cleartext. Production deployments containing customer endpoint data should use `https://` only. The store accepts `http://` for development convenience and to maintain parity with the webhook precedent.
 
 **Operator trust model.** Any principal with `Infrastructure:Write` can register an offload target pointing at any URL the server can resolve, including RFC1918 / loopback / link-local destinations. There is no URL allowlist or network-egress mitigation in this revision; the trust model is "Infrastructure:Write operators are trusted to choose where data goes." For multi-tenant managed deployments this is a known limitation tracked as a roadmap follow-up.
+
+---
+
+### Directory Sync
+
+AD/Entra directory integration (Phase 7). Backed by `DirectorySync` (`directory_sync.{hpp,cpp}`).
+
+#### `POST /api/directory/sync`
+
+Trigger a directory sync. Requires `Directory:Write`.
+
+**Request (`provider: "entra"`):**
+
+```json
+{
+  "provider": "entra",
+  "tenant_id": "...",
+  "client_id": "...",
+  "client_secret": "..."
+}
+```
+
+`tenant_id`/`client_id`/`client_secret` are all required for `entra`; a `provider: "ldap"` request instead takes `server`/`port`/`base_dn`/`bind_dn`/`bind_password`/`use_ssl`, but `sync_ldap` is not yet implemented and always returns `501`. Any other `provider` value is `400`.
+
+**Response (200):** `{"status": "completed", "provider": "entra", "user_count": <n>, "group_count": <n>}`
+
+**Response (409, ADR-1007):** `{"error": "sync already in progress"}` — `sync_entra` holds a single in-process re-entrancy guard for the duration of one sync call; a second `POST` that arrives while a sync is already running is rejected immediately rather than racing it. See "Diagnosing a stuck directory sync" in `docs/user-manual/server-admin.md` for how long a legitimate sync can hold the guard and what a stuck one looks like. Not queued or retried automatically — the caller decides when to retry.
+
+**Response (400):** malformed body, or a missing required Entra field.
+
+**Response (503):** `directory_sync` is unavailable (store not open).
+
+**Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result.
+
+#### `GET /api/directory/users`
+
+List directory-synced users from the last successful sync. Requires `Directory:Read`. Optional `?group_id=` query param filters to members of one synced group.
+
+**Response (200):** `{"users": [{"id","display_name","email","upn","enabled","groups":[...],"synced_at"}], "count": <n>}`
+
+**Response (503):** `directory_sync` unavailable.
+
+#### `GET /api/directory/status`
+
+Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`.
+
+**Response (200):** `{"provider","status","last_sync_at","user_count","group_count","last_error","groups":[{"id","display_name","description","mapped_role","synced_at"}]}`
+
+**Response (503):** `directory_sync` unavailable.
+
+#### `PUT /api/directory/group-mappings`
+
+Configure group-to-role mappings (which RBAC role a synced group's members receive). Requires `Directory:Write`.
+
+**Request:** `{"mappings": [{"group_id": "...", "role_name": "..."}]}`. `role_name` is NOT required per entry — an entry with an empty/omitted `role_name` REMOVES that group's mapping rather than being rejected; a non-empty `role_name` configures (creates or overwrites) it. An entry with an empty `group_id` is silently skipped and not counted.
+
+**Response (200):** `{"mappings": [{"group_id","role_name"}], "count": <n>}` — the FULL current mapping set after applying this request's changes (not the size of the batch just submitted).
+
+**Response (400):** malformed body, or a missing `mappings` array.
+
+**Response (503):** `directory_sync` unavailable.
 
 ---
 
@@ -7007,33 +7075,72 @@ table entry above).
 
 ### Executions
 
+All seven routes below are management-group confined as of #3789 (`docs/auth-architecture.md`'s
+"Fourth migration"): a caller holding `Execution:Read`/`Execute` through a management group only
+sees/acts on executions it dispatched itself or that involve at least one agent it can see. A
+global grant is unrestricted. An execution outside the caller's visibility and a nonexistent one
+return the identical `404` (no existence oracle).
+
+**Response (503):** any of the seven routes returns `503` with `retry_after_ms` on either (a) the
+RBAC/management-group store being degraded when a confinement decision must be made
+(`require_fleet_read` fails closed, replacing the pre-#3789 flat `403`), (b) the execution tracker
+itself being unreadable (`ExecutionTracker`'s `_checked` accessors), or (c) — under a confined
+grant only — the caller's session identity failing to resolve after admission, which fails closed
+rather than silently falling through to agent-only visibility. Retry after the given interval; a
+persistent `503` indicates a store outage, not a permission problem.
+
 #### `GET /api/executions`
 
-List executions. Accepts `definition_id`, `status`, and `limit` as query parameters.
+**Permission:** `Execution:Read`. List executions. Accepts `definition_id`, `status`, and `limit`
+(capped at 500) as query parameters. Under a confined grant, `agents_targeted`/`agents_responded`/
+`agents_success`/`agents_failure` are recomputed from only the caller's visible agents.
 
 #### `GET /api/executions/{id}`
 
-Get details of a single execution.
+**Permission:** `Execution:Read`. Get details of a single execution. Under a confined grant,
+`scope_expression` and `parameter_values` are redacted (`"(redacted - confined view)"`) and the
+four agent counts are recomputed from only the visible agents; `status`/`dispatched_by`/
+`dispatched_at`/`completed_at`/lineage stay truthful. **Response (404):** unknown or
+outside-scope id.
 
 #### `GET /api/executions/{id}/summary`
 
-Get an execution summary (counts of targeted, responded, success, failure agents).
+**Permission:** `Execution:Read`. Get an execution summary (counts of targeted, responded,
+success, failure agents, `progress_pct`). **Response (404):** unknown or outside-scope id.
 
 #### `GET /api/executions/{id}/agents`
 
-List agents involved in an execution.
+**Permission:** `Execution:Read`. List agents involved in an execution, filtered to the caller's
+visible agents under a confined grant. **Response (404):** unknown or outside-scope id.
 
 #### `GET /api/executions/{id}/children`
 
-List child executions spawned from a parent execution.
+**Permission:** `Execution:Read`. List child executions spawned from a parent execution. Each
+child is independently checked against the caller's visibility — a visible parent does not by
+itself disclose a child dispatched by, or targeting, someone else. **Response (404):** unknown or
+outside-scope parent id.
 
 #### `POST /api/executions/{id}/rerun`
 
-Re-execute a previously run instruction with the same parameters and targets.
+**Permission:** `Execution:Execute` AND `Execution:Read` (the mutation's target-visibility check
+runs through the Read fleet gate). Re-execute a previously run instruction with the same
+parameters and targets. Under a confined grant, every targeted agent must be visible to the
+caller — a partially-visible or not-yet-fully-reported execution is refused, with a `404`
+(deliberately non-distinguishing from a nonexistent id, to avoid disclosing a hidden cohort). A
+global (unconfined) grant is unaffected by this check and keeps the pre-existing `400 {"error":
+"original execution not found"}` response for an unknown id. **Escape hatch:** same as `cancel`
+below — an execution whose targeted cohort never fully reports can permanently fail the
+complete-cohort admission check for a confined caller; a **global** grant is never subject to it.
 
 #### `POST /api/executions/{id}/cancel`
 
-Cancel a running execution.
+**Permission:** `Execution:Execute` AND `Execution:Read`, same confinement rule as `rerun`.
+**Response (404):** unknown execution id (this route no longer reports a false success for a
+nonexistent id), outside-scope, or an incomplete/partial target cohort. **Escape hatch:** an
+execution whose targeted cohort never fully reports (an agent gone offline mid-run, for example)
+can permanently fail the complete-cohort admission check for a confined caller — cancel it with a
+**global** `Execution:Execute`+`Execution:Read` grant instead, which is never subject to this
+confinement rule.
 
 ---
 

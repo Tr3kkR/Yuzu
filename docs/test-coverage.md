@@ -123,9 +123,8 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 | `test_analytics_event.cpp` | Analytics events | Event creation, serialization, drain integration |
 | `test_approval_manager.cpp` | Approval manager | Approval CRUD, status transitions, role-gated approvals |
 | `test_cert_reloader.cpp` | Certificate reloader | PEM reload, validation, permission checks, hot-swap |
-| `test_concurrency_manager.cpp` | Concurrency manager | 5 enforcement modes, lock/release |
 | `test_error_codes.cpp` | Error taxonomy | Error code ranges (1xxx-4xxx), message formatting |
-| `test_execution_tracker.cpp` | Execution tracker | Progress tracking, per-agent status, completion |
+| `test_execution_tracker.cpp` | Execution tracker | Progress tracking, per-agent status, completion; per-device concurrency claims (ADR-1007): claim/release, cross-definition non-interference, two-thread same-claim race (partial unique index), terminal-status vs 'running' release, mark_cancelled does NOT release open claims (cancel is server-side bookkeeping only — there is no gRPC kill RPC to actually stop the agent-side work), clock-guarded stale-claim reconciler (force-release, backward-clock decline, cap) |
 | `test_instruction_store.cpp` | Instruction store | Definition/set CRUD (PostgreSQL, ADR-0058), YAML persistence, denormalized queries, seed-vs-live tombstone semantics (delete survives reseed, resurrection-on-delete removed) |
 | `test_legacy_shim.cpp` | Legacy command shim | Raw command-to-instruction translation |
 | `test_management_group_store.cpp` | Management groups | Group CRUD, hierarchy, device membership |

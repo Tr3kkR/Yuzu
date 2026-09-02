@@ -805,6 +805,7 @@ if build_server
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement
+      'unit/server/test_legacy_executions_scope_authz.cpp', # #3789: legacy /api/executions* fleet-read confinement
       'unit/server/test_oidc_principal_key.cpp',
       'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
@@ -816,7 +817,6 @@ if build_server
       'unit/server/test_saml_scim_link.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
-      'unit/server/test_concurrency_manager.cpp',
       'unit/server/test_legacy_shim.cpp',
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',

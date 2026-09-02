@@ -183,6 +183,20 @@ struct ArmDispatchResult {
     /// allocation on the dispatch thread during exactly the degradation that
     /// triggered it.
     std::size_t denied_quarantined_count = 0;
+    /// Ids that passed the containment check (an actual `sink.send_to` was
+    /// attempted) but the registry reported delivery failure. ADR-1007: this
+    /// is the caller-visible half of the per-device concurrency claim leak —
+    /// `resolve_and_dispatch_confined`'s `claim_fn` runs BEFORE this function
+    /// ever sees the candidate list, so an id here already holds a fresh,
+    /// still-open claim with nobody now going to release it on success. This
+    /// function stays pure (no store access — see the file's own header
+    /// comment and the #881 "ONE store operation per dispatch" discipline),
+    /// so it only COLLECTS the ids; `wire_and_dispatch_confined` is the seam
+    /// that built `claim_fn` in the first place and is where the release
+    /// actually happens. Populated only for the Group/Scope/Ids arms — the
+    /// only arms `claim_fn` is ever applied to (ADR-1007: Broadcast/None are
+    /// a documented non-goal).
+    std::vector<std::string> not_sent;
 };
 
 /// #881: case-insensitive predicate for the quarantine control-channel
@@ -565,22 +579,37 @@ struct QuarantineDegradationResult {
         // A management group is a targeting mechanism, not an authz
         // exemption — and, per #881, not a containment exemption either.
         if (targets.group_members)
-            for (const auto& aid : *targets.group_members)
-                if (authz::in_scope(exec_visible, aid) && !contained(aid) && sink.send_to(aid))
+            for (const auto& aid : *targets.group_members) {
+                if (!authz::in_scope(exec_visible, aid) || contained(aid))
+                    continue;
+                if (sink.send_to(aid))
                     ++result.sent;
+                else
+                    result.not_sent.push_back(aid);
+            }
         break;
     case DispatchArm::Scope:
         // Null == the caller aborted resolution and already audited it.
         if (targets.scope_matched)
-            for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible))
-                if (!contained(aid) && sink.send_to(aid))
+            for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible)) {
+                if (contained(aid))
+                    continue;
+                if (sink.send_to(aid))
                     ++result.sent;
+                else
+                    result.not_sent.push_back(aid);
+            }
         break;
     case DispatchArm::Ids:
         if (targets.agent_ids)
-            for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible))
-                if (!contained(aid) && sink.send_to(aid))
+            for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible)) {
+                if (contained(aid))
+                    continue;
+                if (sink.send_to(aid))
                     ++result.sent;
+                else
+                    result.not_sent.push_back(aid);
+            }
         break;
     case DispatchArm::Broadcast:
         // Asked for by its published name (`__all__`) — still narrowed, and

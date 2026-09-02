@@ -18,8 +18,10 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm> // std::max (reap anchor) — not transitively guaranteed on libc++
+#include <cerrno>    // errno — checked parse of the clock-guard-critical readings (#3785)
 #include <chrono>
 #include <cstdlib>
+#include <optional>
 
 namespace yuzu::server {
 
@@ -40,6 +42,30 @@ std::int64_t to_i64(const char* s) {
     if (!s || !*s)
         return 0;
     return std::strtoll(s, nullptr, 10);
+}
+
+// Checked parse for the two clock-guard-critical readings in reap_expired (the
+// DB now() column and the persisted session_meta anchor) — deliberately NOT the
+// ambient `to_i64` above, which is a lenient strtoll-with-no-validation helper
+// appropriate for the trusted DB-returned row columns elsewhere in this file,
+// but NOT for a value the clock-guarded-retention routed concern (CLAUDE.md
+// part 3) requires be SANITISED: "ahead-of-now / negative / unparseable =
+// anomaly, never a quiet reset — on an endpoint the user controls, a quiet
+// reset IS the bypass". A hand-edited session_meta row, a bad migration, or
+// storage corruption writing `123junk`, a negative value, or an overflowed
+// value must be REJECTED as an anomaly, not silently truncated/wrapped by an
+// unchecked strtoll (#3785 — the identical sibling defect execution_tracker.cpp
+// closed in PR #3780; api_token_store.cpp's `parse_meta_i64` /
+// response_store.cpp's inline equivalent are the reference shape this mirrors,
+// and a second hand-rolled copy is the drift those two already accepted as
+// cheaper than a shared-utility header for a three-line function).
+std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
+    errno = 0;
+    char* end = nullptr;
+    const long long v = std::strtoll(val.c_str(), &end, 10);
+    if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
+        return std::nullopt;
+    return static_cast<std::int64_t>(v);
 }
 
 std::uint64_t to_u64(const char* s) {
@@ -488,7 +514,21 @@ SessionStore::reap_expired() {
                 err = "reap now() read failed";
                 return false;
             }
-            now_ms = to_i64(PQgetvalue(nr.get(), 0, 0));
+            // SANITISE the reading (clock-guarded-retention part 3, #3785):
+            // unparseable or negative is an ANOMALY, never a quiet fallback to
+            // 0/silently-truncated garbage — the prior unchecked `to_i64` here
+            // parsed a malformed/overflowed value with no error and no
+            // rejection, in direct violation of this exact standing rule.
+            const std::string now_raw = PQgetvalue(nr.get(), 0, 0);
+            auto parsed_now = parse_reap_i64(now_raw);
+            if (!parsed_now || *parsed_now < 0) {
+                spdlog::warn("SessionStore::reap declined: unparseable or negative now() "
+                             "reading '{}'",
+                             now_raw);
+                clock_anomaly = true;
+                return true; // decline (commit the no-op lock release), anchor unchanged
+            }
+            now_ms = *parsed_now;
         }
         // Persisted anchor = the max now_ms any prior pass accepted. A reading
         // implausibly far ahead of it is an anomaly: decline this pass, do not
@@ -502,8 +542,39 @@ SessionStore::reap_expired() {
             return false;
         }
         const bool has_anchor = PQntuples(ar.get()) > 0;
-        const std::int64_t anchor = has_anchor ? to_i64(PQgetvalue(ar.get(), 0, 0)) : 0;
-        if (has_anchor && now_ms > anchor + kMaxPlausibleSkewMs) {
+        std::int64_t anchor = 0;
+        if (has_anchor) {
+            // Same sanitisation as now_ms, for the SAME reason (#3785) — session_meta
+            // is a plain key/value table a bad migration, a manual repair, or storage
+            // corruption can write anything into. An unparseable or negative persisted
+            // anchor is an anomaly: decline this pass rather than let the lenient
+            // strtoll silently ACCEPT a corrupt value as a legitimate anchor — which
+            // masks the corruption (a value that happens to parse within the plausible
+            // window is taken as real, the pass deletes, and the anchor is advanced to
+            // the corrupt reading) and, for an overflowed value, feeds the signed-
+            // overflow comparison below. "Never a quiet reset" (clock-guard part 3).
+            const std::string anchor_raw = PQgetvalue(ar.get(), 0, 0);
+            auto parsed_anchor = parse_reap_i64(anchor_raw);
+            if (!parsed_anchor || *parsed_anchor < 0) {
+                spdlog::warn("SessionStore::reap declined: unparseable or negative persisted "
+                             "anchor '{}'",
+                             anchor_raw);
+                clock_anomaly = true;
+                return true; // decline, anchor unchanged
+            }
+            anchor = *parsed_anchor;
+        }
+        // Overflow-safe forward-skew comparison (#3785, mirroring execution_tracker.cpp's
+        // PR #3780 round-2 fix): `parse_reap_i64` rejects unparseable/negative values but
+        // NOT an implausibly-large one that parses cleanly (e.g. INT64_MAX from a bad
+        // migration/manual repair/corruption) — `anchor + kMaxPlausibleSkewMs` on such a
+        // value is signed-integer-overflow UB. Subtracting instead of adding cannot
+        // overflow: both operands are already sanitised to be non-negative int64_t, so
+        // their difference always fits (int64_t's negative range strictly exceeds its
+        // positive range). The `now_ms >= anchor` guard preserves the existing branch
+        // order — when now_ms < anchor, this is false and control falls through to the
+        // backward-anomaly check below, unchanged.
+        if (has_anchor && now_ms >= anchor && now_ms - anchor > kMaxPlausibleSkewMs) {
             spdlog::warn("SessionStore::reap declined: now_ms {} implausibly ahead of anchor {}",
                          now_ms, anchor);
             clock_anomaly = true;

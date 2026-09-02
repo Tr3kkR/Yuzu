@@ -28,7 +28,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 2.6 | [#160](https://github.com/Tr3kkR/Yuzu/issues/160) | Instruction Progress Tracking and Statistics | Done |
 | | 2.7 | [#163](https://github.com/Tr3kkR/Yuzu/issues/163) | Instruction Rerun and Cancellation | Done |
 | | 2.8 | [#205](https://github.com/Tr3kkR/Yuzu/issues/205) | Error Code Taxonomy (1xxx-4xxx) | Done |
-| | 2.9 | [#206](https://github.com/Tr3kkR/Yuzu/issues/206) | Concurrency Enforcement (5 Modes) | Done |
+| | 2.9 | [#206](https://github.com/Tr3kkR/Yuzu/issues/206) | Concurrency Enforcement (real-usage scope) | Partial |
 | | 2.10 | [#207](https://github.com/Tr3kkR/Yuzu/issues/207) | YAML Authoring UI (Form + CodeMirror) | Done |
 | | 2.11 | [#208](https://github.com/Tr3kkR/Yuzu/issues/208) | Legacy Command Shim | Done |
 | | 2.12 | [#209](https://github.com/Tr3kkR/Yuzu/issues/209) | Structured Result Envelope | Done |
@@ -360,12 +360,20 @@ Implement the 4-category error code taxonomy from `docs/Instruction-Engine.md` S
 
 **Files:** `server/core/src/execution_tracker.hpp`, `server/core/src/execution_tracker.cpp`, `agents/core/src/agent.cpp`, `proto/yuzu/common/v1/common.proto`
 
-### Issue 2.9: Concurrency Enforcement (5 Modes)
-**Scope:** Server + Agent
+### Issue 2.9: Concurrency Enforcement (real-usage scope, ADR-1007)
+**Scope:** Server
 
-Implement 5 concurrency modes from `docs/Instruction-Engine.md` Section 10: `per-device` (agent-side, default), `per-definition` (server-side), `per-set` (agent-side), `global:<N>` (server-side semaphore), `unlimited`. Agent maintains in-memory lock set; server uses `concurrency_locks` SQLite table.
+Only `per-device` is enforced, server-side, via a dedicated `concurrency_claims` table in
+`execution_tracker`'s Postgres schema (a partial unique index gives race-free claim/release — see
+ADR-1007). This is a corrected scope, not the originally-documented 5 modes: a real-usage audit of
+shipped `content/definitions/*.yaml` found `per-definition`/`global`/`global-singleton` attach
+exclusively to catalog-only `plugin: server`-class definitions with no live agent-dispatch path
+(building DSL enforcement for them would guard a path those 42 operations don't take), and
+`per-set` has zero real usage and no defined grouping mechanism anywhere. See
+`docs/yaml-dsl-spec.md` §12 and `docs/Instruction-Engine.md` §10 for the corrected behavior
+description.
 
-**Files:** `agents/core/src/agent.cpp`, `server/core/src/execution_tracker.cpp`, `server/core/src/instruction_store.cpp`
+**Files:** `server/core/src/execution_tracker.{hpp,cpp}`, `server/core/src/dispatch_scope_ladder.hpp`, `server/core/src/workflow_routes.{hpp,cpp}`, `server/core/src/schedule_runner.{hpp,cpp}`
 
 ### Issue 2.10: YAML Authoring UI (Form + CodeMirror)
 **Scope:** Server
