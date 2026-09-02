@@ -28,7 +28,7 @@ tier — not the tracking mechanism — decides the remediation posture:
   server, agent, or gateway: vcpkg deps, Docker base images, rebar3 deps,
   and the vendored JS assets embedded into the server binary. Security
   advisories here follow the vulnerability-management commitments in
-  `docs/enterprise-readiness-soc2-first-customer.md` (Workstream F).
+  `docs/enterprise-readiness-soc2-first-customer.md` (Workstream C).
 - **Tier 2 — repo tooling.** Build/test/docs/demo tooling that never
   ships in a product artifact: the three npm directories and the pip CI
   tooling. Advisories are tracked, surfaced, and auto-patched through the
