@@ -50,12 +50,15 @@ fi
 
 # psql variable substitution (:'var' literal / :"var" identifier) + format()
 # with %I/%L handles quoting safely — role/db names and the password are
-# never spliced into SQL by the shell.
+# never spliced into SQL by the shell. The password is read by psql from its
+# own environment (\getenv, psql 15+; this image ships 18) rather than -v,
+# so it is never in argv, which the HOST process table exposes even for
+# container processes (F7/#3859) — environ is owner-only, argv is not.
 psql -v ON_ERROR_STOP=1 \
      -v yuzu_user="${YUZU_DB_USER}" \
-     -v yuzu_pass="${YUZU_DB_PASSWORD}" \
      -v yuzu_db="${YUZU_DB_NAME}" \
      --username "${POSTGRES_USER}" --dbname postgres <<'EOSQL'
+\getenv yuzu_pass YUZU_DB_PASSWORD
 SELECT format('CREATE ROLE %I LOGIN PASSWORD %L', :'yuzu_user', :'yuzu_pass')
 WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'yuzu_user')
 \gexec
