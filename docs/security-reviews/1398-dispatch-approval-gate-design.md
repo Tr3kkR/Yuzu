@@ -464,6 +464,18 @@ spot check.
    discrimination beyond what Decision 7's pre-check closure already provides
    (an in-code follow-up note already flags the underlying limitation). Filed
    as **#3687**.
+   **2026-09-02 follow-up:** #3687 shipped a NARROWER fix than this item's
+   own title describes — a pre-dispatch dry-run closure (the same shape as
+   Decision 7's own `execute_instruction` pre-check, generalized via a shared
+   `dispatch_pairs_for(tool_name, args)` registration point to
+   `execute_bundle` and `quarantine_device` too, PR #3893), not a literal
+   `DispatchFn` signature widening. This is a deliberate choice, not a
+   shortfall — it matches Decision 7's own "do NOT widen `DispatchFn`"
+   constraint and covers every dispatch-capable MCP tool's denial
+   discrimination without the larger refactor a signature change would need.
+   No separate literal-widening issue is filed as a successor; #3687's own
+   acceptance criteria are satisfied by the narrower approach, and nothing
+   currently blocked on the wider signature.
 4. **RETRACTED — this item was itself wrong, twice.** The original ladder text
    ("thread a full `DispatchCaller` through `BundleOrchestrator`") was
    corrected during Rung 0 review to claim no follow-up was needed, on the
