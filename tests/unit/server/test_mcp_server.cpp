@@ -808,6 +808,38 @@ struct McpTestServer {
             return kBenignRow;
         }};
 
+    /// #3687: the pre-dispatch authorization dry run `execute_instruction`
+    /// now consults BEFORE `dispatch_fn`, in addition to (and independently
+    /// of) `classify_fn_for_test` above — production wires both from the
+    /// same `capability_registry_`, but the two test seams are deliberately
+    /// separate stubs, exactly like `classify_fn_for_test` and `dispatch_fn`
+    /// itself already are, so a test exercising one denial family need not
+    /// also reason about the other. `McpServer::AuthorizeDispatchFn`'s
+    /// contract is FAIL-CLOSED-WHEN-UNWIRED (mcp_server.hpp) — the SAME
+    /// posture as `classify_fn_for_test` — so the harness DEFAULT wires an
+    /// authorizer that unconditionally SUCCEEDS (a benign row, kill switch
+    /// implicitly "on"), preserving every pre-#3687 test's behaviour. A
+    /// denial-reason test overrides this with a stub returning the specific
+    /// `DispatchDenial` under test; a fail-closed test sets it to `{}`
+    /// (genuinely unwired).
+    yuzu::server::mcp::McpServer::AuthorizeDispatchFn authorize_dispatch_fn_for_test{
+        [](const yuzu::server::DispatchCaller&, std::string_view,
+           std::string_view) -> std::expected<yuzu::server::CommandCapability,
+                                              yuzu::server::detail::DispatchDenial> {
+            static constexpr yuzu::server::CommandCapability kBenignRow{
+                .plugin = "unused",
+                .action = "unused",
+                .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+                .mutability = yuzu::server::Mutability::None,
+                .securable = "Execution",
+                .operation = yuzu::server::authz::Operation::Read,
+                .risk_tier = yuzu::server::authz::RiskTier::Low,
+                .system_reserved = false,
+                .execute_gate = yuzu::server::ExecuteGate::None,
+            };
+            return kBenignRow;
+        }};
+
     /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
     /// real ExecutionTracker so the create_execution / set_agents_targeted
     /// / mark_cancelled lifecycle is exercised end-to-end on the MCP path.
@@ -1149,6 +1181,16 @@ private:
         // preserves every pre-#3685 test's behaviour instead of tripping
         // the new fail-closed-when-unwired gate.
         mcp.set_capability_classify_fn(classify_fn_for_test);
+
+        // #3687: the pre-dispatch authorization dry run ALSO rides a setter,
+        // same pattern as classify_fn_for_test immediately above — wire
+        // before the handlers are built. UNCONDITIONAL, but NOT a no-op
+        // default like most siblings: authorize_dispatch_fn_for_test's own
+        // default is a WIRED (non-empty), unconditionally-succeeding
+        // authorizer (see its doc comment above) precisely so this call
+        // preserves every pre-#3687 test's behaviour instead of tripping
+        // the new fail-closed-when-unwired gate.
+        mcp.set_authorize_dispatch_fn(authorize_dispatch_fn_for_test);
 
         // M5 remediation: the plugin-config/upload-grant stores ALSO ride
         // setters, same pattern as the two above — wire before the handlers
