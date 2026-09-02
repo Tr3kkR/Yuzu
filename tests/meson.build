@@ -940,6 +940,7 @@ if build_server
       'unit/server/test_store_worker_pool.cpp', # #3261: StoreWorkerPool submit/quiesce/backpressure/exception-firewall, no HTTP (avoids the unrelated TSan/glibc crash #2504)
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_dispatch_destructive_gate.cpp', # #3685: Destructive targeting gate — pure verdict + confinement + refusal-string pins
+      'unit/server/test_dashboard_destructive_gate.cpp', # PR6.0b: the same gate wired into POST /api/dashboard/execute
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
       'unit/server/test_mcp_session.cpp',
@@ -988,6 +989,7 @@ if build_server
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',
@@ -1939,14 +1941,23 @@ test('capability gate consistency',
 # docker-dependent test registered here puts a container registry on all three;
 # an earlier version of this wiring did exactly that and was reverted. Without
 # YUZU_TEST_ENABLE_PROMTOOL_DOCKER the harness needs a native promtool of the
-# pinned major and skips (77) otherwise. Timeout matches the workflow's own
-# 10-minute budget for the same work: under the opt-in this pulls a ~110 MB
-# image before it runs anything.
+# pinned major and skips (77) otherwise.
+#
+# TIMEOUT (#2340 PR-4): the harness now runs TWO full gates per invocation -
+# the shipped RULES/TESTS pair, then the marker-extracted yuzu-guardian-journal
+# group (CH-2 + CH-5-PROM) - each up to 4x120s (check + test + the canary's own
+# test + check) = 480s worst case, plus ~225s for the docker daemon probe and
+# pull ladder under the opt-in (0 under a native promtool). Worst case is
+# 225 + 480x2 = 1185s; 1500 keeps ~300s of margin over that, the same
+# methodology run_promtool_tests.py's own pull_with_retry() comment uses for
+# its ladder ("must fit inside the timeouts that enclose it") - see that
+# comment for the full arithmetic and how it composes with the CI job's own
+# `timeout-minutes` in docs-lint.yml.
 test('prometheus alert rules',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py')],
   suite: 'docs',
-  timeout: 600,
+  timeout: 1500,
 )
 
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv

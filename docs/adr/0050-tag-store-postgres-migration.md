@@ -310,3 +310,27 @@ way the window is bounded to one call and self-corrects on the very next
 Full precedence rule: `docs/asset-tagging-guide.md` "Tag source precedence
 (read time, scope-DSL, #3295)"; cross-references: `docs/adr/1006-service-scope-default-deny.md`,
 `docs/auth-architecture.md`.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the mandatory,
+fingerprint-verified, direction-aware backfill this ADR designed (across all four tag
+sources) was real, working code that never had real legacy data to protect. The
+"Recovery runbook" line earlier in this ADR is now dead: `docs/ops-runbooks/
+tag-store-backfill-recovery.md` is deleted along with the mechanism it documented.
+
+`TagStore::migrate_from_sqlite()` and its private helpers/types (`kSourcelessFingerprint`,
+`is_known_source`, `legacy_has_table`, `sha256_hex`, `legacy_text`, `LTag`,
+`LegacySnapshot`, `append_field`, `canonicalize_legacy_snapshot`,
+`fingerprint_legacy_snapshot`, `legacy_fingerprint`) are removed
+(`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623). `tag_store_meta`
+— whose entire purpose was the backfill idempotency marker — is dropped via a
+version-bumped `{2, "DROP TABLE IF EXISTS tag_store_meta;"}` migration, not edited into
+v1: this store IS constructed in production, so v1 has actually run against real
+dev/UAT databases. `server.cpp`'s boot path now runs
+`legacy_sqlite_probe::warn_if_legacy_rows` over `tags` instead — silent unless real rows
+are found, never blocks boot. The dedicated `yuzu_server_tag_store_backfill_total`
+metric and its `YuzuTagStoreBackfillNotCompleted` Prometheus alert are also removed;
+`set_metrics()`/the `metrics_` pointer stay — the read-degrade counter
+(`yuzu_server_tag_store_read_degrade_total`) is unrelated and still live.

@@ -244,3 +244,24 @@ library instead of leaning on a Postgres-side cast this store has no other reaso
   Consequences above — a soft DoS guard, not a security boundary; not tracked as a defect.
 - **Legacy `result_sets.db` disposal.** Retained read-only for one release per ADR-0009; deletion
   in the following release is a housekeeping follow-up, not tracked as an issue yet.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the standard backfill this
+ADR shipped (idempotent via `sqlite_backfill`, a dedicated marker row never inferred
+from `result_sets` being empty since `gc_sweep` legitimately empties it) was real,
+working code that never had real legacy data to protect.
+
+`ResultSetStore::migrate_from_sqlite()` and its local `SqliteConnGuard` RAII wrapper are
+removed (`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623) — this store's
+other helpers (`now_epoch`, `to_i64`, `to_bool`, `read_row`, `as_views`,
+`count_pinned_on`, `safe`) were all already shared with production reads/writes, so
+nothing else came out with it. `sqlite_backfill` is dropped via a version-bumped `{2,
+"DROP TABLE IF EXISTS sqlite_backfill;"}` migration, not edited into v1: this store IS
+constructed in production, so v1 has actually run against real dev/UAT databases.
+`gc_meta` — the UNRELATED #2360-class retention clock-guard durable state `gc_sweep`
+owns — is untouched; it is not backfill machinery despite living in the same migration
+block. `server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over
+`result_sets`/`result_set_members` instead — silent unless real rows are found, never
+blocks boot.

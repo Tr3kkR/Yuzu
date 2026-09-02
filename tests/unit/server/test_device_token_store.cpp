@@ -16,14 +16,12 @@
  *    unbound_legacy -> binding_mismatch, and the #1053 rich-rejection context per variant.
  *  - list_tokens (typed reads — ADR-0036), revoke_token, revoke_by_principal (#823).
  *
- * No legacy-SQLite backfill test coverage: the dedicated [backfill] TEST_CASE
- * suite (2026-08-25) was removed as part of a fresh-start-by-default policy
- * change (ADR-0009 amendment) — no production fleet has ever run a
- * pre-Postgres build. DeviceTokenStore::migrate_from_sqlite() itself is
- * UNCHANGED and still present (its removal is a separate, later step); it is
- * still called by one "closed store returns a sentinel on every method"
- * sweep test, which tests general fail-closed behavior, not backfill
- * correctness.
+ * No legacy-SQLite backfill test coverage: the dedicated [backfill] TEST_CASE suite
+ * (2026-08-25) was removed as part of a fresh-start-by-default policy change (ADR-0009
+ * amendment) — no production fleet has ever run a pre-Postgres build.
+ * DeviceTokenStore::migrate_from_sqlite() itself was retired
+ * (chore/retire-migrate-from-sqlite-batch-b, #3623) — this store had zero production
+ * callers to begin with, so there was no live database to protect either way.
  *
  * Migrated-to-Postgres store (ADR-0012 §1, authoritative/fail-hard). PG-gated: skips when
  * YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken (test_helpers.hpp skip-vs-fail
@@ -130,8 +128,6 @@ TEST_CASE(
     auto revoke_by_device_res = store.revoke_by_device("endpoint-99");
     CHECK_FALSE(revoke_by_device_res.has_value());
     CHECK(revoke_by_device_res.error().starts_with(yuzu::server::kDeviceTokenDbErrorPrefix));
-
-    CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/does/not/matter"));
 }
 
 // ── Create and Validate ──────────────────────────────────────────────────────
