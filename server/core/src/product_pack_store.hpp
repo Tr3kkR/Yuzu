@@ -7,6 +7,11 @@
 /// `ItemInstallFn`/`ItemUninstallFn`. Two tables, one real internal FK with `ON DELETE CASCADE`
 /// (`product_pack_items.pack_id -> product_packs.id`), ported unchanged.
 ///
+/// `migrate_from_sqlite()` retired (chore/retire-migrate-from-sqlite-batch-b, #3623) —
+/// see ADR-0054's Update. `server.cpp` now runs a detect-and-warn probe over the
+/// legacy file instead; `deleted_pack_ids`/`kErasureCoordLockSql` are kept as-is —
+/// their removal is a separate, undecided question.
+///
 /// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and runtime — packs are
 /// operator-installed content (build-time-seeded packs plus operator additions), not a cache.
 /// `install`/`uninstall` already returned `std::expected` pre-migration; `list`/`get` are widened
@@ -124,7 +129,6 @@
 #include <atomic>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -262,49 +266,13 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_product_pack_backfill_total{result}`), `list`/`get`'s read-degrade counter
+    /// Wire a metrics registry for `list`/`get`'s read-degrade counter
     /// (`yuzu_server_product_pack_read_degrade_total{reason}`), matching
     /// `CustomPropertiesStore`/`DiscoveryStore`'s #1675 convention, and `install`'s F031/#3481
     /// compensation-outcome counter (`yuzu_server_product_pack_install_compensation_total{result}`).
-    /// Set ONCE during
-    /// single-threaded startup — BEFORE `migrate_from_sqlite()`, so the backfill counter is
-    /// live on the one pass that matters (the #3261/#3294 wiring-order class; see the
-    /// construction-site comment in server.cpp). A null registry (the default, e.g. in unit
-    /// tests) disables emission.
+    /// Set ONCE during single-threaded startup, before serving. A null registry (the default,
+    /// e.g. in unit tests) disables emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
-
-    /// Legacy-SQLite backfill (ADR-0009/0054). Call once at server startup, before serving, after
-    /// construction has proven the Postgres schema is open. Idempotent PER DISTINCT LEGACY-FILE
-    /// CONTENT (a SHA-256 fingerprint over BOTH tables' rows, or a sourceless sentinel) —
-    /// `LicenseStore`'s two-table backfill is the closest reference. Fails CLOSED on any error,
-    /// including a legacy file holding exactly one of the two expected tables (no version of the
-    /// shipped binary can produce that shape — treated as corruption). Transparently handles a
-    /// pre-7.13 legacy file whose `product_packs` table predates the `verified` column (defaults
-    /// `verified=0` for that vintage, matching the pre-migration raw-`ALTER TABLE` shim this
-    /// migration retires). Returns true (no-op) when `legacy_db_path` does not exist or holds
-    /// neither table (fresh install). Opens the legacy file READ-ONLY and never deletes/moves it
-    /// — erasure consistency for THIS PATH instead runs through `deleted_pack_ids`: every legacy
-    /// pack id is checked against that table (under the same coordination lock `uninstall()`
-    /// takes — `kErasureCoordLockSql` — closing the check-then-insert race a concurrent
-    /// `uninstall()` would otherwise win) before being treated as fresh content, so a
-    /// redeployed/stale-image replica's own untouched legacy file cannot resurrect a pack this
-    /// store has already reported erased INTO POSTGRES via `uninstall()`. This runs on EVERY
-    /// boot whose legacy file content-fingerprint hasn't been seen before, not just the fleet's
-    /// first migration — see the fingerprint-marker check below.
-    ///
-    /// SCOPE (Gate 8 review of F035; resolved by ADR-0009's `ProductPackStore`/ADR-0054 update
-    /// note, adjudicated by an independent reviewer + the change owner): this closes the
-    /// cross-replica/redeployed-replica hazard only. ADR-0009's Decision section separately
-    /// requires a wired erasure path to "delete the same subject/device from the rollback
-    /// copy" — i.e. the retained legacy SQLite file itself — so that an operator who rolls the
-    /// server binary BACK to the pre-migration release (which reads this file directly and has
-    /// no knowledge Postgres or `deleted_pack_ids` exist) cannot see an uninstalled pack's
-    /// catalog listing reappear for the duration of that rollback window. This method does not
-    /// implement that half of the clause; the legacy file is never mutated. Accepted as a
-    /// deliberate, store-scoped residual — see ADR-0009's update note for the full reasoning
-    /// and its explicit non-precedent scoping.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// When true, packs WITHOUT a `signature` field are rejected at install time. Packs with a
     /// signature are always verified regardless of this flag — failed verification rejects
@@ -405,8 +373,8 @@ public:
 
     /// Uninstall a product pack, removing all contained items via uninstall_fn. Stamps `id` into
     /// `deleted_pack_ids` in the SAME transaction as the metadata delete, under
-    /// `kErasureCoordLockSql` (ADR-0009 erasure consistency — see `migrate_from_sqlite`'s doc
-    /// comment for the full mechanism and its scope).
+    /// `kErasureCoordLockSql` (ADR-0009 erasure consistency — originally serialized against the
+    /// now-retired `migrate_from_sqlite`; see the .cpp for the current status of both).
     /// `unexpected("not_found: ...")` when no pack with this id exists; any other
     /// `unexpected(msg)` (prefixed `kProductPackDbErrorPrefix`) is a genuine failure.
     std::expected<void, std::string> uninstall(const std::string& id, ItemUninstallFn uninstall_fn);

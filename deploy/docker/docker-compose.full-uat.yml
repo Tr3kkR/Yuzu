@@ -121,7 +121,10 @@ services:
       - YUZU_GW_ALLOW_DEFAULT_COOKIE=1
     ports:
       - "50051:50051"   # gRPC (agent-facing — agents connect here)
-      - "50063:50063"   # gRPC (management/command forwarding)
+      # :50063 (management/command fan-out) is deliberately NOT published: this
+      # rig's mgmt plane is plaintext+unauthenticated (allow_insecure_mgmt), so
+      # it must stay reachable only from the compose network (the server dials
+      # gateway:50063). #1422.
       - "9568:9568"     # Prometheus metrics
       - "8081:8081"     # Health/readiness
     volumes:

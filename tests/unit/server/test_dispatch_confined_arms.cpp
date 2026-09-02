@@ -753,3 +753,78 @@ TEST_CASE("wire_and_dispatch_confined: a per-device claim is released when the s
     CHECK(second.sent == 1);
     CHECK(second.not_sent.empty());
 }
+
+// ===================================================================================
+// PR6.0b — the D3 DECISION PIN: the shared confined-dispatch seam must NOT
+// refuse a Destructive-class fan-out.
+//
+// `dispatch_destructive_gate.hpp` deliberately gates Destructive TARGETING in
+// route/handler code (`/api/command`, MCP `execute_instruction`, and — since
+// PR6.0b — `POST /api/dashboard/execute`) and NOT here. That decision looks
+// like an oversight from `server.cpp`: `ServerImpl::dispatch_confined` has no
+// dispatch-class check at all, so "finish the job at the chokepoint" is the
+// obvious next move. It is the wrong move, and until this case existed the
+// only thing standing between the next person and shipping it was a paragraph
+// of prose.
+//
+// WHAT WOULD BREAK: `ScheduleRunner::dispatch_tracked` (schedule_runner.cpp)
+// dispatches EVERY scheduled fire with `agent_ids={}` plus a scope expression
+// — an empty stored `scope_expression` is mapped to `kBroadcastScope` right at
+// the call site — and `schedule_arming_permitted`
+// (schedule_arming_check.hpp) refuses only `system_reserved` and unclassified
+// rows, never Destructive ones. A Destructive-refusing gate at this seam
+// therefore turns every scheduled Destructive instruction into a permanent,
+// silent zero-reach fire, INCLUDING the approval-gated ones the four-eyes
+// ticket flow exists to make safe. `rest_api_v1.cpp`'s async result-set
+// producers dispatch `{}` + `__all__` by construction too.
+//
+// HONEST LIMIT OF THIS PIN: this seam receives a `ClassifiedCommand` (a wire
+// `CommandRequest`), never a `CommandCapability`, so it structurally CANNOT
+// consult the dispatch class without a signature widening. This case fails on
+// any gate added inside `wire_and_dispatch_confined` /
+// `resolve_and_dispatch_confined` / `dispatch_confined_arms`. It does NOT
+// reach a gate added directly in `ServerImpl::dispatch_confined`'s own body,
+// which no test seam exposes — that path is still guarded by prose alone.
+// ===================================================================================
+
+TEST_CASE("the shared confined-dispatch seam does not refuse a Destructive fan-out "
+          "(dispatch_destructive_gate.hpp D3)",
+          "[server][dispatch][scope][security][destructive]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    for (const auto& id : {"dev-A", "dev-B", "dev-C"}) {
+        (void)registry.register_agent(make_wiring_test_info(id));
+        registry.set_gateway_route(
+            id, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+    }
+
+    // A REAL Destructive row (tar.purge_source, DispatchClass::Destructive in
+    // capability_decls/plugin_action_catalogue_a.hpp) — named explicitly so
+    // this case cannot quietly become a test about a harmless pair.
+    yuzu::agent::v1::CommandRequest cmd;
+    cmd.set_command_id("d3-pin-cmd");
+    cmd.set_plugin("tar");
+    cmd.set_action("purge_source");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    auto classified = ClassifiedCommandTestAccess::make(cmd);
+
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+
+    // EXACTLY the shape ScheduleRunner produces: no agent_ids, `__all__`
+    // scope, and the unfiltered visible set a system/background caller has.
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"d3-pin-cmd", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{}, /*scope_expr=*/std::string(yuzu::server::kBroadcastScope),
+        /*exec_visible=*/unfiltered(), /*broadcast_on_none=*/false, kNoContainment, classified);
+
+    // The scheduled purge REACHES the fleet. If this ever reads 0, read this
+    // case's header before "fixing" it — the fix is almost certainly a gate
+    // that belongs in a route handler instead.
+    CHECK(outcome.sent == 3);
+}

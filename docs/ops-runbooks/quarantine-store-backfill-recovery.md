@@ -4,10 +4,11 @@ Covers boot-time refusals from the mandatory legacy `quarantine.db` →
 PostgreSQL `quarantine_store` backfill (ADR-0047). If the server is refusing
 to start because of this backfill, this is the page. Background: ADR-0047,
 `docs/postgres-store-playbook.md`; the fingerprint machinery mirrors
-`RbacStore`'s recovery shape (`rbac-store-backfill-recovery.md`) and
-`CustomPropertiesStore`'s (`custom-properties-store-backfill-recovery.md`),
-sized for a single-table, unbounded-retention security-containment record
-instead of operator-editable asset-tagging data.
+`RbacStore`'s recovery shape (`rbac-store-backfill-recovery.md`), sized for
+a single-table, unbounded-retention security-containment record instead of
+operator-editable asset-tagging data. (`CustomPropertiesStore`'s equivalent
+recovery doc was retired along with its backfill mechanism, #3623 — no
+longer a live comparison.)
 
 ## Data-integrity refusals (before any row reaches Postgres)
 
