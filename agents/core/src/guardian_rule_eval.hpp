@@ -96,6 +96,28 @@ struct RuleAssertion {
                              ///< watch the same value_name; NOT part of the compliance verdict here.
 };
 
+/// #2233 item 6: hard agent-side ceiling on an AUTHORED max_bytes, applied (after the
+/// existing 0->default normalisation above) on both the spark
+/// (guardian_spark_bridge.hpp) and legacy (guardian_engine.cpp) file-hash-equals arm
+/// paths - single-sourced so the two cannot drift apart on the ceiling the way two
+/// independent hand-rolled clamps would (this repo's established pattern for exactly
+/// this class of bug; see #3388's jitter fix for precedent). A footgun guard, not a
+/// tight resource limit: an authored value previously had NO upper bound, so an
+/// operator (deliberately or by typo) could direct the detached hashing worker to read
+/// to EOF or an effectively-unbounded cap, which can saturate the file bulkhead and
+/// trip the F3 hard-exit grace at shutdown. Picked with headroom under
+/// guard_file.cpp's own `static_cast<std::size_t>` truncation point (4 GiB on a
+/// 32-bit size_t, e.g. 32-bit ARM) - comfortably generous (16x the 64 MiB default
+/// above) for any legitimate file-integrity target while staying well clear of that
+/// boundary. Flagged in this PR's body for review, not asserted as definitively
+/// correct - there is no measured fleet requirement pinning this exact figure.
+inline constexpr std::uint64_t kMaxFileHashBytes = 1024ull * 1024 * 1024; // 1 GiB
+
+/// Clamp an already-normalised (0->default) max_bytes to kMaxFileHashBytes.
+[[nodiscard]] constexpr std::uint64_t clamp_max_hash_bytes(std::uint64_t v) noexcept {
+    return v > kMaxFileHashBytes ? kMaxFileHashBytes : v;
+}
+
 /// Intrinsic file state read once per spark_key from a single owned handle (the
 /// #807 handle-scoped read, a later rung). Compliance is key-relative EXCEPT
 /// oversize, which each rule projects from its own `max_bytes` vs `size`. `hash`

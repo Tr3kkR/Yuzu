@@ -29,6 +29,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1556,6 +1557,49 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
 
     engine.stop();
     spark_engine.stop();
+}
+
+TEST_CASE("source tripwire: Agent::run() calls guardian start_local() before opening "
+          "the Subscribe stream (#2233 item 1, the pre-network property)",
+          "[spark][guardian][reconcile][boot][source_tripwire]") {
+    // The PRODUCTION boot order test above proves WHAT start_local() does with a
+    // non-empty cached policy in the real production CALL order (wire_spark_engine then
+    // start_local) - #2233 item 1's checklist wording verbatim ("test a non-empty
+    // cached KV policy armed during pre-network startup"). What it cannot prove is WHEN
+    // Agent::run() calls start_local() relative to the network-dependent Subscribe
+    // stream: that ordering lives in agent.cpp, and this repo has no Agent-level test
+    // harness (a mocked gRPC stub/channel) to exercise it behaviourally. This closes
+    // the "pre-network" half as a textual ordering guarantee instead: if a future edit
+    // moves start_local() to after the Subscribe stream opens, this fails loudly rather
+    // than silently reopening the boot-ordering defect #2233 originally found.
+    std::ifstream input(std::filesystem::path(YUZU_AGENT_SRC_DIR) / "agent.cpp");
+    REQUIRE(input.is_open());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+
+    const auto start_local_pos = source.find("guardian_->start_local()");
+    REQUIRE(start_local_pos != std::string::npos);
+    const auto subscribe_pos = source.find("stub->Subscribe(&sub_ctx)");
+    REQUIRE(subscribe_pos != std::string::npos);
+    CHECK(start_local_pos < subscribe_pos);
+}
+
+TEST_CASE("source tripwire: the legacy file-hash-equals arm path applies the #2233 "
+          "item 6 ceiling",
+          "[guardian][source_tripwire]") {
+    // clamp_max_hash_bytes itself is directly unit-tested (test_guardian_rule_eval.cpp)
+    // and the spark path's use of it is proven end to end
+    // (test_guardian_spark_bridge.cpp's rule_assertion_from_rule tests). GuardianEngine's
+    // legacy file-hash-equals parsing lives in a private member function
+    // (start_guard_for_rule_locked) with no existing test seam to observe the resulting
+    // FileGuard::Config::max_hash_bytes directly - this pins that the legacy call site
+    // actually routes through the SAME shared function, rather than trusting the two
+    // paths not to drift apart silently.
+    std::ifstream input(std::filesystem::path(YUZU_AGENT_SRC_DIR) / "guardian_engine.cpp");
+    REQUIRE(input.is_open());
+    const std::string source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    CHECK(source.find("clamp_max_hash_bytes(fcfg.max_hash_bytes)") != std::string::npos);
 }
 
 TEST_CASE("a production-order restart into each degraded spark posture: cached rules "

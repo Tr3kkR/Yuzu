@@ -49,14 +49,26 @@ TEST_CASE("health heartbeat: non-zero demotion emits the pinned key + value (F5 
     CHECK(std::string(kGuardianPriorityDemotedTag) == "yuzu.guardian_priority_demoted");
 }
 
-TEST_CASE("health heartbeat: all three counters independent and additive",
+TEST_CASE("health heartbeat: non-zero outbox backpressure drops emits the pinned key + "
+          "value (#2993)",
+          "[guardian][health][heartbeat]") {
+    std::map<std::string, std::string> tags;
+    emit_guardian_health_heartbeat_tags(tags, GuardianHealthStats{.outbox_backpressure_drops = 11});
+    CHECK(tags.size() == 1);
+    CHECK(tags.at("yuzu.guardian_outbox_backpressure_drops") == "11");
+    CHECK(std::string(kGuardianOutboxBackpressureDropsTag) ==
+          "yuzu.guardian_outbox_backpressure_drops");
+}
+
+TEST_CASE("health heartbeat: all four counters independent and additive",
           "[guardian][health][heartbeat]") {
     std::map<std::string, std::string> tags;
     emit_guardian_health_heartbeat_tags(
         tags, GuardianHealthStats{.unhealthy_suppressed = 1, .unhealthy_refreshed = 2,
-                                  .priority_demoted = 3});
-    CHECK(tags.size() == 3);
+                                  .priority_demoted = 3, .outbox_backpressure_drops = 4});
+    CHECK(tags.size() == 4);
     CHECK(tags.at("yuzu.guardian_unhealthy_suppressed") == "1");
     CHECK(tags.at("yuzu.guardian_unhealthy_refreshed") == "2");
     CHECK(tags.at("yuzu.guardian_priority_demoted") == "3");
+    CHECK(tags.at("yuzu.guardian_outbox_backpressure_drops") == "4");
 }
