@@ -5,6 +5,8 @@
 #include "guardian_resilience_schema.hpp"
 #include "guardian_schema_registry.hpp" // supported_registry_hives / value_types
 
+#include <yuzu/guardian_file_hash_limits.hpp> // kMaxFileHashBytes (#2233 item 6)
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -114,13 +116,28 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
                 "supply the 64-char hex digest, or leave it empty to baseline on arm"};
         // max_bytes / settle_ms are string-or-int on the wire; validate the
         // string form here (an integer passes through to the agent's bounded
-        // parse). max_bytes=0 makes every covered file report <oversize>.
+        // parse, unchanged - the dashboard form (the primary max_bytes-authoring
+        // surface, test_guardian_form_render.cpp) always submits the string
+        // form, which is why closing #2233 item 6's authoring-time gap here is
+        // enough to reach the common case). max_bytes=0 makes every covered
+        // file report <oversize>; max_bytes above kMaxFileHashBytes was
+        // previously accepted and stored verbatim while the agent silently
+        // enforced a lower cap (Gate 4 unhappy-path UP-1/UP-2, PR
+        // spark-pr2a-runtime-robustness) - reject it here too, naming the
+        // ceiling, so the rule's stored/echoed params never diverge from what
+        // is actually enforced.
         std::uint64_t n = 0;
-        if (params.contains("max_bytes") && params["max_bytes"].is_string() &&
-            (!is_whole_u64(params["max_bytes"].get<std::string>(), n) || n == 0))
-            return ResilienceParamError{
-                "max_bytes must be a positive integer",
-                "set assertion.params.max_bytes >= 1 (bytes), or omit it for the default cap"};
+        if (params.contains("max_bytes") && params["max_bytes"].is_string()) {
+            if (!is_whole_u64(params["max_bytes"].get<std::string>(), n) || n == 0)
+                return ResilienceParamError{
+                    "max_bytes must be a positive integer",
+                    "set assertion.params.max_bytes >= 1 (bytes), or omit it for the default cap"};
+            if (n > yuzu::guardian::kMaxFileHashBytes)
+                return ResilienceParamError{
+                    "max_bytes exceeds the 1 GiB agent-side ceiling (#2233 item 6)",
+                    "set assertion.params.max_bytes to at most 1073741824 (1 GiB) - a "
+                    "larger value would only be silently clamped on the agent"};
+        }
         if (params.contains("settle_ms") && params["settle_ms"].is_string() &&
             !is_whole_u64(params["settle_ms"].get<std::string>(), n))
             return ResilienceParamError{

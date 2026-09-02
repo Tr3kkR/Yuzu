@@ -345,7 +345,51 @@ json service_rule_body(const std::string& assertion_type, const std::string& ser
         {"remediation", {{"type", remediation_type}, {"params", json::object()}}},
     };
 }
+
+// Build a file-hash-equals rule body for derive_rule_spec. `max_bytes_str`, if
+// non-null, is authored as a JSON STRING (the dashboard form's wire shape,
+// test_guardian_form_render.cpp) — the #2233 item 6 ceiling check only fires on
+// that encoding (see guardian_rule_spec.cpp's validate_assertion_params).
+json file_hash_rule_body(const char* max_bytes_str) {
+    json params = {{"path", "/etc/hosts"}};
+    if (max_bytes_str)
+        params["max_bytes"] = max_bytes_str;
+    return json{
+        {"spark", {{"type", "file-change"}, {"params", {{"path", "/etc/hosts"}}}}},
+        {"assertion", {{"type", "file-hash-equals"}, {"params", params}}},
+        {"remediation", {{"type", "alert-only"}, {"params", json::object()}}},
+    };
+}
 } // namespace
+
+TEST_CASE("#2233 item 6: file-hash-equals max_bytes above the 1 GiB ceiling is "
+          "rejected at authoring time (string form)",
+          "[guardian][file][derive][max_bytes]") {
+    // Exactly at the ceiling: accepted.
+    auto at = derive_rule_spec(file_hash_rule_body("1073741824"), "fh", 1, true, "audit");
+    CHECK_FALSE(at.error.has_value());
+    CHECK(at.structured);
+
+    // One byte over: rejected, naming the ceiling.
+    auto over = derive_rule_spec(file_hash_rule_body("1073741825"), "fh", 1, true, "audit");
+    REQUIRE(over.error.has_value());
+    CHECK(over.error->message.find("1 GiB") != std::string::npos);
+
+    // Absent: accepted (agent default applies).
+    CHECK_FALSE(derive_rule_spec(file_hash_rule_body(nullptr), "fh", 1, true, "audit")
+                    .error.has_value());
+
+    // Zero: still rejected by the pre-existing check, not this new one.
+    auto zero = derive_rule_spec(file_hash_rule_body("0"), "fh", 1, true, "audit");
+    REQUIRE(zero.error.has_value());
+    CHECK(zero.error->message.find("positive integer") != std::string::npos);
+
+    // A JSON-integer max_bytes bypasses this check entirely (documented, not this
+    // PR's gap to close — the dashboard form only ever sends the string form).
+    json int_body = file_hash_rule_body(nullptr);
+    int_body["assertion"]["params"]["max_bytes"] = 5ull * 1024 * 1024 * 1024; // 5 GiB, as int
+    CHECK_FALSE(derive_rule_spec(int_body, "fh", 1, true, "audit").error.has_value());
+}
 
 TEST_CASE("PR5: service-running/stopped with a valid service_name authors a structured spec",
           "[guardian][service][derive]") {

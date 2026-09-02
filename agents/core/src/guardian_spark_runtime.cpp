@@ -471,9 +471,15 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // guard's destructor fires during that unwind and undoes phase 1's
     // arming_keys_/index_ bookkeeping - its fn was assigned back at function scope,
     // before arming_keys_.emplace() ran, so a bad_alloc during that assignment itself
-    // (the original defect) has nothing left to leak. No live subscription exists to
-    // disarm here either way (the exception means we never got an io_result at all,
-    // successful or not) - the in-memory cleanup is all that is needed.
+    // (the original defect) has nothing left to leak. This in-memory cleanup is all
+    // THIS function needs to do: run()'s own worker lambda re-checks arming_keys_
+    // under registry_mu_ before treating a late success as still-wanted (still_wanted
+    // below) and self-disarms if not, so an abandoned-but-still-completing arm is
+    // covered independently of why the caller abandoned it. That self-disarm race is
+    // NOT airtight against every throw site inside io_executor_.run() itself (e.g. a
+    // std::mutex::lock() failure on its own post-launch wait, after the worker is
+    // already detached and running, is outside run()'s own try/catch) - a narrow,
+    // pre-existing gap in GuardianIoExecutor unrelated to #3831 and not fixed here.
     auto io_result = io_executor_.run(
         *io_class, key, cfg_.backend_op_deadline,
         [self_keepalive = shared_from_this(), backend = backend_, spec, key, rule_id,
