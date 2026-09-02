@@ -29,7 +29,6 @@ constexpr const char* kStoreName = "discovery_store";
 // budgets are generous relative to e.g. the gRPC ingest path.
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
-constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
 // Read-degrade observability (mirrors ManagementGroupStore/AccessReviewStore).
 constexpr const char* kReasonStoreClosed = "store_not_open";
@@ -77,11 +76,10 @@ std::string text_col(PGresult* res, int row, int col) {
                        static_cast<std::size_t>(PQgetlength(res, row, col)));
 }
 
-// Applied to every free-text column reaching Postgres, including the
-// backfill path (a bad byte at-rest in a legacy discovery.db must not brick
-// the mandatory backfill). Scrubs invalid UTF-8 to U+FFFD, then replaces any
-// embedded NUL (PostgreSQL TEXT cannot store one; libpq's text bind
-// C-string-truncates at the first one).
+// Applied to every free-text column reaching Postgres, agent scan input
+// included. Scrubs invalid UTF-8 to U+FFFD, then replaces any embedded NUL
+// (PostgreSQL TEXT cannot store one; libpq's text bind C-string-truncates
+// at the first one).
 std::string sanitize_pg_text(std::string_view s) {
     std::string out = sanitize_utf8_strict(s);
     std::size_t pos = 0;

@@ -11266,9 +11266,10 @@ private:
             // Prior membership is retained; there is NO automatic
             // repopulation pass (governance UP-5 — an earlier comment here
             // claimed one) — membership refreshes only when this ensure
-            // helper next runs, i.e. on the next `service`-tag write. The
-            // operator-facing recovery guidance lives in
-            // docs/ops-runbooks/tag-store-backfill-recovery.md.
+            // helper next runs, i.e. on the next `service`-tag write. There
+            // is no dedicated recovery runbook for this; a degraded tag
+            // store is a `TagStore::agents_with_tag` failure, diagnosed the
+            // same way as any other store-degrade log line.
             if (tag_store_) {
                 if (auto agents = tag_store_->agents_with_tag("service", service_value)) {
                     mgmt_group_store_->refresh_dynamic_membership(*result, *agents);

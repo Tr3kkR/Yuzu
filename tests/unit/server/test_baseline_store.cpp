@@ -27,10 +27,10 @@
  * suite (ADR-0009/0055) was removed as part of a fresh-start-by-default
  * policy change (ADR-0009 amendment, 2026-08-25) -- no production fleet has
  * ever run a pre-Postgres build. BaselineStore::migrate_from_sqlite() itself
- * is UNCHANGED and still present (its removal is a separate, later step);
- * the "bad path yields a closed store" test still exercises it as one of
- * many sentinel-return checks on a closed store, unrelated to backfill
- * correctness.
+ * was retired (chore/retire-migrate-from-sqlite-batch-b, #3623); the "bad
+ * path yields a closed store" test is unaffected -- it exercises
+ * construction against an unroutable DSN, one of many sentinel-return
+ * checks on a closed store, unrelated to backfill correctness.
  */
 
 #include "baseline_store.hpp"

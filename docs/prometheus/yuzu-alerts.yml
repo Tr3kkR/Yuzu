@@ -2894,8 +2894,10 @@ groups:
             tracking signal, not alert state.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInstructionBundledContentNotClean
-        # Same absent-success shape as YuzuProductPackBackfillNotCompleted above, adapted
-        # for an EVERY-BOOT (not one-time) outcome (gov Gate 4 UP-4/Gate 8 fix): the
+        # Same absent-success shape used elsewhere on this page for a one-time boot outcome
+        # (alert on the ABSENCE of a good result rather than the PRESENCE of a bad one, since
+        # a refused boot never serves /metrics), adapted here for an EVERY-BOOT (not one-time)
+        # outcome (gov Gate 4 UP-4/Gate 8 fix): the
         # InstructionStore bundled-content reseed loop (232 definitions / 10 sets as of
         # this writing) runs during server CONSTRUCTION, and a genuine DB error on any
         # item sets startup_failed_ — the HTTP listener never starts, /metrics is never

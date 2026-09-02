@@ -44,7 +44,6 @@ constexpr const char* kStoreName = "tag_store";
 // the per-Register agent sync. All can wait a little; none may block
 // unboundedly on a saturated pool.
 constexpr std::chrono::milliseconds kAcquireTimeout{2000};
-constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
 // Upper bound on one sync_agent_tags batch (governance perf-F1). The proto
 // map is unbounded and gRPC's 4 MB default message cap admits ~10^5 entries;

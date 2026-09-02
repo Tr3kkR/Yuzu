@@ -32,7 +32,6 @@ constexpr const char* kStoreName = "custom_properties_store";
 // props.<key> scope resolver's bulk preload (agent_registry.cpp). All can
 // wait a little; none may block unboundedly on a saturated pool.
 constexpr std::chrono::milliseconds kAcquireTimeout{2000};
-constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(

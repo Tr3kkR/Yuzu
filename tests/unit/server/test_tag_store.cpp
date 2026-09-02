@@ -10,12 +10,11 @@
  * fault-injection and degrade tests take their OWN template clone (a
  * dropped table / installed trigger must not leak into the shared clone).
  *
- * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
- * TEST_CASE suite was removed as part of a fresh-start-by-default policy
- * change (ADR-0009 amendment) -- no production fleet has ever run a
- * pre-Postgres build. TagStore::migrate_from_sqlite() itself is UNCHANGED
- * and still present in production code; only this file's test coverage of
- * it was removed.
+ * No legacy-SQLite backfill test coverage: the dedicated backfill TEST_CASE
+ * suite (ADR-0009) was removed as part of a fresh-start-by-default policy
+ * change (ADR-0009 amendment, 2026-08-25) -- no production fleet has ever
+ * run a pre-Postgres build. TagStore::migrate_from_sqlite() itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  */
 
 #include "tag_store.hpp"
