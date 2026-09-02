@@ -306,21 +306,25 @@ public:
     /// RBAC binder `build_classified_command` itself consults, never a
     /// re-implemented slice — Decision 7 F fix,
     /// `docs/security-reviews/1398-dispatch-approval-gate-design.md`) and
-    /// then, only on success, the SAME per-action kill-switch DECISION
-    /// (`PluginConfigStore::action_allowed`, unset store == legacy-open)
-    /// `finalize_classified_command` also gates on — same order (kill
-    /// switch checked AFTER classify+authorize, so it can never mask a
-    /// `Forbidden`/`ApprovalRequired` verdict with a weaker-sounding one).
-    /// That half is an EQUIVALENT RE-EXPRESSION, not the identical call:
-    /// `finalize_classified_command`'s signature also builds the wire
-    /// `pb::CommandRequest` (`command_id`/`target_arm`/`execution_id`/
-    /// `parameters`/...), none of which exist yet in a pre-dispatch dry run,
-    /// so the production closure re-expresses just the kill-switch boolean
-    /// inline (`action_allowed(plugin, action)`) rather than calling that
-    /// function. Both reduce to the identical condition today — verified by
-    /// test — but a future change to `finalize_classified_command`'s
-    /// kill-switch clause must be mirrored here by hand; it will not be
-    /// caught by sharing code, only by the tests pinning both.
+    /// then, only on success, `kill_switch_denial` (`agent_registry.hpp`) —
+    /// the SAME extracted function `finalize_classified_command` itself
+    /// calls for the per-action kill switch, not a re-implemented slice of
+    /// that decision either (Gate 6 governance fix: an earlier round of this
+    /// change re-expressed the kill-switch boolean inline instead of sharing
+    /// `finalize_classified_command`'s own extracted check — the class of
+    /// drift `finalize_classified_command`'s own M6/wave1 extraction exists
+    /// to prevent, reintroduced once and caught by governance; this seam now
+    /// shares the extracted function like the classify+authorize half
+    /// always did). Kill switch checked AFTER classify+authorize, so it can
+    /// never mask a `Forbidden`/`ApprovalRequired` verdict with a
+    /// weaker-sounding one. Because both halves now call the SAME shared
+    /// functions `finalize_classified_command` calls, the existing
+    /// `finalize_classified_command`/`kill_switch_denial` tests in
+    /// `tests/unit/server/test_dispatch_chokepoint.cpp` (KillSwitched refusal,
+    /// legacy-open-when-unwired, canonical-plugin/action consultation) cover
+    /// this seam's kill-switch behavior too — there is no separate "the two
+    /// paths agree" claim left to verify, because there is only one
+    /// implementation of the decision.
     ///
     /// FAIL-CLOSED contract, matching `ClassifyFn` immediately above (the
     /// OPPOSITE default posture from most `*Fn` seams in this file): an

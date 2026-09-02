@@ -22421,28 +22421,29 @@ private:
             // set_capability_classify_fn immediately above (capability_registry_
             // is a plain ServerImpl member, never conditional on another store's
             // presence). Composes the SAME two DECISIONS build_classified_command
-            // makes, in the SAME order. The classify+authorize half genuinely
-            // calls the shared code: classify_and_authorize_dispatch, via the
-            // SAME has_permission binder (dispatch_has_permission above) —
-            // never a re-implemented slice. The kill-switch half is an
-            // EQUIVALENT RE-EXPRESSION, not a shared call:
-            // finalize_classified_command's own signature also builds the wire
-            // pb::CommandRequest (command_id/target_arm/execution_id/
-            // parameters/...), none of which exist here — this is a pre-dispatch
-            // dry run, not a dispatch — so the boolean condition
-            // (`plugin_config_store_ != nullptr && !action_allowed(...)`) is
-            // written out inline instead, reduced to the identical condition
-            // finalize_classified_command applies today (pinned by test), but
-            // NOT sharing code with it — a future change to that function's
-            // kill-switch clause must be mirrored here by hand. `plugin_config_
-            // store_` is read live through `this` (not captured by value), so
-            // this wiring is safe regardless of construction order relative to
-            // that store; an unset store means legacy-open for the kill-switch
-            // gate ONLY, mirroring build_classified_command's own unwired
-            // contract.
-            // Per McpServer::AuthorizeDispatchFn's fail-closed contract
-            // (mcp_server.hpp), omitting this call refuses every
-            // execute_instruction call outright, not merely a degraded tool.
+            // makes, in the SAME order, and NEITHER is a re-implemented slice:
+            // the classify+authorize half calls classify_and_authorize_dispatch
+            // via the SAME has_permission binder (dispatch_has_permission
+            // above); the kill-switch half calls the SAME kill_switch_denial
+            // (agent_registry.hpp) finalize_classified_command itself calls —
+            // Gate 6 governance fix: an earlier round of this PR re-expressed
+            // that boolean inline instead of sharing code with
+            // finalize_classified_command, reintroducing the exact
+            // "from-scratch copy drifts from what production enforces" shape
+            // that function's own M6/wave1 extraction closed once already;
+            // this wiring now shares the extracted function instead.
+            // `action_allowed`'s construction (nullptr-guarded
+            // plugin_config_store_ wrap) is the SAME literal composition
+            // build_classified_command uses ahead of its own
+            // finalize_classified_command call, above. `plugin_config_store_`
+            // is read live through `this` (not captured by value), so this
+            // wiring is safe regardless of construction order relative to
+            // that store; an unset store means legacy-open for the
+            // kill-switch gate ONLY, mirroring build_classified_command's own
+            // unwired contract. Per McpServer::AuthorizeDispatchFn's
+            // fail-closed contract (mcp_server.hpp), omitting this whole call
+            // refuses every execute_instruction call outright, not merely a
+            // degraded tool.
             mcp_server_->set_authorize_dispatch_fn(
                 [this](const yuzu::server::DispatchCaller& caller, std::string_view plugin,
                        std::string_view action)
@@ -22456,12 +22457,16 @@ private:
                         });
                     if (!decision)
                         return decision;
-                    if (plugin_config_store_ != nullptr &&
-                        !plugin_config_store_->action_allowed(decision->plugin,
-                                                              decision->action)) {
-                        return std::unexpected(yuzu::server::detail::DispatchDenial{
-                            yuzu::server::detail::DispatchDenialReason::KillSwitched,
-                            std::string(decision->securable), decision->operation});
+                    const std::function<bool(std::string_view, std::string_view)> action_allowed =
+                        plugin_config_store_ != nullptr
+                            ? std::function<bool(std::string_view, std::string_view)>(
+                                  [this](std::string_view p, std::string_view a) {
+                                      return plugin_config_store_->action_allowed(p, a);
+                                  })
+                            : std::function<bool(std::string_view, std::string_view)>{};
+                    if (auto denial =
+                            yuzu::server::detail::kill_switch_denial(*decision, action_allowed)) {
+                        return std::unexpected(*denial);
                     }
                     return decision;
                 });
