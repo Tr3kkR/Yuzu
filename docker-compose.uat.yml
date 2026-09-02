@@ -40,9 +40,11 @@ configs:
               {backpressure_threshold, 1000},
               {hash_ring_vnodes, 256},
               %% #1422 escape hatch - UAT ONLY: the mgmt listener below is
-              %% plaintext on 0.0.0.0 and the gateway otherwise refuses to
-              %% boot. Safe only while :50063 stays unpublished on this
-              %% compose network.
+              %% plaintext on 0.0.0.0; a gateway image carrying the #1422
+              %% mgmt-posture guard refuses to boot without this (the
+              %% release-pinned image above ignores the key until a release
+              %% ships the guard). Safe only while :50063 stays unpublished
+              %% on this compose network.
               {allow_insecure_mgmt, true}
           ]},
           {grpcbox, [
