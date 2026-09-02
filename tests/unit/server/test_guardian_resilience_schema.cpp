@@ -384,11 +384,17 @@ TEST_CASE("#2233 item 6: file-hash-equals max_bytes above the 1 GiB ceiling is "
     REQUIRE(zero.error.has_value());
     CHECK(zero.error->message.find("positive integer") != std::string::npos);
 
-    // A JSON-integer max_bytes bypasses this check entirely (documented, not this
-    // PR's gap to close — the dashboard form only ever sends the string form).
-    json int_body = file_hash_rule_body(nullptr);
-    int_body["assertion"]["params"]["max_bytes"] = 5ull * 1024 * 1024 * 1024; // 5 GiB, as int
-    CHECK_FALSE(derive_rule_spec(int_body, "fh", 1, true, "audit").error.has_value());
+    // A JSON-integer (unsigned) max_bytes is checked against the ceiling too, so
+    // the two wire forms can't drift apart on enforcement (its zero-check stays
+    // deferred to the agent, matching this file's pre-existing design for that
+    // form — only the new ceiling closes for both).
+    json int_over = file_hash_rule_body(nullptr);
+    int_over["assertion"]["params"]["max_bytes"] = 5ull * 1024 * 1024 * 1024; // 5 GiB, as int
+    REQUIRE(derive_rule_spec(int_over, "fh", 1, true, "audit").error.has_value());
+
+    json int_at = file_hash_rule_body(nullptr);
+    int_at["assertion"]["params"]["max_bytes"] = 1073741824ull; // exactly at ceiling, as int
+    CHECK_FALSE(derive_rule_spec(int_at, "fh", 1, true, "audit").error.has_value());
 }
 
 TEST_CASE("PR5: service-running/stopped with a valid service_name authors a structured spec",

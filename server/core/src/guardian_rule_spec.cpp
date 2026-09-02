@@ -114,18 +114,17 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
             return ResilienceParamError{
                 "expected_hash must be a 64-char SHA-256 hex digest (or empty)",
                 "supply the 64-char hex digest, or leave it empty to baseline on arm"};
-        // max_bytes / settle_ms are string-or-int on the wire; validate the
-        // string form here (an integer passes through to the agent's bounded
-        // parse, unchanged - the dashboard form (the primary max_bytes-authoring
-        // surface, test_guardian_form_render.cpp) always submits the string
-        // form, which is why closing #2233 item 6's authoring-time gap here is
-        // enough to reach the common case). max_bytes=0 makes every covered
-        // file report <oversize>; max_bytes above kMaxFileHashBytes was
-        // previously accepted and stored verbatim while the agent silently
-        // enforced a lower cap (Gate 4 unhappy-path UP-1/UP-2, PR
-        // spark-pr2a-runtime-robustness) - reject it here too, naming the
-        // ceiling, so the rule's stored/echoed params never diverge from what
-        // is actually enforced.
+        // max_bytes / settle_ms are string-or-int on the wire; the pre-existing
+        // (untouched-by-this-check) design only ever fully validated the string
+        // form here, leaving an integer max_bytes to the agent's own bounded
+        // parse. The #2233 item 6 ceiling check below applies to BOTH wire forms
+        // (closing an asymmetry this PR itself would otherwise introduce - a
+        // ceiling enforced for one JSON type and not the other is not really a
+        // ceiling): a JSON-string value is still fully validated (positive
+        // integer + ceiling); a JSON-integer/unsigned value is checked against
+        // the ceiling ONLY (its zero-check and general shape are unchanged,
+        // still deferred to the agent, matching this file's pre-existing design
+        // for that wire form - only the new ceiling is closed for both).
         std::uint64_t n = 0;
         if (params.contains("max_bytes") && params["max_bytes"].is_string()) {
             if (!is_whole_u64(params["max_bytes"].get<std::string>(), n) || n == 0)
@@ -137,6 +136,12 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
                     "max_bytes exceeds the 1 GiB agent-side ceiling",
                     "set assertion.params.max_bytes to at most 1073741824 (1 GiB) - a "
                     "larger value would only be silently clamped on the agent"};
+        } else if (params.contains("max_bytes") && params["max_bytes"].is_number_unsigned() &&
+                   params["max_bytes"].get<std::uint64_t>() > yuzu::guardian::kMaxFileHashBytes) {
+            return ResilienceParamError{
+                "max_bytes exceeds the 1 GiB agent-side ceiling",
+                "set assertion.params.max_bytes to at most 1073741824 (1 GiB) - a "
+                "larger value would only be silently clamped on the agent"};
         }
         if (params.contains("settle_ms") && params["settle_ms"].is_string() &&
             !is_whole_u64(params["settle_ms"].get<std::string>(), n))
