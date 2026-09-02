@@ -10,7 +10,7 @@ depends-on: ADR-0017, ADR-0033, ADR-1006 (this document's decisions must compose
 context-refs: ADR-0006, ADR-0031 (presentation-core-engine-decomposition), ADR-0032, ADR-0041,
   ADR-0042, ADR-1005, docs/auth-engine-principals-design.md, #388, #480, #1362, #1453, #1496,
   #1715, #1842, #2485, #2665, #2670, #2677, #2721, #2809, #3290, #3489
-supersedes: nothing (net-new target-architecture record; ADR-0017/1006 remain the accepted
+supersedes: nothing (net-new target-architecture record; ADR-0017/0033/1006 remain the accepted
   contracts this one builds forward from)
 ---
 
@@ -155,10 +155,14 @@ spans two currently separate stores -- the grant lives in `RbacStore`, the human
 status lives in `AuthDB` -- and neither exposes a joint transaction primitive to the other today,
 even though both are constructed over the same underlying Postgres pool. This decision requires
 building one (e.g. the enable transaction takes its connection from whichever store owns the
-toggle write and passes it to an explicit `is_user_active_on(conn, username)`-shaped call on the
 other, rather than two sequential, non-transactional reads); it is not a detail D2 can leave
 implicit, because a non-transactional version of this check reopens exactly the zero-active-
-Administrators race this decision exists to close.
+Administrators race this decision exists to close. **"Same transaction" alone is not sufficient
+under ordinary `READ COMMITTED` isolation (Gate-4 governance finding):** a concurrent,
+independently-ordinary deactivation of the checked Administrator can still commit between the
+read and the toggle-write unless the read takes a row lock on the checked account (or the
+transaction runs `SERIALIZABLE` with retry-on-conflict) -- this decision requires one of those
+two, not merely a shared transaction boundary with unspecified isolation.
 
 *Non-conformance (defect) today:* no code path can enable RBAC at all (#388); `set_rbac_enabled`
 cannot report failure to a caller. *Not yet built:* the bootstrap-grant conditioning, the
@@ -189,11 +193,24 @@ INV-7 resolver) with an explicit rule for where an assignment-deny sits in the e
 precedence, reviewed with the same rigor as #1715 was. Until then, an assignment record's
 `effect` field, if built, is `allow`-only.
 
+**The chokepoint also covers group-membership writes, not only role assignment (Gate-4 governance
+finding).** Adding a member to a group that already holds a role grant is, in effect, granting
+that member the group's roles -- the ordinary onboarding action, not an edge case -- and
+`RbacStore::add_group_member` today writes directly (`INSERT INTO group_members` + a generation
+bump) with no call into `validate_assignment` or any equivalent check. Left as is, this is a
+grant-authority bypass in plain sight: whoever can add a group member can hand that member
+every permission the group holds, regardless of whether they themselves could pass D4's check
+for any of those permissions. This decision therefore extends its own chokepoint scope to
+group-membership writes against any role-bearing group -- a membership add must pass the D4
+check for the group's own currently-held role grants -- not only to the role-assignment writes
+named above.
+
 *Non-conformance (defect) today:* the scoped-assignment route hardcodes its allowed-roles list
 (`role_name != "Operator" && role_name != "Viewer"`) instead of deriving it from D4; there is no
-production write path for a global human assignment at all. *Not yet built:* the shared
-assignment record shape; a decided, tested lattice rule for assignment-level deny (deliberately
-out of this decision's scope, see above).
+production write path for a global human assignment at all; `add_group_member` bypasses the
+chokepoint entirely (see above). *Not yet built:* the shared assignment record shape; a decided,
+tested lattice rule for assignment-level deny (deliberately out of this decision's scope, see
+above); the group-membership check just added to this decision's scope.
 
 ### D4 -- Grant authority is an explicit administrative model: the grantor must currently hold what they grant, computed as an effective-authority delta
 
@@ -207,21 +224,47 @@ delta, but it operates on currently-persisted state -- it is not a transactional
 before/after simulator, and this decision does not claim the check is free to build; it requires
 either evaluating the delta inside the same transaction as the write (persisted-before vs.
 persisted-after, with rollback on violation) or an equivalent hypothetical-state evaluation this
-document does not further specify.
+document does not further specify. **Whichever mechanism is chosen, a failure to complete the
+delta computation -- a degraded resolver, a timed-out read, an incomplete hypothetical-state
+evaluation -- must deny the grant, never default-allow it (Gate-4 governance finding): this
+decision's whole purpose is closing an escalation path, and an unspecified failure mode on either
+mechanism would silently reopen it.**
+
+**The delta is evaluated against the grantor's full ADR-0033 §1 effective authority, not only
+their RBAC/management-group lattice standing (Gate-4 governance finding).** An earlier draft's
+"effective permission set" language reused ADR-0033 §1's own defined term while silently scoping
+it to `visible_agents_for_permission`'s RBAC-lattice-only view -- §1 defines effective authority
+as the full intersection (authenticated-actor grants ∩ represented-operator grants ∩
+attenuated-credential grants, when a credential is presented, ∩ ...), and states plainly that "no
+applicable filter may be skipped because another one passed." A grant request arriving on an
+attenuated credential (ADR-0033 §3) must have its credential's own minted envelope checked
+alongside the underlying principal's RBAC holdings -- otherwise a token deliberately minted with
+narrower authority than its owner could pass this check by riding the owner's broader standing
+grants, exactly the escalation-by-token-laundering shape ADR-0032 Decision 7 and this document's
+own D6 already guard dispatch authority against. This decision does not reuse `visible_agents_for_
+permission` alone as sufficient; it requires the same credential-attenuation filter §1 already
+mandates whenever a credential is presented.
 
 **A point-in-time check at assignment is necessary but not sufficient (second Sol review): it
-does not prevent authority that widens *after* the grant with no new assignment event.** A grant
-that adds no authority today because a deny currently masks it can become effective the moment
-that deny is later removed by someone else; a management-group hierarchy change can widen the
-descendant set a scoped grant reaches; a later edit to the granted role's own permissions can
-give the grantee more than the grantor verified at grant time. None of these are new assignment
-events, so a check that only runs at assignment time cannot catch them. This decision therefore
-requires one of: (a) a durable ceiling recorded on the assignment (the grantor's authority
-snapshot at grant time, re-verified whenever the assignment's authority is *read*, not only when
-it is written), or (b) revalidation triggered by every mutation that can grow an existing
-assignment's effective reach (deny removal, hierarchy reparenting, role-permission edits). Which
-of these -- or another mechanism -- is chosen is left open; this decision fixes the requirement
-(latent widening must be caught, not only grant-time escalation), not the mechanism.
+does not prevent authority that widens *after* the grant with no new assignment event.** Four
+distinct triggers can do this, none of them a new assignment event: (1) a grant that adds no
+authority today because a deny currently masks it can become effective the moment that deny is
+later removed by someone else; (2) a management-group hierarchy change can widen the descendant
+set a scoped grant reaches; (3) a later edit to the granted role's own permissions can give the
+grantee more than the grantor verified at grant time; (4) **adding a member to a group that
+already holds a role (D3's chokepoint extension above covers the write itself; this is the same
+widening problem viewed from D4's side)**; (5) **a D10 time-bound grant's `valid_from` arriving --
+a grant with zero delta at creation time can activate later with no new assignment event, the
+same shape as (1)-(4) just clock-driven instead of mutation-driven (Gate-4 governance finding;
+D10's corrected text already requires its OWN read-time expiry check for `valid_until` -- an
+implementation must not treat `valid_from` activation as somehow already covered by that same
+fix without separately checking it).** This decision therefore requires one of: (a) a durable
+ceiling recorded on the assignment (the grantor's authority snapshot at grant time, re-verified
+whenever the assignment's authority is *read*, not only when it is written), or (b) revalidation
+triggered by every mutation that can grow an existing assignment's effective reach (deny removal,
+hierarchy reparenting, role-permission edits, group-membership growth). Which of these -- or
+another mechanism -- is chosen is left open; this decision fixes the requirement (latent widening
+must be caught, not only grant-time escalation), not the mechanism.
 
 **This decision deliberately rejects the alternative administrative model -- a dedicated
 `Approve`/administer-without-holding permission -- that ADR-0033 §8 already adopted for
@@ -274,7 +317,8 @@ route reaches none of them.
 
 Retiring `ManagementGroupStore::get_visible_agents` in favor of `visible_agents_for_permission`
 is **not a new decision this ADR makes** -- ADR-0017 INV-6 already states PR-C "deletes the
-role-existence narrower... rather than extending it." This document reaffirms that conformance
+role-existence narrower and its full-fleet fallback... rather than extending them." This document
+reaffirms that conformance
 with INV-6 is required for a gold-standard claim; it does not re-decide it.
 
 *Non-conformance (defect) today:* `get_visible_agents` still has 7 production call sites (a
@@ -433,6 +477,16 @@ sentence.
    deployment required -- adoption cannot itself be an escalation path. Adoption re-roots the
    Baseline to the adopting operator and clears the pending-adoption state; re-enforcement
    resumes at the next distribution event that reaches each agent, not instantly on adoption.
+   **The orphaned-to-adopted transition is a guarded, atomic state change, not an unconditional
+   overwrite (Gate-4 governance finding):** this document's own Context section already names the
+   identical failure family elsewhere (#1362, management-group reparenting's non-atomic
+   check-then-write), and this codebase already has the correct pattern for a stateful, mutating,
+   execute-once transition on exactly this shape of record (the Deployment/Preflight guarded-
+   transition + CAS pattern this codebase's routed concerns document as catastrophic if violated).
+   `adopt_baseline` must use the same shape -- a CAS on the orphan/adoption state, not a bare
+   read-then-write -- so two racing adoptions, or an adoption racing a concurrent narrowing of the
+   adopting operator's own authority, cannot both succeed or leave the Baseline in an inconsistent
+   root state.
 
    **Shared-Guard rule:** a Guard reached by more than
    one Baseline is armed once on the agent, and `deployed_member_rule_ids()` returns a flat,
@@ -465,6 +519,15 @@ sentence.
    defeating "bounded, prompt pause" in substance (a Gate-2 governance finding). The exact
    values are implementation, but the requirement that a floor and default be stated up front,
    the same standard D9 already holds itself to for its own operational-cost parameters, is not.
+   **The sweep must also emit its own liveness signal (Gate-4 governance finding):** sub-clause
+   3's central guarantee is that orphaning "pauses enforcement, loudly" -- but that guarantee is
+   only as strong as the sweep that detects orphaning, and nothing above says what happens if the
+   sweep itself crashes, hangs, or cannot reach the store mid-cycle. A dead sweep degrades
+   silently to the opposite of the guarantee: stale rules keep enforcing fleet-wide with no
+   operator-visible sign anything stopped working. This decision requires a "last successful
+   sweep completed" timestamp or gauge, alerted on after N missed cycles, the same way any other
+   safety-critical background process in this codebase is expected to prove it is still running,
+   not merely that it is scheduled to run.
 4. **Credential recheck.** For Schedules, ADR-0032 Decision 7 already decides this: its text
    names "a schedule" outright, requires recording the arming credential (not only the arming
    human), and states plainly that revocation, expiry, or deletion of that credential stops the
@@ -695,11 +758,26 @@ presently coupled to `AuthRoutes`' request/response types, so simply asking impl
 "use the real ladder" without extracting a shared core invites exactly the second,
 divergent implementation this decision forbids.
 
+**"One decision core" means one core PER GATE FAMILY, not one ladder for every gate (Gate-4
+governance finding).** `require_permission`'s ladder is not the only one this decision must
+cover: ADR-1006 Decision 2 already froze `require_list_read`/`require_fleet_read` as a
+deliberately DIFFERENT ladder from `require_permission`'s -- "two gates, two route classes, kept
+deliberately separate" -- and #3290 built `require_fleet_read`'s caller-class branches to
+mirror `require_list_read`'s ordering, explicitly NOT `require_permission`'s (no
+service-scope belt-and-braces check `require_fleet_read` structurally cannot need). A single
+core extracted only from `require_permission`'s ladder and asked to answer for a
+list/fan-out-read-gated operation would reproduce this decision's own named defect (`rbac/check`
+diverging from the real gate) for that entire route class. This decision therefore requires
+either a family-parameterized core (one shape for `require_permission`, a second for
+`require_list_read`/`require_fleet_read`) or an explicit, reliable way for a `can-i` caller to
+resolve which family a given operation belongs to before consulting the core -- "extract the
+ladder" is underspecified until one of those two is chosen.
+
 *Non-conformance (defect) today:* `POST /api/v1/rbac/check` calls raw `check_permission`
 directly, reproducing none of the toggle-off legacy fallback, JIT elevation (it currently
 returns a false negative for an elevated caller the real gate would admit), engine-principal
 branch, management-group scoping, service-token scoping, or MCP tier ordering. No Request-free
-decision core exists to extract from yet.
+decision core exists to extract from yet, for either gate family.
 
 ### D9 -- Every authorization decision emits one structured, queryable record, and a record that cannot be written fails the request closed
 
@@ -712,6 +790,16 @@ logging that cannot be aggregated is non-conforming. Consistent with the codebas
 audit-failure posture (ADR-0033 §9, mutations fail closed on audit-write failure): **a mutating
 authorization decision whose record cannot be durably written is itself denied, not admitted
 with a missing record.**
+
+**A fail-closed mutation denial must be distinguishable from an ordinary permission denial
+(Gate-4 governance finding).** `rest_audit.hpp` already gives REST behavioural-PII reads a
+distinguishing signal for exactly this situation (`Sec-Audit-Failed`, per the correction below);
+this decision's mutation-side fail-closed clause does not yet have an equivalent. Under
+sustained audit-store unavailability, every mutating gate this decision covers would deny
+indistinguishably from a genuine 403 -- an operator or on-call responder chasing the outage would
+see what looks like a permissions problem, not an infra one, across the entire mutating surface
+of the product for the duration of the outage. This decision requires an equivalent
+operator-visible signal on an audit-driven mutation denial, not only the denial itself.
 
 **Correction (adversarial review, 2026-09-02): the read-only half of this decision, as originally
 written, overrode an accepted ADR's existing per-surface posture rather than preserving it.**
@@ -742,7 +830,14 @@ under load in production is not an acceptable way to make that call.
 A decision engine built to D8 is expected to expose its winning grant/deny and reason as a
 normal return value; an "explain this decision" surface (effective-permissions view, a
 dry-run simulator) is a direct consumer of D8 plus this decision's closed reason taxonomy, not a
-separate mechanism requiring its own architectural decision.
+separate mechanism requiring its own architectural decision. **This covers a LIVE query only
+(Gate-4 governance finding):** the persisted record's closed, low-cardinality reason taxonomy is
+deliberately too coarse to name which specific grant/role/group admitted a *past* decision once
+live state has since changed -- D8's return value can explain a decision made right now, but
+this decision does not, as specified, let an operator forensically reconstruct why an audit-log
+entry from last month was admitted. If that forensic capability is wanted, it needs its own,
+necessarily higher-cardinality, audit-log-only field -- never Prometheus-labeled -- which this
+decision does not currently add.
 
 *Non-conformance today:* audit logging exists per-gate but is not uniform, and most gate callers
 already ignore the audit helper's own success/failure return today -- **correction (second Sol
@@ -793,6 +888,18 @@ cached "allow" unconditionally. Whichever of the two an implementation picks, it
 construction this decision adds, not something the existing mutation-triggered rule already
 provides for free.
 
+**The two options are safety-equivalent only if "bound lifetime" means enforced at read time, not
+merely eventual reaping (Gate-4 governance finding).** A passive-eviction reading of "bound
+lifetime" -- expired entries reaped by a background timer or on the next unrelated write, rather
+than checked synchronously on every hit -- reopens the exact staleness gap this fix just closed:
+a hit landing in the window between `valid_until` elapsing and the next reap cycle still returns
+the cached "allow." Both options therefore require the same structural change regardless of which
+is chosen: `perm_cache_`'s current value type (a bare `bool`, with no field for a deadline or the
+window itself) must gain a per-entry expiry the read path checks on every hit. "Bound lifetime to
+`valid_until`" and "re-check `now()` on every hit" are two names for the same read-time
+enforcement, not two independently-safe alternatives -- an implementer must not pick a
+timer-based reap believing it satisfies the lighter-sounding of the two options.
+
 *Not yet built* (not a defect -- this capability has never existed): only JIT-to-admin exists;
 no assignment record carries a validity window. Access-review's `flagged_revoke` intentionally
 records evidence only and does not itself revoke -- that is existing, correct policy and is
@@ -824,8 +931,9 @@ activation) is a distinct, currently unaddressed decision, explicitly out of sco
   It mandates one validation chokepoint and one API-facing record shape. Table layout is
   implementation, not architecture, and is left to the store playbook.
 - **D3 explicitly declines to add assignment-level deny.** A future decision that wants one must
-  extend the frozen #1715 resolver with its own precedence rule -- this document does not do
-  that implicitly via an unexamined `effect` field.
+  extend `resolve_perm_groups` (the single INV-7 resolver implementing the #1715-frozen lattice)
+  with its own precedence rule -- this document does not do that implicitly via an unexamined
+  `effect` field.
 - **D6 is compliance with ADR-0032 Decision 7 for Schedules, and this document's own extension of
   the same mechanism to Guardian, decided directly rather than argued as a forced reading of
   existing text.** Anyone implementing D6 should still check the credential-recheck mechanics
@@ -920,7 +1028,8 @@ activation) is a distinct, currently unaddressed decision, explicitly out of sco
 
 ## Governance
 
-Not run through `/governance`. Review history so far:
+Now through `/governance` Gates 2-4 (entries 13-14 below); Gates 5-6 and Dave's final sign-off
+remain. Review history so far:
 
 1. **Codex (Sol, `gpt-5.6-sol`), read-only opine, 2026-09-02.** Reviewed an earlier
    delivery-plan-shaped draft. Corrected several overclaims (call-site counts, a claim that the
@@ -1190,11 +1299,53 @@ ordinary review" rule going forward.
     (Gate 4) are outstanding as of this entry. Verdict: not ready without this round's fixes;
     re-verify once the remaining gates complete.
 
-Gate 2 (`security-guardian` + `docs-writer`) and Gate 3 (`architect`) have now run against this
-document as ADR-1008, per entry 13 above. Remaining before acceptance: Gate 4
-(happy-path/unhappy-path/consistency-auditor), Gate 6 (compliance-officer/sre/enterprise-
-readiness), and Dave's final sign-off -- the same gates every accepted architecture decision in
-this codebase goes through, not a heightened bar specific to this document. D6's implementers
+14. **Fold `/governance` Gate 4 (2026-09-02).** `happy-path`, `unhappy-path`, and
+    `consistency-auditor` ran independently against the post-entry-13 text. All three found real,
+    non-overlapping gaps Gate 2/3 did not: `happy-path` found D3/D4's escalation chain never named
+    RBAC group-membership growth as a widening trigger (`add_group_member` writes directly, with
+    no call into `validate_assignment` -- verified against the actual function), and that D8's
+    single-decision-core claim didn't account for ADR-1006 Decision 2's frozen, deliberately
+    different `require_list_read`/`require_fleet_read` ladder (verified against that accepted
+    ADR's own text). `unhappy-path` found four decisions that specify WHAT a mechanism must
+    accomplish but leave fail-open-vs-fail-closed behavior under partial failure or concurrency
+    unaddressed: D2's cross-store Administrator check names "same transaction" without a locking
+    discipline, leaving a concurrent-deactivation race under ordinary `READ COMMITTED` isolation;
+    D6's periodic sweep had no liveness signal, so the sweep itself dying silently defeats
+    sub-clause 3's own "pauses enforcement, loudly" guarantee; D9's fail-closed mutation denial
+    has no operator-visible signal distinguishing it from an ordinary 403, unlike the
+    `Sec-Audit-Failed` precedent this codebase already has for reads; and D4's second,
+    unspecified delta-computation mechanism never states that a failed computation must deny
+    rather than default-allow. It also found D6's `adopt_baseline`/`adopt_schedule` transition has
+    no concurrency control, against this codebase's own routed, catastrophic-if-violated
+    guarded-transition precedent for the structurally identical Deployment/Preflight mutations.
+    `consistency-auditor` independently found the most consequential gap of the round: D4's
+    "effective authority" language silently narrows ADR-0033 §1's own accepted definition of that
+    exact term (the full authenticated-actor ∩ represented-operator ∩ attenuated-credential ∩ ...
+    intersection, which §1 states no applicable filter may skip) down to only the RBAC/
+    management-group lattice via `visible_agents_for_permission` -- a grant request arriving on an
+    attenuated credential could pass D4's check by riding its owner's broader RBAC standing,
+    exactly the token-laundering escalation D6 and ADR-0032 Decision 7 already guard dispatch
+    authority against, now found unguarded on the higher-stakes standing-authority-grant seam.
+    This is the same false-assurance shape Gate 2 already blocked once in this document (D10);
+    finding a second, independent instance of it in D4 is why Gate 4 exists as a distinct pass
+    from Gate 2/3, not a formality. `consistency-auditor` also found D4 never cross-referenced
+    D10's `valid_from` activation as a fifth latent-widening trigger, and that this Governance
+    section's own opening line still read "Not run through `/governance`" after entry 13 had
+    already run two of its gates -- both fixed. Every finding in this entry was independently
+    verified against the cited code or accepted-ADR text before being accepted, distinguishing
+    real false-assurance/omission defects (fixed into D2/D3/D4/D6/D8/D9/D10 above) from
+    ordinary, already-flagged "not yet built" incompleteness (not re-litigated). Two findings
+    (D2's connection-hold duration, D5's CI-test false-negative risk) were speculative and
+    non-blocking per their own reviewer's assessment; noted here, not fixed, since fixing an
+    unverified speculative concern risks adding false precision instead of real coverage. Gate 5
+    (chaos-injector) and Gate 6 (compliance-officer/sre/enterprise-readiness) remain. Verdict: not
+    ready without this round's fixes; ready once they land, which they now have.
+
+Gates 2 through 4 have now run against this document as ADR-1008, per entries 13-14 above.
+Remaining before acceptance: Gate 6 (compliance-officer/sre/enterprise-readiness), Gate 5
+(chaos-injector, if warranted by Gate 4's risk register), and Dave's final sign-off -- the same
+gates every accepted architecture decision in this codebase goes through, not a heightened bar
+specific to this document. D6's implementers
 should still read ADR-0032 Decision 7's text directly before building the Guardian mechanism, the
 same way any implementer reads the ADR they are building a novel extension of, but that is
 ordinary diligence, not a precondition on the decision itself. Given how much of D6's mechanics
