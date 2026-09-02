@@ -184,13 +184,13 @@ key-format migration, ~2.4 GB of dead weight pinning the pool back near the
 specific previous bucket, as above — anything else then ages out on GitHub's
 own 7-day-unused clock instead of living forever. **Recovering from an
 already-immortal entry:** `gh cache list --repo <owner>/<repo> --limit 100`
-to find it, then `gh api -X DELETE "repos/<owner>/<repo>/actions/caches?key=<key>&ref=<ref>"`
-to remove it. `ref` is technically optional on this endpoint — omitting it
-deletes EVERY cache matching `key` across every ref — but always supply it
-(from the same listing) for a time-bucket key like this one: it has no
-branch component, so `push` and `pull_request` runs routinely produce
-identical-key entries on different refs, and an unscoped delete takes all
-of them.
+to find its numeric id (the first column), then `gh cache delete <id> --repo
+<owner>/<repo>` to remove exactly that entry. Delete by id, not by key — a
+time-bucket key like this one has no branch component, so `push` and
+`pull_request` runs routinely produce several entries sharing the same key
+on different refs, each with its own id; `gh cache list`'s columns are
+id/key/size/created/last-accessed (no ref column), and the id is the one
+value in that listing that names a single entry unambiguously.
 
 Pair the bucket with a job-level `CCACHE_MAXSIZE` sized for ONE build of that
 leg (the workflow-level value may be a self-hosted budget orders of magnitude
