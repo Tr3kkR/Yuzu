@@ -5752,10 +5752,12 @@ public:
         // (ADR-0006/ADR-0036, schema `result_set_store`) — construction fail-CLOSED
         // per ADR-0012 §1 (same template as OfflineEndpointStore above): a
         // reachable database whose schema can't migrate/open is a fatal startup
-        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
-        // one-time, idempotent legacy-`result_sets.db` backfill (ADR-0009) —
-        // AUTHORITATIVE posture means a backfill failure is ALSO fatal (never
-        // serve on top of a partially-migrated schema).
+        // error, never a serve-degraded state. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // result_sets.db is never copied; the detect-and-warn obligation
+        // still applies, so legacy_sqlite_probe::warn_if_legacy_rows() opens
+        // the legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             result_set_store_ = std::make_unique<ResultSetStore>(*pg_pool_);
             if (!result_set_store_->is_open()) {
@@ -5764,20 +5766,9 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
-                auto rs_db = cfg_.db_dir() / "result_sets.db";
-                if (!result_set_store_->migrate_from_sqlite(rs_db)) {
-                    spdlog::error("[PG] Refusing to start: result-set legacy-SQLite backfill "
-                                  "failed (see prior log lines) — result_set_store is "
-                                  "authoritative and must not serve partially-migrated data. "
-                                  "Operator remediation: repair {} or move it aside to skip the "
-                                  "backfill (pinned sets in it will NOT carry over)",
-                                  rs_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("ResultSetStore initialized (schema result_set_store; legacy "
-                                 "backfill source {})",
-                                 rs_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "result_sets.db",
+                                                         "ResultSetStore",
+                                                         {"result_sets", "result_set_members"});
             }
         }
 

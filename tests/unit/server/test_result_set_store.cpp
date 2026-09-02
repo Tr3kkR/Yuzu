@@ -10,9 +10,8 @@
  * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
  * TEST_CASE suite was removed as part of a fresh-start-by-default policy
  * change (ADR-0009 amendment) -- no production fleet has ever run a
- * pre-Postgres build. ResultSetStore::migrate_from_sqlite() itself is
- * UNCHANGED and still present in production code; only this file's test
- * coverage of it was removed.
+ * pre-Postgres build. ResultSetStore::migrate_from_sqlite() itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  */
 
 #include "result_set_store.hpp"
