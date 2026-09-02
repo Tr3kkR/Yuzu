@@ -61,6 +61,17 @@ void set_meta(PgPool& pool, const std::string& key, std::int64_t value) {
                     std::vector<std::string>{key, std::to_string(value)});
 }
 
+// Write a RAW (un-sanitised) string into session_meta — models a hand-edited row,
+// a bad migration, or storage corruption writing a non-numeric/negative/overflowed
+// anchor. The typed set_meta above cannot express these (#3785).
+void set_meta_raw(PgPool& pool, const std::string& key, const std::string& raw_value) {
+    auto lease = pool.acquire();
+    pg::exec_params(lease.get(),
+                    "INSERT INTO session_store.session_meta (key, value) VALUES ($1, $2) "
+                    "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                    std::vector<std::string>{key, raw_value});
+}
+
 void set_last_activity(PgPool& pool, const std::string& hash, std::int64_t ms) {
     auto lease = pool.acquire();
     pg::exec_params(lease.get(),
@@ -267,6 +278,87 @@ TEST_CASE("SessionStore: reap declines an anchor AHEAD of the DB clock (backward
     CHECK(reaped->deleted == 0);
     CHECK(reaped->clock_anomaly); // backward-skew decline is a clock anomaly
     CHECK(store.find("dead2")->has_value());
+}
+
+// #3785: the persisted anchor is a plain key/value string a hand-edit, a bad
+// migration, or storage corruption can write anything into. An unparseable,
+// negative, or overflowed anchor must be REJECTED as a clock anomaly (decline,
+// delete nothing), never parsed by an unchecked strtoll into 0/garbage — on an
+// endpoint the user controls, a quiet reset IS the bypass (clock-guarded-
+// retention part 3). Each case seeds an already-expired session and asserts the
+// pass declines and leaves it intact.
+TEST_CASE("SessionStore: reap declines a non-numeric (junk) persisted anchor",
+          "[session_store][pg][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("dead3", "ivy", -1000)).has_value());
+    set_meta_raw(pool, "reap_anchor_ms", "123junk"); // strtoll parses 123, trailing 'junk'
+
+    auto reaped = store.reap_expired();
+    REQUIRE(reaped.has_value());
+    CHECK(reaped->deleted == 0);
+    CHECK(reaped->clock_anomaly);            // unparseable anchor → decline
+    CHECK(store.find("dead3")->has_value()); // survived — no delete under a bad anchor
+}
+
+TEST_CASE("SessionStore: reap declines a negative persisted anchor",
+          "[session_store][pg][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("dead4", "jon", -1000)).has_value());
+    set_meta_raw(pool, "reap_anchor_ms", "-1000"); // parses cleanly, but negative
+
+    auto reaped = store.reap_expired();
+    REQUIRE(reaped.has_value());
+    CHECK(reaped->deleted == 0);
+    CHECK(reaped->clock_anomaly);            // negative anchor → decline
+    CHECK(store.find("dead4")->has_value());
+}
+
+TEST_CASE("SessionStore: reap declines an overflowed (out-of-int64) persisted anchor",
+          "[session_store][pg][retention]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("dead5", "kim", -1000)).has_value());
+    // 25 nines > INT64_MAX (~9.2e18): strtoll sets errno=ERANGE. Without the
+    // checked parse, `anchor + kMaxPlausibleSkewMs` on this value is signed-
+    // overflow UB — this case is the regression net for that fix.
+    set_meta_raw(pool, "reap_anchor_ms", "9999999999999999999999999");
+
+    auto reaped = store.reap_expired();
+    REQUIRE(reaped.has_value());
+    CHECK(reaped->deleted == 0);
+    CHECK(reaped->clock_anomaly);            // overflowed anchor → decline
+    CHECK(store.find("dead5")->has_value());
+}
+
+TEST_CASE("SessionStore: reap declines an empty-string persisted anchor (NULL-column analogue)",
+          "[session_store][pg][retention]") {
+    // An empty value is what libpq surfaces for a SQL NULL column, and what a
+    // botched write can leave behind. `has_anchor` is true (the row exists) but
+    // parse_reap_i64("") rejects it → decline, never a quiet fallback to 0.
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("dead6", "leo", -1000)).has_value());
+    set_meta_raw(pool, "reap_anchor_ms", ""); // empty value present under the key
+
+    auto reaped = store.reap_expired();
+    REQUIRE(reaped.has_value());
+    CHECK(reaped->deleted == 0);
+    CHECK(reaped->clock_anomaly);            // empty anchor → decline
+    CHECK(store.find("dead6")->has_value());
 }
 
 TEST_CASE("SessionStore: touch_activity is monotonic — a now() stamp never regresses last_activity",
