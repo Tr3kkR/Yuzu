@@ -3019,47 +3019,7 @@ groups:
             degraded and answered 503 rather than a silently-wrong result.
             Pair with yuzu_pg_pool_* saturation signals; /readyz does not
             reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
-      - alert: YuzuProductPackBackfillNotCompleted
-        # Mirrors YuzuTagStoreBackfillNotCompleted's absent-success shape (NOT
-        # CustomPropertiesStore's result="failed" shape, which is accepted
-        # debt precisely because it cannot fire — see that alert's own
-        # comment): the one-time legacy product-packs.db -> product_pack_store
-        # backfill (ADR-0054) runs during server CONSTRUCTION, and a failure
-        # sets startup_failed_ so the HTTP listener never starts — /metrics is
-        # never served and a result="failed" sample is never scraped, making a
-        # failed-keyed expression unfireable. What IS observable is the
-        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
-        # server.cpp's product-pack-store construction block (describe() +
-        # zero-loop over fresh/success/failed) — that is what makes "series
-        # absent" mean "no server is serving" rather than "metric not
-        # registered". THREE-WAY result split: fresh | success | failed; expr
-        # matches the two good outcomes. LIMITS: multi-replica — one wedged
-        # replica among healthy ones shows as up == 0, not this; a
-        # legitimately long first boot on a huge product-packs.db can trip it
-        # during the upgrade window (silence for the window). The BOOT LOG
-        # carries the actual remediation (which pack/item id conflicted). This
-        # is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed product-pack backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            product-packs.db -> PostgreSQL product_pack_store backfill
-            (ADR-0054) in the last 15 minutes. After an upgrade the usual
-            cause is a server that FAILED the backfill: it fails CLOSED,
-            refuses to serve, and retries on the next start — a restart loop
-            with the whole server down. A differently-valued pack/item
-            conflict across replicas means the currently-served pack catalog
-            may be the WRONG SIDE of an operator-authored-data race — treat
-            it as a data-integrity incident, not just an availability one.
-            Read the server BOOT log for the exact pack/item id and repair or
-            move the losing replica's legacy file aside before restarting.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-productpackstore-adr-0054"
       - alert: YuzuProductPackCompensationPartial
         # #3481: install()'s best-effort compensating rollback (undoing
         # already-installed sibling-store content after a late persist or

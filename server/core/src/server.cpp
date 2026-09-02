@@ -6176,9 +6176,11 @@ public:
         // `product_pack_store`). Construction fail-CLOSED per ADR-0012 §1 (same template as
         // CustomPropertiesStore/NotificationStore above): a reachable database whose schema
         // can't migrate/open is a fatal startup error, never a serve-degraded pack catalog.
-        // `migrate_from_sqlite` runs the one-time, idempotent legacy-`product-packs.db` backfill
-        // (ADR-0009) — AUTHORITATIVE operator-installed content means a backfill failure is ALSO
-        // fatal (never serve on top of partially-migrated packs).
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the legacy
+        // product-packs.db is never copied; the detect-and-warn obligation still applies
+        // (this store holds real operator-installed content), so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file read-only and
+        // warns (with a row count) only if it actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             product_pack_store_ = std::make_unique<ProductPackStore>(*pg_pool_);
             if (!product_pack_store_->is_open()) {
@@ -6188,19 +6190,10 @@ public:
                 startup_failed_ = true;
             } else {
                 spdlog::info("ProductPackStore initialized (schema product_pack_store)");
-                // #3261/#3294 class: set_metrics BEFORE migrate_from_sqlite, so the
-                // backfill-result counter is live on the one pass that matters — a
-                // registry wired only after the (one-shot, idempotent) backfill call
-                // would leave that specific pass permanently uncounted.
                 product_pack_store_->set_metrics(&metrics_);
-                // Pre-seed both bounded-label families to 0 (governance arch-F2, per
+                // Pre-seed the bounded-label family to 0 (governance arch-F2, per
                 // docs/observability-conventions.md, TagStore precedent above) so
-                // absent()-based alerting stays meaningful before the first
-                // degrade/backfill event — load-bearing here specifically because a
-                // backfill failure sets startup_failed_ (refused boot never serves
-                // /metrics at all), so an alert on THIS store's backfill result must
-                // be able to fire on the ABSENCE of a success/fresh sample, which
-                // requires the label set to already exist.
+                // absent()-based alerting stays meaningful before the first degrade event.
                 metrics_.describe("yuzu_server_product_pack_read_degrade_total",
                                   "ProductPackStore reads that degraded instead of answering, by "
                                   "reason",
@@ -6208,13 +6201,6 @@ public:
                 for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
                     metrics_.counter("yuzu_server_product_pack_read_degrade_total",
                                      {{"reason", reason}});
-                }
-                metrics_.describe("yuzu_server_product_pack_backfill_total",
-                                  "One-time legacy product-packs.db backfill outcome (ADR-0054)",
-                                  "counter");
-                for (auto result : {"fresh", "success", "failed"}) {
-                    metrics_.counter("yuzu_server_product_pack_backfill_total",
-                                     {{"result", result}});
                 }
                 metrics_.describe("yuzu_server_product_pack_install_compensation_total",
                                   "#3481: best-effort rollback of already-installed sibling-store "
@@ -6232,34 +6218,25 @@ public:
                     metrics_.counter("yuzu_server_product_pack_install_compensation_total",
                                      {{"result", result}});
                 }
-                auto pack_db = cfg_.db_dir() / "product-packs.db";
-                if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: product-pack legacy-SQLite backfill failed "
-                        "(see prior log lines) — product_pack_store is the AUTHORITATIVE pack "
-                        "catalog and must not serve partially-migrated data. Operator "
-                        "remediation: repair {} or move it aside to skip the backfill (packs "
-                        "in it will NOT carry over)",
-                        pack_db.string());
-                    startup_failed_ = true;
-                } else {
-                    // #802 / W7.4: enforce signed-pack-by-default. Default ProductPackStore
-                    // ctor sets require_signed_packs_=true; we invert only when the operator
-                    // opts in via the flag, and make the relaxed posture loud in operator logs
-                    // + audit (audit emission deferred to post-audit_store_-construction block
-                    // below to mirror the viz_disable pattern). #3261/#3294 class: this call
-                    // MUST stay inside the same fail-closed guard as construction — a
-                    // null-guarded call sitting outside it is the silent-skip-wiring bug class
-                    // that shipped three dead integrations.
-                    product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
-                    if (cfg_.allow_unsigned_packs) {
-                        spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
-                                     "by configuration (--allow-unsigned-packs / "
-                                     "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
-                                     "accepted at install — this exposes the fleet to "
-                                     "arbitrary instruction/plugin execution. Sign packs and "
-                                     "remove the flag as soon as feasible.");
-                    }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "product-packs.db",
+                                                         "ProductPackStore",
+                                                         {"product_packs", "product_pack_items"});
+                // #802 / W7.4: enforce signed-pack-by-default. Default ProductPackStore
+                // ctor sets require_signed_packs_=true; we invert only when the operator
+                // opts in via the flag, and make the relaxed posture loud in operator logs
+                // + audit (audit emission deferred to post-audit_store_-construction block
+                // below to mirror the viz_disable pattern). #3261/#3294 class: this call
+                // MUST stay inside the same fail-closed guard as construction — a
+                // null-guarded call sitting outside it is the silent-skip-wiring bug class
+                // that shipped three dead integrations.
+                product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
+                if (cfg_.allow_unsigned_packs) {
+                    spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
+                                 "by configuration (--allow-unsigned-packs / "
+                                 "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
+                                 "accepted at install — this exposes the fleet to "
+                                 "arbitrary instruction/plugin execution. Sign packs and "
+                                 "remove the flag as soon as feasible.");
                 }
             }
         }

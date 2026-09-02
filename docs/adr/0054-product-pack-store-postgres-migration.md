@@ -208,3 +208,31 @@ general precedent.
   regression).
 - No change to the `#802`/W7.4 signed-pack enforcement semantics, the Ed25519 verify path, or the
   `--allow-unsigned-packs` operator flag — all pure/storage-independent and ported unchanged.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the mandatory,
+fingerprint-verified backfill this ADR designed (with its `deleted_pack_ids`
+cross-replica-resurrection guard, Gate-8-reviewed as F035) was real, working code that
+never had real legacy data to protect.
+
+`ProductPackStore::migrate_from_sqlite()` and its private helpers/types (`sqlite_table_exists`,
+`sqlite_column_exists`, `LegacyPackRow`, `LegacyItemRow`, `sha256_hex`, `append_field`,
+`canonicalize_legacy`, `safe`) are removed (`chore/retire-migrate-from-sqlite-batch-b`,
+tracking issue #3623). `sqlite_backfill_source` — whose entire purpose was the backfill
+idempotency marker — is dropped via a version-bumped `{2, "DROP TABLE IF EXISTS
+sqlite_backfill_source;"}` migration, not edited into v1: this store IS constructed in
+production, so v1 has actually run against real dev/UAT databases. `server.cpp`'s boot
+path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over `product_packs`/
+`product_pack_items` instead — silent unless real rows are found, never blocks boot.
+
+**Deliberately NOT touched, scoped out of this removal:** `deleted_pack_ids` and
+`kErasureCoordLockSql` both existed specifically to prevent a stale replica's
+`migrate_from_sqlite` from resurrecting an uninstalled pack — with that consumer gone,
+both are candidates for their own removal, but `uninstall()` still writes to them today
+and stripping them is a materially different, riskier change (touches a live write path
+and an advisory lock, not just dead code) than this mechanical retirement. Left for a
+separate, explicit follow-up decision. The dedicated `yuzu_server_product_pack_backfill_total`
+metric and its `YuzuProductPackBackfillNotCompleted` Prometheus alert are removed —
+neither can fire again with no backfill outcome to report.
