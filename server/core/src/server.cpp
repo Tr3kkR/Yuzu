@@ -191,6 +191,7 @@
 #include "directory_sync.hpp"
 #include "patch_manager.hpp"
 #include "process_health.hpp"
+#include "grpc_bounds_rules.hpp"
 #include "rate_limiter.hpp"
 #include "security_headers.hpp"
 
@@ -572,6 +573,90 @@ public:
                          {{"surface", "http"}, {"event", "security"}});
         metrics_.counter("yuzu_onbehalf_rejected_total",
                          {{"surface", "grpc"}, {"event", "security"}});
+
+        // Agent OTA pull bounds (#913 / #911 / #416). Pre-seeded closed series
+        // per docs/observability-conventions.md so absent() alerts stay
+        // meaningful. Bounded labels only — never a peer identity or IP.
+        //
+        // The admission and deadline counters are OPERATIONAL, not security:
+        // a rate/concurrency rejection is expected steady-state behaviour under
+        // a fleet-wide update, not an attack signal (same reasoning as the
+        // per-principal quota counters below). The IDENTITY counter is the
+        // exception and carries event="security", because a failed certificate
+        // bind on an already-enrolled agent's OTA pull is an authentication
+        // event — it mirrors yuzu_grpc_revoked_cert_total.
+        metrics_.describe("yuzu_ota_download_admission_total",
+                          "Agent OTA DownloadUpdate admission decisions by outcome", "counter");
+        // `decision` is a genuine PARTITION over calls that REACH the admission
+        // gate — exactly one of these each. It is deliberately NOT a partition of
+        // every received DownloadUpdate: the on-behalf, revoked-certificate and
+        // positive-identity gates all return before admission and are counted by
+        // their own families, so this sum is legitimately lower than
+        // yuzu_grpc_requests_total{method="DownloadUpdate",status="received"}.
+        // Refunds are a separate family below precisely so they cannot break that.
+        for (auto d : {"admitted", "rejected_concurrency", "rejected_rate", "rejected_total"})
+            metrics_.counter("yuzu_ota_download_admission_total", {{"decision", d}});
+
+        metrics_.describe("yuzu_ota_download_refund_total",
+                          "Agent OTA rate tokens returned after a server-attributable failure, "
+                          "by reason",
+                          "counter");
+        for (auto r : {"registry_unavailable", "version_not_found", "package_missing",
+                       "transfer_deadline", "chunk_deadline"})
+            metrics_.counter("yuzu_ota_download_refund_total", {{"reason", r}});
+
+        metrics_.describe("yuzu_ota_download_deadline_exceeded_total",
+                          "Agent OTA DownloadUpdate transfers aborted by a server-imposed "
+                          "deadline, by phase",
+                          "counter");
+        for (auto ph : {"transfer", "write"})
+            metrics_.counter("yuzu_ota_download_deadline_exceeded_total", {{"phase", ph}});
+
+        metrics_.describe("yuzu_ota_admission_key_mode_total",
+                          "Agent OTA admission keying actually used, by mode", "counter");
+        for (auto m : {"cert", "peer_ip", "unknown"})
+            metrics_.counter("yuzu_ota_admission_key_mode_total", {{"mode", m}});
+
+        metrics_.describe("yuzu_grpc_ota_identity_rejected_total",
+                          "Agent OTA RPCs rejected for a missing or mismatched client "
+                          "certificate identity, by rpc and reason",
+                          "counter");
+        for (auto rpc : {"check_for_update", "download_update"})
+            for (auto reason :
+                 {"no_client_identity", "foreign_ca", "agent_id_missing", "agent_id_mismatch"})
+                metrics_.counter(
+                    "yuzu_grpc_ota_identity_rejected_total",
+                    {{"event", "security"}, {"rpc", rpc}, {"reason", reason}});
+
+        // Pre-seeded for the same reason as the rejection counter above: an alert
+        // or dashboard that divides by a series which does not exist yet reads as
+        // "no data", not as zero.
+        metrics_.describe("yuzu_ota_identity_audit_suppressed_total",
+                          "Identity-deny audit rows NOT written because the per-peer "
+                          "audit rate limit was exhausted, by rpc and reason",
+                          "counter");
+        for (auto rpc : {"check_for_update", "download_update"})
+            for (auto reason : {"foreign_ca", "agent_id_missing", "agent_id_mismatch"})
+                metrics_.counter("yuzu_ota_identity_audit_suppressed_total",
+                                 {{"rpc", rpc}, {"reason", reason}});
+
+        metrics_.describe("yuzu_ota_download_peers_tracked",
+                          "Peers currently tracked by the OTA admission map", "gauge");
+        metrics_.gauge("yuzu_ota_download_peers_tracked").set(0.0);
+
+        // Published so alerts express occupancy as a RATIO of the configured
+        // ceiling rather than hardcoding a threshold that silently becomes wrong
+        // the moment an operator retunes --ota-max-peers-tracked.
+        metrics_.describe("yuzu_ota_download_peers_capacity",
+                          "Configured ceiling on the OTA admission map (--ota-max-peers-tracked)",
+                          "gauge");
+        metrics_.gauge("yuzu_ota_download_peers_capacity")
+            .set(static_cast<double>(cfg_.ota_max_peers_tracked));
+
+        metrics_.describe("yuzu_ota_download_peers_evicted_total",
+                          "Peers evicted from the OTA admission map by its cardinality ceiling",
+                          "counter");
+        metrics_.counter("yuzu_ota_download_peers_evicted_total");
         // Per-principal quota cap exhaustions (PR 4.4, ADR-1005 class engine
         // principals). Pre-seed all 4 closed series to 0 (docs/observability-
         // conventions.md), mirroring yuzu_onbehalf_rejected_total above.
@@ -6886,6 +6971,30 @@ public:
         // OR operator-supplied). Register stays bootstrap-exempt (it issues the
         // first cert); every other RPC requires a verified, non-revoked identity.
         agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
+
+        // #913 / #911: bounds on the agent OTA pull path.
+        agent_service_.set_ota_bound_config(detail::AgentServiceImpl::OtaBoundConfig{
+            .max_concurrent_per_peer = cfg_.ota_max_concurrent_per_peer,
+            .rate_capacity = cfg_.ota_rate_capacity,
+            .rate_refill_per_min = cfg_.ota_rate_refill_per_min,
+            .transfer_deadline = std::chrono::seconds(cfg_.ota_transfer_deadline_secs),
+            .chunk_stall_deadline = std::chrono::seconds(cfg_.ota_chunk_write_deadline_secs),
+            .max_peers_tracked = static_cast<std::size_t>(cfg_.ota_max_peers_tracked),
+            .max_concurrent_total = cfg_.ota_max_concurrent_total,
+            .cert_reserve_pct = cfg_.ota_cert_reserve_pct,
+        });
+
+        // #416: require a positive peer identity on the OTA RPCs, and bind the
+        // request-body agent_id to the certificate.
+        //
+        // Gated on the LISTENER being strict, NOT on require_client_identity_
+        // above. They differ exactly where it matters: on default agent certs the
+        // agent listener deliberately relaxes to request-but-do-not-require so an
+        // unenrolled agent can bootstrap (see the credential block above), while
+        // require_client_identity_ is TRUE there. Gating on that would reject
+        // every bootstrapping agent's OTA pull.
+        agent_service_.set_require_positive_ota_identity(cfg_.tls_enabled &&
+                                                         !cfg_.using_default_agent_certs);
         // Only an install with our OWN issuing CA (built-in defaults today,
         // subordinate in PR6) signs agent CSRs. When the operator brought their
         // own certs there is no root in ca_store → no signer, and agents must carry
@@ -7065,6 +7174,34 @@ public:
         builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
         builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 30000);
+
+        // Server-wide resource bounds (#913's fleet-wide half). Until these, this
+        // builder carried keepalive/ping args and NOTHING else — no ResourceQuota,
+        // no stream cap, no sync-server thread bound anywhere in the tree. That
+        // absence is what turned the unbounded per-peer OTA path into a genuine
+        // capacity-monopolisation P0 rather than a theoretical one: a single
+        // authenticated agent could open unlimited concurrent streams, each
+        // pinning a gRPC thread on blocking disk and network I/O.
+        //
+        // Both bounds REJECT at capacity rather than queueing — queueing would
+        // hold the very threads the caps exist to free.
+        {
+            // Derivation lives in grpc_bounds_rules.hpp so the MiB->bytes
+            // arithmetic and its overflow guard are testable; these two lines are
+            // the thin application of it.
+            const auto bounds = grpc_bounds_from_config(cfg_);
+            builder.AddChannelArgument(GRPC_ARG_MAX_CONCURRENT_STREAMS,
+                                       bounds.max_concurrent_streams);
+            grpc::ResourceQuota quota("yuzu_grpc");
+            quota.Resize(bounds.resource_quota_bytes);
+            // The THREAD ceiling is the one that bounds concurrent handlers
+            // globally. GRPC_ARG_MAX_CONCURRENT_STREAMS is per-connection and
+            // connections are uncapped, so without this nothing limits how many
+            // sync handlers — Subscribe, DownloadUpdate — run at once.
+            quota.SetMaxThreads(bounds.max_threads);
+            builder.SetResourceQuota(quota);
+        }
+
         builder.AddListeningPort(cfg_.listen_address, agent_creds);
         builder.AddListeningPort(cfg_.management_address, mgmt_creds);
         builder.RegisterService(&agent_service_);
@@ -15338,8 +15475,9 @@ private:
         // Aggregate endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/aggregate)", [this](const httplib::Request& req,
                                                                        httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
@@ -15416,46 +15554,29 @@ private:
                 return;
             }
 
-            // #1634 management-group scope (filter-BEFORE-aggregate; same as MCP
-            // aggregate_responses). The flat Response:Read gate is not a per-agent
-            // ownership check, so resolve the in-scope agent set and push it into the
-            // aggregate WHERE clause. Uses an EXPLICIT positive check, never the
-            // "dropped==0 → unrestricted" inference (#1634 UP-1/2/3):
-            //   * RBAC loaded & explicitly disabled → leave scope nullopt (open).
-            //   * Global Response:Read holder → leave scope nullopt (correct totals at
-            //     any scale; also the perf hoist — skips the distinct scan + per-agent
-            //     loop). check_permission (not is_rbac_enabled) gates this, so a corrupt
-            //     store can't take this branch.
-            //   * Otherwise (group-scoped operator) → resolve and ALWAYS set scope,
-            //     even to the empty set (`AND 1=0` → zero rows), never an unrestricted
-            //     read. A distinct_agent_ids() read error returns 503 (store-availability
-            //     failure is NOT "operator sees no agents" — it must not look like empty
-            //     data; observability-conventions + agentic-first A4 + ADR-0016
-            //     authoritative-reads, #1634 sre review).
+            // #1634 management-group scope. Resolve the responding agents only to
+            // retain the existing distinct-drop audit; the gate's VisibleSet is the
+            // authority and the engaged AggregateScope is applied before folding.
             AggregateScope agg_scope; // nullopt = no restriction
             std::size_t agg_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                if (rbac_enforcement_in_effect(rbac_store_.get()) &&
-                    !(rbac_store_ &&
-                      rbac_store_->check_permission(session->username, "Response", "Read"))) {
-                    auto distinct = response_store_->distinct_agent_ids(instruction_id);
-                    if (!distinct) {
-                        res.status = 503;
-                        res.set_content(
-                            R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
-                            "application/json");
-                        return;
-                    }
-                    std::vector<std::string> in_scope;
-                    in_scope.reserve(distinct->size());
-                    for (auto& aid : *distinct)
-                        if (response_agent_in_scope(session->username, aid))
-                            in_scope.push_back(std::move(aid));
-                    agg_dropped = distinct->size() - in_scope.size();
-                    agg_scope = std::move(in_scope); // ALWAYS engaged in this branch
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
                 }
-            } else {
-                return; // require_auth already wrote 401
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++agg_dropped;
+                }
+                agg_scope = std::move(in_scope); // engaged-empty means no rows
             }
             // CC7.2 evidence: a scope-drop is a security-relevant filtering event — record
             // it so a cross-operator access attempt that was suppressed is auditable on this
@@ -15495,8 +15616,9 @@ private:
         // Export endpoint — must be registered before the catch-all responses route
         web_server_->Get(R"(/api/responses/([^/]+)/export)", [this](const httplib::Request& req,
                                                                     httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (!response_store_ || !response_store_->is_open()) {
@@ -15529,7 +15651,34 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET, not as a post-fetch filter — a
+            // post-fetch filter on a paginated read can hand a confined caller a short or
+            // empty page even though visible rows exist past the hidden ones LIMIT already
+            // truncated. Mirrors the /aggregate sibling's resolve-then-scope pattern above.
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t export_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++export_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15539,32 +15688,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope agents' rows before
-            // export (mirrors MCP query_responses / the visualization reader). The
-            // flat Response:Read gate is not a per-agent ownership check.
-            std::size_t export_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
-                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
-                // response_agent_in_scope, rather than skipping it and serving the fleet.
-                if (rbac_enforcement_in_effect(rbac_store_.get())) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(results.size());
-                    for (auto& r : results) {
-                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
-                        if (ins)
-                            m->second = response_agent_in_scope(session->username, r.agent_id);
-                        if (m->second)
-                            visible.push_back(std::move(r));
-                        else if (ins) // count each DISTINCT dropped agent once
-                            ++export_dropped;
-                    }
-                    results.swap(visible);
-                }
-            } else {
-                return; // require_auth already wrote 401
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (export_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,
@@ -15609,8 +15732,9 @@ private:
 
         web_server_->Get(R"(/api/responses/(.+))", [this](const httplib::Request& req,
                                                           httplib::Response& res) {
-            if (!require_permission(req, res, "Response", "Read"))
-                return;
+            auto gate = require_fleet_read(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
 
             auto instruction_id = req.matches[1].str();
             if (instruction_id.empty()) {
@@ -15651,7 +15775,33 @@ private:
                 return;
             }
 
-            auto results_opt = response_store_->query(instruction_id, q);
+            // #1634 / ADR-0017 INV-3 (CRITICAL): resolve the in-scope agent set and push it
+            // into the SQL WHERE clause BEFORE LIMIT/OFFSET — see the /export sibling above
+            // for the full rationale (post-fetch filtering a paginated read can hand a
+            // confined caller a short or empty page).
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t get_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store_->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"response store degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++get_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+
+            auto results_opt = response_store_->query(instruction_id, q, scope_arg);
             if (!results_opt) {
                 res.status = 503;
                 res.set_content(
@@ -15661,32 +15811,6 @@ private:
             }
             auto results = std::move(*results_opt);
 
-            // #1634 management-group scope: drop out-of-scope agents' rows before
-            // serving (mirrors the export sibling above + MCP query_responses). The
-            // flat Response:Read gate is not a per-agent ownership check.
-            std::size_t get_dropped = 0;
-            if (auto session = require_auth(req, res)) {
-                // #1634 UP-1: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled)
-                // so a corrupt/load-failed rbac.db enters the filter and fails closed via
-                // response_agent_in_scope, rather than skipping it and serving the fleet.
-                if (rbac_enforcement_in_effect(rbac_store_.get())) {
-                    std::unordered_map<std::string, bool> memo;
-                    std::vector<StoredResponse> visible;
-                    visible.reserve(results.size());
-                    for (auto& r : results) {
-                        auto [m, ins] = memo.try_emplace(r.agent_id, false);
-                        if (ins)
-                            m->second = response_agent_in_scope(session->username, r.agent_id);
-                        if (m->second)
-                            visible.push_back(std::move(r));
-                        else if (ins) // count each DISTINCT dropped agent once
-                            ++get_dropped;
-                    }
-                    results.swap(visible);
-                }
-            } else {
-                return; // require_auth already wrote 401
-            }
             // CC7.2 evidence: record the scope-drop on this surface (#1634 compliance review).
             if (get_dropped > 0)
                 (void)audit_log(req, "response.read", "denied", "Execution", instruction_id,

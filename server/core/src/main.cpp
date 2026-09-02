@@ -15,6 +15,8 @@
 #include "security_headers.hpp"
 
 #include <CLI/CLI.hpp>
+
+#include "server_ota_options.hpp"
 #include "stream_budget.hpp" // detail::kMaxHttpWorkerThreads (pool ceiling)
 #include "web_utils.hpp"     // normalise_trusted_origins (#2537 CSRF allowlist)
 #include <spdlog/sinks/rotating_file_sink.h>
@@ -471,6 +473,12 @@ int main(int argc, char* argv[]) {
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_PRINCIPAL_RATE_LIMIT");
 
+    // Agent OTA pull bounds (#913 per-peer limit, #911 deadlines) and the
+    // server-wide gRPC bounds. Registered from server_ota_options.hpp so the flag
+    // names, defaults, env spellings and validators are pinned by a test —
+    // see test_server_ota_options.cpp.
+    register_ota_options(app, cfg);
+
     // MFA / TOTP — SOC 2 CC6.6. See docs/auth-mfa-design.md.
     app.add_option("--mfa-enforcement", cfg.mfa_enforcement,
                    "MFA enforcement (default: optional). \"optional\" = self-service "
@@ -926,6 +934,10 @@ int main(int argc, char* argv[]) {
     app.add_flag("--remove-service", remove_service, "Remove Windows service and exit");
 
     CLI11_PARSE(app, argc, argv);
+
+    // Apply configuration floors ONCE, before anything reads cfg, so the metrics,
+    // the settings page and the docs all report the value the server enforces.
+    yuzu::server::normalize_ota_options(cfg);
 
     // ── CSRF trusted origins: normalise ONCE, here (#2537) ──
     // Comma-splitting, trimming, lowercasing and default-port stripping happen

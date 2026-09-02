@@ -38,6 +38,7 @@
 #include "rest_api_v1.hpp"
 #include "test_approval_manager_pg_helper.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
+#include "test_response_execution_authz_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -53,6 +54,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "../test_helpers.hpp"
@@ -84,6 +86,7 @@ struct RestEventsHarness {
     // Auth/perm/audit toggles for negative cases.
     bool session_present{true};
     bool perm_grant{true};
+    authz::VisibleSet fleet_read_scope{std::nullopt};
     bool audit_should_fail{false};
     bool audit_should_throw{false};
 
@@ -100,7 +103,9 @@ struct RestEventsHarness {
     /// `with_tracker=false` opts out of the tracker entirely (separate
     /// 503 path).
     explicit RestEventsHarness(bool with_bus = true, bool with_tracker = true,
-                               yuzu::server::detail::StreamBudget* budget = nullptr)
+                               yuzu::server::detail::StreamBudget* budget = nullptr,
+                               RestApiV1::AuthFn auth_override = {},
+                               RestApiV1::FleetReadFn fleet_read_override = {})
         : stream_budget(budget) {
         if (with_tracker) {
             tracker_bundle.emplace();
@@ -115,8 +120,8 @@ struct RestEventsHarness {
             event_bus = std::make_unique<ExecutionEventBus>();
         }
 
-        auto auth_fn = [this](const httplib::Request&,
-                              httplib::Response& res) -> std::optional<auth::Session> {
+        RestApiV1::AuthFn auth_fn = [this](const httplib::Request&,
+                                           httplib::Response& res) -> std::optional<auth::Session> {
             if (!session_present) {
                 // Mirror require_auth's 401 contract — set status +
                 // body so the handler short-circuits.
@@ -129,6 +134,8 @@ struct RestEventsHarness {
             s.role = auth::Role::admin;
             return s;
         };
+        if (auth_override)
+            auth_fn = std::move(auth_override);
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                               const std::string&) -> bool {
             if (!perm_grant) {
@@ -146,6 +153,23 @@ struct RestEventsHarness {
                 throw std::runtime_error("simulated audit pipeline failure");
             return !audit_should_fail;
         };
+        RestApiV1::FleetReadFn fleet_read_fn =
+            [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) -> authz::FleetReadGate {
+            if (!session_present) {
+                res.status = 401;
+                res.set_content(R"({"error":"unauthorized"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            if (!perm_grant) {
+                res.status = 403;
+                res.set_content(R"({"error":"forbidden"})", "application/json");
+                return {false, authz::deny_all()};
+            }
+            return {true, fleet_read_scope};
+        };
+        if (fleet_read_override)
+            fleet_read_fn = std::move(fleet_read_override);
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/nullptr,
@@ -187,15 +211,19 @@ struct RestEventsHarness {
                             /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr,
                             /*access_review_store=*/nullptr, /*auth_db=*/nullptr,
-                            /*directory_sync=*/nullptr, stream_budget);
+                            /*directory_sync=*/nullptr, stream_budget,
+                            /*exec_visible_fn=*/{}, /*list_read_fn=*/{}, fleet_read_fn);
     }
 
-    std::string make_exec(const std::string& status) {
+    std::string make_exec(const std::string& status,
+                          const std::string& dispatched_by = "tester") {
         Execution e;
         e.id = "exec-events-" + std::to_string(exec_counter.fetch_add(1));
         e.definition_id = "def-events";
         e.status = status;
-        e.dispatched_by = "tester";
+        e.scope_expression = "agent:secret-target";
+        e.parameter_values = R"({"secret_agent":"agent-hidden"})";
+        e.dispatched_by = dispatched_by;
         e.dispatched_at = 1735689600;
         e.agents_targeted = 3;
         e.agents_success = (status == "completed") ? 3 : 0;
@@ -205,6 +233,19 @@ struct RestEventsHarness {
         auto id = tracker->create_execution(e);
         REQUIRE(id.has_value());
         return *id;
+    }
+
+    void agent_status(const std::string& exec_id, const std::string& agent_id,
+                      const std::string& status, const std::string& error_detail = {},
+                      int64_t completed_at = 1735689660) {
+        AgentExecStatus a;
+        a.agent_id = agent_id;
+        a.status = status;
+        a.dispatched_at = 1735689600;
+        a.first_response_at = 1735689601;
+        a.completed_at = completed_at;
+        a.error_detail = error_detail;
+        tracker->update_agent_status(exec_id, a);
     }
 };
 
@@ -465,9 +506,17 @@ TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[pg][events][notf
     REQUIRE(res->status == 404);
     REQUIRE(res->body.find("execution not found") != std::string::npos);
     REQUIRE(res->body.find(R"("correlation_id":"req-)") != std::string::npos);
-    // 404 deliberately does NOT audit — leaking enumeration evidence
-    // into the audit log would give an attacker a side channel.
-    REQUIRE(h.audit_log.empty());
+    // #1634 (governance Gate 4 fix): a `denied` audit row is now emitted here
+    // (CC7.2 evidence, parity with MCP get_execution_status and every other
+    // migrated route's scope-drop audit). This does NOT reopen an enumeration
+    // side channel: the audited detail string is IDENTICAL for a genuinely
+    // nonexistent id and an exists-but-invisible one (no distinguishing text),
+    // matching the #1700/#3558 precedent for get_agent_details — the
+    // distinguishing fact lives only in a server-side spdlog::debug line no
+    // audited-evidence reader (including query_audit_log) can reach.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "api.v1.events.subscribe");
+    CHECK(h.audit_log[0].result == "denied");
 }
 
 TEST_CASE("GET /api/v1/events: terminal execution → 410 A4", "[pg][events][terminal]") {
@@ -1028,6 +1077,135 @@ TEST_CASE("GET /api/v1/executions/{id}: unknown id → 404 A4 envelope",
     REQUIRE(res->body.find(R"("correlation_id":"req-)") != std::string::npos);
     // A4 mandates an api_version meta block on every error envelope.
     REQUIRE(res->body.find(R"("api_version":"v1")") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: unknown id emits execution.detail.fetch denied audit "
+          "row (Doomgoose review, important — was undocumented and untested)",
+          "[pg][events][executions][issue-1088][notfound][audit]") {
+    RestEventsHarness h;
+    auto res = h.sink.Get("/api/v1/executions/exec-does-not-exist");
+    REQUIRE(res);
+    REQUIRE(res->status == 404);
+    bool saw_denied = false;
+    for (const auto& a : h.audit_log) {
+        CHECK(a.result != "success");
+        if (a.action == "execution.detail.fetch" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: invisible and nonexistent ids share one 404 shape",
+          "[pg][events][executions][scope][notfound]") {
+    RestEventsHarness h;
+    auto invisible_id = h.make_exec("running", "alice");
+    h.agent_status(invisible_id, "alice-agent", "success");
+    h.fleet_read_scope = authz::deny_all();
+
+    auto invisible = h.sink.Get("/api/v1/executions/" + invisible_id);
+    auto missing = h.sink.Get("/api/v1/executions/exec-does-not-exist");
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    REQUIRE(invisible->status == 404);
+    REQUIRE(missing->status == 404);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    invisible_json["error"].erase("correlation_id");
+    missing_json["error"].erase("correlation_id");
+    CHECK(invisible_json == missing_json);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: confined dispatcher is visible but still projected",
+          "[pg][events][executions][scope][owner]") {
+    // #1634 adversarial-review fix: dispatcher ownership admits the caller to their
+    // OWN execution (avoids a false 404 before any response has landed) but must
+    // NEVER bypass the confined projection — a dispatcher later confined out of a
+    // management group (or reading an execution dispatched before they were ever
+    // confined) must not retain durable full-fidelity access to hidden-agent data
+    // just because they fired the dispatch.
+    RestEventsHarness h;
+    auto exec_id = h.make_exec("running", "tester");
+    h.fleet_read_scope = authz::deny_all();
+
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id);
+    REQUIRE(res);
+    REQUIRE(res->status == 200); // visible: dispatcher ownership still avoids the 404
+    CHECK(res->body.find("agent:secret-target") == std::string::npos);
+    CHECK(res->body.find("agent-hidden") == std::string::npos);
+    CHECK(res->body.find("redacted - confined view") != std::string::npos);
+}
+
+TEST_CASE("GET /api/v1/executions/{id}: confined non-owner gets visible-only projection",
+          "[pg][events][executions][scope][projection]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz_rig{authz_db.dsn()};
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, /*budget=*/nullptr,
+                        authz_rig.auth_fn(), authz_rig.fleet_read_fn()};
+    auto exec_id = h.make_exec("running", "alice");
+    h.agent_status(exec_id, "bob-agent", "success");
+    h.agent_status(exec_id, "alice-agent", "failure", "alice-only-error", 1735689661);
+
+    const auto token = authz_rig.mint_bob();
+    auto res = h.sink.Get("/api/v1/executions/" + exec_id,
+                          yuzu::test::ResponseExecutionAuthzPgRig::bearer(token));
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    const auto& data = body.at("data");
+    CHECK(data.at("agents_targeted") == 1);
+    CHECK(data.at("agents_responded") == 1);
+    CHECK(data.at("agents_success") == 1);
+    CHECK(data.at("agents_failure") == 0);
+    CHECK(data.at("scope_expression") == "(redacted - confined view)");
+    CHECK(data.at("parameter_values") == "(redacted - confined view)");
+    CHECK(data.at("last_error_detail") == "");
+    CHECK(res->body.find("alice-only-error") == std::string::npos);
+    CHECK(res->body.find("agent-hidden") == std::string::npos);
+}
+
+// #1634 (governance Gate 3 quality-engineer finding): every sibling
+// single-execution surface (GET /api/v1/executions/{id} above, dashboard
+// GET /sse/executions/{id}, MCP get_execution_status/list_executions) has a
+// real-rig test driving the actual AuthRoutes + RbacStore + ManagementGroupStore
+// composition; this route only ever had the synthetic-fleet_read_fn tests
+// above, which cannot catch a wrong securable/operation string at this call
+// site or a regression in the real-gate composition specifically for SSE.
+TEST_CASE("GET /api/v1/events: real fleet-read gate collapses an invisible "
+          "execution to the missing-id 404",
+          "[pg][events][executions][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz_rig{authz_db.dsn()};
+    RestEventsHarness h{/*with_bus=*/true, /*with_tracker=*/true, /*budget=*/nullptr,
+                        authz_rig.auth_fn(), authz_rig.fleet_read_fn()};
+    auto exec_id = h.make_exec("running", "alice");
+    h.agent_status(exec_id, "alice-agent", "success");
+
+    const auto token = authz_rig.mint_bob();
+    const auto headers = yuzu::test::ResponseExecutionAuthzPgRig::bearer(token);
+    auto invisible = h.sink.Get("/api/v1/events?execution_id=" + exec_id, headers);
+    auto missing = h.sink.Get("/api/v1/events?execution_id=exec-does-not-exist", headers);
+    REQUIRE(invisible);
+    REQUIRE(missing);
+    REQUIRE(invisible->status == 404);
+    REQUIRE(missing->status == 404);
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    invisible_json["error"].erase("correlation_id");
+    missing_json["error"].erase("correlation_id");
+    CHECK(invisible_json == missing_json);
+    CHECK(h.event_bus->subscribers_total() == 0);
+    // #1634 (governance Gate 4 consistency-auditor fix): a suppressed
+    // cross-operator subscribe attempt now DOES get a distinct `denied` audit
+    // row (CC7.2 evidence, parity with MCP get_execution_status) — it must
+    // never be the `success`-shaped `execution.live_subscribe`/subscribe row a
+    // genuine admit gets.
+    bool saw_denied = false;
+    for (const auto& a : h.audit_log) {
+        CHECK(a.result != "success");
+        if (a.action == "api.v1.events.subscribe" && a.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
 }
 
 TEST_CASE("GET /api/v1/executions/{id}: tracker unavailable → 503 A4 with retry_after_ms",
