@@ -258,11 +258,11 @@ too (`mcp.stream.attach` / `mcp.stream.close`, the latter carrying the close rea
 `AdminOrApproval`/`AlwaysApproval` (#1398, `command_capability.hpp`) — e.g.
 `script_exec.exec`, `filesystem.delete`, `registry.set_value`. Those are denied
 at the shared dispatch chokepoint regardless of MCP tier, admin-role-holding
-tokens excepted (`principal_is_admin`). Today that denial surfaces as the SAME
-`no_agents_reached`-shaped tool result an offline/unreachable agent gets, not a
-discriminated approval error — JSON-RPC error-shaping for this case is tracked
-as #1398 Rung 4, not yet shipped. See `docs/mcp-server.md` "Security Model" for
-the full gate list.
+tokens excepted (`principal_is_admin`). That denial — and every other
+dispatch-chokepoint denial reason — is now a discriminated JSON-RPC error
+naming the reason, not the `no_agents_reached`-shaped result an
+offline/unreachable agent also produces (CLOSED by #3687). See
+`docs/mcp-server.md` "Security Model" for the full gate list.
 ## Authorization Tiers
 
 MCP tokens use a **tier** system that restricts what operations are available,
