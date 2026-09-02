@@ -150,6 +150,19 @@ RBAC and be self-granted `Administrator` regardless of their actual standing aut
 Disabling RBAC is symmetric: audited, MFA-stepped-up, reversible. A failed transaction is
 reported to the caller (`set_rbac_enabled`'s current `void` return must change to support this).
 
+**The self-grant branch's own precondition needs the same discipline as the Administrator check,
+not a different one (Gate-5 governance finding).** The row-lock/`SERIALIZABLE` requirement added
+below closes the race on the Administrator-existence check, but the self-grant branch gates on a
+DIFFERENT fact -- "the enabling operator's current session already holds the legacy `admin`
+session role" -- read via `auth::effective_role(session)`, which resolves against an in-memory
+session cache bounded by `kSessionGenStaleServeBoundMs` (30s), not a transactional read of the
+durable store. A concurrent revocation of the enabling operator's `admin` role landing inside
+that staleness window is invisible to a Postgres row lock or `SERIALIZABLE` isolation level on a
+different table entirely -- those primitives cannot reach a stale in-memory session. This
+decision therefore requires the self-grant branch to re-verify the operator's admin standing
+against the DURABLE store (not the session cache) inside the same locked/serializable transaction
+as the Administrator-existence check and the toggle write, before creating the bootstrap grant.
+
 **"Same transaction," named (Gate-2 governance finding):** the Administrator-existence check
 spans two currently separate stores -- the grant lives in `RbacStore`, the human's active-account
 status lives in `AuthDB` -- and neither exposes a joint transaction primitive to the other today,
@@ -484,9 +497,15 @@ sentence.
    execute-once transition on exactly this shape of record (the Deployment/Preflight guarded-
    transition + CAS pattern this codebase's routed concerns document as catastrophic if violated).
    `adopt_baseline` must use the same shape -- a CAS on the orphan/adoption state, not a bare
-   read-then-write -- so two racing adoptions, or an adoption racing a concurrent narrowing of the
-   adopting operator's own authority, cannot both succeed or leave the Baseline in an inconsistent
-   root state.
+   read-then-write -- so two racing adoptions cannot both succeed or leave the Baseline in an
+   inconsistent root state. **A CAS on the Baseline's own row does not, by itself, close the
+   second race named above (Gate-5 governance finding): the adopting operator's authority lives
+   in a different table entirely (RBAC/management-group grants), which a single-row CAS on the
+   Baseline cannot observe.** The D4 authority check ("current effective authority... covers the
+   Baseline's scope") must therefore be re-verified *inside* the same transaction that commits
+   the CAS, under the same locking/`SERIALIZABLE` discipline D2 requires for its structurally
+   identical problem -- a check performed before the CAS, in a separate read, leaves the window
+   D2's fix was written specifically to close, reopened here.
 
    **Shared-Guard rule:** a Guard reached by more than
    one Baseline is armed once on the agent, and `deployed_member_rule_ids()` returns a flat,
@@ -911,6 +930,17 @@ Mutually-exclusive role pairs (an INCITS 359-style static SoD constraint) are de
 and checked at assignment time by the D3/D4 chokepoint, not a separate validator that can drift
 from the authority model it protects. Dynamic SoD (constraints on simultaneous session
 activation) is a distinct, currently unaddressed decision, explicitly out of scope here.
+
+**The checked set is the principal's full, group-inclusive effective role set, not only the write
+being processed (Gate-5 governance finding).** D3's chokepoint now covers two distinct write
+shapes: a direct role assignment, and (per D3's own Gate-4 extension) a group-membership add
+against a role-bearing group. Declaring a SoD pair and checking it only against whichever single
+write is in flight does not catch a pair assembled across both shapes -- role A assigned directly
+to a principal today, then that same principal added to a group holding role B tomorrow, with
+neither write individually seeing the other half of a declared A+B SoD violation. The chokepoint
+must resolve the principal's complete effective role set (direct grants union every role-bearing
+group they belong to, following the same membership resolution D5/D7 already use) before
+consulting the SoD table on either write shape, not just the roles the current write touches.
 
 *Not yet built* (not a defect): no SoD mechanism of either kind exists today.
 
@@ -1341,11 +1371,48 @@ ordinary review" rule going forward.
     (chaos-injector) and Gate 6 (compliance-officer/sre/enterprise-readiness) remain. Verdict: not
     ready without this round's fixes; ready once they land, which they now have.
 
-Gates 2 through 4 have now run against this document as ADR-1008, per entries 13-14 above.
-Remaining before acceptance: Gate 6 (compliance-officer/sre/enterprise-readiness), Gate 5
-(chaos-injector, if warranted by Gate 4's risk register), and Dave's final sign-off -- the same
-gates every accepted architecture decision in this codebase goes through, not a heightened bar
-specific to this document. D6's implementers
+15. **Fold `/governance` Gate 5 (2026-09-02).** `chaos-injector`, run because Gate 4 found
+    substantive issues, stress-tested the Gate-4 fixes against each other rather than against the
+    original text -- and found a real, nameable pattern: **two of Gate 4's own fixes (D2's
+    Administrator-check locking, D6's `adopt_baseline` CAS) named a single-row/single-store
+    concurrency primitive and claimed it closed a race that actually spans a DIFFERENT row or
+    store.** For D2, the row-lock/`SERIALIZABLE` requirement covers the Administrator-existence
+    check but not the self-grant branch's own precondition (the enabling operator's session-role
+    standing), which resolves through an entirely different, session-cache-based consistency
+    mechanism bounded by `kSessionGenStaleServeBoundMs` (30s) -- verified directly against
+    `auth::effective_role`/`AuthManager`'s session-generation refresh code, not asserted from the
+    ADR text alone. A Postgres row lock cannot reach a stale in-memory session, so a concurrent
+    revocation of the enabling operator's admin role inside that window could still let the
+    self-grant through; fixed by requiring the self-grant branch to re-verify against the durable
+    store, not the session cache, inside the same locked transaction. For D6, the CAS on a
+    Baseline's own orphan/adoption-state column closes the two-operators-racing-the-same-Baseline
+    case but cannot observe the adopting operator's own RBAC/management-group grant rows, so an
+    authority revocation landing between the D4 check and the CAS commit could still complete the
+    adoption; fixed by requiring the D4 check inside the same transaction as the CAS, under the
+    same discipline D2 now names. `chaos-injector` also found a genuinely new class of gap,
+    distinct from the concurrency-primitive-scope pattern above: D11's static SoD check is
+    declared as running "at assignment time," but D3's own Gate-4 extension widened that
+    chokepoint to also cover group-membership writes, and D11 was never revisited to state that
+    the checked role set must be the principal's full direct-plus-group-inherited set -- a
+    declared SoD-forbidden pair could otherwise be assembled across a direct assignment and a
+    separate group-membership add, with neither write's SoD check seeing the other half; fixed.
+    Two prompted questions were checked and cleared with no defect: the Shared-Guard rule's
+    interaction with concurrent adoption of different orphaned Baselines (the per-Baseline CAS
+    scoping is correct here), and D9's audit-sampling clause vs. its new mutation-denial signal
+    (the text already keeps these disjoint by construction; the reviewer's own note that a
+    conflation is reachable only against the grain of the text is why this stayed non-blocking).
+    The reviewer's own convergence assessment, worth recording verbatim in substance: the
+    concurrency-primitive-scope pattern (Findings 1 and 3) is "narrowing in kind" -- the same
+    nameable class recurring rather than new unrelated classes -- while the D11 finding shows a
+    fix round can still open a genuinely new cross-reference gap when it widens one decision's
+    scope (D3) without revisiting a decision that reads from it (D11). Gate 6 (compliance-officer/
+    sre/enterprise-readiness) remains. Verdict: not ready without this round's fixes; ready once
+    they land, which they now have.
+
+Gates 2 through 5 have now run against this document as ADR-1008, per entries 13-15 above.
+Remaining before acceptance: Gate 6 (compliance-officer/sre/enterprise-readiness) and Dave's
+final sign-off -- the same gates every accepted architecture decision in this codebase goes
+through, not a heightened bar specific to this document. D6's implementers
 should still read ADR-0032 Decision 7's text directly before building the Guardian mechanism, the
 same way any implementer reads the ADR they are building a novel extension of, but that is
 ordinary diligence, not a precondition on the decision itself. Given how much of D6's mechanics
