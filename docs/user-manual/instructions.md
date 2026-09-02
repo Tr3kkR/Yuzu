@@ -1190,6 +1190,9 @@ curl -s -b cookies.txt \
 
 ### Executions
 
+All routes below are management-group confined (#3789) — see `rest-api.md`'s "Executions" section
+for the per-route permission and confinement/404 behavior.
+
 #### List executions
 
 ```

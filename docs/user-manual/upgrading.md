@@ -141,6 +141,54 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: legacy `/api/executions*` routes are now management-group confined (#3789)
+
+The legacy pre-v1 `GET /api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`,
+`/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes previously carried NO
+management-group confinement at all — a bare `Execution:Read`/`Execute` grant, global or
+group-scoped, saw and could act on the entire fleet's executions. They now gate on
+`require_fleet_read`, the same admit-then-filter mechanism `GET /api/v1/executions/{id}` already
+used.
+
+**Who this affects:** operators holding `Execution:Read`/`Execute` ONLY through a management group
+(not a global grant) — these callers are newly ADMITTED to the five GET routes (previously flat
+`403`'d outright) but see a narrowed, redacted view. A global grant holder sees no behavior change
+on read shape. Everyone sees the following response-shape changes regardless of scope:
+
+- `GET /{id}/summary`, `/{id}/agents`, and `/{id}/children` now return `404` for an unknown
+  execution id, instead of a zero-filled/empty `200`.
+- `POST /{id}/cancel` now returns `404` for a nonexistent execution id, instead of a false
+  `200 {"status":"cancelled"}` (the underlying `UPDATE` always reported success even when it
+  matched zero rows).
+- A caller holding `Execution:Execute` but **not** `Execution:Read` can no longer rerun or cancel
+  an execution — both mutating routes now also require `Read` admission through the fleet gate,
+  since `require_fleet_read` is the only place the mutation's target-visibility check happens.
+- `GET /api/executions` (list) now caps `limit` at 500 (previously unbounded).
+- A gate failure caused by a degraded RBAC/management-group store now returns `503` with
+  `retry_after_ms` instead of a flat `403`.
+- **`rerun`'s unknown-id response differs by grant scope, deliberately.** A confined caller
+  attempting a rerun always gets the uniform `404` above. An UNCONFINED (global-grant) caller
+  hitting a genuinely unknown execution id instead keeps the pre-existing
+  `400 {"error":"original execution not found"}` from `create_rerun` — unchanged from before
+  #3789, and intentionally not unified with the new `404`, to minimize behavior change for
+  existing global-grant automation. `cancel` has no equivalent asymmetry: it returns `404` for an
+  unknown id under every grant scope.
+- An execution whose targeted cohort never fully reports (an agent that went permanently offline
+  mid-run, for example) can permanently fail `rerun`/`cancel`'s complete-cohort check for a
+  confined caller. The escape hatch is a **global** `Execution:Execute`+`Execution:Read` grant,
+  which is never subject to this confinement rule.
+
+**What to do:** if you have automation with a group-scoped (not global) `Execution:Read`/`Execute`
+grant, re-verify it still sees the executions it depends on — a confined caller now sees only
+executions it dispatched itself or that involve at least one agent it can see, rather than being
+denied outright or (previously) seeing everything. If you scripted around the old `/cancel`
+false-success or the old zero-filled `/summary` response for an unknown id, update to expect `404`.
+
+**Verify:** `GET /api/executions/{id}` for an execution outside your management-group scope should
+return `404`, not the previously-unfiltered full record. `docs/auth-architecture.md`'s "Fourth
+migration (#3789)" section has the full design; `docs/user-manual/rest-api.md`'s "Executions"
+section has the per-route reference including the `503` shape and the `rerun` escape hatch above.
+
 ## Behaviour change: Destructive-class dispatch now requires explicit `agent_ids` on REST and MCP (#3685)
 
 17 `plugin.action` pairs are classified `Destructive` in the command catalogue: `tar.purge_source`,
@@ -1098,7 +1146,14 @@ tickets before you cut over, so you know what to re-create afterward rather
 than discovering gaps after the fact. `GET /api/executions` defaults to the
 100 most recent rows (`?limit=<N>` to raise it — there is no offset/cursor
 parameter) — for a fleet with more history than that, raise the limit
-before relying on this as a full capture. The retired `instructions.db` file is **left on disk,
+before relying on this as a full capture. **This capture step runs on the
+pre-upgrade binary, which necessarily predates #3789** — the ADR-0065 Postgres cutover this
+section documents shipped before #3789 did, so any binary old enough to still need this
+procedure cannot yet carry #3789's `limit` cap; raise `?limit` as high as needed for this
+specific step. (A binary that already carries #3789, by contrast, caps `GET /api/executions`'
+`limit` at 500 regardless of the value requested, with no offset/cursor to page past it — see
+`docs/user-manual/rest-api.md`'s "Executions" section — but that cap cannot bite on this
+already-completed cutover's capture step.) The retired `instructions.db` file is **left on disk,
 not deleted** — if you need to recover consumed-approval audit evidence
 (the `submitted_by → reviewed_by → consumed_by` chain) after upgrading,
 that file is the most complete source (the audit store also carries

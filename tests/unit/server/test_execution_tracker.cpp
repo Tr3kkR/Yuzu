@@ -159,6 +159,182 @@ TEST_CASE("ExecutionTracker: query with limit", "[pg][execution_tracker]") {
     REQUIRE(results.size() == 5);
 }
 
+// ── #3789: query_executions_checked / SQL scope pushdown ──────────────────
+
+TEST_CASE("ExecutionTracker: query_executions_checked with no scope matches query_executions",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    REQUIRE(tracker.create_execution(make_execution("def-a")).has_value());
+    REQUIRE(tracker.create_execution(make_execution("def-b")).has_value());
+
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, std::nullopt);
+    REQUIRE(checked.has_value());
+    CHECK(checked->size() == 2);
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope admits the owner's own "
+          "dispatch before any agent has responded",
+          "[pg][execution_tracker]") {
+    // #3789 finding: agent_exec_status is response-arrival seeded, so a
+    // just-dispatched execution has zero status rows. Without the owner
+    // disjunct, this execution would be invisible to its own dispatcher
+    // under an engaged scope.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution("def-owner", "scope", "bob"));
+    REQUIRE(id.has_value());
+
+    ExecutionListScope scope;
+    scope.owner = "bob";
+    // visible_agents deliberately empty — no agent has reported yet.
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 1);
+    CHECK((*checked)[0].id == *id);
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope admits via a visible "
+          "agent's status row even when the caller is not the dispatcher",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution("def-teammate", "scope", "alice"));
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "bob-agent";
+    as.status = "success";
+    tracker.update_agent_status(*id, as);
+
+    ExecutionListScope scope;
+    scope.owner = "bob"; // not the dispatcher
+    scope.visible_agents = {"bob-agent"};
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 1);
+    CHECK((*checked)[0].id == *id);
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope excludes an execution "
+          "neither dispatched by the owner nor reported by a visible agent",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution("def-hidden", "scope", "alice"));
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "alice-agent";
+    as.status = "success";
+    tracker.update_agent_status(*id, as);
+
+    ExecutionListScope scope;
+    scope.owner = "bob";
+    scope.visible_agents = {"bob-agent"}; // does not include alice-agent
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    CHECK(checked->empty());
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked engaged-empty scope (no owner, "
+          "no visible agents) excludes every row",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    REQUIRE(tracker.create_execution(make_execution()).has_value());
+
+    ExecutionListScope scope; // owner empty, visible_agents empty
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    CHECK(checked->empty());
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope pushdown respects "
+          "LIMIT ordering (INV-3) — a hidden newer execution must not consume the "
+          "page while an older visible one exists",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    // Older, visible (dispatched by bob).
+    Execution visible_exec = make_execution("def-visible", "scope", "bob");
+    visible_exec.dispatched_at = 1000;
+    REQUIRE(tracker.create_execution(visible_exec).has_value());
+    // Newer, hidden (dispatched by someone else, no visible-agent row).
+    Execution hidden_exec = make_execution("def-hidden", "scope", "alice");
+    hidden_exec.dispatched_at = 2000;
+    REQUIRE(tracker.create_execution(hidden_exec).has_value());
+
+    ExecutionListScope scope;
+    scope.owner = "bob";
+    ExecutionQuery q;
+    q.limit = 1; // if the scope were applied AFTER LIMIT, the hidden newer
+                 // row would consume the only slot and the visible one
+                 // would never be returned.
+    auto checked = tracker.query_executions_checked(q, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 1);
+    CHECK((*checked)[0].definition_id == "def-visible");
+}
+
+TEST_CASE("ExecutionTracker: get_execution_checked distinguishes absent from present",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto absent = tracker.get_execution_checked("no-such-execution");
+    REQUIRE(absent.has_value()); // not degraded
+    CHECK_FALSE(absent->has_value()); // genuinely absent
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    auto present = tracker.get_execution_checked(*id);
+    REQUIRE(present.has_value());
+    REQUIRE(present->has_value());
+    CHECK((*present)->id == *id);
+}
+
+TEST_CASE("ExecutionTracker: get_agent_statuses_for_executions_checked groups by "
+          "execution id and short-circuits on empty input without degrading",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id_a = tracker.create_execution(make_execution("def-a"));
+    auto id_b = tracker.create_execution(make_execution("def-b"));
+    REQUIRE(id_a.has_value());
+    REQUIRE(id_b.has_value());
+    AgentExecStatus a1;
+    a1.agent_id = "agent-1";
+    a1.status = "success";
+    tracker.update_agent_status(*id_a, a1);
+
+    auto checked = tracker.get_agent_statuses_for_executions_checked({*id_a, *id_b});
+    REQUIRE(checked.has_value());
+    CHECK(checked->at(*id_a).size() == 1);
+    CHECK(checked->find(*id_b) == checked->end()); // no rows -> no key, not degrade
+
+    auto empty_result = tracker.get_agent_statuses_for_executions_checked({});
+    REQUIRE(empty_result.has_value());
+    CHECK(empty_result->empty());
+}
+
+TEST_CASE("ExecutionTracker: get_children_checked distinguishes genuinely-no-children "
+          "from a degraded read",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    auto checked = tracker.get_children_checked(*id);
+    REQUIRE(checked.has_value()); // not degraded
+    CHECK(checked->empty());      // genuinely no children
+}
+
 // ── Update Agent Status ────────────────────────────────────────────────────
 
 TEST_CASE("ExecutionTracker: update_agent_status dispatched -> running -> success",
@@ -772,6 +948,24 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     CHECK_FALSE(closed.get_execution("exec-1").has_value());
     CHECK(closed.get_summary("exec-1").id == "exec-1"); // id echoed, everything else defaulted
     CHECK(closed.get_agent_statuses("exec-1").empty());
+
+    // #3789: the checked twins must fail closed (nullopt/unexpected), not
+    // collapse to the plain methods' empty-on-degrade shape — a caller that
+    // drops rows or writes `denied` audit rows off these results must be
+    // able to tell "degraded" from "genuinely nothing here".
+    CHECK_FALSE(closed.query_executions_checked(ExecutionQuery{}).has_value());
+    auto exec_checked = closed.get_execution_checked("exec-1");
+    REQUIRE_FALSE(exec_checked.has_value());
+    CHECK(exec_checked.error() == "execution tracker not open");
+    CHECK_FALSE(closed.get_children_checked("exec-1").has_value());
+    CHECK_FALSE(
+        closed.get_agent_statuses_for_executions_checked({"exec-1"}).has_value());
+    // Engaged-empty still short-circuits on a closed store — zero requested
+    // ids is a success-empty outcome, not a degrade, regardless of whether
+    // the store could otherwise serve the request.
+    auto empty_ids_result = closed.get_agent_statuses_for_executions_checked({});
+    REQUIRE(empty_ids_result.has_value());
+    CHECK(empty_ids_result->empty());
 
     auto created = closed.create_execution(make_execution());
     REQUIRE_FALSE(created.has_value());

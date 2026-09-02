@@ -178,6 +178,14 @@ the cap, never an out-of-scope row), so this is not a security regression, but i
 not migrated onto the SQL-pushdown pattern above. Not the same surfaces as #3789/#3526;
 tracked separately as #3805.
 
+**#3789 (closed):** the legacy pre-v1 `/api/executions*` route family (`server.cpp`) — the one
+execution-reading surface with NO confinement of any kind, not even a post-fetch filter — is now
+on `require_fleet_read`, and its LIST route uses the SQL-pushdown pattern this paragraph describes
+(a correlated `EXISTS` over `agent_exec_status`, since `executions` carries no per-row `agent_id`
+column). Full design: `docs/auth-architecture.md`'s "Fourth migration (#3789)" /
+`docs/adr/0017-management-group-confinement-list-reads.md`'s "Executions (legacy pre-v1 routes)"
+bullet.
+
 ## PR 3 — SSE live updates
 
 `ExecutionEventBus` (`server/core/src/execution_event_bus.{hpp,cpp}`) is the
