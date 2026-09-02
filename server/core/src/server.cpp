@@ -1721,31 +1721,6 @@ public:
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_discovery_read_degrade_total", {{"reason", reason}});
-        metrics_.describe("yuzu_server_discovery_backfill_total",
-                          "DiscoveryStore legacy-SQLite backfill outcomes by result "
-                          "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
-                          "failed = fail-closed refusal). One-time at boot (ADR-0044)",
-                          "counter");
-        for (const auto result : {"completed", "fresh", "failed"})
-            metrics_.counter("yuzu_server_discovery_backfill_total", {{"result", result}});
-        // NotificationStore observability (ADR-0046). Two-way result split (not
-        // RbacStore/ManagementGroupStore/DiscoveryStore's three-way
-        // fresh/completed/failed) — this store's backfill is a single
-        // transaction with no multi-step outcome to report separately, so
-        // "fresh install" and "already-migrated skip" both collapse into
-        // result="success". This wrapper emits on EVERY boot (including
-        // already-migrated restarts), so a boot that never reaches this line
-        // — the failure mode YuzuNotificationBackfillFailing watches for —
-        // is visible as an absent series, not a "reaper" concern (this store
-        // has no retention/reap pass at all).
-        metrics_.describe("yuzu_server_notification_backfill_total",
-                          "One-time legacy notifications.db -> notification_store PostgreSQL "
-                          "backfill outcome on every boot, by result (success = fresh install, "
-                          "already-migrated skip, or a completed migration; failed = fail-closed, "
-                          "boot refused, next start retries). ADR-0046.",
-                          "counter");
-        for (const auto result : {"success", "failed"})
-            metrics_.counter("yuzu_server_notification_backfill_total", {{"result", result}});
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",
@@ -5051,14 +5026,17 @@ public:
         // `tag_store`), construction fail-CLOSED per ADR-0012 §1 (same
         // template as the sibling PG stores): a reachable database whose
         // schema can't migrate/open is a fatal startup error, never a
-        // serve-degraded scope-resolution substrate. `migrate_from_sqlite`
-        // runs the one-time, idempotent legacy-`tags.db` backfill (ADR-0009,
-        // MANDATORY — tags are scope/dispatch-targeting input, not
-        // expendable telemetry) — a backfill failure is ALSO fatal. NOTE:
-        // constructed HERE (not down in the later PG-store section) because
-        // the "Wire up store pointers for AgentServiceImpl" block just below
-        // hands agent_service_ the raw pointer — a construction site after
-        // that block would leave the service's pointer null forever.
+        // serve-degraded scope-resolution substrate. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy tags.db
+        // is never copied; the detect-and-warn obligation still applies
+        // (tags are scope/dispatch-targeting input, not expendable
+        // telemetry), so legacy_sqlite_probe::warn_if_legacy_rows() opens
+        // the legacy file read-only and warns (with a row count) only if it
+        // actually holds rows. NOTE: constructed HERE (not down in the later
+        // PG-store section) because the "Wire up store pointers for
+        // AgentServiceImpl" block just below hands agent_service_ the raw
+        // pointer — a construction site after that block would leave the
+        // service's pointer null forever.
         if (pg_pool_ && !startup_failed_) {
             tag_store_ = std::make_unique<TagStore>(*pg_pool_);
             if (!tag_store_->is_open()) {
@@ -5067,13 +5045,9 @@ public:
                 startup_failed_ = true;
             } else {
                 tag_store_->set_metrics(&metrics_);
-                // Pre-seed both bounded-label families to 0 (governance
-                // arch-F2, per docs/observability-conventions.md) so
-                // absent()-based alerting stays meaningful before the first
-                // degrade/backfill event. The sibling migrated stores
-                // predate this convention being applied to store counters —
-                // a class-wide follow-up tracks them; seeding only the new
-                // store is the conventions doc's side of that divergence.
+                // Pre-seed the bounded-label family to 0 (governance arch-F2,
+                // per docs/observability-conventions.md) so absent()-based
+                // alerting stays meaningful before the first degrade event.
                 metrics_.describe("yuzu_server_tag_store_read_degrade_total",
                                   "Tag-store reads that degraded instead of answering, by reason "
                                   "(scope/dispatch callers fail closed on these)",
@@ -5082,24 +5056,8 @@ public:
                     metrics_.counter("yuzu_server_tag_store_read_degrade_total",
                                      {{"reason", reason}});
                 }
-                metrics_.describe("yuzu_server_tag_store_backfill_total",
-                                  "One-time legacy tags.db backfill outcome (ADR-0050)",
-                                  "counter");
-                for (auto result : {"fresh", "success", "failed"}) {
-                    metrics_.counter("yuzu_server_tag_store_backfill_total",
-                                     {{"result", result}});
-                }
-                auto tag_db = cfg_.db_dir() / "tags.db";
-                if (!tag_store_->migrate_from_sqlite(tag_db)) {
-                    spdlog::error("[PG] Refusing to start: tag legacy-SQLite backfill failed "
-                                  "(see prior log lines) — tag_store feeds scope resolution and "
-                                  "dispatch targeting and must not serve partially-migrated "
-                                  "data. Operator remediation: reconcile or repair {}, or move "
-                                  "it aside to skip the backfill (tags in it will NOT carry "
-                                  "over)",
-                                  tag_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "tags.db", "TagStore",
+                                                         {"tags"});
             }
         }
 
@@ -5817,10 +5775,12 @@ public:
         // (ADR-0006/ADR-0036, schema `result_set_store`) — construction fail-CLOSED
         // per ADR-0012 §1 (same template as OfflineEndpointStore above): a
         // reachable database whose schema can't migrate/open is a fatal startup
-        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
-        // one-time, idempotent legacy-`result_sets.db` backfill (ADR-0009) —
-        // AUTHORITATIVE posture means a backfill failure is ALSO fatal (never
-        // serve on top of a partially-migrated schema).
+        // error, never a serve-degraded state. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // result_sets.db is never copied; the detect-and-warn obligation
+        // still applies, so legacy_sqlite_probe::warn_if_legacy_rows() opens
+        // the legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             result_set_store_ = std::make_unique<ResultSetStore>(*pg_pool_);
             if (!result_set_store_->is_open()) {
@@ -5829,20 +5789,10 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
-                auto rs_db = cfg_.db_dir() / "result_sets.db";
-                if (!result_set_store_->migrate_from_sqlite(rs_db)) {
-                    spdlog::error("[PG] Refusing to start: result-set legacy-SQLite backfill "
-                                  "failed (see prior log lines) — result_set_store is "
-                                  "authoritative and must not serve partially-migrated data. "
-                                  "Operator remediation: repair {} or move it aside to skip the "
-                                  "backfill (pinned sets in it will NOT carry over)",
-                                  rs_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("ResultSetStore initialized (schema result_set_store; legacy "
-                                 "backfill source {})",
-                                 rs_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "result_sets.db",
+                                                         "ResultSetStore",
+                                                         {"result_sets", "result_set_members"});
+                spdlog::info("ResultSetStore initialized (schema result_set_store)");
             }
         }
 
@@ -5923,10 +5873,13 @@ public:
         // (ADR-0006/0038, schema `guaranteed_state_store`) — construction fail-CLOSED
         // per ADR-0012 §1 (same template as ResultSetStore above): a reachable
         // database whose schema can't migrate/open is a fatal startup error, never a
-        // serve-degraded state. `migrate_from_sqlite` runs the one-time, idempotent
-        // legacy-`guaranteed-state.db` backfill (ADR-0009) — the rules/meta/status
-        // tables are AUTHORITATIVE/fail-hard, so a backfill failure is ALSO fatal
-        // (never serve on top of a partially-migrated rule set).
+        // serve-degraded state. NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment): the legacy guaranteed-state.db is
+        // never copied; the detect-and-warn obligation still applies (the
+        // rules/meta/status tables are real operator-authored enforcement
+        // config), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             guaranteed_state_store_ = std::make_unique<GuaranteedStateStore>(
                 *pg_pool_, cfg_.guardian_event_retention_days);
@@ -5936,25 +5889,17 @@ public:
                               "could not be created/opened)");
                 startup_failed_ = true;
             } else {
-                auto gs_db = cfg_.db_dir() / "guaranteed-state.db";
-                if (!guaranteed_state_store_->migrate_from_sqlite(gs_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: guaranteed-state legacy-SQLite backfill failed "
-                        "(see prior log lines) — rules/meta are authoritative and must not serve "
-                        "partially-migrated data. Operator remediation: repair {} or move it "
-                        "aside to skip the backfill (rules/events/observations in it will NOT "
-                        "carry over)",
-                        gs_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "guaranteed-state.db", "GuaranteedStateStore",
+                    {"guaranteed_state_rules", "guardian_meta", "guardian_agent_rule_status",
+                     "guaranteed_state_events", "guardian_observations"});
             }
             if (guaranteed_state_store_ && guaranteed_state_store_->is_open() &&
                 !startup_failed_) {
                 guaranteed_state_store_->set_metrics(&metrics_);
                 spdlog::info("GuaranteedStateStore initialized (schema guaranteed_state_store; "
-                             "retention={}d; legacy backfill source {})",
-                             cfg_.guardian_event_retention_days,
-                             (cfg_.db_dir() / "guaranteed-state.db").string());
+                             "retention={}d)",
+                             cfg_.guardian_event_retention_days);
                 // Step 5: ingest agent `__guard__` events arriving on the Subscribe
                 // stream → guaranteed_state_events. See docs/guardian-mvp-contract.md.
                 agent_service_.set_guaranteed_state_store(guaranteed_state_store_.get());
@@ -6047,11 +5992,13 @@ public:
         // construction fail-CLOSED per ADR-0012 §1 (same template as
         // GuaranteedStateStore above, its closest Guardian-domain sibling): a
         // reachable database whose schema can't migrate/open is a fatal startup
-        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
-        // one-time, idempotent legacy-`guardian-baselines.db` backfill (ADR-0009)
-        // — every table here is AUTHORITATIVE operator-authored enforcement
-        // config, so a backfill failure is ALSO fatal (never serve on top of a
-        // partially-migrated Baseline set).
+        // error, never a serve-degraded state. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // guardian-baselines.db is never copied; the detect-and-warn obligation
+        // still applies (this store holds real operator-authored enforcement
+        // config), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             baseline_store_ = std::make_unique<BaselineStore>(*pg_pool_);
             if (!baseline_store_->is_open()) {
@@ -6060,21 +6007,10 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
-                auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
-                if (!baseline_store_->migrate_from_sqlite(bl_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: Guardian Baseline legacy-SQLite backfill failed "
-                        "(see prior log lines) — Baselines are authoritative enforcement config "
-                        "and must not serve partially-migrated data. Operator remediation: "
-                        "repair {} or move it aside to skip the backfill (Baselines in it will "
-                        "NOT carry over)",
-                        bl_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("BaselineStore initialized (schema baseline_store; legacy "
-                                 "backfill source {})",
-                                 bl_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "guardian-baselines.db", "BaselineStore",
+                    {"guaranteed_state_baselines", "guaranteed_state_baseline_rules",
+                     "guaranteed_state_baseline_groups"});
             }
         }
 
@@ -6171,11 +6107,13 @@ public:
         // `custom_properties_store`) — construction fail-CLOSED per ADR-0012
         // §1 (same template as ManagementGroupStore above): a reachable
         // database whose schema can't migrate/open is a fatal startup error,
-        // never a serve-degraded asset-tagging substrate. `migrate_from_sqlite`
-        // runs the one-time, idempotent legacy-`custom-properties.db` backfill
-        // (ADR-0009) — AUTHORITATIVE operator-authored data means a backfill
-        // failure is ALSO fatal (never serve on top of partially-migrated
-        // custom properties/schemas).
+        // never a serve-degraded asset-tagging substrate. NO backfill
+        // (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the
+        // legacy custom-properties.db is never copied; the detect-and-warn
+        // obligation still applies (this store holds real operator-authored
+        // data), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             custom_properties_store_ = std::make_unique<CustomPropertiesStore>(*pg_pool_);
             if (!custom_properties_store_->is_open()) {
@@ -6185,17 +6123,9 @@ public:
                 startup_failed_ = true;
             } else {
                 custom_properties_store_->set_metrics(&metrics_);
-                auto props_db = cfg_.db_dir() / "custom-properties.db";
-                if (!custom_properties_store_->migrate_from_sqlite(props_db)) {
-                    spdlog::error("[PG] Refusing to start: custom-properties legacy-SQLite "
-                                  "backfill failed (see prior log lines) — custom_properties_store "
-                                  "is the AUTHORITATIVE asset-tagging substrate and must not serve "
-                                  "partially-migrated data. Operator remediation: repair {} or move "
-                                  "it aside to skip the backfill (custom properties/schemas in it "
-                                  "will NOT carry over)",
-                                  props_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "custom-properties.db", "CustomPropertiesStore",
+                    {"custom_properties", "custom_property_schemas"});
             }
         }
 
@@ -6236,9 +6166,11 @@ public:
         // `product_pack_store`). Construction fail-CLOSED per ADR-0012 §1 (same template as
         // CustomPropertiesStore/NotificationStore above): a reachable database whose schema
         // can't migrate/open is a fatal startup error, never a serve-degraded pack catalog.
-        // `migrate_from_sqlite` runs the one-time, idempotent legacy-`product-packs.db` backfill
-        // (ADR-0009) — AUTHORITATIVE operator-installed content means a backfill failure is ALSO
-        // fatal (never serve on top of partially-migrated packs).
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the legacy
+        // product-packs.db is never copied; the detect-and-warn obligation still applies
+        // (this store holds real operator-installed content), so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file read-only and
+        // warns (with a row count) only if it actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             product_pack_store_ = std::make_unique<ProductPackStore>(*pg_pool_);
             if (!product_pack_store_->is_open()) {
@@ -6248,19 +6180,10 @@ public:
                 startup_failed_ = true;
             } else {
                 spdlog::info("ProductPackStore initialized (schema product_pack_store)");
-                // #3261/#3294 class: set_metrics BEFORE migrate_from_sqlite, so the
-                // backfill-result counter is live on the one pass that matters — a
-                // registry wired only after the (one-shot, idempotent) backfill call
-                // would leave that specific pass permanently uncounted.
                 product_pack_store_->set_metrics(&metrics_);
-                // Pre-seed both bounded-label families to 0 (governance arch-F2, per
+                // Pre-seed the bounded-label family to 0 (governance arch-F2, per
                 // docs/observability-conventions.md, TagStore precedent above) so
-                // absent()-based alerting stays meaningful before the first
-                // degrade/backfill event — load-bearing here specifically because a
-                // backfill failure sets startup_failed_ (refused boot never serves
-                // /metrics at all), so an alert on THIS store's backfill result must
-                // be able to fire on the ABSENCE of a success/fresh sample, which
-                // requires the label set to already exist.
+                // absent()-based alerting stays meaningful before the first degrade event.
                 metrics_.describe("yuzu_server_product_pack_read_degrade_total",
                                   "ProductPackStore reads that degraded instead of answering, by "
                                   "reason",
@@ -6268,13 +6191,6 @@ public:
                 for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
                     metrics_.counter("yuzu_server_product_pack_read_degrade_total",
                                      {{"reason", reason}});
-                }
-                metrics_.describe("yuzu_server_product_pack_backfill_total",
-                                  "One-time legacy product-packs.db backfill outcome (ADR-0054)",
-                                  "counter");
-                for (auto result : {"fresh", "success", "failed"}) {
-                    metrics_.counter("yuzu_server_product_pack_backfill_total",
-                                     {{"result", result}});
                 }
                 metrics_.describe("yuzu_server_product_pack_install_compensation_total",
                                   "#3481: best-effort rollback of already-installed sibling-store "
@@ -6292,34 +6208,25 @@ public:
                     metrics_.counter("yuzu_server_product_pack_install_compensation_total",
                                      {{"result", result}});
                 }
-                auto pack_db = cfg_.db_dir() / "product-packs.db";
-                if (!product_pack_store_->migrate_from_sqlite(pack_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: product-pack legacy-SQLite backfill failed "
-                        "(see prior log lines) — product_pack_store is the AUTHORITATIVE pack "
-                        "catalog and must not serve partially-migrated data. Operator "
-                        "remediation: repair {} or move it aside to skip the backfill (packs "
-                        "in it will NOT carry over)",
-                        pack_db.string());
-                    startup_failed_ = true;
-                } else {
-                    // #802 / W7.4: enforce signed-pack-by-default. Default ProductPackStore
-                    // ctor sets require_signed_packs_=true; we invert only when the operator
-                    // opts in via the flag, and make the relaxed posture loud in operator logs
-                    // + audit (audit emission deferred to post-audit_store_-construction block
-                    // below to mirror the viz_disable pattern). #3261/#3294 class: this call
-                    // MUST stay inside the same fail-closed guard as construction — a
-                    // null-guarded call sitting outside it is the silent-skip-wiring bug class
-                    // that shipped three dead integrations.
-                    product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
-                    if (cfg_.allow_unsigned_packs) {
-                        spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
-                                     "by configuration (--allow-unsigned-packs / "
-                                     "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
-                                     "accepted at install — this exposes the fleet to "
-                                     "arbitrary instruction/plugin execution. Sign packs and "
-                                     "remove the flag as soon as feasible.");
-                    }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "product-packs.db",
+                                                         "ProductPackStore",
+                                                         {"product_packs", "product_pack_items"});
+                // #802 / W7.4: enforce signed-pack-by-default. Default ProductPackStore
+                // ctor sets require_signed_packs_=true; we invert only when the operator
+                // opts in via the flag, and make the relaxed posture loud in operator logs
+                // + audit (audit emission deferred to post-audit_store_-construction block
+                // below to mirror the viz_disable pattern). #3261/#3294 class: this call
+                // MUST stay inside the same fail-closed guard as construction — a
+                // null-guarded call sitting outside it is the silent-skip-wiring bug class
+                // that shipped three dead integrations.
+                product_pack_store_->set_require_signed_packs(!cfg_.allow_unsigned_packs);
+                if (cfg_.allow_unsigned_packs) {
+                    spdlog::warn("[SECURITY] product pack signature enforcement DISABLED "
+                                 "by configuration (--allow-unsigned-packs / "
+                                 "YUZU_ALLOW_UNSIGNED_PACKS). Unsigned packs will be "
+                                 "accepted at install — this exposes the fleet to "
+                                 "arbitrary instruction/plugin execution. Sign packs and "
+                                 "remove the flag as soon as feasible.");
                 }
             }
         }
@@ -6327,11 +6234,12 @@ public:
         // NotificationStore (ADR-0006 Wave 2): Postgres-backed, construction
         // fail-closed (ADR-0012 §1) — a reachable database whose schema
         // can't migrate/open is a fatal startup error, never a serve-degraded
-        // state. `migrate_from_sqlite` runs the one-time, idempotent legacy-
-        // `notifications.db` backfill (ADR-0009, MANDATORY — unread/dismissed
-        // state is operator-relevant, not expendable telemetry) — a backfill
-        // failure is ALSO fatal (never serve on top of a partially-migrated
-        // schema).
+        // state. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment): the legacy notifications.db is never copied; the
+        // detect-and-warn obligation still applies, so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds
+        // rows.
         if (pg_pool_ && !startup_failed_) {
             notification_store_ = std::make_unique<NotificationStore>(*pg_pool_);
             if (!notification_store_->is_open()) {
@@ -6340,26 +6248,13 @@ public:
                               "could not be created/opened)");
                 startup_failed_ = true;
             } else {
-                notification_store_->set_metrics(&metrics_);
-                auto notif_db = cfg_.db_dir() / "notifications.db";
-                if (!notification_store_->migrate_from_sqlite(notif_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: notification legacy-SQLite backfill failed "
-                        "(see prior log lines) — notification_store is authoritative and must "
-                        "not serve partially-migrated data. Operator remediation: repair {} or "
-                        "move it aside to skip the backfill (unread/dismissed history in it "
-                        "will NOT carry over)",
-                        notif_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("NotificationStore initialized (schema notification_store; "
-                                 "legacy backfill source {})",
-                                 notif_db.string());
-                    // #3261: wire the consumer immediately after construction,
-                    // inside the full-success branch - the old top-of-ctor
-                    // wiring block ran before this store existed and never fired.
-                    agent_service_.set_notification_store(notification_store_.get());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "notifications.db",
+                                                         "NotificationStore", {"notifications"});
+                spdlog::info("NotificationStore initialized (schema notification_store)");
+                // #3261: wire the consumer immediately after construction,
+                // inside the full-success branch - the old top-of-ctor
+                // wiring block ran before this store existed and never fired.
+                agent_service_.set_notification_store(notification_store_.get());
             }
         }
         // WebhookStore (ADR-0057, Wave 3) — Postgres-backed, construction
@@ -6801,11 +6696,13 @@ public:
         // (ADR-0006/ADR-0043, schema `deployment_store`) — construction
         // fail-CLOSED per ADR-0012 §1 (same template as ResultSetStore
         // above): a reachable database whose schema can't migrate/open is a
-        // fatal startup error, never a serve-degraded state.
-        // `migrate_from_sqlite` runs the one-time, idempotent legacy-
-        // `deployment-jobs.db` backfill (ADR-0009) — AUTHORITATIVE posture
-        // means a backfill failure is ALSO fatal (never serve on top of a
-        // partially-migrated schema). NOT `DeploymentRunStore` (the `/auto`
+        // fatal startup error, never a serve-degraded state. NO backfill
+        // (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the
+        // legacy deployment-jobs.db is never copied; the detect-and-warn
+        // obligation still applies (this store holds real operator-initiated
+        // deployment intent), so legacy_sqlite_probe::warn_if_legacy_rows()
+        // opens the legacy file read-only and warns (with a row count) only
+        // if it actually holds rows. NOT `DeploymentRunStore` (the `/auto`
         // Deploy stage's own, unrelated PG store) — see deployment_store.hpp's
         // file header for the naming trap.
         if (pg_pool_ && !startup_failed_) {
@@ -6816,20 +6713,9 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
-                auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
-                if (!deployment_store_->migrate_from_sqlite(deploy_db)) {
-                    spdlog::error("[PG] Refusing to start: deployment-jobs legacy-SQLite "
-                                  "backfill failed (see prior log lines) — deployment_store is "
-                                  "authoritative and must not serve partially-migrated data. "
-                                  "Operator remediation: repair {} or move it aside to skip the "
-                                  "backfill (jobs in it will NOT carry over)",
-                                  deploy_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("DeploymentStore initialized (schema deployment_store; legacy "
-                                 "backfill source {})",
-                                 deploy_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "deployment-jobs.db",
+                                                         "DeploymentStore", {"deployment_jobs"});
+                spdlog::info("DeploymentStore initialized (schema deployment_store)");
             }
         }
 
@@ -6837,11 +6723,12 @@ public:
         // (ADR-0006/0009, schema `discovery_store`) — construction fail-CLOSED
         // per ADR-0012 §1: a reachable database whose schema can't
         // migrate/open is a fatal startup error, never a serve-degraded
-        // state. `migrate_from_sqlite` runs the one-time, idempotent legacy-
-        // `discovery.db` backfill (ADR-0009) — the operator-set `managed`
-        // flag is real state, not expendable telemetry, so backfill is
-        // MANDATORY and a failure is ALSO fatal (never serve on top of
-        // partially-migrated discovery data).
+        // state. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment): the legacy discovery.db is never copied; the
+        // detect-and-warn obligation still applies (the operator-set
+        // `managed` flag is real state), so legacy_sqlite_probe::
+        // warn_if_legacy_rows() opens the legacy file read-only and warns
+        // (with a row count) only if it actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             discovery_store_ = std::make_unique<DiscoveryStore>(*pg_pool_);
             if (!discovery_store_->is_open()) {
@@ -6851,23 +6738,8 @@ public:
                 startup_failed_ = true;
             } else {
                 discovery_store_->set_metrics(&metrics_);
-                auto discovery_db = cfg_.db_dir() / "discovery.db";
-                if (!discovery_store_->migrate_from_sqlite(discovery_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: discovery legacy-SQLite backfill failed — "
-                        "discovery_store is AUTHORITATIVE and must not serve partially-migrated "
-                        "data. Operator remediation depends on the SPECIFIC reason logged above, "
-                        "not on this line alone: if it names a corrupt/truncated/unreadable {} "
-                        "or a fingerprint refusal BEFORE any insert happened, nothing has been "
-                        "migrated yet and moving it aside safely skips the backfill (its "
-                        "devices, including the operator-set managed flag, will NOT carry "
-                        "over). If it instead names a reconciliation FAILED or completion-marker "
-                        "problem, this replica's rows may ALREADY be durably inserted in "
-                        "Postgres — do NOT move the file aside without first checking "
-                        "discovery_store.discovered_devices for the affected IP(s).",
-                        discovery_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "discovery.db",
+                                                         "DiscoveryStore", {"discovered_devices"});
             }
         }
     }
@@ -11449,9 +11321,10 @@ private:
             // Prior membership is retained; there is NO automatic
             // repopulation pass (governance UP-5 — an earlier comment here
             // claimed one) — membership refreshes only when this ensure
-            // helper next runs, i.e. on the next `service`-tag write. The
-            // operator-facing recovery guidance lives in
-            // docs/ops-runbooks/tag-store-backfill-recovery.md.
+            // helper next runs, i.e. on the next `service`-tag write. There
+            // is no dedicated recovery runbook for this; a degraded tag
+            // store is a `TagStore::agents_with_tag` failure, diagnosed the
+            // same way as any other store-degrade log line.
             if (tag_store_) {
                 if (auto agents = tag_store_->agents_with_tag("service", service_value)) {
                     mgmt_group_store_->refresh_dynamic_membership(*result, *agents);

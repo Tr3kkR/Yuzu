@@ -153,3 +153,22 @@ partially-migrated discovery data). Added to both the `/healthz` and `/readyz` c
   `"success"`/`"partial"`/`"failure"`). Remaining gap in the same area, still open: no write-side
   Prometheus degrade counter (unlike the read
   path's `yuzu_server_discovery_read_degrade_total`) — tracked as a follow-up issue.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the mandatory
+fingerprint-verified backfill this ADR ported from `RbacStore` was real, working code
+that never had real legacy data to protect.
+
+`DiscoveryStore::migrate_from_sqlite()` and its private helpers (`sha256_hex`,
+`legacy_has_table`, `sqlite_text`, `read_legacy_snapshot`, `append_field`,
+`canonicalize_legacy_snapshot`, `fingerprint_legacy_snapshot`,
+`legacy_discovery_fingerprint`, and the `LDevice` type) are removed
+(`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623). `discovery_meta`
+— whose entire purpose was the backfill idempotency marker — is dropped via a
+version-bumped `{2, "DROP TABLE IF EXISTS discovery_meta;"}` migration, not edited into
+v1: this store IS constructed in production, so v1 has actually run against real
+dev/UAT databases. `server.cpp`'s boot path now runs
+`legacy_sqlite_probe::warn_if_legacy_rows` over `discovered_devices` instead — silent
+unless real rows are found, never blocks boot.

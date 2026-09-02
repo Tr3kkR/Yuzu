@@ -2192,57 +2192,6 @@ tests:
         eval_time: 20m
         exp_samples: []
 
-  # ── YuzuTagStoreBackfillNotCompleted (ADR-0050) ─────────────────────────
-  #
-  # `absent_over_time(..._backfill_total{result=~"success|fresh"}[15m])`,
-  # for: 5m, critical. The rule is ABSENCE-keyed because a failed backfill
-  # sets startup_failed_ and /metrics is never served -- a result="failed"
-  # sample is unscrappable, so a failed-keyed expression could never fire
-  # (governance sre-1). These two cases pin both halves of that design.
-
-  # CASE 59 -- a scraped success outcome (the pre-seeded counter incremented
-  # once at boot) suppresses the alert for as long as it stays in the window.
-  - interval: 1m
-    name: tag store backfill - a scraped success outcome is quiet
-    input_series:
-      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="success"}'
-        values: "1x40"
-      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="failed"}'
-        values: "0x40"
-    promql_expr_test:
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted"}'
-        eval_time: 30m
-        exp_samples: []
-
-  # CASE 60 -- the sre-1 pin: even with a result="failed" series PRESENT
-  # (hypothetically scraped), the rule fires on the ABSENCE of the two good
-  # outcomes -- it must never be rewritten to key on result="failed", which
-  # a refused boot never serves. The absent series carries no result label
-  # (regex matchers do not populate absent()-family label sets).
-  - interval: 1m
-    name: tag store backfill - absent good outcomes fire even with a failed series present
-    input_series:
-      - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="failed"}'
-        values: "0+1x40"
-    promql_expr_test:
-      # for: 5m pinned both sides: absence is true from the first evaluation
-      # (absent_over_time needs no window population), so pending starts at
-      # t=0 and firing begins at exactly t=5m -- quiet at 4m, firing at 5m
-      # and still at 25m.
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
-        eval_time: 4m
-        exp_samples: []
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
-        eval_time: 5m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing", severity="critical"}'
-            value: 1
-      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
-        eval_time: 25m
-        exp_samples:
-          - labels: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing", severity="critical"}'
-            value: 1
-
   # ── YuzuDispatchTargetRejected: the reason="quarantined" exclusion (#881) ──
   #
   # `sum by (route, reason)(increase(yuzu_server_dispatch_target_rejected_total

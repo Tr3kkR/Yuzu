@@ -1477,13 +1477,20 @@ PostgreSQL store (authoritative posture).
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_custom_properties_read_degrade_total{reason}` | counter | A `props.<key>` scope-feeding read (the bulk `get_values_for_keys` preload `AgentRegistry::evaluate_scope` uses, or a direct property read) degraded instead of returning a result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). **A non-zero rate means a `props.<key>`-scoped dispatch/policy/push rule is aborting scope evaluation** — every caller collapses that abort to "zero targets matched," so this is NOT the same as "operators removed the properties." |
-| `yuzu_server_custom_properties_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres backfill at boot (ADR-0045). `result` ∈ `success` (legacy `custom-properties.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable legacy file, or a holder-side fingerprint-verification refusal on a multi-replica boot with divergent legacy content; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
 
-## Notification store metrics (dashboard feed, ADR-0046)
+`yuzu_server_custom_properties_backfill_total{result}` (the one-time SQLite→Postgres backfill
+outcome) was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a pre-Postgres
+build, so there was no real `custom-properties.db` data to migrate. See ADR-0045's Update.
 
-| Metric | Type | Description |
-|---|---|---|
-| `yuzu_server_notification_backfill_total{result}` | counter | Outcome of the one-time legacy `notifications.db` → PostgreSQL backfill, emitted on **every** boot (not just first boot — unlike the sibling stores' *three-way* fresh/completed/failed split, this store's backfill is a single transaction with no separate fresh/completed outcome, so "fresh install" and "already-migrated skip" both collapse into `result="success"`, and the wrapper always emits it). `result` ∈ `success` (fresh install, an already-migrated skip, or a completed migration), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
+## Notification store (dashboard feed, ADR-0046)
+
+`yuzu_server_notification_backfill_total{result}` (the one-time legacy backfill outcome)
+was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real `notifications.db` data to migrate. This store
+had no other dedicated metric (`set_metrics()`/the `metrics_` pointer were retired with
+it — nothing else consumed them). See ADR-0046's Update.
 
 **Useful PromQL queries:**
 
@@ -1491,12 +1498,6 @@ PostgreSQL store (authoritative posture).
 # props.<key> scope reads degrading → scoped dispatch/policy/push rules may be
 # silently matching nobody. (Shipped as the YuzuCustomPropertiesReadDegraded alert.)
 sum(rate(yuzu_server_custom_properties_read_degrade_total[5m])) by (reason) > 0
-
-# One-time custom-properties backfill failed → server refused to boot (ADR-0045).
-sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 0
-
-# One-time notification backfill failed → server refused to boot (ADR-0046).
-sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## Analytics event outbox metrics (ADR-0049)
@@ -1515,7 +1516,12 @@ Analytics collection itself is disabled entirely with `--no-analytics` — no st
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_tag_store_read_degrade_total{reason}` | counter | A tag read degraded instead of answering, and the caller FAILED CLOSED (ADR-0050): `tag:<key>` scope resolution aborts the whole evaluation (a tag-scoped dispatch reaches zero agents), service-scoped-token confinement 503s, and the REST/MCP tag surfaces answer `503`/`-32603` — never a silently-empty result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection in time — correlates with `yuzu_pg_acquire_*`/`yuzu_pg_pool_waiters` saturation), `query_error`. **A non-zero rate also means the policy evaluator is silently skipping `tag:`-scoped checks** (its tick collapses the abort to "no targets"; `PolicyStore.last_check_at` stops advancing). Pre-seeded to 0 for all three reasons. Write-path failures (set/sync/delete) are log-only — deliberately no per-store write counter (wave-level decision pending). |
-| `yuzu_server_tag_store_backfill_total{result}` | counter | Outcome of the one-time `tags.db` → Postgres backfill at boot (ADR-0050). `result` ∈ `fresh` (no legacy DB), `success` (backfilled and moved aside), `failed` (refused — the server **fails the boot closed** and retries next start; NOTE a refused boot never serves `/metrics`, so `failed` is effectively unscrapeable — alerting keys on the ABSENCE of `success|fresh` instead, which the pre-seed makes meaningful; see `YuzuTagStoreBackfillNotCompleted`). A direction-aware row-conflict refusal is a data-integrity signal, not just availability — see `docs/ops-runbooks/tag-store-backfill-recovery.md`. |
+
+`yuzu_server_tag_store_backfill_total{result}` (the one-time `tags.db` → Postgres
+backfill outcome) was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real `tags.db` data to migrate. See ADR-0050's
+Update.
 
 **Useful PromQL queries:**
 
@@ -1523,11 +1529,6 @@ Analytics collection itself is disabled entirely with `--no-analytics` — no st
 # Tag reads degrading → tag-scoped dispatch failing closed to zero agents and
 # policy tag-checks silently skipping. (Shipped as YuzuTagStoreReadDegraded.)
 sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
-
-# No server reporting a completed tag backfill → possible fail-closed boot
-# refusal loop. (Shipped as YuzuTagStoreBackfillNotCompleted; absent-success
-# shape, NOT result="failed" — a refused boot never serves /metrics.)
-absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
 ```
 
 ## Product pack store metrics (operator-installed content, ADR-0054)
@@ -1535,7 +1536,6 @@ absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[1
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_product_pack_read_degrade_total{reason}` | counter | A `product_pack_store` read (`list()`/`get()`, including the per-pack item fetch) degraded instead of answering, and the caller FAILED CLOSED — `GET /api/product-packs`/`GET /api/product-packs/{id}` answer `503`, never a silently-empty pack list or a false "not found". `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection in time — correlates with `yuzu_pg_acquire_*`/`yuzu_pg_pool_waiters` saturation), `query_error` (covers both the pack-row query and the per-pack item-row query). Pre-seeded to 0 for all three reasons. `uninstall` write-path failures are still log-only — no per-store write counter (wave-level decision pending, matches `TagStore`'s own boundary) — but `install` gained one below (#3481). |
-| `yuzu_server_product_pack_backfill_total{result}` | counter | Outcome of the one-time `product-packs.db` → Postgres backfill at boot (ADR-0054). `result` ∈ `fresh` (no legacy DB, or an empty one), `success` (backfilled), `failed` (refused — the server **fails the boot closed** and retries next start; NOTE a refused boot never serves `/metrics`, so `failed` is effectively unscrapeable — alerting keys on the ABSENCE of `success|fresh` instead, which the pre-seed makes meaningful; see `YuzuProductPackBackfillNotCompleted`). A differently-valued pack/item conflict across replicas is a data-integrity signal, not just availability — see `docs/user-manual/upgrading.md`'s "Product packs migrate to Postgres" section. |
 | `yuzu_server_product_pack_install_compensation_total{result}` | counter | Fires only when `install()`'s final Postgres persist (or its pre-persist duplicate-item-id check) fails AFTER `install_fn` already committed one or more items into sibling stores (#3481). `result` ∈ `ok` (every already-installed item was successfully compensated/undone) or `partial` — two distinct shapes share this label: at least one item's compensation itself failed (including a `compensate_fn` call that threw — see the paired `spdlog::error` line naming the exact kind/item id), OR (#3481, gov Gate 5 CHAOS-1b) the transaction's own outcome could not be confirmed at all (still in progress, or the confirmation check itself failed) — this second shape skips compensation ENTIRELY (zero items attempted, not just some), carries no per-item kind/item-id log line and no `(compensated N/M)` suffix on the audit `detail` (there is nothing to name — compensation never ran), and is the WORST-CASE residual since no cleanup was attempted at all. **The two shapes need DIFFERENT manual/operator responses — read the paired `spdlog::error` line first to tell them apart** ("compensation FAILED for `<kind>` '`<item_id>`'..." vs. "outcome could not be confirmed..."). Pre-seeded to 0 for both `result` values at boot, same as the two counters above — load-bearing here, not just convention: `increase()` needs a baseline (differently-valued) sample inside its window to detect a 0→1 step, so a series that only comes into existence already at 1 never fires (verified with `promtool test rules`). Alert on ANY occurrence of a non-zero `partial` count (`YuzuProductPackCompensationPartial`, `for: 0m` — deliberately not a sustained-rate threshold) — it means residual orphaned sibling-store content that self-heal cannot fix; a lone event is an operator cleanup task, not an incident, but it does not self-clear either. Remediation: if the paired log line names a specific kind/item id ("compensation FAILED for..."), that item is a confirmed orphan — delete it directly through that sibling store's own route (`DELETE /api/instructions/{id}`, `DELETE /api/policies/{id}` or `/api/policy-fragments/{id}`, `DELETE /api/workflows/{id}`). If it instead says "outcome could not be confirmed" (no item named — the ambiguous-outcome shape), do **NOT** delete anything by guessing item ids from the submitted bundle: first confirm via `GET /api/product-packs/{id}` whether the pack actually committed — a live, successfully-installed pack is indistinguishable from an orphan using this alert alone, and deleting a live pack's content is the exact destructive hazard the ambiguous-commit-outcome check exists to prevent. There is no bulk reconciliation sweep for either shape. **After a flap that produces several events at once** (gov Gate 6, sre): there is no batch tooling — enumerate candidates by correlating the counter's increment timestamps against `product_pack.install`/`product_pack.uninstall` audit rows carrying a `(compensated N/M item(s))` or "outcome could not be confirmed" detail in the same window, then loop the per-event remediation above for each. **Crash-mid-compensation blind spot:** this counter, its paired log line, and the audit row are all written only after the compensation loop completes — a process crash/restart during that loop leaves NO evidence on any of the three channels for that specific attempt. A restart around the time of a large pack install, with no alert or log line for it, is not proof compensation ran cleanly; check the submitted bundle against sibling-store content manually in that window (see `product_pack_store.hpp`'s F031 update note). |
 
 **Useful PromQL queries:**
@@ -1544,13 +1544,13 @@ absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[1
 # Product-pack reads degrading → GET /api/product-packs* failing closed to 503.
 # (Shipped as YuzuProductPackReadDegraded.)
 sum(rate(yuzu_server_product_pack_read_degrade_total[5m])) by (reason) > 0
-
-# No server reporting a completed product-pack backfill → possible fail-closed
-# boot refusal loop. (Shipped as YuzuProductPackBackfillNotCompleted;
-# absent-success shape, NOT result="failed" — a refused boot never serves
-# /metrics.)
-absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
 ```
+
+`yuzu_server_product_pack_backfill_total{result}` (the one-time legacy backfill outcome)
+was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real `product-packs.db` data to migrate. See
+ADR-0054's Update.
 
 ## Instruction store metrics (content-plane catalog, ADR-0058)
 
@@ -1563,7 +1563,7 @@ legacy-SQLite backfill** (ADR-0009's fresh-start-by-default class) — there is 
 |---|---|---|
 | `yuzu_server_instruction_read_degrade_total{reason}` | counter | An `InstructionStore` read degraded instead of answering, and the caller FAILED CLOSED — the REST/MCP surfaces answer `503`, never a silently-empty or silently-truncated catalog. `reason` ∈ `store_not_open`, `pool_acquire_timeout`, `query_error`. Pre-seeded to 0 for all three. |
 | `yuzu_server_instruction_write_degrade_total{reason}` | counter | An `InstructionStore` write degraded instead of succeeding. `reason` ∈ `insert_definition_row`, `update_definition`, `delete_definition`, `insert_set_row`, `delete_set`. Pre-seeded to 0 for all five. Shared with the boot-time reseed loop's own inserts (`insert_definition_row`/`insert_set_row`) — a spike here during a boot window overlaps with `yuzu_server_instruction_bundled_content_total{result="errored"}` below; outside a boot window it's an ordinary operator-write failure. |
-| `yuzu_server_instruction_bundled_content_total{result}` | counter | Outcome of the **every-boot** bundled-content reseed loop (`kBundledDefinitions`/`kBundledSets`, 232 definitions / 10 sets as of this writing) — distinct from the `*_backfill_total` one-time-at-boot shape used elsewhere on this page, since this store reseeds on **every** boot, not once. `result` ∈ `clean` (zero import errors) or `errored` (at least one definition/set failed to import against an open store). Pre-seeded to 0 for both. **`errored` means the boot refused to start** (gov Gate 4 UP-4/Gate 8 fix): a genuine DB error during the reseed loop sets `startup_failed_`, so — same caveat as the `*_backfill_total{result="failed"}` families elsewhere on this page — a refused boot never serves `/metrics`, making `errored` itself effectively unscrapeable; alert on the ABSENCE of `clean` instead, the same shape `YuzuProductPackBackfillNotCompleted` uses. |
+| `yuzu_server_instruction_bundled_content_total{result}` | counter | Outcome of the **every-boot** bundled-content reseed loop (`kBundledDefinitions`/`kBundledSets`, 232 definitions / 10 sets as of this writing) — distinct from the `*_backfill_total` one-time-at-boot shape used elsewhere on this page, since this store reseeds on **every** boot, not once. `result` ∈ `clean` (zero import errors) or `errored` (at least one definition/set failed to import against an open store). Pre-seeded to 0 for both. **`errored` means the boot refused to start** (gov Gate 4 UP-4/Gate 8 fix): a genuine DB error during the reseed loop sets `startup_failed_`, so — same caveat as the `*_backfill_total{result="failed"}` families elsewhere on this page — a refused boot never serves `/metrics`, making `errored` itself effectively unscrapeable; alert on the ABSENCE of `clean` instead, the same absent-success shape the `*_backfill_total` alerts elsewhere on this page use. |
 
 **Useful PromQL queries:**
 

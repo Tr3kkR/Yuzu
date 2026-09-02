@@ -17,7 +17,10 @@
 /// `rest_api_v1.cpp` are compiled and register whenever a non-null pointer
 /// IS passed, so this header's contract is real even though nothing
 /// exercises it in production today. See ADR-0051 for the full
-/// posture/backfill/dormancy record.
+/// posture/backfill/dormancy record; its Update records `migrate_from_sqlite()`'s
+/// retirement (chore/retire-migrate-from-sqlite-batch-b, #3623) — this store's
+/// zero production callers meant its schema migration v1 never ran against
+/// any real database either.
 ///
 /// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and
 /// runtime — same reasoning as `DeploymentStore` (ADR-0043): no in-memory
@@ -35,11 +38,8 @@
 /// `(deployment_id, agent_id)`). **Postgres ENFORCES these FKs** — the
 /// pre-migration SQLite store never ran `PRAGMA foreign_keys=ON`, so an
 /// orphan row (a deployment referencing a deleted package, e.g.) was
-/// possible there and is not here. See the `.cpp`'s `migrate_from_sqlite`
-/// doc comment for how backfill handles a legacy orphan (fails the whole
-/// backfill closed — there is no valid parent to satisfy the FK with) and
-/// `delete_package`'s doc comment for the enforced-FK behavior change on the
-/// live path.
+/// possible there and is not here. See `delete_package`'s doc comment for
+/// the enforced-FK behavior change on the live path.
 ///
 /// `id` (packages, deployments) stays a client-generated 32-hex-char TEXT
 /// surrogate key — the pre-migration `generate_id()` format (two
@@ -50,7 +50,6 @@
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -90,12 +89,10 @@ struct SoftwareDeployment {
     std::string scope_expression;
     // "staged" -> "deploying" -> "verifying" -> "completed", with
     // "cancelled"/"rolled_back"/"failed" reachable as terminal exits from
-    // various points (see the .cpp's deployment_lifecycle_rank). Only
-    // staged/deploying/cancelled/rolled_back have a store writer today
-    // (start_deployment/cancel_deployment/rollback_deployment) —
-    // verifying/completed/failed are part of the documented contract for a
-    // future orchestration engine and for legacy rows from the store's
-    // wired era; backfill accepts all seven.
+    // various points. Only staged/deploying/cancelled/rolled_back have a
+    // store writer today (start_deployment/cancel_deployment/
+    // rollback_deployment) — verifying/completed/failed are part of the
+    // documented contract for a future orchestration engine.
     std::string status;
     std::string created_by;
     std::int64_t created_at{0};
@@ -111,10 +108,9 @@ struct AgentDeploymentStatus {
     std::string agent_id;
     // "pending" -> "downloading" -> "installing" -> "verifying" ->
     // {"success","failed","rolled_back"} (terminal). `update_agent_status`
-    // is an unguarded upsert (any transition is possible on the live path),
-    // so this order is a documented CONTRACT the backfill's direction check
-    // treats as authoritative, not a proven-safe guard like the deployment
-    // table's guarded transitions — see the .cpp for the heuristic note.
+    // is an unguarded upsert (any transition is possible on the live path)
+    // — this order is documented, not enforced by a transition guard like
+    // the deployment table's.
     std::string status;
     std::int64_t started_at{0};
     std::int64_t completed_at{0};
@@ -132,18 +128,6 @@ public:
     SoftwareDeploymentStore& operator=(const SoftwareDeploymentStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
-
-    /// Legacy-SQLite backfill (ADR-0009). Call once at server startup,
-    /// BEFORE the server serves, after construction has proven the Postgres
-    /// schema is open. Idempotent PER DISTINCT LEGACY-FILE CONTENT (a
-    /// SHA-256 fingerprint over all three tables' rows, canonicalized and
-    /// sorted — see the .cpp) rather than a single fleet-wide completion
-    /// flag, mirroring `DeploymentStore`/ADR-0043. Fails CLOSED on any
-    /// error — an in-flight or completed deployment, or a real per-agent
-    /// install outcome, is real operator intent and must not be silently
-    /// dropped. Opens the legacy file READ-ONLY and never deletes/moves it
-    /// — the one-release rollback-window file is retained by the caller.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Packages ─────────────────────────────────────────────────────────
 
