@@ -2784,7 +2784,7 @@ groups:
             policy evaluator silently skips tag-scoped checks while this
             fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
             saturation signals; /readyz does not reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#device-tags-migrate-to-postgres-tagstore-adr-0050"
       - alert: YuzuRuntimeConfigReadDegraded
         # A runtime_config_store read degraded (ADR-0060). Two DIFFERENT failure
         # families under one metric, distinguished by `reason`:
@@ -2827,50 +2827,6 @@ groups:
             fail closed on this same secret; see "Key management (secrets
             KEK)" in the server admin guide before it does.
           runbook_url: "https://docs.yuzu.io/runbooks/runtime-config-read-degraded"
-      - alert: YuzuTagStoreBackfillNotCompleted
-        # Mirrors YuzuNotificationBackfillFailing's absent-success shape (NOT
-        # the custom-properties result="failed" shape): the one-time legacy
-        # tags.db -> tag_store backfill (ADR-0050) runs during server
-        # CONSTRUCTION, and a failure sets startup_failed_ so the HTTP
-        # listener never starts — /metrics is never served and a
-        # result="failed" sample is never scraped, making a failed-keyed
-        # expression unfireable (governance sre-1). What IS observable is the
-        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
-        # server.cpp's tag-store construction block (describe() + zero-loop
-        # over fresh/success/failed) — that is what makes "series absent"
-        # mean "no server is serving" rather than "metric not registered".
-        # THREE-WAY result split: fresh | success | failed; expr matches the
-        # two good outcomes. LIMITS: multi-replica — one wedged replica among
-        # healthy ones shows as up == 0, not this; a legitimately long first
-        # boot on a huge tags.db can trip it during the upgrade window
-        # (silence for the window). The BOOT LOG carries the actual
-        # remediation (holder-side fingerprint mismatch / direction-aware
-        # row-conflict refusal / unreadable legacy file). An oversized legacy
-        # file does NOT time out server-side — it makes a LONG boot that an
-        # orchestrator's startup budget may kill mid-backfill (safe, retried
-        # whole) — so also check for a kill loop, not only a refusal line.
-        # This is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed tag-store backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            tags.db -> PostgreSQL tag_store backfill (ADR-0050) in the last
-            15 minutes. After an upgrade the usual cause is a server that
-            FAILED the backfill: it fails CLOSED, refuses to serve, and
-            retries on the next start — a restart loop with the whole server
-            down. A DIRECTION-AWARE row-conflict refusal additionally means
-            the currently-served tag data may be the WRONG SIDE of an
-            operator-authored-data race — treat it as a data-integrity
-            incident, not just an availability one (verify which side is
-            authoritative before clearing anything). Read the server BOOT
-            log for the specific refusal; the runbook maps each message to
-            its recovery.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
       - alert: YuzuProductPackReadDegraded
         # A product_pack_store list()/get() read degraded and the caller failed
         # CLOSED (503 via workflow_routes.cpp's product_pack_error_status),

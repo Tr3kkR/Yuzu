@@ -1516,7 +1516,12 @@ Analytics collection itself is disabled entirely with `--no-analytics` — no st
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_tag_store_read_degrade_total{reason}` | counter | A tag read degraded instead of answering, and the caller FAILED CLOSED (ADR-0050): `tag:<key>` scope resolution aborts the whole evaluation (a tag-scoped dispatch reaches zero agents), service-scoped-token confinement 503s, and the REST/MCP tag surfaces answer `503`/`-32603` — never a silently-empty result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection in time — correlates with `yuzu_pg_acquire_*`/`yuzu_pg_pool_waiters` saturation), `query_error`. **A non-zero rate also means the policy evaluator is silently skipping `tag:`-scoped checks** (its tick collapses the abort to "no targets"; `PolicyStore.last_check_at` stops advancing). Pre-seeded to 0 for all three reasons. Write-path failures (set/sync/delete) are log-only — deliberately no per-store write counter (wave-level decision pending). |
-| `yuzu_server_tag_store_backfill_total{result}` | counter | Outcome of the one-time `tags.db` → Postgres backfill at boot (ADR-0050). `result` ∈ `fresh` (no legacy DB), `success` (backfilled and moved aside), `failed` (refused — the server **fails the boot closed** and retries next start; NOTE a refused boot never serves `/metrics`, so `failed` is effectively unscrapeable — alerting keys on the ABSENCE of `success|fresh` instead, which the pre-seed makes meaningful; see `YuzuTagStoreBackfillNotCompleted`). A direction-aware row-conflict refusal is a data-integrity signal, not just availability — see `docs/ops-runbooks/tag-store-backfill-recovery.md`. |
+
+`yuzu_server_tag_store_backfill_total{result}` (the one-time `tags.db` → Postgres
+backfill outcome) was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real `tags.db` data to migrate. See ADR-0050's
+Update.
 
 **Useful PromQL queries:**
 
@@ -1524,11 +1529,6 @@ Analytics collection itself is disabled entirely with `--no-analytics` — no st
 # Tag reads degrading → tag-scoped dispatch failing closed to zero agents and
 # policy tag-checks silently skipping. (Shipped as YuzuTagStoreReadDegraded.)
 sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
-
-# No server reporting a completed tag backfill → possible fail-closed boot
-# refusal loop. (Shipped as YuzuTagStoreBackfillNotCompleted; absent-success
-# shape, NOT result="failed" — a refused boot never serves /metrics.)
-absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
 ```
 
 ## Product pack store metrics (operator-installed content, ADR-0054)

@@ -4986,14 +4986,17 @@ public:
         // `tag_store`), construction fail-CLOSED per ADR-0012 §1 (same
         // template as the sibling PG stores): a reachable database whose
         // schema can't migrate/open is a fatal startup error, never a
-        // serve-degraded scope-resolution substrate. `migrate_from_sqlite`
-        // runs the one-time, idempotent legacy-`tags.db` backfill (ADR-0009,
-        // MANDATORY — tags are scope/dispatch-targeting input, not
-        // expendable telemetry) — a backfill failure is ALSO fatal. NOTE:
-        // constructed HERE (not down in the later PG-store section) because
-        // the "Wire up store pointers for AgentServiceImpl" block just below
-        // hands agent_service_ the raw pointer — a construction site after
-        // that block would leave the service's pointer null forever.
+        // serve-degraded scope-resolution substrate. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy tags.db
+        // is never copied; the detect-and-warn obligation still applies
+        // (tags are scope/dispatch-targeting input, not expendable
+        // telemetry), so legacy_sqlite_probe::warn_if_legacy_rows() opens
+        // the legacy file read-only and warns (with a row count) only if it
+        // actually holds rows. NOTE: constructed HERE (not down in the later
+        // PG-store section) because the "Wire up store pointers for
+        // AgentServiceImpl" block just below hands agent_service_ the raw
+        // pointer — a construction site after that block would leave the
+        // service's pointer null forever.
         if (pg_pool_ && !startup_failed_) {
             tag_store_ = std::make_unique<TagStore>(*pg_pool_);
             if (!tag_store_->is_open()) {
@@ -5002,13 +5005,9 @@ public:
                 startup_failed_ = true;
             } else {
                 tag_store_->set_metrics(&metrics_);
-                // Pre-seed both bounded-label families to 0 (governance
-                // arch-F2, per docs/observability-conventions.md) so
-                // absent()-based alerting stays meaningful before the first
-                // degrade/backfill event. The sibling migrated stores
-                // predate this convention being applied to store counters —
-                // a class-wide follow-up tracks them; seeding only the new
-                // store is the conventions doc's side of that divergence.
+                // Pre-seed the bounded-label family to 0 (governance arch-F2,
+                // per docs/observability-conventions.md) so absent()-based
+                // alerting stays meaningful before the first degrade event.
                 metrics_.describe("yuzu_server_tag_store_read_degrade_total",
                                   "Tag-store reads that degraded instead of answering, by reason "
                                   "(scope/dispatch callers fail closed on these)",
@@ -5017,24 +5016,8 @@ public:
                     metrics_.counter("yuzu_server_tag_store_read_degrade_total",
                                      {{"reason", reason}});
                 }
-                metrics_.describe("yuzu_server_tag_store_backfill_total",
-                                  "One-time legacy tags.db backfill outcome (ADR-0050)",
-                                  "counter");
-                for (auto result : {"fresh", "success", "failed"}) {
-                    metrics_.counter("yuzu_server_tag_store_backfill_total",
-                                     {{"result", result}});
-                }
-                auto tag_db = cfg_.db_dir() / "tags.db";
-                if (!tag_store_->migrate_from_sqlite(tag_db)) {
-                    spdlog::error("[PG] Refusing to start: tag legacy-SQLite backfill failed "
-                                  "(see prior log lines) — tag_store feeds scope resolution and "
-                                  "dispatch targeting and must not serve partially-migrated "
-                                  "data. Operator remediation: reconcile or repair {}, or move "
-                                  "it aside to skip the backfill (tags in it will NOT carry "
-                                  "over)",
-                                  tag_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "tags.db", "TagStore",
+                                                         {"tags"});
             }
         }
 

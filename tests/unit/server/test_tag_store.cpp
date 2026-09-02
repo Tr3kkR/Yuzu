@@ -70,14 +70,12 @@ TagShared& tag_shared() {
     return s;
 }
 
-// TRUNCATE both tables (tag_store_meta included so a stray backfill-marker
-// write can never leak into a later CRUD test's fixture).
+// tag_store_meta was the backfill idempotency marker table; migrate_from_sqlite()
+// (and the table itself) are retired (#3623) — nothing left to TRUNCATE there.
 void tag_reset() {
     auto lease = tag_shared().pool->acquire();
     REQUIRE(lease);
-    auto trunc = pg::exec_params(lease.get(),
-                                 "TRUNCATE tag_store.tags, tag_store.tag_store_meta "
-                                 "RESTART IDENTITY CASCADE",
+    auto trunc = pg::exec_params(lease.get(), "TRUNCATE tag_store.tags RESTART IDENTITY CASCADE",
                                  std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
 }

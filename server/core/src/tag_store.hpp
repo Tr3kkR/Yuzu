@@ -52,23 +52,13 @@
 /// pooled connections carry no per-store `search_path`. Mutate-and-return
 /// uses `RETURNING` (the #1033-banning idiom), never `sqlite3_changes()`.
 ///
-/// **Backfill (ADR-0009): mandatory, one-time, idempotent, fail-closed.**
-/// Tags are irreducible operator intent (and agent-reported state the
-/// operator may already scope on) — all four live sources ('server',
-/// 'agent', 'api', 'mcp') backfill. `migrate_from_sqlite()` follows the
-/// `RbacStore`/`CustomPropertiesStore` post-#2703 reference shape (content
-/// fingerprint stamped with the completion marker in the SAME transaction
-/// via a monotonic-promotion upsert; holder-side verification on later
-/// boots), with one addition over `CustomPropertiesStore`: row conflicts
-/// are DIRECTION-AWARE (the `DeploymentStore` shape) — a Postgres row
-/// strictly ahead of the legacy row on `updated_at` (or identical) is a
-/// benign no-op; a legacy row strictly ahead, or a tied `updated_at` with
-/// differing value/source, fails the backfill closed rather than silently
-/// discarding evidence of which write was the operator's latest.
+/// `migrate_from_sqlite()` retired (chore/retire-migrate-from-sqlite-batch-b,
+/// #3623): no production fleet ever ran a pre-Postgres build of this store —
+/// see ADR-0050's Update. `server.cpp` now runs a detect-and-warn probe over
+/// the legacy file instead.
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -137,19 +127,11 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_tag_store_backfill_total{result}`) and the read-degrade
-    /// counter (`yuzu_server_tag_store_read_degrade_total{reason}`). Set
-    /// ONCE during single-threaded startup, before serving begins; a null
-    /// registry (the default, e.g. in unit tests) disables emission.
+    /// Wire a metrics registry for the read-degrade counter
+    /// (`yuzu_server_tag_store_read_degrade_total{reason}`). Set ONCE during
+    /// single-threaded startup, before serving begins; a null registry (the
+    /// default, e.g. in unit tests) disables emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
-
-    /// One-time, idempotent legacy-SQLite backfill (ADR-0009), run at
-    /// startup before serving. Returns false (fail-closed — the server MUST
-    /// refuse to start) on any error, including a holder-side
-    /// fingerprint-verification failure and a direction-aware row-conflict
-    /// refusal (see the header comment above and the .cpp decision tree).
-    bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Writes ───────────────────────────────────────────────────────────
 
