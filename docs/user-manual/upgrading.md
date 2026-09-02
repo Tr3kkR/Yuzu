@@ -2489,49 +2489,36 @@ shape (`YuzuProductPackBackfillNotCompleted`) keys on the ABSENCE of any
 refused boot never serves `/metrics` at all, so no server in the window reporting
 either outcome is itself the signal of a fail-closed boot-refusal loop.
 
-## Guardian Baselines migrate to Postgres (mandatory backfill, BaselineStore, ADR-0055)
+## Guardian Baselines migrate to Postgres (BaselineStore, ADR-0055)
 
 `BaselineStore` — Guardian's deployable Baseline unit (`/guardian` → Baselines,
 `GET /api/v1/guaranteed-state/device-compliance`) — moves from the SQLite
 `guardian-baselines.db` file to the server's PostgreSQL substrate in this release,
 schema `baseline_store`, on the existing shared pool. A **Baseline** is the only
 deployable unit in Guardian: what a deploy enforces across the fleet is read from
-each Baseline's `deployed_snapshot`, never its live member set — so, like every
-other store feeding an enforcement decision, the backfill is mandatory and fails
-closed rather than degrading silently.
+each Baseline's `deployed_snapshot`, never its live member set.
 
-- **What is preserved:** every Baseline (`baselines`), its member Guards
-  (`baseline_rules`), and its assignment of included/excluded management groups
-  (`baseline_groups`) — read inside one deferred SQLite transaction so the parent
-  and its children fingerprint against the same instant. A Baseline already live
-  in Postgres (a second replica booting against shared state, or a re-run after a
-  partial pass) keeps its own current members/assignment untouched by the legacy
-  backfill — only a freshly-inserted parent's children are copied.
-- **Fail-closed boot, retried each start.** A backfill that cannot complete —
-  an unreadable/corrupt legacy file, a SHA-256 fingerprint failure, a Postgres
-  write error, an invalid legacy `lifecycle`/assignment `disposition` value, a
-  name collision against a different already-live baseline_id, or a row-direction
-  conflict (below) — **refuses the boot** and retries on the next start. The boot
-  log's `BaselineStore: migrate_from_sqlite:` lines carry the specific refusal,
-  naming the offending Baseline id.
-- **Fingerprint-verified whole-file marker, with per-row direction-aware
-  conflicts.** A completed backfill is recorded once per distinct SHA-256
-  fingerprint over the legacy file's full canonicalized content (the
-  `DiscoveryStore`/`ProductPackStore` shape — a later-booting replica still
-  holding its own legacy file re-verifies against the recorded fingerprint before
-  trusting an already-set completion marker). Independently, if Postgres already
-  holds a row for a legacy Baseline's id, that ROW is compared on `updated_at`
-  (the `TagStore` shape): Postgres strictly ahead, or identical content, is a
-  benign skip; the legacy side strictly ahead (or tied with differing content)
-  **refuses the boot** — the legacy file demonstrably holds a later write that
-  silently keeping Postgres's value would discard. Treat this refusal as a
-  data-integrity incident, not an availability one: the log names the exact
-  Baseline id and both `updated_at` values; decide which side is authoritative
-  before restarting.
-- **Legacy file moved aside after a verified backfill**
-  (`guardian-baselines.db.migrated-<epoch>`), same one-release rollback window as
-  the sibling stores.
-- **Fresh installs are unaffected** — no legacy file, nothing to migrate.
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `guardian-baselines.db` data to carry over — the
+one-time backfill mechanism this section originally described was retired under
+ADR-0009's fresh-start-by-default amendment (see ADR-0055's Update).
+
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching the ladder's "authoritative" posture for this
+  store), same as every other born-on-Postgres store.
+- A legacy `guardian-baselines.db` file with real content **does NOT** fail startup
+  and its content is **never imported** — the server opens it read-only, purely to
+  count rows across `guaranteed_state_baselines`/`guaranteed_state_baseline_rules`/
+  `guaranteed_state_baseline_groups` for a diagnostic warning, then boots
+  fresh-started regardless of what it finds. If any of those tables has rows, it
+  logs a `BaselineStore` legacy-row-count warning at WARN; boot proceeds unaffected
+  either way. If you see this warning and the environment genuinely has real
+  Baselines to keep, there is no automated recovery path: re-author the equivalent
+  Baselines against the new Postgres-backed store via the Guardian UI/REST API
+  before relying on it.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Operator-visible behaviour changes (fail-closed reads).** A degraded read on
 the enforcement-feeding path (`deployed_member_rule_ids()` — the source for the
@@ -2547,10 +2534,9 @@ which also rely on the boot log + `/readyz` rather than a Prometheus counter for
 a boot-fatal event) — a refused boot never serves `/metrics` at all, so the boot
 log and `/readyz` are the channels to watch during an upgrade.
 
-**Verify:** after the server reports ready, `/guardian` shows the same Baselines
-(and each one's members/assignment) as before the upgrade, and
-`SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
-`sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
+**Verify:** after the server reports ready, `/guardian` shows the expected Baselines
+(re-authored via the Guardian UI/REST API on a fresh install, or already-live
+Postgres data on a redeploy).
 
 ## Compliance policy engine moves to Postgres (PolicyStore, ADR-0056)
 

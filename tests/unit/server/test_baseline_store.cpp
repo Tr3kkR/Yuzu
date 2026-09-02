@@ -594,5 +594,4 @@ TEST_CASE("Bad path (unroutable DSN) yields a closed store with sentinel returns
     CHECK_FALSE(bad.deployed_member_rule_ids("x").has_value());
     CHECK(bad.baseline_count() == 0);
     CHECK(bad.member_count("x") == 0);
-    CHECK_FALSE(bad.migrate_from_sqlite("/nonexistent/path/does-not-matter.db"));
 }

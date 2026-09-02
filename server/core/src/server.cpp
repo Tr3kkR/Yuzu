@@ -6007,11 +6007,13 @@ public:
         // construction fail-CLOSED per ADR-0012 §1 (same template as
         // GuaranteedStateStore above, its closest Guardian-domain sibling): a
         // reachable database whose schema can't migrate/open is a fatal startup
-        // error, never a serve-degraded state. `migrate_from_sqlite` runs the
-        // one-time, idempotent legacy-`guardian-baselines.db` backfill (ADR-0009)
-        // — every table here is AUTHORITATIVE operator-authored enforcement
-        // config, so a backfill failure is ALSO fatal (never serve on top of a
-        // partially-migrated Baseline set).
+        // error, never a serve-degraded state. NO backfill (ADR-0009's
+        // 2026-08-25 fresh-start-by-default amendment): the legacy
+        // guardian-baselines.db is never copied; the detect-and-warn obligation
+        // still applies (this store holds real operator-authored enforcement
+        // config), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             baseline_store_ = std::make_unique<BaselineStore>(*pg_pool_);
             if (!baseline_store_->is_open()) {
@@ -6020,21 +6022,10 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
-                auto bl_db = cfg_.db_dir() / "guardian-baselines.db";
-                if (!baseline_store_->migrate_from_sqlite(bl_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: Guardian Baseline legacy-SQLite backfill failed "
-                        "(see prior log lines) — Baselines are authoritative enforcement config "
-                        "and must not serve partially-migrated data. Operator remediation: "
-                        "repair {} or move it aside to skip the backfill (Baselines in it will "
-                        "NOT carry over)",
-                        bl_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("BaselineStore initialized (schema baseline_store; legacy "
-                                 "backfill source {})",
-                                 bl_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "guardian-baselines.db", "BaselineStore",
+                    {"guaranteed_state_baselines", "guaranteed_state_baseline_rules",
+                     "guaranteed_state_baseline_groups"});
             }
         }
 
