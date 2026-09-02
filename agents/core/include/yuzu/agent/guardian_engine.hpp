@@ -499,6 +499,21 @@ private:
     /// disabled/invalid/spark-armed paths without duplicating it.
     void withdraw_legacy_guard_locked(const std::string& rule_id);
 
+    /// reconcile_rule_locked's outcome. Armed: the rule ended up armed via either
+    /// backend. Failed: the rule was ELIGIBLE to arm and a genuine arm ATTEMPT did
+    /// not succeed (currently: a spark attach_rule() error - a synchronous refusal,
+    /// a #2233 item 3 bounded-wait timeout, or a same-key busy rejection). Inert:
+    /// every other false-shaped outcome - disabled, an authoring/validation fault,
+    /// agent-wide SparkFailed/Unwired, Unsupported (a routine cross-platform gap,
+    /// NOT an error - pinned by "an all-unsupported push still advances
+    /// policy_generation" in test_guardian_engine_spark_reconcile.cpp), or a
+    /// legacy-path arm that did not start. Failed is deliberately narrower than
+    /// "returned false": apply_rules' policy_generation hold-on-failure gate must
+    /// count a genuine per-push arm failure (else a timed-out rule's push is
+    /// silently treated as fully applied and the server never retries it) without
+    /// also holding generation on routine/expected inert outcomes (#2233 item 3).
+    enum class ReconcileOutcome { Armed, Failed, Inert };
+
     /// THE reconcile op (rung 7): the SOLE per-rule arm/disarm decision point,
     /// replacing the direct start_guard_for_rule_locked call apply_rules and
     /// start_local's A2 re-arm loop used to make. Decides spark vs legacy per
@@ -506,10 +521,9 @@ private:
     /// and guarantees the mutual-exclusion invariant: a rule is armed in
     /// AT MOST ONE of guards_ / spark_runtime_, and an arm failure on
     /// whichever path was attempted is errored, NEVER a silent fallback to
-    /// the other. Called under mtx_. Returns true iff the rule ended up armed
-    /// via EITHER backend (so callers - A2's re-arm counter, apply_rules'
-    /// telemetry - keep counting correctly regardless of which path armed it).
-    bool reconcile_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
+    /// the other. Called under mtx_. See ReconcileOutcome for what each value
+    /// means and why Failed is narrower than "not Armed".
+    ReconcileOutcome reconcile_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
 
     /// Unwind a partially-completed wire_spark_engine() attempt, in the
     /// reverse order construction attempted the steps (each step is
