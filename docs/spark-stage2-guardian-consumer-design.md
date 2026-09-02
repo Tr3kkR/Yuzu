@@ -948,7 +948,7 @@ guards and the switch becomes a hard on/off for spark detection.
 
 `--spark-disable` default posture: **the pre-enforcement observe stage** (labelled
 rung (2) below when this paragraph was written; renumbered impl-rung-7 in the
-current F1-F13 code ladder + rung-7.7 flip sequencing — see
+current F1-F13 code ladder + rung-7.7 flip sequencing - see
 `docs/spark-flip-gate.md` for the current, canonical gate state) defaults to the
 spark path (safe, detection-only); the **enforce and deletion stages** (originally
 rungs 3/5; now the P3 enforce-cutover and P5 legacy-deletion post-flip programme
