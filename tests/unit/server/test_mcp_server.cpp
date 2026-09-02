@@ -7730,6 +7730,331 @@ TEST_CASE("MCP #3685: a Targeted Destructive call is NOT refused and still reach
     CHECK(*seen == std::unordered_set<std::string>{"dev-1", "dev-2"});
 }
 
+// ── 35c. #3687: pre-dispatch authorization dry run — discriminated denials ──
+//
+// classify_and_authorize_dispatch/PluginConfigStore::action_allowed (the
+// shared dispatch chokepoint) can refuse a call for six reasons
+// (DispatchDenialReason, agent_registry.hpp). Before this fix EVERY one of
+// them, reached via execute_instruction's main handler, was indistinguishable
+// from an empty target set — dispatch_fn still enforced the denial correctly,
+// but reported it as the same agents_reached:0/no_agents_reached envelope an
+// offline/unreachable agent also produces. These tests prove each reason now
+// surfaces as a discriminated JSON-RPC error (code + error.data.reason,
+// naming the denial per Decision 7's F fix) with dispatch_fn NEVER invoked.
+
+TEST_CASE("MCP #3687: unwired authorizer fails CLOSED — every execute_instruction call refused, "
+          "dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    McpTestServer ts;
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK_FALSE(dispatched);
+}
+
+namespace {
+/// Builds an AuthorizeDispatchFn stub that unconditionally denies with the
+/// given reason/securable/operation, for the table-style tests below.
+yuzu::server::mcp::McpServer::AuthorizeDispatchFn
+deny_with(yuzu::server::detail::DispatchDenialReason reason, std::string securable = {},
+         yuzu::server::authz::Operation operation = yuzu::server::authz::Operation::Read) {
+    return [reason, securable, operation](const yuzu::server::DispatchCaller&, std::string_view,
+                                          std::string_view)
+        -> std::expected<yuzu::server::CommandCapability, yuzu::server::detail::DispatchDenial> {
+        return std::unexpected(
+            yuzu::server::detail::DispatchDenial{reason, securable, operation});
+    };
+}
+} // namespace
+
+TEST_CASE("MCP #3687: Unclassified denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Unclassified);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"nope","action":"nope"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "unknown or ambiguous plugin.action");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "unclassified");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "unclassified"}})
+              .value() == 1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=unclassified") != std::string::npos);
+}
+
+TEST_CASE("MCP #3687: Ambiguous denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Ambiguous);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"dup","action":"dup"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "ambiguous");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "ambiguous"}}).value() ==
+          1.0);
+}
+
+TEST_CASE("MCP #3687: AnonymousOperator denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test = deny_with(
+        yuzu::server::detail::DispatchDenialReason::AnonymousOperator, "Execution",
+        yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "anonymous_operator");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "anonymous_operator"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP #3687: Forbidden denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>() == "permission denied: Infrastructure:Write");
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() ==
+          1.0);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find("reason=forbidden") != std::string::npos);
+}
+
+TEST_CASE("MCP #3687: ApprovalRequired denial is discriminated (NOT the kApprovalRequired "
+          "ticket-mint code — no ticket exists to poll), dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Operator tier: skips C8 entirely (auto-approved tier, no ticket ever
+    // minted), so this proves the main-handler dry run denies on its own —
+    // not a fall-through from the C8 approval-tier gate.
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired (-32006): that code's contract mandates
+    // approval_id/status_url, which this dry run — minting no ticket — never
+    // carries.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("approval required for os_info.version") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "approval_required");
+    CHECK_FALSE(body["error"]["data"].contains("approval_id"));
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "approval_required"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP #3687: KillSwitched denial is discriminated, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][3687]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::KillSwitched, "Execution",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"].get<std::string>().find("kill switch is OFF for os_info.version") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "kill_switched");
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP #3687: a genuinely-authorized call still dispatches normally (no regression)",
+          "[mcp][integration][execute][3687]") {
+    // Default authorize_dispatch_fn_for_test unconditionally succeeds — this
+    // test only pins that the dry run is a true pass-through on success,
+    // naming the scenario explicitly rather than relying on it being an
+    // unstated side effect of every other execute_instruction test.
+    McpTestServer ts;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string& plugin, const std::string& action,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        dispatched = true;
+        CHECK(plugin == "os_info");
+        CHECK(action == "version");
+        return {"cmd-3687", 3};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    CHECK(dispatched);
+}
+
+TEST_CASE("MCP #3687: a denial happens BEFORE execution-row creation — no phantom row",
+          "[mcp][pg][integration][execute][3687]") {
+    // Mirrors #3685's identically-named-in-spirit test at ~7624 ("operator-tier
+    // Destructive refusal happens BEFORE execution-row creation and
+    // dispatch") — the sign-off correction that produced #3687 explicitly
+    // named "a phantom cancelled execution row" as part of the defect (a
+    // denial reached inside dispatch_fn's own chokepoint left behind a
+    // created-then-cancelled row); this proves the #3687 dry run denies
+    // before any row is ever created, not merely before dispatch_fn runs.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Execution",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(dispatched);
+    CHECK(tracker.query_executions({}).empty()); // no execution row was ever created
+}
+
+
 // ── 36. Audit on success ─────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integration][execute]") {
