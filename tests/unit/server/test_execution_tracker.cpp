@@ -1984,3 +1984,373 @@ TEST_CASE("ExecutionTracker: reconcile_stale_concurrency_claims caps the number 
     }
     CHECK(tracker.reconcile_stale_concurrency_claims(now) == 10);
 }
+
+// ── HA WS-2a: durable event outbox (ADR-2002 §5) ─────────────────────────────
+
+namespace {
+struct OutboxRow {
+    long long event_id{0};
+    std::string execution_id;
+    std::string event_type;
+    std::string data;
+    bool is_terminal{false};
+    long long created_at{0};
+};
+
+// Reads event_outbox rows for one execution, oldest event_id first, over a
+// fresh lease on the given pool (the public API has no outbox read yet — no
+// consumer until WS-2a-2).
+std::vector<OutboxRow> fetch_outbox(pg::PgPool& pool, const std::string& execution_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT event_id, execution_id, event_type, data, is_terminal, created_at "
+        "FROM execution_tracker.event_outbox WHERE execution_id=$1 ORDER BY event_id",
+        std::vector<std::string>{execution_id});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    std::vector<OutboxRow> rows;
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
+        OutboxRow row;
+        row.event_id = std::strtoll(PQgetvalue(r.get(), i, 0), nullptr, 10);
+        row.execution_id = PQgetvalue(r.get(), i, 1);
+        row.event_type = PQgetvalue(r.get(), i, 2);
+        row.data = PQgetvalue(r.get(), i, 3);
+        row.is_terminal = std::string(PQgetvalue(r.get(), i, 4)) == "t";
+        row.created_at = std::strtoll(PQgetvalue(r.get(), i, 5), nullptr, 10);
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+} // namespace
+
+TEST_CASE("ExecutionTracker: WS-2a a completed execution durably appends "
+          "agent-transition + execution-progress + execution-completed events",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.completed_at = 1002;
+    tracker.update_agent_status(*id, as); // upsert (agent-transition) + refresh_counts (terminal)
+
+    auto rows = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0].event_type == "agent-transition");
+    CHECK_FALSE(rows[0].is_terminal);
+    CHECK(rows[1].event_type == "execution-progress");
+    CHECK(rows[1].is_terminal); // all agents responded -> the progress event is terminal-flagged
+    CHECK(rows[2].event_type == "execution-completed");
+    CHECK(rows[2].is_terminal);
+
+    // event_id is a global durable MONOTONIC id — strictly increasing in
+    // append order across the two separate transactions (upsert, then
+    // refresh_counts).
+    CHECK(rows[0].event_id < rows[1].event_id);
+    CHECK(rows[1].event_id < rows[2].event_id);
+
+    // The durable data mirrors what the in-memory bus would publish.
+    CHECK(rows[2].data.find("succeeded") != std::string::npos);
+
+    // Both-sides of invariant 1: the AUTHORITATIVE state committed in the SAME
+    // transactions as its events — not the event without the state. Read via
+    // the degrade-distinguishable accessor so a store error can't masquerade as
+    // "no state".
+    auto statuses = tracker.get_agent_statuses_checked(*id);
+    REQUIRE(statuses.has_value());
+    REQUIRE(statuses->size() == 1);
+    CHECK((*statuses)[0].status == "success");
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "succeeded");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a the state write and its event append are "
+          "ATOMIC — a failing append rolls the state write back (invariant 1)",
+          "[pg][execution_tracker][outbox]") {
+    // The headline WS-9 durability scenario: never state-without-event. The
+    // agent_exec_status upsert and the event_outbox append share ONE
+    // with_txn_for transaction, so if the append cannot commit, neither does
+    // the state write. Injected by dropping event_outbox so every append
+    // INSERT errors — the paired upsert must then leave no row.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(),
+                                   "DROP TABLE execution_tracker.event_outbox",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    tracker.update_agent_status(*id, as); // append fails -> whole txn rolls back
+
+    // Strengthened assertion (governance quality-engineer): distinguish a
+    // genuine rollback (read succeeds, zero rows) from a verification read that
+    // itself errored — the plain get_agent_statuses() collapses both into an
+    // empty vector via value_or({}), so it could not tell the two apart. Only
+    // `event_outbox` was dropped; `agent_exec_status` is intact, so the checked
+    // read MUST succeed, and its emptiness then PROVES the upsert rolled back
+    // (not that the read failed).
+    auto statuses = tracker.get_agent_statuses_checked(*id);
+    REQUIRE(statuses.has_value());
+    CHECK(statuses->empty());
+}
+
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled is atomic too — a failing "
+          "append rolls the cancel back (invariant 1, all write sites)",
+          "[pg][execution_tracker][outbox]") {
+    // Extends the atomicity coverage beyond update_agent_status to the second
+    // converted write path. mark_cancelled was a bare autocommit UPDATE before
+    // the outbox existed; it is now transactional, so a failing append must
+    // leave the execution NOT cancelled.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    CHECK_FALSE(tracker.mark_cancelled(*id, "admin")); // append fails -> rollback -> false
+
+    // The cancel was rolled back with the failing append: the execution is
+    // still 'running', not 'cancelled'.
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled durably appends a terminal "
+          "execution-completed event",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.mark_cancelled(*id, "admin"));
+
+    auto rows = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].event_type == "execution-completed");
+    CHECK(rows[0].is_terminal);
+    CHECK(rows[0].data.find("cancelled") != std::string::npos);
+}
+
+TEST_CASE("ExecutionTracker: WS-2a events appended on one instance are durable "
+          "and readable from a SEPARATE instance (WS-9 failover scenario)",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle; // "replica A" — writes
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "running";
+    tracker.update_agent_status(*id, as);
+
+    // "replica B" — a second pool against the SAME database, sharing no
+    // process memory with A. The in-memory bus could never surface A's events
+    // here; the durable outbox does. One update_agent_status durably appends
+    // both the agent-transition and the refresh_counts execution-progress
+    // event (mirroring exactly what the in-memory bus publishes per call).
+    pg::PgPool pool_b{{.conninfo = tracker_bundle.dsn(), .size = 2}};
+    auto rows = fetch_outbox(pool_b, *id);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].event_type == "agent-transition");
+    CHECK(rows[1].event_type == "execution-progress");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox deletes only aged-out "
+          "rows, missing-anchor PROCEEDs, and is clock-guarded",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "running";
+    tracker.update_agent_status(*id, as); // agent-transition + execution-progress
+
+    const std::size_t appended = fetch_outbox(tracker_bundle.pool(), *id).size();
+    REQUIRE(appended == 2);
+
+    // First pass: no anchor yet — PROCEED (missing-anchor decision), delete 0
+    // (the rows are fresh, far inside the 24h window), no anomaly.
+    auto first = tracker.reap_event_outbox();
+    REQUIRE(first.has_value());
+    CHECK(first->deleted == 0);
+    CHECK_FALSE(first->clock_anomaly);
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).size() == appended);
+
+    // Age the rows past the 24h window (test-only backdate, no public hook).
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.event_outbox SET created_at = created_at - 90000 "
+            "WHERE execution_id = $1",
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker.reap_event_outbox();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == static_cast<int>(appended));
+    CHECK_FALSE(second->clock_anomaly);
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).empty());
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox declines on a "
+          "forward-skewed anchor gap",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    // Establish a real anchor.
+    REQUIRE(tracker_bundle->reap_event_outbox().has_value());
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = (value::bigint - 200000)::text "
+            "WHERE key = 'event_outbox_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    auto second = tracker_bundle->reap_event_outbox();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox declines on a "
+          "backward-stepped clock and on an unparseable anchor",
+          "[pg][execution_tracker][outbox]") {
+    SECTION("backward-stepped clock (anchor far in the future)") {
+        yuzu::test::ExecutionTrackerPg tracker_bundle;
+        REQUIRE(tracker_bundle->reap_event_outbox().has_value());
+        {
+            auto lease = tracker_bundle.pool().acquire();
+            REQUIRE(lease);
+            auto res = pg::exec_params(
+                lease.get(),
+                "UPDATE execution_tracker.reap_meta SET value = (value::bigint + 200000)::text "
+                "WHERE key = 'event_outbox_reap_anchor'",
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        auto second = tracker_bundle->reap_event_outbox();
+        REQUIRE(second.has_value());
+        CHECK(second->deleted == 0);
+        CHECK(second->clock_anomaly);
+    }
+
+    SECTION("unparseable persisted anchor is sanitised, not coerced") {
+        yuzu::test::ExecutionTrackerPg tracker_bundle;
+        REQUIRE(tracker_bundle->reap_event_outbox().has_value());
+        {
+            auto lease = tracker_bundle.pool().acquire();
+            REQUIRE(lease);
+            auto res = pg::exec_params(
+                lease.get(),
+                "UPDATE execution_tracker.reap_meta SET value = '123junk' "
+                "WHERE key = 'event_outbox_reap_anchor'",
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        auto second = tracker_bundle->reap_event_outbox();
+        REQUIRE(second.has_value());
+        CHECK(second->deleted == 0);
+        CHECK(second->clock_anomaly);
+    }
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox on an unreachable pool "
+          "degrades without crashing",
+          "[execution_tracker][outbox]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+    auto reaped = closed.reap_event_outbox();
+    REQUIRE_FALSE(reaped.has_value());
+    CHECK(reaped.error() == "execution tracker not open");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled of an UNKNOWN id is a no-op — "
+          "no phantom durable event, returns false (self-adversarial C1/K6)",
+          "[pg][execution_tracker][outbox]") {
+    // ADR-2002 §5 event-WITHOUT-state direction: a cancel of an id that matches
+    // no execution row must NOT append a durable execution-completed event.
+    // (The UPDATE ... RETURNING id guard: zero rows matched -> no append, false.)
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    CHECK_FALSE(tracker.mark_cancelled("no-such-execution-id", "admin"));
+    CHECK(fetch_outbox(tracker_bundle.pool(), "no-such-execution-id").empty());
+}
+
+TEST_CASE("ExecutionTracker: WS-2a refresh_counts terminal transition is atomic — "
+          "a failing append rolls the transition back (self-adversarial C4c)",
+          "[pg][execution_tracker][outbox]") {
+    // Isolates refresh_counts_once's append-failure rollback (the third write
+    // path, whose terminal transition appends 1-2 events in one txn). A responded
+    // agent row is inserted directly so refresh_counts sees all-responded WITHOUT
+    // going through update_agent_status (whose own append would fire first).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.agent_exec_status "
+            "(execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
+            " exit_code, error_detail, plugin_result_status) "
+            "VALUES ($1, 'agent-1', 'success', 0, 0, 0, 0, '', 0)",
+            std::vector<std::string>{*id});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+        auto drop = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                    std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    tracker.refresh_counts(*id); // recompute -> terminal transition -> append fails -> rollback
+
+    // The terminal transition (status -> succeeded) rolled back with the failing
+    // append; the execution is still 'running'.
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+}

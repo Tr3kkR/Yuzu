@@ -400,3 +400,63 @@ subscriber.
 Both call sites are pinned by source-tripwire tests
 (`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
 **A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
+## HA WS-2a — durable event outbox (ADR-2002 §5)
+
+The "Restart loss" characteristic above is what WS-2a closes. `ExecutionTracker`
+gains a durable, append-only `event_outbox` table (migration v3) that shadows
+every event `ExecutionEventBus` fans out in-memory. The bus stays the *local*
+fan-out; the outbox is the durable, cross-replica feed. **2a-1 lands the outbox
+and its atomic write only — there is no consumer yet** (the in-memory bus still
+serves live SSE exactly as before). A later slice (2a-2) drives a
+LISTEN/NOTIFY-plus-cursor-poll loop from it.
+
+- **Atomic-write invariant (§5 invariant 1).** Each event is appended
+  (`append_event_outbox`, `execution_tracker.cpp`) on the **caller's live
+  transaction connection**, inside the same `with_txn_for` as the state
+  mutation that produced it — the `agent_exec_status` upsert
+  (`upsert_agent_status_once`), the aggregate recompute / terminal transition
+  (`refresh_counts_once`), and the cancel (`mark_cancelled`). A failed append
+  returns false, which rolls the whole transaction back, so the store can never
+  hold state without its event or an event without its state. The append takes
+  no lease of its own (nesting a pool acquire inside an open `with_txn` would
+  deadlock). It is decoupled from `event_bus_`: the durable append happens
+  regardless of whether a local SSE bus is attached; only the post-commit
+  in-memory fan-out is bus-gated.
+- **Durable monotonic ids.** `event_id` is a global `BIGINT` IDENTITY,
+  replacing the per-process ring-buffer counter. `created_at` is authored from
+  Postgres `now()` in-SQL so the retention cutoff and the row share one DB clock
+  domain.
+- **ID-ORDERING CONTRACT for future consumers.** An IDENTITY id is assigned at
+  INSERT but the row is visible only at COMMIT, so a transaction holding a lower
+  id can commit *after* one holding a higher id, and rolled-back appends/state
+  writes leave permanent id gaps. A cross-execution forward poll (2a-2) **MUST
+  NOT** use a bare `event_id > cursor ORDER BY event_id`, or it silently skips a
+  slower-committing lower id forever. **A trailing `created_at` time-lookback is
+  NOT a sufficient fix** and must not be specified as one: `created_at` is
+  authored from `now()`, which in Postgres is TRANSACTION-START time, so it does
+  not linearize COMMIT order — a late-starting transaction can commit a higher id
+  before an early-starting transaction commits a lower one, and no finite time
+  window closes that straddle. The two sound approaches (algorithm left to the
+  2a-2 design) are: **(a)** an id-gap-pending advance — never step past a missing
+  id until it is proven committed OR proven rolled back (aborted-txn gaps are
+  permanent); or **(b)** a txid/snapshot-horizon cursor — poll only rows whose
+  inserting xid is below the database's all-committed xmin horizon
+  (`pg_snapshot_xmin(pg_current_snapshot())`). The per-execution `Last-Event-ID`
+  reconnect replay (`execution_id = $1 AND event_id > $since`) is safe with a
+  bare id cursor — those rows are long-committed by reconnect time; the hazard is
+  the live-edge forward poll. The authoritative statement of this contract lives
+  at `append_event_outbox`.
+- **No FK, deliberately.** `event_outbox` carries no foreign key to
+  `executions(id)` and no UNIQUE/CHECK beyond the PK — `execution_id`
+  legitimately holds non-`executions` ids (`polchk-`/`preflight-`/…), and a
+  constraint would turn a benign append into an unrecoverable, differential
+  failure of the paired state write.
+- **Retention.** `reap_event_outbox` is a clock-guarded sweep (24h window,
+  `reap_meta` key `event_outbox_reap_anchor`) mirroring
+  `reap_command_execution_mappings`: advisory-lock single-writer, one in-SQL DB
+  `now()` read, sanitised persisted anchor, forward/backward-anomaly decline,
+  unconditional cap, and the same would-wipe + fact-set-dedup carve-outs.
+  Missing anchor **PROCEEDs** (an outbox row is a regenerable live-update frame,
+  not compliance evidence; the reap never touches authoritative state). Metrics:
+  `yuzu_exec_outbox_reap_total`, `yuzu_exec_outbox_reap_clock_anomaly_total`,
+  `yuzu_exec_outbox_store_degrade_total`.

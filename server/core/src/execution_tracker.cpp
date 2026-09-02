@@ -284,8 +284,118 @@ const std::vector<pg::PgMigration>& migrations() {
          "  key    TEXT PRIMARY KEY,"
          "  value  TEXT NOT NULL"
          ");"},
+        // HA WS-2a (durable event outbox), ADR-2002 §5. An append-only durable
+        // shadow of the events ExecutionEventBus fans out in-memory, written
+        // ATOMICALLY inside the same transaction as the state mutation that
+        // produced each one (append_event_outbox rides the caller's conn). No
+        // consumer in this slice — the in-memory bus still serves live SSE; the
+        // durable feed is drained by a later slice's LISTEN/cursor-poll loop.
+        //   event_id  — global durable MONOTONIC id (BIGINT IDENTITY), replacing
+        //               the in-memory per-process channel counter. A forward-poll
+        //               consumer must NOT advance by a bare id>cursor (nor by a
+        //               created_at time-lookback); see the authoritative
+        //               ID-ORDERING CONTRACT on ExecutionTracker::
+        //               append_event_outbox for why and the safe cursor forms.
+        //   created_at — epoch seconds, authored from Postgres now() IN-SQL by
+        //               append_event_outbox, so reap_event_outbox's cutoff and
+        //               the row share ONE DB clock domain.
+        // DELIBERATELY no FK to executions(id) and no UNIQUE/CHECK beyond the
+        // PK (execution_id also legitimately holds non-executions ids like
+        // polchk-/preflight-/deployment-): with no constraint, the append
+        // cannot fail on a constraint the state write does not also face, so it
+        // adds no DIFFERENTIAL failure. It is NOT failure-free — a
+        // statement_timeout, disk/WAL pressure, or a dropped connection on the
+        // second statement still fails the append, and because it is atomic
+        // with the state write, the ADR-2002 §5 contract then ROLLS THE STATE
+        // WRITE BACK too (durability over availability — an agent status write
+        // is coupled to its event being durable). That coupling is the
+        // deliberate cost of invariant 1; an FK would make it WORSE by adding a
+        // differential failure that fails the append alone. reap_meta (created
+        // in v2) carries this table's retention anchor too.
+        //
+        // Numbered v4: dev's ADR-1007 concurrency_claims migration (v3 above)
+        // and this event_outbox migration were authored on parallel branches;
+        // dev's v3 shipped to origin/dev first, so this renumbered to v4 on the
+        // rebase (MigrationRunner requires strictly-increasing versions).
+        {4,
+         "CREATE TABLE event_outbox ("
+         "  event_id     BIGINT  GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+         "  execution_id TEXT    NOT NULL,"
+         "  event_type   TEXT    NOT NULL,"
+         "  data         TEXT    NOT NULL,"
+         "  is_terminal  BOOLEAN NOT NULL DEFAULT FALSE,"
+         "  created_at   BIGINT  NOT NULL"
+         ");"
+         "CREATE INDEX idx_event_outbox_created ON event_outbox(created_at);"
+         "CREATE INDEX idx_event_outbox_exec ON event_outbox(execution_id, event_id);"},
     };
     return kMigrations;
+}
+
+// HA WS-2a (ADR-2002 §5): append one event to the durable `event_outbox` on
+// the CALLER's live transaction connection — NEVER its own lease (nesting a
+// pool acquire inside an open with_txn would deadlock, pg_pool.hpp) — so the
+// outbox row commits ATOMICALLY with the state mutation that produced it
+// (invariant 1: a crash or failure never leaves state-without-event or
+// event-without-state). Returns false on the INSERT failing; the caller MUST
+// propagate that false out of the enclosing with_txn callback so the whole
+// transaction rolls back — that propagation is what makes the pairing atomic
+// (see the four call sites in upsert_agent_status_once / refresh_counts_once /
+// mark_cancelled). `event_id` is a global durable monotonic BIGINT IDENTITY
+// assigned at INSERT; `created_at` is authored from Postgres now() IN-SQL, so
+// the reap cutoff and the row share one DB clock domain (the same
+// DB-clock-authority reason record_command_execution authors created_at
+// in-SQL).
+//
+// ID-ORDERING CONTRACT for future consumers (HA WS-2a-2 forward poll): an
+// IDENTITY id is assigned at INSERT but the row becomes visible only at COMMIT,
+// so a transaction holding a LOWER id can commit AFTER one holding a HIGHER id,
+// and rolled-back appends / rolled-back state writes leave PERMANENT id gaps. A
+// live forward poll MUST therefore NOT advance its cursor by a bare
+// `event_id > cursor ORDER BY event_id`, or it silently skips a
+// slower-committing lower id forever. NOTE (governance self-adversarial finding
+// C2/K1): a trailing `created_at` TIME-lookback is NOT a sufficient fix on its
+// own, and must not be specified as one — `created_at` is authored from now(),
+// which in Postgres is TRANSACTION-START time, so it does not linearize COMMIT
+// order; a late-starting txn can commit a higher id before an early-starting
+// txn commits a lower one, and no finite time window closes that straddle. The
+// two sound approaches, left to the WS-2a-2 design: (a) an id-gap-pending
+// advance — never step the cursor past a missing id until that id is proven
+// committed OR proven rolled back (aborted-txn gaps are permanent); or (b) a
+// txid/snapshot-horizon cursor — poll only rows whose inserting xid is below the
+// database's all-committed xmin horizon (pg_snapshot_xmin(pg_current_snapshot())),
+// which is exactly the "no in-flight lower id can still appear" guarantee. Only a
+// per-execution RECONNECT replay (`execution_id = $1 AND event_id > $since` on a
+// `Last-Event-ID` reconnect) is safe with a bare id cursor — those rows are
+// long-committed by the time the consumer reconnects. A per-execution LIVE
+// forward poll at the write edge faces the same out-of-order-commit hazard
+// (concurrent transitions on one execution_id) and needs (a)/(b) too: the safety
+// is a property of reading only the COMMITTED-and-settled prefix, not of the
+// per-execution filter.
+//
+// The table carries NO foreign key to executions(id) and no UNIQUE/CHECK beyond
+// the event_id PK, DELIBERATELY: with no constraint, the append cannot fail on a
+// constraint the paired state write does not also face — it adds no DIFFERENTIAL
+// failure. It is NOT failure-free: a statement_timeout, disk/WAL pressure, or a
+// dropped connection on the INSERT still fails it, and because the append is
+// atomic with the state write, the §5 contract then rolls the STATE write back
+// too — an agent status write is coupled to its event being durable (durability
+// over availability, the deliberate cost of invariant 1; failures are logged on
+// the update_agent_status double-retry path). An FK here would make this WORSE,
+// reintroducing a differential failure that fails the append ALONE and turns a
+// benign append into UNRECOVERABLE agent-status loss (agents do not re-send;
+// #3729's reconciler recomputes from agent_exec_status, which the same rollback
+// would destroy).
+bool append_event_outbox(PGconn* conn, const std::string& execution_id,
+                         const std::string& event_type, const std::string& data,
+                         bool is_terminal) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "INSERT INTO execution_tracker.event_outbox "
+        "(execution_id, event_type, data, is_terminal, created_at) "
+        "VALUES ($1, $2, $3, $4, extract(epoch FROM now())::bigint) RETURNING event_id",
+        std::vector<std::string>{execution_id, event_type, data, is_terminal ? "true" : "false"});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
 }
 
 } // namespace
@@ -686,42 +796,33 @@ std::expected<std::string, std::string> ExecutionTracker::create_execution(const
 std::optional<std::string>
 ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
                                            const AgentExecStatus& s) {
-    // Snapshot-and-release (governance round perf-B1 / UP-A9), preserved
-    // under the pool model: build the SSE payload, release the lease
-    // (scope exit), THEN publish. Holding a lease across publish would
-    // hold a pool connection for the duration of every downstream SSE
-    // listener body — the same "slow client stalls every other agent
-    // reporting onto this execution" hazard the original mutex-based
-    // rationale described, now against pool capacity instead of a mutex.
+    // Snapshot-and-release (governance round perf-B1 / UP-A9): build the SSE
+    // payload, commit the transaction, release the lease, THEN publish.
     bool should_publish = false;
     nlohmann::json payload;
     std::string persisted_status;
 
-    {
-        auto lease = pool_.try_acquire_for(kWriteTimeout);
-        if (!lease)
-            return std::nullopt;
-
+    // HA WS-2a: the agent_exec_status upsert AND the durable event_outbox append
+    // commit in ONE transaction (invariant 1) — this was a bare autocommit
+    // statement before the outbox existed, so a crash between the upsert and the
+    // (formerly separate) event would leave state-without-event. The payload is
+    // built from the RETURNING (ACTUALLY-PERSISTED) row, not `s` verbatim
+    // (#3784 sticky-terminal fix): a stale 'running' write the CASE below
+    // correctly rejects must not publish OR durably append an "agent-transition"
+    // claiming status="running". The in-memory bus publish still runs AFTER the
+    // transaction commits and the lease is released, and only when a bus is set.
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         auto now = now_epoch();
         pg::PgResult res = pg::exec_params(
-            lease.get(),
+            conn,
             "INSERT INTO execution_tracker.agent_exec_status "
             "(execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
             " exit_code, error_detail, plugin_result_status) "
             "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) "
             "ON CONFLICT (execution_id, agent_id) DO UPDATE SET "
             // Terminal status is STICKY (CHAOS-TTL-1 keepalive hardening,
-            // security-guardian finding): a stale 'running' write arriving
-            // AFTER a real terminal write — the keepalive thread's
-            // snapshot-then-write has no re-check against a command that
-            // completes mid-sweep, an ordinary race requiring no attacker —
-            // must not flip an already-terminal row back to 'running'. Once
-            // status is in the terminal set, only another TERMINAL status
-            // (a legitimate second/replayed terminal write, e.g. HA WS-0
-            // redelivery) may overwrite it; a 'running' write is a no-op on
-            // every column here once terminal, so completed_at/exit_code/
-            // error_detail/plugin_result_status stay whatever the terminal
-            // write set them to.
+            // #3784): a stale 'running' write arriving AFTER a real terminal
+            // write must not flip an already-terminal row back to 'running'.
             "  status=CASE WHEN agent_exec_status.status IN "
             "                 ('success','failure','timeout','rejected') "
             "                 AND excluded.status = 'running' "
@@ -746,14 +847,6 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
             "                                AND excluded.status = 'running' "
             "                             THEN agent_exec_status.plugin_result_status "
             "                             ELSE excluded.plugin_result_status END "
-            // RETURNING the post-write row (CHAOS-TTL-1 keepalive hardening,
-            // security-guardian finding): the SSE payload below must reflect
-            // what was ACTUALLY persisted, not the caller's `s` verbatim —
-            // otherwise a stale 'running' write correctly rejected by the
-            // sticky-terminal CASE above would still publish an
-            // agent-transition event CLAIMING status="running", misleading
-            // every live listener (dashboard, SSE, MCP) even though the row
-            // itself stayed correctly terminal.
             "RETURNING status, exit_code, completed_at, error_detail, plugin_result_status",
             std::vector<std::string>{
                 execution_id, s.agent_id, s.status,
@@ -762,29 +855,35 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
                 std::to_string(s.completed_at), std::to_string(s.exit_code), s.error_detail,
                 std::to_string(s.plugin_result_status)});
         if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
-            return std::nullopt;
+            return false;
 
-        // UP-2 fix (unhappy-path Gate 4 finding, PR #3784 fix round):
-        // captured unconditionally, not only when event_bus_ is set — the
-        // caller needs the ACTUALLY-PERSISTED status (which the
-        // sticky-terminal CASE above may have kept unchanged from `s.status`)
-        // to gate concurrency-claim release/renewal correctly.
+        // The ACTUALLY-PERSISTED status (#3784 UP-2): captured unconditionally
+        // because the caller uses it to gate concurrency-claim release/renewal,
+        // and the durable append + bus publish below must both reflect it.
         persisted_status = col_str(res.get(), 0, 0);
+        payload["agent_id"] = s.agent_id;
+        payload["status"] = persisted_status;
+        payload["exit_code"] = to_i64(col(res.get(), 0, 1));
+        payload["completed_at"] = to_i64(col(res.get(), 0, 2));
+        const std::string returned_error = col_str(res.get(), 0, 3);
+        if (!returned_error.empty())
+            payload["error_detail"] = returned_error;
+        const int64_t returned_plugin_status = to_i64(col(res.get(), 0, 4));
+        if (returned_plugin_status != 0)
+            payload["plugin_result_status"] = returned_plugin_status;
 
-        if (event_bus_) {
+        // Durable append, atomic with the upsert above. A false rolls both back.
+        if (!append_event_outbox(conn, execution_id, "agent-transition", payload.dump(),
+                                 /*is_terminal=*/false))
+            return false;
+
+        if (event_bus_)
             should_publish = true;
-            payload["agent_id"] = s.agent_id;
-            payload["status"] = persisted_status;
-            payload["exit_code"] = to_i64(col(res.get(), 0, 1));
-            payload["completed_at"] = to_i64(col(res.get(), 0, 2));
-            const std::string returned_error = col_str(res.get(), 0, 3);
-            if (!returned_error.empty())
-                payload["error_detail"] = returned_error;
-            const int64_t returned_plugin_status = to_i64(col(res.get(), 0, 4));
-            if (returned_plugin_status != 0)
-                payload["plugin_result_status"] = returned_plugin_status;
-        }
-    } // lease released here — publish below runs lease-free.
+        return true;
+    }); // transaction committed / lease released here — publish below runs lease-free.
+
+    if (!ok)
+        return std::nullopt;
 
     if (should_publish) {
         event_bus_->publish(execution_id, "agent-transition", payload.dump());
@@ -994,19 +1093,35 @@ bool ExecutionTracker::refresh_counts_once(const std::string& execution_id) {
         }
         transitioned_terminal_was = transitioned_terminal;
 
-        if (event_bus_ && exec) {
-            publish_progress = true;
+        // HA WS-2a: build the SSE payloads and durably append them to the
+        // event_outbox INSIDE this transaction (invariant 1: the aggregate/
+        // terminal state mutation above and its events commit atomically). The
+        // payloads are built whenever `exec` resolved — the durable append does
+        // not depend on a bus being attached; only the post-commit in-memory
+        // fan-out (the publish_* flags) does. A false append rolls the whole
+        // recompute+transition back.
+        if (exec) {
             progress_payload["agents_targeted"] = exec->agents_targeted;
             progress_payload["agents_responded"] = exec->agents_responded;
             progress_payload["agents_success"] = exec->agents_success;
             progress_payload["agents_failure"] = exec->agents_failure;
             if (transitioned_terminal)
                 progress_payload["status"] = final_status_str;
+            if (!append_event_outbox(conn, execution_id, "execution-progress",
+                                     progress_payload.dump(), transitioned_terminal))
+                return false;
             if (transitioned_terminal) {
-                publish_terminal = true;
                 terminal_payload["status"] = final_status_str;
                 terminal_payload["agents_success"] = exec->agents_success;
                 terminal_payload["agents_failure"] = exec->agents_failure;
+                if (!append_event_outbox(conn, execution_id, "execution-completed",
+                                         terminal_payload.dump(), /*is_terminal=*/true))
+                    return false;
+            }
+            if (event_bus_) {
+                publish_progress = true;
+                if (transitioned_terminal)
+                    publish_terminal = true;
             }
         }
         return true;
@@ -1065,30 +1180,42 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
     // Snapshot-and-release (perf-B1 / UP-A9). See update_agent_status for
     // the full rationale.
     bool should_publish = false;
+    nlohmann::json payload;
+    payload["status"] = "cancelled";
 
-    {
-        auto lease = pool_.try_acquire_for(kWriteTimeout);
-        if (!lease) {
-            spdlog::error("ExecutionTracker::mark_cancelled: pool exhausted for execution id={}",
-                          id);
-            return false;
-        }
-
+    // HA WS-2a: the cancel UPDATE AND the durable execution-completed append
+    // commit in ONE transaction (invariant 1) — was a bare autocommit statement
+    // before the outbox existed. A false append rolls the cancel back.
+    //
+    // The UPDATE carries `RETURNING id` and the event is appended ONLY when a
+    // row actually matched (governance self-adversarial finding C1/K6, ADR-2002
+    // §5): a bare `UPDATE ... WHERE id=$2` returns PGRES_COMMAND_OK even when it
+    // matches ZERO rows (an unknown/stale id), so appending unconditionally
+    // would commit a durable `execution-completed` event with NO paired
+    // source-state mutation — the event-WITHOUT-state half of the §5 pairing
+    // the outbox exists to uphold, poisoning the future forward-poll feed with a
+    // phantom terminal frame. A zero-row cancel is a no-op: no state change, no
+    // event, and a false return ("not cancelled — no such execution", distinct
+    // from a store failure).
+    bool matched = false;
+    bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult res = pg::exec_params(
-            lease.get(),
-            "UPDATE execution_tracker.executions SET status='cancelled', completed_at=$1 WHERE id=$2",
+            conn,
+            "UPDATE execution_tracker.executions SET status='cancelled', completed_at=$1 "
+            "WHERE id=$2 RETURNING id",
             std::vector<std::string>{std::to_string(now_epoch()), id});
-        if (res.status() != PGRES_COMMAND_OK) {
-            spdlog::error("ExecutionTracker::mark_cancelled: update failed for execution id={} — "
-                          "the execution was NOT actually cancelled",
-                          id);
+        if (res.status() != PGRES_TUPLES_OK)
             return false;
-        }
+        if (PQntuples(res.get()) == 0)
+            return true; // no such execution — no state change, so NO event (matched stays false)
+        matched = true;
 
-        if (event_bus_) {
+        if (!append_event_outbox(conn, id, "execution-completed", payload.dump(),
+                                 /*is_terminal=*/true))
+            return false;
+
+        if (event_bus_)
             should_publish = true;
-        }
-
         // ADR-1007 correctness fix (Gate 4 unhappy-path UP-1): a cancelled
         // execution's per-device claims are DELIBERATELY NOT released here.
         // `mark_cancelled` only updates SERVER-side bookkeeping — there is
@@ -1103,11 +1230,20 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
         // `expires_at` if no response ever comes. This is honest, not
         // lossy: "cancel requested" is not the same fact as "agent
         // stopped", and the claim table only ever asserts the latter.
-    } // lease released — publish below runs lease-free.
+        return true;
+    }); // transaction committed / lease released here — publish below runs lease-free.
+
+    if (!ok) {
+        spdlog::error("ExecutionTracker::mark_cancelled: cancel transaction failed for execution "
+                      "id={} — the execution was NOT actually cancelled (pool exhaustion or a "
+                      "failed statement rolled the whole transaction back)",
+                      id);
+        return false;
+    }
+    if (!matched)
+        return false; // unknown/stale id — no-op, reported as not-cancelled (no phantom event)
 
     if (should_publish) {
-        nlohmann::json payload;
-        payload["status"] = "cancelled";
         event_bus_->publish(id, "execution-completed", payload.dump(), /*is_terminal=*/true);
     }
     return true;
@@ -2089,6 +2225,156 @@ ExecutionTracker::reap_command_execution_mappings() {
     if (!ok)
         return std::unexpected(err.empty() ? "reap failed" : err);
     return CommandExecutionReapOutcome{deleted, clock_anomaly};
+}
+
+namespace {
+// These values are bit-identical to the command_execution sibling's
+// (kCmdExecutionReapWindowSecs / kCmdExecutionReapCap / kMaxPlausibleSkewSecs)
+// and that is DELIBERATE, not a copy the clock-guarded-retention routed concern
+// forbids: that prohibition (part 1) is scoped to the WOULD-WIPE implausible-
+// ahead FLOOR, and this table takes the would-wipe carve-out, so it computes no
+// such floor at all. The two tables are the same KIND of thing — short-lived
+// per-execution observability feeds on the same maintenance cadence, same
+// substrate, same failover/reconnect replay horizon — so their window/cap/skew
+// are kept in LOCKSTEP with the sibling ON PURPOSE, and should be revisited
+// TOGETHER, not diverged silently. Rationale for the shared values: 24h of
+// durable frames comfortably covers a failover + a client-reconnect replay
+// window while bounding table growth; the skew threshold is ~24x the sibling's
+// ~3600s nominal cadence and absorbs scheduler jitter while still catching a
+// genuinely wrong clock (the event_outbox reap itself runs on a TIGHTER ~60s
+// cadence for volume reasons — see server.cpp — but the skew headroom is sized
+// against the same worst-case inter-pass gap the sibling documents). If a
+// future event-outbox-specific input (a consumer replay SLA, a failover MTTR
+// bound) argues for a different value, derive it then and let the two diverge.
+constexpr std::int64_t kEventOutboxReapWindowSecs = 24 * 3600;
+constexpr int kEventOutboxReapCap = 5000;
+constexpr std::int64_t kEventOutboxMaxPlausibleSkewSecs = 24 * 3600;
+} // namespace
+
+std::expected<EventOutboxReapOutcome, std::string> ExecutionTracker::reap_event_outbox() {
+    if (!open_)
+        return std::unexpected("execution tracker not open");
+
+    // Shape mirrors reap_command_execution_mappings (which itself mirrors
+    // SessionStore::reap_expired) — advisory lock as its OWN statement, one
+    // in-SQL DB `now()` read reused for cutoff/anchor-compare/anchor-update,
+    // persisted+sanitised anchor, forward/backward-anomaly decline, unconditional
+    // cap, and the SAME two carve-outs (no would-wipe probe, no fact-set dedup).
+    // Missing-anchor: PROCEED. See the header for the recorded part-(6) reasoning.
+    int deleted = 0;
+    bool clock_anomaly = false;
+    std::int64_t now_s = 0;
+    std::string err;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        // NON-BLOCKING lock, DELIBERATELY diverging from the blocking
+        // pg_advisory_xact_lock the command_execution sibling uses (governance
+        // Gate 8 sre finding). That sibling reaps hourly, so a losing replica
+        // blocking briefly is negligible; this reap runs on a ~60s cadence
+        // (kEventOutboxReapEveryNTicks) on the SHARED single-threaded maintenance
+        // tick, so a blocking lock would stall the whole tick (session reap, the
+        // clock-integrity monitor) on every replica that loses the race, ~60x
+        // more often. A skipped pass costs nothing here — another replica is
+        // draining this tick, and a miss retries in ~60s, far inside the 24h
+        // window — so try-and-skip is correct. Mirrors response_store's
+        // tight-cadence precedent (pg_try_advisory_xact_lock + skip).
+        pg::PgResult lk =
+            pg::exec_params(c, "SELECT pg_try_advisory_xact_lock(hashtext('execution_tracker:outbox_reap'))",
+                            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK || PQntuples(lk.get()) == 0) {
+            err = "outbox reap advisory lock failed";
+            return false;
+        }
+        if (col_str(lk.get(), 0, 0) != "t")
+            return true; // another replica holds the reap lock this tick — skip (deleted 0)
+        {
+            pg::PgResult nr = pg::exec_params(
+                c, "SELECT extract(epoch FROM now())::bigint", std::vector<std::string>{});
+            if (nr.status() != PGRES_TUPLES_OK || PQntuples(nr.get()) == 0) {
+                err = "outbox reap now() read failed";
+                return false;
+            }
+            // SANITISE the reading (clock-guarded-retention routed concern part
+            // 3): unparseable or negative is an ANOMALY, never a quiet fallback.
+            auto parsed_now = parse_reap_i64(col_str(nr.get(), 0, 0));
+            if (!parsed_now || *parsed_now < 0) {
+                spdlog::warn("ExecutionTracker::reap_event_outbox declined: unparseable or "
+                             "negative now() reading '{}'",
+                             col_str(nr.get(), 0, 0));
+                clock_anomaly = true;
+                return true; // decline, anchor unchanged
+            }
+            now_s = *parsed_now;
+        }
+        pg::PgResult ar = pg::exec_params(
+            c, "SELECT value FROM execution_tracker.reap_meta WHERE key = 'event_outbox_reap_anchor'",
+            std::vector<std::string>{});
+        if (ar.status() != PGRES_TUPLES_OK) {
+            err = "outbox reap anchor read failed";
+            return false;
+        }
+        const bool has_anchor = PQntuples(ar.get()) > 0;
+        std::int64_t anchor = 0;
+        if (has_anchor) {
+            // Same sanitisation as now_s, for the same reason (a bad migration /
+            // manual repair / corruption can write anything into reap_meta).
+            auto parsed_anchor = parse_reap_i64(col_str(ar.get(), 0, 0));
+            if (!parsed_anchor || *parsed_anchor < 0) {
+                spdlog::warn("ExecutionTracker::reap_event_outbox declined: unparseable or "
+                             "negative persisted anchor '{}'",
+                             col_str(ar.get(), 0, 0));
+                clock_anomaly = true;
+                return true;
+            }
+            anchor = *parsed_anchor;
+        }
+        // Overflow-safe forward-skew comparison (subtract, never add — both
+        // operands are sanitised non-negative int64_t, so the difference cannot
+        // overflow; adding kEventOutboxMaxPlausibleSkewSecs to an INT64_MAX-ish
+        // anchor would be signed-overflow UB). The `now_s >= anchor` guard
+        // preserves branch order — a rewound clock falls through to the
+        // backward-anomaly check below.
+        if (has_anchor && now_s >= anchor && now_s - anchor > kEventOutboxMaxPlausibleSkewSecs) {
+            spdlog::warn("ExecutionTracker::reap_event_outbox declined: now_s {} implausibly ahead "
+                         "of anchor {}",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true; // decline, anchor unchanged
+        }
+        if (has_anchor && now_s < anchor) {
+            spdlog::warn("ExecutionTracker::reap_event_outbox declined: now_s {} is behind anchor "
+                         "{} (backward clock movement or a poisoned anchor) — not deleting under a "
+                         "rewound clock",
+                         now_s, anchor);
+            clock_anomaly = true;
+            return true;
+        }
+        pg::PgResult dr = pg::exec_params(
+            c,
+            "DELETE FROM execution_tracker.event_outbox WHERE event_id IN "
+            "(SELECT event_id FROM execution_tracker.event_outbox "
+            " WHERE created_at < $1::bigint ORDER BY event_id LIMIT $2::bigint) RETURNING event_id",
+            std::vector<std::string>{std::to_string(now_s - kEventOutboxReapWindowSecs),
+                                     std::to_string(kEventOutboxReapCap)});
+        if (dr.status() != PGRES_TUPLES_OK) {
+            err = std::string("outbox reap delete failed: ") + PQerrorMessage(c);
+            return false;
+        }
+        deleted = PQntuples(dr.get());
+        const std::int64_t new_anchor = has_anchor ? (std::max)(anchor, now_s) : now_s;
+        pg::PgResult ur = pg::exec_params(
+            c,
+            "INSERT INTO execution_tracker.reap_meta (key, value) VALUES "
+            "('event_outbox_reap_anchor', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            std::vector<std::string>{std::to_string(new_anchor)});
+        if (ur.status() != PGRES_COMMAND_OK) {
+            err = "outbox reap anchor update failed";
+            return false;
+        }
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(err.empty() ? "outbox reap failed" : err);
+    return EventOutboxReapOutcome{deleted, clock_anomaly};
 }
 
 } // namespace yuzu::server
