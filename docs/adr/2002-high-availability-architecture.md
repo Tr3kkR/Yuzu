@@ -366,7 +366,10 @@ enumeration:
 2. **Runtime-mutable AND cross-instance-referenced** — a write on A that must resolve on B or dispatch
    fails: `instruction_store` (`create_definition()` on POST) **with `product_pack_store`** (an
    instruction referencing a runtime-imported pack), `tag_store` (scope resolution),
-   `concurrency_manager` (fleet-wide limits), `device_token_store` (agent auth), `baseline_store`.
+   `device_token_store` (agent auth), `baseline_store`. (`ConcurrencyManager` — deliberately deleted,
+   not migrated, per ADR-1007: the "fleet-wide limits" modes it would have enforced attach only to
+   catalog-only definitions with no live dispatch path. The real per-device claim table this ADR
+   replaces it with lives inside `execution_tracker`'s schema, already covered by criterion 1 above.)
 3. **Security/enforcement state** — divergence is a *security* bug, not cosmetic: `quarantine_store`
    (a device quarantined via A must not look healthy on B), `software_deployment_store` (destructive
    deployment actions), `policy_store` + `approval_manager`/`workflow_engine` (an approval on A must
@@ -504,7 +507,13 @@ This ADR records the model and principles. Each area becomes a child ADR/issue:
     wall-clock retention/reaper pass inherits the clock-guard **SINGLE-WRITER** rule (shared reading +
     anomaly-dedup rows under an ADR-0012 advisory lock), not just the new event outbox. Classify every
     background job as **fenced-leader-only**, **independently replica-safe**, or **disabled-until-fixed**;
-    bring the #2508 not-yet-compliant passes (`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore`)
+    bring the #2508 not-yet-compliant passes (`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore`,
+    and the `concurrency_claims` stale-claim reconciler added by ADR-1007 — clock-guard-compliant on
+    all seven parts, including a persisted anchor and dedup fact-set in `retention_meta` across
+    restarts [part 2], but not yet SINGLE-WRITER-safe: it has no `pg_advisory_lock`/
+    `pg_try_advisory_lock` around its shared read-decide-write sequence, unlike `audit_store.cpp`'s
+    `pg_try_advisory_xact_lock('audit_store:reap')` — a materially smaller gap than the other three
+    siblings here, which issue bare wall-clock deletes with no clock-guard shape at all)
     to the guarded shape *before* a second replica exists. HA turns that backlog into a correctness
     prerequisite. **Deliverable is a checked-in, exhaustive background-job table** (job → one of
     fenced-leader-only / independently-replica-safe / disabled-until-fixed) kept in the tree and

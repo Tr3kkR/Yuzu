@@ -1149,6 +1149,94 @@ from a raw SQLite extended error code to a Postgres SQLSTATE string — the
 same two response shapes are still chosen by the same rule, so no client
 migration is needed.
 
+## Behaviour change: `per-device` dispatch can now refuse a target it always accepted before (ADR-1007)
+
+`ExecutionTracker` gains a new table, `concurrency_claims` (same
+`execution_tracker` schema introduced above), backing real enforcement of
+the `per-device` concurrency mode — the shipped default and the only one of
+the five documented modes that was ever actually enforced (see
+`docs/user-manual/instructions.md` §8 and ADR-1007 for the full
+real-usage audit; `per-definition`/`global`/`global-singleton`/`per-set`
+remain accepted but unenforced, unchanged from before this release).
+
+**Operator-visible:** dispatching a `per-device` definition (via `POST
+/api/instructions/:id/execute` or a `ScheduleEngine` run) to a device that
+already has an execution of that same definition in flight now **excludes**
+that device from the target list instead of sending a second, overlapping
+command as it always did before. This is the intended fix, not a
+regression — but any automation that dispatches the same definition
+repeatedly in quick succession to the same fleet (e.g. a tight retry loop)
+may see partial dispatch where it previously always saw full dispatch.
+Watch the new `yuzu_server_dispatch_concurrency_skipped_total` counter (or
+`ExecutionTracker::claim_concurrency_slots`'s `spdlog::info` line, which
+reports a count — how many of the dispatch's candidates were already busy
+for the definition — not individual device ids) to see when this fires —
+the executions API's `agents_targeted` field is the post-claim SENT count,
+not a pre-claim total, so there is no "targeted vs. claimed" comparison to
+read it against. Error code `3003` (`ConcurrencyBlocked`) is registered for
+this condition but not yet surfaced through the dispatch response.
+
+Quarantining a device mid-flight (after it was claimed but before it
+reports a terminal status) behaves the same as a crash for this purpose —
+its claim ages out at the reconciler's TTL rather than releasing
+immediately, so a device released from quarantine may still read as "busy"
+for a `per-device` definition for up to that TTL window.
+
+The claim's exclusion window is bounded by a flat one-hour timeout, renewed
+by a dedicated agent-core keepalive that runs independently of any given
+plugin — so a long-running `script_exec.*` action (a MUTATING instruction —
+runs an operator-named program or authored script that can hold real state)
+with an operator-configured timeout near the one-hour ceiling stays
+correctly excluded even if it produces little or no output. The keepalive
+sends one empty gRPC frame every 5 minutes per in-flight `per-device`
+command — negligible traffic even at fleet scale, but worth knowing about
+if you're diffing agent-to-server wire volume before/after this release.
+See ADR-1007 for the full mechanism.
+
+**Rolling-upgrade behaviour:** the keepalive lives in the agent binary, not
+the server — during a staged agent rollout, a `per-device` command running
+on an agent still on a build older than this release has no keepalive
+thread, so its claim relies on the same rarer, less reliable renewal
+signals this release replaces (a plugin's own output volume crossing an
+internal threshold, or nothing at all for a quiet action). This is a
+narrowing of a pre-existing exposure, not a new one — an old agent's
+long-running quiet command was *always* at risk of this race before this
+release; upgrading the server first only protects commands running on
+already-upgraded agents. Upgrade agents promptly to get full coverage; per
+the standing rule below, never upgrade agents before the server.
+
+A claim is released when the excluded-from device's prior execution reaches
+a terminal state; an execution that never gets a terminal response (agent
+crash or disconnect mid-run) has its claim force-released by a periodic
+reconciler, bounded by the claim's own `expires_at` — worst case, a device
+can be excluded from a repeat `per-device` dispatch of the same definition
+for up to one hour (a claim's lease is capped at one hour regardless of the
+originating command's own expiry). **Cancelling an execution does not
+release its claim** — there is no way to tell the agent to stop, so a
+cancelled-but-still-running execution's claim behaves exactly like a normal
+in-flight one until a terminal response or the reconciler's TTL bound
+releases it. A `per-device` definition dispatched via a workflow step
+(rather than a direct `POST /api/instructions/:id/execute` call or a
+schedule) releases on the agent's real terminal response and renews on its
+keepalive the same as every other dispatch path — workflow-step dispatch
+still does not correlate a real execution id for the executions drawer
+(so its progress won't show there), but that gap no longer affects claim
+timing: it is not release-by-TTL-only. Raw MCP `execute_instruction` and
+any other dispatch call that does not resolve an `InstructionDefinition`
+are unaffected (no `definition_id` in scope, so this gate never fires for
+them), as is the
+fleet-broadcast dispatch arm. No operator action is required to upgrade.
+
+**Also in this release:** `DirectorySync::sync_entra` (`POST
+/api/directory/sync`) now rejects a concurrent call while a sync is already
+in progress with `409 Conflict` instead of racing — previously two
+overlapping sync calls could interleave writes. A caller that retries on
+`409` behaves correctly; one that treated every non-2xx response as a hard
+failure should special-case `409` as "try again shortly." `ConcurrencyManager`
+(dead code with zero production callers, already flagged in
+`docs/postgres-migration-ladder.md`) is deleted rather than migrated to
+Postgres.
+
 ## ⚠️ Behaviour change: buffered analytics events reset on Postgres cutover (ADR-0049)
 
 `AnalyticsEventStore` (the outbox spool behind `/api/analytics/status` and

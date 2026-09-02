@@ -1511,6 +1511,138 @@ TEST_CASE("notify_exec_tracker: RUNNING maps to status='running' with "
     CHECK(statuses[0].completed_at == 0);
 }
 
+TEST_CASE("process_gateway_response: the __keepalive__ sentinel renews the concurrency claim "
+          "without storing a response row or tagging an SSE output line (CHAOS-TTL-1)",
+          "[pg][agent_service][executions][concurrency][adr1007]") {
+    // The agent's concurrency-claim keepalive thread (agents/core/src/agent.cpp)
+    // sends a bare RUNNING with this exact output sentinel on a fixed interval,
+    // independent of any real plugin progress — see the twin intercept in
+    // process_agent_response (agent_service_impl.cpp's direct-Subscribe RUNNING
+    // branch) and this function's own. It must reach notify_exec_tracker (so
+    // ExecutionTracker::renew_concurrency_claim fires) but must NOT be treated
+    // as a real output row.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+    auto exec_id = ts.make_exec();
+    h.svc.record_execution_id("cmd-keepalive", exec_id);
+
+    auto ping = GatewayResponseHarness::make_response("cmd-keepalive", apb::CommandResponse::RUNNING,
+                                                       /*output=*/"__keepalive__");
+    h.svc.process_gateway_response("agent-1", ping);
+
+    // Reached notify_exec_tracker: the agent_exec_status row was touched
+    // exactly as a real 'running' CommandResponse would (same assertion shape
+    // as the RUNNING test just above).
+    auto ka_statuses = ts.tracker->get_agent_statuses(exec_id);
+    REQUIRE(ka_statuses.size() == 1);
+    CHECK(ka_statuses[0].status == "running");
+    CHECK(ka_statuses[0].first_response_at > 0);
+    CHECK(ka_statuses[0].completed_at == 0);
+
+    // Did NOT reach ResponseStore::store — no row landed for the drawer/SSE.
+    auto rows_opt = h.responses.query_by_execution(exec_id);
+    REQUIRE(rows_opt.has_value());
+    CHECK(rows_opt->empty());
+}
+
+TEST_CASE("notify_exec_tracker: the by-command concurrency-claim fallback fires end-to-end "
+          "through process_gateway_response when execution_id cannot be resolved (cpp-safety "
+          "Gate 8 reconciliation-review finding, PR #3784)",
+          "[pg][agent_service][executions][concurrency][adr1007]") {
+    // The ExecutionTracker-level test ("release_concurrency_claim_by_command /
+    // renew_concurrency_claim_by_command restore claim release/renewal...",
+    // test_execution_tracker.cpp) proves the fallback methods work in
+    // isolation. It does NOT prove notify_exec_tracker's own decision logic
+    // (the RUNNING-vs-terminal switch, the resolve_execution_id-miss branch
+    // condition) actually reaches them correctly when driven through the
+    // real AgentServiceImpl entry point a live agent connection uses. This
+    // test closes that gap: deliberately never calls record_execution_id
+    // (so resolve_execution_id genuinely misses, matching an unresolved
+    // workflow-step dispatch or a correlation-table degrade), claims a slot
+    // directly on the tracker, then drives real CommandResponses through
+    // process_gateway_response and asserts the claim renews then releases.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+
+    const int64_t now0 = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    auto claimed = ts.tracker->claim_concurrency_slots(
+        "def-fallback-e2e", "exec-unresolved", "cmd-fallback-e2e", {"agent-1"},
+        /*expires_at=*/now0 + 2);
+    REQUIRE(claimed.size() == 1);
+
+    // A RUNNING response with no recorded execution_id mapping must renew
+    // the claim via renew_concurrency_claim_by_command, not silently drop
+    // it — proven by advancing past the SHORT original expiry and checking
+    // the reconciler does NOT force-release it.
+    auto running = GatewayResponseHarness::make_response(
+        "cmd-fallback-e2e", apb::CommandResponse::RUNNING, /*output=*/"row-1");
+    h.svc.process_gateway_response("agent-1", running);
+
+    REQUIRE(ts.tracker->reconcile_stale_concurrency_claims(now0) == 0); // prime the anchor
+    CHECK(ts.tracker->reconcile_stale_concurrency_claims(now0 + 5) == 0); // past ORIGINAL expiry
+    CHECK(ts.tracker
+              ->claim_concurrency_slots("def-fallback-e2e", "exec-other", "cmd-probe-1",
+                                        {"agent-1"}, now0 + 100)
+              .empty()); // still held — the RUNNING response renewed it
+
+    // A terminal response with no recorded execution_id mapping must
+    // release the claim via release_concurrency_claim_by_command.
+    auto done = GatewayResponseHarness::make_response("cmd-fallback-e2e",
+                                                       apb::CommandResponse::SUCCESS,
+                                                       /*output=*/"", /*exit_code=*/0);
+    h.svc.process_gateway_response("agent-1", done);
+
+    CHECK(ts.tracker
+              ->claim_concurrency_slots("def-fallback-e2e", "exec-other-2", "cmd-probe-2",
+                                        {"agent-1"}, now0 + 100)
+              .size() == 1); // released — a fresh claim succeeds
+
+    // Confirms nothing leaked into the normal execution_id-resolved path
+    // (no agent_exec_status row, since no execution was ever created/
+    // correlated for this command_id).
+    CHECK(h.responses.query_by_execution("exec-unresolved")->empty());
+}
+
+TEST_CASE("notify_exec_tracker: a __guard__- command_id short-circuits the by-command fallback "
+          "before either renew or release fires (Fable adversarial-review finding, PR #3784)",
+          "[pg][agent_service][executions][concurrency][adr1007]") {
+    // __guard__.* dispatches are system-caller, definition-less, and can
+    // never carry a per-device concurrency claim — the skip exists purely
+    // to avoid a wasted write-pool lease on every guard push/reconcile
+    // response. Prove it actually short-circuits: a claim taken under a
+    // DIFFERENT, real command_id must survive a __guard__-prefixed
+    // response arriving with no recorded execution_id mapping.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    TrackerScope ts{h.svc, pool};
+
+    auto claimed = ts.tracker->claim_concurrency_slots("def-guard-skip", "exec-unresolved-2",
+                                                        "cmd-real-command", {"agent-1"},
+                                                        /*expires_at=*/9999999999);
+    REQUIRE(claimed.size() == 1);
+
+    auto guard_ping = GatewayResponseHarness::make_response(
+        "__guard__-reconcile-1-abc123", apb::CommandResponse::RUNNING, /*output=*/"");
+    h.svc.process_gateway_response("agent-1", guard_ping);
+    auto guard_terminal = GatewayResponseHarness::make_response(
+        "__guard__-reconcile-1-abc123", apb::CommandResponse::SUCCESS, /*output=*/"");
+    h.svc.process_gateway_response("agent-1", guard_terminal);
+
+    // The unrelated real claim must be completely untouched by either
+    // __guard__- response.
+    CHECK(ts.tracker
+              ->claim_concurrency_slots("def-guard-skip", "exec-other", "cmd-probe",
+                                        {"agent-1"}, 9999999999)
+              .empty());
+}
+
 TEST_CASE("notify_exec_tracker: SUCCESS maps to status='success' and stamps "
           "completed_at",
           "[pg][agent_service][executions][issue872]") {

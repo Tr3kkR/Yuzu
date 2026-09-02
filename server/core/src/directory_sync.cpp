@@ -740,6 +740,24 @@ std::expected<void, std::string> DirectorySync::sync_entra(const EntraConfig& co
         return std::unexpected("Entra config incomplete: tenant_id, client_id, and client_secret required");
     }
 
+    // ADR-1007: re-entrancy guard, whole-operation scope. A concurrent
+    // caller loses the CAS and is refused immediately — no queueing, no
+    // blocking (see the header doc comment for the 409 mapping). RAII reset
+    // covers every one of this function's several early-return exit paths.
+    bool expected_free = false;
+    if (!entra_sync_in_progress_.compare_exchange_strong(expected_free, true)) {
+        return std::unexpected(std::string(kEntraSyncAlreadyInProgress));
+    }
+    // Reference, not pointer — matches nvd_sync.cpp's ActiveGuard, this
+    // codebase's existing precedent for the identical reentrancy-guard
+    // idiom (Gate 3 cpp-expert).
+    struct Release {
+        std::atomic<bool>& flag;
+        ~Release() { flag.store(false); }
+    } release_guard{entra_sync_in_progress_};
+    if (test_hook_after_entra_guard_acquired_)
+        test_hook_after_entra_guard_acquired_();
+
     update_status("entra", "running");
     spdlog::info("DirectorySync: starting Entra ID sync for tenant {}", config.tenant_id);
 
