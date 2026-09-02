@@ -9,12 +9,15 @@
 %%%      per-agent mTLS auto-provisioning breaks for gateway-connected
 %%%      agents (the bug this PR fixes).
 %%%
-%%%   2. The grpcbox v0.17.1 listener TLS contract: a transport_opts map
+%%%   2. The vendored grpcbox listener TLS contract: a transport_opts map
 %%%      enables TLS ONLY when it carries `ssl => true` AND all three of
-%%%      keyfile/certfile/cacertfile (grpcbox_pool.erl:18-31). A map that
+%%%      keyfile/certfile/cacertfile (grpcbox_pool.erl). A map that
 %%%      omits `ssl => true` silently degrades to plaintext — the latent
-%%%      bug in the old config/sys.config.prod. grpcbox then HARDCODES
-%%%      fail_if_no_peer_cert + verify_peer, so any TLS listener is mTLS.
+%%%      bug in the old config/sys.config.prod. The _checkouts patch made
+%%%      verify / fail_if_no_peer_cert CONFIGURABLE (stock v0.17.1
+%%%      hardcoded them), defaulting to the strict verify_peer +
+%%%      fail_if_no_peer_cert=true when omitted — so an unconfigured TLS
+%%%      listener is mTLS, and :50051 relaxes both explicitly.
 %%%
 %%%   3. A real TLS 1.2 mutual handshake using EC certs (P-384 CA, P-256
 %%%      leaf with serverAuth+clientAuth — the shape the server mints as
