@@ -9146,6 +9146,58 @@ TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a tick
     CHECK(appr.pending_count() == 1);
 }
 
+// #3893 fix round (Doomgoose review, blocking findings 1+2): a non-dispatch,
+// approval-gated tool must be COMPLETELY UNAFFECTED by the C8 generalization
+// (point 2 of the fix) — proves dispatch_pairs_for("revoke_certificate", ...)
+// correctly returns empty (revoke_certificate calls no dispatch_fn/
+// bundle_orch->dispatch at all) so the new `if (!pairs.empty())` guard never
+// fires for it: no fail-closed-authorizer check, no per-pair authorize_dispatch_fn_
+// call, mint proceeds exactly as the pre-#3893 test immediately above already
+// pins. authorize_dispatch_fn_for_test is wired to unconditionally DENY here —
+// the opposite of that test's default-succeeds stub — specifically so a
+// regression that made the C8 generalization fire for every kKnownRegistered
+// tool (not just dispatch-capable ones) would turn this ticket mint into a
+// denial and fail this test.
+TEST_CASE("MCP #3893: revoke_certificate (non-dispatch tool) is unaffected by the generalized "
+          "C8 pre-mint dry run even when authorize_dispatch_fn_for_test always denies",
+          "[mcp][integration][pki][security][approval][pg][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "3893";
+    rec.subject = "agent-3893";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec).has_value());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    // Would deny EVERY (plugin, action) pair if the C8 pre-check ever ran for
+    // this tool — it must not, since revoke_certificate dispatches nothing.
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    ts.start("supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3893,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"3893"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // kApprovalRequired, the TICKET-MINT code — proves the always-deny
+    // authorizer stub never got a chance to fire deny_dispatch_authorization
+    // (which would answer kPermissionDenied instead).
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    CHECK(body["error"]["data"].contains("approval_id"));
+    CHECK_FALSE(store.is_revoked("3893"));
+    CHECK(appr.pending_count() == 1);
+}
+
 TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches revoked:true "
           "(#2712)",
           "[mcp][integration][pki][security][approval][pg]") {
@@ -10483,6 +10535,122 @@ TEST_CASE("MCP execute_bundle threads the caller's principal_is_admin into Dispa
         R"({"jsonrpc":"2.0","method":"tools/call","id":1398,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
     REQUIRE(res);
     CHECK(captured_admin);
+}
+
+// ── #3893 fix round (Doomgoose review, blocking finding 1) ────────────────
+//
+// Before this fix, BundleOrchestrator::DispatchResult carried only
+// {correlation_id, expected} — no per-step outcome — so a denied
+// execute_bundle call unconditionally returned a JSON-RPC SUCCESS naming the
+// requested step count, even when every step was about to be denied by the
+// real chokepoint. This test proves the new per-step pre-check catches a
+// denial on ANY step and refuses the WHOLE call, all-or-nothing, before
+// bundle_orch->dispatch(...) is ever reached for any step (not just the
+// denied one).
+TEST_CASE("MCP #3893: execute_bundle refuses the WHOLE call when ANY step is denied — "
+          "all-or-nothing, dispatch_fn NOT invoked for any step",
+          "[pg][mcp][bundle][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    // Step 1 (os_info.uptime) would be authorized; step 2 (registry.set_value)
+    // is denied. Proves the loop does not stop at "first step OK".
+    ts.authorize_dispatch_fn_for_test =
+        [](const yuzu::server::DispatchCaller&, std::string_view plugin,
+           std::string_view action)
+        -> std::expected<yuzu::server::CommandCapability,
+                        yuzu::server::detail::DispatchDenial> {
+        if (plugin == "registry" && action == "set_value") {
+            return std::unexpected(yuzu::server::detail::DispatchDenial{
+                yuzu::server::detail::DispatchDenialReason::Forbidden, "Infrastructure",
+                yuzu::server::authz::Operation::Write});
+        }
+        static constexpr yuzu::server::CommandCapability kBenignRow{
+            .plugin = "unused",
+            .action = "unused",
+            .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+            .mutability = yuzu::server::Mutability::None,
+            .securable = "Execution",
+            .operation = yuzu::server::authz::Operation::Read,
+            .risk_tier = yuzu::server::authz::RiskTier::Low,
+            .system_reserved = false,
+            .execute_gate = yuzu::server::ExecuteGate::None,
+        };
+        return kBenignRow;
+    };
+    bool dispatched = false;
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::DispatchCaller&)
+                               -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    });
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38932,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"},{"plugin":"registry","action":"set_value"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK_FALSE(body.contains("result")); // no bundle_id — the false-success gap this closes
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    // Neither step reached bundle_orch->dispatch(...) — the SAME dispatch_fn
+    // spy every other bundle test in this file uses to observe fan-out.
+    CHECK_FALSE(dispatched);
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() >=
+          1.0);
+}
+
+TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): ApprovalRequired at C8 pre-mint for execute_bundle "
+          "is NOT a denial — a legitimate fresh-mint call still mints normally",
+          "[pg][mcp][bundle][approval][3893]") {
+    // Mirrors execute_instruction's own "ApprovalRequired at C8 pre-mint is
+    // NOT a denial" test — the same critical subtlety, now proven for
+    // execute_bundle: a supervised-tier caller reaching C8 for an
+    // approval-gated pair is there BECAUSE the pair requires approval, not
+    // because it is being denied.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::ApprovalRequired, "Infrastructure",
+                 yuzu::server::authz::Operation::Write);
+    bool dispatched = false;
+    ts.start_with_dispatch(
+        [&dispatched](const std::string&, const std::string&, const std::vector<std::string>&,
+                     const std::string&, const std::unordered_map<std::string, std::string>&,
+                     const std::string&, const yuzu::server::DispatchCaller&)
+            -> std::pair<std::string, int> {
+            dispatched = true;
+            return {"cmd", 1};
+        },
+        "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38933,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"registry","action":"set_value"}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // kApprovalRequired (-32006), the TICKET-MINT code — NOT kPermissionDenied
+    // (what deny_dispatch_authorization would answer). Proves ApprovalRequired
+    // at C8 pre-mint falls through to "mint a ticket", not "deny locally", for
+    // execute_bundle exactly as it already did for execute_instruction.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    REQUIRE(body["error"].contains("data"));
+    CHECK_FALSE(body["error"]["data"]["approval_id"].get<std::string>().empty());
+    CHECK(appr.pending_count() == 1); // a REAL ticket was minted
+    CHECK_FALSE(dispatched);          // not consumed either — this is the mint response
 }
 
 TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is unwired (CDX-R6-02)",
@@ -14276,6 +14444,117 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
         REQUIRE(st.has_value()); // read succeeded
         CHECK(st->has_value()); // ...and found the record
     }
+}
+
+// ── #3893 fix round (Doomgoose review, blocking finding 2) ────────────────
+//
+// quarantine_device's own pre-dispatch dry run, mirroring execute_instruction's
+// #3687 two-site coverage: the main-handler pre-check (this test) and the C8
+// pre-mint check (the next test). BOTH are required for the same reason
+// #3687 needed both for execute_instruction — a supervised-tier caller
+// reaches the ticket flow via C8, while a caller whose tier does not require
+// approval for Security:Execute (an empty/non-MCP-tiered session, same as a
+// dashboard/admin caller) skips C8 entirely and reaches this handler's body
+// directly.
+//
+// This first test is the PHANTOM-ISOLATION check that is the whole point of
+// pre-checking BEFORE the store write (point 3 of the fix): if the denial
+// were still applied after `quarantine_store->quarantine_device(...)`, a
+// denied call would leave a persisted-but-undispatched quarantine record —
+// the exact #3127 class this handler already fought once.
+TEST_CASE("MCP #3893: quarantine_device Forbidden denial at the MAIN-HANDLER site happens "
+          "BEFORE the store write — no phantom record, dispatch_fn NOT invoked",
+          "[mcp][integration][quarantine][3893]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.metrics_for_test = &reg;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Security",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // Empty tier ("" — not an MCP-tiered token, e.g. a dashboard/admin
+    // session): tier_allows("", ...) admits it and requires_approval("", ...)
+    // is unconditionally false (mcp_policy.hpp), so this call skips C8
+    // entirely and reaches quarantine_device's own handler body directly —
+    // the SAME reason execute_instruction's main-handler backstop needed its
+    // own independent fail-closed/denial coverage, not just C8's.
+    ts.start_with_dispatch(dispatch, "");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3893,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-3893","reason":"test"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK_FALSE(dispatched);
+    // The phantom-isolation check: no record was ever persisted for this denied call.
+    {
+        auto st = quar.get_status("agent-3893");
+        REQUIRE(st.has_value());       // read succeeded
+        CHECK_FALSE(st->has_value());  // ...and found NOTHING — no phantom record
+    }
+    CHECK(reg.counter("yuzu_server_dispatch_denied_total", {{"reason", "forbidden"}}).value() >=
+          1.0);
+}
+
+TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): a Forbidden quarantine.quarantine pair is denied AT "
+          "C8 PRE-MINT — no ticket minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][quarantine][approval][3893]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    // quarantine_device declares its own approval_id schema property (unlike
+    // most gated tools, which tolerate it as undeclared) — no other args are
+    // required by the schema for C8's #2405 validation to pass, so agent_id
+    // alone is enough to reach the pairs check.
+    ts.authorize_dispatch_fn_for_test =
+        deny_with(yuzu::server::detail::DispatchDenialReason::Forbidden, "Security",
+                 yuzu::server::authz::Operation::Execute);
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    // supervised: requires_approval("supervised", "Security", "Execute") is
+    // unconditionally true (mcp_policy.hpp) — quarantine.quarantine is live
+    // device isolation, "as destructive as it gets".
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":38931,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-3893"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // NOT kApprovalRequired — refused before a ticket exists at all, same
+    // convention as every other C8 pre-mint denial in this file.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["reason"] == "forbidden");
+    CHECK(appr.pending_count() == 0); // no ticket minted — the defect this fix closes
+    CHECK_FALSE(dispatched);
 }
 
 TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (governance UP-9)",
