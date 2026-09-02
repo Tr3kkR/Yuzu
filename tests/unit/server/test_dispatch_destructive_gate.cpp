@@ -40,6 +40,7 @@
 #include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
+#include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -334,12 +335,13 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 6> sources{{
+    const std::array<std::span<const CommandCapability>, 7> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
+        capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     }};
 
@@ -371,7 +373,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
     CHECK(destructive_execution_securable_count == 4);
 
     // Composability spot check — mirrors test_capability_catalogue.cpp's own
-    // `build_registry`: the same six spans compose into a real registry
+    // `build_registry`: the same seven spans compose into a real registry
     // exactly as the production composition site does, and a known
     // Destructive row still resolves through it.
     CommandCapabilityRegistry registry{
@@ -380,6 +382,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
+        capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     };
     auto classified = registry.classify("tar", "purge_source");

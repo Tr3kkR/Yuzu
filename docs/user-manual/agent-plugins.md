@@ -576,6 +576,20 @@ Plugins for file and directory operations.
 |---|---|
 | `free` | Report free and total bytes (and percent used) for the volume containing `path`. Parameter: `path` (string, optional -- volume root or any directory on the target volume; defaults to `C:\` on Windows / `/` on Linux/macOS). Returns `disk|<path>|<total_bytes>|<free_bytes>|<percent_used>` on success, `error|<msg>` with a non-zero exit on failure (same convention as os_info). |
 
+### filesystem_posture
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Mounted-volume inventory, volume-level disk quota state, and filesystem snapshot inventory. All three actions are read-only. |
+
+| Action | Description |
+|---|---|
+| `mounts` | List mounted volumes with device, filesystem type, mount options, capacity, and a fixed flags vocabulary (`ro rw nosuid nodev noexec noatime relatime removable remote cdrom`). On Windows uses `GetLogicalDrives`/`GetVolumeInformationW`. On Linux parses `/proc/self/mountinfo`; a network-filesystem source reports its capacity columns as `-`, and a device-mapper source may be dm-crypt/multipath rather than a volume manager. On macOS uses `getmntinfo`; an APFS snapshot shared by two mount points of one volume lineage is reported once per mount point. |
+| `quotas` | Report volume-level disk quota state -- volume-level only everywhere, no per-user/group breakdown on any platform. On Linux uses `quotactl(Q_GETQUOTA)` per mounted filesystem. On macOS reports `state|unsupported`: APFS has no per-user or per-group quota mechanism at all. On Windows uses `IDiskQuotaControl`, initialized read-only (`bReadWrite=FALSE`); this leg is **compile-verified only -- not exercised against a live Windows host in this change**. |
+| `snapshots` | Enumerate filesystem snapshots. On Linux reports Btrfs/LVM snapshot capability, not a live inventory of existing snapshots. On macOS enumerates APFS snapshots, with the same shared-lineage per-mount-point caveat as `mounts`. On Windows enumerates VSS shadow copies; this leg is **compile-verified only -- not exercised against a live Windows host in this change**. |
+
 ---
 
 ## Execution
