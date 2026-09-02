@@ -143,6 +143,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
+    auto cmd_dispatch_concurrency = std::move(deps.command_dispatch_fn_concurrency);
     // K-R7-02 / PLAN-006: per-request DispatchCaller derivation. A missing
     // callback fails CLOSED on visibility at each dispatch site (empty
     // principal, present-empty set, deny all).
@@ -1561,7 +1562,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/workflows/:id/execute -- execute workflow against agents
     sink.Post(R"(/api/workflows/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                     workflow_engine, instruction_store,
-                                                    cmd_dispatch, caller_fn,
+                                                    cmd_dispatch, cmd_dispatch_concurrency,
+                                                    caller_fn,
                                                     approval_manager](const httplib::Request& req,
                                                                       httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -1699,7 +1701,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // synchronously below, but a value capture is lifetime-safe
         // regardless) so every step narrows to AND identifies the operator.
         auto dispatch_fn =
-            [instruction_store, &cmd_dispatch, caller](
+            [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller](
                 const std::string& instruction_id, const std::string& agent_ids_json,
                 const std::string& parameters_json) -> std::expected<std::string, std::string> {
             // Look up the instruction definition to get plugin + action
@@ -1768,8 +1770,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // record_execution_id is skipped and responses arrive with
             // the legacy sentinel (legacy fallback in detail handler
             // covers the rendering).
-            auto [command_id, sent] = cmd_dispatch(def.plugin, def.action, target_ids, "", params,
-                                                   /*execution_id=*/"", caller);
+            // ADR-1007: per-device concurrency gate, when wired — falls back
+            // to the ungated dispatch when unwired (test harnesses that
+            // don't construct an ExecutionTracker), matching the
+            // ConcurrencyDispatchFn doc contract.
+            auto [command_id, sent] =
+                cmd_dispatch_concurrency
+                    ? cmd_dispatch_concurrency(def.plugin, def.action, target_ids, "", params,
+                                              /*execution_id=*/"", caller, def.id,
+                                              def.concurrency_mode)
+                    : cmd_dispatch(def.plugin, def.action, target_ids, "", params,
+                                   /*execution_id=*/"", caller);
 
             if (sent == 0)
                 return std::unexpected<std::string>("no agents reached for " + instruction_id);
@@ -1880,8 +1891,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                        instruction_store, cmd_dispatch,
-                                                       caller_fn, execution_tracker,
-                                                       approval_manager,
+                                                       cmd_dispatch_concurrency, caller_fn,
+                                                       execution_tracker, approval_manager,
                                                        metrics](const httplib::Request& req,
                                                                 httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
@@ -2145,9 +2156,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 caller_fn ? caller_fn(req)
                           : yuzu::server::DispatchCaller{
                                 .exec_visible = yuzu::server::authz::deny_all()};
-            std::tie(command_id, sent) = cmd_dispatch(def.plugin, def.action, agent_ids,
-                                                      dispatch_scope, params, execution_id,
-                                                      caller);
+            // ADR-1007: per-device concurrency gate, when wired.
+            std::tie(command_id, sent) =
+                cmd_dispatch_concurrency
+                    ? cmd_dispatch_concurrency(def.plugin, def.action, agent_ids, dispatch_scope,
+                                              params, execution_id, caller, def.id,
+                                              def.concurrency_mode)
+                    : cmd_dispatch(def.plugin, def.action, agent_ids, dispatch_scope, params,
+                                   execution_id, caller);
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created
@@ -2180,10 +2196,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // sent count, so the discriminator is not available here (#3424);
             // until it is, the message must not assert unreachability, which
             // is what sends an operator to the agent/networking team during a
-            // Postgres incident.
+            // Postgres incident. ADR-1007 adds a FOURTH: for a `per-device`
+            // definition, every target may have been excluded by an already-open
+            // concurrency claim rather than being unreachable at all — check
+            // yuzu_server_dispatch_concurrency_skipped_total too.
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, or withheld because containment state could not be read. Check GET /api/v1/quarantine and yuzu_server_quarantine_gate_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
+                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, withheld because containment state could not be read, or excluded by an in-flight per-device concurrency claim. Check GET /api/v1/quarantine, yuzu_server_quarantine_gate_total, and yuzu_server_dispatch_concurrency_skipped_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }

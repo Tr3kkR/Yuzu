@@ -813,7 +813,6 @@ if build_server
       'unit/server/test_saml_scim_link.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
-      'unit/server/test_concurrency_manager.cpp',
       'unit/server/test_legacy_shim.cpp',
       'unit/server/test_management_group_store.cpp',
       'unit/server/test_dashboard_tar_retention.cpp',

@@ -5300,6 +5300,63 @@ public:
                 startup_failed_ = true;
             } else {
                 execution_tracker_->set_event_bus(execution_event_bus_.get());
+                execution_tracker_->set_metrics(&metrics_); // ADR-1007
+                // ADR-1007: pre-seed to 0 so absent-vs-zero is meaningful —
+                // a healthy fleet with zero concurrency collisions/anomalies
+                // must read as "wired, nothing happened" on a dashboard, not
+                // as "this code never ran." The reconcile-liveness gauge
+                // below needs no VALUE pre-seed: it is set unconditionally on
+                // every reconciler pass, so it self-heals within one tick of
+                // boot — but it still gets its own describe() call here
+                // (HELP/TYPE registration, not a value), same as the
+                // `yuzu_server_audit_retention_last_pass_unixtime` sibling
+                // this shape is copied from: without it the series has no
+                // documented type and no HELP text on /metrics until the
+                // reconciler's first tick calls .gauge() implicitly.
+                metrics_.describe("yuzu_server_concurrency_reconcile_last_pass_unixtime",
+                                  "Unix timestamp of the stale-claim reconciler's last completed "
+                                  "pass. A liveness signal only - pair with absent()/staleness "
+                                  "alerting to catch a reconciler that stopped ticking, same shape "
+                                  "as yuzu_server_audit_retention_last_pass_unixtime. Absent until "
+                                  "the first pass runs (no value pre-seed - see the comment above).",
+                                  "gauge");
+                metrics_.describe("yuzu_server_dispatch_concurrency_skipped_total",
+                                  "per-device dispatch candidates excluded because they already "
+                                  "held an open concurrency claim for the same definition. Zero "
+                                  "means no candidate has ever been excluded.",
+                                  "counter");
+                metrics_.counter("yuzu_server_dispatch_concurrency_skipped_total");
+                // Gate 3 sre finding (this fix round): a fail-CLOSED claim
+                // attempt (Postgres pool exhaustion or a query failure inside
+                // claim_concurrency_slots) also excludes every candidate from
+                // the dispatch, same as a genuinely-busy candidate, but had no
+                // metric of its own -- an operator watching only the sibling
+                // counter above couldn't distinguish "candidates really are
+                // busy" from "Postgres is degraded and every per-device
+                // dispatch is silently excluded regardless of real state".
+                metrics_.describe("yuzu_server_concurrency_claim_unavailable_total",
+                                  "A per-device concurrency claim attempt failed closed (Postgres "
+                                  "pool exhaustion or a query error) and excluded every candidate "
+                                  "from that dispatch, independent of whether any of them were "
+                                  "actually busy. Nonzero alongside a live "
+                                  "yuzu_server_dispatch_concurrency_skipped_total signal points at "
+                                  "store degradation, not real contention.",
+                                  "counter");
+                metrics_.counter("yuzu_server_concurrency_claim_unavailable_total");
+                metrics_.describe("yuzu_server_concurrency_reconcile_declined_total",
+                                  "Stale-claim reconciler passes declined by the clock-guard's "
+                                  "anomaly classification (implausible clock jump, unusable prior "
+                                  "state, or no persisted anchor yet). Zero means every pass so "
+                                  "far has been accepted.",
+                                  "counter");
+                metrics_.counter("yuzu_server_concurrency_reconcile_declined_total");
+                metrics_.describe("yuzu_server_concurrency_claim_force_released_total",
+                                  "Concurrency claims force-released by the stale-claim "
+                                  "reconciler because their owning agent never reported a "
+                                  "terminal status before expires_at. Zero means no orphaned "
+                                  "claim has ever needed force-release.",
+                                  "counter");
+                metrics_.counter("yuzu_server_concurrency_claim_force_released_total");
                 // UAT 2026-05-06 #8: AgentServiceImpl notifies the
                 // tracker on every response so the per-agent KPI
                 // table populates and SSE agent-transition fires
@@ -11105,7 +11162,18 @@ private:
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id,
         const yuzu::server::DispatchCaller& caller,
-        bool broadcast_on_none) {
+        bool broadcast_on_none,
+        // ADR-1007: per-device concurrency gate — trailing, defaulted-empty
+        // so every existing caller is unaffected. The callers that actually
+        // resolve an InstructionDefinition before dispatching supply these —
+        // workflow_routes.cpp's `/api/instructions/:id/execute` route AND
+        // its workflow-step dispatch path (both route through
+        // `command_dispatch_concurrency_fn`, wired to
+        // `WorkflowRoutes::Deps::command_dispatch_fn_concurrency`), plus
+        // `ScheduleRunner`. Every OTHER caller (background pushes, raw
+        // plugin/action dispatch with no definition concept) passes neither
+        // and gets no gate, unchanged from today.
+        const std::string& definition_id = {}, const std::string& concurrency_mode = {}) {
         // Normalize action to lowercase — agent plugins register actions in
         // lowercase and match case-sensitively (was implicit on the MCP path
         // via upstream lowercasing; a safe superset here).
@@ -11113,8 +11181,18 @@ private:
         for (auto& c : norm_action)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
 
-        auto command_id =
-            plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+        // 16 random bytes (128 bits), not 8 (Sol/Fable adversarial-review
+        // finding, PR #3784 fix round): this is the ONE command_id
+        // generation site behind `dispatch_confined`'s concurrency-gated
+        // callers (`definition_id`/`concurrency_mode` above), and
+        // `ExecutionTracker::release_concurrency_claim_by_command`/
+        // `renew_concurrency_claim_by_command` match on `(command_id,
+        // agent_id)` alone — a collision at 8 bytes was only
+        // probabilistically unlikely, not DB-enforced. See the new
+        // `ux_concurrency_claims_command` unique index
+        // (execution_tracker.cpp) for the enforcement half of this fix.
+        auto command_id = plugin + "-" +
+                          auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
 
         // Same classifier as the /api/command handler (#2500): an explicit
         // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
@@ -11192,7 +11270,8 @@ private:
                 audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
             },
             command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
-            caller.exec_visible, broadcast_on_none, containment_gate, *classified);
+            caller.exec_visible, broadcast_on_none, containment_gate, *classified, definition_id,
+            concurrency_mode);
 
         // #881: this seam serves the MAJORITY of dispatch (MCP, workflows,
         // schedules, REST v1) — without this, quarantine enforcement here
@@ -18587,6 +18666,35 @@ private:
                     replace("{{SEL_CC_DEF}}",
                             def.concurrency_mode == "per-definition" ? "selected" : "");
                     replace("{{SEL_CC_SET}}", def.concurrency_mode == "per-set" ? "selected" : "");
+                    // Fifth, dynamic option (Gate 6 enterprise-readiness finding, PR #3784 fix
+                    // round): the four static options above cover every ENFORCED/documented
+                    // mode, but the real content library also ships `global`/`global-singleton`
+                    // (42 catalog-only `plugin: server` definitions, ADR-1007) — neither matches
+                    // any static <option>, so none was ever `selected` and the browser silently
+                    // defaulted to displaying "Unlimited". Form-mode "Convert to YAML" then baked
+                    // that displayed default into the generated YAML, so an ordinary Save on one
+                    // of those 42 definitions silently overwrote its real concurrency_mode. Fixed
+                    // by emitting a raw <option> carrying the actual stored value whenever it
+                    // doesn't match one of the four known modes, so round-tripping never discards
+                    // it. NOT run through the escaping `replace()` lambda above (it HTML-escapes
+                    // the whole substituted string, which would mangle this option's own tags) —
+                    // only the stored value itself is escaped, everything else is a literal
+                    // template.
+                    {
+                        static const std::string kOtherPlaceholder = "{{SEL_CC_OTHER_OPTION}}";
+                        std::string other_option;
+                        if (!def.concurrency_mode.empty() && def.concurrency_mode != "unlimited" &&
+                            def.concurrency_mode != "per-device" &&
+                            def.concurrency_mode != "per-definition" &&
+                            def.concurrency_mode != "per-set") {
+                            const auto escaped = html_escape(def.concurrency_mode);
+                            other_option = "<option value=\"" + escaped + "\" selected>" + escaped +
+                                          " (unrecognized, not enforced)</option>";
+                        }
+                        for (auto pos = tmpl.find(kOtherPlaceholder); pos != std::string::npos;
+                             pos = tmpl.find(kOtherPlaceholder))
+                            tmpl.replace(pos, kOtherPlaceholder.size(), other_option);
+                    }
                 }
             } else {
                 // New definition — clear all placeholders
@@ -18623,6 +18731,7 @@ private:
                 clear("{{SEL_CC_DEV}}");
                 clear("{{SEL_CC_DEF}}");
                 clear("{{SEL_CC_SET}}");
+                clear("{{SEL_CC_OTHER_OPTION}}");
             }
             res.set_content(tmpl, "text/html; charset=utf-8");
         });
@@ -19206,6 +19315,22 @@ private:
                                      execution_id, caller, /*broadcast_on_none=*/false);
         };
 
+        // ADR-1007 — a deliberate SIBLING of command_dispatch_caller_fn, not
+        // a widening of it (see workflow_routes.hpp's ConcurrencyDispatchFn
+        // doc comment for why). Routes through the identical dispatch_confined
+        // seam, two extra trailing arguments.
+        auto command_dispatch_concurrency_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+                   const std::string& definition_id,
+                   const std::string& concurrency_mode) -> std::pair<std::string, int> {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false,
+                                     definition_id, concurrency_mode);
+        };
+
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
         // A background thread ticks it: dispatch due policies' check
         // instructions, collect responses, evaluate the CEL, write status.
@@ -19462,6 +19587,18 @@ private:
                           "which denies fail-closed). Zero means the check ran and passed.",
                           "counter");
         metrics_.counter("yuzu_schedule_arming_denied_total");
+        // ADR-1007: absent-vs-zero carries the same meaning as the arming
+        // counter above — zero means the second definition read always
+        // succeeded and per-device enforcement applied to every fire;
+        // absent means this code never ran (metrics unwired), which must
+        // not read as "always succeeded" on a dashboard.
+        metrics_.describe("yuzu_schedule_concurrency_mode_lookup_failed_total",
+                          "Scheduled fires where the second get_definition() read (needed to "
+                          "learn concurrency_mode) failed or returned empty - per-device "
+                          "concurrency enforcement was NOT applied to that one fire. Zero means "
+                          "the read always succeeded.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_concurrency_mode_lookup_failed_total");
         schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
             .schedule_engine = schedule_engine_.get(),
             .instruction_store = instruction_store_.get(),
@@ -19478,6 +19615,7 @@ private:
             // `command_dispatch_caller_fn` — reverting it to the system
             // closure silently reopens that bypass.
             .dispatch_fn = command_dispatch_caller_fn,
+            .dispatch_fn_concurrency = command_dispatch_concurrency_fn,
             .resolve_caller =
                 [this](const std::string& username) {
                 return derive_dispatch_caller_for_username(username);
@@ -19591,6 +19729,9 @@ private:
                 // so this rides the same 60m cadence as the other non-PII
                 // stores above, not the tighter session cadence.
                 constexpr int kCmdExecutionReapEveryNTicks = 1800; // ~60 minutes at 2s/tick
+                // ADR-1007: per-device concurrency claim stale-claim reconciler
+                // cadence — see the call site's own comment for the rationale.
+                constexpr int kConcurrencyClaimReconcileEveryNTicks = 150; // ~5 minutes at 2s/tick
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -19789,6 +19930,23 @@ private:
                                 metrics_.counter("yuzu_exec_correlation_store_degrade_total")
                                     .increment();
                             }
+                        }
+
+                        // 2f) Per-device concurrency claim stale-claim reconciler
+                        // (ADR-1007) — piggybacks this thread's tick counter like
+                        // the reaps above. A ~5m cadence: frequent enough that a
+                        // crashed/disconnected agent's orphaned claim does not
+                        // block a legitimate re-dispatch of the same definition to
+                        // the same device for too long, without competing for the
+                        // pool anywhere near session/response reap frequency.
+                        // reconcile_stale_concurrency_claims is itself
+                        // clock-guarded (persisted anchor, sanitized reading,
+                        // fact-set anomaly suppression, unconditional cap — see
+                        // its own doc comment) — this call site owns only the
+                        // cadence, not the safety.
+                        if (execution_tracker_ && execution_tracker_->is_open() &&
+                            tick % kConcurrencyClaimReconcileEveryNTicks == 0) {
+                            execution_tracker_->reconcile_stale_concurrency_claims(now);
                         }
 
                         // 3) Refresh alive gauges.
@@ -20976,6 +21134,7 @@ private:
         // system command_dispatch_fn. Both funnel through the ONE
         // dispatch_confined seam.
         wf_deps.command_dispatch_fn = command_dispatch_caller_fn;
+        wf_deps.command_dispatch_fn_concurrency = command_dispatch_concurrency_fn;
         wf_deps.caller_fn =
             [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
             // Resolve the session from a throwaway Response (never written back);

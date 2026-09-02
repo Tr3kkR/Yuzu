@@ -188,12 +188,17 @@ the original ladder never tracked is now on Postgres.**
   `server.cpp` to whatever it constructed — moot now that the trio has migrated and
   `InstructionDbPool` is deleted (ADR-0065), but the general lesson (a pool consumer's SQLite
   handle can be grep-invisible by filename) still applies to any future shared-connection pattern.
-- **`ConcurrencyManager` (`concurrency_manager.{hpp,cpp}`) is deliberately NOT a Wave 4 row.** It
-  holds a real `sqlite3*` and a real migration ladder of its own, but has zero production callers
-  anywhere in `server.cpp` (verified 2026-08-27 via `grep`) — compiled, unit-tested, and never
-  instantiated. Out of scope for this migration program; if it's ever wired up, it gets its own
-  ADR + row then. (`FleetTopologyStore`, the other non-`*Store`-shaped exclusion, is already
-  recorded inline in its own Wave 1 row above — a pure in-memory cache, never SQLite.)
+- **`ConcurrencyManager` was deleted (ADR-1007, 2026-08-31), not migrated.** It held a real
+  `sqlite3*` and a real migration ladder of its own but had zero production callers anywhere in
+  `server.cpp` (verified 2026-08-27 via `grep`) — compiled, unit-tested, never instantiated. A
+  real-usage audit of shipped `content/definitions/*.yaml` found the two server-side concurrency
+  modes it would have enforced (`per-definition`/`global`) attach exclusively to catalog-only
+  `plugin: server`/`server_internal`/`_server` definitions that never dispatch through the agent
+  path at all — migrating it would have built Postgres infrastructure for a mechanism that
+  structurally cannot fire. The one mode with real live usage, `per-device`, is now enforced by a
+  dedicated `concurrency_claims` table inside `execution_tracker`'s own schema instead — see
+  ADR-1007. (`FleetTopologyStore`, the other non-`*Store`-shaped exclusion, is already recorded
+  inline in its own Wave 1 row above — a pure in-memory cache, never SQLite.)
 - **Schema naming for a non-`*Store` class (Wave 4)** extends the ADR-0008 rule above: there is no
   `Store` suffix to append, so the schema name is plain `snake_case(ClassName)` —
   e.g. `WorkflowEngine` → `workflow_engine`, `ExecutionTracker` → `execution_tracker`.

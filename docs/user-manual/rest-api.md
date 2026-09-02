@@ -1628,7 +1628,14 @@ Quarantine a device.
 > (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
 > do **not** yet carry this split — they answer their existing
 > "no agents reached" shapes for all three conditions, because the shared
-> dispatch closure returns only a sent count. Tracked as #3424. The quarantine
+> dispatch closure returns only a sent count. Tracked as #3424. ADR-1007 added
+> a fourth cause to that same undifferentiated message on
+> `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
+> named target may have been excluded by an already-open concurrency claim
+> rather than being unreachable at all — the response text now says so, and
+> points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
+> this is still prose inside the one undifferentiated 503 body, not a fourth
+> structured `error.reason` value — the same #3424 gap applies to it. The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —
@@ -4098,6 +4105,67 @@ Recent delivery attempts for a target (default 50, override via `?limit=N`). Eac
 **Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the entire JSON payload — including potentially sensitive instruction response data (file paths, registry values, software inventory, security findings) — is transmitted in cleartext. Production deployments containing customer endpoint data should use `https://` only. The store accepts `http://` for development convenience and to maintain parity with the webhook precedent.
 
 **Operator trust model.** Any principal with `Infrastructure:Write` can register an offload target pointing at any URL the server can resolve, including RFC1918 / loopback / link-local destinations. There is no URL allowlist or network-egress mitigation in this revision; the trust model is "Infrastructure:Write operators are trusted to choose where data goes." For multi-tenant managed deployments this is a known limitation tracked as a roadmap follow-up.
+
+---
+
+### Directory Sync
+
+AD/Entra directory integration (Phase 7). Backed by `DirectorySync` (`directory_sync.{hpp,cpp}`).
+
+#### `POST /api/directory/sync`
+
+Trigger a directory sync. Requires `Directory:Write`.
+
+**Request (`provider: "entra"`):**
+
+```json
+{
+  "provider": "entra",
+  "tenant_id": "...",
+  "client_id": "...",
+  "client_secret": "..."
+}
+```
+
+`tenant_id`/`client_id`/`client_secret` are all required for `entra`; a `provider: "ldap"` request instead takes `server`/`port`/`base_dn`/`bind_dn`/`bind_password`/`use_ssl`, but `sync_ldap` is not yet implemented and always returns `501`. Any other `provider` value is `400`.
+
+**Response (200):** `{"status": "completed", "provider": "entra", "user_count": <n>, "group_count": <n>}`
+
+**Response (409, ADR-1007):** `{"error": "sync already in progress"}` — `sync_entra` holds a single in-process re-entrancy guard for the duration of one sync call; a second `POST` that arrives while a sync is already running is rejected immediately rather than racing it. See "Diagnosing a stuck directory sync" in `docs/user-manual/server-admin.md` for how long a legitimate sync can hold the guard and what a stuck one looks like. Not queued or retried automatically — the caller decides when to retry.
+
+**Response (400):** malformed body, or a missing required Entra field.
+
+**Response (503):** `directory_sync` is unavailable (store not open).
+
+**Response (500):** a genuine sync failure (e.g. Graph API error) — the error message is passed through from `sync_entra`'s result.
+
+#### `GET /api/directory/users`
+
+List directory-synced users from the last successful sync. Requires `Directory:Read`. Optional `?group_id=` query param filters to members of one synced group.
+
+**Response (200):** `{"users": [{"id","display_name","email","upn","enabled","groups":[...],"synced_at"}], "count": <n>}`
+
+**Response (503):** `directory_sync` unavailable.
+
+#### `GET /api/directory/status`
+
+Sync status plus the last-synced group list (there is no separate `GET /api/directory/groups` route — groups are embedded here). Requires `Directory:Read`.
+
+**Response (200):** `{"provider","status","last_sync_at","user_count","group_count","last_error","groups":[{"id","display_name","description","mapped_role","synced_at"}]}`
+
+**Response (503):** `directory_sync` unavailable.
+
+#### `PUT /api/directory/group-mappings`
+
+Configure group-to-role mappings (which RBAC role a synced group's members receive). Requires `Directory:Write`.
+
+**Request:** `{"mappings": [{"group_id": "...", "role_name": "..."}]}`. `role_name` is NOT required per entry — an entry with an empty/omitted `role_name` REMOVES that group's mapping rather than being rejected; a non-empty `role_name` configures (creates or overwrites) it. An entry with an empty `group_id` is silently skipped and not counted.
+
+**Response (200):** `{"mappings": [{"group_id","role_name"}], "count": <n>}` — the FULL current mapping set after applying this request's changes (not the size of the batch just submitted).
+
+**Response (400):** malformed body, or a missing `mappings` array.
+
+**Response (503):** `directory_sync` unavailable.
 
 ---
 

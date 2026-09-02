@@ -37,6 +37,10 @@ namespace yuzu::server::pg {
 class PgPool;
 } // namespace yuzu::server::pg
 
+namespace yuzu {
+class MetricsRegistry;
+} // namespace yuzu
+
 namespace yuzu::server {
 
 class ExecutionEventBus;
@@ -203,6 +207,14 @@ public:
     /// owned by the server; the tracker only borrows it. nullptr disables
     /// publishing — used by harnesses that don't exercise SSE.
     void set_event_bus(ExecutionEventBus* bus) { event_bus_ = bus; }
+
+    /// ADR-1007 — optional observability sink for the per-device
+    /// concurrency-claim path (skip counts, force-releases). nullptr (the
+    /// default) means no metrics — matches every sibling store's `set_metrics`
+    /// idiom (a post-construction setter, not a constructor parameter, so
+    /// this costs zero changes to any existing `ExecutionTracker(pg::PgPool&)`
+    /// call site).
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
     // Query
     std::vector<Execution> query_executions(const ExecutionQuery& q = {}) const;
@@ -390,6 +402,193 @@ public:
     [[nodiscard]] std::expected<CommandExecutionReapOutcome, std::string>
     reap_command_execution_mappings();
 
+    // ── per-device concurrency enforcement (ADR-1007) ──────────────────
+    //
+    // A dedicated claim table (only OPEN rows are short-lived — released
+    // rows are retained indefinitely, see the no-prune comment on
+    // idx_concurrency_claims_claimed_at in migrations()) — deliberately
+    // NOT a reuse of
+    // `agent_exec_status` (that table only gains a row when an agent's
+    // FIRST RESPONSE arrives, which is too late: the whole point is
+    // excluding an agent that is still mid-execution with no response yet).
+    // Race-freedom comes from a Postgres partial unique index
+    // (`ux_concurrency_claims_open`, see migrations()), never an app-level
+    // check — see `claim_concurrency_slots`.
+
+    /// Default/max claim TTL — one hour. The single source of truth for both
+    /// the initial claim (`dispatch_scope_ladder.hpp`, which clamps any
+    /// caller-supplied wire expiry into `[now, now+this]`) and each renewal
+    /// (`renew_concurrency_claim`, below) — a second copy of this number in
+    /// the dispatch seam is how it would drift from what the renewal
+    /// actually extends by.
+    static constexpr int64_t kConcurrencyClaimDefaultTtlSeconds = 3600;
+
+    /// Attempt to claim `definition_id` on every id in `candidates`, in ONE
+    /// batched round trip (never per-agent — matches this codebase's #881
+    /// "one store operation per dispatch" discipline). Returns the SUBSET
+    /// that won the claim (cleared to dispatch); an id NOT in the returned
+    /// set either already holds an open claim for this definition, OR
+    /// (Sol/Fable adversarial-review finding, PR #3784 fix round) hit the
+    /// `(command_id, agent_id)` uniqueness constraint — a caller-error/
+    /// entropy-collision case that should never happen but is excluded
+    /// exactly the same way, fail-closed, rather than distinguished. Either
+    /// way, excluded ids must be excluded from the send. Empty
+    /// `command_id` is rejected outright (see body) — see
+    /// `release_concurrency_claim_by_command`'s doc comment for why an
+    /// empty value would otherwise be a hazard, not just a no-op. Only
+    /// meaningful for `concurrency_mode == "per-device"` — callers gate on
+    /// that themselves; this method does not know or care about the mode
+    /// string.
+    [[nodiscard]] std::vector<std::string>
+    claim_concurrency_slots(const std::string& definition_id, const std::string& execution_id,
+                            const std::string& command_id,
+                            const std::vector<std::string>& candidates, int64_t expires_at);
+
+    /// Release a specific (definition_id, agent_id) claim early, on a
+    /// terminal per-agent outcome (called from `update_agent_status` — see
+    /// its body). A best-effort UPDATE; failure is logged, not propagated —
+    /// an unreleased claim still self-heals via
+    /// `reconcile_stale_concurrency_claims` once past its `expires_at`.
+    ///
+    /// `definition_id` is REQUIRED in the WHERE clause (Gate 2 security-guardian
+    /// finding, PR #3784 fix round) — `(definition_id, agent_id)` is the sole
+    /// uniqueness key (`ux_concurrency_claims_open`), so two DIFFERENT
+    /// definitions can each hold a genuinely open claim on the same
+    /// `agent_id` simultaneously. Matching on `(execution_id, agent_id)`
+    /// alone is unsafe whenever `execution_id` can collide across
+    /// definitions — which it does today: every workflow-step dispatch
+    /// (`workflow_routes.cpp`) passes the literal empty string as
+    /// `execution_id` for EVERY definition it dispatches (CONSIST-2/sec-M2,
+    /// pending real correlation), so an unscoped release for one definition
+    /// could otherwise release a different, still-genuinely-running
+    /// definition's open claim on the same agent.
+    void release_concurrency_claim(const std::string& definition_id,
+                                   const std::string& execution_id, const std::string& agent_id);
+
+    /// Batched sibling of `release_concurrency_claim` — one store op for a
+    /// whole not-sent/quarantine-denied set (`#881` discipline), matching
+    /// `claim_concurrency_slots`'s own `unnest`-batched INSERT. Best-effort
+    /// per row: a row this UPDATE doesn't touch (already released, or a
+    /// pool/query failure) stays open and self-heals via
+    /// `reconcile_stale_concurrency_claims`, same as the single-id path.
+    /// No-op on an empty `agent_ids`. `definition_id` scoping: see
+    /// `release_concurrency_claim`'s doc comment — identical rationale.
+    void release_concurrency_claims(const std::string& definition_id,
+                                    const std::string& execution_id,
+                                    const std::vector<std::string>& agent_ids);
+
+    /// Extend an open claim's `expires_at` by another `kConcurrencyClaimDefaultTtlSeconds`
+    /// from now (Gate 5 chaos finding, PR #3784 fix round CHAOS-TTL-1): the
+    /// reconciler cannot tell "crashed" from "legitimately still running"
+    /// from `expires_at` alone once a command genuinely runs longer than one
+    /// TTL window. Called from `update_agent_status` on every NON-terminal
+    /// ("running") `CommandResponse` — so a claim is only ever force-released
+    /// after a full TTL window with NO such response at all, not merely a
+    /// long one. Best-effort, same as `release_concurrency_claim`: a missed
+    /// renewal (pool exhaustion, a dropped update) does not escalate — the
+    /// claim just falls back to the reconciler's existing crash-detection
+    /// behaviour at its now-unextended `expires_at`.
+    ///
+    /// The reliable trigger for this is NOT plugin cooperation — a plugin's
+    /// own output-buffer auto-flush (`CommandContextImpl::flush_output_locked`,
+    /// 64KB threshold) and its `yuzu_ctx_report_progress` calls (a local
+    /// no-op) both proved unable to guarantee a quiet, long-running mutating
+    /// action (`script_exec.*`, operator-timeout up to 3600s) ever sends a
+    /// mid-execution `running` response (CHAOS-TTL-1, Gate 5 chaos finding).
+    /// The actual trigger is a dedicated agent-core keepalive thread
+    /// (`agent.cpp`) that sends a periodic `RUNNING` (sentinel
+    /// `__keepalive__`) for every command it still owes a terminal response
+    /// for, independent of what that command's plugin does — see ADR-1007's
+    /// "CLOSED (agent-core keepalive)" section.
+    ///
+    /// `definition_id` scoping: same rationale as `release_concurrency_claim`'s
+    /// doc comment (Gate 2 security-guardian finding, PR #3784 fix round) —
+    /// without it, a shared (empty-string) `execution_id` across multiple
+    /// workflow-step-dispatched definitions would renew every open claim on
+    /// that agent matching just `(execution_id, agent_id)`, not only the
+    /// one the caller actually meant to renew.
+    void renew_concurrency_claim(const std::string& definition_id,
+                                 const std::string& execution_id, const std::string& agent_id);
+
+    /// Fallback for `release_concurrency_claim` keyed on `command_id` alone
+    /// (UP-1, unhappy-path Gate 4 finding, PR #3784 fix round), called by
+    /// `notify_exec_tracker` whenever it cannot resolve `execution_id` via
+    /// `resolve_execution_id`/`lookup_execution_id` (the PG-backed
+    /// `command_execution` correlation table, HA WS-1(1b) above — this
+    /// fallback predates that migration and originally covered a server
+    /// restart losing the then-in-process `cmd_execution_ids_` map; that
+    /// case is now the persisted table's own job and no longer needs this
+    /// fallback's help). What's still genuinely unreached by the normal
+    /// path: (1) every workflow-step dispatch (`workflow_routes.cpp`),
+    /// whose `execution_id` is always empty (CONSIST-2/sec-M2) and which
+    /// `record_execution_id` therefore never records a mapping for at all
+    /// — this is the ONLY release path workflow-step per-device claims
+    /// ever reach; (2) a genuine degrade on the correlation table's
+    /// own write or read side (`record_command_execution`/
+    /// `lookup_execution_id` returning false/nullopt under pool exhaustion
+    /// or a query failure), which this fallback also transparently covers
+    /// as a side effect of matching on `command_id` alone rather than
+    /// needing the table to have succeeded; and (3) the correlation
+    /// table's own bounded retention (`reap_command_execution_mappings`,
+    /// a fixed 24h window, `kCmdExecutionReapWindowSecs`) aging a mapping
+    /// out from under a command that is STILL legitimately running past
+    /// that window (ADR-1007 deliberately supports unbounded "run until
+    /// finished" dispatch with no wire `expires_at`) — the mapping's own
+    /// reap has nothing to do with whether the command finished, so this
+    /// fallback is what still lets that claim release/renew correctly once
+    /// the mapping is gone.
+    ///
+    /// Matching on `(command_id, agent_id)` alone needs no `definition_id`
+    /// scoping the way `execution_id` does: `command_id` is minted fresh
+    /// per dispatch (`plugin + "-" + random_bytes(16)`, server.cpp) and is
+    /// DB-enforced unique per `(command_id, agent_id)` for the row's whole
+    /// lifetime (`ux_concurrency_claims_command`, see migrations()) — not
+    /// merely "unlikely to collide" the way an earlier round of this fix
+    /// documented it; `claim_concurrency_slots` fails a claim CLOSED
+    /// (excluded from the dispatch) on a conflict rather than assuming
+    /// uniqueness. A no-op (0 rows) if no open claim matches, which covers
+    /// ordinary out-of-band dispatch that never took a claim in the first
+    /// place.
+    void release_concurrency_claim_by_command(const std::string& command_id,
+                                              const std::string& agent_id);
+
+    /// Fallback for `renew_concurrency_claim` keyed on `command_id` alone —
+    /// same rationale and same three remaining cases (workflow-step,
+    /// correlation-table degrade, correlation-table reap-window expiry) as
+    /// `release_concurrency_claim_by_command` above, for the
+    /// keepalive/`running` path instead of the terminal
+    /// path. Fed by the SAME agent-core keepalive thread that drives
+    /// `renew_concurrency_claim` (`agent.cpp`'s periodic `__keepalive__`,
+    /// which echoes the wire `command_id` unconditionally regardless of
+    /// which path resolves it). NOT a bound on how quickly a claim
+    /// recovers after a LONG network outage (as opposed to a server
+    /// restart, which the persisted `command_execution` table above
+    /// already handles on its own): the keepalive thread waits a full
+    /// interval after (re)connecting before its first ping, so a claim
+    /// that has already passed its `expires_at` by the time the agent
+    /// reconnects can still race the reconciler's own periodic sweep
+    /// (documented residual gap, ADR-1007 — not closed by this fix; the
+    /// reconciler's TTL-based self-heal is the accepted backstop for that
+    /// window, same as for a genuinely crashed agent).
+    void renew_concurrency_claim_by_command(const std::string& command_id,
+                                            const std::string& agent_id);
+
+    /// Clock-guarded stale-claim sweep (CLAUDE.md's seven-part discipline,
+    /// via the shared `yuzu::server::audit_retention::classify` decision
+    /// rule — see `audit_retention_rules.hpp`). Force-releases any open
+    /// claim whose `expires_at` has passed with no terminal response (agent
+    /// crashed/disconnected mid-execution, so `release_concurrency_claim`
+    /// was never called). Returns the number force-released; every one is
+    /// logged loudly — a claim outliving its own command's expiry is a
+    /// correctness-relevant event, not routine housekeeping. `now` is
+    /// threaded in by the caller so the guard logic stays unit-testable
+    /// without a real clock; the persisted anchor and anomaly-fact-set
+    /// dedup key are read/written internally against
+    /// `execution_tracker.retention_meta` (`concurrency_last_pass_now` /
+    /// `concurrency_last_anomaly_facts`) — there is no caller-supplied
+    /// anchor parameter.
+    int reconcile_stale_concurrency_claims(int64_t now);
+
     /// Whether the store is usable (schema migrated). False after a failed
     /// migration — feeds the `/readyz` probe so a broken execution-history
     /// schema fails closed instead of serving errors (or silently wedging
@@ -413,14 +612,43 @@ private:
     bool refresh_counts_once(const std::string& execution_id);
 
     /// One attempt at `update_agent_status`'s upsert + agent-transition SSE
-    /// publish. Returns false on a lease-acquire failure or a query failure;
-    /// `true` otherwise. See `update_agent_status`'s retry-and-log wrapper.
-    bool upsert_agent_status_once(const std::string& execution_id, const AgentExecStatus& s);
+    /// publish. Returns `nullopt` on a lease-acquire failure or a query
+    /// failure (retry-and-log wrapper is `update_agent_status`); on success,
+    /// returns the row's ACTUALLY-PERSISTED `status` from the upsert's
+    /// `RETURNING` clause — which the sticky-terminal CASE may have kept
+    /// unchanged even when `s.status` asked for something else (a stale
+    /// `running` arriving after a real terminal write). UP-2 fix
+    /// (unhappy-path Gate 4 finding, PR #3784 fix round): the caller MUST
+    /// gate concurrency-claim release/renewal on this returned value, never
+    /// on `s.status` directly — using the caller-supplied value let a
+    /// stale, sticky-rejected `running` write still call
+    /// `renew_concurrency_claim` for a command whose row was already
+    /// terminal, extending a dead command's claim past when it should
+    /// self-heal.
+    std::optional<std::string> upsert_agent_status_once(const std::string& execution_id,
+                                                         const AgentExecStatus& s);
+
+    /// A single indexed PK lookup (`executions.id`) fetching only
+    /// `definition_id`, for scoping a concurrency-claim release/renewal
+    /// correctly (Gate 2 security-guardian finding, PR #3784 fix round —
+    /// see `release_concurrency_claim`'s doc comment). Called on EVERY
+    /// terminal transition AND every `running`/keepalive tick
+    /// (`update_agent_status` uses it for both release and renew), so a
+    /// long-running command under the 5-minute keepalive re-runs this once
+    /// per tick — an indexed PK lookup, not per-poll load in any
+    /// meaningful sense, but not a one-shot call either. Empty string on a
+    /// missing row / closed store / lease failure — the caller treats that
+    /// as "cannot scope, skip the release/renewal", matching every other
+    /// best-effort failure mode in this class (the claim self-heals via
+    /// the reconciler either way).
+    std::string definition_id_for_execution(const std::string& execution_id) const;
 
     pg::PgPool& pool_;
     bool open_{false};
     /// Borrowed — owned by the server. nullptr = no SSE publishing.
     ExecutionEventBus* event_bus_{nullptr};
+    /// Borrowed — owned by the server. nullptr = no metrics (ADR-1007).
+    yuzu::MetricsRegistry* metrics_{nullptr};
 };
 
 } // namespace yuzu::server

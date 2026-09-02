@@ -18,14 +18,15 @@ This document covers Yuzu server deployment, configuration, and ongoing administ
 10. [Tag Compliance](#tag-compliance)
 11. [OIDC SSO Configuration](#oidc-sso-configuration)
 12. [SAML 2.0 SP Configuration](#saml-20-sp-configuration)
-13. [Data Storage and Encryption](#data-storage-and-encryption)
-14. [PostgreSQL Substrate](#postgresql-substrate)
-15. [NVD CVE sync](#nvd-cve-sync)
-16. [Retention Settings](#retention-settings)
-17. [Settings API Reference](#settings-api-reference)
-18. [Deployment](#deployment)
-19. [Windows Service Installation](#windows-service-installation)
-20. [Planned Features](#planned-features)
+13. [Directory Sync (AD/Entra ID)](#directory-sync-adentra-id)
+14. [Data Storage and Encryption](#data-storage-and-encryption)
+15. [PostgreSQL Substrate](#postgresql-substrate)
+16. [NVD CVE sync](#nvd-cve-sync)
+17. [Retention Settings](#retention-settings)
+18. [Settings API Reference](#settings-api-reference)
+19. [Deployment](#deployment)
+20. [Windows Service Installation](#windows-service-installation)
+21. [Planned Features](#planned-features)
 
 ---
 
@@ -2251,6 +2252,51 @@ the `openssl` keypair-generation and IdP-registration recipe.
 See `docs/user-manual/authentication.md` "SAML 2.0 SSO" for the full login flow, capability table, and `docs/auth-architecture.md` "SAML 2.0 SP" for the implementation reference.
 
 ---
+
+## Directory Sync (AD/Entra ID)
+
+`POST /api/directory/sync` pulls users, groups, and group memberships from
+Microsoft Entra ID into `DirectorySync` (schema `directory_sync`, ADR-0063).
+See `docs/user-manual/upgrading.md`'s ADR-0063 entry for the Postgres-cutover
+migration note.
+
+### Diagnosing a stuck directory sync (ADR-1007)
+
+`sync_entra` holds a single in-process guard (an `std::atomic<bool>`, not a
+Postgres advisory lock — this is a single-server-process concern, unlike the
+KEK op lock below) for the duration of one sync call, so two overlapping
+`POST /api/directory/sync` calls can no longer race and interleave writes.
+A call that arrives while another is already in flight is rejected
+immediately with `409 Conflict` — no queueing, no blocking, and the caller
+gets its response right away rather than waiting for the in-flight sync to
+finish; retry once the guard clears (see below for how long that can take).
+
+**If `409` responses persist well past a normal sync's duration** (a normal
+sync completes in seconds to low tens of seconds; each individual HTTP call
+IS bounded — 15s connect / 30s read+write per Microsoft Graph call, 10s
+connect / 15s read+write for the OAuth token exchange — but nothing bounds
+the sync AS A WHOLE, which can page through an arbitrarily large tenant
+across many such calls), the guard is most likely still
+held by a sync that is genuinely slow — a large tenant, or a slow/degraded
+Graph API response — not wedged forever, since the guard is released via
+RAII on every exit path of `sync_entra`, including error returns. There is
+**no operator override to force-clear the guard** — restarting the server
+is the only way to reset it, because the guard is in-process state with no
+persisted record for an admin surface to reset independently (a Postgres
+advisory lock, by contrast, can be inspected and — carefully — cleared
+without restarting anything; see "Diagnosing a stuck KEK op lock" below for
+what that looks like when the underlying primitive supports it). Before
+restarting, check the server log for the sync's own completion or error
+line and confirm Microsoft Graph reachability from this host — a restart
+discards no synced data (the store itself is unaffected), but it does drop
+the in-flight sync attempt.
+
+**HA / multi-replica:** this guard, like the SAML/OIDC login-state
+limitation above, is in-process and therefore per-replica — a second
+server replica has its own independent guard and would not see a sync
+in flight on the first. Coordinating this across replicas is not yet
+built (`docs/adr/2002-high-availability-architecture.md`); today's
+single-server deployment model is unaffected.
 
 ## Data Storage and Encryption
 

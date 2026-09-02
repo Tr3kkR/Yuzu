@@ -664,6 +664,19 @@ duration is unbounded); #2011's per-mechanism-type lock (rung 0) removes only
 *cross-mechanism* coupling. Gate rung 3 on a measured Service-arm-latency ceiling
 (or the walk-off-`mu_` restructure the header defers). (architect S4.)
 
+**#2233 item 3 (landed)** bounds the wall-clock a *caller* of `GuardianSparkRuntime`
+waits for one File/Registry/Service arm/disarm - a dedicated `GuardianIoExecutor`
+instance runs the actual backend call off `registry_mu_`, bounded by
+`Config::backend_op_deadline` (5s default) - up to 2x that on a same-key redeploy
+of an already-armed rule (the prior generation's disarm and the new arm run
+sequentially, each individually bounded, not concurrently). `GuardianEngine::apply_rules()` and
+`GuardianEngine::stop()` no longer wedge on a hung watch; a hung watch degrades to
+one rule left un-armed and retried, while every other rule and shutdown proceed.
+This does **not** restructure `mech_ops_mu_by_type_` itself: a hung SCM/Registry
+call inside `backend_->arm()` can still block a sibling arm/disarm of the SAME
+mechanism type at the `SparkEngine` layer until this caller's own deadline elapses.
+The Pre-Stage-3 dependency above is otherwise unchanged by this landing.
+
 ## Health / status surface — the #1939 checklist
 
 Per ADR-1005 (headless platform) a new capability lands on REST **and** MCP, or
