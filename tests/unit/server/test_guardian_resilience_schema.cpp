@@ -348,8 +348,10 @@ json service_rule_body(const std::string& assertion_type, const std::string& ser
 
 // Build a file-hash-equals rule body for derive_rule_spec. `max_bytes_str`, if
 // non-null, is authored as a JSON STRING (the dashboard form's wire shape,
-// test_guardian_form_render.cpp) — the #2233 item 6 ceiling check only fires on
-// that encoding (see guardian_rule_spec.cpp's validate_assertion_params).
+// test_guardian_form_render.cpp); the #2233 item 6 ceiling check fires
+// regardless of wire encoding (see guardian_rule_spec.cpp's
+// validate_assertion_params) — `max_bytes_str` only selects which of that
+// function's two branches (string vs numeric) a given test case exercises.
 json file_hash_rule_body(const char* max_bytes_str) {
     json params = {{"path", "/etc/hosts"}};
     if (max_bytes_str)
@@ -395,6 +397,33 @@ TEST_CASE("#2233 item 6: file-hash-equals max_bytes above the 1 GiB ceiling is "
     json int_at = file_hash_rule_body(nullptr);
     int_at["assertion"]["params"]["max_bytes"] = 1073741824ull; // exactly at ceiling, as int
     CHECK_FALSE(derive_rule_spec(int_at, "fh", 1, true, "audit").error.has_value());
+
+    // One over the ceiling, as an int: rejected, same message shape as the string form.
+    json int_over_by_one = file_hash_rule_body(nullptr);
+    int_over_by_one["assertion"]["params"]["max_bytes"] = 1073741825ull;
+    auto int_over_res = derive_rule_spec(int_over_by_one, "fh", 1, true, "audit");
+    REQUIRE(int_over_res.error.has_value());
+    CHECK(int_over_res.error->message.find("1 GiB") != std::string::npos);
+}
+
+TEST_CASE("#2233 item 6 / Gate 8: a JSON float or negative max_bytes is rejected as "
+          "malformed, not silently substituted with the default (unhappy-path UP8-1)",
+          "[guardian][file][derive][max_bytes]") {
+    // A float, even one comfortably under the ceiling, was previously accepted and
+    // then silently discarded (server AND agent both fell through to the 64 MiB
+    // default) with no signal anywhere - reject it outright instead.
+    json flt = file_hash_rule_body(nullptr);
+    flt["assertion"]["params"]["max_bytes"] = 10000000.0; // 10 MB, as a JSON float
+    auto flt_res = derive_rule_spec(flt, "fh", 1, true, "audit");
+    REQUIRE(flt_res.error.has_value());
+    CHECK(flt_res.error->message.find("positive integer") != std::string::npos);
+
+    // Negative: same rejection, not a silent fallback either.
+    json neg = file_hash_rule_body(nullptr);
+    neg["assertion"]["params"]["max_bytes"] = -1;
+    auto neg_res = derive_rule_spec(neg, "fh", 1, true, "audit");
+    REQUIRE(neg_res.error.has_value());
+    CHECK(neg_res.error->message.find("positive integer") != std::string::npos);
 }
 
 TEST_CASE("PR5: service-running/stopped with a valid service_name authors a structured spec",

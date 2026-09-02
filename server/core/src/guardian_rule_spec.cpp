@@ -18,6 +18,14 @@
 #include <string_view>
 #include <vector>
 
+// The max_bytes-over-ceiling ResilienceParamError remediation text below hardcodes
+// "1073741824 (1 GiB)" rather than building it from yuzu::guardian::kMaxFileHashBytes
+// (cheaper than a std::to_string call on a validation hot path) - this assert is what
+// keeps that hardcoded text honest if the constant ever moves.
+static_assert(yuzu::guardian::kMaxFileHashBytes == 1073741824ull,
+              "guardian_rule_spec.cpp's max_bytes ResilienceParamError text hardcodes "
+              "this value - update both if kMaxFileHashBytes changes");
+
 namespace yuzu::server::guardian {
 namespace {
 
@@ -121,10 +129,20 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
         // (closing an asymmetry this PR itself would otherwise introduce - a
         // ceiling enforced for one JSON type and not the other is not really a
         // ceiling): a JSON-string value is still fully validated (positive
-        // integer + ceiling); a JSON-integer/unsigned value is checked against
-        // the ceiling ONLY (its zero-check and general shape are unchanged,
-        // still deferred to the agent, matching this file's pre-existing design
-        // for that wire form - only the new ceiling is closed for both).
+        // integer + ceiling); a JSON-number value is now ALSO shape-validated
+        // (must be a non-negative integer literal, matching the string form's
+        // own "positive integer" bar) before the ceiling check - a JSON float,
+        // negative number, or uint64-overflow literal was previously accepted
+        // outright and then silently discarded server- AND agent-side in favour
+        // of the 64 MiB default (Gate 8 unhappy-path/security-guardian/
+        // cpp-expert/quality-engineer, 4 independent reporters: not a ceiling
+        // bypass - agents/core/src/guardian_engine.cpp's aparam_u64 requires a
+        // whole-string integer parse and falls back to the default for
+        // anything else - but a genuinely unlogged state-divergence bug for an
+        // operator authoring a deliberately strict, well-under-ceiling cap).
+        // Zero-check for the numeric form stays deferred to the agent, matching
+        // this file's pre-existing design for that wire form - only shape +
+        // ceiling are closed for both forms now.
         std::uint64_t n = 0;
         if (params.contains("max_bytes") && params["max_bytes"].is_string()) {
             if (!is_whole_u64(params["max_bytes"].get<std::string>(), n) || n == 0)
@@ -134,14 +152,16 @@ validate_assertion_params(const std::string& assertion_type, const nlohmann::jso
             if (n > yuzu::guardian::kMaxFileHashBytes)
                 return ResilienceParamError{
                     "max_bytes exceeds the 1 GiB agent-side ceiling",
-                    "set assertion.params.max_bytes to at most 1073741824 (1 GiB) - a "
-                    "larger value would only be silently clamped on the agent"};
-        } else if (params.contains("max_bytes") && params["max_bytes"].is_number_unsigned() &&
-                   params["max_bytes"].get<std::uint64_t>() > yuzu::guardian::kMaxFileHashBytes) {
-            return ResilienceParamError{
-                "max_bytes exceeds the 1 GiB agent-side ceiling",
-                "set assertion.params.max_bytes to at most 1073741824 (1 GiB) - a "
-                "larger value would only be silently clamped on the agent"};
+                    "set assertion.params.max_bytes to at most 1073741824 (1 GiB)"};
+        } else if (params.contains("max_bytes") && !params["max_bytes"].is_string()) {
+            if (!params["max_bytes"].is_number_unsigned())
+                return ResilienceParamError{
+                    "max_bytes must be a positive integer",
+                    "set assertion.params.max_bytes >= 1 (bytes), or omit it for the default cap"};
+            if (params["max_bytes"].get<std::uint64_t>() > yuzu::guardian::kMaxFileHashBytes)
+                return ResilienceParamError{
+                    "max_bytes exceeds the 1 GiB agent-side ceiling",
+                    "set assertion.params.max_bytes to at most 1073741824 (1 GiB)"};
         }
         if (params.contains("settle_ms") && params["settle_ms"].is_string() &&
             !is_whole_u64(params["settle_ms"].get<std::string>(), n))
