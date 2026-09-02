@@ -946,11 +946,16 @@ an `IGuard` and a spark (invariant test: no unit appears in both `guards_` and t
 spark arm set). (UP-2, security-guardian LOW-4.) The final rung deletes the legacy
 guards and the switch becomes a hard on/off for spark detection.
 
-`--spark-disable` default posture: **observe rung (2)** defaults to the spark path
-(safe, detection-only); the **enforce and deletion rungs (3, 5)** default to the
-legacy path until burn-in, so a first-customer fleet is not switched onto new
-enforcement by default (enterprise-readiness). The default is recorded explicitly
-in each rung's PR. **What enforces during the rung-2 default window:** with the
+`--spark-disable` default posture: **the pre-enforcement observe stage** (labelled
+rung (2) below when this paragraph was written; renumbered impl-rung-7 in the
+current F1-F13 code ladder + rung-7.7 flip sequencing — see
+`docs/spark-flip-gate.md` for the current, canonical gate state) defaults to the
+spark path (safe, detection-only); the **enforce and deletion stages** (originally
+rungs 3/5; now the P3 enforce-cutover and P5 legacy-deletion post-flip programme
+steps, see `docs/spark-flip-gate.md` §7) default to the legacy path until burn-in,
+so a first-customer fleet is not switched onto new enforcement by default
+(enterprise-readiness). The default is recorded explicitly in each rung's PR.
+**What enforces during the rung-2 default window:** with the
 spark path selected in observe-only mode and the legacy `IGuard` not instantiated,
 Guardian at rung 2 **detects but does not enforce** (spark enforce arrives at
 rung 3). An operator who needs continued enforcement during rung-2 burn-in flips to
