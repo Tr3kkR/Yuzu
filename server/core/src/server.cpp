@@ -11451,9 +11451,10 @@ private:
             for (auto& gp : gw_pending) {
                 auto* stub = gw_mgmt_stub_.get();
                 auto* svc = &agent_service_;
+                auto* metrics = &metrics_;
                 auto cmd_id = gp.cmd.command_id();
                 spdlog::debug("Forwarding command {} to gateway for agent {}", cmd_id, gp.agent_id);
-                std::thread([stub, svc, gp = std::move(gp), cmd_id]() {
+                std::thread([stub, svc, metrics, gp = std::move(gp), cmd_id]() {
                     ::yuzu::server::v1::SendCommandRequest req;
                     req.add_agent_ids(gp.agent_id);
                     *req.mutable_command() = gp.cmd;
@@ -11482,19 +11483,48 @@ private:
                         if (status.ok()) {
                             spdlog::debug("Gateway SendCommand for {} completed: {} response(s)",
                                           cmd_id, resp_count);
+                            metrics->counter("yuzu_server_gateway_forward_total",
+                                             {{"status", "ok"}})
+                                .increment();
                             return; // success — done
+                        }
+                        // #1422: the gateway's mgmt-plane peer pin rejects with
+                        // UNAUTHENTICATED and a deliberately EMPTY message — the
+                        // generic warn below would render as "failed:  (16)",
+                        // which is invisible as the fleet-wide forwarding outage
+                        // it actually is. Name the cause and the fix.
+                        if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
+                            spdlog::error(
+                                "Gateway SendCommand for {} REJECTED by the gateway's "
+                                "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
+                                "server presents does not match the gateway's "
+                                "mgmt_peer_pins (rotated leaf? BYO cert without "
+                                "repointing the pin?). Command forwarding to "
+                                "gateway-connected agents is DOWN until the pin and "
+                                "the server leaf agree. Command dropped.",
+                                cmd_id);
+                            metrics->counter("yuzu_server_gateway_forward_total",
+                                             {{"status", "unauthenticated"}})
+                                .increment();
+                            return; // config defect — retry cannot help
                         }
                         // Only retry on UNAVAILABLE (connection refused / not ready)
                         if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
                             spdlog::warn("Gateway SendCommand RPC for {} failed: {} ({})", cmd_id,
                                          status.error_message(),
                                          static_cast<int>(status.error_code()));
+                            metrics->counter("yuzu_server_gateway_forward_total",
+                                             {{"status", "other"}})
+                                .increment();
                             return; // non-transient error — don't retry
                         }
                         spdlog::warn("Gateway SendCommand for {} unavailable (attempt {}): {}",
                                      cmd_id, attempt + 1, status.error_message());
                     }
                     spdlog::error("Gateway SendCommand for {} failed after 3 attempts", cmd_id);
+                    metrics->counter("yuzu_server_gateway_forward_total",
+                                     {{"status", "unavailable"}})
+                        .increment();
                 }).detach();
             }
         }

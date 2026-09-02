@@ -281,3 +281,111 @@ der(Certs, Which) ->
     {ok, Pem} = file:read_file(maps:get(Which, Certs)),
     [{'Certificate', Der, not_encrypted} | _] = public_key:pem_decode(Pem),
     Der.
+
+%%%-------------------------------------------------------------------
+%%% Toolchain canary + telemetry wiring (Gate 7 additions)
+%%%-------------------------------------------------------------------
+
+%% The cert-minting fixtures above SKIP (emit zero tests) when openssl is
+%% absent — which would silently drop the CN-collision, EKU and pin
+%% regression nets on a CI leg with a broken toolchain. This canary makes
+%% that state loud: every leg that runs gateway eunit is expected to carry
+%% openssl (Linux + Windows/MSYS2 both do).
+openssl_available_canary_test() ->
+    ?assertNotEqual(false, os:find_executable("openssl")).
+
+%% gw-S1 regression: a badarg-class {spki_sha256, ...} entry (codepoints
+%% > 255 — a pasted Unicode lookalike) must be SKIPPED like any other
+%% malformed pin, never abort the pin walk and reject every peer.
+badarg_class_pin_is_skipped_test_() ->
+    {setup, fun setup_certs/0, fun cleanup_certs/1,
+     fun(Certs) ->
+        case Certs of
+            #{srv_pem := SrvPem} ->
+                [{"unicode-junk pin skipped; valid co-pin still admits",
+                  fun() ->
+                      Der = der(Certs, srv_pem),
+                      Pins = [{spki_sha256, [16#2010 | lists:duplicate(63, $a)]},
+                              {cert_file, SrvPem}],
+                      ?assertEqual({true, <<"yuzu-server">>},
+                                   yuzu_gw_authz:check_peer(Der, Pins)),
+                      %% and alone it fails CLOSED, not internal_error-open
+                      ?assertEqual(false,
+                                   yuzu_gw_authz:check_peer(
+                                       Der, [{spki_sha256,
+                                              [16#2010 | lists:duplicate(63, $a)]}]))
+                  end}];
+            _ -> []
+        end
+     end}.
+
+%% sec-M1 closure evidence: every reject reason increments the Prometheus
+%% counter through the REAL yuzu_gw_telemetry handler (event name, ?EVENTS
+%% registration, handler clause, and metric declaration all exercised), and
+%% an unresolved configured pin bumps the pin_unresolved counter.
+telemetry_counter_test_() ->
+    {setup,
+     fun() ->
+        {ok, Started} = application:ensure_all_started(prometheus),
+        {ok, Started2} = application:ensure_all_started(telemetry),
+        catch telemetry:detach(yuzu_gw_prometheus),
+        ok = yuzu_gw_telemetry:setup(),
+        Certs = setup_certs(),
+        {Certs, Started ++ Started2}
+     end,
+     fun({Certs, _}) ->
+        catch telemetry:detach(yuzu_gw_prometheus),
+        cleanup_certs(Certs)
+     end,
+     fun({Certs, _}) ->
+        case Certs of
+            #{srv_pem := SrvPem} ->
+                [{"each reject reason lands on the counter with its label",
+                  fun() ->
+                      Der = der(Certs, srv_pem),
+                      Cases =
+                          [{<<"no_pins_configured">>,
+                            fun() -> yuzu_gw_authz:check_peer(Der, []) end},
+                           {<<"pin_mismatch">>,
+                            fun() -> yuzu_gw_authz:check_peer(
+                                         der(Certs, gw_pem), [{cert_file, SrvPem}]) end},
+                           {<<"missing_server_auth_eku">>,
+                            fun() -> yuzu_gw_authz:check_peer(
+                                         der(Certs, agent_pem), [{cert_file, SrvPem}]) end},
+                           {<<"bad_peer_cert">>,
+                            fun() -> yuzu_gw_authz:check_peer(
+                                         <<1, 2, 3>>, [{cert_file, SrvPem}]) end},
+                           {<<"no_pins_resolved">>,
+                            fun() -> yuzu_gw_authz:check_peer(
+                                         Der, [{cert_file, "/nonexistent.pem"}]) end},
+                           {<<"bad_pin_config">>,
+                            fun() -> yuzu_gw_authz:check_peer(Der, not_a_list) end}],
+                      lists:foreach(fun({Label, Fire}) ->
+                          Before = counter_val(yuzu_gw_mgmt_auth_rejected_total, [Label]),
+                          ?assertEqual(false, Fire()),
+                          ?assertEqual(Before + 1,
+                                       counter_val(yuzu_gw_mgmt_auth_rejected_total,
+                                                   [Label]))
+                      end, Cases)
+                  end},
+                 {"unresolved configured pin bumps pin_unresolved",
+                  fun() ->
+                      Der = der(Certs, srv_pem),
+                      Before = counter_val(yuzu_gw_mgmt_auth_pin_unresolved_total, []),
+                      ?assertEqual({true, <<"yuzu-server">>},
+                                   yuzu_gw_authz:check_peer(
+                                       Der, [{spki_sha256, "zz"},
+                                             {cert_file, SrvPem}])),
+                      ?assertEqual(Before + 1,
+                                   counter_val(yuzu_gw_mgmt_auth_pin_unresolved_total,
+                                               []))
+                  end}];
+            _ -> []
+        end
+     end}.
+
+counter_val(Name, Labels) ->
+    case prometheus_counter:value(Name, Labels) of
+        undefined -> 0;
+        V -> V
+    end.

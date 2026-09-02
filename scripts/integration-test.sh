@@ -502,7 +502,11 @@ cat > "$GW_SYS_CONFIG" << ERLCFG
         {upstream_pool_size, 4},
         {heartbeat_batch_interval_ms, 2000},
         {default_command_timeout_s, 30},
-        {telemetry_gauge_interval_ms, 5000}
+        {telemetry_gauge_interval_ms, 5000},
+        %% #1422 escape hatch - single-host test rig: the wildcard listener
+        %% below serves management_pb in plaintext, and the gateway refuses
+        %% to boot that posture without this explicit acknowledgement.
+        {allow_insecure_mgmt, true}
     ]},
     {grpcbox, [
         {client, #{channels => [

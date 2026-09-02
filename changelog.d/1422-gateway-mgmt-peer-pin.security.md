@@ -20,6 +20,9 @@
   **Upgrade note:** deployments mounting a custom mTLS mgmt sys.config must add
   the `auth_fun` + `mgmt_peer_pins` (new images refuse to boot without them);
   conversely a config referencing `yuzu_gw_authz` on a pre-#1422 gateway image
-  fails with `undef` — update image and config together (the reference compose
-  mounts the config from the checkout, so `git pull` + `docker compose pull`
-  move in step). Remaining tracked residual: no CRL/OCSP check on this path.
+  fails with `undef` — a silently dead mgmt plane. Update the image and the
+  mounted config **together**: a dev checkout's `reference-gateway-sys.config`
+  is ahead of the pinned release image until the next release ships, so do not
+  `git pull` that config onto a stack still running the previous image. Full
+  ordering guidance: `docs/user-manual/server-admin.md` "Upgrade Notes".
+  Remaining tracked residual: no CRL/OCSP check on this path.

@@ -44,7 +44,8 @@ configs:
               %% mgmt-posture guard refuses to boot without this (the
               %% release-pinned image above ignores the key until a release
               %% ships the guard). Safe only while :50063 stays unpublished
-              %% on this compose network.
+              %% on this compose network. Standing exception, revisit when
+              %% the rig TLS flip lands (#1422 follow-up).
               {allow_insecure_mgmt, true}
           ]},
           {grpcbox, [

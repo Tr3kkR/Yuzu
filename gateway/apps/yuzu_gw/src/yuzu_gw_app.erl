@@ -401,10 +401,11 @@ check_mgmt_listener_posture() ->
 -spec evaluate_mgmt_posture(term(), term(), boolean()) ->
           ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
 evaluate_mgmt_posture(Servers, Pins, Allow) when is_list(Servers) ->
-    Details = [{listener_port(S), mgmt_defects(S, Pins)}
+    Details = [{listener_port(S), D}
                || S <- Servers, is_mgmt_listener(S),
                   not loopback_bound(S),
-                  mgmt_defects(S, Pins) =/= []],
+                  D <- [mgmt_defects(S, Pins)],
+                  D =/= []],
     case {Details, Allow} of
         {[], _}     -> ok;
         {_, true}   -> {ok_insecure, Details};

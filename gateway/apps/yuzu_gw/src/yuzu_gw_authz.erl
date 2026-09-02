@@ -83,6 +83,14 @@ check_peer(DerCert, Pins) when is_list(Pins) ->
             case has_server_auth_eku(DerCert) of
                 true ->
                     Resolved = [H || P <- Pins, {ok, H} <- [resolve_pin(P)]],
+                    %% A configured-but-unresolvable pin is otherwise SILENT
+                    %% while a sibling pin still admits the server — exactly
+                    %% the pre-staged-rotation-typo shape that stays green
+                    %% until the old leaf retires. Surface it every time.
+                    case length(Resolved) < length(Pins) of
+                        true  -> report_unresolved_pins(Pins);
+                        false -> ok
+                    end,
                     case Resolved =/= [] andalso lists:member(PeerSpki, Resolved) of
                         true  -> {true, ?IDENTITY};
                         false when Resolved =:= [] -> reject(no_pins_resolved);
@@ -151,7 +159,12 @@ has_server_auth_eku(_) ->
 %% can never widen access.
 -spec resolve_pin(term()) -> {ok, binary()} | error.
 resolve_pin({spki_sha256, Hex}) when is_list(Hex) ->
-    resolve_pin({spki_sha256, list_to_binary(Hex)});
+    %% list_to_binary badargs on improper lists and codepoints > 255 (pasted
+    %% Unicode hex lookalikes) — that must stay a SKIPPED pin, never abort the
+    %% whole pin walk (which would reject every peer, valid co-pin included).
+    try resolve_pin({spki_sha256, list_to_binary(Hex)})
+    catch _:_ -> error
+    end;
 resolve_pin({spki_sha256, Hex}) when is_binary(Hex), byte_size(Hex) =:= 64 ->
     try {ok, binary:decode_hex(Hex)}
     catch _:_ -> error
@@ -166,9 +179,11 @@ resolve_pin(_) ->
 %% server leaf is re-read after the C++ server rotates it (no gateway
 %% restart needed). persistent_term:put triggers a global GC scan, but the
 %% token only changes on rotation, so puts are rare by construction.
-%% Granularity note: a same-second, same-size rewrite is not detected —
-%% acceptable, since rotation replaces the key (different length/DER) and
-%% is itself a rare event.
+%% Granularity note: a same-second, SAME-SIZE rewrite is not detected — and
+%% a re-minted same-type key typically yields a same-length DER, so the size
+%% half of the token does NOT catch that case. What bounds the risk is that
+%% rotation is rare, the miss direction is fail-closed (stale pin rejects
+%% the new leaf, never admits a wrong one), and a gateway restart recovers.
 -spec cached_file_spki(file:name_all()) -> {ok, binary()} | error.
 cached_file_spki(Path) ->
     Token = file_token(Path),
@@ -214,12 +229,38 @@ file_token(Path) ->
 
 %% @private Count + log the rejection by reason only. Reasons are a small
 %% closed atom set (low cardinality); no certificate-derived data reaches
-%% the log or the metric labels.
+%% the log or the metric labels. Event name lives in yuzu_gw_telemetry's
+%% ?EVENTS ([yuzu, gw, ...] namespace) — an unlisted name would fire into
+%% the void and the advertised counter would never move.
 -spec reject(atom()) -> false.
 reject(Reason) ->
-    telemetry:execute([yuzu_gw, mgmt_auth, rejected], #{count => 1},
+    telemetry:execute([yuzu, gw, mgmt_auth, rejected], #{count => 1},
                       #{reason => Reason}),
     logger:notice("mgmt-plane peer rejected: ~p (CA-issued cert is not "
                   "authorization to command the fleet — see mgmt_peer_pins)",
                   [Reason]),
     false.
+
+%% @private A configured pin entry did not resolve. Counted on every auth
+%% attempt (so a dashboard sees it move), logged once per BEAM per distinct
+%% unresolved-set (so a dead entry cannot become a per-stream log flood).
+-spec report_unresolved_pins([term()]) -> ok.
+report_unresolved_pins(Pins) ->
+    Dead = [P || P <- Pins, resolve_pin(P) =:= error],
+    telemetry:execute([yuzu, gw, mgmt_auth, pin_unresolved],
+                      #{count => 1}, #{}),
+    Key = {?MODULE, warned_unresolved, erlang:phash2(Dead)},
+    case persistent_term:get(Key, false) of
+        true -> ok;
+        false ->
+            persistent_term:put(Key, true),
+            logger:warning("mgmt_peer_pins: ~p configured entr~s could not be "
+                           "resolved (typo'd fingerprint? unreadable cert "
+                           "file?) — a dead pin is invisible while another "
+                           "pin still admits the server, then bites at "
+                           "rotation cutover. Entries: ~0p",
+                           [length(Dead),
+                            case length(Dead) of 1 -> "y"; _ -> "ies" end,
+                            Dead])
+    end,
+    ok.
