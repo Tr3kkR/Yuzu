@@ -6746,11 +6746,13 @@ public:
         // (ADR-0006/ADR-0043, schema `deployment_store`) — construction
         // fail-CLOSED per ADR-0012 §1 (same template as ResultSetStore
         // above): a reachable database whose schema can't migrate/open is a
-        // fatal startup error, never a serve-degraded state.
-        // `migrate_from_sqlite` runs the one-time, idempotent legacy-
-        // `deployment-jobs.db` backfill (ADR-0009) — AUTHORITATIVE posture
-        // means a backfill failure is ALSO fatal (never serve on top of a
-        // partially-migrated schema). NOT `DeploymentRunStore` (the `/auto`
+        // fatal startup error, never a serve-degraded state. NO backfill
+        // (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the
+        // legacy deployment-jobs.db is never copied; the detect-and-warn
+        // obligation still applies (this store holds real operator-initiated
+        // deployment intent), so legacy_sqlite_probe::warn_if_legacy_rows()
+        // opens the legacy file read-only and warns (with a row count) only
+        // if it actually holds rows. NOT `DeploymentRunStore` (the `/auto`
         // Deploy stage's own, unrelated PG store) — see deployment_store.hpp's
         // file header for the naming trap.
         if (pg_pool_ && !startup_failed_) {
@@ -6761,20 +6763,8 @@ public:
                               "created/opened)");
                 startup_failed_ = true;
             } else {
-                auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
-                if (!deployment_store_->migrate_from_sqlite(deploy_db)) {
-                    spdlog::error("[PG] Refusing to start: deployment-jobs legacy-SQLite "
-                                  "backfill failed (see prior log lines) — deployment_store is "
-                                  "authoritative and must not serve partially-migrated data. "
-                                  "Operator remediation: repair {} or move it aside to skip the "
-                                  "backfill (jobs in it will NOT carry over)",
-                                  deploy_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("DeploymentStore initialized (schema deployment_store; legacy "
-                                 "backfill source {})",
-                                 deploy_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "deployment-jobs.db",
+                                                         "DeploymentStore", {"deployment_jobs"});
             }
         }
 
