@@ -1939,14 +1939,23 @@ test('capability gate consistency',
 # docker-dependent test registered here puts a container registry on all three;
 # an earlier version of this wiring did exactly that and was reverted. Without
 # YUZU_TEST_ENABLE_PROMTOOL_DOCKER the harness needs a native promtool of the
-# pinned major and skips (77) otherwise. Timeout matches the workflow's own
-# 10-minute budget for the same work: under the opt-in this pulls a ~110 MB
-# image before it runs anything.
+# pinned major and skips (77) otherwise.
+#
+# TIMEOUT (#2340 PR-4): the harness now runs TWO full gates per invocation -
+# the shipped RULES/TESTS pair, then the marker-extracted yuzu-guardian-journal
+# group (CH-2 + CH-5-PROM) - each up to 4x120s (check + test + the canary's own
+# test + check) = 480s worst case, plus ~225s for the docker daemon probe and
+# pull ladder under the opt-in (0 under a native promtool). Worst case is
+# 225 + 480x2 = 1185s; 1500 keeps ~300s of margin over that, the same
+# methodology run_promtool_tests.py's own pull_with_retry() comment uses for
+# its ladder ("must fit inside the timeouts that enclose it") - see that
+# comment for the full arithmetic and how it composes with the CI job's own
+# `timeout-minutes` in docs-lint.yml.
 test('prometheus alert rules',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py')],
   suite: 'docs',
-  timeout: 600,
+  timeout: 1500,
 )
 
 # Pure-logic selftest for the harness above (version-banner parsing, docker argv
