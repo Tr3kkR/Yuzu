@@ -293,6 +293,12 @@ without being able to do X myself" is the escalation this decision exists to pre
 independent of the granted role's own permissions) is a genuine, different, and rejected
 alternative -- see Rejected Alternatives.
 
+**This decision's denial routes through D9's `assignment-authority` axis with its own reason
+code, not a bare `deny` (Gate-8 governance finding, committed here rather than asserted only from
+D9's side).** A grant-authority-delta denial and an ordinary permission denial are different
+facts a SOC 2 reviewer needs to tell apart; this decision is bound to surface that distinction at
+`validate_assignment`, the same obligation D9 states it expects of D4.
+
 *Non-conformance:* not applicable as a defect -- no production grant-authority check exists at
 all outside the hardcoded Operator/Viewer list, so there is nothing yet to violate D4. Any
 implementation of D3 that ships a per-row check instead of the effective-authority delta
@@ -508,7 +514,14 @@ sentence.
    Baseline's scope") must therefore be re-verified *inside* the same transaction that commits
    the CAS, under the same locking/`SERIALIZABLE` discipline D2 requires for its structurally
    identical problem -- a check performed before the CAS, in a separate read, leaves the window
-   D2's fix was written specifically to close, reopened here.
+   D2's fix was written specifically to close, reopened here. **This decision independently
+   requires `adopt_baseline`/`adopt_schedule` to be audited (Gate-8 governance finding, naming
+   the coverage precisely): that audit obligation is D6's own, not borrowed from D9, and does not
+   by itself require D9's specific structured schema (correlation id, closed-taxonomy reason,
+   Prometheus counter) -- an ordinary audit-log row satisfies this sub-clause's own text. Routing
+   it through D9's schema as well is worth doing for the same evidentiary reasons D3/D4/D11 do,
+   but this sub-clause does not currently commit to it; treat it as an open follow-on, not an
+   already-closed gap.
 
    **Shared-Guard rule:** a Guard reached by more than
    one Baseline is armed once on the agent, and `deployed_member_rule_ids()` returns a flat,
@@ -563,13 +576,26 @@ sentence.
    wrong to fire from every replica independently. This decision does not specify the lock itself
    -- that is implementation -- but requires that one exists before this mechanism runs on more
    than one replica.
-4. **Credential recheck.** For Schedules, ADR-0032 Decision 7 already decides this: its text
-   names "a schedule" outright, requires recording the arming credential (not only the arming
-   human), and states plainly that revocation, expiry, or deletion of that credential stops the
-   dispatch the same way authority loss does. Decision 0's own corollary states the underlying
-   principle Decision 7 applies: "whatever admits a run supplies a credential; if a seam has no
-   credential to filter on, the answer is never 'then that filter is vacuous' -- it is that the
-   seam is under-specified." This is compliance, not invention. For Guardian, Decision 7's own
+4. **Credential recheck.** **Corrected (Gate-8 governance finding): ADR-0032 Decision 7 does
+   NOT already decide this for the shipped `Schedule`/`ScheduleRunner` feature, and "compliance,
+   not invention" was wrong.** Decision 7's own scope is a *Use-Case run* under the not-yet-built
+   UCE admission protocol -- ADR-0032's frontmatter names its scope as exactly that, and
+   `ADR-0032`/`ADR-1005`/`ADR-0031`/`ADR-0033` collectively contain zero references to
+   `schedule_engine`/`ScheduleRunner`/`InstructionSchedule`, while `schedule_runner.{hpp,cpp}`
+   contains zero references to ADR-0032, ADR-1005, UCE, or a use-case run, verified by direct
+   grep in both directions. The shipped feature this document is actually applying Decision 7's
+   mechanics to (`ScheduleEngine`/`ScheduleRunner`, ADR-0009/0065) dispatches `InstructionSet`
+   executions directly to agents; it never enters a UCE admission path. "A schedule" in Decision
+   7's text names a real thing, but a different, not-yet-built one -- the same word, not the same
+   referent. Six review rounds each confirmed the word "schedule" appears in Decision 7 without
+   checking whether it names the object this document applies it to; that check is what this
+   correction adds. **What this document actually does, correctly stated:** the same way it
+   extends the credential-recheck mechanism to Guardian on its own authority (below), it now also
+   extends Decision 7's *principle* -- record the arming credential, distinguish rotation from
+   revocation, stop on either -- to the shipped Schedule feature, as this document's own decision
+   by analogy, not as compliance with an ADR that already covers it. The requirements below this
+   correction (recording the arming credential, the rotation-vs-compromise split, `adopt_schedule`)
+   are unchanged; only their source of authority is corrected. For Guardian, Decision 7's own
    scope statement ("this governs operator-facing runs... it does NOT re-home the autonomous-sync
    identity") names neither Guardian's case nor excludes it, so this document decides, on its own
    authority as an ADR-0033 extension, to apply the same mechanism -- see the decision's opening
@@ -816,27 +842,49 @@ decision core exists to extract from yet, for either gate family.
 
 ### D9 -- Every authorization decision emits one structured, queryable record, and a record that cannot be written fails the request closed
 
-Every gate's admit/deny/degrade decision -- across `authorize_list_read`, `require_fleet_read`,
-`require_scoped_permission`, `require_permission`, `validate_assignment` (D3's write chokepoint),
-and the service-scope and MCP-tier branches -- emits one shared decision shape: axis
-(management-group / service-scope / RBAC-legacy / engine / **assignment-authority**), outcome
-(admit-all / admit-scoped / deny / degrade), and a reason drawn from a closed taxonomy, to both
-the audit log (with correlation id) and a Prometheus counter. Per-gate bespoke logging that
-cannot be aggregated is non-conforming. Consistent with the codebase's existing audit-failure
-posture (ADR-0033 §9, mutations fail closed on audit-write failure): **a mutating authorization
-decision whose record cannot be durably written is itself denied, not admitted with a missing
-record.**
+Every admit/deny/degrade decision made by (a) any of D5's three named confinement mechanisms in
+full -- single-target writes (`require_scoped_permission`), fan-out dispatch
+(`dispatch_confined_arms` / `derive_exec_visible` / `authz::meet`), and list/fan-out reads (the
+ADR-0017 triad `authorize_list_read` / `require_fleet_read` / `require_list_read`, plus
+`confine_agent_target`) -- (b) `require_permission` (including its service-scope and MCP-tier
+branches), and (c) `validate_assignment` (D3's write chokepoint) emits one shared decision shape:
+axis (management-group / service-scope / RBAC-legacy / engine / **assignment-authority**),
+outcome (admit-all / admit-scoped / deny / degrade), and a reason drawn from a closed taxonomy,
+to both the audit log (with correlation id) and a Prometheus counter. Per-gate bespoke logging
+that cannot be aggregated is non-conforming. Consistent with the codebase's existing
+audit-failure posture (ADR-0033 §9, mutations fail closed on audit-write failure): **a mutating
+authorization decision whose record cannot be durably written is itself denied, not admitted
+with a missing record.**
 
-**"Every authorization decision" must include the write chokepoint, not only the read/dispatch
-gates (Gate-6 governance finding).** An earlier draft's enumerated gate list omitted
-`validate_assignment` entirely, which is where D4's escalation-safety delta check and D11's SoD
-check actually run -- so a blocked privilege-escalation attempt or a blocked SoD-violating
-assignment would have produced no structured, queryable evidence at all under this decision as
-first written, exactly the kind of proof a SOC 2 CC6.1/CC6.3 reviewer would ask for first. The
-new `assignment-authority` axis above, and closed-taxonomy reason codes that distinguish a D4
-delta-denial from a D11 SoD-denial from an ordinary permission denial, close this. D3, D4, and
-D11 each route their decision through this axis; this decision does not ask them to build a
-second, parallel evidence mechanism.
+**"Every authorization decision" is defined by reference to D5's own canonical, CI-proven
+mechanism set, not by a second, independently-maintained enumeration (Gate-8 governance
+finding).** Two earlier drafts of this clause each enumerated gates by hand and each omitted a
+real one: the first omitted `validate_assignment` entirely (D3/D4/D11's escalation-safety and
+SoD checks would have had no structured evidence); fixing that omission still left out
+`require_list_read`, `confine_agent_target`, and the fan-out dispatch mechanism -- verified
+directly against `require_list_read`'s own implementation, whose caller-class rejections
+(non-Read, MCP-tier, service-scoped-token) each call a generic `audit_log()` today, precisely
+the "per-gate bespoke logging that cannot be aggregated" this decision forbids, with no route
+into any of the enumerated gates above them. A hand-maintained list drifted wrong twice in two
+consecutive fix rounds because nothing forces it to track D5's own mechanism set as that set
+gets corrected. This decision now points at D5's three mechanisms **as a set**, not by naming
+each function separately, specifically so that D5's own coverage-proving CI check (which must
+already enumerate every route/tool against those three mechanisms) is the single source of
+truth both decisions read from -- a route D5's CI check classifies is a route D9 already knows
+to instrument, with no second list to fall out of sync. `confine_agent_target` and the fan-out
+mechanism's per-arm decisions (including D7's non-human-principal delegation decisions, which
+compose through the same `authz::meet`) are covered by construction under this reference, not as
+separately-named additions.
+
+The new `assignment-authority` axis, and closed-taxonomy reason codes that distinguish a D4
+delta-denial from a D11 SoD-denial from an ordinary permission denial, cover `validate_assignment`
+specifically. **D3, D4, and D11 must each state that they route through this axis, not only D9
+and D3 asserting it from one side (Gate-8 governance finding):** D4 and D11's own text did not,
+as of the previous round, commit to anything -- an implementer reading only D4 or only D11 would
+not know a discriminable reason code is expected from them. D4's grant-authority delta denial and
+D11's SoD denial must each surface via `validate_assignment`'s D9 record using a reason code
+specific to that decision, not a bare `deny`; this is binding on D4 and D11 as much as it is on
+D9, not a one-sided obligation this decision imposes on itself alone.
 
 **A fail-closed mutation denial must be distinguishable from an ordinary permission denial
 (Gate-4 governance finding).** `rest_audit.hpp` already gives REST behavioural-PII reads a
@@ -998,6 +1046,12 @@ must resolve the principal's complete effective role set (direct grants union ev
 group they belong to, following the same membership resolution D5/D7 already use) before
 consulting the SoD table on either write shape, not just the roles the current write touches.
 
+**A blocked SoD pair routes through D9's `assignment-authority` axis with its own reason code
+(Gate-8 governance finding, committed here rather than asserted only from D9's side).** A SoD
+denial and an ordinary permission denial are different facts a SOC 2 reviewer needs to tell
+apart, and D9 already names this as an expected discriminator; this decision is bound to produce
+it, not merely benefit from it if built.
+
 *Not yet built* (not a defect): no SoD mechanism of either kind exists today.
 
 ## Consequences
@@ -1020,12 +1074,15 @@ consulting the SoD table on either write shape, not just the roles the current w
   extend `resolve_perm_groups` (the single INV-7 resolver implementing the #1715-frozen lattice)
   with its own precedence rule -- this document does not do that implicitly via an unexamined
   `effect` field.
-- **D6 is compliance with ADR-0032 Decision 7 for Schedules, and this document's own extension of
-  the same mechanism to Guardian, decided directly rather than argued as a forced reading of
-  existing text.** Anyone implementing D6 should still check the credential-recheck mechanics
-  against Decision 7's actual text, not just this document's summary of it -- not because the
-  decision is in question, but because it is genuinely new construction and the usual review a
-  new mechanism gets before it ships.
+- **D6 extends ADR-0032 Decision 7's credential-recheck principle to BOTH the shipped Schedule
+  feature AND Guardian, on this document's own authority, not as compliance with an ADR that
+  already covers either (Gate-8 correction to an earlier framing that treated Schedules as
+  already-decided).** Decision 7's own text governs a *Use-Case run* under the not-yet-built UCE
+  admission protocol -- a different, real thing from the shipped `ScheduleRunner`/`InstructionSet`
+  dispatch this document applies its principle to. Anyone implementing D6 should still check the
+  credential-recheck mechanics against Decision 7's actual text, not just this document's summary
+  of it -- not because the decision is in question, but because it is genuinely new construction
+  for both dispatch classes, and the usual review a new mechanism gets before it ships.
 - **D4 defaults to "grantor must currently hold what they grant," computed as a delta that must
   also catch authority that widens after the grant with no new assignment event** -- not just
   escalation visible at grant time. A `Grant` administrative-permission model is not adopted as
@@ -1157,8 +1214,13 @@ consulting the SoD table on either write shape, not just the roles the current w
 
 ## Governance
 
-Now through `/governance` Gates 2-4 (entries 13-14 below); Gates 5-6 and Dave's final sign-off
-remain. Review history so far:
+**Current status: see the LAST numbered entry below, not this paragraph (Gate-8 governance
+finding, third occurrence).** A specific gate/entry count stated here has gone stale three
+separate times as entries were added -- caught and fixed at Gate 4 (this exact sentence), fixed
+again in the closing paragraph at Gate 8's first pass, and found stale here a third time on the
+next check. A snapshot restated at the top of a growing log is structurally guaranteed to drift;
+the fix is to stop maintaining one here, not to write a fourth snapshot that will drift again.
+Review history so far:
 
 1. **Codex (Sol, `gpt-5.6-sol`), read-only opine, 2026-09-02.** Reviewed an earlier
    delivery-plan-shaped draft. Corrected several overclaims (call-site counts, a claim that the
@@ -1519,7 +1581,7 @@ ordinary review" rule going forward.
     latency bound, a materially different problem from the read-path's own batching design; D2,
     D6, and D10 are silent on point-in-time-restore interaction with the durable, time-sensitive
     state they introduce; D2's atomic enable has no shadow/staged/canary rollout lever for a
-    change of this blast radius. All six fixed. `compliance-officer` found one BLOCKING issue,
+    change of this blast radius. All seven fixed. `compliance-officer` found one BLOCKING issue,
     verified directly against the text: D9's own heading claims "**every** authorization
     decision," but its enumerated gate list never included `validate_assignment` -- D3's own
     named write chokepoint, where D4's escalation-delta check and D11's SoD check actually run --
@@ -1556,9 +1618,63 @@ ordinary review" rule going forward.
     itself, the exact false-assurance pattern this run found and fixed five separate times in the
     decisions above.
 
-Gates 2 through 6 have run against this document as ADR-1008, per entries 13-16 above. Gate 8
-(re-review of the fix diff's touched domains, ledger, final decision) is the next entry below;
-until it lands clean, Dave's sign-off is not yet the only remaining step. D6's implementers
+17. **Fold `/governance` Gate 8, first pass (2026-09-02).** `security-guardian`, `architect`,
+    `consistency-auditor` ran a fresh top-to-bottom read of the whole document (not just the Gate
+    6 diff), plus a targeted self-check by `sre` of its own seven Gate 6 fixes. The self-check
+    held up on all seven, with two trivial LOW findings folded in below. The three fresh reads
+    found real, independently-verified problems -- proving the concern that motivated running
+    Gate 8 at all (this document declared itself complete once before, at the end of entry 16,
+    before Gate 8 had actually run; that premature claim was caught and corrected in a separate
+    commit before this pass launched). `consistency-auditor` and `security-guardian` independently
+    found the SAME defect from different angles: D9's Gate-6-fixed gate list, even after adding
+    `validate_assignment`, still omitted `require_list_read`, `confine_agent_target`, and the
+    fan-out dispatch mechanism (`dispatch_confined_arms`/`derive_exec_visible`/`authz::meet`) --
+    `consistency-auditor` verified this by reading `require_list_read`'s actual implementation
+    line by line and confirming its caller-class rejections use generic `audit_log()` calls, not
+    D9's structured shape; `security-guardian` independently found the same gap by cross-checking
+    D9's list against D5's and D7's own named mechanism inventories. This is the SAME recurring
+    false-assurance shape found and fixed six times before in this document (D10 x2, D4, D6 x2,
+    D9 once already) -- now found a second time inside D9 specifically, surviving its own Gate 6
+    fix. Fixed structurally rather than by hand-enumerating a fourth time: D9 now defines its
+    coverage by reference to D5's own canonical, CI-proven mechanism set, so a route D5's coverage
+    check classifies is a route D9 already knows to instrument, with no second list to drift out
+    of sync. `architect` independently found a different, previously-undetected instance of the
+    same defect class in D6 sub-clause 4: the claim "ADR-0032 Decision 7 already decides this...
+    compliance, not invention" for the shipped Schedule feature is wrong -- verified directly
+    against ADR-0032's own frontmatter (scope: "the protocol by which a Use-Case run is
+    admitted... "), Decision 7's actual text (governing scheduled *Use-Case runs* under the
+    not-yet-built UCE admission protocol), and cross-grepping in both directions (zero references
+    between ADR-0031/0032/0033/1005 and `schedule_engine`/`ScheduleRunner`, zero references
+    between the shipped scheduler's code and ADR-0032/UCE/use-case). Six prior review rounds each
+    confirmed the word "schedule" appears in Decision 7's text without checking it names the same
+    real-world object D6 applies it to -- a referent-identity error, not a plain misreading.
+    Fixed by reframing Schedules the same way Guardian was already framed: this document's own
+    extension of Decision 7's principle by analogy, decided on its own authority, not compliance
+    with an ADR that already covers the shipped feature. `consistency-auditor` also found D4's
+    and D11's commitment to route through D9's new axis was asserted only from D9's/D3's side,
+    with nothing in D4 or D11's own text committing to it -- fixed by adding the commitment to
+    both. `security-guardian` separately, more leniently, flagged that `adopt_baseline`/
+    `adopt_schedule`'s D4 check isn't named in D9's list either, but correctly judged this
+    non-blocking since D6 already independently requires it audited on its own terms -- fixed by
+    naming this as an open follow-on, not an already-closed gap. `sre`'s self-check found its own
+    seven fixes accurate and appropriately scoped, plus two small governance-record slips: an
+    entry-16 count mismatch ("7 MEDIUM findings" against "All six fixed" a few sentences later --
+    fixed to "All seven") and a stale opening-line status snapshot that had now drifted three
+    times (caught at Gate 4, fixed again at this Gate 8 pass's start, found stale a third time by
+    this same pass) -- fixed by no longer maintaining a restated snapshot at all, pointing instead
+    at the last entry in this log, which cannot go stale the way a duplicated count can.
+    **Convergence decision:** per the explicit stop condition set before this pass launched (fix,
+    one targeted recheck, then stop regardless of outcome rather than an open-ended Gate 9/10/11),
+    this fix round is self-verified against the same code and ADR text the findings cited, not
+    re-submitted to a third full four-agent Gate 8 pass. The pattern across the whole run is now:
+    eleven total false-assurance-shaped findings, in D4 (x1), D6 (x3: sub-clause 3's sweep claim,
+    sub-clause 4's Decision-7 citation twice), D9 (x2: `validate_assignment` then the wider
+    mechanism list), D10 (x2). Two consecutive independent Gate 8 passes would be needed to have
+    empirical confidence the pattern has actually stopped rather than merely narrowed; this
+    document has had one. That is the honest state to hand to Dave, not "verified clean."
+
+Gates 2 through 6, plus one Gate 8 pass, have run against this document as ADR-1008, per entries
+13-17 above. D6's implementers
 should still read ADR-0032 Decision 7's text directly before building the Guardian mechanism, the
 same way any implementer reads the ADR they are building a novel extension of, but that is
 ordinary diligence, not a precondition on the decision itself. Given how much of D6's mechanics
