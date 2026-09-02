@@ -118,7 +118,7 @@ The core unit of the content model. Every ad-hoc command, scheduled task, policy
 |---|---|---|---|---|
 | `plugin` | string | Yes | -- | Plugin identifier (must match a registered plugin's `name` field). |
 | `action` | string | Yes | -- | Action name (must exist in the plugin's `actions[]` array). Case-insensitive; normalized to lowercase at creation time and at dispatch. |
-| `concurrency` | string | No | `per-device` | Concurrency mode. Values: `per-device`, `per-definition`, `per-set`, `global:<N>`, `unlimited`. See [Section 12](#12-concurrency-model). |
+| `concurrency` | string | No | `per-device` | Concurrency mode. **Only `per-device` is actually enforced** (server-side); `per-definition`/`per-set`/`global:<N>`/`unlimited` are accepted but unenforced. Not validated — any string is accepted. See [Section 12](#12-concurrency-model). |
 | `stagger` | object | No | -- | Stagger configuration for large-fleet dispatch. |
 | `minSuccessPercent` | integer | No | `100` | Minimum percentage of agents that must succeed. `0` = best-effort, `100` = all must succeed. |
 
@@ -393,7 +393,7 @@ spec:
   execution:
     plugin: services
     action: inspect
-    concurrency: per-device              # per-device | per-definition | per-set | global:<N> | unlimited
+    concurrency: per-device              # only per-device is enforced — see Section 12
     stagger:
       maxDelaySeconds: 0                 # 0 = no stagger
       fixedDelaySeconds: 0               # 0 = no fixed delay
@@ -1456,34 +1456,68 @@ The `clob` type indicates a potentially large text field. The server may apply c
 
 ## 12. Concurrency Model
 
-Five concurrency modes control parallel execution of instruction definitions. The default (`per-device`) requires zero server coordination and scales to any fleet size.
+**Corrected 2026-08-31 (ADR-1007) — only `per-device` is actually enforced.** An earlier revision
+of this section described 5 modes as shipped; a real-usage audit of `content/definitions/*.yaml`
+plus a direct read of the dispatch path found that only `per-device` has ever been enforced, and
+the other four values are either unspecified or attach exclusively to catalog-only definitions
+that never dispatch through the agent path at all. `concurrency_mode` is not validated anywhere in
+the load/CRUD path — any string is accepted verbatim, so a typo or an unsupported value is silently
+treated as no limit, never rejected.
 
-| Mode | Enforcement | Scope | Use Case |
+| Mode | Enforcement | Scope | Status |
 |---|---|---|---|
-| `per-device` | Agent-side | One execution of this definition per device at a time | Default. Prevents conflicting operations on the same device. |
-| `per-definition` | Server-side | One fleet-wide execution of this definition at a time | Dangerous global operations (schema migration, bulk delete). |
-| `per-set` | Agent-side | One execution of any definition in this set per device | Set-level mutual exclusion (e.g., all patch operations). |
-| `global:<N>` | Server-side | At most N concurrent executions fleet-wide | Patch rollouts, license-limited operations. Server maintains a semaphore in SQLite. |
-| `unlimited` | None | No limits | Read-only queries, diagnostic gathering. |
+| `per-device` | Server-side (see below) | One execution of this definition per device at a time | **Enforced.** Default. The one mode with real, present-day usage (191 shipped definitions). |
+| `per-definition` | None | — | **Not enforced.** Accepted as a YAML value; used only on catalog-only `plugin: server`-class definitions that never dispatch through the agent path — see below. |
+| `per-set` | None | — | **Not enforced, and unspecified** — no "set" grouping key is defined anywhere in this spec or the code. Zero real usage. |
+| `global:<N>` | None | — | **Not enforced.** Not used in any shipped definition — real content uses the bare literals `global`/`global-singleton` instead, neither of which this or any other syntax ever parsed. |
+| `unlimited` | None | No limits | No enforcement needed — this was always the intended behavior. |
 
-### Agent-Side Enforcement (per-device, per-set)
+### Enforcement (per-device)
 
-The agent maintains an in-memory `std::unordered_set` of active definition IDs (or set IDs). On `CommandRequest` arrival, the agent checks the set. If occupied, the agent returns `REJECTED` with error code `3003` (`ORCH_CONCURRENCY_LIMIT`). No server round-trip is required.
+Enforced **server-side**, not agent-side as an earlier revision of this spec described — see
+ADR-1007 for why (the wire `CommandRequest` carries no `definition_id`, and building agent-side
+dedup would require a proto + gateway change with no correctness benefit once the server-side
+design is made race-free). The server holds a claim (a dedicated Postgres table, race-free via a
+partial unique index — not the `concurrency_locks` an earlier revision of this section described,
+which was never built) on `(definition_id, agent_id)` at dispatch time and releases it when that
+agent's execution reaches a terminal state. An agent already holding a claim for the same
+definition is excluded from the dispatch — for a single-target dispatch this means "no agents
+reached"; there is no queueing (an earlier revision of this section claimed an at-limit execution
+"enters a wait queue" — no such mechanism has ever existed, agent or server side). The caller may
+retry once the in-flight execution completes. Error code `3003`
+(`kConcurrencyBlocked`) is registered in the taxonomy for this condition but is not currently
+surfaced through the dispatch response — see ADR-1007's follow-ups.
 
-### Server-Side Enforcement (per-definition, global:N)
+**Not covered:** raw MCP `execute_instruction` and raw REST command dispatch (no `definition_id`
+in scope — cannot be gated by definition), and fleet-broadcast dispatch of a `per-device`
+definition (`scope: __all__`) — both real, deliberate gaps, not oversights.
 
-The server checks a `concurrency_locks` SQLite table before dispatch. If the lock is held (or the semaphore count is at the limit), the execution enters a wait queue. The lock is released when the execution completes or times out.
+**One release exception:** cancelling an execution does not release its claim (no agent-side
+cancel/kill path exists, so the claim stays open exactly as if the execution were still running,
+until a terminal response or the reconciler's TTL bound — at most one hour — releases it). A
+`per-device` definition dispatched via a workflow step releases and renews the same way as any
+other dispatch path (a `command_id`-keyed fallback covers it, since workflow-step dispatch still
+doesn't correlate a real execution id) — see ADR-1007.
+
+### `plugin: server` / `server_internal` / `_server` definitions
+
+The 42 shipped definitions using `per-definition`/`global`/`global-singleton` are catalog/discovery
+metadata for the management API and dashboard, not live execution artifacts — no agent plugin
+named `server`/`server_internal`/`_server` exists. Their real functionality (directory sync,
+deployment orchestration, policy CRUD, etc.) is implemented by dedicated REST routes calling
+dedicated C++ objects directly, which never consult `concurrency_mode`. Where real concurrent-call
+protection is needed for one of these operations, it is implemented directly on the handler (see
+`DirectorySync::sync_entra`'s re-entrancy guard, ADR-1007) rather than through this DSL field.
 
 ### YAML Syntax
 
 ```yaml
 spec:
   execution:
-    concurrency: per-device          # default
-    # concurrency: per-definition    # one fleet-wide at a time
-    # concurrency: per-set           # one per set per device
-    # concurrency: global:50         # at most 50 concurrent across fleet
-    # concurrency: unlimited         # no limits
+    concurrency: per-device          # default — the only mode actually enforced
+    # concurrency: per-definition    # accepted, NOT enforced — see above
+    # concurrency: per-set           # accepted, NOT enforced, unspecified grouping — see above
+    # concurrency: unlimited         # no limits (also the practical effect of any unsupported value)
 ```
 
 ---
@@ -1516,11 +1550,17 @@ Errors are categorized into four domains with non-overlapping numeric ranges.
 
 | Code | Name | Description | Retry |
 |---|---|---|---|
-| 3001 | `ORCH_EXPIRED` | Instruction passed its `expires_at` before dispatch | Never |
-| 3002 | `ORCH_AGENT_MISSING` | Target agent not connected at dispatch time | Yes (on reconnect) |
-| 3003 | `ORCH_CONCURRENCY_LIMIT` | Concurrency mode blocked execution | Yes (after slot frees) |
-| 3004 | `ORCH_APPROVAL_REQUIRED` | Execution blocked pending approval | No (awaits human) |
-| 3005 | `ORCH_CANCELLED` | Execution cancelled by operator | Never |
+| 3001 | `DefinitionNotFound` | The referenced InstructionDefinition does not exist | Never |
+| 3002 | `ApprovalRequired` | Execution blocked pending approval | No (awaits human) |
+| 3003 | `ConcurrencyBlocked` | Registered for `per-device` claim exclusion; not yet surfaced through the dispatch response (ADR-1007) | Yes (after slot frees) |
+| 3004 | `ScopeEmpty` | The resolved target scope matched no agents | Never |
+| 3005 | `ScheduleExpired` | The schedule's execution window has passed | Never |
+
+Names above are the taxonomy's actual registered names (`server/core/src/error_codes.cpp`) — this
+row set was corrected from a stale naming scheme this table had carried (`ORCH_*` prefixes that
+never matched the code). Like 3003, none of 3001/3002/3004/3005 currently has a production call
+site that emits it — the retry column states the DESIGNED behavior per the taxonomy entry, not an
+observed one.
 
 ### 4xxx -- Agent Errors
 

@@ -850,6 +850,135 @@ activity (own audit rows: `access_review.exported`, `.campaign_opened`,
 convention in `docs/observability-conventions.md`, so `absent()`-style
 alerts stay meaningful.
 
+## Agent OTA pull metrics (#913, #911, #416)
+
+```
+# HELP yuzu_ota_download_admission_total Agent OTA DownloadUpdate admission decisions by outcome
+# TYPE yuzu_ota_download_admission_total counter
+yuzu_ota_download_admission_total{decision="admitted"} 0
+yuzu_ota_download_admission_total{decision="rejected_concurrency"} 0
+yuzu_ota_download_admission_total{decision="rejected_rate"} 0
+yuzu_ota_download_admission_total{decision="rejected_total"} 0
+
+# HELP yuzu_ota_download_refund_total Agent OTA rate tokens returned after a server-attributable failure, by reason
+# TYPE yuzu_ota_download_refund_total counter
+yuzu_ota_download_refund_total{reason="registry_unavailable"} 0
+yuzu_ota_download_refund_total{reason="version_not_found"} 0
+yuzu_ota_download_refund_total{reason="package_missing"} 0
+yuzu_ota_download_refund_total{reason="transfer_deadline"} 0
+yuzu_ota_download_refund_total{reason="chunk_deadline"} 0
+
+# HELP yuzu_ota_download_deadline_exceeded_total Agent OTA DownloadUpdate transfers aborted by a server-imposed deadline, by phase
+# TYPE yuzu_ota_download_deadline_exceeded_total counter
+yuzu_ota_download_deadline_exceeded_total{phase="transfer"} 0
+yuzu_ota_download_deadline_exceeded_total{phase="write"} 0
+
+# HELP yuzu_ota_admission_key_mode_total Agent OTA admission keying actually used, by mode
+# TYPE yuzu_ota_admission_key_mode_total counter
+yuzu_ota_admission_key_mode_total{mode="cert"} 0
+yuzu_ota_admission_key_mode_total{mode="peer_ip"} 0
+yuzu_ota_admission_key_mode_total{mode="unknown"} 0
+
+# HELP yuzu_grpc_ota_identity_rejected_total Agent OTA RPCs rejected for a missing or mismatched client certificate identity, by rpc and reason
+# TYPE yuzu_grpc_ota_identity_rejected_total counter
+yuzu_grpc_ota_identity_rejected_total{event="security",rpc="download_update",reason="agent_id_mismatch"} 0
+...
+
+# HELP yuzu_ota_download_peers_tracked Peers currently tracked by the OTA admission map
+# TYPE yuzu_ota_download_peers_tracked gauge
+yuzu_ota_download_peers_tracked 0
+
+# HELP yuzu_ota_download_peers_capacity Configured ceiling on the OTA admission map (--ota-max-peers-tracked)
+# TYPE yuzu_ota_download_peers_capacity gauge
+yuzu_ota_download_peers_capacity 50000
+
+# HELP yuzu_ota_download_peers_evicted_total Peers evicted from the OTA admission map by its cardinality ceiling
+# TYPE yuzu_ota_download_peers_evicted_total counter
+yuzu_ota_download_peers_evicted_total 0
+```
+
+Every closed series is pre-seeded to `0` at startup so `absent()` alerts stay
+meaningful. Labels are bounded by construction — a peer identity or IP is
+**never** a label value.
+
+**Operational vs security.** The admission, deadline and keying counters are
+**operational**: a concurrency or rate rejection is expected steady-state
+behaviour during a fleet-wide update, not an attack signal (the same reasoning
+that keeps the per-principal quota counters off `event="security"`).
+`yuzu_grpc_ota_identity_rejected_total` is the exception and carries
+`event="security"` (it counts all four rejection reasons; only three of them also
+write an audit row — `no_client_identity` is metric-only, see
+`docs/user-manual/audit-log.md`), because a failed certificate bind on an already-enrolled
+agent's OTA pull is an authentication event; it mirrors
+`yuzu_grpc_revoked_cert_total` and is paired with a
+`session.ota_identity_rejected` audit row (the metric is the signal, the audit
+row is the evidence). **This counter is complete; the audit row is not.** The row
+is rate-limited to roughly two per second per (peer, RPC, reason), because that write is
+synchronous, Postgres-backed, and sits ahead of the per-peer admission bound. Use
+this counter to measure volume during a flood, and the rows for attribution.
+
+`yuzu_ota_identity_audit_suppressed_total{rpc,reason}` counts the rows that were
+NOT written because that bucket was exhausted, so the sampling is directly
+observable rather than inferred from a gap between two other numbers. The bucket
+key includes the denial `reason` deliberately: without it, a peer holding a
+certificate from another CA in a multi-CA trust bundle could present
+`CN=<victim agent id>` and spend the victim's allowance. Note that verb is deliberately distinct from
+`session.identity_mismatch`, which is the Subscribe binding check and carries a
+different `detail` shape — see `docs/user-manual/audit-log.md`.
+
+**Reading `decision`.** `rejected_concurrency` means the peer already held
+`--ota-max-concurrent-per-peer` parallel downloads — the primary bound, and the
+one that should fire under an actual monopolisation attempt.
+`rejected_total` means the SERVER-WIDE ceiling
+(`--ota-max-concurrent-total`) was hit — the only bound that does not scale with a
+caller's address space, so it is the one that fires under a distributed pull.
+`rejected_rate` means the peer drained its token bucket, which is a much looser
+secondary bound; sustained `rejected_rate` without `rejected_concurrency`
+usually indicates the rate knobs are tuned too tightly for the fleet's retry
+behaviour rather than an attack. `decision` is a genuine partition over calls that **reach the admission gate** —
+exactly one per such call. It is deliberately not a partition of every received
+`DownloadUpdate`: the on-behalf, revoked-certificate and positive-identity gates
+return before admission and are counted by their own families, so this sum is
+legitimately lower than
+`yuzu_grpc_requests_total{method="DownloadUpdate",status="received"}`. A
+divergence between the two is expected during an identity attack, not missing
+accounting.
+
+**Reading refunds.** `yuzu_ota_download_refund_total{reason}` is a SEPARATE
+family, deliberately not a `decision="refunded"` label: a refunded request has
+already been counted as `admitted`, so folding refunds into that family would
+stop `decision` partitioning and make `sum(yuzu_ota_download_admission_total)`
+double-count. A refund is issued only for a **server-attributable** failure —
+a deadline the server imposed, an unavailable registry, a missing artifact, or
+a version this server does not hold — and it is why a slow-link or flapping
+agent cannot spend itself into a lockout. The `reason` label is what makes the
+invariant checkable: in steady state the two deadline reasons together must
+match `yuzu_ota_download_deadline_exceeded_total` exactly, and a growing gap
+means a code path is aborting without refunding (this is what
+the invariant a refund-divergence alert watches — the rule for it ships with the OTA alert group, separately). `version_not_found` is refunded on purpose
+even though the peer chose the version: nothing is streamed, so no capacity is
+consumed, and a staged rollout routinely has agents asking for versions a given
+server does not hold.
+
+**Reading the peer map.** `yuzu_ota_download_peers_capacity` publishes the
+configured `--ota-max-peers-tracked` so alerts can express occupancy as a RATIO
+rather than hardcoding a threshold that silently becomes wrong when an operator
+retunes the flag. `yuzu_ota_download_peers_evicted_total` increments at the
+moment the ceiling actually bites, so approaching the cap and hitting it are
+distinguishable.
+
+**Reading `mode`.** `cert` is the healthy case: admission is keyed on the
+peer's certificate identity. `peer_ip` means the peer presented no client
+certificate, so admission fell back to source IP — expected on a
+default-certificate deployment where unenrolled agents are still bootstrapping,
+but a sustained high `peer_ip` share on a fleet you believe is fully enrolled
+is worth investigating. `unknown` should never appear; it means neither a
+certificate nor a parseable peer address was available.
+
+**Caveat — per-process.** These counters describe one server process. Behind a
+load balancer the per-peer bounds they report are per-replica, not fleet-wide
+(see `docs/user-manual/server-admin.md`).
+
 ## Histogram buckets
 
 Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom
@@ -1446,6 +1575,39 @@ sum(rate(yuzu_server_instruction_read_degrade_total[5m])) by (reason) > 0
 # genuine DB error and the boot refused to start (absent-clean shape, not
 # result="errored" — a refused boot never serves /metrics).
 absent_over_time(yuzu_server_instruction_bundled_content_total{result="clean"}[15m])
+```
+
+## Per-device concurrency enforcement metrics (ADR-1007)
+
+`per-device` is the only concurrency mode with real enforcement (see `docs/user-manual/instructions.md`
+§8) — a claim table (`execution_tracker.concurrency_claims`) excludes an agent already mid-execution
+of the same definition from a repeat dispatch. All six metrics below are pre-seeded to 0 at server
+construction except the liveness gauge, which is set unconditionally on every reconciler pass and
+so needs no pre-seed (absent for at most one reconciler cadence — ~5 minutes — after boot).
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_dispatch_concurrency_skipped_total` | counter | A `per-device` dispatch excluded one or more candidates because they already held an open concurrency claim for the same definition. The generic `POST /api/instructions/{id}/execute` 503 body points here when every named target was excluded this way. |
+| `yuzu_server_concurrency_claim_unavailable_total` | counter | A claim attempt failed CLOSED (Postgres pool exhaustion or a query error) and excluded every candidate from that dispatch, independent of whether any were actually busy. Nonzero alongside the skip counter above points at store degradation, not real contention — watch this before reading the skip counter as "the feature is working as intended." |
+| `yuzu_server_concurrency_reconcile_last_pass_unixtime` | gauge | Unix timestamp of the stale-claim reconciler's last tick (~5-minute cadence, folded into the existing result-set maintenance thread). A liveness signal — pair with `absent()`/staleness alerting to catch a reconciler that stopped ticking, the same shape `yuzu_server_audit_retention_last_pass_unixtime` uses. |
+| `yuzu_server_concurrency_reconcile_declined_total` | counter | A reconciler pass declined by the clock-guard's anomaly classification (implausible clock jump, unusable prior state, or no persisted anchor yet — `audit_retention::classify`). A sustained nonzero rate means the reconciler is not force-releasing orphaned claims and needs investigation. |
+| `yuzu_server_concurrency_claim_force_released_total` | counter | A concurrency claim force-released by the reconciler because its owning agent never reported a terminal status before `expires_at` — an orphaned claim from an agent crash, a disconnect mid-execution, or a cancelled-but-still-running execution (`mark_cancelled` deliberately does not release claims — see the ADR). |
+| `yuzu_schedule_concurrency_mode_lookup_failed_total` | counter | A `ScheduleRunner` fire's second `get_definition()` read (needed to learn `concurrency_mode`) failed or returned empty — per-device enforcement was NOT applied to that one fire, which still dispatches (a deliberate fail-open, since the alternative for a `'once'` schedule is losing the fire permanently). Zero means the read has always succeeded. |
+
+No dedicated alert rule ships for any of the six in this release — recommended follow-up, not
+shipped: an `absent()` alert on the reconcile-liveness gauge (same shape as the audit-retention
+sibling's alert), and a rate-based alert on `..._reconcile_declined_total` or
+`..._claim_unavailable_total` if either is ever sustained nonzero.
+
+**Useful PromQL queries:**
+
+```promql
+# Concurrency reconciler stopped ticking (liveness gauge hasn't advanced).
+time() - yuzu_server_concurrency_reconcile_last_pass_unixtime > 900
+
+# Any per-device dispatch exclusions in the last hour (informational, not itself alertable —
+# exclusion is the mechanism working as intended, not a fault).
+increase(yuzu_server_dispatch_concurrency_skipped_total[1h]) > 0
 ```
 
 ## Shutdown-time dispatch metrics (#3495)

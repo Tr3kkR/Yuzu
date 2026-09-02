@@ -24,7 +24,7 @@
 - Unified substrate primitive table (Section 7) — consolidation of per-OS tables.
 - Expression language evolution path (Section 8) — extend scope DSL now, adopt CEL for policy in Phase 5.
 - Error model with 4-category taxonomy (Section 9).
-- Concurrency model with 5 modes (Section 10).
+- Concurrency model — only `per-device` is enforced in practice (Section 10, corrected 2026-08-31 per ADR-1007).
 - YAML authoring in dashboard (Section 11).
 - File upload patterns (Section 12).
 - ProductPack Ed25519 trust chain (Section 13).
@@ -137,7 +137,7 @@ spec:
   execution:
     plugin: services
     action: inspect
-    concurrency: per-device              # per-device | per-definition | per-set | global:<N> | unlimited
+    concurrency: per-device              # only per-device is enforced — see Section 10
     stagger:
       maxDelaySeconds: 0                 # 0 = no stagger
   parameters:
@@ -739,11 +739,17 @@ Errors are categorized into four domains with non-overlapping numeric ranges:
 
 | Code | Name | Description | Retry |
 |---|---|---|---|
-| 3001 | `ORCH_EXPIRED` | Instruction passed its `expires_at` before dispatch | Never |
-| 3002 | `ORCH_AGENT_MISSING` | Target agent not connected at dispatch time | Yes (on reconnect) |
-| 3003 | `ORCH_CONCURRENCY_LIMIT` | Concurrency mode blocked execution | Yes (after slot frees) |
-| 3004 | `ORCH_APPROVAL_REQUIRED` | Execution blocked pending approval | No (awaits human) |
-| 3005 | `ORCH_CANCELLED` | Execution cancelled by operator | Never |
+| 3001 | `DefinitionNotFound` | The referenced InstructionDefinition does not exist | Never |
+| 3002 | `ApprovalRequired` | Execution blocked pending approval | No (awaits human) |
+| 3003 | `ConcurrencyBlocked` | Registered for `per-device` claim exclusion; not yet surfaced through the dispatch response (ADR-1007) | Yes (after slot frees) |
+| 3004 | `ScopeEmpty` | The resolved target scope matched no agents | Never |
+| 3005 | `ScheduleExpired` | The schedule's execution window has passed | Never |
+
+Names above are the taxonomy's actual registered names (`server/core/src/error_codes.cpp`) — this
+row set was corrected from a stale naming scheme this table had carried (`ORCH_*` prefixes that
+never matched the code). Like 3003, none of 3001/3002/3004/3005 currently has a production call
+site that emits it — the retry column states the DESIGNED behavior per the taxonomy entry, not an
+observed one.
 
 #### 4xxx — Agent Errors
 
@@ -803,31 +809,40 @@ struct AgentExecStatus {
 
 ## 10. Concurrency Model
 
-Five concurrency modes control parallel execution. The default (`per-device`) requires zero server coordination and scales to any fleet size.
+**Corrected 2026-08-31 (ADR-1007) — only `per-device` is actually enforced.** See
+`docs/yaml-dsl-spec.md` §12 for the full corrected model (mode-by-mode status, why enforcement is
+server-side rather than agent-side, the `plugin: server`-class catalog-definition caveat, what
+remains unenforced and why). Summary below.
 
 ### 10.1 Modes
 
-| Mode | Enforcement | Scope | Use Case |
+| Mode | Enforcement | Scope | Status |
 |---|---|---|---|
-| `per-device` | Agent-side | One execution of this definition per device at a time | Default. Prevents conflicting ops on same device. |
-| `per-definition` | Server-side | One fleet-wide execution of this definition at a time | Dangerous global operations (schema migration, bulk delete). |
-| `per-set` | Agent-side | One execution of any definition in this set per device | Set-level mutual exclusion (e.g., all patch operations). |
-| `global:<N>` | Server-side | At most N concurrent executions fleet-wide | Patch rollouts, license-limited operations. Server maintains semaphore in SQLite. |
-| `unlimited` | None | No limits | Read-only queries, diagnostic gathering. |
+| `per-device` | Server-side | One execution of this definition per device at a time | **Enforced** (default; 191 real shipped definitions use it). |
+| `per-definition` | None | — | **Not enforced** — used only on catalog-only definitions with no live dispatch path. |
+| `per-set` | None | — | **Not enforced, unspecified** — no grouping key defined anywhere. Zero real usage. |
+| `global:<N>` | None | — | **Not enforced** — not used in any shipped definition. |
+| `unlimited` | None | No limits | No enforcement needed. |
 
 ### 10.2 Implementation
 
-**Agent-side (`per-device`, `per-set`):** Agent maintains an in-memory `std::unordered_set` of active definition IDs (or set IDs). On `CommandRequest` arrival, check the set; if occupied, return `REJECTED` with error code `3003`. No server round-trip, no coordination overhead.
-
-**Server-side (`per-definition`, `global:<N>`):** Server checks a `concurrency_locks` SQLite table before dispatch. If the lock is held, the execution enters a wait queue. Lock is released when execution completes or times out.
+**`per-device` (the only enforced mode):** enforced server-side (not agent-side as originally
+designed — `CommandRequest` carries no `definition_id`, and an agent-side design would need a
+proto + gateway change with no correctness benefit — see ADR-1007). The server holds a claim on
+`(definition_id, agent_id)` in a dedicated Postgres table (`execution_tracker.concurrency_claims`,
+race-free via a partial unique index) at dispatch time, excludes any agent already holding one, and
+releases the claim on that agent's terminal status. No wait queue exists (agent- or server-side) —
+an excluded agent is simply not dispatched to; the caller may retry once the in-flight execution
+completes. Error code `3003` is registered for this condition but not yet surfaced through the
+dispatch response (ADR-1007 follow-up). Not covered: raw MCP/REST dispatch (no `definition_id` in
+scope) and fleet-broadcast dispatch of a `per-device` definition.
 
 **Configuration in YAML:**
 ```yaml
 spec:
   execution:
-    concurrency: per-device          # default
-    # concurrency: global:50         # at most 50 concurrent across fleet
-    # concurrency: unlimited         # no limits
+    concurrency: per-device          # default — the only mode actually enforced
+    # concurrency: unlimited         # no limits (also the practical effect of any unsupported value)
 ```
 
 ---
@@ -1351,7 +1366,7 @@ Updated to reflect current state (Phase 0 and 1 complete, Phase 2 scaffolded).
 13. `ApprovalManager` business logic — submit/approve/reject with ownership rules
 14. `ExecutionTracker` business logic — progress tracking, aggregate status computation
 15. Rerun/cancel — clone completed executions, send cancel to agents
-16. Concurrency enforcement — agent-side per-device/per-set, server-side per-definition/global
+16. Concurrency enforcement — server-side per-device only (ADR-1007); per-set/per-definition/global remain unenforced
 
 ### Phase D — Policy and Triggers (Phases 4-5)
 
@@ -1424,7 +1439,7 @@ This is enough to move Yuzu from "plugin executor" to "governed endpoint instruc
 | Error codes | 4-category 1xxx-4xxx taxonomy | Clear domain separation; non-overlapping ranges; retry semantics per category |
 | Partial failure | Configurable `minSuccessPercent`, default 100% | Supports "all must succeed" (compliance) and "best effort" (diagnostics) |
 | YAML storage | SQLite TEXT + denormalized columns | Single source of truth; queryable without re-parsing |
-| Concurrency default | `per-device` (agent-enforced) | Zero server overhead at any fleet size |
+| Concurrency default | `per-device` (server-enforced, ADR-1007) | One claim-table round trip per gated dispatch, not per fleet size |
 | Pack signing | Ed25519, 3-level key hierarchy | Fast, small signatures; no padding attacks; HSM-compatible |
 | Agent compat | `minAgentVersion` per definition, graceful REJECTED | No forced upgrades; mixed-version fleet support |
 | Legacy shim | Every definition maps 1:1 to CommandRequest | No separate path; seamless migration from ad-hoc to governed |
