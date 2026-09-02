@@ -321,7 +321,14 @@ TEST_CASE("CommandDedupStore: open fails on a non-database file",
         REQUIRE(f.is_open());
         f << "this is not a sqlite database";
         REQUIRE(f.good());
+        f.flush();
+        REQUIRE(f.good());
     }
+    // f.good() alone doesn't prove the bytes reached disk: the actual flush/
+    // write happens in the destructor above, which can't propagate an I/O
+    // error — the explicit flush() + re-check makes the failure observable
+    // here instead of manifesting as a silent empty file for open() to accept.
+    REQUIRE(fs::file_size(path) > 0);
     // journal_mode/synchronous read-back or the schema DDL rejects a garbage file.
     auto result = CommandDedupStore::open(path);
     CHECK_FALSE(result.has_value());
