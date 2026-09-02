@@ -41,6 +41,7 @@ Wired into tests/meson.build (suite: docs), mirroring test_changelog_order.py.
 
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -59,6 +60,16 @@ INSTRUCTION_FILE_BUDGET = 32_000
 # @-imports. Only CLAUDE.md was measured before; the routed-concern tables had
 # reached 38,545 and 37,808 unmeasured, and AGENTS.md 49,859 -- already 25% over
 # the cap nothing was applying to it.
+# The two routed-concern tables, checked for column structure as well as size.
+# A cell containing an unescaped "|" silently shifts every column to its right,
+# which is how a CATASTROPHIC row's "Loaded by" agent list was once overwritten
+# by a copy of its own "Doc" column -- leaving a credential-revocation surface
+# with no review trigger, while the table still looked well-formed.
+ROUTED_CONCERN_FILES = (
+    ".claude/routed-concerns.md",
+    ".claude/routed-concerns-access-control.md",
+)
+
 INSTRUCTION_FILES = (
     "CLAUDE.md",
     "AGENTS.md",
@@ -86,6 +97,20 @@ ABSENT_BY_DESIGN = {
 # numerals a grep/bash consumer would miss, and `0318` would int() to 318 while
 # a string-comparing consumer looks for "318" — both are silent-shrink bugs.
 ISSUE_NUMBER_RE = re.compile(r"0|[1-9][0-9]*")
+
+
+_BASENAMES: set[str] = set()
+
+
+def _tracked_basenames() -> set[str]:
+    """Basenames of every tracked file, for resolving bare-filename citations."""
+    if not _BASENAMES:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        _BASENAMES.update(pathlib.PurePosixPath(p).name for p in out.splitlines())
+    return _BASENAMES
 
 
 def main() -> int:
@@ -144,15 +169,67 @@ def main() -> int:
         # directory and resolved nowhere, not even on the author's machine.
         for match in BACKTICK_PATH_RE.finditer(text):
             cited = match.group(1)
-            if cited.startswith(("http", "//")):
+            if cited.startswith(("http", "//")) or cited in ABSENT_BY_DESIGN:
                 continue
-            # Bare basenames are prose shorthand ("update `meson.build`"), not
-            # pointers; only path-shaped citations are checked.
-            if "/" not in cited or cited in ABSENT_BY_DESIGN:
+            if "/" in cited:
+                # Path-shaped: must resolve exactly.
+                if not (ROOT / cited).exists():
+                    failures.append(
+                        f"{rel} cites `{cited}`, which does not exist in the repo."
+                    )
+            else:
+                # A bare filename is still a pointer -- `STREAM.md` named a file
+                # that existed nowhere, and read as authoritative for months. It
+                # cannot be resolved to one location, so require only that some
+                # tracked file carries that name; a citation matching nothing is
+                # dead by any reading.
+                if cited not in _tracked_basenames():
+                    failures.append(
+                        f"{rel} cites `{cited}`, and no file with that name "
+                        f"exists in the repo."
+                    )
+
+    # 1b. Routed-concern tables: column structure
+    #
+    # test_issue_docs.py cannot judge whether a row routes to the RIGHT agents,
+    # but it can prove every row still has three distinct, populated columns.
+    for rel in ROUTED_CONCERN_FILES:
+        path = ROOT / rel
+        if not path.exists():
+            continue
+        for lineno, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            if not line.startswith("|"):
                 continue
-            if not (ROOT / cited).exists():
+            if set(line.strip()) <= {"|", "-", " ", ":"}:
+                continue  # header separator
+            cells = line.split("|")
+            if len(cells) != 5:
                 failures.append(
-                    f"{rel} cites `{cited}`, which does not exist in the repo."
+                    f"{rel}:{lineno}: routed-concern row has {len(cells) - 2} "
+                    f"columns, expected 3. A literal '|' inside a cell must be "
+                    f"escaped as '\\|' -- an unescaped one shifts every column "
+                    f"to its right and silently corrupts the row."
+                )
+                continue
+            concern, doc, loaded_by = (c.strip() for c in cells[1:4])
+            if concern.lower().startswith("concern"):
+                continue  # header row
+            for name, value in (
+                ("Concern", concern), ("Doc", doc), ("Loaded by", loaded_by)
+            ):
+                if not value:
+                    failures.append(
+                        f"{rel}:{lineno}: routed-concern row has an empty "
+                        f"'{name}' column."
+                    )
+            if doc and doc == loaded_by:
+                failures.append(
+                    f"{rel}:{lineno}: routed-concern row's 'Loaded by' column is "
+                    f"a verbatim copy of its 'Doc' column -- the row names no "
+                    f"review trigger. Standing rule 1: the matrix decides WHICH "
+                    f"agents, never WHETHER."
                 )
 
     # 2. do-not-close.txt parses clean

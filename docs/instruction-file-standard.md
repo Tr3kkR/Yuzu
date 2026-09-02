@@ -35,8 +35,9 @@ Take the **first** home that fits.
 
 ### 1. A hookify rule — if it is mechanically checkable at the moment of violation
 
-`.claude/hookify.*.local.md`. Eight already exist (`vcvars64`, Windows Clang, dropping
-`include_type: 'system'`, `rebar3 eunit --dir`, `sqlite3_changes()`, both temp-path salt rules).
+`.claude/hookify.*.local.md`. Eight already exist: `vcvars64`, Windows Clang,
+dropping `include_type: 'system'`, `rebar3 eunit --dir`, `sqlite3_changes()`, the CI
+`save-always` guard, and both temp-path salt rules.
 
 This is the **best** home for a "never do X" gotcha, because it fires when someone is about to do X
 rather than hoping they read a file first. A rule with a hook needs at most one line elsewhere,
@@ -95,7 +96,8 @@ own; the budget is only real if it is paid at the point of addition.
 
 CI fails once the date passes. Write the teardown step at the same time as the section.
 
-The now-removed `docs/workstreams.md` did the human half of this correctly — it declared a one-week
+The now-removed workstreams document (`docs/workstreams.md`, deleted in the same change that
+wrote this standard) did the human half of this correctly — it declared a one-week
 life *and* wrote its own teardown procedure naming the exact blocks to delete. It was still live four weeks past
 expiry, and so were both pointer blocks, because nothing checked. Good intentions plus no check is
 the same as no intention.
@@ -122,7 +124,14 @@ resolved even on the author's own machine.
 
 1. **Budget** — each of the four files under 32,000 characters, and the 40,000 hard cap.
 2. **Expiry** — no `EXPIRES:` date in the past.
-3. **Dead pointers** — every backticked path in the four files resolves in the repo.
+3. **Dead pointers** — every backticked citation in the four files resolves: a path-shaped one
+   (with a directory component) must exist exactly, and a bare filename must match some tracked
+   file's name. `STREAM.md` was cited for months and existed nowhere.
+4. **Routed-concern table structure** — every row has three populated columns, and no row's
+   `Loaded by` column is a copy of its `Doc` column. A literal `|` inside a cell must be escaped as
+   `\|`: an unescaped one shifts every column to its right, which is how one CATASTROPHIC row's
+   agent list was silently overwritten while the table still looked well-formed. A row that names no
+   review trigger defeats standing rule 1 — the matrix decides WHICH agents, never WHETHER.
 
 Character counts are UTF-8-decoded in Python. `wc -c` reads high on these files (multi-byte
 punctuation) and Windows `wc -m` disagrees again; the Python count is the one the budget means.

@@ -44,7 +44,8 @@ Per CLAUDE.md standing rule 2: a finding BLOCKS when its **derived** band is CRI
 
 ### First: confirm you are running the current pipeline
 
-This skill and the routed-concern table are read **from your working tree**, so a branch
+This skill and **both** routed-concern tables (`.claude/routed-concerns.md` and
+`.claude/routed-concerns-access-control.md`) are read **from your working tree**, so a branch
 that predates a change to either silently runs the old pipeline. At the time #2604
 merged, 81 of 81 local branches predated it.
 
@@ -116,7 +117,7 @@ Check existing memory that might apply — at minimum:
 - `feedback_test_quality.md` — fixture leaks, test code standards
 - `feedback_claude_md_scope.md` — which areas are cipher to you / still churning
 
-### Load and MATCH the routed-concern table — do not rely on memory
+### Load and MATCH both routed-concern tables — do not rely on memory
 
 ```bash
 # Every changed path, against every routed-concern row.
@@ -1399,7 +1400,10 @@ to close rather than a contradiction to adjudicate.
    that agent raised nothing in round 1**.
 
    Concretely, against the **fix diff** (not the original):
-   - **Gate 3** — re-run the decision matrix, including the routed-concern table.
+   - **Gate 3** — re-run the decision matrix, including **both** routed-concern
+     tables: `.claude/routed-concerns.md` AND
+     `.claude/routed-concerns-access-control.md`. Opening only the first misses
+     every auth, access-control and request-admission invariant.
    - **Gate 2** — `security-guardian` always; `docs-writer` whenever the fix touches
      a doc, a changelog fragment, a user-facing string, or in-code prose.
    - **Gates 4 and 6** — re-run an agent when the fix changes behaviour in its

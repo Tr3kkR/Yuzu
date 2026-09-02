@@ -1,8 +1,8 @@
-- Reduced the always-loaded agent instruction files by 44% (161,845 → 89,792 characters) and
+- Reduced the always-loaded agent instruction files by 44% (161,845 → 90,817 characters) and
   documented the standard that keeps them there. `CLAUDE.md` and `AGENTS.md` are now contents pages
   that route to `docs/`, rather than carrying the detail themselves: `CLAUDE.md` 35,633 → 15,218 and
   `AGENTS.md` 49,859 → 16,395, with the two routed-concern tables dropping from 38,545 and 37,808 to
-  30,886 and 28,035. Detail moved to three new documents — `docs/testing/unit-test-conventions.md`,
+  30,886 and 28,318. Detail moved to three new documents — `docs/testing/unit-test-conventions.md`,
   `docs/build-guide.md` and `docs/clock-guarded-retention.md` — plus the existing
   `docs/auth-architecture.md`, the governance skill, and the Guardian design document. No invariant,
   issue reference or ADR citation was dropped: all 83 issue references and 28 ADR references in the
@@ -23,3 +23,10 @@
   three citations of a private memory directory that resolved nowhere, and `AGENTS.md`'s duplicate
   copy of the routed-concern tables, which had drifted far enough to still describe `CaStore` and
   `AuthDB` as SQLite stores and to cite three `.codex/agents/*.md` briefs that do not exist.
+- Added routed-concern table structure validation to `tests/test_issue_docs.py`: every row must have
+  three populated columns, no row's `Loaded by` column may duplicate its `Doc` column, and a literal
+  `|` inside a cell must be escaped. An unescaped `|` shifts every column to its right, which is how
+  one CATASTROPHIC row's agent list was silently replaced by a copy of its own doc pointer — leaving
+  a credential-revocation surface with no review trigger while the table still looked well-formed.
+  Nothing previously validated table columns; a row that names no trigger defeats governance
+  standing rule 1.
