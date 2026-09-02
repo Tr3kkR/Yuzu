@@ -17996,12 +17996,17 @@ private:
                     return;
                 }
             } else if (!exec_opt) {
-                // #3789: `mark_cancelled` reports PGRES_COMMAND_OK (success)
-                // on an UPDATE that matched zero rows — without this
-                // existence check an UNCONFINED caller hitting an unknown id
-                // would get a false "cancelled" 200 (Sol/gpt-5.6-sol
-                // adversarial review). A confined caller's existence check
-                // is folded into the unified branch above.
+                // #3789 + PR #3842: this existence check gives an unknown id a
+                // clean 404. It was originally load-bearing because
+                // `mark_cancelled` reported PGRES_COMMAND_OK (a false "cancelled"
+                // 200) on an UPDATE matching zero rows (Sol/gpt-5.6-sol review);
+                // PR #3842's `RETURNING id` + terminal-status guard now makes
+                // mark_cancelled return FALSE for an unknown OR already-terminal
+                // execution, so this check is now defense-in-depth — it keeps the
+                // common unknown-id case a 404 rather than the 503 a bare
+                // mark_cancelled-false would produce below (a not-found/terminal-
+                // vs-degrade refinement of that 503 is tracked in #3845). A
+                // confined caller's existence check is folded into the branch above.
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "not found"), "application/json");
                 return;
@@ -19993,6 +19998,12 @@ private:
                                     metrics_.counter("yuzu_exec_outbox_reap_clock_anomaly_total")
                                         .increment();
                             } else {
+                                // Log the descriptive PG error, not just bump the
+                                // counter (PR #3842 review): on a ~60s cadence a
+                                // real reap failure is otherwise a climbing counter
+                                // with nothing to grep for.
+                                spdlog::warn("event_outbox reap failed: {}",
+                                             reaped.error());
                                 metrics_.counter("yuzu_exec_outbox_store_degrade_total")
                                     .increment();
                             }

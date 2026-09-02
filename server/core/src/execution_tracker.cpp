@@ -386,6 +386,17 @@ const std::vector<pg::PgMigration>& migrations() {
 // benign append into UNRECOVERABLE agent-status loss (agents do not re-send;
 // #3729's reconciler recomputes from agent_exec_status, which the same rollback
 // would destroy).
+//
+// AT-LEAST-ONCE, by design (PR #3842 review): the INSERT is non-idempotent (a
+// fresh IDENTITY event_id each call). The caller retry loops (update_agent_status
+// / refresh_counts each retry once) were safe pre-outbox because the state UPSERT
+// is idempotent; now a COMMIT that succeeds server-side but reads as failed
+// client-side (a dropped connection at the COMMIT ack) makes the retry durably
+// append a SECOND row for one real event. This is the ADR-2002 §5 "events: at-
+// least-once, consumers tolerate duplicates" contract, NOT a bug — the WS-2a-2
+// forward-poll consumer MUST dedup on content/command_id, never assume one row
+// per transition. A retry after a genuine rollback (attempt 1 committed nothing)
+// produces no duplicate; only the rare ambiguous-commit case does.
 bool append_event_outbox(PGconn* conn, const std::string& execution_id,
                          const std::string& event_type, const std::string& data,
                          bool is_terminal) {
@@ -395,7 +406,17 @@ bool append_event_outbox(PGconn* conn, const std::string& execution_id,
         "(execution_id, event_type, data, is_terminal, created_at) "
         "VALUES ($1, $2, $3, $4, extract(epoch FROM now())::bigint) RETURNING event_id",
         std::vector<std::string>{execution_id, event_type, data, is_terminal ? "true" : "false"});
-    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1;
+    if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1)
+        return true;
+    // Log the durable-append failure DISTINCTLY (PR #3842 review): the caller's
+    // own error log now covers TWO independent statements (its state write and
+    // this append) with one opaque bool, so an event_outbox-only degrade would
+    // otherwise be invisible on-call. This runs inside the caller's txn, which
+    // the false return then rolls back (the paired state write with it).
+    spdlog::error("ExecutionTracker::append_event_outbox: durable append failed for "
+                  "execution_id={} event_type={} — {} (rolls back the paired state write)",
+                  execution_id, event_type, PQerrorMessage(conn));
+    return false;
 }
 
 } // namespace
@@ -1031,9 +1052,8 @@ void ExecutionTracker::refresh_counts(const std::string& execution_id) {
 }
 
 bool ExecutionTracker::refresh_counts_once(const std::string& execution_id) {
-    // Snapshot-and-release (perf-B1 / UP-A9). See update_agent_status for
-    // the full rationale. We snapshot up to two SSE payloads inside the
-    // transaction below, then publish after it commits and the lease is
+    // Snapshot-and-release (perf-B1 / UP-A9): we snapshot up to two SSE payloads
+    // inside the transaction below, then publish after it commits and the lease is
     // released.
     bool publish_progress = false;
     bool publish_terminal = false;
@@ -1177,8 +1197,7 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
     if (!open_)
         return false;
 
-    // Snapshot-and-release (perf-B1 / UP-A9). See update_agent_status for
-    // the full rationale.
+    // Snapshot-and-release (perf-B1 / UP-A9).
     bool should_publish = false;
     nlohmann::json payload;
     payload["status"] = "cancelled";
@@ -1187,27 +1206,34 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
     // commit in ONE transaction (invariant 1) — was a bare autocommit statement
     // before the outbox existed. A false append rolls the cancel back.
     //
-    // The UPDATE carries `RETURNING id` and the event is appended ONLY when a
-    // row actually matched (governance self-adversarial finding C1/K6, ADR-2002
-    // §5): a bare `UPDATE ... WHERE id=$2` returns PGRES_COMMAND_OK even when it
-    // matches ZERO rows (an unknown/stale id), so appending unconditionally
-    // would commit a durable `execution-completed` event with NO paired
-    // source-state mutation — the event-WITHOUT-state half of the §5 pairing
-    // the outbox exists to uphold, poisoning the future forward-poll feed with a
-    // phantom terminal frame. A zero-row cancel is a no-op: no state change, no
-    // event, and a false return ("not cancelled — no such execution", distinct
-    // from a store failure).
+    // The UPDATE is GUARDED (`AND status NOT IN (<terminal set>) RETURNING id`)
+    // and the event is appended ONLY when a row actually transitioned:
+    //  - governance self-adversarial finding C1/K6, ADR-2002 §5: a bare
+    //    `UPDATE ... WHERE id=$2` (no RETURNING) returns PGRES_COMMAND_OK even on
+    //    a ZERO-row match (unknown/stale id), so appending unconditionally would
+    //    commit a durable `execution-completed` with NO paired state mutation —
+    //    the event-WITHOUT-state half of the §5 pairing;
+    //  - PR #3842 review (Doomgoose): the guard must ALSO exclude already-
+    //    TERMINAL rows. Without `AND status NOT IN (...)`, a retried/double-
+    //    clicked cancel, or a cancel racing with `refresh_counts_once`'s
+    //    `running -> succeeded/completed` transition (which itself guards on
+    //    `status='running'`), would overwrite the true terminal status back to
+    //    `cancelled` AND durably append a second, CONTRADICTORY terminal frame.
+    //    The guard makes a cancel of an already-terminal (or unknown) execution
+    //    a clean no-op: zero rows -> no state change, no event, false return
+    //    ("not cancelled — no such live execution", distinct from a store
+    //    failure). This also closes the earlier double-cancel duplicate-frame.
     bool matched = false;
     bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult res = pg::exec_params(
             conn,
             "UPDATE execution_tracker.executions SET status='cancelled', completed_at=$1 "
-            "WHERE id=$2 RETURNING id",
+            "WHERE id=$2 AND status NOT IN ('succeeded','completed','cancelled') RETURNING id",
             std::vector<std::string>{std::to_string(now_epoch()), id});
         if (res.status() != PGRES_TUPLES_OK)
             return false;
         if (PQntuples(res.get()) == 0)
-            return true; // no such execution — no state change, so NO event (matched stays false)
+            return true; // unknown id OR already terminal — no state change, no event
         matched = true;
 
         if (!append_event_outbox(conn, id, "execution-completed", payload.dump(),

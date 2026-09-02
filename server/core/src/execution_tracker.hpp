@@ -622,8 +622,10 @@ public:
     /// reconnecting consumer re-derives by execution_id (the
     /// `ExecutionEventBus` `kTerminalKnownLost -> fetch-by-id` fallback
     /// contract) — so a from-boot skewed clock deleting a batch of frames is an
-    /// acceptable worst case. Constants are substrate-tuned to THIS table — copy
-    /// the SHAPE, never the numbers.
+    /// acceptable worst case. The window/cap/skew constants are kept in LOCKSTEP
+    /// with the `command_execution` sibling deliberately (same short-lived feed,
+    /// same substrate) — see the recorded reasoning at the definition site in the
+    /// .cpp; revisit both together, do not diverge silently.
     [[nodiscard]] std::expected<EventOutboxReapOutcome, std::string> reap_event_outbox();
 
     /// Whether the store is usable (schema migrated). False after a failed

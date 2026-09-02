@@ -2316,6 +2316,39 @@ TEST_CASE("ExecutionTracker: WS-2a mark_cancelled of an UNKNOWN id is a no-op �
     CHECK(fetch_outbox(tracker_bundle.pool(), "no-such-execution-id").empty());
 }
 
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled of an already-TERMINAL execution is a "
+          "no-op — no status overwrite, no second event (PR #3842 review)",
+          "[pg][execution_tracker][outbox]") {
+    // The terminal-status guard: a cancel arriving after (or racing with) a
+    // genuine terminal transition must NOT overwrite the true outcome back to
+    // 'cancelled' NOR durably append a contradictory execution-completed frame.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+    // Drive it to a genuine terminal 'succeeded'.
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    tracker.update_agent_status(*id, as);
+    {
+        auto exec = tracker.get_execution(*id);
+        REQUIRE(exec.has_value());
+        REQUIRE(exec->status == "succeeded");
+    }
+    const std::size_t rows_before = fetch_outbox(tracker_bundle.pool(), *id).size();
+
+    // Cancel must be a no-op — the execution is already terminal.
+    CHECK_FALSE(tracker.mark_cancelled(*id, "admin"));
+
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "succeeded"); // NOT overwritten to 'cancelled'
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).size() == rows_before); // no second frame
+}
+
 TEST_CASE("ExecutionTracker: WS-2a refresh_counts terminal transition is atomic — "
           "a failing append rolls the transition back (self-adversarial C4c)",
           "[pg][execution_tracker][outbox]") {

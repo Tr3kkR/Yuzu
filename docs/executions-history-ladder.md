@@ -403,7 +403,7 @@ Both call sites are pinned by source-tripwire tests
 ## HA WS-2a — durable event outbox (ADR-2002 §5)
 
 The "Restart loss" characteristic above is what WS-2a closes. `ExecutionTracker`
-gains a durable, append-only `event_outbox` table (migration v3) that shadows
+gains a durable, append-only `event_outbox` table (migration v4) that shadows
 every event `ExecutionEventBus` fans out in-memory. The bus stays the *local*
 fan-out; the outbox is the durable, cross-replica feed. **2a-1 lands the outbox
 and its atomic write only — there is no consumer yet** (the in-memory bus still

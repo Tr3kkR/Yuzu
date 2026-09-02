@@ -1,6 +1,6 @@
 - **HA WS-2a (ADR-2002 §5): a durable Postgres event outbox for execution
   events.** `ExecutionTracker` gains a third table (`event_outbox`, migration
-  v3) that durably records the transition events it already fans out in-memory
+  v4) that durably records the transition events it already fans out in-memory
   over `ExecutionEventBus` — `agent-transition`, `execution-progress`, and
   `execution-completed` — each carrying a global durable monotonic `event_id`
   (`BIGINT` IDENTITY). Every event is appended **inside the same transaction as
