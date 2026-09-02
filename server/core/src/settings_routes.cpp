@@ -4,6 +4,8 @@
 
 #include "settings_routes.hpp"
 
+#include "ota_signature_sidecar.hpp"
+
 #include <cstdio>
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
@@ -5424,27 +5426,18 @@ void SettingsRoutes::register_routes(
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
-        // Write the signature sidecar AFTER the package row exists, so a failure
-        // here leaves an unsigned-but-usable package rather than a registered
-        // package pointing at a half-written signature. An agent with
-        // --update-require-signature then refuses it, which is the correct
-        // outcome for a partial upload.
-        if (!signature_pem.empty()) {
-            const auto sig_path = update_registry_->signature_path(pkg);
-            std::ofstream sf(sig_path, std::ios::binary | std::ios::trunc);
-            if (sf) {
-                sf.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
-            }
-            if (!sf) {
-                std::error_code rm_ec;
-                std::filesystem::remove(sig_path, rm_ec);
-                spdlog::error("OTA package {}: signature sidecar could not be written; the "
-                              "package remains registered as UNSIGNED",
-                              pkg.filename);
-            } else {
-                spdlog::info("OTA package {}: detached signature stored ({} bytes)", pkg.filename,
-                             signature_pem.size());
-            }
+        // Sidecar handling AFTER the package row exists, so a failure here leaves
+        // an unsigned-but-usable package rather than a registered package
+        // pointing at a half-written signature. The remove inside
+        // replace_signature_sidecar is UNCONDITIONAL — see its header for why an
+        // unsigned re-upload must not inherit the previous signature.
+        if (!replace_signature_sidecar(update_registry_->signature_path(pkg), signature_pem)) {
+            spdlog::error("OTA package {}: signature sidecar could not be written; the "
+                          "package remains registered as UNSIGNED",
+                          pkg.filename);
+        } else if (!signature_pem.empty()) {
+            spdlog::info("OTA package {}: detached signature stored ({} bytes)", pkg.filename,
+                         signature_pem.size());
         }
 
         res.set_content(render_updates_fragment(), "text/html; charset=utf-8");

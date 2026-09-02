@@ -185,6 +185,57 @@ TEST_CASE("updater: a package signed by a FOREIGN CA is refused", "[updater][sig
     CHECK(refused(metrics, "untrusted") == 1.0);
 }
 
+TEST_CASE("updater: a present-but-invalid signature is refused in BOTH modes",
+          "[updater][signing][grpc]") {
+    // THE CONTRACT THE DOCS ASSERT ON FIVE SURFACES: --update-require-signature
+    // governs only whether an ABSENT signature is tolerated. A signature that is
+    // PRESENT and does not verify is refused either way.
+    //
+    // Every other invalid-signature case here ran with require=false, so nothing
+    // would have failed if require=true had bypassed verification entirely — a
+    // gap an external reviewer found, not this suite.
+    auto f = build_signing_fixtures();
+
+    for (const bool require : {false, true}) {
+        FakeExe exe;
+        Harness h;
+        h.svc.payload = read_file(f.artifact_file);
+        h.svc.signature = read_file(f.sig_file);
+        h.start();
+
+        yuzu::MetricsRegistry metrics;
+        // Signature is valid, but the agent trusts a different CA.
+        Updater updater(cfg_with(f.other_trust_bundle, require, &metrics), "test-agent", "0.1.0",
+                        "linux", "x86_64", exe.path);
+        auto r = updater.check_and_apply(h.stub.get());
+        INFO("require_signature=" << require);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(read_file(exe.path) == "old-binary");
+        CHECK(refused(metrics, "untrusted") == 1.0);
+    }
+}
+
+TEST_CASE("updater: a tampered payload increments the INVALID refusal counter",
+          "[updater][signing][grpc]") {
+    // The `invalid` label had no assertion anywhere — only `missing` and
+    // `untrusted` did — so the reason an operator would see for the commonest
+    // real failure (a signature over different bytes) was unverified.
+    auto f = build_signing_fixtures();
+    FakeExe exe;
+    Harness h;
+    h.svc.payload = read_file(f.artifact_file) + "-tampered";
+    h.svc.signature = read_file(f.sig_file);
+    h.start();
+
+    yuzu::MetricsRegistry metrics;
+    Updater updater(cfg_with(f.trust_bundle, /*require=*/true, &metrics), "test-agent", "0.1.0",
+                    "linux", "x86_64", exe.path);
+    auto r = updater.check_and_apply(h.stub.get());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(refused(metrics, "invalid") == 1.0);
+    CHECK(refused(metrics, "untrusted") == 0.0); // classified, not lumped together
+}
+
 TEST_CASE("updater: a tampered payload is refused even with a real signature",
           "[updater][signing][grpc]") {
     auto f = build_signing_fixtures();

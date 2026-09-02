@@ -763,6 +763,7 @@ if build_server
       'unit/server/test_runtime_config_store.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
+      'unit/server/test_ota_signature_sidecar.cpp', # server half of OTA signature delivery (#416/#3807)
       'unit/server/test_update_registry.cpp',
       'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',

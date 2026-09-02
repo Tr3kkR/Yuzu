@@ -1,5 +1,7 @@
 #include "update_registry.hpp"
 
+#include "ota_signature_sidecar.hpp"
+
 #include "nvd_db.hpp" // compare_versions()
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -298,9 +300,7 @@ std::filesystem::path UpdateRegistry::signature_path(const UpdatePackage& pkg) c
     // filename is operator-controlled, and letting the signature location be
     // named independently would allow a package to point at some other
     // package's signature.
-    auto p = binary_path(pkg);
-    p += ".sig";
-    return p;
+    return signature_sidecar_path(binary_path(pkg));
 }
 
 } // namespace yuzu::server

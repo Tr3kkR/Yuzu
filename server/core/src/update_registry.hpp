@@ -66,17 +66,6 @@ class MetricsRegistry;
 
 namespace yuzu::server {
 
-/// Upper bound on a package's detached signature (#416/#3807).
-///
-/// A PEM CMS detached signature is a few KB — the signer certificate chain plus
-/// one digest. The cap is not about disk: the signature is attached to EVERY
-/// CheckForUpdateResponse, and gRPC clients default to a 4 MB receive limit, so
-/// a wrong file uploaded into the signature field would push that response past
-/// the limit and break update checks for the entire fleet at once. Bounded at
-/// upload AND at read, because a file can also arrive in update_dir_ by means
-/// that never passed through the upload handler.
-inline constexpr std::size_t kMaxSignatureBytes = 64 * 1024;
-
 struct UpdatePackage {
     std::string platform; // "windows", "linux", "darwin"
     std::string arch;     // "x86_64", "aarch64"

@@ -1,5 +1,7 @@
 #include "agent_service_impl.hpp"
 
+#include "ota_signature_sidecar.hpp"
+
 #include "ota_audit_key.hpp"
 
 #include "on_behalf_guard.hpp"
@@ -2092,43 +2094,25 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
     // own packages' authenticity.
     {
         const auto sig_path = update_registry_->signature_path(*latest);
-        std::error_code sig_ec;
-        if (std::filesystem::exists(sig_path, sig_ec)) {
-            // Size-checked BEFORE reading. This blob is attached to every
-            // CheckForUpdateResponse, and gRPC clients default to a 4 MB receive
-            // limit, so an oversized file here would break update checks for the
-            // whole fleet rather than for one package.
-            // A SEPARATE error_code: reusing the one exists() filled meant a
-            // FAILED file_size left !size_ec false, skipping the cap branch and
-            // falling through to an unbounded read — the exact case the cap is
-            // for. A size we cannot determine is treated as over-cap, because a
-            // sidecar that is not a regular file (a FIFO, say) is not a
-            // signature and must never be read into a response.
-            std::error_code size_ec;
-            const auto sig_size = std::filesystem::file_size(sig_path, size_ec);
-            // NOTHING is opened until the size check passes. Constructing the
-            // ifstream first would defeat the check entirely: open(2) on a FIFO
-            // blocks until a writer appears, so the handler thread would wedge
-            // before ever reaching this branch — one wedged thread per agent
-            // check, which is pool exhaustion rather than a slow response.
-            if (size_ec || sig_size > kMaxSignatureBytes) {
-                spdlog::error("CheckForUpdate: signature sidecar for {} is unusable ({}, cap {} "
-                              "bytes); serving the package as unsigned",
-                              latest->filename,
-                              size_ec ? "size undeterminable: " + size_ec.message()
-                                      : std::to_string(sig_size) + " bytes",
-                              kMaxSignatureBytes);
-            } else if (std::ifstream sig_in(sig_path, std::ios::binary); sig_in) {
-                std::string sig((std::istreambuf_iterator<char>(sig_in)),
-                                std::istreambuf_iterator<char>());
-                response->set_update_signature(std::move(sig));
-            } else {
-                // Present but unreadable is worth a log: the operator believes
-                // this package is signed and every agent will be told it is not.
-                spdlog::warn("CheckForUpdate: signature sidecar for {} exists but is unreadable; "
-                             "serving the package as unsigned",
-                             latest->filename);
-            }
+        std::string sig;
+        switch (read_signature_sidecar(sig_path, sig)) {
+        case SidecarOutcome::kServed:
+            response->set_update_signature(std::move(sig));
+            break;
+        case SidecarOutcome::kAbsent:
+            break; // the ordinary unsigned case
+        case SidecarOutcome::kOverCap:
+            spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (missing, "
+                          "over the {} byte cap, or not a regular file); serving as unsigned",
+                          latest->filename, kMaxSignatureBytes);
+            break;
+        case SidecarOutcome::kUnreadable:
+            // Present but unreadable is worth a log: the operator believes this
+            // package is signed and every agent will be told it is not.
+            spdlog::warn("CheckForUpdate: signature sidecar for {} exists but is unreadable; "
+                         "serving the package as unsigned",
+                         latest->filename);
+            break;
         }
     }
 
