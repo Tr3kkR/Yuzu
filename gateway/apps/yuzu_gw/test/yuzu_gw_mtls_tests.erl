@@ -600,3 +600,44 @@ mgmt_posture_proplist_transport_refused_test() ->
     {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
         yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
     ?assert(lists:member(plaintext, Defects)).
+
+mgmt_posture_fd_socket_forfeits_loopback_exemption_test_() ->
+    %% PR #3905 review blocking finding: grpcbox DELETES the map ip whenever
+    %% socket_options carries an inherited {fd, _} (systemd socket
+    %% activation) and binds wherever the descriptor points — so a nominal
+    %% loopback ip is a dead letter and must NOT exempt the listener. An
+    %% {ip, _} inside socket_options likewise overrides (later inet option
+    %% wins). An unrecognised socket_options shape is unprovable — exposed.
+    Plain = fun(SockOpts) ->
+        #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+          listen_opts => maps:merge(#{port => 50063, ip => {127, 0, 0, 1}},
+                                    SockOpts)}
+    end,
+    [{"loopback ip + {fd,_} socket option refused",
+      ?_assertMatch({error, {insecure_mgmt_listener, [{50063, _}]}},
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => [{fd, 42}]})], [], false))},
+     {"loopback ip + overriding {ip,_} socket option refused",
+      ?_assertMatch({error, {insecure_mgmt_listener, [{50063, _}]}},
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => [{ip, {0, 0, 0, 0}}]})], [], false))},
+     {"loopback ip + unrecognised socket_options shape refused",
+      ?_assertMatch({error, {insecure_mgmt_listener, [{50063, _}]}},
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => junk})], [], false))},
+     {"loopback ip + benign socket_options list stays exempt",
+      ?_assertEqual(ok,
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [Plain(#{socket_options => [{reuseaddr, true}]})], [], false))},
+     {"secure posture with {fd,_} still passes (exemption lost, posture holds)",
+      ?_assertEqual(ok,
+                    yuzu_gw_app:evaluate_mgmt_posture(
+                        [#{grpc_opts => #{service_protos => [management_pb],
+                                          services => #{},
+                                          auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1},
+                           listen_opts => #{port => 50063, ip => {127, 0, 0, 1},
+                                            socket_options => [{fd, 42}]},
+                           transport_opts => #{ssl => true, certfile => "c.pem",
+                                               keyfile => "k.pem",
+                                               cacertfile => "ca.pem"}}],
+                        [{cert_file, "srv.pem"}], false))}].

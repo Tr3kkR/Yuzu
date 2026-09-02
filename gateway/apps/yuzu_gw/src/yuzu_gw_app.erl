@@ -425,13 +425,30 @@ is_mgmt_listener(_) ->
     false.
 
 %% @private Loopback-only binds have no network attack surface. A missing or
-%% unrecognised ip is EXPOSED (grpcbox defaults to {0,0,0,0}).
+%% unrecognised ip is EXPOSED (grpcbox defaults to {0,0,0,0}). The map `ip` is
+%% authoritative ONLY when `socket_options` cannot override the bind: grpcbox
+%% DELETES the ip whenever socket_options carries an inherited `{fd, _}`
+%% descriptor (grpcbox_socket:maybe_adjust_port_opts_for_fdopt/2 — the socket
+%% binds wherever the fd points, e.g. systemd socket activation), and an
+%% `{ip, _}` inside socket_options is appended after the map ip in the inet
+%% option list, where the later occurrence wins. Either shape makes a nominal
+%% `ip => {127,0,0,1}` a dead letter, so both forfeit the exemption
+%% (PR #3905 review, Doomgoose blocking finding — verified live: the fd shape
+%% previously evaluated `ok` with zero TLS/auth_fun/pins).
 -spec loopback_bound(map()) -> boolean().
 loopback_bound(S) ->
-    case maps:get(ip, maps:get(listen_opts, S, #{}), undefined) of
-        {127, _, _, _}            -> true;
-        {0, 0, 0, 0, 0, 0, 0, 1} -> true;
-        _                         -> false
+    ListenOpts = maps:get(listen_opts, S, #{}),
+    Overridable = case opt_value(socket_options, ListenOpts) of
+        undefined -> false;
+        L when is_list(L) ->
+            lists:keymember(fd, 1, L) orelse lists:keymember(ip, 1, L);
+        _ -> true  % unrecognised shape: cannot prove the bind — exposed
+    end,
+    case {Overridable, maps:get(ip, ListenOpts, undefined)} of
+        {true, _}                        -> false;
+        {false, {127, _, _, _}}          -> true;
+        {false, {0, 0, 0, 0, 0, 0, 0, 1}} -> true;
+        _                                -> false
     end.
 
 %% @private Everything wrong with one mgmt listener's posture. `ssl => true`

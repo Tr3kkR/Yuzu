@@ -64,6 +64,17 @@ check_strict(Path) ->
     Servers = servers(Cfg),
     MgmtListeners = [S || S <- Servers, is_mgmt(S)],
     ?assertMatch([_ | _], MgmtListeners),
+    %% Evaluate through the REAL production decision function first — the
+    %% hand-rolled shape checks below are supplements, not the gate. A test
+    %% that re-implements the guard can diverge from it (PR #3905 review:
+    %% exactly such divergence hid the fd-socket loopback bypass).
+    YuzuEnv0 = proplists:get_value(yuzu_gw, Cfg, []),
+    Pins0 = proplists:get_value(mgmt_peer_pins, YuzuEnv0, []),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(Servers, Pins0, false)),
+    %% ...and non-vacuously: strip the pins and the same evaluation must
+    %% REFUSE, proving the guard actually recognised the mgmt listener.
+    ?assertMatch({error, {insecure_mgmt_listener, _}},
+                 yuzu_gw_app:evaluate_mgmt_posture(Servers, [], false)),
     lists:foreach(fun(S) ->
         GrpcOpts = maps:get(grpc_opts, S),
         ?assertEqual(?AUTH_FUN, maps:get(auth_fun, GrpcOpts, missing)),
