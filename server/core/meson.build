@@ -422,7 +422,6 @@ yuzu_server_core_lib = static_library(
     'src/saml_scim_link.cpp',
     'src/error_codes.cpp',
     'src/result_envelope.cpp',
-    'src/concurrency_manager.cpp',
     'src/legacy_shim.cpp',
     'src/management_group_store.cpp',
     'src/api_token_store.cpp',

@@ -198,5 +198,11 @@ spike/
 !tests/**/*.db
 
 # promtool canary scratch tree (created and removed by
-# tests/prometheus/run_promtool_tests.py; only survives a killed run)
-.promtool-canary/
+# tests/prometheus/run_promtool_tests.py; a fresh mkdtemp per gate() call
+# since #2340 PR-4, so only a killed run leaves one of these behind)
+.promtool-canary-*/
+
+# marker-extracted yuzu-guardian-journal rules (#2340 PR-4), materialized
+# fresh on every run by tests/prometheus/run_promtool_tests.py from the
+# commented block in docs/prometheus/yuzu-alerts.yml - never committed
+tests/prometheus/generated/

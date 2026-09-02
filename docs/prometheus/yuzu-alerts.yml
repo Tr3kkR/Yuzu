@@ -3528,6 +3528,18 @@ groups:
   # deployed fleet-wide, because its 0 also means "nothing journalled yet" (see its
   # description below).
   #
+  # EXTRACT ANCHOR (tests/prometheus/run_promtool_tests.py): the harness pulls
+  # everything between the BEGIN/END markers below out of this comment,
+  # strips one leading "  # " from each line, and runs the result through
+  # the SAME check/test/canary machinery as the shipped rules - materialized
+  # to a generated fixture, never written back here - so CH-2 and CH-5-PROM
+  # can be promtool-verified while this group stays inert in production.
+  # The END marker sits right after AccountingBug's runbook_url, BEFORE the
+  # trailing "remaining counters" prose below it - that prose was never
+  # YAML and stripping its single "# " would extract as bare text inside
+  # `groups:`. Moving the block means moving both markers with it, or the
+  # harness fails closed (marker not found / duplicate / empty extraction).
+  # PROMTOOL-EXTRACT-BEGIN: yuzu-guardian-journal
   # - name: yuzu-guardian-journal
   #   rules:
   #     # ---- Pipeline health ---------------------------------------------------------
@@ -3749,6 +3761,7 @@ groups:
   #           Should stay 0 in correct operation; any value is an accounting or
   #           id-generation bug surfacing. Investigate - do not threshold.
   #         runbook_url: "https://docs.yuzu.io/runbooks/guardian-journal-key-collisions"
+  # PROMTOOL-EXTRACT-END: yuzu-guardian-journal
   #
   # The remaining should-stay-0 counters (_stage_failures, _field_rejected,
   # _clock_rejected, _quarantined, _quarantine_failures, _prune_failures,

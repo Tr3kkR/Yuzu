@@ -2651,6 +2651,14 @@ Out of scope for this migration, flagged not fixed (none newly reachable by this
 
 **Third migration (#1634, this ADR-0017 continuation).** Closes the systemic gap #1634 tracked since 2026-06-23: the legacy REST `/api/responses/{id}/aggregate`/`/export`/catch-all-list routes (`server.cpp`), MCP `query_responses`/`aggregate_responses`, and REST `GET /api/v1/executions/{id}/visualization` all carried a per-row post-filter (`response_agent_in_scope`/`response_scope_fn`) that sat BEHIND a still-flat global gate — the exact "inert filter" shape #1711/#1550 shipped and this ADR names as the systemic defect. All five migrated onto `require_fleet_read`/`fleet_read_fn_` as their sole gate; the response list/export routes and `query_responses` additionally push the resolved visible-agent set into `ResponseStore::query`/`query_by_execution` as SQL `agent_id = ANY(...)` **before** `LIMIT`/`OFFSET` (a new optional scope parameter, ADR-0017 INV-3) rather than post-filtering a capped/paginated read — the INV-3-compliant fix an adversarial review (Kimi + Codex) found the first migration pass had missed. `GET /api/v1/executions/{id}` (REST final-state lookup), `GET /api/v1/events` (REST SSE), `GET /sse/executions/{id}` (dashboard SSE — closing the #3699 gap above), and MCP `get_execution_status`/`list_executions` also migrated: all four collapse an invisible execution to the same 404/not-found shape a genuinely nonexistent one gets (no existence oracle), and a confined non-dispatcher's view is a redacted projection (recomputed per-agent counts from only the visible agent-status rows, `scope_expression`/`parameter_values` replaced with a fixed placeholder) — dispatcher ownership admits VISIBILITY only (avoids a false 404 on a just-dispatched execution with zero responses yet) and never bypasses this projection, a distinction the same adversarial-review round caught the first attempt getting wrong. `list_executions` has a weaker mechanism than the others — execution rows carry no single `agent_id` to filter by, so a confined caller is restricted to `dispatched_by = session->username` (`ExecutionQuery::dispatched_by`) rather than a real visible-agent intersection. As of the PR #3793 review round, `agents_targeted`/`agents_responded` on this route ARE now projected (a batched, non-N+1 `get_agent_statuses_for_executions` call) the same way `get_execution_status` projects them, closing that specific gap; the confinement AXIS itself remains own-dispatches-only, not a real visible-agent intersection. **Disclosure gap (found in the same review round, not fixed):** `dispatched_by = session->username` is scoped to the minting principal, not intersected against a service-scoped token's own service-tag scope — an admitted service token sees its minting user's full dispatch-history metadata (status/timing/lineage, no agent identities), not narrowed to its own service. Recorded here as disclosed, not fixed. The two SSE routes share one event projector (`execution_event_scope.hpp`): `agent-transition` events are filtered by `agent_id`, `execution-progress` is dropped for confined subscribers (execution-wide counts, no `agent_id`), and `execution-completed` is sanitized (real `status` field preserved, counts stripped) rather than dropped, so the client still closes its stream. `query_responses`/`aggregate_responses`/`get_execution_status`/`list_executions` are reclassified `ServiceScopeClass::confined` (`kToolSecurityRows`), matching the real `fleet_read_fn_` mechanism they now have.
 
+**Fourth migration (#3789, this ADR-0017 continuation).** Closes the gap #1634's own Gate 2 review found and deliberately deferred: the legacy pre-v1 `/api/executions` (list), `/{id}` (detail), `/{id}/summary`, `/{id}/agents`, `/{id}/children`, `POST /{id}/rerun`, and `POST /{id}/cancel` routes (`server.cpp`) carried NO management-group confinement at all — a bare `require_permission(Execution, Read/Execute)`, unlike every other execution-reading surface migrated above. All five GET routes now gate on `require_fleet_read(..., "Read")`, mirroring the `GET /api/v1/executions/{id}` shape: an invisible or nonexistent execution collapses to one 404 (no oracle) for EVERY caller — but the audit row is written only when the caller's scope was actually engaged (`gate.scope`). A confined caller failing this check writes `execution.read`/`denied`; an unconfined caller's genuinely-nonexistent id is ordinary "not found", not a confinement decision, and writes no row at all — auditing it as `denied` would have inflated the CC7.2 denial-rate metric with routine 404 traffic (compliance-officer, #3789 Gate 6 finding F2, corrected before merge). The caller-visible 404 response is identical either way; only the server-side audit trail distinguishes the two. A confined view redacts `scope_expression`/`parameter_values` and recomputes the four agent counts from only the in-scope, terminal-status rows. `/agents` — the worst pre-migration leak, returning raw agent identities and `error_detail` fleet-wide — filters its row list to `authz::in_scope`. `/children` does NOT inherit the detail route's "keep lineage truthful" precedent: a visible parent does not authorize enumerating separate child execution records, so each child is checked against the same visibility predicate independently. The LIST route goes further than every sibling migrated above (including `list_executions`, next paragraph): rather than a post-fetch drop or an own-dispatches-only filter, the confinement predicate is pushed into the `WHERE` clause itself, before `LIMIT` (ADR-0017 INV-3) — `dispatched_by = $owner OR EXISTS (SELECT 1 FROM agent_exec_status WHERE agent_id = ANY($visible))`, one statement, no N+1 (`ExecutionTracker::query_executions_checked`'s new `ExecutionScope` parameter). The owner disjunct is load-bearing, not cosmetic: `agent_exec_status` rows are written only on response arrival, so an agent-membership-only predicate would make a caller's own just-dispatched execution invisible to them until the first agent replies.
+
+The two mutating routes (`rerun`/`cancel`) keep `require_permission(Execution, Execute)` ahead of the fleet gate — `require_fleet_read` structurally rejects any operation but `Read` (its legacy-open `AdmitAll` branch has no MCP approval-ticket check, so a mutation must never reach it) — then additionally take `require_fleet_read(..., "Read")` purely for scope. Mutation admission is stricter than read visibility: an adversarial review (external model, Sol/gpt-5.6-sol) found that "every EXISTING agent-status row is in scope" is a false-admission path, because those rows are response-arrival-seeded — an execution targeting agents A and B can have only A's row while B, still pending, might be out of scope. The rule implemented instead: zero status rows (the just-dispatched window) admits ONLY the dispatcher; one or more rows requires the row count to equal `agents_targeted` (a complete ledger) AND every row's agent to be in scope — dispatcher ownership is not a bypass once rows exist. Nonexistent, zero-visible, partial-visibility, and incomplete-ledger all collapse to the identical 404 + non-distinguishing audit detail (a distinct status for "partial visibility" would itself be a hidden-cohort disclosure). `mark_cancelled`'s pre-existing false-success-on-nonexistent-id behavior (an `UPDATE` matching zero rows still reports `PGRES_COMMAND_OK`) is fixed as a side effect: an explicit existence check now runs before every cancel attempt, for confined and unconfined callers alike.
+
+New degrade-distinguishable tracker accessors (`get_execution_checked`, `get_children_checked`, `get_agent_statuses_for_executions_checked`, `query_executions_checked`) fail closed (503, `retry_after_ms`) on a transient read failure rather than collapsing it into "absent"/"empty" the way their pre-#3789 plain twins do — required because these five routes now write `denied` audit rows and 404 responses off these results, which the old degrade-collapsing methods cannot safely feed. `execution_scope_rules.hpp`'s `execution_visible` and `admit_confined_mutation` deliberately scan every status row with no early exit, even after a match is found — an early return makes wall-clock time a function of WHERE in the row list the first in-scope agent falls, a residual timing side-channel on the admit path (cpp-expert, #3789 Gate 3). **Behavior changes accepted, not oversights:** `/summary`'s nonsense zero-filled-200 response for an unknown id is now a 404 for every caller, confined or not; `/agents` and `/children` similarly now 404 on an unknown id instead of an empty-array 200; a caller holding `Execution:Execute` but not `Execution:Read` can no longer rerun/cancel (the mutation routes need both); gate-failure responses on a degraded RBAC/management-group store are now 503 (`retry_after_ms`) where the old flat gate failed closed 403. Coverage: `tests/unit/server/test_legacy_executions_scope_authz.cpp` (pure-function unit tests for the shared `execution_scope_rules.hpp` predicates, a real-rig PG confinement test, and per-route source tripwires) plus new `[pg][execution_tracker]` cases in `test_execution_tracker.cpp` for the SQL pushdown and the new checked accessors.
+
+Deferred, not fixed here (flagged for a follow-up, not swept into #3789): MCP `list_executions` still uses the weaker own-dispatches-only axis this migration's LIST route improves on — worth backporting the same SQL-pushdown shape; `workflow_routes.cpp` still calls the degrade-collapsing plain `get_agent_statuses` at one site.
+
 Still open after this migration (unrelated files, tracked separately, not swept into #1634): REST `GET /api/v1/execution-statistics/agents` + the workflow executions LIST fragment (#3526); three reliability gaps on the workflow detail route — legacy-fallback starvation, untested store-degrade banner, `get_execution` error-vs-absent ambiguity (#3527); `/fragments/results` has no audit trail at all (#3528); no `[pg]` end-to-end test proves the real `require_fleet_read`/`RbacStore`/`ManagementGroupStore` composition for the #1712 call sites (#3529). **Staleness of an already-open SSE stream (compliance/sre finding, this round):** `require_fleet_read`/`fleet_read_fn` is evaluated once, at subscribe time — neither `/sse/executions/{id}` nor `/api/v1/events` re-checks the caller's management-group scope for the life of the connection, so a scope narrowed (or a session revoked) mid-stream via `invalidate_session` does not disconnect an already-open subscriber; `invalidate_session` (`auth.cpp`) only erases the session record, it never reaches an open httplib connection, and no lever exists today to force-disconnect one live stream short of a full server restart. This is the same one-time-admission shape `require_fleet_read`'s non-streaming callers already have (a scope change doesn't retroactively alter an in-flight response either), but a held-open stream widens the exposure window from one request to as long as the tab/worker stays connected. Accepted for this migration (real-time revocation is a separate, larger change to the SSE subsystem, not a #1634 scope-pushdown fix); worth a security runbook line if this becomes an operational concern before it is addressed.
 
 `GET`/`PUT`/`DELETE /api/agents/:id/properties[/:key]` — found in this same governance re-review, bare `require_permission(Infrastructure,Read/Write)` with no per-agent scope filter at all (including a WRITE path) — is now **fixed** (#3700): all three routes migrated to `require_scoped_permission("Infrastructure", "Read"/"Write", agent_id)`, the same per-target gate the Tag routes (`/api/tags/set`, `/api/tags/delete`) use. RBAC-off behavior is unchanged, since `Infrastructure` is not in `kTopologyFloor`. Coverage: `tests/unit/server/test_agent_properties_scope_authz.cpp`.
@@ -2758,6 +2766,111 @@ resulting latency bounds.
   distinct from the tier a *human/automation caller* needs to invoke the
   lifecycle surface itself — see "Lifecycle surface (PR 4.3)" below.
 
+
+#### Catastrophic invariants (routed-concern detail)
+
+These are the clauses `.claude/routed-concerns-access-control.md` routes here. A service-scoped API
+token (`session->token_scope_service` non-empty) **must never reach fleet-wide data or actions
+unfiltered.**
+
+1. **`AuthRoutes::require_permission`'s service-scoped branch is the PRIMARY closure mechanism.**
+   ITServiceOwner is the authority ceiling only; a `(securable_type, operation)` pair must ALSO clear
+   the seeded-EMPTY `kServiceScopeGlobalSafe` allow-list (`service_scope_policy.hpp`) or it 403s.
+   **Widening that allow-list is a security decision** — security-guardian sign-off plus a
+   policy-table entry, never inferred from one route being changed.
+
+2. **Branch order in `require_permission`/`require_scoped_permission` is fixed — `elevated → engine →
+   mcp_tier → service → RBAC-enforced → legacy` — never reorder it.** The elevated branch is guarded
+   (`is_elevated && token_scope_service.empty()`); the `mcp_tier` branch must never `return true` on
+   its own (deny, or fall through into the service branch only). A tier-admit that bypasses the
+   service check reopens the flip on every route at once.
+
+3. **MCP's mirror is C8's `ServiceScopeClass`** — `denied` by default; `confined` requires a REAL
+   downstream confinement mechanism (a label with none is the same lie this concern exists to
+   prevent); `global_safe` boot-validates against the same allow-list.
+
+4. **A route reaching agent/fleet data via NO `require_permission`/`require_scoped_permission`/C8 call
+   at all is untouched by the flip and needs its OWN explicit deny — EXTEND an existing per-file
+   helper, never fork a new one.** The helpers: `AuthRoutes::deny_service_scoped_session`
+   (`server.cpp`), `ComplianceRoutes::deny_service_scoped_`, `WorkflowRoutes`' local
+   `deny_service_scoped_schedule_list`/`deny_service_scoped_scope_estimate`,
+   `deny_service_scoped_`/`deny_service_scoped_mutation_` (`guardian_routes.*`), `deny_service_scoped_`
+   (`dex_routes.*`, `deployment_routes.*`, `preflight_routes.*`), the shared
+   `deny_fleet_wide_service_scoped` lambda (`rest_api_v1.cpp`, `mcp_server.cpp`), plus inline checks in
+   `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp`/`tar_tree_routes.cpp`.
+
+   These per-file helpers are now a SECOND, largely-redundant layer for routes the flip already
+   covers — scheduled for Phase 2 retirement, not removed here. `schedule_routes.*`'s
+   `deny_service_scoped_schedule` was the first FULLY retired (#3290 Phase 2 bucket 1a, 2026-08-21):
+   all four of its call sites were provably dead (they fired *after* `require_permission`), unlike the
+   still-live-but-redundant helpers above, which fire *before* their route's gate and so are a
+   different, more cautious retirement class.
+
+5. **A blanket deny's A4 error body MUST NOT name a `.permission` the caller does not currently hold**
+   if holding it would not, by itself, admit the caller — omit the field rather than claim a false
+   self-remediation grant. (Found live in PR 3's own `require_permission`/`require_scoped_permission`
+   service branches, and fixed in the same round that wrote the clause.)
+
+   This MUST binds: every branch inside the service-scoped path of
+   `require_permission`/`require_scoped_permission`; every NEW gate-less-route deny added after this
+   clause was written; and every site in (4) already migrated to the no-`.permission` `a4_denial`
+   shape — as of that round: `AuthRoutes::deny_service_scoped_session`,
+   `ComplianceRoutes::deny_service_scoped_`, `WorkflowRoutes`'
+   `deny_service_scoped_schedule_list`/`deny_service_scoped_scope_estimate`,
+   `GuardianRoutes::deny_service_scoped_`/`deny_service_scoped_mutation_`,
+   `DexRoutes::deny_service_scoped_`, `DeploymentRoutes::deny_service_scoped_`. #3167 closed the
+   remainder — `PreflightRoutes::deny_service_scoped_`'s 3 call sites plus its separate inline deny on
+   the MUTATING `POST /fragments/auto/run`, `schedule_routes.*`'s `deny_service_scoped_schedule` and
+   its 4 call sites (each already passed a correctly-typed permission per operation — the defect was
+   unactionability, not a wrong permission TYPE, a claim the routed row previously made in error), and
+   the inline checks in `device_routes.cpp`/`network_routes.cpp`/`inventory_routes.cpp` (×2)/
+   `tar_tree_routes.cpp` (×2).
+
+   **One known, tracked exception, not retroactively bound:** pre-existing
+   `deny_fleet_wide_service_scoped` call sites that fire AFTER the route's own `perm_fn` already
+   confirmed the caller holds that exact grant, where `.permission` names a grant the caller
+   demonstrably already has — a different, informational claim. `GET /api/v1/inventory/software` no
+   longer illustrates this (#3290 retired its after-gate deny entirely, migrating the route onto
+   `require_fleet_read`). **NO LIVE EXAMPLE CURRENTLY EXISTS:** an exhaustive check of every remaining
+   `deny_fleet_wide_service_scoped` call site — all 20 in `rest_api_v1.cpp` and, as of #3290 Phase 2
+   bucket 1a, all 5 remaining in `mcp_server.cpp` — found every REST site fires BEFORE its route's
+   `perm_fn`, not after (see `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`'s
+   migration checklist). `deny_service_scoped_schedule` (previously 4 sites, `permission` param
+   defaulting empty) and the one MCP site whose surrounding `perm_fn` fired first
+   (`get_dex_group_app_perf`) are no longer part of this count at all — both were retired outright in
+   bucket 1a as provably dead, not merely candidates that failed to match the exception shape.
+
+   Do not read "no current instance" as "no longer needed": the next route to add an after-gate
+   `deny_fleet_wide_service_scoped` call with a non-empty `.permission` becomes the example, and this
+   clause still governs it. **A gate-less-route deny not yet audited against this clause is NOT
+   assumed compliant.**
+
+6. **The tag being read to decide admission must never be mutable by that same admission (#3289).**
+   `require_scoped_permission`'s service branch reads the target agent's `service` tag to decide
+   whether to admit a `Tag:Write`/`Tag:Delete` — so without a separate guard it would authorize the
+   very write that changes that tag, letting a service-scoped token move an agent out of (or a
+   different agent into) its own confinement.
+
+   **EXTEND `authz::service_scope_may_mutate_tag_key`** (`service_scope_policy.hpp`) at every
+   tag-mutation site — REST v1 PUT/DELETE `/api/v1/tags`, the legacy dashboard
+   `/api/tags/set`/`/api/tags/delete` (via `AuthRoutes::deny_service_scoped_service_tag_mutation`), and
+   MCP `set_tag`/`delete_tag` — checked BEFORE the scoped gate, **value-blind** (no read-compare
+   TOCTOU: even a no-op rewrite of the token's own current value is denied).
+
+   The agent's own gRPC `Register`→`TagStore::sync_agent_tags` path is the same class of gap on a
+   DIFFERENT axis (no gate at all, not a TOCTOU) — `authz::is_service_tag_key` is filtered there too,
+   silently dropping an agent-claimed `service` value rather than refusing the whole sync (a
+   pre-existing agent-authored row self-heals on the next sync).
+
+   A live agent's in-memory self-reported tags shadowing the store during scope-DSL evaluation
+   (`agent_registry.cpp`) was a THIRD, distinct mechanism this clause did not cover, tracked separately
+   as #3295 — now CLOSED: the `tag:<key>` resolver is store-first (a TagStore row of any source wins
+   over a connected agent's live claim; the session value answers only when the store has no row at
+   all), and `register_agent` drops an agent-claimed `service` key from the session at ingest,
+   mirroring this clause's own store-side purge.
+
+Full design, decisions, and the closed route inventory: `docs/adr/1006-service-scope-default-deny.md`
+and `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 ### Lifecycle surface (PR 4.3)
 
 Operator-facing CRUD for engine-principal identities and their credentials —

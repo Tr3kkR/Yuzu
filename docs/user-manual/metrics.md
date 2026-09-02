@@ -1577,6 +1577,39 @@ sum(rate(yuzu_server_instruction_read_degrade_total[5m])) by (reason) > 0
 absent_over_time(yuzu_server_instruction_bundled_content_total{result="clean"}[15m])
 ```
 
+## Per-device concurrency enforcement metrics (ADR-1007)
+
+`per-device` is the only concurrency mode with real enforcement (see `docs/user-manual/instructions.md`
+§8) — a claim table (`execution_tracker.concurrency_claims`) excludes an agent already mid-execution
+of the same definition from a repeat dispatch. All six metrics below are pre-seeded to 0 at server
+construction except the liveness gauge, which is set unconditionally on every reconciler pass and
+so needs no pre-seed (absent for at most one reconciler cadence — ~5 minutes — after boot).
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_dispatch_concurrency_skipped_total` | counter | A `per-device` dispatch excluded one or more candidates because they already held an open concurrency claim for the same definition. The generic `POST /api/instructions/{id}/execute` 503 body points here when every named target was excluded this way. |
+| `yuzu_server_concurrency_claim_unavailable_total` | counter | A claim attempt failed CLOSED (Postgres pool exhaustion or a query error) and excluded every candidate from that dispatch, independent of whether any were actually busy. Nonzero alongside the skip counter above points at store degradation, not real contention — watch this before reading the skip counter as "the feature is working as intended." |
+| `yuzu_server_concurrency_reconcile_last_pass_unixtime` | gauge | Unix timestamp of the stale-claim reconciler's last tick (~5-minute cadence, folded into the existing result-set maintenance thread). A liveness signal — pair with `absent()`/staleness alerting to catch a reconciler that stopped ticking, the same shape `yuzu_server_audit_retention_last_pass_unixtime` uses. |
+| `yuzu_server_concurrency_reconcile_declined_total` | counter | A reconciler pass declined by the clock-guard's anomaly classification (implausible clock jump, unusable prior state, or no persisted anchor yet — `audit_retention::classify`). A sustained nonzero rate means the reconciler is not force-releasing orphaned claims and needs investigation. |
+| `yuzu_server_concurrency_claim_force_released_total` | counter | A concurrency claim force-released by the reconciler because its owning agent never reported a terminal status before `expires_at` — an orphaned claim from an agent crash, a disconnect mid-execution, or a cancelled-but-still-running execution (`mark_cancelled` deliberately does not release claims — see the ADR). |
+| `yuzu_schedule_concurrency_mode_lookup_failed_total` | counter | A `ScheduleRunner` fire's second `get_definition()` read (needed to learn `concurrency_mode`) failed or returned empty — per-device enforcement was NOT applied to that one fire, which still dispatches (a deliberate fail-open, since the alternative for a `'once'` schedule is losing the fire permanently). Zero means the read has always succeeded. |
+
+No dedicated alert rule ships for any of the six in this release — recommended follow-up, not
+shipped: an `absent()` alert on the reconcile-liveness gauge (same shape as the audit-retention
+sibling's alert), and a rate-based alert on `..._reconcile_declined_total` or
+`..._claim_unavailable_total` if either is ever sustained nonzero.
+
+**Useful PromQL queries:**
+
+```promql
+# Concurrency reconciler stopped ticking (liveness gauge hasn't advanced).
+time() - yuzu_server_concurrency_reconcile_last_pass_unixtime > 900
+
+# Any per-device dispatch exclusions in the last hour (informational, not itself alertable —
+# exclusion is the mechanism working as intended, not a fault).
+increase(yuzu_server_dispatch_concurrency_skipped_total[1h]) > 0
+```
+
 ## Shutdown-time dispatch metrics (#3495)
 
 | Metric | Type | Description |

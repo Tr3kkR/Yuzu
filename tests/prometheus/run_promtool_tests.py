@@ -51,7 +51,8 @@ out of that path; if you enable it there, that mount is what you are testing.
 
 THE PUBLISHED STATUS CHECK IS NAMED "Prometheus alert rules", not
 `prometheus-rules`. The latter is the JOB ID; branch protection matches on the
-name. CLAUDE.md points here for this fact, so it must stay.
+name. docs/testing/unit-test-conventions.md points here for this fact, so it
+must stay.
 
 `--selftest` exercises the pure logic - version parsing, docker argv
 construction, the vacuity verdict, and the assertion COUNTER itself against
@@ -66,6 +67,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -102,6 +104,27 @@ PULL_ATTEMPTS = len(PULL_LADDER)
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RULES = "docs/prometheus/yuzu-alerts.yml"
 TESTS = "tests/prometheus/yuzu-alerts.test.yml"
+
+# Marker-extraction of the commented-out yuzu-guardian-journal group (#2340
+# CH-2 + CH-5-PROM). RULES' own REASON 2 (see its "DISABLED" preamble) means
+# this group stays commented in production past the prefer_spark cutover -
+# extraction lets promtool verify it anyway, off a temp-materialized copy
+# this script writes fresh every run. RULES itself is never uncommented.
+EXTRACT_GROUP = "yuzu-guardian-journal"
+EXTRACT_BEGIN = f"# PROMTOOL-EXTRACT-BEGIN: {EXTRACT_GROUP}"
+EXTRACT_END = f"# PROMTOOL-EXTRACT-END: {EXTRACT_GROUP}"
+EXTRACTED_RULES = "tests/prometheus/generated/yuzu-guardian-journal-extracted.rules.yml"
+EXTRACTED_TESTS = "tests/prometheus/yuzu-guardian-journal-extracted.test.yml"
+
+# Mutation target for the extracted gate's own canary. TelemetryDark is the
+# one rule in the group RULES' own preamble calls out as able to be sound
+# today (a server-owned pipeline-health counter, not a fleet sum of agent
+# monotonics), so it is the rule CH-5-PROM actually pins. Uniqueness is
+# checked the same way CANARY_FROM is below (exactly one, or fail closed);
+# no indent-anchoring needed - the extracted block is ~220 lines, not 3800,
+# and this guard clause appears nowhere else in it.
+EXTRACTED_CANARY_FROM = "and on() yuzu_fleet_agents_healthy > 0"
+EXTRACTED_CANARY_TO = "and on() yuzu_fleet_agents_healthy > 999999999999"
 
 # Namespace/resource limits: the container parses a test file a fork PR can
 # control. The mount is read-only and no credential is present, so the bound is
@@ -158,7 +181,8 @@ def run(argv: list[str], timeout: int = 300, quiet: bool = False) -> tuple[int, 
 
 
 def check_gate_output(check_out: str, test_out: str,
-                      facts: CaseFacts | None) -> str | None:
+                      facts: CaseFacts | None, *,
+                      tests_label: str = TESTS) -> str | None:
     """The reason this run proves nothing, or None if it is real evidence.
 
     PROMTOOL EXITS 0 ON AN EMPTY RUN, and that is the whole reason this function
@@ -201,18 +225,18 @@ def check_gate_output(check_out: str, test_out: str,
         return "`check rules` loaded 0 rules - nothing was validated."
     if facts is not None:
         if facts.cases == 0:
-            return f"{TESTS} declares no test cases - nothing was asserted."
+            return f"{tests_label} declares no test cases - nothing was asserted."
         if facts.assertions == 0:
-            return (f"{TESTS} declares {facts.cases} case(s) and ZERO assertions "
+            return (f"{tests_label} declares {facts.cases} case(s) and ZERO assertions "
                     f"- promtool exits 0 on that, so the run validated the rules "
                     f"and checked none of them.")
         if facts.caseless:
-            return (f"{TESTS} has {facts.caseless} case(s) with no assertion "
+            return (f"{tests_label} has {facts.caseless} case(s) with no assertion "
                     f"block; each is dead weight that reads as coverage.")
     return None
 
 
-def inspect_test_file(*, strict: bool = True) -> CaseFacts | None:
+def inspect_test_file(tests_rel: str = TESTS, *, strict: bool = True) -> CaseFacts | None:
     """What the test file actually asserts. `strict` decides the no-parser case.
 
     STRICT IS KEYWORD-ONLY ON PURPOSE. The two mistakes are not symmetric: a new
@@ -276,12 +300,12 @@ def inspect_test_file(*, strict: bool = True) -> CaseFacts | None:
             "promtool from PATH to skip these tests instead."
         )
     try:
-        with (REPO_ROOT / TESTS).open(encoding="utf-8") as fh:
+        with (REPO_ROOT / tests_rel).open(encoding="utf-8") as fh:
             doc = yaml.safe_load(fh) or {}
     except (OSError, yaml.YAMLError) as ex:
-        sys.exit(f"FAIL: {TESTS} is present but could not be parsed ({ex}).")
+        sys.exit(f"FAIL: {tests_rel} is present but could not be parsed ({ex}).")
     if not isinstance(doc, dict):
-        sys.exit(f"FAIL: {TESTS} did not parse to a mapping (got {type(doc).__name__}).")
+        sys.exit(f"FAIL: {tests_rel} did not parse to a mapping (got {type(doc).__name__}).")
     return count_assertions(doc)
 
 
@@ -324,6 +348,145 @@ def count_assertions(doc: dict) -> CaseFacts:
     return CaseFacts(cases=len(tests), assertions=assertions, caseless=caseless)
 
 
+def extract_marked_block(text: str, begin: str, end: str) -> str:
+    """Pull the single BEGIN/END-marked block out of `text`, strip its
+    comment prefix, and return it as a standalone value for a `groups:` key
+    (still needs that key prepended and each line re-indented by the
+    caller - see `build_extracted_rules_text`).
+
+    PURE FUNCTION, no filesystem, so `--selftest` can drive it against
+    synthetic text with known answers - the same split `count_assertions`
+    uses, for the same reason: a bug in the extraction logic itself needs a
+    KNOWN answer to redden against, not just the shipped file's shape.
+
+    FAILS CLOSED (raises ValueError) on exactly the defect class this
+    machinery exists to catch - a silently-wrong extraction that promtool
+    would still exit 0 on:
+      - the begin/end marker missing, or present more than once (a moved or
+        duplicated marker mutates the wrong span, or none);
+      - the end marker not after the begin marker;
+      - zero lines between the markers, or only blank ones (nothing to
+        extract);
+      - a line between the markers that is not a comment - either exactly
+        "  #" (a blank line inside the commented block) or prefixed "  # "
+        - which means the markers now straddle something that was never
+          YAML-shaped (see yuzu-alerts.yml's EXTRACT ANCHOR comment: this is
+          the exact shape of the trailing "remaining counters" prose bug the
+          markers are placed to avoid).
+    """
+    lines = text.splitlines()
+    begins = [i for i, ln in enumerate(lines) if ln.strip() == begin]
+    ends = [i for i, ln in enumerate(lines) if ln.strip() == end]
+    if len(begins) != 1:
+        raise ValueError(f"expected exactly one {begin!r} marker, found {len(begins)}")
+    if len(ends) != 1:
+        raise ValueError(f"expected exactly one {end!r} marker, found {len(ends)}")
+    b, e = begins[0], ends[0]
+    if e <= b:
+        raise ValueError(
+            f"end marker at line {e + 1} is not after begin marker at line {b + 1}")
+    block = lines[b + 1:e]
+    if not block:
+        raise ValueError("no lines between the markers - empty extraction")
+    stripped = []
+    for i, ln in enumerate(block):
+        if ln == "  #":
+            stripped.append("")
+        elif ln.startswith("  # "):
+            stripped.append(ln[4:])
+        else:
+            raise ValueError(
+                f"line {b + 2 + i} between the markers is not a '  # '-prefixed "
+                f"comment line: {ln!r}")
+    if not any(s.strip() for s in stripped):
+        raise ValueError("extraction contained only blank lines")
+    return "\n".join(stripped)
+
+
+def build_extracted_rules_text(rules_text: str) -> str:
+    """The extracted `yuzu-guardian-journal` group, wrapped as a standalone
+    rules file. Raises ValueError on the same conditions as
+    `extract_marked_block`; the caller decides how to fail closed."""
+    block = extract_marked_block(rules_text, EXTRACT_BEGIN, EXTRACT_END)
+    indented = "\n".join(("  " + ln if ln else ln) for ln in block.split("\n"))
+    return f"groups:\n{indented}\n"
+
+
+def materialize_extracted_rules() -> None:
+    """Write the extracted group to `EXTRACTED_RULES`, fresh every run. This
+    is a generated artifact (gitignored), never the committed RULES file -
+    the production group stays commented; this is a temp-materialized copy
+    promtool can actually load.
+
+    FAILS CLOSED on the extraction itself (see `extract_marked_block`) and,
+    separately, on the wrapped result not parsing as a single non-empty
+    `groups:` entry with at least one rule - the "zero rules parsed" leg of
+    Part 1's fail-closed set, checked HERE with PyYAML rather than left to
+    promtool's own `SUCCESS: 0 rules found` path, because a YAML syntax
+    error in the wrapped text (as opposed to a structurally-empty one) would
+    otherwise surface as an opaque promtool parse failure instead of naming
+    what this script did wrong.
+
+    PyYAML is required on this path unconditionally - this only ever runs
+    right before a real promtool invocation (`gate()` is about to call that
+    invocation's exit 0 evidence), so a missing parser here must fail the
+    same way `inspect_test_file(strict=True)` already does, not skip.
+    """
+    try:
+        import yaml  # noqa: PLC0415 - see below
+    except ImportError:
+        sys.exit(
+            "FAIL: PyYAML is unavailable, so the extracted-group rules file "
+            "cannot be validated before handing it to promtool. Install "
+            "PyYAML (`pip install pyyaml`), or unset any promtool from PATH "
+            "to skip these tests instead."
+        )
+    rules_text = (REPO_ROOT / RULES).read_text(encoding="utf-8")
+    try:
+        wrapped = build_extracted_rules_text(rules_text)
+    except ValueError as ex:
+        sys.exit(
+            f"FAIL: could not extract the {EXTRACT_GROUP!r} block from {RULES}: {ex}"
+        )
+    try:
+        doc = yaml.safe_load(wrapped)
+    except yaml.YAMLError as ex:
+        sys.exit(
+            f"FAIL: the extracted {EXTRACT_GROUP!r} block does not parse as YAML "
+            f"once unwrapped ({ex})."
+        )
+    groups = isinstance(doc, dict) and doc.get("groups")
+    rules = (isinstance(groups, list) and len(groups) == 1
+             and isinstance(groups[0], dict) and groups[0].get("rules"))
+    if not rules:
+        sys.exit(
+            f"FAIL: the extracted {EXTRACT_GROUP!r} block did not unwrap to a "
+            f"single `groups:` entry with at least one rule - 0 rules parsed."
+        )
+    dest = REPO_ROOT / EXTRACTED_RULES
+    # Refuse to write THROUGH a pre-existing symlink at either level, rather
+    # than follow it (#2340 PR-4 adversarial review). `build_canary_tree`'s
+    # sibling hazard is covered by razing its whole scratch tree before every
+    # rebuild; this path has no such raze step, so it needs its own explicit
+    # check. Not a privilege boundary on its own - anything that can commit a
+    # symlink here already has code execution on this no-secrets runner - but
+    # cheap enough to close outright rather than accept.
+    if dest.parent.is_symlink():
+        sys.exit(f"FAIL: {dest.parent} exists and is a symlink; refusing to write through it.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_symlink() or dest.exists():
+        dest.unlink()
+    dest.write_text(wrapped, encoding="utf-8")
+    # Same restrictive-umask hazard `build_canary_tree` chmods for (see its
+    # comment): the container runs as uid 65534, and a 077 umask (a common
+    # hardened-shell/CI default) would otherwise leave this 0700/0600 and
+    # unreadable to it. MEASURED (adversarial review, #2340 PR-4): without
+    # this, `umask 077` makes the second gate fail on a permission error
+    # before promtool ever opens the file.
+    dest.parent.chmod(0o755)
+    dest.chmod(0o644)
+
+
 # The canary mutation. `unless` is what makes YuzuAuditRetentionNotRunning's
 # never-ran grace an EXCLUSION; `and` inverts it so the rule can fire ONLY on a
 # never-anchored database, and every case asserting it FIRES on an anchored one
@@ -339,32 +502,39 @@ CANARY_FROM = "\n          unless (\n"
 CANARY_TO = "\n          and (\n"
 
 
-def build_canary_tree(dest: Path) -> None:
-    """Mirror RULES + TESTS under `dest`, with RULES deliberately broken.
+def build_canary_tree(dest: Path, rules_rel: str, tests_rel: str,
+                      canary_from: str, canary_to: str) -> None:
+    """Mirror `rules_rel` + `tests_rel` under `dest`, with the rules copy
+    deliberately broken.
 
     The layout MIRRORS the repo because promtool resolves a test file's
     `rule_files:` relative to THE TEST FILE, not to cwd. Copying the test file
     byte-unchanged is the whole point: its own glob is the thing under test.
+
+    GENERALIZED (#2340 PR-4) to take rules/tests/canary as parameters rather
+    than the module-level RULES/TESTS/CANARY_FROM/CANARY_TO, so the same
+    mirror-and-mutate logic serves both the shipped gate and the extracted
+    yuzu-guardian-journal gate - one canary implementation, not two.
     """
-    for rel in (RULES, TESTS):
+    for rel in (rules_rel, tests_rel):
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy(REPO_ROOT / TESTS, dest / TESTS)
-    text = (REPO_ROOT / RULES).read_text(encoding="utf-8")
+    shutil.copy(REPO_ROOT / tests_rel, dest / tests_rel)
+    text = (REPO_ROOT / rules_rel).read_text(encoding="utf-8")
     # Exactly-one, not merely present (#2854 rung D governance UP-16): with
     # `replace(..., 1)` a SECOND match added above the intended rule would be
     # the one mutated - its own cases might redden, and the real target's
     # grace would go unguarded while the canary reports success. Presence
     # alone cannot see that; the count can.
-    n = text.count(CANARY_FROM)
+    n = text.count(canary_from)
     if n != 1:
         sys.exit(
-            f"FAIL: canary anchor {CANARY_FROM!r} matches {n} times in {RULES} "
+            f"FAIL: canary anchor {canary_from!r} matches {n} times in {rules_rel} "
             f"(need exactly 1), so the canary would mutate the wrong site or "
             f"nothing - silently inert, which is the exact failure it exists to "
-            f"catch. Re-anchor CANARY_FROM/CANARY_TO to the intended rule."
+            f"catch. Re-anchor the canary to the intended rule."
         )
-    (dest / RULES).write_text(text.replace(CANARY_FROM, CANARY_TO, 1),
-                              encoding="utf-8")
+    (dest / rules_rel).write_text(text.replace(canary_from, canary_to, 1),
+                                  encoding="utf-8")
     # The container runs as uid 65534 with the tree mounted read-only. Under a
     # restrictive umask (077 is a common hardened-shell and CI default) these
     # files are created 0600/0700 and promtool cannot stat them - it exits
@@ -376,12 +546,18 @@ def build_canary_tree(dest: Path) -> None:
         path.chmod(0o755 if path.is_dir() else 0o644)
 
 
-def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> int:
+def gate(promtool_argv: list[str], rules: str, tests: str, *,
+        rules_rel: str = RULES, tests_rel: str = TESTS,
+        canary_from: str = CANARY_FROM, canary_to: str = CANARY_TO,
+        canary_for=None) -> int:
     """`check rules`, `test rules`, prove the run was not vacuous, then prove
-    the behaviour suite is testing THE SHIPPED RULES.
+    the behaviour suite is testing THE RULES FILE UNDER TEST (`rules`/
+    `rules_rel` - the shipped file by default, or whichever file a caller
+    passes; #2340 PR-4 generalized this to also serve the never-shipped
+    extracted-group pair).
 
     THAT LAST STEP EXISTS BECAUSE THE FIRST TWO VALIDATE DIFFERENT FILES.
-    `check rules` is handed `RULES` by this script. `test rules` is handed the
+    `check rules` is handed `rules` by the caller. `test rules` is handed the
     TEST file, and promtool then loads whatever THAT file's own `rule_files:`
     glob names. Nothing tied the two together. MEASURED on 3.13.1 (#2553 pass
     13): point the glob at a real-but-wrong rules file and make the assertions
@@ -389,9 +565,9 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     found" - a count that came from a file the behaviour run never opened.
 
     The vacuity guard above cannot see it: there ARE cases, there ARE
-    assertions, and not one of them is empty. So instead we break a COPY of the
-    shipped rules and require the suite to notice. A suite that stays green
-    against deliberately broken rules is not testing them.
+    assertions, and not one of them is empty. So instead we break a COPY of
+    the rules under test and require the suite to notice. A suite that stays
+    green against deliberately broken rules is not testing them.
 
     Note what this deliberately does NOT do: parse the glob or canonicalise
     paths. An earlier revision reimplemented Go's `filepath.Glob` in Python to
@@ -404,15 +580,24 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     rc, test_out = run(promtool_argv + ["test", "rules", tests], timeout=120)
     if rc:
         return rc
-    reason = check_gate_output(check_out, test_out, inspect_test_file(strict=True))
+    reason = check_gate_output(check_out, test_out,
+                               inspect_test_file(tests_rel, strict=True),
+                               tests_label=tests_rel)
     if reason:
         sys.exit(f"FAIL: promtool exited 0 but the run proves nothing - {reason}")
     if canary_for is None:
         return 0
-    tmp = REPO_ROOT / ".promtool-canary"
-    shutil.rmtree(tmp, ignore_errors=True)
+    # A UNIQUE directory per call, not a fixed name (#2340 PR-4 adversarial
+    # review, UP-1). This function now runs TWICE per script invocation (once
+    # per gate) - a fixed ".promtool-canary" name meant a second concurrent
+    # invocation of this script against the same checkout could have one
+    # process's `finally` rmtree race another's read of the mutated tree,
+    # turning an I/O error into a wrongly-trusted "canary reddened" verdict.
+    # `mkdtemp` under REPO_ROOT keeps it on the same filesystem as the mount
+    # docker needs, with no collision possible between concurrent callers.
+    tmp = Path(tempfile.mkdtemp(dir=REPO_ROOT, prefix=".promtool-canary-"))
     try:
-        build_canary_tree(tmp)
+        build_canary_tree(tmp, rules_rel, tests_rel, canary_from, canary_to)
         canary_argv, canary_tests, canary_rules = canary_for(tmp)
         # Quiet on purpose: a PASSING canary means promtool printed a wall of
         # `FAILED:` detail, which above the reassuring line reads as a broken
@@ -447,7 +632,7 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     loaded = re.search(r"SUCCESS:\s*(\d+)\s+rules found", canary_check_out)
     if canary_check_rc != 0 or not loaded or int(loaded.group(1)) == 0:
         sys.exit(
-            f"FAIL: the canary's mutated copy of {RULES} could not be read back "
+            f"FAIL: the canary's mutated copy of {rules_rel} could not be read back "
             f"(rc {canary_check_rc}, "
             f"{'no rule count reported' if not loaded else loaded.group(1) + ' rules'}), "
             f"so a `FAILED` from the suite would prove only that promtool could "
@@ -464,10 +649,10 @@ def gate(promtool_argv: list[str], rules: str, tests: str, canary_for=None) -> i
     if canary_rc == 0:
         sys.exit(
             f"FAIL: the suite stayed GREEN against a deliberately broken copy of "
-            f"{RULES} ({CANARY_FROM!r} -> {CANARY_TO!r}), so it is not testing "
-            f"the shipped rules. TWO causes produce this, both measured:\n"
-            f"  1. `rule_files:` in {TESTS} names a different file. That is what "
-            f"the behaviour run loads; `check rules` above validated {RULES}, so "
+            f"{rules_rel} ({canary_from!r} -> {canary_to!r}), so it is not testing "
+            f"the rules under test. TWO causes produce this, both measured:\n"
+            f"  1. `rule_files:` in {tests_rel} names a different file. That is what "
+            f"the behaviour run loads; `check rules` above validated {rules_rel}, so "
             f"the two halves can disagree silently.\n"
             f"  2. Every assertion is negative (`exp_samples: []`). Those pass "
             f"whatever the rules say - including against no rules at all - so the "
@@ -548,22 +733,28 @@ def pull_with_retry() -> bool:
     # 940s, against a `timeout-minutes: 10` job and a meson `timeout: 600` - so
     # a slow-but-failing registry got killed from outside and reported as "the
     # job timed out", which is the exact diagnosis the per-call timeout was
-    # added to prevent (#2553, Gate 5). Worst case is now 2x90 + 15 = 195s here,
-    # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s.
-    # That is comfortable against meson's 600s, which starts at script launch.
-    # `timeout-minutes` on the `prometheus-rules` job is now 30 (1800s) -
-    # #2854 rung B added a second promtool-driven step
-    # (`blind_band_sweep.py --check`) to the SAME job, sharing this budget
-    # rather than getting its own, and rung D doubled that step's real
-    # (scenario, interval) measurements to 6. Sized to the WORST-CASE SUM of
-    # both steps' own documented ceilings (~465-495s here, ~915s for the
-    # second step - see `docs-lint.yml`'s comment on this job for the full
-    # arithmetic), not to either step's typical measured runtime - sizing to
-    # typical runtime is exactly what let the second step ship with a
-    # per-call ceiling the shared budget could not actually survive if
-    # promtool ever genuinely wedges. Size any FURTHER addition the same way:
-    # against the job's total worst-case budget, not this comment's number
-    # alone - two consumers now draw from it.
+    # added to prevent (#2553, Gate 5). Pull ladder ceiling is 2x90 + 15 = 195s
+    # here, plus ~30s for the daemon probe: 225s before a single promtool call.
+    # ONE full gate() - check + test + the canary's own test + check, all
+    # timeout=120 - is 4x120s = 480s worst case; an earlier version of this
+    # comment counted only the first two and undercounted its own ceiling by
+    # the canary's 240s. #2340 PR-4 (marker-extraction of yuzu-guardian-journal,
+    # CH-2 + CH-5-PROM) made `main()` run gate() TWICE per invocation - once for
+    # RULES/TESTS, once for the extracted group - so THIS SCRIPT's own worst
+    # case is 225 + 480x2 = 1185s under the docker opt-in (960s on a native
+    # promtool, no pull/probe). meson's `timeout:` on this test covers that
+    # with margin (see tests/meson.build).
+    # `timeout-minutes` on the `prometheus-rules` job covers this script's
+    # docker-path ceiling (1185s) PLUS a second promtool-driven step
+    # (`blind_band_sweep.py --check`) sharing the same job, sized in its own
+    # comment to ~915s - see `docs-lint.yml`'s comment on this job for the
+    # combined arithmetic and current value. Sized to the WORST-CASE SUM of
+    # both steps' own documented ceilings, not to either step's typical
+    # measured runtime - sizing to typical runtime is exactly what let the
+    # second step ship with a per-call ceiling the shared budget could not
+    # actually survive if promtool ever genuinely wedges. Size any FURTHER
+    # addition the same way: against the job's total worst-case budget, not
+    # this comment's number alone - multiple consumers now draw from it.
     #
     # Two attempts, not three: a transient blip clears in seconds and a second
     # try covers it. This still does not pretend to outlast an anonymous Docker
@@ -702,16 +893,71 @@ def selftest() -> int:
         if got != want:
             failures.append(f"count_assertions({why}) = {got}, want {want}")
 
-    # And the shipped file must itself carry assertions in every case.
-    facts = inspect_test_file(strict=False)
-    if facts is not None:
-        if facts.cases == 0:
-            failures.append(f"{TESTS} declares no cases")
-        if facts.assertions == 0:
-            failures.append(f"{TESTS} declares no assertions")
-        if facts.caseless:
-            failures.append(
-                f"{TESTS} has {facts.caseless} case(s) with no assertion block")
+    # And the shipped files must themselves carry assertions in every case -
+    # both the original suite and the marker-extracted one (#2340 PR-4).
+    for tests_rel in (TESTS, EXTRACTED_TESTS):
+        facts = inspect_test_file(tests_rel, strict=False)
+        if facts is not None:
+            if facts.cases == 0:
+                failures.append(f"{tests_rel} declares no cases")
+            if facts.assertions == 0:
+                failures.append(f"{tests_rel} declares no assertions")
+            if facts.caseless:
+                failures.append(
+                    f"{tests_rel} has {facts.caseless} case(s) with no assertion block")
+
+    # And the REAL commented block must itself still extract cleanly (#2340
+    # PR-4 adversarial review: architect + quality-engineer independently -
+    # every case above proves the synthetic-text logic works, but none of
+    # them ever run extraction against the actual shipped RULES file, so a
+    # real-file break - a reformatted indent, a moved marker, a merge that
+    # duplicates one - is caught only by the non-required docs-lint.yml job,
+    # never by the three REQUIRED build legs this selftest runs on).
+    # build_extracted_rules_text() needs no PyYAML (that's
+    # materialize_extracted_rules()'s job, which also validates and is gate-
+    # path-only) so this is safe to run unconditionally here.
+    try:
+        build_extracted_rules_text((REPO_ROOT / RULES).read_text(encoding="utf-8"))
+    except ValueError as ex:
+        failures.append(f"extraction of the real {EXTRACT_GROUP!r} block failed: {ex}")
+
+    # extract_marked_block() ITSELF, against synthetic text with KNOWN
+    # answers - Part 1's fail-closed set (marker missing, duplicate, empty
+    # extraction, a malformed line inside the block) each needs its own
+    # case proving the harness catches it, not just the shipped file's
+    # shape (same reasoning as the count_assertions rows above).
+    B, E = "# BEGIN", "# END"
+
+    def extract_fails(text: str, *, contains: str) -> bool:
+        try:
+            extract_marked_block(text, B, E)
+        except ValueError as ex:
+            if contains not in str(ex):
+                failures.append(
+                    f"extract_marked_block wrong reason for {contains!r}: {ex}")
+            return True
+        return False
+
+    if not extract_fails("no markers here at all\n", contains="found 0"):
+        failures.append("a missing begin/end marker was accepted")
+    if not extract_fails(f"  {B}\n  # x\n  {E}\n  {B}\n  # y\n  {E}\n",
+                         contains="found 2"):
+        failures.append("a duplicated marker was accepted")
+    if not extract_fails(f"  {B}\n  {E}\n", contains="empty extraction"):
+        failures.append("zero lines between the markers was accepted")
+    if not extract_fails(f"  {B}\n  #\n  #\n  {E}\n", contains="only blank"):
+        failures.append("a block of only blank comment lines was accepted")
+    if not extract_fails(f"  {E}\n  # x\n  {B}\n", contains="not after"):
+        failures.append("an END marker before BEGIN was accepted")
+    if not extract_fails(f"  {B}\n  # ok\n  not a comment line\n  {E}\n",
+                         contains="not a '  # '-prefixed"):
+        failures.append("a non-comment line inside the block was accepted")
+    # The GOOD path, so the checks above are not just testing that everything
+    # fails: a clean two-line block strips its prefix and blank lines survive
+    # as blank, not as "  #" or missing entirely.
+    good = extract_marked_block(f"  {B}\n  # - name: x\n  #   rules: []\n  #\n  {E}\n",
+                                B, E)
+    check("clean extraction", good, "- name: x\n  rules: []\n")
 
     for f in failures:
         print(f"SELFTEST FAIL: {f}", flush=True)
@@ -743,11 +989,23 @@ def main(argv: list[str]) -> int:
                 )
                 return SKIP
             print(f"using native promtool: {exe} (major {major})", flush=True)
+            materialize_extracted_rules()
             # Native resolves the canary tree by absolute path; `run()`'s cwd is
             # REPO_ROOT, which is the wrong root for the mirror.
-            return gate([exe], RULES, TESTS,
-                        canary_for=lambda root: ([exe], str(root / TESTS),
-                                                       str(root / RULES)))
+            rc = gate([exe], RULES, TESTS,
+                     canary_for=lambda root: ([exe], str(root / TESTS),
+                                                    str(root / RULES)))
+            if rc:
+                return rc
+            # SECOND GATE: the marker-extracted yuzu-guardian-journal group
+            # (#2340 CH-2 + CH-5-PROM). Same machinery, its own rules/tests/
+            # canary - RULES itself stays commented; only the generated copy
+            # at EXTRACTED_RULES is ever handed to promtool.
+            return gate([exe], EXTRACTED_RULES, EXTRACTED_TESTS,
+                        rules_rel=EXTRACTED_RULES, tests_rel=EXTRACTED_TESTS,
+                        canary_from=EXTRACTED_CANARY_FROM, canary_to=EXTRACTED_CANARY_TO,
+                        canary_for=lambda root: ([exe], str(root / EXTRACTED_TESTS),
+                                                       str(root / EXTRACTED_RULES)))
 
         print(
             f"SKIP: no usable promtool on PATH and {DOCKER_OPT_IN} is unset. Set "
@@ -769,9 +1027,22 @@ def main(argv: list[str]) -> int:
     if not pull_with_retry():
         sys.exit(f"FAIL: could not pull {PROMTOOL_IMAGE} after {PULL_ATTEMPTS} attempts.")
 
-    return gate(docker_argv(), f"/w/{RULES}", f"/w/{TESTS}",
-                canary_for=lambda root: (docker_argv(root), f"/w/{TESTS}",
-                                                 f"/w/{RULES}"))
+    materialize_extracted_rules()
+    rc = gate(docker_argv(), f"/w/{RULES}", f"/w/{TESTS}",
+             canary_for=lambda root: (docker_argv(root), f"/w/{TESTS}",
+                                              f"/w/{RULES}"))
+    if rc:
+        return rc
+    # SECOND GATE: the marker-extracted yuzu-guardian-journal group (#2340
+    # CH-2 + CH-5-PROM). Same pinned image, same hardening, its own
+    # rules/tests/canary - RULES itself stays commented; only the generated
+    # copy at EXTRACTED_RULES (mounted read-only inside the SAME /w tree) is
+    # ever handed to promtool.
+    return gate(docker_argv(), f"/w/{EXTRACTED_RULES}", f"/w/{EXTRACTED_TESTS}",
+                rules_rel=EXTRACTED_RULES, tests_rel=EXTRACTED_TESTS,
+                canary_from=EXTRACTED_CANARY_FROM, canary_to=EXTRACTED_CANARY_TO,
+                canary_for=lambda root: (docker_argv(root), f"/w/{EXTRACTED_TESTS}",
+                                                 f"/w/{EXTRACTED_RULES}"))
 
 
 if __name__ == "__main__":

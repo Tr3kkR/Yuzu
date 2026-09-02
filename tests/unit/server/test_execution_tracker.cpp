@@ -14,6 +14,10 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <latch>
 #include <string>
 #include <thread>
 #include <vector>
@@ -155,6 +159,182 @@ TEST_CASE("ExecutionTracker: query with limit", "[pg][execution_tracker]") {
     REQUIRE(results.size() == 5);
 }
 
+// ── #3789: query_executions_checked / SQL scope pushdown ──────────────────
+
+TEST_CASE("ExecutionTracker: query_executions_checked with no scope matches query_executions",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    REQUIRE(tracker.create_execution(make_execution("def-a")).has_value());
+    REQUIRE(tracker.create_execution(make_execution("def-b")).has_value());
+
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, std::nullopt);
+    REQUIRE(checked.has_value());
+    CHECK(checked->size() == 2);
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope admits the owner's own "
+          "dispatch before any agent has responded",
+          "[pg][execution_tracker]") {
+    // #3789 finding: agent_exec_status is response-arrival seeded, so a
+    // just-dispatched execution has zero status rows. Without the owner
+    // disjunct, this execution would be invisible to its own dispatcher
+    // under an engaged scope.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution("def-owner", "scope", "bob"));
+    REQUIRE(id.has_value());
+
+    ExecutionListScope scope;
+    scope.owner = "bob";
+    // visible_agents deliberately empty — no agent has reported yet.
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 1);
+    CHECK((*checked)[0].id == *id);
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope admits via a visible "
+          "agent's status row even when the caller is not the dispatcher",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution("def-teammate", "scope", "alice"));
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "bob-agent";
+    as.status = "success";
+    tracker.update_agent_status(*id, as);
+
+    ExecutionListScope scope;
+    scope.owner = "bob"; // not the dispatcher
+    scope.visible_agents = {"bob-agent"};
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 1);
+    CHECK((*checked)[0].id == *id);
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope excludes an execution "
+          "neither dispatched by the owner nor reported by a visible agent",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution("def-hidden", "scope", "alice"));
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "alice-agent";
+    as.status = "success";
+    tracker.update_agent_status(*id, as);
+
+    ExecutionListScope scope;
+    scope.owner = "bob";
+    scope.visible_agents = {"bob-agent"}; // does not include alice-agent
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    CHECK(checked->empty());
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked engaged-empty scope (no owner, "
+          "no visible agents) excludes every row",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+    REQUIRE(tracker.create_execution(make_execution()).has_value());
+
+    ExecutionListScope scope; // owner empty, visible_agents empty
+    auto checked = tracker.query_executions_checked(ExecutionQuery{}, scope);
+    REQUIRE(checked.has_value());
+    CHECK(checked->empty());
+}
+
+TEST_CASE("ExecutionTracker: query_executions_checked scope pushdown respects "
+          "LIMIT ordering (INV-3) — a hidden newer execution must not consume the "
+          "page while an older visible one exists",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    // Older, visible (dispatched by bob).
+    Execution visible_exec = make_execution("def-visible", "scope", "bob");
+    visible_exec.dispatched_at = 1000;
+    REQUIRE(tracker.create_execution(visible_exec).has_value());
+    // Newer, hidden (dispatched by someone else, no visible-agent row).
+    Execution hidden_exec = make_execution("def-hidden", "scope", "alice");
+    hidden_exec.dispatched_at = 2000;
+    REQUIRE(tracker.create_execution(hidden_exec).has_value());
+
+    ExecutionListScope scope;
+    scope.owner = "bob";
+    ExecutionQuery q;
+    q.limit = 1; // if the scope were applied AFTER LIMIT, the hidden newer
+                 // row would consume the only slot and the visible one
+                 // would never be returned.
+    auto checked = tracker.query_executions_checked(q, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->size() == 1);
+    CHECK((*checked)[0].definition_id == "def-visible");
+}
+
+TEST_CASE("ExecutionTracker: get_execution_checked distinguishes absent from present",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto absent = tracker.get_execution_checked("no-such-execution");
+    REQUIRE(absent.has_value()); // not degraded
+    CHECK_FALSE(absent->has_value()); // genuinely absent
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    auto present = tracker.get_execution_checked(*id);
+    REQUIRE(present.has_value());
+    REQUIRE(present->has_value());
+    CHECK((*present)->id == *id);
+}
+
+TEST_CASE("ExecutionTracker: get_agent_statuses_for_executions_checked groups by "
+          "execution id and short-circuits on empty input without degrading",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id_a = tracker.create_execution(make_execution("def-a"));
+    auto id_b = tracker.create_execution(make_execution("def-b"));
+    REQUIRE(id_a.has_value());
+    REQUIRE(id_b.has_value());
+    AgentExecStatus a1;
+    a1.agent_id = "agent-1";
+    a1.status = "success";
+    tracker.update_agent_status(*id_a, a1);
+
+    auto checked = tracker.get_agent_statuses_for_executions_checked({*id_a, *id_b});
+    REQUIRE(checked.has_value());
+    CHECK(checked->at(*id_a).size() == 1);
+    CHECK(checked->find(*id_b) == checked->end()); // no rows -> no key, not degrade
+
+    auto empty_result = tracker.get_agent_statuses_for_executions_checked({});
+    REQUIRE(empty_result.has_value());
+    CHECK(empty_result->empty());
+}
+
+TEST_CASE("ExecutionTracker: get_children_checked distinguishes genuinely-no-children "
+          "from a degraded read",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    auto checked = tracker.get_children_checked(*id);
+    REQUIRE(checked.has_value()); // not degraded
+    CHECK(checked->empty());      // genuinely no children
+}
+
 // ── Update Agent Status ────────────────────────────────────────────────────
 
 TEST_CASE("ExecutionTracker: update_agent_status dispatched -> running -> success",
@@ -188,6 +368,76 @@ TEST_CASE("ExecutionTracker: update_agent_status dispatched -> running -> succes
     CHECK(statuses[0].agent_id == "agent-1");
     CHECK(statuses[0].status == "success");
     CHECK(statuses[0].exit_code == 0);
+}
+
+TEST_CASE("ExecutionTracker: a stale 'running' update arriving AFTER a terminal status does not "
+          "regress the row (CHAOS-TTL-1 keepalive hardening)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // security-guardian finding on the CHAOS-TTL-1 agent-core keepalive: the
+    // keepalive thread's periodic snapshot-then-write of in_flight_ids_ has
+    // no re-check against a command that completes mid-sweep — an ordinary
+    // race, no attacker required — so a stale keepalive 'running' response
+    // can legitimately arrive at the server strictly AFTER the command's own
+    // real terminal response. Without this guard, the unconditional
+    // ON CONFLICT upsert would flip an already-terminal row back to
+    // status='running', completed_at=0, silently corrupting the executions
+    // drawer / SSE / per-agent KPI surface with no self-healing signal ever
+    // arriving afterward (agents do not re-send a terminal status).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id_result = tracker.create_execution(make_execution());
+    REQUIRE(id_result.has_value());
+
+    AgentExecStatus terminal;
+    terminal.agent_id = "agent-1";
+    terminal.status = "success";
+    terminal.dispatched_at = 1000;
+    terminal.first_response_at = 1001;
+    terminal.completed_at = 1002;
+    terminal.exit_code = 0;
+    tracker.update_agent_status(*id_result, terminal);
+
+    // A stale keepalive ping, reordered to arrive strictly after the
+    // terminal write — same shape as ExecutionTracker::renew_concurrency_
+    // claim's caller (notify_exec_tracker's RUNNING case), different
+    // (larger, nonzero) exit_code/error_detail to prove these columns are
+    // untouched too, not just `status`.
+    AgentExecStatus stale_running;
+    stale_running.agent_id = "agent-1";
+    stale_running.status = "running";
+    stale_running.first_response_at = 1050; // later than the real one — must NOT move it either
+    stale_running.completed_at = 0;
+    stale_running.exit_code = 99;
+    stale_running.error_detail = "should never be visible";
+    tracker.update_agent_status(*id_result, stale_running);
+
+    auto statuses = tracker.get_agent_statuses(*id_result);
+    REQUIRE(statuses.size() == 1);
+    CHECK(statuses[0].status == "success");
+    CHECK(statuses[0].completed_at == 1002);
+    CHECK(statuses[0].exit_code == 0);
+    CHECK(statuses[0].error_detail.empty());
+    // first_response_at's own "only fill if zero" rule already protects this
+    // column independently of the terminal guard — confirm both hold together.
+    CHECK(statuses[0].first_response_at == 1001);
+
+    // A genuine SECOND terminal write (e.g. HA WS-0 redelivery) still applies
+    // normally — the guard is scoped to 'running' overwriting terminal, not
+    // to terminal-vs-terminal.
+    AgentExecStatus second_terminal;
+    second_terminal.agent_id = "agent-1";
+    second_terminal.status = "failure";
+    second_terminal.completed_at = 2000;
+    second_terminal.exit_code = 1;
+    second_terminal.error_detail = "redelivered as failure";
+    tracker.update_agent_status(*id_result, second_terminal);
+
+    auto restatuses = tracker.get_agent_statuses(*id_result);
+    REQUIRE(restatuses.size() == 1);
+    CHECK(restatuses[0].status == "failure");
+    CHECK(restatuses[0].completed_at == 2000);
+    CHECK(restatuses[0].error_detail == "redelivered as failure");
 }
 
 TEST_CASE("ExecutionTracker: update_agent_status failure with error_detail",
@@ -699,6 +949,24 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     CHECK(closed.get_summary("exec-1").id == "exec-1"); // id echoed, everything else defaulted
     CHECK(closed.get_agent_statuses("exec-1").empty());
 
+    // #3789: the checked twins must fail closed (nullopt/unexpected), not
+    // collapse to the plain methods' empty-on-degrade shape — a caller that
+    // drops rows or writes `denied` audit rows off these results must be
+    // able to tell "degraded" from "genuinely nothing here".
+    CHECK_FALSE(closed.query_executions_checked(ExecutionQuery{}).has_value());
+    auto exec_checked = closed.get_execution_checked("exec-1");
+    REQUIRE_FALSE(exec_checked.has_value());
+    CHECK(exec_checked.error() == "execution tracker not open");
+    CHECK_FALSE(closed.get_children_checked("exec-1").has_value());
+    CHECK_FALSE(
+        closed.get_agent_statuses_for_executions_checked({"exec-1"}).has_value());
+    // Engaged-empty still short-circuits on a closed store — zero requested
+    // ids is a success-empty outcome, not a degrade, regardless of whether
+    // the store could otherwise serve the request.
+    auto empty_ids_result = closed.get_agent_statuses_for_executions_checked({});
+    REQUIRE(empty_ids_result.has_value());
+    CHECK(empty_ids_result->empty());
+
     auto created = closed.create_execution(make_execution());
     REQUIRE_FALSE(created.has_value());
     CHECK(created.error() == "database not open");
@@ -1075,4 +1343,1047 @@ TEST_CASE("ExecutionTracker: the four non-tracked correlation-id VALUES "
         REQUIRE(looked_up.has_value());
         CHECK(*looked_up == execution_id);
     }
+}
+
+// ── Per-device concurrency claims (ADR-1007) ────────────────────────────────
+
+TEST_CASE("ExecutionTracker: claim_concurrency_slots wins an uncontested claim",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto claimed = tracker.claim_concurrency_slots("def-conc-1", "exec-1", "cmd-test-1", {"agent-a", "agent-b"},
+                                                    /*expires_at=*/9999999999);
+    CHECK(claimed.size() == 2);
+    CHECK(std::find(claimed.begin(), claimed.end(), "agent-a") != claimed.end());
+    CHECK(std::find(claimed.begin(), claimed.end(), "agent-b") != claimed.end());
+}
+
+TEST_CASE("ExecutionTracker: claim_concurrency_slots refuses an agent already claimed for the "
+          "SAME definition_id",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto first =
+        tracker.claim_concurrency_slots("def-conc-2", "exec-1", "cmd-test-2", {"agent-a"}, 9999999999);
+    REQUIRE(first.size() == 1);
+
+    // Same definition, same agent, a DIFFERENT execution — this is exactly
+    // the same-device-double-dispatch scenario the whole mechanism exists
+    // to prevent. The partial unique index (ux_concurrency_claims_open), not
+    // any timing, is what makes this deterministic — a plain sequential
+    // second call already exercises the constraint that a real concurrent
+    // race would also hit; see the dedicated race test below for genuine
+    // thread contention on the same claim.
+    auto second =
+        tracker.claim_concurrency_slots("def-conc-2", "exec-2", "cmd-test-3", {"agent-a"}, 9999999999);
+    CHECK(second.empty());
+}
+
+TEST_CASE("ExecutionTracker: claim_concurrency_slots does NOT block a DIFFERENT definition_id "
+          "on the same agent",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    // Real duplicate-(plugin,action) definitions exist in shipped content
+    // (antivirus/status, filesystem/replace, filesystem/get_version_info) —
+    // the claim is keyed on definition_id, never (plugin,action), and this
+    // proves two DIFFERENT definitions never cross-block each other even
+    // when they would resolve to the same agent plugin call.
+    auto first = tracker.claim_concurrency_slots("def-conc-A", "exec-1", "cmd-test-4", {"agent-a"}, 9999999999);
+    auto second =
+        tracker.claim_concurrency_slots("def-conc-B", "exec-2", "cmd-test-5", {"agent-a"}, 9999999999);
+    CHECK(first.size() == 1);
+    CHECK(second.size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: two threads racing the SAME (definition_id, agent_id) — exactly "
+          "one wins",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    // Genuine concurrent contention (not just the sequential-call proof
+    // above) — the pool hands each thread its own connection, and the
+    // partial unique index is what actually serializes the two INSERTs.
+    // Gate 3 quality-engineer SHOULD: correctness here holds regardless of
+    // true overlap (a single atomic INSERT...ON CONFLICT can't leak a
+    // second winner even if the two calls happen to run sequentially), but
+    // a rendezvous barrier makes this an actual concurrency stress test
+    // rather than a restatement of the sequential proof above — both
+    // threads submit at the same instant instead of whichever the OS
+    // scheduler happens to run first.
+    std::latch start_gate{2};
+    std::atomic<int> won{0};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 2; ++i) {
+        threads.emplace_back([&] {
+            start_gate.arrive_and_wait();
+            auto claimed = tracker.claim_concurrency_slots("def-conc-race", "exec-race", "cmd-test-6",
+                                                            {"agent-race"}, 9999999999);
+            if (!claimed.empty())
+                won.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+    for (auto& t : threads)
+        t.join();
+    CHECK(won.load() == 1);
+}
+
+TEST_CASE("ExecutionTracker: release_concurrency_claim frees the slot for a new claim",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto first =
+        tracker.claim_concurrency_slots("def-conc-3", "exec-1", "cmd-test-7", {"agent-a"}, 9999999999);
+    REQUIRE(first.size() == 1);
+    tracker.release_concurrency_claim("def-conc-3", "exec-1", "agent-a");
+
+    auto second =
+        tracker.claim_concurrency_slots("def-conc-3", "exec-2", "cmd-test-8", {"agent-a"}, 9999999999);
+    CHECK(second.size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: release_concurrency_claim/s do NOT cross-release a different "
+          "definition's open claim when execution_id collides (Gate 2 security-guardian "
+          "finding, PR #3784 fix round)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // Every workflow-step dispatch (workflow_routes.cpp) shares the literal
+    // empty string as execution_id across EVERY definition it dispatches
+    // (CONSIST-2/sec-M2, pending real correlation) — so two DIFFERENT
+    // per-device definitions can each hold a genuinely open claim on the
+    // same agent under the SAME (empty) execution_id at the same time.
+    // Releasing/renewing by (execution_id, agent_id) alone would therefore
+    // touch BOTH definitions' rows on a release meant for only one —
+    // reopening the exact double-dispatch race this feature exists to
+    // prevent for whichever definition's claim got released early.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    const std::string shared_exec_id; // the empty-string collision, verbatim
+
+    auto claim_x =
+        tracker.claim_concurrency_slots("def-conc-collide-x", shared_exec_id, "cmd-test-9", {"agent-a"},
+                                        9999999999);
+    REQUIRE(claim_x.size() == 1);
+    auto claim_y =
+        tracker.claim_concurrency_slots("def-conc-collide-y", shared_exec_id, "cmd-test-10", {"agent-a"},
+                                        9999999999);
+    REQUIRE(claim_y.size() == 1); // different definition_id — NOT blocked by X's claim
+
+    // Release Y's claim only. X must stay open.
+    tracker.release_concurrency_claim("def-conc-collide-y", shared_exec_id, "agent-a");
+
+    auto x_still_open = tracker.claim_concurrency_slots("def-conc-collide-x", "exec-other", "cmd-test-11",
+                                                         {"agent-a"}, 9999999999);
+    CHECK(x_still_open.empty()); // still held by the original claim — NOT released
+
+    auto y_now_free = tracker.claim_concurrency_slots("def-conc-collide-y", "exec-other", "cmd-test-12",
+                                                       {"agent-a"}, 9999999999);
+    REQUIRE(y_now_free.size() == 1); // Y's release worked correctly
+    // Release this probe claim too, or the batched re-claim below (a
+    // DIFFERENT execution_id) legitimately fails — Y would still be held.
+    tracker.release_concurrency_claim("def-conc-collide-y", "exec-other", "agent-a");
+
+    // Batched sibling: re-claim Y, then release it via release_concurrency_claims
+    // alongside an id that was never claimed at all — same collision shape.
+    auto claim_y2 = tracker.claim_concurrency_slots("def-conc-collide-y", shared_exec_id, "cmd-test-13",
+                                                     {"agent-a"}, 9999999999);
+    REQUIRE(claim_y2.size() == 1);
+    tracker.release_concurrency_claims("def-conc-collide-y", shared_exec_id, {"agent-a"});
+
+    auto x_still_open2 = tracker.claim_concurrency_slots("def-conc-collide-x", "exec-other2", "cmd-test-14",
+                                                          {"agent-a"}, 9999999999);
+    CHECK(x_still_open2.empty()); // X's claim survives the batched release too
+}
+
+TEST_CASE("ExecutionTracker: renew_concurrency_claim does NOT touch a different definition's "
+          "open claim when execution_id collides (Gate 3 quality-engineer finding, PR #3784 "
+          "fix round)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // Sibling gap to the release_concurrency_claim/s test above — renew_concurrency_claim
+    // shares the identical unscoped-match hazard (fixed with the identical definition_id
+    // parameter, same fix round) but had no direct regression test of its own; the only
+    // test that reaches it (the CHAOS-TTL-1 renewal test) uses a single definition_id, so
+    // it cannot detect a dropped/misordered definition_id filter in renew's WHERE clause.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    const std::string shared_exec_id; // the empty-string collision, verbatim
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+
+    // X claims with a short TTL (about to expire); Y claims with a long one.
+    auto claim_x = tracker.claim_concurrency_slots("def-conc-renew-x", shared_exec_id, "cmd-test-15",
+                                                    {"agent-a"}, /*expires_at=*/now + 2);
+    REQUIRE(claim_x.size() == 1);
+    auto claim_y = tracker.claim_concurrency_slots("def-conc-renew-y", shared_exec_id, "cmd-test-16",
+                                                    {"agent-a"}, /*expires_at=*/now + 2);
+    REQUIRE(claim_y.size() == 1); // different definition_id — NOT blocked by X's claim
+
+    // Renew ONLY Y. If renew_concurrency_claim's WHERE clause lost its
+    // definition_id scoping, this UPDATE would touch BOTH rows (same
+    // execution_id, same agent_id) and X's claim would be renewed too —
+    // silently reopening this fix's own hazard on the renewal side.
+    tracker.renew_concurrency_claim("def-conc-renew-y", shared_exec_id, "agent-a");
+
+    // Prime the reconciler anchor, then advance past X's ORIGINAL (unrenewed)
+    // expiry. X must be force-released; Y must NOT be — proving the renewal
+    // only ever touched Y's row.
+    REQUIRE(tracker.reconcile_stale_concurrency_claims(now) == 0);
+    auto released = tracker.reconcile_stale_concurrency_claims(now + 5);
+    CHECK(released == 1); // only X's claim was past its (unrenewed) expiry
+
+    auto x_free = tracker.claim_concurrency_slots("def-conc-renew-x", "exec-other", "cmd-test-17",
+                                                   {"agent-a"}, 9999999999);
+    CHECK(x_free.size() == 1); // X force-released — never renewed by Y's call
+
+    auto y_still_open = tracker.claim_concurrency_slots("def-conc-renew-y", "exec-other", "cmd-test-18",
+                                                         {"agent-a"}, 9999999999);
+    CHECK(y_still_open.empty()); // Y's claim survived — it WAS correctly renewed
+}
+
+TEST_CASE("ExecutionTracker: update_agent_status releases the claim on a terminal status, NOT "
+          "on 'running'",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto exec_id = tracker.create_execution(make_execution("def-conc-4"));
+    REQUIRE(exec_id.has_value());
+    auto first =
+        tracker.claim_concurrency_slots("def-conc-4", *exec_id, "cmd-test-19", {"agent-a"}, 9999999999);
+    REQUIRE(first.size() == 1);
+
+    AgentExecStatus running;
+    running.agent_id = "agent-a";
+    running.status = "running";
+    tracker.update_agent_status(*exec_id, running);
+
+    // Still held — 'running' is not terminal.
+    auto still_busy =
+        tracker.claim_concurrency_slots("def-conc-4", "exec-other", "cmd-test-20", {"agent-a"}, 9999999999);
+    CHECK(still_busy.empty());
+
+    AgentExecStatus success;
+    success.agent_id = "agent-a";
+    success.status = "success";
+    tracker.update_agent_status(*exec_id, success);
+
+    // Released now.
+    auto now_free =
+        tracker.claim_concurrency_slots("def-conc-4", "exec-other", "cmd-test-21", {"agent-a"}, 9999999999);
+    CHECK(now_free.size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: mark_cancelled does NOT release open claims — cancel is server "
+          "bookkeeping only, the agent may still be executing",
+          "[pg][execution_tracker][concurrency]") {
+    // ADR-1007 correctness fix (Gate 4 unhappy-path UP-1): there is no
+    // gRPC cancel/kill RPC to the agent, so releasing the claim here would
+    // let a duplicate dispatch land on a still-executing agent — the exact
+    // race per-device enforcement exists to prevent. Claims release only
+    // via a genuine terminal agent response or the stale-claim reconciler.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto exec_id = tracker.create_execution(make_execution("def-conc-5"));
+    REQUIRE(exec_id.has_value());
+    auto claimed = tracker.claim_concurrency_slots("def-conc-5", *exec_id, "cmd-test-22",
+                                                    {"agent-a", "agent-b"}, 9999999999);
+    REQUIRE(claimed.size() == 2);
+
+    REQUIRE(tracker.mark_cancelled(*exec_id, "tester"));
+
+    // Still held — cancelling server-side bookkeeping proves nothing about
+    // whether the agent actually stopped.
+    auto still_a =
+        tracker.claim_concurrency_slots("def-conc-5", "exec-other", "cmd-test-23", {"agent-a"}, 9999999999);
+    auto still_b =
+        tracker.claim_concurrency_slots("def-conc-5", "exec-other", "cmd-test-24", {"agent-b"}, 9999999999);
+    CHECK(still_a.empty());
+    CHECK(still_b.empty());
+
+    // A genuine terminal response DOES release it, cancel notwithstanding.
+    AgentExecStatus done;
+    done.agent_id = "agent-a";
+    done.status = "success";
+    tracker.update_agent_status(*exec_id, done);
+    CHECK(tracker.claim_concurrency_slots("def-conc-5", "exec-other", "cmd-test-25", {"agent-a"}, 9999999999)
+              .size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: reconcile_stale_concurrency_claims force-releases a claim past its "
+          "own expires_at",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    const int64_t now = 2000000000;
+    // Prime the persisted anchor first — a reconcile pass with an expired
+    // claim but NO prior anchor correctly declines as Anomaly::NoAnchor
+    // (audit_retention_rules.hpp's documented behavior: a fresh process
+    // with something already expired and no comparison point must not
+    // assume its own clock is trustworthy). This priming call has nothing
+    // expired yet, so it short-circuits to None and just stamps the anchor.
+    REQUIRE(tracker.reconcile_stale_concurrency_claims(now) == 0);
+
+    auto claimed =
+        tracker.claim_concurrency_slots("def-conc-6", "exec-1", "cmd-test-26", {"agent-a"}, /*expires_at=*/now - 100);
+    REQUIRE(claimed.size() == 1);
+
+    // Still open pre-reconcile.
+    CHECK(tracker.claim_concurrency_slots("def-conc-6", "exec-other", "cmd-test-27", {"agent-a"}, now + 100)
+              .empty());
+
+    auto released = tracker.reconcile_stale_concurrency_claims(now);
+    CHECK(released == 1);
+
+    // Free after reconcile.
+    CHECK(tracker.claim_concurrency_slots("def-conc-6", "exec-other", "cmd-test-28", {"agent-a"}, now + 100)
+              .size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: a 'running' status renews the claim's expires_at, so the reconciler "
+          "does not force-release a still-progressing execution (CHAOS-TTL-1)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // Gate 5 chaos finding, PR #3784 fix round (CHAOS-TTL-1): a flat TTL
+    // with no renewal force-releases a claim for a command that legitimately
+    // runs longer than one TTL window, admitting a genuine concurrent
+    // second dispatch. This test proves the SERVER-SIDE renewal mechanism
+    // given a 'running' update; the RELIABLE real-world trigger for that
+    // update — the agent-core keepalive thread, independent of plugin
+    // cooperation — is proven separately in
+    // test_agent_service_impl.cpp's "__keepalive__" test and agent-side in
+    // agents/core/src/agent.cpp. See ADR-1007's "CLOSED (agent-core
+    // keepalive)" section for the full closure story, including why
+    // plugin-cooperation signals (output-buffer auto-flush,
+    // yuzu_ctx_report_progress) were tried and found unreliable first.
+    // renew_concurrency_claim uses real wall-clock time internally
+    // (now_epoch()), unlike claim_concurrency_slots/reconcile_stale_
+    // concurrency_claims elsewhere in this file which take a caller-supplied
+    // synthetic `now` — so this test anchors on real time throughout rather
+    // than the far-future 2000000000 constant used above.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    const int64_t now0 = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    REQUIRE(tracker.reconcile_stale_concurrency_claims(now0) == 0); // prime the anchor
+
+    auto exec_id = tracker.create_execution(make_execution("def-conc-ttl-renew"));
+    REQUIRE(exec_id.has_value());
+    auto claimed = tracker.claim_concurrency_slots("def-conc-ttl-renew", *exec_id, "cmd-test-29", {"agent-a"},
+                                                    /*expires_at=*/now0 + 2);
+    REQUIRE(claimed.size() == 1);
+
+    AgentExecStatus progress;
+    progress.agent_id = "agent-a";
+    progress.status = "running";
+    tracker.update_agent_status(*exec_id, progress); // renews to ~now0 + kConcurrencyClaimDefaultTtlSeconds
+
+    // Walk `now` forward in steps well under the reconciler's own 1h
+    // big-step anomaly floor (kConcurrencyReconcileBigStepFloorSeconds) —
+    // a single jump straight to ~now0+3600 would itself look like a clock
+    // anomaly and decline instead of force-releasing, which would prove
+    // nothing about the renewal.
+    //
+    // Past the ORIGINAL expires_at (now0+2) but nowhere near the renewed
+    // one (~now0+3600) — must NOT force-release.
+    CHECK(tracker.reconcile_stale_concurrency_claims(now0 + 5) == 0);
+    CHECK(tracker.claim_concurrency_slots("def-conc-ttl-renew", "exec-other", "cmd-test-30", {"agent-a"},
+                                          now0 + 100)
+              .empty());
+    CHECK(tracker.reconcile_stale_concurrency_claims(now0 + 1800) == 0);
+    CHECK(tracker.claim_concurrency_slots("def-conc-ttl-renew", "exec-other", "cmd-test-31", {"agent-a"},
+                                          now0 + 100)
+              .empty());
+    CHECK(tracker.reconcile_stale_concurrency_claims(now0 + 3200) == 0);
+    CHECK(tracker.claim_concurrency_slots("def-conc-ttl-renew", "exec-other", "cmd-test-32", {"agent-a"},
+                                          now0 + 100)
+              .empty());
+
+    // Past the RENEWED expires_at too — the reconciler still eventually
+    // reclaims a claim with no further progress signal at all.
+    CHECK(tracker.reconcile_stale_concurrency_claims(now0 + 3700) == 1);
+    CHECK(tracker.claim_concurrency_slots("def-conc-ttl-renew", "exec-other", "cmd-test-33", {"agent-a"},
+                                          now0 + 100)
+              .size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: release_concurrency_claim_by_command / "
+          "renew_concurrency_claim_by_command restore claim release/renewal when the "
+          "execution_id correlation is lost (UP-1, unhappy-path Gate 4 finding, PR #3784 "
+          "fix round)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // These *_by_command methods are the fallback notify_exec_tracker falls
+    // back to whenever it can't resolve execution_id via the PG-backed
+    // command_id -> execution_id correlation table (HA WS-1(1b),
+    // ExecutionTracker::lookup_execution_id) -- genuinely, today: a
+    // workflow-step dispatch (execution_id is always empty for those,
+    // CONSIST-2/sec-M2), a correlation-table write/read degrade, or the
+    // correlation table's own 24h-window entry aging out from under a
+    // legitimately still-running command (reap_command_execution_mappings).
+    // command_id alone (no definition_id scoping) is a safe match key
+    // because command_id is minted fresh per dispatch
+    // (plugin + "-" + random_bytes(16), server.cpp) and can never collide
+    // the way the empty-string execution_id does for workflow-step
+    // dispatch.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    const int64_t now0 = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    REQUIRE(tracker.reconcile_stale_concurrency_claims(now0) == 0); // prime the anchor
+
+    auto claimed = tracker.claim_concurrency_slots("def-conc-by-cmd", "exec-lost", "cmd-restart-1",
+                                                    {"agent-a"}, /*expires_at=*/now0 + 2);
+    REQUIRE(claimed.size() == 1);
+
+    // Renew purely by (command_id, agent_id) — as notify_exec_tracker's
+    // fallback does on a post-restart keepalive it can no longer resolve
+    // to an execution_id. Must extend well past the original short TTL.
+    tracker.renew_concurrency_claim_by_command("cmd-restart-1", "agent-a");
+    CHECK(tracker.reconcile_stale_concurrency_claims(now0 + 5) == 0); // past original TTL, not renewed one
+    CHECK(tracker.claim_concurrency_slots("def-conc-by-cmd", "exec-other", "cmd-test-34", {"agent-a"},
+                                          now0 + 100)
+              .empty()); // still held — the renewal worked
+
+    // A DIFFERENT command_id/agent must not be touched by either call —
+    // scoping sanity, even though command_id is generated globally-unique
+    // in production.
+    auto unrelated = tracker.claim_concurrency_slots("def-conc-by-cmd-2", "exec-other-2",
+                                                      "cmd-unrelated", {"agent-b"}, now0 + 2);
+    REQUIRE(unrelated.size() == 1);
+    tracker.release_concurrency_claim_by_command("cmd-restart-1", "agent-a");
+    CHECK(tracker.claim_concurrency_slots("def-conc-by-cmd-2", "exec-other-3", "cmd-test-35",
+                                          {"agent-b"}, now0 + 100)
+              .empty()); // agent-b's claim under a different command_id survives untouched
+
+    // Release purely by (command_id, agent_id) — as notify_exec_tracker's
+    // fallback does on a post-restart terminal response. The original
+    // claim must now be free.
+    CHECK(tracker.claim_concurrency_slots("def-conc-by-cmd", "exec-other-4", "cmd-test-36", {"agent-a"},
+                                          now0 + 100)
+              .size() == 1);
+
+    // No-op sanity: a command_id/agent_id pair with no open claim at all
+    // (ordinary out-of-band dispatch that never took one) must not error
+    // or touch anything.
+    tracker.release_concurrency_claim_by_command("cmd-never-claimed", "agent-z");
+    tracker.renew_concurrency_claim_by_command("cmd-never-claimed", "agent-z");
+}
+
+TEST_CASE("ExecutionTracker: release_concurrency_claim_by_command discriminates by command_id "
+          "for the SAME agent, not just by agent_id (Fable adversarial-review finding, PR #3784 "
+          "fix round)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // The by-command match key is (command_id, agent_id) — sibling tests
+    // proved the agent_id half; this proves the command_id half. A SINGLE
+    // agent legitimately holds two open claims for two different
+    // definitions at once (per-device enforcement is per-definition, not a
+    // global agent lock) — releasing one by its command_id must not touch
+    // the other.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto claim_1 = tracker.claim_concurrency_slots("def-conc-by-cmd-disc-1", "exec-1",
+                                                    "cmd-disc-1", {"agent-shared"}, 9999999999);
+    REQUIRE(claim_1.size() == 1);
+    auto claim_2 = tracker.claim_concurrency_slots("def-conc-by-cmd-disc-2", "exec-2",
+                                                    "cmd-disc-2", {"agent-shared"}, 9999999999);
+    REQUIRE(claim_2.size() == 1); // different definition_id — not blocked by claim_1
+
+    tracker.release_concurrency_claim_by_command("cmd-disc-1", "agent-shared");
+
+    CHECK(tracker.claim_concurrency_slots("def-conc-by-cmd-disc-1", "exec-other", "cmd-probe-1",
+                                          {"agent-shared"}, 9999999999)
+              .size() == 1); // claim_1 released
+    CHECK(tracker.claim_concurrency_slots("def-conc-by-cmd-disc-2", "exec-other", "cmd-probe-2",
+                                          {"agent-shared"}, 9999999999)
+              .empty()); // claim_2 untouched — still held
+}
+
+TEST_CASE("ExecutionTracker: claim_concurrency_slots fails a candidate CLOSED on a "
+          "(command_id, agent_id) reuse, rather than silently taking a second claim (Sol/Fable "
+          "adversarial-review finding, PR #3784 fix round)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // command_id is minted fresh per dispatch (128 random bits,
+    // server.cpp) and no legitimate caller reuses one — but that was
+    // previously an assumption, not a schema guarantee. This proves the
+    // NEW `ux_concurrency_claims_command` unique index actually enforces
+    // it: a second INSERT reusing the same (command_id, agent_id), even
+    // for a DIFFERENT definition_id/execution_id, must be excluded from
+    // `RETURNING` (fail closed) rather than silently succeeding — which
+    // would otherwise let a later single-command_id release/renew touch
+    // two unrelated definitions' claims at once.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto first = tracker.claim_concurrency_slots("def-conc-reuse-1", "exec-1", "cmd-reused",
+                                                  {"agent-a"}, 9999999999);
+    REQUIRE(first.size() == 1);
+
+    // Same command_id, same agent_id, but a DIFFERENT definition_id/
+    // execution_id — must NOT win a second claim.
+    auto second = tracker.claim_concurrency_slots("def-conc-reuse-2", "exec-2", "cmd-reused",
+                                                   {"agent-a"}, 9999999999);
+    CHECK(second.empty());
+
+    // The first claim is unaffected by the failed second attempt.
+    CHECK(tracker.claim_concurrency_slots("def-conc-reuse-1", "exec-other", "cmd-reuse-probe",
+                                          {"agent-a"}, 9999999999)
+              .empty()); // still held by the original claim
+}
+
+TEST_CASE("ExecutionTracker: update_agent_status gates release/renew on the ACTUALLY-PERSISTED "
+          "status, not the caller-supplied one — a stale reordered 'running' does not renew a "
+          "claim whose row is already terminal (UP-2, unhappy-path Gate 4 finding, PR #3784 fix "
+          "round)",
+          "[pg][execution_tracker][concurrency][adr1007]") {
+    // upsert_agent_status_once's sticky-terminal CASE (CHAOS-TTL-1
+    // hardening) keeps agent_exec_status.status terminal when a stale
+    // 'running' write arrives after a real terminal one — but the OUTER
+    // release/renew decision used to branch on the caller's literal
+    // s.status ("running") instead of what was actually persisted. This
+    // proves the decision now follows the persisted value: a stale
+    // 'running' delivered for an execution_id whose row is already
+    // terminal must take the RELEASE branch (a no-op/self-heal on an
+    // already-released claim), never the RENEW branch (which would
+    // wrongly extend a claim that has nothing left to renew for).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto exec_id = tracker.create_execution(make_execution("def-conc-stale-running"));
+    REQUIRE(exec_id.has_value());
+
+    auto claimed = tracker.claim_concurrency_slots("def-conc-stale-running", *exec_id, "cmd-test-37",
+                                                    {"agent-a"}, 9999999999);
+    REQUIRE(claimed.size() == 1);
+
+    AgentExecStatus success;
+    success.agent_id = "agent-a";
+    success.status = "success";
+    tracker.update_agent_status(*exec_id, success);
+    // Terminal write releases the claim — confirmed free.
+    REQUIRE(tracker.claim_concurrency_slots("def-conc-stale-running", "exec-other", "cmd-test-38",
+                                            {"agent-a"}, 9999999999)
+                .size() == 1);
+    // Release the probe claim so the SAME execution_id can be re-claimed
+    // below without the earlier fix's cross-definition-leak guard tests'
+    // pattern getting in the way.
+    tracker.release_concurrency_claim("def-conc-stale-running", "exec-other", "agent-a");
+
+    // Re-claim under the SAME (already-terminal) execution_id with a short
+    // TTL — standing in for a claim a stale 'running' for this execution_id
+    // could reach via the (execution_id, agent_id) match key, so the test
+    // can observe which branch the decision actually takes.
+    const int64_t now0 = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    auto reclaimed = tracker.claim_concurrency_slots("def-conc-stale-running", *exec_id, "cmd-test-2",
+                                                      {"agent-a"}, /*expires_at=*/now0 + 3600);
+    REQUIRE(reclaimed.size() == 1);
+
+    // The stale, reordered 'running' — agent_exec_status[*exec_id] is
+    // ALREADY 'success' (sticky CASE keeps it there; this write is a no-op
+    // on the row itself). The pre-fix code branched on this literal
+    // "running" and would have called renew_concurrency_claim, leaving the
+    // re-claimed row open with an extended expires_at. The fix must
+    // instead see the persisted 'success' and call release_concurrency_claim.
+    AgentExecStatus stale_running;
+    stale_running.agent_id = "agent-a";
+    stale_running.status = "running";
+    tracker.update_agent_status(*exec_id, stale_running);
+
+    // Proves RELEASE, not RENEW, ran: the re-claimed row is free again.
+    CHECK(tracker.claim_concurrency_slots("def-conc-stale-running", "exec-other-2", "cmd-test-39",
+                                          {"agent-a"}, 9999999999)
+              .size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: reconcile_stale_concurrency_claims declines on a backward clock "
+          "jump",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    const int64_t now1 = 2000000000;
+    // First pass just stamps the persisted anchor at now1 — no open claims
+    // yet, so the release count is 0 regardless.
+    CHECK(tracker.reconcile_stale_concurrency_claims(now1) == 0);
+
+    // BEFORE the persisted anchor, and past the big-step floor (1h) — a
+    // sub-floor drift (ordinary NTP correction) must NOT trigger this; only
+    // a jump exceeding the floor does (moved_at_least is direction-agnostic).
+    const int64_t now2 = now1 - 7200;
+    auto claimed = tracker.claim_concurrency_slots("def-conc-7", "exec-1", "cmd-test-40", {"agent-a"},
+                                                    /*expires_at=*/now2 - 100);
+    REQUIRE(claimed.size() == 1);
+
+    // A pass whose `now` has moved past the floor from the persisted anchor
+    // — in either direction — must DECLINE (release nothing), even though
+    // this claim is nominally past its own expires_at relative to now2.
+    CHECK(tracker.reconcile_stale_concurrency_claims(now2) == 0);
+
+    // Still held — the decline means the claim was NOT force-released.
+    CHECK(tracker.claim_concurrency_slots("def-conc-7", "exec-2", "cmd-test-41", {"agent-a"}, now1 + 100)
+              .empty());
+}
+
+TEST_CASE("ExecutionTracker: reconcile_stale_concurrency_claims declines on the very first pass "
+          "when something is already expired and there is no prior anchor",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    // No priming call — this IS the first-ever pass against this store,
+    // exactly the boot-with-an-already-wrong-clock scenario
+    // audit_retention_rules.hpp's Anomaly::NoAnchor exists for (#2579's
+    // fix, adopted here via the shared classify() rather than reimplemented).
+    const int64_t now = 2000000000;
+    auto claimed =
+        tracker.claim_concurrency_slots("def-conc-8", "exec-1", "cmd-test-42", {"agent-a"}, /*expires_at=*/now - 100);
+    REQUIRE(claimed.size() == 1);
+
+    CHECK(tracker.reconcile_stale_concurrency_claims(now) == 0); // declined, not released
+    CHECK(tracker.claim_concurrency_slots("def-conc-8", "exec-other", "cmd-test-43", {"agent-a"}, now + 100)
+              .empty()); // still held
+
+    // The SECOND pass now has a comparison point (the anchor the first
+    // pass stamped) and proceeds normally.
+    CHECK(tracker.reconcile_stale_concurrency_claims(now) == 1);
+    CHECK(tracker.claim_concurrency_slots("def-conc-8", "exec-other", "cmd-test-44", {"agent-a"}, now + 100)
+              .size() == 1);
+}
+
+TEST_CASE("ExecutionTracker: reconcile_stale_concurrency_claims caps the number released per "
+          "pass",
+          "[pg][execution_tracker][concurrency]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    // Below the cap (5000) — this only proves the cap parameter is wired,
+    // not that 5000+ claims behave correctly (that volume is unrealistic
+    // for this table and not worth the test runtime); see the reconciler's
+    // own doc comment for the "generous headroom, not a routine limit"
+    // rationale.
+    const int64_t now = 2000000000;
+    REQUIRE(tracker.reconcile_stale_concurrency_claims(now) == 0); // prime the anchor
+    for (int i = 0; i < 10; ++i) {
+        auto claimed = tracker.claim_concurrency_slots(
+            "def-conc-cap", "exec-" + std::to_string(i), "cmd-test-45",
+            {"agent-" + std::to_string(i)}, now - 100);
+        REQUIRE(claimed.size() == 1);
+    }
+    CHECK(tracker.reconcile_stale_concurrency_claims(now) == 10);
+}
+
+// ── HA WS-2a: durable event outbox (ADR-2002 §5) ─────────────────────────────
+
+namespace {
+struct OutboxRow {
+    long long event_id{0};
+    std::string execution_id;
+    std::string event_type;
+    std::string data;
+    bool is_terminal{false};
+    long long created_at{0};
+};
+
+// Reads event_outbox rows for one execution, oldest event_id first, over a
+// fresh lease on the given pool (the public API has no outbox read yet — no
+// consumer until WS-2a-2).
+std::vector<OutboxRow> fetch_outbox(pg::PgPool& pool, const std::string& execution_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "SELECT event_id, execution_id, event_type, data, is_terminal, created_at "
+        "FROM execution_tracker.event_outbox WHERE execution_id=$1 ORDER BY event_id",
+        std::vector<std::string>{execution_id});
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    std::vector<OutboxRow> rows;
+    for (int i = 0; i < PQntuples(r.get()); ++i) {
+        OutboxRow row;
+        row.event_id = std::strtoll(PQgetvalue(r.get(), i, 0), nullptr, 10);
+        row.execution_id = PQgetvalue(r.get(), i, 1);
+        row.event_type = PQgetvalue(r.get(), i, 2);
+        row.data = PQgetvalue(r.get(), i, 3);
+        row.is_terminal = std::string(PQgetvalue(r.get(), i, 4)) == "t";
+        row.created_at = std::strtoll(PQgetvalue(r.get(), i, 5), nullptr, 10);
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+} // namespace
+
+TEST_CASE("ExecutionTracker: WS-2a a completed execution durably appends "
+          "agent-transition + execution-progress + execution-completed events",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    as.completed_at = 1002;
+    tracker.update_agent_status(*id, as); // upsert (agent-transition) + refresh_counts (terminal)
+
+    auto rows = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[0].event_type == "agent-transition");
+    CHECK_FALSE(rows[0].is_terminal);
+    CHECK(rows[1].event_type == "execution-progress");
+    CHECK(rows[1].is_terminal); // all agents responded -> the progress event is terminal-flagged
+    CHECK(rows[2].event_type == "execution-completed");
+    CHECK(rows[2].is_terminal);
+
+    // event_id is a global durable MONOTONIC id — strictly increasing in
+    // append order across the two separate transactions (upsert, then
+    // refresh_counts).
+    CHECK(rows[0].event_id < rows[1].event_id);
+    CHECK(rows[1].event_id < rows[2].event_id);
+
+    // The durable data mirrors what the in-memory bus would publish.
+    CHECK(rows[2].data.find("succeeded") != std::string::npos);
+
+    // Both-sides of invariant 1: the AUTHORITATIVE state committed in the SAME
+    // transactions as its events — not the event without the state. Read via
+    // the degrade-distinguishable accessor so a store error can't masquerade as
+    // "no state".
+    auto statuses = tracker.get_agent_statuses_checked(*id);
+    REQUIRE(statuses.has_value());
+    REQUIRE(statuses->size() == 1);
+    CHECK((*statuses)[0].status == "success");
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "succeeded");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a the state write and its event append are "
+          "ATOMIC — a failing append rolls the state write back (invariant 1)",
+          "[pg][execution_tracker][outbox]") {
+    // The headline WS-9 durability scenario: never state-without-event. The
+    // agent_exec_status upsert and the event_outbox append share ONE
+    // with_txn_for transaction, so if the append cannot commit, neither does
+    // the state write. Injected by dropping event_outbox so every append
+    // INSERT errors — the paired upsert must then leave no row.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(),
+                                   "DROP TABLE execution_tracker.event_outbox",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    tracker.update_agent_status(*id, as); // append fails -> whole txn rolls back
+
+    // Strengthened assertion (governance quality-engineer): distinguish a
+    // genuine rollback (read succeeds, zero rows) from a verification read that
+    // itself errored — the plain get_agent_statuses() collapses both into an
+    // empty vector via value_or({}), so it could not tell the two apart. Only
+    // `event_outbox` was dropped; `agent_exec_status` is intact, so the checked
+    // read MUST succeed, and its emptiness then PROVES the upsert rolled back
+    // (not that the read failed).
+    auto statuses = tracker.get_agent_statuses_checked(*id);
+    REQUIRE(statuses.has_value());
+    CHECK(statuses->empty());
+}
+
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled is atomic too — a failing "
+          "append rolls the cancel back (invariant 1, all write sites)",
+          "[pg][execution_tracker][outbox]") {
+    // Extends the atomicity coverage beyond update_agent_status to the second
+    // converted write path. mark_cancelled was a bare autocommit UPDATE before
+    // the outbox existed; it is now transactional, so a failing append must
+    // leave the execution NOT cancelled.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                   std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    CHECK_FALSE(tracker.mark_cancelled(*id, "admin")); // append fails -> rollback -> false
+
+    // The cancel was rolled back with the failing append: the execution is
+    // still 'running', not 'cancelled'.
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled durably appends a terminal "
+          "execution-completed event",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.mark_cancelled(*id, "admin"));
+
+    auto rows = fetch_outbox(tracker_bundle.pool(), *id);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].event_type == "execution-completed");
+    CHECK(rows[0].is_terminal);
+    CHECK(rows[0].data.find("cancelled") != std::string::npos);
+}
+
+TEST_CASE("ExecutionTracker: WS-2a events appended on one instance are durable "
+          "and readable from a SEPARATE instance (WS-9 failover scenario)",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle; // "replica A" — writes
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "running";
+    tracker.update_agent_status(*id, as);
+
+    // "replica B" — a second pool against the SAME database, sharing no
+    // process memory with A. The in-memory bus could never surface A's events
+    // here; the durable outbox does. One update_agent_status durably appends
+    // both the agent-transition and the refresh_counts execution-progress
+    // event (mirroring exactly what the in-memory bus publishes per call).
+    pg::PgPool pool_b{{.conninfo = tracker_bundle.dsn(), .size = 2}};
+    auto rows = fetch_outbox(pool_b, *id);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].event_type == "agent-transition");
+    CHECK(rows[1].event_type == "execution-progress");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox deletes only aged-out "
+          "rows, missing-anchor PROCEEDs, and is clock-guarded",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "running";
+    tracker.update_agent_status(*id, as); // agent-transition + execution-progress
+
+    const std::size_t appended = fetch_outbox(tracker_bundle.pool(), *id).size();
+    REQUIRE(appended == 2);
+
+    // First pass: no anchor yet — PROCEED (missing-anchor decision), delete 0
+    // (the rows are fresh, far inside the 24h window), no anomaly.
+    auto first = tracker.reap_event_outbox();
+    REQUIRE(first.has_value());
+    CHECK(first->deleted == 0);
+    CHECK_FALSE(first->clock_anomaly);
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).size() == appended);
+
+    // Age the rows past the 24h window (test-only backdate, no public hook).
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.event_outbox SET created_at = created_at - 90000 "
+            "WHERE execution_id = $1",
+            std::vector<std::string>{*id});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto second = tracker.reap_event_outbox();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == static_cast<int>(appended));
+    CHECK_FALSE(second->clock_anomaly);
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).empty());
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox declines on a "
+          "forward-skewed anchor gap",
+          "[pg][execution_tracker][outbox]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    // Establish a real anchor.
+    REQUIRE(tracker_bundle->reap_event_outbox().has_value());
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto res = pg::exec_params(
+            lease.get(),
+            "UPDATE execution_tracker.reap_meta SET value = (value::bigint - 200000)::text "
+            "WHERE key = 'event_outbox_reap_anchor'",
+            std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+    auto second = tracker_bundle->reap_event_outbox();
+    REQUIRE(second.has_value());
+    CHECK(second->deleted == 0);
+    CHECK(second->clock_anomaly);
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox declines on a "
+          "backward-stepped clock and on an unparseable anchor",
+          "[pg][execution_tracker][outbox]") {
+    SECTION("backward-stepped clock (anchor far in the future)") {
+        yuzu::test::ExecutionTrackerPg tracker_bundle;
+        REQUIRE(tracker_bundle->reap_event_outbox().has_value());
+        {
+            auto lease = tracker_bundle.pool().acquire();
+            REQUIRE(lease);
+            auto res = pg::exec_params(
+                lease.get(),
+                "UPDATE execution_tracker.reap_meta SET value = (value::bigint + 200000)::text "
+                "WHERE key = 'event_outbox_reap_anchor'",
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        auto second = tracker_bundle->reap_event_outbox();
+        REQUIRE(second.has_value());
+        CHECK(second->deleted == 0);
+        CHECK(second->clock_anomaly);
+    }
+
+    SECTION("unparseable persisted anchor is sanitised, not coerced") {
+        yuzu::test::ExecutionTrackerPg tracker_bundle;
+        REQUIRE(tracker_bundle->reap_event_outbox().has_value());
+        {
+            auto lease = tracker_bundle.pool().acquire();
+            REQUIRE(lease);
+            auto res = pg::exec_params(
+                lease.get(),
+                "UPDATE execution_tracker.reap_meta SET value = '123junk' "
+                "WHERE key = 'event_outbox_reap_anchor'",
+                std::vector<std::string>{});
+            REQUIRE(res.status() == PGRES_COMMAND_OK);
+        }
+        auto second = tracker_bundle->reap_event_outbox();
+        REQUIRE(second.has_value());
+        CHECK(second->deleted == 0);
+        CHECK(second->clock_anomaly);
+    }
+}
+
+TEST_CASE("ExecutionTracker: WS-2a reap_event_outbox on an unreachable pool "
+          "degrades without crashing",
+          "[execution_tracker][outbox]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    ExecutionTracker closed(unreachable);
+    REQUIRE(!closed.is_open());
+    auto reaped = closed.reap_event_outbox();
+    REQUIRE_FALSE(reaped.has_value());
+    CHECK(reaped.error() == "execution tracker not open");
+}
+
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled of an UNKNOWN id is a no-op — "
+          "no phantom durable event, returns false (self-adversarial C1/K6)",
+          "[pg][execution_tracker][outbox]") {
+    // ADR-2002 §5 event-WITHOUT-state direction: a cancel of an id that matches
+    // no execution row must NOT append a durable execution-completed event.
+    // (The UPDATE ... RETURNING id guard: zero rows matched -> no append, false.)
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    CHECK_FALSE(tracker.mark_cancelled("no-such-execution-id", "admin"));
+    CHECK(fetch_outbox(tracker_bundle.pool(), "no-such-execution-id").empty());
+}
+
+TEST_CASE("ExecutionTracker: WS-2a mark_cancelled of an already-TERMINAL execution is a "
+          "no-op — no status overwrite, no second event (PR #3842 review)",
+          "[pg][execution_tracker][outbox]") {
+    // The terminal-status guard: a cancel arriving after (or racing with) a
+    // genuine terminal transition must NOT overwrite the true outcome back to
+    // 'cancelled' NOR durably append a contradictory execution-completed frame.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution());
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+    // Drive it to a genuine terminal 'succeeded'.
+    AgentExecStatus as;
+    as.agent_id = "agent-1";
+    as.status = "success";
+    tracker.update_agent_status(*id, as);
+    {
+        auto exec = tracker.get_execution(*id);
+        REQUIRE(exec.has_value());
+        REQUIRE(exec->status == "succeeded");
+    }
+    const std::size_t rows_before = fetch_outbox(tracker_bundle.pool(), *id).size();
+
+    // Cancel must be a no-op — the execution is already terminal.
+    CHECK_FALSE(tracker.mark_cancelled(*id, "admin"));
+
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "succeeded"); // NOT overwritten to 'cancelled'
+    CHECK(fetch_outbox(tracker_bundle.pool(), *id).size() == rows_before); // no second frame
+}
+
+TEST_CASE("ExecutionTracker: WS-2a refresh_counts terminal transition is atomic — "
+          "a failing append rolls the transition back (self-adversarial C4c)",
+          "[pg][execution_tracker][outbox]") {
+    // Isolates refresh_counts_once's append-failure rollback (the third write
+    // path, whose terminal transition appends 1-2 events in one txn). A responded
+    // agent row is inserted directly so refresh_counts sees all-responded WITHOUT
+    // going through update_agent_status (whose own append would fire first).
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id = tracker.create_execution(make_execution()); // status "running"
+    REQUIRE(id.has_value());
+    REQUIRE(tracker.set_agents_targeted(*id, 1));
+
+    {
+        auto lease = tracker_bundle.pool().acquire();
+        REQUIRE(lease);
+        auto ins = pg::exec_params(
+            lease.get(),
+            "INSERT INTO execution_tracker.agent_exec_status "
+            "(execution_id, agent_id, status, dispatched_at, first_response_at, completed_at, "
+            " exit_code, error_detail, plugin_result_status) "
+            "VALUES ($1, 'agent-1', 'success', 0, 0, 0, 0, '', 0)",
+            std::vector<std::string>{*id});
+        REQUIRE(ins.status() == PGRES_COMMAND_OK);
+        auto drop = pg::exec_params(lease.get(), "DROP TABLE execution_tracker.event_outbox",
+                                    std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    tracker.refresh_counts(*id); // recompute -> terminal transition -> append fails -> rollback
+
+    // The terminal transition (status -> succeeded) rolled back with the failing
+    // append; the execution is still 'running'.
+    auto exec = tracker.get_execution(*id);
+    REQUIRE(exec.has_value());
+    CHECK(exec->status == "running");
 }
