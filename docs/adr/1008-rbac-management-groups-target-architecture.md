@@ -151,6 +151,17 @@ RBAC and be self-granted `Administrator` regardless of their actual standing aut
 Disabling RBAC is symmetric: audited, MFA-stepped-up, reversible. A failed transaction is
 reported to the caller (`set_rbac_enabled`'s current `void` return must change to support this).
 
+**"Cannot produce zero active Administrators" must hold on an ongoing basis, not only at enable
+time (PR review finding, @fjarvis).** As first written, this decision's mechanism only guarded
+the moment RBAC is switched on; nothing guarded a later revocation, once RBAC is already enabled,
+that drops the last active Administrator to zero -- the heading's claim was broader than the
+mechanism delivered. This decision closes that the same way it closes every other escalation-
+safety gap: through the existing chokepoint, not a second bespoke check. `validate_assignment`
+(D3) must refuse a revocation or role edit that would leave zero active, authenticatable human
+principals holding `Administrator` globally, the same class of check D2 already requires at
+enable time, now required at every subsequent write through the same chokepoint rather than
+only at the one moment this decision originally named.
+
 **The self-grant branch's own precondition needs the same discipline as the Administrator check,
 not a different one (Gate-5 governance finding).** The row-lock/`SERIALIZABLE` requirement added
 below closes the race on the Administrator-existence check, but the self-grant branch gates on a
@@ -221,12 +232,45 @@ group-membership writes against any role-bearing group -- a membership add must 
 check for the group's own currently-held role grants -- not only to the role-assignment writes
 named above.
 
+**The chokepoint also covers role-DEFINITION edits, not only who holds a role (PR review finding,
+@fjarvis).** `RbacStore::create_role`/`set_permission`/`remove_permission` change what a role
+GRANTS, and today none of them route through `validate_assignment` or any equivalent
+grant-authority check -- confirmed against the store's actual signatures
+(`rbac_store.hpp:202,226,246`). This is the same escalation shape as the group-membership bypass
+above, one level up: whoever can edit a role's permission set can add a permission to that role
+they do not themselves hold, silently escalating themselves (if they hold the role) and every
+other current holder of it, with no D4 check ever running on the editor. D4's own latent-widening
+trigger #3 (a later edit to a role's permissions) already treats this as something to *detect*
+on existing grantees after the fact -- but detection-only leaves the editor's own escalation
+ungated at the moment they make the edit. This decision extends its chokepoint scope a second
+time: adding a permission to a role's definition must pass the same D4 check as granting that
+permission directly -- the editor must currently hold what they add to the role -- while removing
+a permission from a role needs no such check (removal never grants standing authority to anyone).
+
+**The chokepoint also covers assigning a role TO an already member-bearing group, not only
+adding a member to an already role-bearing group (PR review finding, @fjarvis).** The
+group-membership fix above closes one direction: adding member M to group G, where G already
+holds role B. Its mirror is open: create group G with no role, add members to it freely (D3
+exempts a non-role-bearing group from this chokepoint, since it grants nothing yet), then assign
+role B to G. `validate_assignment` already runs on that role-assignment write per this decision's
+opening paragraph, so D4's grant-authority check (does the grantor hold B) already applies
+correctly regardless of whether the target principal is a user or a group -- but D11's SoD check
+(below) resolves the *write principal's* effective set, and the write principal here is the
+group, whose own set does not include each existing member's other roles. A member who already
+holds role A, now inheriting B through the group, can assemble a declared A+B SoD-forbidden pair
+with neither half of the check ever seeing both roles together. D11 must resolve every CURRENT
+member's resulting combined role set against the SoD table at the moment a role is assigned to a
+member-bearing group, symmetric to the group-inclusive check it already requires on new-member
+adds.
+
 *Non-conformance (defect) today:* the scoped-assignment route hardcodes its allowed-roles list
 (`role_name != "Operator" && role_name != "Viewer"`) instead of deriving it from D4; there is no
 production write path for a global human assignment at all; `add_group_member` bypasses the
-chokepoint entirely (see above). *Not yet built:* the shared assignment record shape; a decided,
-tested lattice rule for assignment-level deny (deliberately out of this decision's scope, see
-above); the group-membership check just added to this decision's scope.
+chokepoint entirely (see above); `create_role`/`set_permission`/`remove_permission` bypass it
+entirely too (see above). *Not yet built:* the shared assignment record shape; a decided, tested
+lattice rule for assignment-level deny (deliberately out of this decision's scope, see above);
+both group-membership checks just added to this decision's scope (member-add to a role-bearing
+group, and role-assign to a member-bearing group); the role-definition-edit check.
 
 ### D4 -- Grant authority is an explicit administrative model: the grantor must currently hold what they grant, computed as an effective-authority delta
 
@@ -274,13 +318,28 @@ a grant with zero delta at creation time can activate later with no new assignme
 same shape as (1)-(4) just clock-driven instead of mutation-driven (Gate-4 governance finding;
 D10's corrected text already requires its OWN read-time expiry check for `valid_until` -- an
 implementation must not treat `valid_from` activation as somehow already covered by that same
-fix without separately checking it).** This decision therefore requires one of: (a) a durable
-ceiling recorded on the assignment (the grantor's authority snapshot at grant time, re-verified
-whenever the assignment's authority is *read*, not only when it is written), or (b) revalidation
-triggered by every mutation that can grow an existing assignment's effective reach (deny removal,
-hierarchy reparenting, role-permission edits, group-membership growth). Which of these -- or
-another mechanism -- is chosen is left open; this decision fixes the requirement (latent widening
-must be caught, not only grant-time escalation), not the mechanism.
+fix without separately checking it); (6) **assigning a role to a group that already has members
+(D3's second chokepoint extension covers the write itself; the same widening problem as (4),
+mirrored).** This decision therefore requires one of: (a) a durable ceiling recorded on the
+assignment (the grantor's authority snapshot at grant time, re-verified whenever the assignment's
+authority is *read*, not only when it is written), or (b) revalidation triggered by every
+mutation that can grow an existing assignment's effective reach (deny removal, hierarchy
+reparenting, role-permission edits, group-membership growth in either direction). Which of these
+-- or another mechanism -- is chosen is left open; this decision fixes the requirement (latent
+widening must be caught, not only grant-time escalation), not the mechanism.
+
+**Mechanism (a)'s snapshot re-verifies its own integrity, not that the grantor still holds it
+today (PR review finding, @fjarvis; this decision takes a position rather than leaving it
+implicit).** "Re-verified whenever read" as written checks that the recorded ceiling has not been
+tampered with -- it does not re-check whether the grantor who set that ceiling has since been
+demoted or lost the authority the snapshot recorded. A grant can therefore outlive its own
+grantor's standing under mechanism (a), which is in tension with this decision's own framing
+("the grantor must CURRENTLY hold what they grant"). This decision's position: that tension is
+accepted for mechanism (a), not silently permitted -- a snapshot is a point-in-time ceiling by
+design, and continuously re-validating it against the grantor's live standing would collapse
+mechanism (a) into mechanism (b) in every case that matters. An implementation that wants the
+grantor's ongoing standing enforced, not merely their standing at grant time, should choose
+mechanism (b) instead; mechanism (a) is for callers who explicitly want a frozen ceiling.
 
 **This decision deliberately rejects the alternative administrative model -- a dedicated
 `Approve`/administer-without-holding permission -- that ADR-0033 §8 already adopted for
@@ -363,19 +422,26 @@ contract test.
 
 ### D6 -- Every durable or background dispatch resolves to a currently-valid human authority and credential
 
-**The requirement is not in question; only its application to one dispatcher (Guardian) required
-this document's own decision rather than a reading of existing text, and that decision is now
-made.** ADR-0033's narrowing law (§1) is platform-wide: authority is never created out of
-nowhere, and an effect crosses the system only through filters that confirm a real, current
-grant behind it. ADR-0032 Decision 7 is the validated design that satisfies this for Schedules:
-record the credential that armed the dispatch, not only the human; recheck it at execution;
-distinguish routine rotation (rebind, keeps running) from revocation/expiry/deletion (stop); make
-a stopped dispatch loud, not a silent failure. **For Schedules, this document is simply
-compliance** -- Decision 7 names schedules explicitly and already requires exactly this.
-**For Guardian, no accepted ADR names this dispatcher, and this document decides, on its own
-authority as a proposed ADR-0033 extension, to apply the identical mechanism** -- not because an
-existing text already reaches that far, but because Guardian's rule distribution is the same
-shape of problem (a person's decision keeps taking effect long after they made it, with nobody
+**The requirement is not in question; this document decides, on its own authority, to apply it to
+BOTH dispatchers below -- corrected here to match sub-clause 4's own text (PR review finding,
+@fjarvis; this exact contradiction was flagged twice: once by this session's own Gate 8, which
+fixed sub-clause 4 but missed this earlier restatement of the same claim; once by an external
+reviewer's panel, which caught what the self-check missed).** ADR-0033's narrowing law (§1) is
+platform-wide: authority is never created out of nowhere, and an effect crosses the system only
+through filters that confirm a real, current grant behind it. ADR-0032 Decision 7 is the
+validated design whose mechanics satisfy this shape of problem: record the credential that armed
+the dispatch, not only the human; recheck it at execution; distinguish routine rotation (rebind,
+keeps running) from revocation/expiry/deletion (stop); make a stopped dispatch loud, not a silent
+failure. **Decision 7's own text governs a Use-Case run under the not-yet-built UCE admission
+protocol, not the shipped `ScheduleRunner`/`InstructionSet` dispatch this document actually
+applies its mechanics to** -- so for Schedules, exactly as much as for Guardian, this document
+extends Decision 7's principle on its own authority; it is not compliance with an ADR that
+already covers the shipped feature. See sub-clause 4 below for the full citation-accuracy
+argument. **For Guardian, no accepted ADR names this dispatcher either, and this document
+decides, on its own authority as a proposed ADR-0033 extension, to apply the identical
+mechanism** -- not because an existing text already reaches that far, but because Guardian's rule
+distribution is the same shape of problem (a person's decision keeps taking effect long after
+they made it, with nobody
 re-checking whether they still could) and reusing a mechanism this codebase has already designed,
 reasoned through, and will build once for Schedules is better engineering than inventing a second
 one. Dave decided this directly (2026-09-02) rather than leaving it contingent on a maintainer's
@@ -646,9 +712,19 @@ sentence.
        -- a session was never designed to represent a standing authorization that should outlive
        the login, only that a particular browser tab was recently authenticated. For this case,
        the recheck is the principal's current RBAC authority plus account liveness (below), with
-       no separate credential-expiry component; the 8-hour session lifetime has no bearing on how
-       long the Baseline or Schedule stays rooted. An operator who wants a dispatch immune from
-       needing periodic rebinds should arm it with a token, which is exactly what the token path
+       no separate credential-EXPIRY component; the 8-hour session lifetime has no bearing on how
+       long the Baseline or Schedule stays rooted. **Explicit session revocation is a different
+       signal from expiry and is not excluded by the sentence above (PR review finding,
+       @fjarvis): this codebase's `AuthManager::invalidate_session` is a real, distinct,
+       operator-triggered event -- a forced logout or a detected-theft response -- not a passive
+       clock. Excluding time-based expiry (correct, argued above) is not the same claim as
+       excluding an explicit invalidation, and ADR-0032 Decision 7's revocation-stops-the-run
+       principle does not carve out session-armed dispatch from that distinction.** This decision
+       requires the recheck to also observe an explicit `invalidate_session` on the arming
+       session, treating it the same way sub-clause 3 treats authority loss -- orphaned, loudly
+       -- distinct from the ordinary 8-hour expiry this sentence correctly excludes. An operator
+       who wants a dispatch immune from needing periodic rebinds should arm it with a token,
+       which is exactly what the token path
        above is for.
    - **Account liveness is an explicit, separate check, required in both cases above (and
      necessary on the token path specifically, not merely a fallback for the session path).**
@@ -873,8 +949,16 @@ already enumerate every route/tool against those three mechanisms) is the single
 truth both decisions read from -- a route D5's CI check classifies is a route D9 already knows
 to instrument, with no second list to fall out of sync. `confine_agent_target` and the fan-out
 mechanism's per-arm decisions (including D7's non-human-principal delegation decisions, which
-compose through the same `authz::meet`) are covered by construction under this reference, not as
-separately-named additions.
+compose through the same `authz::meet`) are named by this reference, not as separately-listed
+additions. **"Covered by construction" is D5's own claim about route-to-mechanism reachability;
+it is not, by itself, a claim about mechanism-internal completeness (PR review finding,
+@fjarvis) -- softened from an earlier overclaim.** D5's coverage-proving CI check proves a route
+REACHES the applicable mechanism; it cannot prove every internal admit/deny/degrade branch
+inside that mechanism (a service-scope sub-check, a degrade path, a per-arm decision) actually
+emits D9's record once it is written -- a later-added internal branch that returns without
+calling the D9 writer would still pass D5's route-level coverage check while silently opening a
+gap in D9's completeness. This decision therefore requires a separate, per-branch D9 contract
+test for each of D5's three mechanisms, not only the route-level CI check D5 already has.
 
 The new `assignment-authority` axis, and closed-taxonomy reason codes that distinguish a D4
 delta-denial from a D11 SoD-denial from an ordinary permission denial, cover `validate_assignment`
@@ -1023,6 +1107,18 @@ window itself) must gain a per-entry expiry the read path checks on every hit. "
 enforcement, not two independently-safe alternatives -- an implementer must not pick a
 timer-based reap believing it satisfies the lighter-sounding of the two options.
 
+**The same fix must also reactivate a cached DENY when `valid_from` arrives, not only expire a
+cached ALLOW at `valid_until` (PR review finding, @fjarvis).** Everything above addresses one
+direction of the staleness problem D4 trigger #5 names: a future grant is fully specified at
+creation but has zero effective delta until its window opens, so a decision cached as "deny"
+before `valid_from` can keep answering "deny" after the window opens, for exactly the same
+reason a cached "allow" can outlive `valid_until` -- nothing bumps the generation when a clock
+boundary passes with no write. This is fail-closed (a functional defect -- a grant that never
+activates on schedule -- not an escalation), but it is the same mechanism this decision already
+requires, applied to the other edge of the same window: the per-entry expiry check the read path
+performs on every hit must compare `now()` against BOTH `valid_from` and `valid_until`, not
+`valid_until` alone.
+
 *Not yet built* (not a defect -- this capability has never existed): only JIT-to-admin exists;
 no assignment record carries a validity window. Access-review's `flagged_revoke` intentionally
 records evidence only and does not itself revoke -- that is existing, correct policy and is
@@ -1045,6 +1141,18 @@ neither write individually seeing the other half of a declared A+B SoD violation
 must resolve the principal's complete effective role set (direct grants union every role-bearing
 group they belong to, following the same membership resolution D5/D7 already use) before
 consulting the SoD table on either write shape, not just the roles the current write touches.
+
+**The mirrored write shape needs the mirrored check: assigning a role TO a member-bearing group,
+not only adding a member TO a role-bearing group (PR review finding, @fjarvis, per D3's own
+second chokepoint extension).** A direct role assignment and a member-add against a role-bearing
+group are one pair of write shapes; assigning a role to a group that already has members is a
+second, symmetric shape D3 now also routes through the chokepoint. When that write lands, the
+principal the chokepoint sees is the GROUP, whose own effective-role-set resolution (above)
+doesn't surface any individual member's OTHER roles -- so this decision's check must, on this
+specific write shape, additionally resolve every CURRENT member's resulting combined role set
+(their own direct/group roles union the group's newly-assigned role) and reject the write if any
+member would land in a declared SoD-forbidden pair, not only check the group's own set against
+the table.
 
 **A blocked SoD pair routes through D9's `assignment-authority` axis with its own reason code
 (Gate-8 governance finding, committed here rather than asserted only from D9's side).** A SoD
@@ -1673,8 +1781,51 @@ ordinary review" rule going forward.
     empirical confidence the pattern has actually stopped rather than merely narrowed; this
     document has had one. That is the honest state to hand to Dave, not "verified clean."
 
-Gates 2 through 6, plus one Gate 8 pass, have run against this document as ADR-1008, per entries
-13-17 above. D6's implementers
+18. **PR #3891 review, @fjarvis (2026-09-02).** Requested changes on commit `2d6587ff1`, running
+    four more independent reads (Codex+Kimi adversarial, a Hermes deep-cyber pass, a Fable
+    enterprise-architecture adjudication) and personally verifying their findings against real
+    code and the accepted ADRs before reporting -- exactly the practice this governance run has
+    used throughout, now applied externally. Confirms the document's own entry 17 assessment: one
+    Gate 8 pass narrows the pattern, it does not stop it. Two real, previously-undetected
+    escalation-coverage gaps found from opposite angles, both now fixed: (1) role-DEFINITION
+    edits (`create_role`/`set_permission`/`remove_permission`) were entirely ungated -- D4's own
+    trigger #3 only detects a role-permission edit's effect on existing grantees after the fact,
+    never gating the EDITOR's own escalation at the moment they add a permission they don't hold
+    (Fable, verified against `rbac_store.hpp:202,226,246`'s actual signatures); (2) the mirror of
+    D3's own group-membership fix was missing -- assigning a role TO an already member-bearing
+    group bypasses per-member SoD checking the same way adding a member TO a role-bearing group
+    used to bypass D4 (Hermes, verified against D3/D11's actual text). Both fixed by extending
+    D3's chokepoint scope a further time and D11's checked-set requirement, the same shape as
+    every prior fix in this family. Separately: D6's OPENING paragraph -- not sub-clause 4, which
+    this run's own Gate 8 already fixed -- still asserted "For Schedules, this document is simply
+    compliance," the identical false-assurance claim, missed because Gate 8's self-check grepped
+    the specific sentence it had already found, not every restatement of the same claim elsewhere
+    in the document (Codex+Kimi, independently; this is the twelfth instance of the recurring
+    class, and the second time in this document specifically this exact D6/Schedule claim needed
+    fixing). D2's own heading ("cannot produce zero active Administrators") was broader than its
+    mechanism (enable-time only, nothing guarded a later revocation) -- fixed by routing a
+    would-be-zero-admin revocation through the same D3 chokepoint, rather than leaving it as a
+    named-but-unclosed gap. Session-armed durable dispatch conflated explicit `invalidate_session`
+    revocation with ordinary 8-hour expiry under one exclusion, when this codebase has a real,
+    distinct revocation event Decision 7's stop-on-revocation principle should reach (Codex,
+    verified against `auth.cpp:1391`). D9's "covered by construction" over-claimed that D5's
+    route-level coverage proof also proves mechanism-INTERNAL branch completeness -- softened,
+    with a new per-branch D9 contract test required. D10's cache fix addressed `valid_until`
+    expiry but not the mirrored `valid_from` activation of a cached deny -- fixed, correctly
+    characterized as fail-closed (a functional defect, not an escalation). D4's durable-ceiling
+    mechanism was silent on whether a snapshot re-validates against the grantor's CURRENT
+    standing or only its own integrity -- this decision now takes an explicit position (it does
+    not; that is what distinguishes mechanism (a) from (b)) rather than leaving the tension
+    implicit. Two Hermes findings did NOT survive @fjarvis's own verification (quarantine
+    reconciliation already disclosed non-conforming in D6 sub-clause 2; D9 already requires
+    pre-admission durability confirmation) -- correctly not counted against the document, and not
+    re-litigated here. @fjarvis's own recommendation, worth recording: D6 carries enough
+    finding-density across its own review history that it may warrant a separate acceptance
+    track from D1-D5/D7-D11, since it cannot ship ahead of D4 regardless. Not decided here --
+    Dave's call.
+
+Gates 2 through 6, plus one Gate 8 pass and one external PR review round, have run against this
+document as ADR-1008, per entries 13-18 above. D6's implementers
 should still read ADR-0032 Decision 7's text directly before building the Guardian mechanism, the
 same way any implementer reads the ADR they are building a novel extension of, but that is
 ordinary diligence, not a precondition on the decision itself. Given how much of D6's mechanics
