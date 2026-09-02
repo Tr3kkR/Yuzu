@@ -17268,10 +17268,20 @@ private:
 
         web_server_->Get("/api/executions", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
-            // No correlation-id capture here: list confinement is silent
-            // narrowing (like every other list-read gate in this file), so
-            // no audit-detail string needs it — a4_error mints one lazily
-            // on any 503/400 branch below.
+            // No correlation-id capture here. Unlike the `/api/responses/*`
+            // family (server.cpp aggregate/export/get routes), which
+            // computes a `scope_dropped=N` audit count because it filters
+            // rows in C++ AFTER the query, this route's confinement is a
+            // SQL EXISTS pushdown (execution_tracker.cpp's
+            // append_execution_scope_clause) — dropped rows never reach
+            // this handler, so N is not observable here without a second,
+            // unfiltered COUNT(*) query per confined LIST call (real cost
+            // on the exact route already flagged for scan-depth amplification,
+            // consistency-auditor #3789 Finding 1 / chaos-injector CH-6).
+            // Deliberately deferred, not an oversight — tracked as a
+            // follow-up (audit-coherence issue) rather than blocking this
+            // migration. a4_error mints a correlation id lazily on any
+            // 503/400 branch below.
             auto gate = require_fleet_read(req, res, "Execution", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the response.
@@ -17410,6 +17420,22 @@ private:
             if (gate.scope) {
                 auto session = auth_routes_->resolve_session(req);
                 username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
             }
 
             auto exec_r = execution_tracker_->get_execution_checked(id);
@@ -17441,15 +17467,22 @@ private:
             const bool visible =
                 exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
             if (!exec_opt || !visible) {
-                // #3789: a suppressed cross-operator read attempt is
-                // CC7.2-evidence-worthy the same way the #1634 v1 detail
-                // route treats it — audit it distinctly even though the
-                // caller-visible response stays identical to a nonexistent
-                // execution_id (no oracle).
-                (void)audit_log(req, "execution.read", "denied", "Execution", id,
-                                "not found or outside caller's fleet-read scope surface=detail "
-                                "cid=" +
-                                    cid);
+                // #3789: audit ONLY when a confinement decision actually
+                // happened (gate.scope engaged) — a suppressed
+                // cross-operator read attempt is CC7.2-evidence-worthy the
+                // same way the #1634 v1 detail route treats it. An
+                // unconfined caller's genuinely-nonexistent id is ordinary
+                // "not found", not a security event; auditing it as
+                // "denied" would inflate the confinement-denial metric with
+                // routine 404s (compliance-officer #3789 F2). The
+                // caller-visible response stays identical either way (no
+                // oracle) — only the server-side audit trail differs.
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=detail "
+                                    "cid=" +
+                                        cid);
+                }
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "not found"), "application/json");
                 return;
@@ -17517,6 +17550,22 @@ private:
             if (gate.scope) {
                 auto session = auth_routes_->resolve_session(req);
                 username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
             }
 
             auto exec_r = execution_tracker_->get_execution_checked(id);
@@ -17549,11 +17598,14 @@ private:
                 // 404 for EVERY caller — the legacy route previously
                 // returned a zero-filled 200 for an unknown id even to an
                 // unconfined caller (behavior change; docs/user-manual/
-                // upgrading.md).
-                (void)audit_log(req, "execution.read", "denied", "Execution", id,
-                                "not found or outside caller's fleet-read scope surface=summary "
-                                "cid=" +
-                                    cid);
+                // upgrading.md). Audit ONLY under an engaged scope — see
+                // the detail route's identical rationale.
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=summary "
+                                    "cid=" +
+                                        cid);
+                }
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "not found"), "application/json");
                 return;
@@ -17602,6 +17654,22 @@ private:
             if (gate.scope) {
                 auto session = auth_routes_->resolve_session(req);
                 username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
             }
 
             auto exec_r = execution_tracker_->get_execution_checked(id);
@@ -17627,10 +17695,14 @@ private:
             const bool visible =
                 exec_opt.has_value() && execution_visible(*exec_opt, statuses, gate.scope, username);
             if (!exec_opt || !visible) {
-                (void)audit_log(req, "execution.read", "denied", "Execution", id,
-                                "not found or outside caller's fleet-read scope surface=agents "
-                                "cid=" +
-                                    cid);
+                // #3789: audit ONLY under an engaged scope — see the detail
+                // route's identical rationale (compliance-officer F2).
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=agents "
+                                    "cid=" +
+                                        cid);
+                }
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "not found"), "application/json");
                 return;
@@ -17678,6 +17750,19 @@ private:
             const std::string username = session ? session->username : std::string{};
 
             if (gate.scope) {
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 (matches the GET routes' identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
                 auto exec_r = execution_tracker_->get_execution_checked(id);
                 if (!exec_r) {
                     res.status = 503;
@@ -17713,7 +17798,7 @@ private:
                     // distinct status for "partial visibility" would be a
                     // hidden-cohort oracle, Sol/gpt-5.6-sol adversarial
                     // review).
-                    (void)audit_log(req, "execution.rerun", "denied", "Execution", id,
+                    (void)audit_log(req, "execution.rerun", "denied", "execution", id,
                                     "not found or outside caller's fleet-read scope cid=" + cid);
                     res.status = 404;
                     res.set_content(detail::a4_error(res, "not found"), "application/json");
@@ -17773,6 +17858,19 @@ private:
             const auto& exec_opt = *exec_r;
 
             if (gate.scope) {
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 (matches the GET routes' identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
                 // #3789 (adversarial review, Kimi+Codex): fetch statuses and
                 // audit UNIFORMLY for a nonexistent id and a
                 // hidden-but-existing/incomplete-cohort id — the earlier
@@ -17795,7 +17893,7 @@ private:
                                      admit_confined_mutation(*exec_opt, *statuses_opt, gate.scope,
                                                             username);
                 if (!admitted) {
-                    (void)audit_log(req, "execution.cancel", "denied", "Execution", id,
+                    (void)audit_log(req, "execution.cancel", "denied", "execution", id,
                                     "not found or outside caller's fleet-read scope cid=" + cid);
                     res.status = 404;
                     res.set_content(detail::a4_error(res, "not found"), "application/json");
@@ -17849,6 +17947,22 @@ private:
             if (gate.scope) {
                 auto session = auth_routes_->resolve_session(req);
                 username = session ? session->username : std::string{};
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after require_fleet_read
+                // already admitted the request — fail closed with an
+                // honest 503 rather than silently falling through to
+                // agent-only visibility, which could otherwise 404 a
+                // dispatcher's own execution under a misleading "denied"
+                // audit row (matches the LIST route's identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                        "unable to resolve caller identity for a confined read",
+                                        {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
             }
 
             auto exec_r = execution_tracker_->get_execution_checked(id);
@@ -17878,10 +17992,14 @@ private:
                 exec_opt.has_value() &&
                 execution_visible(*exec_opt, parent_statuses, gate.scope, username);
             if (!exec_opt || !parent_visible) {
-                (void)audit_log(req, "execution.read", "denied", "Execution", id,
-                                "not found or outside caller's fleet-read scope surface=children "
-                                "cid=" +
-                                    cid);
+                // #3789: audit ONLY under an engaged scope — see the detail
+                // route's identical rationale (compliance-officer F2).
+                if (gate.scope) {
+                    (void)audit_log(req, "execution.read", "denied", "Execution", id,
+                                    "not found or outside caller's fleet-read scope surface=children "
+                                    "cid=" +
+                                        cid);
+                }
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "not found"), "application/json");
                 return;

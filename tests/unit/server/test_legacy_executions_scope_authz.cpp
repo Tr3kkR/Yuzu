@@ -229,6 +229,19 @@ TEST_CASE("admit_confined_mutation: a row count exceeding agents_targeted also d
     CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, "bob"));
 }
 
+TEST_CASE("admit_confined_mutation: a negative agents_targeted denies rather than "
+          "admitting via a static_cast<int> row-count mismatch (unhappy-path UP-4)",
+          "[execution][scope][3789]") {
+    // A corrupt/negative agents_targeted can never equal a non-negative
+    // status-row count, so this fails closed on the same `!=` comparison
+    // that guards the ordinary incomplete/excess-ledger cases — pinning
+    // that as a regression test rather than leaving it implicit.
+    auto exec = make_exec("bob", -1);
+    std::vector<AgentExecStatus> statuses{make_status("bob-agent", "success")};
+    authz::VisibleSet scope{std::unordered_set<std::string>{"bob-agent"}};
+    CHECK_FALSE(admit_confined_mutation(exec, statuses, scope, "bob"));
+}
+
 // ── Real-rig confinement (PG) ───────────────────────────────────────────────
 
 TEST_CASE("legacy executions: real fleet-read scope excludes Alice's agent for Bob",
@@ -336,7 +349,10 @@ TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
     CHECK(list_route.find("query_executions_checked") != std::string::npos);
     CHECK(list_route.find("ExecutionListScope") != std::string::npos);
     CHECK(list_route.find("get_agent_statuses_for_executions_checked") != std::string::npos);
-    CHECK(list_route.find("500") != std::string::npos); // limit cap
+    // Exact statement, not a bare "500" substring — a 5000ms retry_after_ms
+    // literal in the same block would false-green a "500" find (#3789
+    // quality-engineer S1).
+    CHECK(list_route.find("q.limit > 500") != std::string::npos);
 }
 
 TEST_CASE("legacy executions summary route: unknown-id collapses to 404 for every "
@@ -369,6 +385,14 @@ TEST_CASE("legacy executions rerun/cancel routes: mutation admission uses the "
     for (const auto* block : {&rerun, &cancel}) {
         CHECK(block->find("admit_confined_mutation") != std::string::npos);
         CHECK(block->find("get_execution_checked") != std::string::npos);
+        // #3789 (adversarial review, Kimi+Codex fix round): statuses must
+        // be fetched via the checked accessor UNCONDITIONALLY under
+        // gate.scope, not only when exec_opt is present — a regression
+        // back to the id-conditional shape reopens the DB-round-trip
+        // timing/work oracle between "nonexistent" and "hidden" (quality-
+        // engineer S2: this pins the fix, not just admit_confined_mutation's
+        // presence).
+        CHECK(block->find("get_agent_statuses_checked") != std::string::npos);
     }
     // #3789: mark_cancelled's false-success-on-nonexistent-row bug is fixed
     // by an explicit existence check ahead of the mutation call.

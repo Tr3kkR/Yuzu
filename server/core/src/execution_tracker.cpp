@@ -260,11 +260,15 @@ std::vector<Execution> ExecutionTracker::query_executions(const ExecutionQuery& 
 std::optional<std::vector<Execution>>
 ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
                                            const ExecutionScope& scope) const {
-    if (!open_)
+    if (!open_) {
+        spdlog::warn("ExecutionTracker::query_executions_checked degraded: tracker not open");
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::query_executions_checked degraded: pool exhausted");
         return std::nullopt;
+    }
 
     std::string sql = std::string("SELECT ") + kSelectBase +
                       (q.include_error_detail ? kSelectErrorDetailExpr : kSelectErrorDetailEmpty) +
@@ -290,8 +294,10 @@ ExecutionTracker::query_executions_checked(const ExecutionQuery& q,
     params.push_back(std::to_string(q.limit));
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ExecutionTracker::query_executions_checked degraded: query failed");
         return std::nullopt;
+    }
 
     std::vector<Execution> results;
     const int rows = PQntuples(res.get());
@@ -315,11 +321,15 @@ std::optional<Execution> ExecutionTracker::get_execution(const std::string& id) 
 
 std::expected<std::optional<Execution>, std::string>
 ExecutionTracker::get_execution_checked(const std::string& id) const {
-    if (!open_)
+    if (!open_) {
+        spdlog::warn("ExecutionTracker::get_execution_checked degraded: tracker not open");
         return std::unexpected("execution tracker not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::get_execution_checked degraded: pool exhausted");
         return std::unexpected("execution tracker temporarily unavailable (pool exhausted)");
+    }
     // Deliberately NOT delegating to exec_by_id_at above: that helper
     // collapses "row absent" and "query failed" into one nullopt return
     // (single early-return on `PGRES_TUPLES_OK-or-zero-rows`), which is
@@ -329,8 +339,10 @@ ExecutionTracker::get_execution_checked(const std::string& id) const {
     auto sql = std::string("SELECT ") + kSelectBase + kSelectErrorDetailExpr +
                " FROM execution_tracker.executions WHERE id = $1";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{id});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ExecutionTracker::get_execution_checked degraded: query failed");
         return std::unexpected("execution query failed");
+    }
     if (PQntuples(res.get()) == 0)
         return std::optional<Execution>{std::nullopt};
     return std::optional<Execution>{row_to_exec(res.get(), 0)};
@@ -358,11 +370,15 @@ ExecutionSummary ExecutionTracker::get_summary(const std::string& id) const {
 
 std::optional<std::vector<AgentExecStatus>>
 ExecutionTracker::get_agent_statuses_checked(const std::string& execution_id) const {
-    if (!open_)
+    if (!open_) {
+        spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: tracker not open");
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: pool exhausted");
         return std::nullopt;
+    }
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -370,8 +386,10 @@ ExecutionTracker::get_agent_statuses_checked(const std::string& execution_id) co
         "error_detail, COALESCE(plugin_result_status, 0) FROM execution_tracker.agent_exec_status "
         "WHERE execution_id = $1 ORDER BY agent_id",
         std::vector<std::string>{execution_id});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ExecutionTracker::get_agent_statuses_checked degraded: query failed");
         return std::nullopt;
+    }
 
     std::vector<AgentExecStatus> results;
     const int rows = PQntuples(res.get());
@@ -412,11 +430,17 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
     // ResponseStore::facet_values' convention for this same shape).
     if (execution_ids.empty())
         return by_execution;
-    if (!open_)
+    if (!open_) {
+        spdlog::warn(
+            "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: tracker not open");
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        spdlog::warn(
+            "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: pool exhausted");
         return std::nullopt;
+    }
 
     std::vector<std::string_view> sv(execution_ids.begin(), execution_ids.end());
     pg::PgResult res = pg::exec_params(
@@ -426,8 +450,11 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
         "FROM execution_tracker.agent_exec_status "
         "WHERE execution_id = ANY($1::text[]) ORDER BY execution_id, agent_id",
         std::vector<std::string>{pg::to_text_array(sv)});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn(
+            "ExecutionTracker::get_agent_statuses_for_executions_checked degraded: query failed");
         return std::nullopt;
+    }
 
     const int rows = PQntuples(res.get());
     for (int i = 0; i < rows; ++i) {
@@ -451,19 +478,25 @@ std::vector<Execution> ExecutionTracker::get_children(const std::string& parent_
 
 std::optional<std::vector<Execution>>
 ExecutionTracker::get_children_checked(const std::string& parent_id) const {
-    if (!open_)
+    if (!open_) {
+        spdlog::warn("ExecutionTracker::get_children_checked degraded: tracker not open");
         return std::nullopt;
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        spdlog::warn("ExecutionTracker::get_children_checked degraded: pool exhausted");
         return std::nullopt;
+    }
 
     // get_children is used by workflow drill-down — opt out of the
     // error-detail subquery to keep the workflow-step expansion cheap.
     auto sql = std::string("SELECT ") + kSelectBase + kSelectErrorDetailEmpty +
                " FROM execution_tracker.executions WHERE parent_id = $1 ORDER BY dispatched_at DESC";
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{parent_id});
-    if (res.status() != PGRES_TUPLES_OK)
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::warn("ExecutionTracker::get_children_checked degraded: query failed");
         return std::nullopt;
+    }
 
     std::vector<Execution> results;
     const int rows = PQntuples(res.get());

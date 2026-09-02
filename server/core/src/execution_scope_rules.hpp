@@ -42,12 +42,15 @@ namespace yuzu::server {
                                             const std::string& username) {
     if (!scope)
         return true;
-    if (!username.empty() && exec.dispatched_by == username)
-        return true;
+    // Full scan, no early exit — matches the doc comment above. An early
+    // `return true` on the first in-scope row makes the loop length
+    // (and thus wall-clock time) a function of WHERE in `statuses` the
+    // first visible agent falls, a residual timing side-channel on the
+    // admit path (cpp-expert, #3789 Gate 3).
+    bool visible = !username.empty() && exec.dispatched_by == username;
     for (const auto& a : statuses)
-        if (authz::in_scope(scope, a.agent_id))
-            return true;
-    return false;
+        visible = authz::in_scope(scope, a.agent_id) || visible;
+    return visible;
 }
 
 /// Recomputed execution counters, projected to only the in-scope agent
@@ -122,10 +125,12 @@ confined_projection(const std::vector<AgentExecStatus>& statuses, const authz::V
         return owns;
     if (static_cast<int>(statuses.size()) != exec.agents_targeted)
         return false;
+    // Full scan, no early exit — same rationale as `execution_visible`
+    // above (cpp-expert NICE, folded in for consistency, #3789 Gate 3).
+    bool all_in_scope = true;
     for (const auto& a : statuses)
-        if (!authz::in_scope(scope, a.agent_id))
-            return false;
-    return true;
+        all_in_scope = authz::in_scope(scope, a.agent_id) && all_in_scope;
+    return all_in_scope;
 }
 
 } // namespace yuzu::server
