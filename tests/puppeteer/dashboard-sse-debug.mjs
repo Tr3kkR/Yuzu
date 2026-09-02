@@ -20,7 +20,7 @@ async function main() {
 
   const browser = await puppeteer.launch({
     headless: false,
-    args: ['--window-size=1400,900'],
+    args: ['--window-size=1400,900', '--no-sandbox'],
     defaultViewport: { width: 1400, height: 900 },
   });
 
