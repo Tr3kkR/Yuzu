@@ -174,7 +174,10 @@ json file_hash_equals_params() {
           {"minimum", 1},
           {"default", 67108864},
           {"description", "Hashing-DoS cap (bytes). A file larger than this reports <oversize> "
-                          "rather than being hashed."}}},
+                          "rather than being hashed. A value above 1073741824 (1 GiB) is NOT "
+                          "rejected at authoring time - it is silently clamped to that ceiling "
+                          "on the agent and logged once there (#2233 item 6); author within the "
+                          "ceiling if you need the authored value to be the effective one."}}},
         {"settle_ms",
          {{"type", json::array({"integer", "string"})},
           {"minimum", 0},

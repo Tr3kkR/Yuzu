@@ -1364,19 +1364,20 @@ window later that is population churn, not a new incident.
 ### Guardian M1 health-stream fleet gauges
 
 The M1 flood-guard telemetry ([Guaranteed State](guaranteed-state.md)'s errored-view
-staleness/priority-lane backstops): 3 sparse counters rolled up as an **unlabelled fleet
-sum**, same absent-not-zero rule and same forged-value posture as the journal family
-above - a healthy or inert (`prefer_spark` off) fleet reads all three **absent**, never
-a fabricated `0`. **Monitor-only**, same reasons as the journal family: no
-churn-robust alert form exists over an unlabelled fleet sum of per-agent cumulative
-counters.
+staleness/priority-lane backstops) plus the #2993 outbox-backpressure signal: 4 sparse
+counters rolled up as an **unlabelled fleet sum**, same absent-not-zero rule and same
+forged-value posture as the journal family above - a healthy or inert (`prefer_spark`
+off) fleet reads all four **absent**, never a fabricated `0`. **Monitor-only**, same
+reasons as the journal family: no churn-robust alert form exists over an unlabelled
+fleet sum of per-agent cumulative counters.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_fleet_guardian_unhealthy_suppressed` | gauge | Fleet sum of convergence re-evals of a still-errored Guardian rule whose repeat `guard.unhealthy` was **not** re-emitted (the edge-suppression flood guard). Monitor-only |
 | `yuzu_fleet_guardian_unhealthy_refreshed` | gauge | Fleet sum of `guard.unhealthy` **re-emissions** for a rule still stuck errored, sent at `errored_refresh_ms` cadence (default 300 s) so a lost/coalesced edge cannot leave the server's errored view stale forever. Sibling to `_unhealthy_suppressed` - together they partition every committed repeat-errored eval into "put on the wire" vs "not this tick" |
 | `yuzu_fleet_guardian_priority_demoted` | gauge | Fleet sum of rule_ids demoted off the 5 s convergence priority lane to their normal type-lane cadence after K consecutive Unknown sweeps or T elapsed (defaults 12 sweeps / 120 s) - the read-flood guard for a rule stuck pending-initial |
-| `yuzu_fleet_guardian_health_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** health tag - the coverage denominator for the 3 counters. **Published every sweep including `0`**. Read `0` carefully, same caveat as the journal family's reporting gauge: the writer is sparse, so this counts agents with a non-zero counter, not agents whose health pipeline is working - a live fleet with nothing currently errored/refreshed/demoted reads `0` legitimately |
+| `yuzu_fleet_guardian_outbox_backpressure_drops` | gauge | Fleet sum of compliance/health entries rejected at an agent's MAIN outbox capacity (#2993) - distinct from the journal family's own backpressure gauges above, a different log. A chronic per-agent jam here means compliance/health drift is being lost, not just delayed. Monitor-only |
+| `yuzu_fleet_guardian_health_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** health tag - the coverage denominator for the 4 counters. **Published every sweep including `0`**. Read `0` carefully, same caveat as the journal family's reporting gauge: the writer is sparse, so this counts agents with a non-zero counter, not agents whose health pipeline is working - a live fleet with nothing currently errored/refreshed/demoted/backpressured reads `0` legitimately |
 | `yuzu_fleet_guardian_health_tag_rejected` | gauge | Health tags **present** on a heartbeat this sweep but rejected by the forged-value parse. **Published every sweep including `0`**. `> 0` means some agent is shipping malformed Guardian health telemetry |
 
 `errored_rules` on `GET /api/v1/guaranteed-state/status` and `/status/{agent_id}`

@@ -230,16 +230,19 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         if (const auto it = arming_keys_.find(key);
             it != arming_keys_.end() && it->second.rule_id == rule_id && it->second.generation == gen)
             arming_keys_.erase(it);
-        // index_add_rollback (armed before index_->add(), committed at this locked
-        // block's own normal end) already owns undoing index_->add() for every throw
-        // before that commit point - and by construction it always commits before
-        // arming_emplaced can be true for any exception-reachable duration (nothing
-        // throwing runs between the two). This call is therefore redundant-but-safe
-        // (index_->remove_rule is documented idempotent) belt-and-suspenders for THIS
-        // guard's own later firing window (after the locked block has closed), not a
+        // NOT redundant with index_add_rollback in this guard's PRIMARY firing window.
+        // index_add_rollback is armed before index_->add() and committed at this locked
+        // block's own normal end (well before arming_emplaced can be true for any
+        // exception-reachable duration - nothing throwing runs between the two), so it
+        // has already gone out of scope by the time io_executor_.run() (much further
+        // down, off both locks) can throw and fire THIS guard - at that point this is
+        // the ONLY undo of index_->add() left. It is a harmless no-op (index_->remove_rule
+        // is documented idempotent) ONLY in the narrow window index_add_rollback still
+        // covers (a throw inside the locked block, before it commits) - do not delete
+        // this call as "redundant" without re-checking that later window. Also not a
         // second copy of the class of duplication PR #3821 round 3 removed (that
-        // removed three IDENTICAL per-branch copies of the same undo; this is a
-        // different guard covering a different, later window).
+        // removed three IDENTICAL per-branch copies of the same undo within one window;
+        // this is a different guard's undo for a later, non-overlapping window).
         index_->remove_rule(rule_id); // no-op if already withdrawn
     };
 
@@ -1033,9 +1036,11 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     try {
         const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // best-effort live window
         // #2233 item 7 (see the ARM-side twin above for the full rationale). Distinct
-        // from the try/catch's own return-false-on-throw path just below: THAT one is a
-        // build/construction failure (already counted separately via
-        // journal_stage_failures_), not a capacity drop, so it must not double-log here.
+        // from THIS try's own catch just below: that one covers enqueue() itself
+        // throwing (not a capacity rejection, which enqueue() reports via its return
+        // value) - a genuinely different failure, so it must not double-log here. The
+        // separate construction try/catch above (agent_id/event_id/OutboxEntry/record
+        // build) already returned early on its own throw and never reaches this line.
         if (!accepted && lifecycle_log_.backpressure_drops() == 1)
             spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
                         "rule '{}' dropped (further occurrences counted, not logged)",
