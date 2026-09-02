@@ -2,6 +2,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "agent_registry.hpp" // #3687: DispatchDenial / DispatchDenialReason — AuthorizeDispatchFn's error type
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
@@ -284,6 +285,52 @@ public:
                                     yuzu::server::ClassificationError>(
             std::string_view plugin, std::string_view action)>;
 
+    /// #3687: the pre-dispatch DRY RUN of the shared dispatch chokepoint's
+    /// full classify+authorize+kill-switch decision — the same decision
+    /// `ServerImpl::build_classified_command` makes, minus the wire-command
+    /// construction a dry run has no use for. `execute_instruction`'s
+    /// handler calls this BEFORE `dispatch_fn`, with no target-agent list —
+    /// classification and authorization are decided from `(plugin, action,
+    /// caller)` alone, before any scope/group target resolution happens.
+    ///
+    /// Every `yuzu::server::detail::DispatchDenialReason` the chokepoint can
+    /// produce (`Unclassified`/`Ambiguous`/`AnonymousOperator`/`Forbidden`/
+    /// `ApprovalRequired`/`KillSwitched`) is reachable here — production
+    /// wires a closure that calls `classify_and_authorize_dispatch`
+    /// (`agent_registry.hpp`, the SAME pure function + the SAME injected
+    /// RBAC binder `build_classified_command` itself consults, never a
+    /// re-implemented slice — Decision 7 F fix,
+    /// `docs/security-reviews/1398-dispatch-approval-gate-design.md`) and
+    /// then, only on success, the SAME per-action kill-switch check
+    /// (`PluginConfigStore::action_allowed`) `finalize_classified_command`
+    /// runs — same order (kill switch checked AFTER classify+authorize, so
+    /// it can never mask a `Forbidden`/`ApprovalRequired` verdict with a
+    /// weaker-sounding one).
+    ///
+    /// FAIL-CLOSED contract, matching `ClassifyFn` immediately above (the
+    /// OPPOSITE default posture from most `*Fn` seams in this file): an
+    /// unset (`{}`) fn means `execute_instruction` cannot determine whether
+    /// this caller may dispatch this pair at all, so it refuses EVERY call
+    /// with a distinguishable "dispatch authorization unavailable" denial —
+    /// never a silent fall-through to the pre-#3687 collapsed-envelope
+    /// behaviour. Production always wires this (server.cpp, unconditionally,
+    /// next to `set_capability_classify_fn`); an unset fn reaching a live
+    /// request means the wiring itself regressed.
+    ///
+    /// A WIRED fn returning success here is NOT the sole enforcement point —
+    /// `dispatch_fn` still re-runs the identical chokepoint decision
+    /// internally a moment later (cheap: no I/O beyond the same RBAC read
+    /// this call already made) and is the surface that actually dispatches.
+    /// This seam exists purely so a caller this dispatch was always going to
+    /// refuse gets a discriminated, reason-naming error instead of the
+    /// generic `agents_reached:0`/`no_agents_reached` envelope an empty
+    /// target set also produces — it does not change what dispatch_fn itself
+    /// enforces.
+    using AuthorizeDispatchFn = std::function<std::expected<yuzu::server::CommandCapability,
+                                                             yuzu::server::detail::DispatchDenial>(
+        const yuzu::server::DispatchCaller& caller, std::string_view plugin,
+        std::string_view action)>;
+
     /// Injects the engine-principal + engine-credential store pointers and
     /// the owner-FK predicate via SETTERS rather than growing the already
     /// 30-parameter build_handler()/register_routes() trailing-parameter
@@ -311,6 +358,11 @@ public:
     /// above (the handler's `[=]` lambda captures `this`, so the injection
     /// is a live read on the next request).
     void set_capability_classify_fn(ClassifyFn fn) { classify_fn_ = std::move(fn); }
+    /// #3687: see `AuthorizeDispatchFn`'s doc comment above for the
+    /// fail-closed contract. Same setter idiom as `set_capability_classify_fn`
+    /// immediately above (the handler's `[=]` lambda captures `this`, so the
+    /// injection is a live read on the next request).
+    void set_authorize_dispatch_fn(AuthorizeDispatchFn fn) { authorize_dispatch_fn_ = std::move(fn); }
 
     /// Progress bridge (2f PR 3a). Same setter idiom + lifetime argument as
     /// set_engine_principal_store above (the handler's `[=]` lambda captures
@@ -588,6 +640,10 @@ private:
     // execute_instruction fails closed at BOTH gate sites (mcp_server.cpp),
     // never a silent fall-through to the pre-#3685 unconfined behaviour.
     ClassifyFn classify_fn_;
+    // #3687 — see AuthorizeDispatchFn's doc comment above: unset means the
+    // pre-dispatch dry run in mcp_server.cpp fails closed rather than
+    // silently reverting to the pre-#3687 collapsed-envelope behaviour.
+    AuthorizeDispatchFn authorize_dispatch_fn_;
     // Progress bridge core (2f PR 3a) - see set_stream_bridge above.
     McpStreamBridge* stream_bridge_{nullptr};
     // KEK rotation seam (#2395 track C) - see set_kek_ops above. Default-
