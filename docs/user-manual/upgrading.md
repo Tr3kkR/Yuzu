@@ -1654,41 +1654,33 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
-## Notification feed moves to PostgreSQL — history preserved (NotificationStore, ADR-0046)
+## Notification feed moves to PostgreSQL (NotificationStore, ADR-0046)
 
 `NotificationStore` — the dashboard toast/badge feed — moves from the SQLite
 `notifications.db` file to the server's PostgreSQL substrate in this release
-(ADR-0006 Wave 2, ADR-0046), schema `notification_store`. **Unread/dismissed
-state is preserved by a mandatory backfill, not a fresh start.** No new flag
-or environment variable is added (it reuses the shared server `PgPool`).
+(ADR-0006 Wave 2, ADR-0046), schema `notification_store`. No new flag or
+environment variable is added (it reuses the shared server `PgPool`).
 
-**What happens on first PG boot:**
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `notifications.db` data to carry over — the
+one-time mandatory backfill this section originally described was retired under
+ADR-0009's fresh-start-by-default amendment (see ADR-0046's Update).
 
-- A one-time, idempotent, **fail-closed** backfill copies every notification
-  out of the legacy `notifications.db` into `notification_store`, preserving
-  ids (so any bookmarked/linked notification id stays valid) and read/dismissed
-  state. The legacy file is moved aside once the backfill is verified.
-- **Startup failure mode changed.** Previously, a broken or unreadable
-  `notifications.db` degraded only the notification feature — the store ran
-  closed and `/api/notifications*` returned 503. **It now fails the whole
-  server boot** (matching every other Postgres-migrated store's fail-closed
-  contract): if the schema can't open, or the backfill can't complete, the
-  server logs `[PG] Refusing to start` and refuses to serve at all. If you
-  hit this, the log line names the legacy file and states the remediation:
-  repair it, or move it aside to skip the backfill (unread/dismissed history
-  in it will **not** carry over if you do).
-- **Multi-instance consolidation — boot the authoritative replica first.**
-  If you are consolidating multiple previously-independent server instances
-  (each with genuinely different local `notifications.db` content) onto one
-  shared Postgres for the first time, whichever instance boots first and
-  completes the backfill becomes the fleet's sole notification history — every
-  other instance's own legacy file will permanently fail closed (a
-  holder-side fingerprint mismatch) on every subsequent boot, requiring manual
-  reconciliation (move the losing instances' legacy files aside once you've
-  confirmed their content is disposable). This is the intended fail-loud
-  behavior, not a bug — there is no automated merge across independent legacy
-  files. Boot the instance holding the notification history you want to keep
-  first, same guidance as the RBAC store migration above.
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching every other Postgres-migrated store's
+  contract): the server logs `[PG] Refusing to start` and refuses to serve at all.
+- A legacy `notifications.db` file with real content **does NOT** fail startup and
+  its content is **never imported** — the server opens it read-only, purely to
+  count rows in `notifications` for a diagnostic warning, then boots fresh-started
+  regardless of what it finds. If that table has rows, it logs a
+  `NotificationStore` legacy-row-count warning at WARN; boot proceeds unaffected
+  either way. There is no automated recovery path for old unread/dismissed history
+  — this is display-only state (never an authorization, targeting, or enforcement
+  decision), so a fresh start is acceptable in a way it would not be for an
+  authoritative store.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Not affected:** `/api/notifications*` request/response behavior is
 unchanged — this is a storage-engine swap only, no API change.

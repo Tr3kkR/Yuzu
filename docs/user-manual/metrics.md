@@ -1483,11 +1483,14 @@ outcome) was retired along with `migrate_from_sqlite()` itself
 (chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a pre-Postgres
 build, so there was no real `custom-properties.db` data to migrate. See ADR-0045's Update.
 
-## Notification store metrics (dashboard feed, ADR-0046)
+## Notification store (dashboard feed, ADR-0046)
 
-| Metric | Type | Description |
-|---|---|---|
-| `yuzu_server_notification_backfill_total{result}` | counter | Outcome of the one-time legacy `notifications.db` → PostgreSQL backfill, emitted on **every** boot (not just first boot — unlike the sibling stores' *three-way* fresh/completed/failed split, this store's backfill is a single transaction with no separate fresh/completed outcome, so "fresh install" and "already-migrated skip" both collapse into `result="success"`, and the wrapper always emits it). `result` ∈ `success` (fresh install, an already-migrated skip, or a completed migration), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
+`yuzu_server_notification_backfill_total{result}` (the one-time legacy backfill outcome)
+was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real `notifications.db` data to migrate. This store
+had no other dedicated metric (`set_metrics()`/the `metrics_` pointer were retired with
+it — nothing else consumed them). See ADR-0046's Update.
 
 **Useful PromQL queries:**
 
@@ -1495,9 +1498,6 @@ build, so there was no real `custom-properties.db` data to migrate. See ADR-0045
 # props.<key> scope reads degrading → scoped dispatch/policy/push rules may be
 # silently matching nobody. (Shipped as the YuzuCustomPropertiesReadDegraded alert.)
 sum(rate(yuzu_server_custom_properties_read_degrade_total[5m])) by (reason) > 0
-
-# One-time notification backfill failed → server refused to boot (ADR-0046).
-sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## Analytics event outbox metrics (ADR-0049)

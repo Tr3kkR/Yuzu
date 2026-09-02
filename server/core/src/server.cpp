@@ -6267,11 +6267,12 @@ public:
         // NotificationStore (ADR-0006 Wave 2): Postgres-backed, construction
         // fail-closed (ADR-0012 §1) — a reachable database whose schema
         // can't migrate/open is a fatal startup error, never a serve-degraded
-        // state. `migrate_from_sqlite` runs the one-time, idempotent legacy-
-        // `notifications.db` backfill (ADR-0009, MANDATORY — unread/dismissed
-        // state is operator-relevant, not expendable telemetry) — a backfill
-        // failure is ALSO fatal (never serve on top of a partially-migrated
-        // schema).
+        // state. NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default
+        // amendment): the legacy notifications.db is never copied; the
+        // detect-and-warn obligation still applies, so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds
+        // rows.
         if (pg_pool_ && !startup_failed_) {
             notification_store_ = std::make_unique<NotificationStore>(*pg_pool_);
             if (!notification_store_->is_open()) {
@@ -6280,26 +6281,12 @@ public:
                               "could not be created/opened)");
                 startup_failed_ = true;
             } else {
-                notification_store_->set_metrics(&metrics_);
-                auto notif_db = cfg_.db_dir() / "notifications.db";
-                if (!notification_store_->migrate_from_sqlite(notif_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: notification legacy-SQLite backfill failed "
-                        "(see prior log lines) — notification_store is authoritative and must "
-                        "not serve partially-migrated data. Operator remediation: repair {} or "
-                        "move it aside to skip the backfill (unread/dismissed history in it "
-                        "will NOT carry over)",
-                        notif_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("NotificationStore initialized (schema notification_store; "
-                                 "legacy backfill source {})",
-                                 notif_db.string());
-                    // #3261: wire the consumer immediately after construction,
-                    // inside the full-success branch - the old top-of-ctor
-                    // wiring block ran before this store existed and never fired.
-                    agent_service_.set_notification_store(notification_store_.get());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "notifications.db",
+                                                         "NotificationStore", {"notifications"});
+                // #3261: wire the consumer immediately after construction,
+                // inside the full-success branch - the old top-of-ctor
+                // wiring block ran before this store existed and never fired.
+                agent_service_.set_notification_store(notification_store_.get());
             }
         }
         // WebhookStore (ADR-0057, Wave 3) — Postgres-backed, construction
