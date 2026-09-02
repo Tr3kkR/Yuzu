@@ -208,7 +208,7 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
-### vNEXT — gateway management plane now pins its peer (#1422)
+### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable
 listener, strict mTLS **plus** an SPKI peer pin

@@ -1452,6 +1452,23 @@ public:
             "yuzu_server_gateway_capability_denied_total",
             {{"capability", std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}});
 
+        // #1422: terminal outcomes of gateway command forwarding. Pre-seeded so
+        // the family exports at 0 from boot (absent-vs-zero stays meaningful:
+        // absent = no gateway forwarding configured, zero = configured and
+        // healthy). "unauthenticated" = the gateway's mgmt-plane peer pin
+        // rejected this server's cert - fleet forwarding is down until the pin
+        // and the server leaf agree.
+        metrics_.describe("yuzu_server_gateway_forward_total",
+                          "Gateway SendCommand forwards by terminal outcome (ok / "
+                          "unauthenticated = rejected by the gateway's #1422 mgmt-plane "
+                          "peer pin / unavailable = dropped after 3 retries / other). "
+                          "Any non-ok movement means commands to gateway-connected "
+                          "agents are being lost.",
+                          "counter");
+        for (const char* st : {"ok", "unauthenticated", "unavailable", "other"}) {
+            metrics_.counter("yuzu_server_gateway_forward_total", {{"status", st}});
+        }
+
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -9371,7 +9388,12 @@ public:
         // below), which is why it no longer belongs in this enumeration -
         // response_store_/notification_store_ remain on the raw-pointer
         // pattern, #3279's reach set for them is unchanged.
-        // #3279 should be updated to name the (now two-store) reach set.
+        // #3279 should be updated to name the (now two-store) reach set,
+        // plus &metrics_ (#1422: the same detached forward thread now also
+        // increments yuzu_server_gateway_forward_total at each terminal
+        // outcome - cpp-safety Gate 8: destruction order puts metrics_
+        // strictly after the pre-existing capture targets, so its dangle
+        // window is a subset of theirs; same envelope, not widened).
         //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
         // makes a few hundred lines up, and for the identical reason - NOT
@@ -11489,17 +11511,20 @@ private:
                             return; // success — done
                         }
                         // #1422: the gateway's mgmt-plane peer pin rejects with
-                        // UNAUTHENTICATED and a deliberately EMPTY message — the
-                        // generic warn below would render as "failed:  (16)",
-                        // which is invisible as the fleet-wide forwarding outage
-                        // it actually is. Name the cause and the fix.
+                        // UNAUTHENTICATED and an EMPTY message (grpcbox sends no
+                        // grpc-message when an auth_fun rejects) — the generic
+                        // warn below would render as "failed:  (16)", which is
+                        // invisible as the fleet-wide forwarding outage it
+                        // actually is. Name the cause and the fix.
                         if (status.error_code() == grpc::StatusCode::UNAUTHENTICATED) {
                             spdlog::error(
                                 "Gateway SendCommand for {} REJECTED by the gateway's "
                                 "mgmt-plane peer pin (UNAUTHENTICATED): the cert this "
-                                "server presents does not match the gateway's "
-                                "mgmt_peer_pins (rotated leaf? BYO cert without "
-                                "repointing the pin?). Command forwarding to "
+                                "server presents does not satisfy the gateway's "
+                                "mgmt_peer_pins posture (rotated leaf? BYO cert "
+                                "without repointing the pin, or without the "
+                                "serverAuth EKU?). The gateway log's reason atom "
+                                "names the exact cause. Command forwarding to "
                                 "gateway-connected agents is DOWN until the pin and "
                                 "the server leaf agree. Command dropped.",
                                 cmd_id);
