@@ -216,20 +216,52 @@ exhaustive switch with no default arm, so a future change to the verdict enum fo
 compile-time decision here too, instead of silently falling through to a guard shape that was
 correct only because of a downstream backstop.
 
-**Who this affects:** any operator or automation dispatching one of the 17 rows above via MCP
-`execute_instruction` with `scope` or an omitted/empty target — this is the surface whose outcome
-actually changes. A REST `/api/command` caller doing the same was already refused before this
-release and sees no behavior change. Explicit `agent_ids` dispatches to these rows, and any
-dispatch to a row NOT on this list, are unaffected on either surface.
+**Who this affects:** two surfaces change outcome in this release. **MCP `execute_instruction`**,
+for any operator or automation dispatching one of the 17 rows above with `scope` or an
+omitted/empty target. And the **dashboard execute surface** (`POST /api/dashboard/execute`), which
+gains the gate for the first time here — including the case most likely to bite, an **omitted**
+scope: that surface treated "no target named" as the whole fleet, so console automation that
+posted neither `agent_ids` nor `scope` for one of these rows previously dispatched fleet-wide and
+is now refused. A REST `/api/command` caller was already refused before this release and sees no
+behavior change. Dispatches to a row NOT on this list are unaffected on all three surfaces.
 
-**What to do:** switch any such call to explicit, non-empty `agent_ids`. `POST
-/api/instructions/{id}/execute`, the dashboard execute surface, and MCP `execute_bundle` do not yet
-enforce this gate for these same 17 rows — a tracked follow-up, not a gap this release closes.
+**A second dashboard change, distinct from the targeting gate:** an explicitly-targeted Destructive
+dispatch from the console is now confined to the agents visible to the calling operator, matching
+REST. With RBAC off this is a no-op — every enrolled agent belongs to the auto-created root "All
+Devices" group, so the visible set is the whole fleet. It bites only with **RBAC enforcement on**
+where an operator holds `Execution:Execute` as a global grant rather than through a
+management-group role: that operator has no management-group rows to be visible through, so the
+confined list is empty and the dispatch is refused with `no reachable in-scope agent` (audited
+`reason=scope_violation`). The fix is to grant the operator a management-group role covering the
+agents they administer. Note the message names in-scope reachability, not connectivity — an agent
+shown as online in the console can still produce it.
 
-**Verify:** re-run the affected dispatch with explicit `agent_ids` and confirm it succeeds as
-before; a scope/broadcast call to one of the 17 rows should now return the refusal above rather
-than dispatching. `yuzu_server_dispatch_target_rejected_total{route="command"|"mcp",reason="destructive_untargeted"}`
-counts refusals on both surfaces if you want to confirm the gate is exercising in your environment.
+**What to do — the field to send differs by surface, so do not apply one remediation to both:**
+
+- **MCP `execute_instruction`** (and REST `/api/command`): send an explicit, non-empty
+  `agent_ids` array.
+- **Dashboard `POST /api/dashboard/execute`**: this endpoint has **no `agent_ids` field** and
+  ignores one if sent. It takes a single `scope` form field, and one explicit agent is expressed
+  as `scope=<agent-id>` (a management group is `scope=group:<id>`, the fleet is `scope=__all__` —
+  the latter two are what the gate now refuses for Destructive rows). Console automation must
+  therefore send `scope=<agent-id>`. The browser UI already does this and needs no change.
+
+In both cases, if RBAC is enforced, also confirm the calling operator's management-group roles
+cover the agents named — see the confinement note above.
+`POST /api/instructions/{id}/execute` and MCP `execute_bundle` do not yet enforce the gate — a
+tracked follow-up, not a gap this release closes.
+
+**Verify:** re-run the affected dispatch with an explicit single target — `agent_ids` on
+MCP/REST, `scope=<agent-id>` on the dashboard — and confirm it succeeds as before; a group-scope,
+broadcast, or untargeted call to one of the 17 rows should now return the refusal above rather
+than dispatching. To confirm the gate is exercising in your environment:
+
+```promql
+yuzu_server_dispatch_target_rejected_total{route=~"command|mcp|dashboard",reason="destructive_untargeted"}
+```
+
+Note the regex matcher (`=~`): a label matcher cannot take an alternation of quoted strings. The visible-agent confinement refusal is deliberately **not** on that counter —
+look for the `command.dispatch|denied` audit row carrying `reason=scope_violation` instead.
 
 ## Behaviour change: SAML login gains a new availability coupling to `rbac_store` (#1832)
 

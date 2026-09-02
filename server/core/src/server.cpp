@@ -1266,8 +1266,9 @@ public:
                           "Dispatch calls refused because a supplied targeting argument "
                           "named no device, plus dispatch-closure calls that named no target at "
                           "all (#2500), plus Destructive-class capabilities targeted without "
-                          "explicit agent_ids on REST (route=command) or MCP execute_instruction "
-                          "(route=mcp, #3685). Both labels are closed sets; every reachable pair "
+                          "explicit agent_ids on REST (route=command), MCP execute_instruction "
+                          "(route=mcp) or the dashboard exec console (route=dashboard) (#3685). "
+                          "Both labels are closed sets; every reachable pair "
                           "is pre-seeded at boot so absent() stays meaningful.",
                           "counter");
         // The route-level reasons below are the literals in `kRouteRejectReasons`
@@ -1300,7 +1301,11 @@ public:
         // seeding it here would publish a series claiming a reachability
         // that does not exist, which is exactly what the per-route seeding
         // above exists to avoid.
-        for (const char* route : {"command", "mcp"})
+        // "dashboard" seeded alongside the other two (PR6.0b): a series created
+        // only on first use reads as ABSENT until the first refusal, which is
+        // exactly the absent()-alerting break the single-array discipline exists
+        // to prevent -- and three docs tell operators to alert on this series.
+        for (const char* route : {"command", "mcp", "dashboard"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
@@ -20923,6 +20928,17 @@ private:
         // above); wiring it here too so /fragments/results migrates onto
         // require_fleet_read as its sole gate.
         dashboard_routes_->set_fleet_read_fn(fleet_read_fn);
+        // PR6.0b — the SAME capability_registry_ classifier /api/command and MCP
+        // execute_instruction consult, so the three operator-facing dispatch
+        // surfaces cannot disagree about whether a plugin.action is Destructive.
+        // Wired UNCONDITIONALLY, exactly like set_capability_classify_fn on
+        // McpServer below: per DashboardRoutes::ClassifyFn's fail-closed
+        // contract, omitting this call does not merely degrade the exec console
+        // — it refuses every /api/dashboard/execute dispatch.
+        dashboard_routes_->set_capability_classify_fn(
+            [this](std::string_view p, std::string_view a) {
+                return capability_registry_.classify(p, a);
+            });
         dashboard_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn, response_store_.get(),
             mgmt_group_store_.get(), &registry_, tag_store_.get(), &event_bus_,
