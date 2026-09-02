@@ -1,7 +1,7 @@
 # Spark flip gate - `prefer_spark` cutover readiness (ADR-0021 rung 7.7)
 
 This is the canonical, committed record of what gates flipping `prefer_spark` true
-(`agents/core/src/agent.cpp:834`). It supersedes #2298 (closed 2026-08-11 with stale
+(`agents/core/src/agent.cpp:835`). It supersedes #2298 (closed 2026-08-11 with stale
 checkboxes, not backfilled) and retires the local-only plan file that stranded these
 criteria outside the repo - #3438's exact complaint. Do not maintain a parallel
 local plan once this doc exists; update this file instead.
@@ -10,23 +10,29 @@ local plan once this doc exists; update this file instead.
 rung-7.7 activation-readiness checklist this document's §2 tracks) was
 auto-closed on 2026-09-02 by the repo's `close-linked-issues` workflow because
 PR #3821's body said "closes #2233" - but PR #3821 only completed item 3 of the
-issue's 10-item checklist. Items 1, 4, 5, 6, 7, 8, 9, 10 are still literally
+issue's 10-item checklist. Items 1, 4, 5, 6, 7, 8, 9, 10 were still literally
 unchecked `[ ]` in the issue body at time of writing. This is the identical
 failure mode #2298 suffered and that this gate doc exists to stop repeating,
 now reproduced by automation on its successor issue. §3 below tracks the real
-state from the checklist content, not the issue's `CLOSED` state. **Action
-needed**: reopen #2233 or replace it with a fresh tracking issue - not this
-PR's call to make unilaterally, flagged for the operator.
+state from the checklist content, not the issue's `CLOSED` state.
+
+**Resolved (Dave, 2026-09-02):** #2233 is replaced, not reopened. Its genuinely
+open items are re-filed fresh as **#3847** (items 1/4/6) and **#3848** (item 9)
+- every one of §3's 10 rows below carries its actual disposition. #2233 itself
+stays closed; recorded on #3438. The underlying automation gap (a checklist
+issue auto-closing on a partial-scope PR) is tracked separately as **#3849**.
 
 ## 1. Status header
 
 | | |
 |---|---|
 | Gate state | **OPEN** - 0 of 9 flip-green criteria evidenced |
+| Shipped posture today | `prefer_spark=false`; spark is fully dormant, legacy `IGuard` is the sole live detection/enforcement path. Nothing in this doc describes current production behavior - it is a readiness gate for a future flip (PR-5, not yet written). |
 | Evidence commit | _(placeholder - filled by PR-6, the evidence closeout PR)_ |
 | Sign-off | _(blank - filled by PR-6 once every criterion below is green)_ |
-| This PR | PR-1 of 7 in the operator's local delivery-plan draft for the spark flip (uncommitted, superseded by this doc going forward; was 8, PR-2b dropped per §3 row 5 - confirmed by the operator 2026-09-02) |
+| This PR | PR-1 of 7: PR-1 (this doc) → PR-2a (#2233 items 1/4/6 + #3831 batch, #3847) → PR-2c (fault-injection seams + item-9 TSan rerun, #3848) → PR-4 (promtool CH-2/CH-5-PROM) → PR-5 (the flip) → PR-6 (evidence closeout) → PR-2d (contingency, only if PR-2c's seams demonstrate a real defect). PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
 | Re-verified against | `origin/dev @ bd387afec` (2026-09-02); the kickoff plan's citations were pinned to `880900f1e1` - every file:line citation below was re-checked against the newer HEAD, not copied blind. Drift is called out inline where found. |
+| Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. |
 
 ## 2. Flip-green criteria (1)–(9)
 
@@ -61,9 +67,13 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
 - [ ] **7. Resource evidence** vs `docs/spark-rebuild-baselines/`.
 - [ ] **8. External gates green**: #2340 CH-2 + CH-5-PROM (promtool, PR-4) + CH-5-UAT (UAT rig,
       Rig A - §8). CH-11 does **not** gate this criterion (ruled 2026-09-01 - see §4).
-- [ ] **9. Rung-3-implementation-ready sign-off** + D4 gap-budget recorded. D4 already ruled
-      2026-08-23: the enforcement gap is temporary, no fixed budget - cited here, not
-      re-litigated.
+- [ ] **9. Rung-3-implementation-ready sign-off** + the enforcement-gap budget recorded. Already
+      ruled 2026-08-23: the flip's enforcement gap (§3 row 2) is temporary with no fixed
+      remediation budget attached - stated here, not re-litigated. (This ruling is recorded
+      only in the delivery-plan draft this doc supersedes, not restated in any other committed
+      doc - the substance is inlined here rather than cited by a bare decision label, to avoid
+      colliding with `docs/spark-legacy-delta-registry.md`'s own differently-scoped decision
+      labels of the same shape.)
 
 ## 3. #2233 item table
 
@@ -78,12 +88,12 @@ grown substantially, largely from PR #3821's rework); drift is called out per ro
 |---|---|---|---|
 | 1 | Boot ordering | Code fixed, **test still missing** | `guardian_->start_local()` runs at `agent.cpp:1292`, after `wire_spark_engine()` (call at `:1254`) and after `SparkEngine` construction (`:1207`) + `start()` (`:1225`) - ordering confirmed correct. (The issue's checklist body carries no line citations for this item; these are freshly pulled against `origin/dev @ bd387afec`.) The issue's own bar also requires "test a non-empty cached KV policy armed during pre-network startup" - that test doesn't exist yet. Tracked fresh as **#3847** (PR-2a scope). |
 | 2 | Enforcement posture | **RULED, closed** | Dave, 2026-08-28 (issue comment): hard flip, no enforcement preservation, no operator warning required, no `spark_enforce_active` signal required. |
-| 3 | Arm/disarm liveness | **DONE** | PR #3821, merged 2026-09-02. Routes File/Registry/Service arm/disarm off `registry_mu_` onto `GuardianIoExecutor`; fixes a `policy_generation_` undercount via a new 3-state `ReconcileOutcome`. A scoped Gate-8 re-review on the PR itself found and fixed 2 more guard-arming gaps of the same shape; one more (`arming_rollback`) deliberately deferred as **#3831** (OPEN, confirmed via `gh issue view 3831` - title: "attach_rule's arming_rollback is armed after its own protected mutation"). #3831 slots into PR-2a per ruling 5/9 of the delivery plan (fix approach: promote `arming_rollback` to function scope, same idiom as `prior_disarm_rollback`). |
-| 4 | Stalled sink cannot freeze the runtime | **Open - citations drifted, mechanism partially improved** | The issue cites `guardian_spark_runtime.cpp:441–445` for "`drain()` holds `outbox_mu_` across the injected send callback" - that region no longer contains `drain()` (now at `:1242`, calling `drain_bounded()` at `:1257`). Re-checked the actual current shape: `drain_bounded()` takes `drain_mu_` (`lock_guard`, held for the whole function) and calls `drain_log_unlocked(lifecycle_log_, outbox_mu_, send, ...)` at `:1349`. A comment at `:1134–1135` confirms `outbox_mu_` specifically **is now released across each send** inside `drain_log_unlocked` - that half of the original concern looks fixed. But `drain_mu_` is still held for the entire `drain_bounded()` call, including the nested `send()`. `drain_mu_` has exactly one acquisition site in the file (`:1260`, `drain_bounded()`'s own `lock_guard`) and exactly one production caller chain (`GuardianOutboxDrainWorker::drain_once()`/`drain_bounded()` in `guardian_outbox_drain_worker.cpp:186-197`, called from the worker's own loop at `:277`) - so today this does not create cross-caller lock contention the way the issue's original `outbox_mu_` framing implied. What it does mean, unchanged from the issue's actual hazard: the drain worker thread itself is wedged for the duration of a stalled send, with no other path progressing that work until it unwedges - same shape as the original concern, just self-contained within the worker rather than blocking a second lock-holder. The sync gRPC `Write()` that can block is `agent.cpp:3364–3383`'s `send_guardian_outbox_entry()` (`guardian_sink_stream_->Write(resp, ...)`, under `stream_write_mu_`) - the issue's cited `agent.cpp:2576–2585` is stale (that range is now unrelated heartbeat-tag code). Still needs a bounded/nonblocking sink contract + a stall-during-evaluation/withdrawal/shutdown test. Tracked fresh as **#3847** (PR-2a scope). |
-| 5 | Firewall both teardown scope guards, make them noncopyable | **DONE - confirmed via commit archaeology, PR-2b can drop from the delivery plan** | The issue cites two copyable guards with implicitly-noexcept destructors at `guardian_engine.cpp:66–79` / `guardian_spark_runtime.cpp:31–44`. `git show 25f73e231` (2026-07-18, part of **PR #2283**, "Guardian spark PR-1a: send-path + exception-safety + drain hardening, items 1-4", merged 2026-07-18 - a full 6 weeks before #3821) deletes the identical `struct ScopeExit { std::function<void()> fn; bool committed{false}; ~ScopeExit() { if (!committed && fn) fn(); } };` from each of `guardian_engine.cpp` (old hunk `@@ -64,20 +65,11 @@`, struct at old lines ~67-79, matching the issue's `66-79` citation almost exactly) and `guardian_spark_runtime.cpp` (old hunk `@@ -28,21 +29,6 @@`, struct within old lines 28-48, containing the issue's `31-44` citation) - copyable, implicitly-noexcept destructor invoking a throwing `std::function`, the exact shape item 5 describes, at the exact lines item 5 cites. The commit's own body states it explicitly: "B3: the two Guardian ScopeExit guards are replaced by one terminate-safe GuardianRollback (guardian_scope_guard.*): its dtor swallows a cleanup throw (which would std::terminate the agent mid-unwind) and counts it." `GuardianRollback` (`agents/core/src/guardian_scope_guard.hpp`) is noncopyable (copy/assign deleted) and its destructor never propagates (`try { fn(); } catch (...) { count + best-effort log }`) - now used 5× in `guardian_engine.cpp` and 9× in `guardian_spark_runtime.cpp`. Confirmed as part of **PR #2283** (`gh pr view 2283 --json mergeCommit` + `git merge-base --is-ancestor 25f73e231 <that commit>` both check out), merged 2026-07-18 - one day after #2233's creation timestamp (2026-07-17), and a full 6 weeks before #3821. Because the issue's own citations match the pre-fix code exactly, item 5's text was accurate at the time it was written and simply never updated once PR #2283 landed - not a case of speculative or drifted citations. **PR-2b in the delivery plan (item 5, "teardown-path-specific, merges immediately before item 9 runs") had no remaining work and is dropped** - confirmed by the operator 2026-09-02; the delivery plan's Lane A now runs PR-1 → PR-2a → PR-2c directly. No successor tracking issue needed. |
+| 3 | Arm/disarm liveness | **DONE, one residual deferred to #3831** | PR #3821, merged 2026-09-02. Routes File/Registry/Service arm/disarm off `registry_mu_` onto `GuardianIoExecutor`; fixes a `policy_generation_` undercount via a new 3-state `ReconcileOutcome`. A scoped Gate-8 re-review on the PR itself found and fixed 2 more guard-arming gaps of the same shape; one more (`arming_rollback`) deliberately deferred as **#3831** (OPEN, confirmed via `gh issue view 3831` - title: "attach_rule's arming_rollback is armed after its own protected mutation"). #3831 slots into PR-2a; the ruled fix approach (delivery plan, 2026-09-02) is to promote `arming_rollback` to function scope, the same idiom PR #3821 already used for the other three guards it fixed, mirroring `prior_disarm_rollback`. |
+| 4 | Stalled sink cannot freeze the runtime | **Open - citations drifted, mechanism partially improved** | The issue cites `guardian_spark_runtime.cpp:441–445` for "`drain()` holds `outbox_mu_` across the injected send callback" - that region no longer contains `drain()` (now at `:1242`, calling `drain_bounded()` at `:1254`). Re-checked the actual current shape: `drain_bounded()` (defined `:1257`) takes `drain_mu_` (`lock_guard`, held for the whole function) and calls `drain_log_unlocked(lifecycle_log_, outbox_mu_, send, ...)` at `:1349`. A comment at `:1134–1135` confirms `outbox_mu_` specifically **is now released across each send** inside `drain_log_unlocked` - that half of the original concern looks fixed. But `drain_mu_` is still held for the entire `drain_bounded()` call, including the nested `send()`. `drain_mu_` has exactly one acquisition site in the file (`:1260`, `drain_bounded()`'s own `lock_guard`) and exactly one production caller chain: `GuardianOutboxDrainWorker::drain_bounded()` (`guardian_outbox_drain_worker.cpp:188-197`), called from the worker's own loop at `:277`. (The sibling method `drain_once()`, `:186`, wraps the unbounded `rt_.drain()` and has zero production callers - test-only, do not read it as a second production path.) So today this does not create cross-caller lock contention the way the issue's original `outbox_mu_` framing implied. What it does mean, unchanged from the issue's actual hazard: the drain worker thread itself is wedged for the duration of a stalled send, with no other path progressing that work until it unwedges - same shape as the original concern, just self-contained within the worker rather than blocking a second lock-holder. The sync gRPC `Write()` that can block is `agent.cpp:3364–3383`'s `send_guardian_outbox_entry()` (`guardian_sink_stream_->Write(resp, ...)`, under `stream_write_mu_`) - the issue's cited `agent.cpp:2576–2585` is stale (that range is now unrelated heartbeat-tag code). Still needs a bounded/nonblocking sink contract + a stall-during-evaluation/withdrawal/shutdown test. Tracked fresh as **#3847** (PR-2a scope). |
+| 5 | Firewall both teardown scope guards, make them noncopyable | **DONE - confirmed via commit archaeology; PR-2b is dropped from the delivery plan** | The issue cites two copyable guards with implicitly-noexcept destructors at `guardian_engine.cpp:66–79` / `guardian_spark_runtime.cpp:31–44`. `git show 25f73e231` (2026-07-18, part of **PR #2283**, "Guardian spark PR-1a: send-path + exception-safety + drain hardening, items 1-4", merged 2026-07-18 - a full 6 weeks before #3821) deletes the identical `struct ScopeExit { std::function<void()> fn; bool committed{false}; ~ScopeExit() { if (!committed && fn) fn(); } };` from each of `guardian_engine.cpp` (old hunk `@@ -64,20 +65,11 @@`, struct at old lines ~67-79, matching the issue's `66-79` citation almost exactly) and `guardian_spark_runtime.cpp` (old hunk `@@ -28,21 +29,6 @@`, struct within old lines 28-48, containing the issue's `31-44` citation) - copyable, implicitly-noexcept destructor invoking a throwing `std::function`, the exact shape item 5 describes, at the exact lines item 5 cites. The commit's own body states it explicitly: "B3: the two Guardian ScopeExit guards are replaced by one terminate-safe GuardianRollback (guardian_scope_guard.*): its dtor swallows a cleanup throw (which would std::terminate the agent mid-unwind) and counts it." `GuardianRollback` (`agents/core/src/guardian_scope_guard.hpp`) is noncopyable (copy/assign deleted) and its destructor never propagates (`try { fn(); } catch (...) { count + best-effort log }`) - now used 3× in `guardian_engine.cpp` (lines 242, 623, 1384) and 6× in `guardian_spark_runtime.cpp` (lines 216, 265, 288, 321, 424, 547) - counted by direct `grep -nE '^\s*GuardianRollback [a-z_]+;'`, cross-checked by two independent governance reviewers. Confirmed as part of **PR #2283** (`gh pr view 2283 --json mergeCommit` + `git merge-base --is-ancestor 25f73e231 <that commit>` both check out), merged 2026-07-18 - one day after #2233's creation timestamp (2026-07-17), and a full 6 weeks before #3821. Because the issue's own citations match the pre-fix code exactly, item 5's text was accurate at the time it was written and simply never updated once PR #2283 landed - not a case of speculative or drifted citations. **PR-2b in the delivery plan (item 5, "teardown-path-specific, merges immediately before item 9 runs") had no remaining work and is dropped** - confirmed by the operator 2026-09-02; the delivery plan's Lane A now runs PR-1 → PR-2a → PR-2c directly. No successor tracking issue needed. |
 | 6 | Hard agent-side file-hash maximum | **Open, confirmed current** | Unclamped `max_bytes` on both spark (`guardian_spark_bridge.hpp:275–289`, drifted slightly from the issue's `:211–225`) and legacy (`guardian_engine.cpp:1036–1043`, drifted from `:622–629`) paths; only a `0` input normalizes to the 64 MiB default (`guardian_rule_eval.hpp:86`, `max_bytes{64ull * 1024 * 1024}`). No server-side clamp found. The issue's own note - a prior review's claimed "512 MiB cap" does not exist anywhere in these files - re-confirmed: `git grep -n "512"` over `guardian_spark_bridge.hpp` / `guardian_engine.cpp` / `guardian_rule_eval.hpp` is empty. Treat that prior review's other claims with extra scrutiny. Tracked fresh as **#3847** (PR-2a scope). |
 | 7 | Backpressure-drop surfacing (=#2993) | **Open, confirmed current** | The lifecycle-log outbox capacity default is 4096 (`guardian_spark_runtime.hpp:170`, `outbox_capacity{4096}`; issue didn't cite a line). Rejects on full; the drop counter's only consumers are tests (`outbox_backpressure_drops()` per #3005's own follow-up list, which explicitly filed this as #2993). PR-2a. |
-| 8 | Multi-rule mixed-capability selection | **Moved to P3 lane** | Ruled 2026-09-02 (delivery-plan ruling 4): the issue's own text says "harmless while spark cannot enforce ... must be enforced before spark gains enforcement" - item 2's no-enforcement-at-flip ruling removes the pre-flip premise. Now a P3 (enforce-cutover) prerequisite, not flip-gating. |
+| 8 | Multi-rule mixed-capability selection | **Moved to P3 lane** | Ruled 2026-09-02: the issue's own text says "harmless while spark cannot enforce ... must be enforced before spark gains enforcement" - item 2's no-enforcement-at-flip ruling removes the pre-flip premise. Now a P3 (enforce-cutover) prerequisite, not flip-gating. (This is what dropped PR-3, ~2-4 days, off the flip's critical path before this doc was even drafted.) |
 | 9 | Focused TSan + shutdown/fault-injection | **Open - citations drifted, scope re-confirmed, not narrowed** | The issue cites a single "instantaneous fake backend" TSan test at `test_guardian_spark_runtime.cpp:598–643`. The file has grown to 3551 lines and that range no longer holds a TSan test. There are now **three** TSan-checkpoint test cases (`grep TEST_CASE.*tsan`): `:1530` ("concurrent attach/detach/evaluate/drain do not race"), `:3061` ("concurrent pagers + a drainer do not race"), `:3293` ("concurrent persist + page + prune + drain do not race, QE-1"). None of the three arms `FakeBackend`'s `hang_next_arm`/`hang_next_disarm` gate (added for item 3's own fix, confirmed present and used at `:1744` onward across 10 distinct deterministic single-scenario `TEST_CASE`s) - so the issue's core finding still holds under the current code: concurrency is proven race-free only against an instantaneous fake, not against a backend that can actually block. This is the literal scope #2224's approval was conditioned on. Tracked fresh as **#3848** (PR-2c scope). PR-2c builds the deterministic per-issue scenario seams first (§5), then this rerun executes against that tree. |
 | 10 | Doc drift | **Fixed in this PR** | `docs/spark-stage2-guardian-consumer-design.md` - the issue cited line 500; the actual current line (file has grown) was 949, still reading "observe rung (2) defaults to the spark path", stale against the re-sequenced ladder (this is impl-rung-7 in current terminology). Corrected as part of this PR - see the diff on that file. |
 
@@ -93,7 +103,7 @@ Canonical home for this contract as of this PR - a local (uncommitted) delivery-
 (Sol draft + Fable corrections, 2026-08-31/09-01) is now superseded by this section and can be
 discarded once this doc lands.
 
-**Veto semantics (resolved 2026-09-01)**: CH-11 vetoes **alert-enablement only, not the flip**.
+**Veto semantics (Dave, 2026-09-01, #2340 comment)**: CH-11 vetoes **alert-enablement only, not the flip**.
 The flip gates on CH-2 + CH-5-PROM + CH-5-UAT only. CH-11, its 500-agent rig requirement, and
 #2336 (per-agent attribution axis) move to the post-flip P11 lane (§7). This resolves the
 ambiguity the delivery-plan draft flagged: Sol's original reading ("the flip may proceed only
@@ -106,7 +116,7 @@ genuine go/no-go." Against: the issue's own title/body do say "cutover gates" (p
 unscoped) - genuine internal ambiguity in the source issue, not a clean misreading. This
 doc's ruling stands regardless.
 
-**CH-2 verdict (resolved 2026-09-02): fires-then-resolves.** The issue's literal wording
+**CH-2 verdict (Dave, 2026-09-02, #2340 comment): fires-then-resolves.** The issue's literal wording
 ("assert zero alerts") reads as inverted against the rule's own design intent.
 `YuzuGuardianJournalIntegrityGap`'s doc comment states: "No `for:` clause on purpose - the 90s
 staleness window means an agent that reports a loss then dies is visible for less than one
@@ -125,12 +135,22 @@ Do not conflate them:**
   claimed "22 metric families" is known-stale, having grown via
   `docs/spark-stage2-guardian-consumer-design.md` items 3/4/5/6/9 landing since; "six batch-unit
   counters" also doesn't obviously map to the current table) is absent for 7 days, and
-  `YuzuGuardianJournalTelemetryDark` fires within 15 minutes while nothing else does.
+  `YuzuGuardianJournalTelemetryDark` fires within 15 minutes while nothing else does. **PR-4
+  scoping note**: the rule's own expression is `yuzu_fleet_guardian_journal_reporting == 0 and
+  on() yuzu_fleet_agents_healthy > 0` - per `yuzu-alerts.yml`'s comment (~line 3523),
+  `_reporting` publishes every sweep at 0 by design and is NOT one of the families expected to
+  go absent. The "metric-family set absent for 7 days" test case must exclude `_reporting` from
+  what it drives absent, or the case is mis-specified and fires on a setup artifact rather than
+  the intended scenario.
 - **CH-5-UAT** (design-doc item 7, `docs/guardian-c0-thread-reloc-design.md`): a live UAT-rig
   load/timing gate holding the journal at its hard ceiling (2000 batches / 64 MiB - resolved
   2026-08-18, not reopened here), measuring live-event latency under KV contention, including a
   forced-blocking sanity stage (`headroom_blocked_seconds` has never fired outside unit tests -
-  a 0 reading is ambiguous without this stage).
+  a 0 reading is ambiguous without this stage). **OPEN: no latency pass/fail threshold is defined
+  anywhere** - no percentile, sample-size, or platform-matrix target exists in the design doc or
+  any other committed source, despite this being "the flip's genuine go/no-go" per that doc's
+  own item 7. Tracked as **#3850** (filed while writing this doc); must be resolved before Rig A
+  (§8) can produce an objective pass/fail result rather than a subjective call.
 
 Both gate the flip independently; neither substitutes for the other.
 
@@ -188,15 +208,25 @@ tracked separately below)
 - Operator action: none today (no detection signal to act on); would require a restart once
   discovered by other means (e.g. operator-reported unresponsiveness) - not a documented
   runbook step yet.
-- Compensating control: ruling 3/7, with the gap recorded honestly - the shutdown watchdog
+- Compensating control: the standing downgrade of this pair from a hard pre-Stage-2 gate to
+  early-post-flip hardening, **with the gap recorded honestly** - the shutdown watchdog
   (#3737) bounds hang-**at-exit** only; it does **not** bound an unbounded stall **during
   normal operation**, which is #2012's actual hazard class (Sol opine, verified - confirmed
   untouched by PR #3821, a different layer: #3821 bounds Guardian's synchronous wait on
   SparkEngine, not the File mechanism's own internal unbounded walk under its own lock).
-  Legacy-twin #2189 parity (no regression vs. what runs today) is the real basis for
-  deferring, not the watchdog. #3840 (filed 2026-09-02, `spark_engine.hpp:536–548`) is the
-  identical "walk-off-`mu_`" hazard shape for Registry's `TP_WAIT` / Service's Windows SCM
-  query - folded into this same mechanism-hardening package.
+  **The basis for deferring is NOT "no regression vs. legacy" - direct code comparison shows
+  the opposite for the File mechanism.** Legacy's own hang (`guard_file.cpp:96`, an unbounded
+  `fs::is_directory` walk on a per-rule dedicated thread with no shared lock) stalls exactly
+  the one affected rule, permanently, but does not block any other rule. Under spark
+  (`spark_engine.hpp:536-548`), the identical class of hang holds the File mechanism's
+  per-type lock, stalling arm/disarm for **every** File-type rule for the hang's duration -
+  a broader, if temporary, blast radius than legacy's single-rule stall. The real basis for
+  deferring is legacy-twin #2189 parity for the Service mechanism specifically (a macOS
+  launchd whole-engine `mtx_` seizure, `stop_all_guards_locked`) plus the absence of any
+  production fleet today - not a blanket "no regression" claim across all three mechanisms.
+  #3840 (filed 2026-09-02, `spark_engine.hpp:536–548`) is the identical "walk-off-`mu_`"
+  hazard shape for Registry's `TP_WAIT` / Service's Windows SCM query - folded into this same
+  mechanism-hardening package.
 - Owner: the mechanism-hardening package (File + Registry + Service together, one restructure,
   reviewed once) - no individual named in source.
 - Milestone: early post-flip, named package.
@@ -233,15 +263,20 @@ tracked separately below)
 - Owner / milestone: P4 lane; recheck cost at P4 start.
 - Revisit trigger: N/A - not currently expected to need escalation.
 
-**Pulled out entirely, not risk-accepted here**: #2797's legacy-branch half (ruling 6) - a live
+**Pulled out entirely, not risk-accepted here**: #2797's legacy-branch half (ruled 2026-09-02 to be tracked outside this plan) - a live
 defect in currently-shipping legacy `IGuard` code, unrelated to whether the flip happens.
 Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half (fixed by PR
 #3821) was ever flip-relevant.
 
 ## 6. `--spark-disable` rollback drill procedure
 
-`--spark-disable` is the sole rollback lever (D7, standing ruling - not re-litigated here). It
-is **boot-time, restart-required** - accepted with that limitation.
+`--spark-disable` is the sole rollback lever (a standing ruling, not re-litigated here). It
+is **boot-time, restart-required** - accepted with that limitation. **Scope note**: this
+procedure is a UAT-drill spec, written against zero production fleet. It is single-agent
+(one restart at a time) with no fleet-wide orchestration story - flipping this on N agents
+during a real incident is N individual restarts, not covered here. It also has no persistence
+mechanism wired into the shipped `yuzu-agent.service` unit today (tracked as #3851). Treat
+this as the drill procedure for evidence collection, not yet a production incident runbook.
 
 1. Confirm current state: agent running with `prefer_spark` active, spark armed on at least one
    rule, drift/heartbeat evidence flowing (criterion 5's UAT smoke precondition).
@@ -253,18 +288,33 @@ is **boot-time, restart-required** - accepted with that limitation.
    legacy IGuard (enforcing)"`.
 3. Confirm legacy enforcement resumed: the same-boot `wire_spark_engine()` call
    (`agent.cpp:1254`) records `SparkAvailability::SparkDisabled`, and the `SparkDisabled` case
-   of the backend-derivation log switch (`:1269–1272`) reports `detection backend = legacy
-   IGuard` regardless of `prefer_spark`'s compiled-in value - SparkDisabled always means legacy,
+   of the backend-derivation log switch (`:1269–1272`) reports `detection backend = legacy`
+   regardless of `prefer_spark`'s compiled-in value - SparkDisabled always means legacy,
    unconditionally. Verify via the `yuzu.guardian_backend` heartbeat tag on the next beat.
-4. Confirm no spark state leaks: no armed spark subscriptions, no spark outbox entries draining,
-   `spark_running`/`spark_disabled` posture keys reflect the disabled state fleet-side.
+4. Confirm no spark state leaks: both sub-checks follow directly from step 2's
+   `spark_engine_` staying null - with no `SparkEngine` instance, there is nothing to hold an
+   armed subscription and nothing to drain an outbox from, by construction, not by a separate
+   runtime check. What IS an independent observable: `spark_running`/`spark_disabled` posture
+   keys reflect the disabled state fleet-side.
 5. Record the drill's timing (boot-to-legacy-enforcing latency) and any anomaly as this
-   criterion's evidence (§2 criterion 5).
+   criterion's evidence (§2 criterion 5). **If legacy enforcement does NOT resume after the
+   restart** (step 3's checks fail): this is not currently a documented failure path - escalate
+   rather than retry silently, and treat it as a §5 risk-register candidate in its own right.
 
 ## 7. Post-flip programme order
 
-1. **P3 - enforce cutover** (now includes #2233 item 8 as a prerequisite, ruling 4). Runs
-   immediately after the flip: the enforcement gap was accepted as temporary (D4) on the
+**PR-5's own deliverable, before this programme starts**: `docs/user-manual/guaranteed-state.md:352`
+already makes an operator-facing promise that spark's default posture is documented "ahead of
+that flag flipping so a pilot's network monitoring is not surprised by it later; see Behaviour
+changes (upgrading.md) for how you'll be told when that flag actually flips." PR-5 (the flip
+itself) must close that loop: update `guaranteed-state.md`'s posture table, add the
+`upgrading.md` Behaviour-changes entry, and add a `changelog.d` fragment - none of which are
+named anywhere else in this doc's PR sequencing, and the promise is already live in a shipped
+doc today, so it cannot be silently missed when PR-5 lands.
+
+1. **P3 - enforce cutover** (now includes #2233 item 8 as a prerequisite, ruled 2026-09-02 per
+   §3 row 8). Runs
+   immediately after the flip: the enforcement gap was accepted as temporary (§2 criterion 9) on the
    premise it stays temporary, and P11 has no fleet to observe yet.
 2. **Hardening package 1** - #2469/#2278/#2279 (drain-death/retry-churn/poison-head), P11's own
    precondition, slots right after P3.
@@ -272,7 +322,7 @@ is **boot-time, restart-required** - accepted with that limitation.
    #2418/#2338 + the CH-11 campaign + its 500-agent rig. #2336 (per-agent attribution) can start
    in parallel once P3 is staffed.
 4. **P4 - health surface** - #3416 first (already has a compensating control, §5).
-5. **Docs** (#2991/#3439/#2966) + test debt (the #3360/#3392/#2570/#2578 rows from §5).
+5. **Docs** (#2991/#3439/#2966/#3852) + test debt (the #3360/#3392/#2570/#2578 rows from §5).
 6. **P5 - legacy deletion, LAST** - structural: `--spark-disable` boots legacy, so legacy code
    cannot be deleted before that lever is retired on its own separate timeline. Closes #2189 by
    deletion, not by fix.
@@ -297,18 +347,29 @@ are well clear of the hands-off homeserver at `100.74.176.116:8080`/`:50051`
 (Tailscale-bound - **never touch**; `start-UAT.sh`-style scripts default to those ports and
 have killed it before).
 
+**Contamination risk (not yet mitigated)**: Rig A's 4-7 day measurement window is the flip's
+primary latency evidence source (once #3850's threshold is defined), sharing BigColin with the
+hands-off homeserver, the existing dev-pair, and ad hoc build/CI-style load from other
+sessions on the same box. A noisy neighbor during the measurement window inflates exactly the
+metric the gate depends on, and no isolation (cgroup/`nice`) or concurrent-load recording
+alongside samples is planned. Record this as a real gap before Rig A runs, not just a rig
+capacity concern.
+
 **Setup timing**: this is prep work, not started by this PR - begins once PR-2a/PR-2c are
-close to merging (PR-2b is dropped per §3 row 5, confirmed by the operator), i.e. when the
-rig-dependent evidence collection
-(Lane C in the delivery plan)
-is actually about to begin.
+close to merging (PR-2b is dropped per §3 row 5, confirmed by the operator 2026-09-02), i.e.
+when this rig-dependent evidence-collection phase is actually about to begin. The capacity
+numbers above are a 2026-09-02 point-in-time reading; re-verify immediately before
+provisioning rather than trusting this reading weeks later.
 
 ## Also closed out by this PR
 
 ### F2 / #2237 verify-only close-out
 
-Checked the D6 journal-authoritative retirement shape for full conformance (not assumed from
-"substantially landed"):
+Checked the journal-authoritative retirement shape - the design ruling that made the lifecycle
+journal, not the legacy in-process compliant-edge re-fire, the sole replay authority for outbox
+delivery - for full conformance (not assumed from "substantially landed"). (This ruling itself
+is recorded only in the delivery-plan draft this doc supersedes, not restated in any other
+committed doc; the substance is inlined here rather than cited by a bare decision label.)
 
 - **Sent-label written only after `Sent` on a batch's last entry** - confirmed at
   `guardian_engine.cpp:1429–1432` (drifted from an earlier `:1408–1414` citation, same content):
@@ -329,7 +390,7 @@ Checked the D6 journal-authoritative retirement shape for full conformance (not 
   *not* examined this pass** - `guardian_spark_runtime.cpp`'s boot-nonce comment (~line 42,
   `make_boot_nonce()`) is the right starting point for that check, still open.
 
-**Overall: F2/#2237's D6 sent-label write/skip/live-entry-participation shape is conformant**
+**Overall: F2/#2237's journal-authoritative sent-label write/skip/live-entry-participation shape is conformant**
 for the three points checked above. Stamp-semantics equivalence is a separate, narrower claim
 not yet examined and should not be read as covered by "conformant" here.
 
@@ -353,8 +414,8 @@ Checked, not assumed:
   items deliberately left open (not missed): two doc-truth disagreements between §25 and
   `docs/enterprise-readiness-soc2-first-customer.md:387`, a sign-off-status-not-in-repo gap, a
   consolidated risk-register residual, and the enterprise-readiness half of a pipeline-health
-  signals gap. None of these block #2298's item 5 as scoped, but they are open follow-up debt
-  worth a line in the docs/test-debt lane (§7) if not already tracked elsewhere.
+  signals gap. None of these block #2298's item 5 as scoped, but they are open follow-up debt;
+  the §25 vs. SOC2-doc pair is now tracked as **#3852** and listed in the docs lane (§7).
 
 ### Item 10's doc-drift fix
 
