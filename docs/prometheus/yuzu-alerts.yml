@@ -2731,29 +2731,6 @@ groups:
             open at boot. Do not read a props.<key>-scoped rule's empty match
             as authoritative while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/custom-properties-read-degraded"
-      - alert: YuzuCustomPropertiesBackfillFailing
-        # The one-time SQLite->Postgres backfill (ADR-0045) reported a failed
-        # outcome. The server fails closed at boot on a backfill failure
-        # (write error, or a holder-side fingerprint-verification refusal on
-        # a multi-replica boot with divergent legacy content — see
-        # docs/ops-runbooks/custom-properties-store-backfill-recovery.md) and
-        # retries next start, so a failed sample means the server refused to
-        # come up.
-        expr: |
-          sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 0
-        for: 0m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Custom-properties backfill failed (server refused to boot)"
-          description: >-
-            yuzu_server_custom_properties_backfill_total{result="failed"}
-            advanced: the one-time custom-properties backfill could not
-            complete. The server fails closed at boot rather than come up
-            with partial data and retries on the next start — see
-            docs/ops-runbooks/custom-properties-store-backfill-recovery.md
-            for the holder-side-verification recovery procedure.
-          runbook_url: "docs/ops-runbooks/custom-properties-store-backfill-recovery.md"
       - alert: YuzuDiscoveryReadDegraded
         # A discovery_store list_devices read degraded and the caller failed
         # closed (503, per ADR-0044 §Reads), never a silently-empty device
@@ -2776,110 +2753,7 @@ groups:
             failed to open at boot (should not be reachable post-boot given
             fail-closed construction — investigate as a possible regression if
             seen). Do not read a 503 window as "no devices discovered".
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
-      - alert: YuzuDiscoveryBackfillFailing
-        # Mirrors YuzuAuditBackfillFailing's shape, NOT YuzuMgmtGroupBackfillFailing's
-        # (sre Gate 6 finding): the one-time legacy discovery.db -> discovery_store
-        # backfill (ADR-0044) runs during server CONSTRUCTION, and a failure sets
-        # startup_failed_ so run() returns before the HTTP listener starts —
-        # /metrics is never served and a result="failed" sample is never scraped.
-        # An expression keyed on result="failed" (the mgmt-group shape) can
-        # therefore never fire no matter how the counter behaves. What IS
-        # observable from outside is the ABSENCE of a success outcome — a server
-        # that refused to boot publishes no discovery-backfill series at all.
-        #
-        # THIS RULE DEPENDS ON THE PRE-SEED. Unlike AuditStore (whose
-        # set_metrics() owns its own pre-seed), DiscoveryStore::set_metrics()
-        # is a bare pointer assignment — the seed lives in server.cpp's metrics
-        # registration block (the `describe()`/zero-loop right after
-        # DiscoveryStore construction), which initialises the whole `result`
-        # set to 0. That is what makes "series absent" mean "no server is
-        # serving" rather than "no server has this metric registered yet".
-        # Without the seed, the ordinary restart of an already-migrated server
-        # (which returns at the marker check without reaching an outcome this
-        # tick) exports nothing and this rule pages on every routine restart.
-        #
-        # LIMITS: fires only when NO scraped server reports a completed/fresh
-        # backfill, so in a multi-replica deployment one wedged replica among
-        # healthy ones will not trip it (shows up as `up == 0` instead). It ALSO
-        # fires during a legitimately long first-boot backfill on a large
-        # legacy discovery.db — expected during that upgrade window (silence it
-        # for the window). The BOOT LOG carries the actual remediation in every
-        # case (fingerprint mismatch / 0-byte file / reconciliation FAILED);
-        # this is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_discovery_backfill_total{result=~"completed|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed discovery-store backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            discovery.db -> PostgreSQL discovery_store backfill (ADR-0044) in
-            the last 15 minutes. After an upgrade the usual cause is a server
-            that FAILED the backfill: it fails CLOSED, refuses to serve, and
-            retries on the next start — a restart loop with no
-            network-discovered-device inventory available. Read the server BOOT
-            log for the specific refusal reason (fingerprint mismatch / 0-byte
-            legacy file / managed-agent_id reconciliation conflict) — it carries
-            the remediation. See the runbook for what each reason means and how
-            to resolve it.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
-      - alert: YuzuNotificationBackfillFailing
-        # Mirrors YuzuDiscoveryBackfillFailing's shape (same underlying reason,
-        # not YuzuMgmtGroupBackfillFailing's result="failed" shape): the
-        # one-time legacy notifications.db -> notification_store backfill
-        # (ADR-0046) runs during server CONSTRUCTION, and a failure sets
-        # startup_failed_ so run() returns before the HTTP listener starts —
-        # /metrics is never served and a result="failed" sample is never
-        # scraped. An expression keyed on result="failed" can therefore never
-        # fire no matter how the counter behaves. What IS observable from
-        # outside is the ABSENCE of a success outcome — a server that refused
-        # to boot publishes no notification-backfill series at all.
-        #
-        # THIS RULE DEPENDS ON THE PRE-SEED. NotificationStore::set_metrics()
-        # is a bare pointer assignment — the seed lives in server.cpp's
-        # metrics registration block (the describe()/zero-loop right after
-        # DiscoveryStore's own, both pre-seeding their result sets to 0). That
-        # is what makes "series absent" mean "no server is serving" rather
-        # than "no server has this metric registered yet".
-        #
-        # TWO-WAY RESULT SPLIT (not discovery/rbac/mgmt-group's three-way
-        # fresh/completed/failed): this store's backfill is a single
-        # transaction with no multi-step outcome to report separately, so the
-        # wrapper (migrate_from_sqlite in notification_store.cpp) only ever
-        # emits result="success" or result="failed" — expr below matches
-        # "success" only, not "completed|fresh".
-        #
-        # LIMITS: fires only when NO scraped server reports a successful
-        # backfill, so in a multi-replica deployment one wedged replica among
-        # healthy ones will not trip it (shows up as `up == 0` instead). It
-        # ALSO fires during a legitimately long first-boot backfill on a large
-        # legacy notifications.db — expected during that upgrade window
-        # (silence it for the window). The BOOT LOG carries the actual
-        # remediation in every case (holder-side fingerprint mismatch /
-        # sourceless-marker refusal / unreadable legacy file) — this is the
-        # outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_notification_backfill_total{result="success"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed notification-store backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            notifications.db -> PostgreSQL notification_store backfill
-            (ADR-0046) in the last 15 minutes. After an upgrade the usual
-            cause is a server that FAILED the backfill: it fails CLOSED,
-            refuses to serve, and retries on the next start — a restart loop
-            with the whole server down, not just the notification feed. Read
-            the server BOOT log for the specific refusal reason (holder-side
-            fingerprint mismatch / sourceless-marker refusal / unreadable
-            legacy file) — it carries the remediation. See the runbook for
-            what each reason means and how to resolve it.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#notification-feed-moves-to-postgresql--history-preserved-notificationstore-adr-0046"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-discoverystore-adr-0044"
       - alert: YuzuTagStoreReadDegraded
         # A tag_store read degraded and the caller failed CLOSED (ADR-0050):
         # tags are DISPATCH-CRITICAL scope input, so evaluate_scope ABORTS the
@@ -2910,7 +2784,7 @@ groups:
             policy evaluator silently skips tag-scoped checks while this
             fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
             saturation signals; /readyz does not reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#device-tags-migrate-to-postgres-tagstore-adr-0050"
       - alert: YuzuRuntimeConfigReadDegraded
         # A runtime_config_store read degraded (ADR-0060). Two DIFFERENT failure
         # families under one metric, distinguished by `reason`:
@@ -2953,50 +2827,6 @@ groups:
             fail closed on this same secret; see "Key management (secrets
             KEK)" in the server admin guide before it does.
           runbook_url: "https://docs.yuzu.io/runbooks/runtime-config-read-degraded"
-      - alert: YuzuTagStoreBackfillNotCompleted
-        # Mirrors YuzuNotificationBackfillFailing's absent-success shape (NOT
-        # the custom-properties result="failed" shape): the one-time legacy
-        # tags.db -> tag_store backfill (ADR-0050) runs during server
-        # CONSTRUCTION, and a failure sets startup_failed_ so the HTTP
-        # listener never starts — /metrics is never served and a
-        # result="failed" sample is never scraped, making a failed-keyed
-        # expression unfireable (governance sre-1). What IS observable is the
-        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
-        # server.cpp's tag-store construction block (describe() + zero-loop
-        # over fresh/success/failed) — that is what makes "series absent"
-        # mean "no server is serving" rather than "metric not registered".
-        # THREE-WAY result split: fresh | success | failed; expr matches the
-        # two good outcomes. LIMITS: multi-replica — one wedged replica among
-        # healthy ones shows as up == 0, not this; a legitimately long first
-        # boot on a huge tags.db can trip it during the upgrade window
-        # (silence for the window). The BOOT LOG carries the actual
-        # remediation (holder-side fingerprint mismatch / direction-aware
-        # row-conflict refusal / unreadable legacy file). An oversized legacy
-        # file does NOT time out server-side — it makes a LONG boot that an
-        # orchestrator's startup budget may kill mid-backfill (safe, retried
-        # whole) — so also check for a kill loop, not only a refusal line.
-        # This is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed tag-store backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            tags.db -> PostgreSQL tag_store backfill (ADR-0050) in the last
-            15 minutes. After an upgrade the usual cause is a server that
-            FAILED the backfill: it fails CLOSED, refuses to serve, and
-            retries on the next start — a restart loop with the whole server
-            down. A DIRECTION-AWARE row-conflict refusal additionally means
-            the currently-served tag data may be the WRONG SIDE of an
-            operator-authored-data race — treat it as a data-integrity
-            incident, not just an availability one (verify which side is
-            authoritative before clearing anything). Read the server BOOT
-            log for the specific refusal; the runbook maps each message to
-            its recovery.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
       - alert: YuzuProductPackReadDegraded
         # A product_pack_store list()/get() read degraded and the caller failed
         # CLOSED (503 via workflow_routes.cpp's product_pack_error_status),
@@ -3019,47 +2849,7 @@ groups:
             degraded and answered 503 rather than a silently-wrong result.
             Pair with yuzu_pg_pool_* saturation signals; /readyz does not
             reflect this state.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
-      - alert: YuzuProductPackBackfillNotCompleted
-        # Mirrors YuzuTagStoreBackfillNotCompleted's absent-success shape (NOT
-        # CustomPropertiesStore's result="failed" shape, which is accepted
-        # debt precisely because it cannot fire — see that alert's own
-        # comment): the one-time legacy product-packs.db -> product_pack_store
-        # backfill (ADR-0054) runs during server CONSTRUCTION, and a failure
-        # sets startup_failed_ so the HTTP listener never starts — /metrics is
-        # never served and a result="failed" sample is never scraped, making a
-        # failed-keyed expression unfireable. What IS observable is the
-        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
-        # server.cpp's product-pack-store construction block (describe() +
-        # zero-loop over fresh/success/failed) — that is what makes "series
-        # absent" mean "no server is serving" rather than "metric not
-        # registered". THREE-WAY result split: fresh | success | failed; expr
-        # matches the two good outcomes. LIMITS: multi-replica — one wedged
-        # replica among healthy ones shows as up == 0, not this; a
-        # legitimately long first boot on a huge product-packs.db can trip it
-        # during the upgrade window (silence for the window). The BOOT LOG
-        # carries the actual remediation (which pack/item id conflicted). This
-        # is the outside-in backstop, not the primary signal.
-        expr: |
-          absent_over_time(yuzu_server_product_pack_backfill_total{result=~"success|fresh"}[15m])
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "No server is reporting a completed product-pack backfill (possible boot refusal)"
-          description: >-
-            No scraped Yuzu server has reported a successful one-time legacy
-            product-packs.db -> PostgreSQL product_pack_store backfill
-            (ADR-0054) in the last 15 minutes. After an upgrade the usual
-            cause is a server that FAILED the backfill: it fails CLOSED,
-            refuses to serve, and retries on the next start — a restart loop
-            with the whole server down. A differently-valued pack/item
-            conflict across replicas means the currently-served pack catalog
-            may be the WRONG SIDE of an operator-authored-data race — treat
-            it as a data-integrity incident, not just an availability one.
-            Read the server BOOT log for the exact pack/item id and repair or
-            move the losing replica's legacy file aside before restarting.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-mandatory-backfill-productpackstore-adr-0054"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#product-packs-migrate-to-postgres-productpackstore-adr-0054"
       - alert: YuzuProductPackCompensationPartial
         # #3481: install()'s best-effort compensating rollback (undoing
         # already-installed sibling-store content after a late persist or
@@ -3104,8 +2894,10 @@ groups:
             tracking signal, not alert state.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuInstructionBundledContentNotClean
-        # Same absent-success shape as YuzuProductPackBackfillNotCompleted above, adapted
-        # for an EVERY-BOOT (not one-time) outcome (gov Gate 4 UP-4/Gate 8 fix): the
+        # Same absent-success shape used elsewhere on this page for a one-time boot outcome
+        # (alert on the ABSENCE of a good result rather than the PRESENCE of a bad one, since
+        # a refused boot never serves /metrics), adapted here for an EVERY-BOOT (not one-time)
+        # outcome (gov Gate 4 UP-4/Gate 8 fix): the
         # InstructionStore bundled-content reseed loop (232 definitions / 10 sets as of
         # this writing) runs during server CONSTRUCTION, and a genuine DB error on any
         # item sets startup_failed_ — the HTTP listener never starts, /metrics is never

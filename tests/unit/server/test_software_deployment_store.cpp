@@ -19,8 +19,9 @@
  * TEST_CASE suite was removed as part of a fresh-start-by-default policy
  * change (ADR-0009 amendment) -- no production fleet has ever run a
  * pre-Postgres build. SoftwareDeploymentStore::migrate_from_sqlite() itself
- * is UNCHANGED and still present in production code; only this file's test
- * coverage of it was removed.
+ * was retired (chore/retire-migrate-from-sqlite-batch-b, #3623) -- this
+ * store had zero production callers to begin with, so there was no live
+ * database to protect either way.
  */
 
 #include "software_deployment_store.hpp"

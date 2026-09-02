@@ -272,3 +272,25 @@ already-tested `is_deployment_db_error` pattern, and building new route-level te
 for these two handlers (which are registered inline in `server.cpp`, not through a separately
 testable `register_routes(HttpRouteSink&, ...)` overload) was judged disproportionate to this fix's
 scope.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the mandatory
+monotonic-promotion-fingerprint backfill this ADR ported from `RbacStore` was real,
+working code that never had real legacy data to protect.
+
+`CustomPropertiesStore::migrate_from_sqlite()` and its private helpers (`legacy_has_table`,
+`sha256_hex`, `legacy_text`, `append_field`, `canonicalize_legacy_snapshot`,
+`fingerprint_legacy_snapshot`, `read_legacy_snapshot`, `legacy_fingerprint`, and the
+`LProperty`/`LSchema`/`LegacySnapshot` types) are removed
+(`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623). `custom_properties_meta`
+— whose entire purpose was the backfill idempotency marker — is dropped via a
+version-bumped `{2, "DROP TABLE IF EXISTS custom_properties_meta;"}` migration, not edited
+into v1: this store IS constructed in production, so v1 has actually run against real
+dev/UAT databases. `server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows`
+over the two legacy tables (`custom_properties`/`custom_property_schemas`) instead — silent
+unless real rows are found, never blocks boot. The dedicated
+`yuzu_server_custom_properties_backfill_total{result}` metric and
+`docs/ops-runbooks/custom-properties-store-backfill-recovery.md` are both removed — there is
+no backfill left to observe or recover from.

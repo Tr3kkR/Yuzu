@@ -26,7 +26,9 @@
  * gate at all, per the plain-migration-test carve-out documented on that macro.
  *
  * migrate_from_sqlite backfill-contract coverage was retired 2026-08-25 (fresh-start-by-default,
- * ADR-0009 amendment) — no upgrade path exists for this store's legacy SQLite file.
+ * ADR-0009 amendment); the method itself was retired 2026-09-02
+ * (chore/retire-migrate-from-sqlite-batch-b, #3623) — this store had zero production callers to
+ * begin with, so there was no live database to protect either way.
  */
 
 #include "license_store.hpp"
@@ -155,8 +157,6 @@ TEST_CASE("LicenseStore reports !is_open on an unreachable pool, and every metho
     auto days_res = store.days_remaining();
     CHECK_FALSE(days_res.has_value());
     CHECK(days_res.error().starts_with(yuzu::server::kLicenseDbErrorPrefix));
-
-    CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/does/not/matter"));
 }
 
 // ── activate_license / get_active_license round-trip ────────────────────────

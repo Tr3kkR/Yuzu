@@ -123,3 +123,29 @@ dataset:
 - `docs/postgres-migration-ladder.md`'s `NotificationStore` row moves from the Wave 2 table to
   the Done table, schema `notification_store`, posture `authoritative` (construction/backfill)
   with display-only runtime reads/writes.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production
+Yuzu fleet has ever run a pre-Postgres build of any store — the mandatory,
+holder-side-fingerprint-verified backfill this ADR ported from `RbacStore` was real,
+working code that never had real legacy data to protect.
+
+`NotificationStore::migrate_from_sqlite()`/`migrate_from_sqlite_impl()` and their private
+helpers/types (`sha256_hex`, `legacy_has_table`, `sqlite_text`, `read_legacy_snapshot`,
+`append_field`, `canonicalize_legacy_snapshot`, `fingerprint_legacy_snapshot`,
+`legacy_notification_fingerprint`, `LegacyNotification`, `LegacySnapshot`, `now_secs`) are
+removed (`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623).
+`notification_meta` — whose entire purpose was the backfill idempotency marker — is
+dropped via a version-bumped `{2, "DROP TABLE IF EXISTS notification_meta;"}` migration,
+not edited into v1: this store IS constructed in production, so v1 has actually run
+against real dev/UAT databases. `set_metrics()` and the `metrics_` member are also
+removed — this store's ONLY metrics consumer was the backfill-result counter
+(`yuzu_server_notification_backfill_total`), unlike sibling stores that also emit a
+read-degrade counter through the same pointer. `server.cpp`'s boot path now runs
+`legacy_sqlite_probe::warn_if_legacy_rows` over `notifications` instead — silent unless
+real rows are found, never blocks boot. This store's runtime reads/writes were already
+plain container/bool (deny-or-benign, never an authorization/targeting/enforcement
+decision — see the header doc), so unlike an authoritative store, losing old
+unread/dismissed history on a hypothetical real-data environment was always an
+acceptable outcome, never a promotion of this change's actual risk.
