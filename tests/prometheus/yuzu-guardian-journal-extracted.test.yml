@@ -48,7 +48,7 @@
 # YuzuGuardianJournalTelemetryDark's `and on() yuzu_fleet_agents_healthy > 0`
 # guard and requires at least one case here to go red. Per-case mutation
 # proof for every other clause (does CH-2a specifically redden against a
-# `for:` clause added to IntegrityGap; does CH-5-PROM case 1 specifically
+# `for:` clause added to IntegrityGap; does CH-5-PROM case 3 specifically
 # redden against the `and on()` guard removed; does CH-2c specifically
 # redden against the `unless (... offset 15m > 0)` clause removed) was
 # verified MANUALLY at authorship time - flip the rule, rerun, confirm the

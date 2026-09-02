@@ -66,6 +66,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import NamedTuple
 
@@ -462,7 +463,18 @@ def materialize_extracted_rules() -> None:
             f"single `groups:` entry with at least one rule - 0 rules parsed."
         )
     dest = REPO_ROOT / EXTRACTED_RULES
+    # Refuse to write THROUGH a pre-existing symlink at either level, rather
+    # than follow it (#2340 PR-4 adversarial review). `build_canary_tree`'s
+    # sibling hazard is covered by razing its whole scratch tree before every
+    # rebuild; this path has no such raze step, so it needs its own explicit
+    # check. Not a privilege boundary on its own - anything that can commit a
+    # symlink here already has code execution on this no-secrets runner - but
+    # cheap enough to close outright rather than accept.
+    if dest.parent.is_symlink():
+        sys.exit(f"FAIL: {dest.parent} exists and is a symlink; refusing to write through it.")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_symlink() or dest.exists():
+        dest.unlink()
     dest.write_text(wrapped, encoding="utf-8")
     # Same restrictive-umask hazard `build_canary_tree` chmods for (see its
     # comment): the container runs as uid 65534, and a 077 umask (a common
@@ -538,10 +550,13 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
         canary_from: str = CANARY_FROM, canary_to: str = CANARY_TO,
         canary_for=None) -> int:
     """`check rules`, `test rules`, prove the run was not vacuous, then prove
-    the behaviour suite is testing THE SHIPPED RULES.
+    the behaviour suite is testing THE RULES FILE UNDER TEST (`rules`/
+    `rules_rel` - the shipped file by default, or whichever file a caller
+    passes; #2340 PR-4 generalized this to also serve the never-shipped
+    extracted-group pair).
 
     THAT LAST STEP EXISTS BECAUSE THE FIRST TWO VALIDATE DIFFERENT FILES.
-    `check rules` is handed `RULES` by this script. `test rules` is handed the
+    `check rules` is handed `rules` by the caller. `test rules` is handed the
     TEST file, and promtool then loads whatever THAT file's own `rule_files:`
     glob names. Nothing tied the two together. MEASURED on 3.13.1 (#2553 pass
     13): point the glob at a real-but-wrong rules file and make the assertions
@@ -549,9 +564,9 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
     found" - a count that came from a file the behaviour run never opened.
 
     The vacuity guard above cannot see it: there ARE cases, there ARE
-    assertions, and not one of them is empty. So instead we break a COPY of the
-    shipped rules and require the suite to notice. A suite that stays green
-    against deliberately broken rules is not testing them.
+    assertions, and not one of them is empty. So instead we break a COPY of
+    the rules under test and require the suite to notice. A suite that stays
+    green against deliberately broken rules is not testing them.
 
     Note what this deliberately does NOT do: parse the glob or canonicalise
     paths. An earlier revision reimplemented Go's `filepath.Glob` in Python to
@@ -571,8 +586,15 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
         sys.exit(f"FAIL: promtool exited 0 but the run proves nothing - {reason}")
     if canary_for is None:
         return 0
-    tmp = REPO_ROOT / ".promtool-canary"
-    shutil.rmtree(tmp, ignore_errors=True)
+    # A UNIQUE directory per call, not a fixed name (#2340 PR-4 adversarial
+    # review, UP-1). This function now runs TWICE per script invocation (once
+    # per gate) - a fixed ".promtool-canary" name meant a second concurrent
+    # invocation of this script against the same checkout could have one
+    # process's `finally` rmtree race another's read of the mutated tree,
+    # turning an I/O error into a wrongly-trusted "canary reddened" verdict.
+    # `mkdtemp` under REPO_ROOT keeps it on the same filesystem as the mount
+    # docker needs, with no collision possible between concurrent callers.
+    tmp = Path(tempfile.mkdtemp(dir=REPO_ROOT, prefix=".promtool-canary-"))
     try:
         build_canary_tree(tmp, rules_rel, tests_rel, canary_from, canary_to)
         canary_argv, canary_tests, canary_rules = canary_for(tmp)
@@ -627,7 +649,7 @@ def gate(promtool_argv: list[str], rules: str, tests: str, *,
         sys.exit(
             f"FAIL: the suite stayed GREEN against a deliberately broken copy of "
             f"{rules_rel} ({canary_from!r} -> {canary_to!r}), so it is not testing "
-            f"the shipped rules. TWO causes produce this, both measured:\n"
+            f"the rules under test. TWO causes produce this, both measured:\n"
             f"  1. `rule_files:` in {tests_rel} names a different file. That is what "
             f"the behaviour run loads; `check rules` above validated {rules_rel}, so "
             f"the two halves can disagree silently.\n"
@@ -882,6 +904,21 @@ def selftest() -> int:
             if facts.caseless:
                 failures.append(
                     f"{tests_rel} has {facts.caseless} case(s) with no assertion block")
+
+    # And the REAL commented block must itself still extract cleanly (#2340
+    # PR-4 adversarial review: architect + quality-engineer independently -
+    # every case above proves the synthetic-text logic works, but none of
+    # them ever run extraction against the actual shipped RULES file, so a
+    # real-file break - a reformatted indent, a moved marker, a merge that
+    # duplicates one - is caught only by the non-required docs-lint.yml job,
+    # never by the three REQUIRED build legs this selftest runs on).
+    # build_extracted_rules_text() needs no PyYAML (that's
+    # materialize_extracted_rules()'s job, which also validates and is gate-
+    # path-only) so this is safe to run unconditionally here.
+    try:
+        build_extracted_rules_text((REPO_ROOT / RULES).read_text(encoding="utf-8"))
+    except ValueError as ex:
+        failures.append(f"extraction of the real {EXTRACT_GROUP!r} block failed: {ex}")
 
     # extract_marked_block() ITSELF, against synthetic text with KNOWN
     # answers - Part 1's fail-closed set (marker missing, duplicate, empty
