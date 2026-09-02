@@ -22,6 +22,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -50,6 +51,30 @@ std::string route_block(const std::string& source, const std::string& marker) {
     REQUIRE(begin != std::string::npos);
     const auto end = source.find("web_server_->", begin + marker.size());
     return source.substr(begin, (end == std::string::npos ? source.size() : end) - begin);
+}
+
+// A bare needle name inside a `//` comment can satisfy a substring find
+// without the code actually calling it (quality-engineer, #3789 Gate 8 F2:
+// a `find("get_agent_statuses_checked")` check alone can't tell "called
+// unconditionally" from "called only inside `if (exec_opt)`" — both
+// contain the identical literal). Precedent: test_store_wiring_order.cpp /
+// test_shutdown_join_order.cpp both strip comments before scanning.
+std::string strip_line_comments(const std::string& text) {
+    static const std::regex re(R"(//[^\n]*)");
+    return std::regex_replace(text, re, "");
+}
+
+// The substring of `block` starting at the FIRST occurrence of `from` and
+// ending at the FIRST occurrence of `to` after it — the actual span of
+// code between two named calls, so a structural check (e.g. "no
+// conditional on X in here") is scoped to where it matters instead of the
+// whole route body.
+std::string span_between(const std::string& block, const std::string& from, const std::string& to) {
+    const auto begin = block.find(from);
+    REQUIRE(begin != std::string::npos);
+    const auto end = block.find(to, begin + from.size());
+    REQUIRE(end != std::string::npos);
+    return block.substr(begin, end - begin);
 }
 
 AgentExecStatus make_status(const std::string& agent_id, const std::string& status,
@@ -351,8 +376,10 @@ TEST_CASE("legacy executions list route: SQL scope pushdown precedes the "
     CHECK(list_route.find("get_agent_statuses_for_executions_checked") != std::string::npos);
     // Exact statement, not a bare "500" substring — a 5000ms retry_after_ms
     // literal in the same block would false-green a "500" find (#3789
-    // quality-engineer S1).
-    CHECK(list_route.find("q.limit > 500") != std::string::npos);
+    // quality-engineer S1). The closing paren additionally excludes a
+    // digit-appended weakening (e.g. `> 5000`) from still matching (#3789
+    // Gate 8 quality-engineer follow-up).
+    CHECK(list_route.find("q.limit > 500)") != std::string::npos);
 }
 
 TEST_CASE("legacy executions summary route: unknown-id collapses to 404 for every "
@@ -385,16 +412,65 @@ TEST_CASE("legacy executions rerun/cancel routes: mutation admission uses the "
     for (const auto* block : {&rerun, &cancel}) {
         CHECK(block->find("admit_confined_mutation") != std::string::npos);
         CHECK(block->find("get_execution_checked") != std::string::npos);
-        // #3789 (adversarial review, Kimi+Codex fix round): statuses must
-        // be fetched via the checked accessor UNCONDITIONALLY under
-        // gate.scope, not only when exec_opt is present — a regression
-        // back to the id-conditional shape reopens the DB-round-trip
-        // timing/work oracle between "nonexistent" and "hidden" (quality-
-        // engineer S2: this pins the fix, not just admit_confined_mutation's
-        // presence).
         CHECK(block->find("get_agent_statuses_checked") != std::string::npos);
+        // #3789 (adversarial review, Kimi+Codex fix round): statuses must
+        // be fetched via the checked accessor UNCONDITIONALLY relative to
+        // exec_opt, not only when exec_opt is present — a regression back
+        // to the id-conditional shape reopens the DB-round-trip timing/work
+        // oracle between "nonexistent" and "hidden". A bare `.find()` for
+        // the callee's NAME can't tell "called unconditionally" from
+        // "called only inside `if (exec_opt)`" (quality-engineer, #3789
+        // Gate 8 F2 — verified false-green by mutation-testing the prior
+        // version of this assertion). This pins the actual SHAPE: no
+        // `exec_opt`-conditional appears in the span between fetching the
+        // execution and fetching its statuses, on comment-stripped source.
+        const auto stripped = strip_line_comments(*block);
+        const auto span =
+            span_between(stripped, "get_execution_checked", "get_agent_statuses_checked");
+        static const std::regex exec_opt_conditional(R"(if\s*\([^)]*exec_opt)");
+        CHECK_FALSE(std::regex_search(span, exec_opt_conditional));
     }
     // #3789: mark_cancelled's false-success-on-nonexistent-row bug is fixed
     // by an explicit existence check ahead of the mutation call.
     CHECK(cancel.find("if (!exec_opt)") != std::string::npos);
+}
+
+TEST_CASE("legacy executions GET routes: the 'denied' audit row fires only "
+          "under an engaged scope, never for an unconfined caller's "
+          "genuinely-nonexistent id (#3789 Gate 8 compliance-officer F2)",
+          "[execution][scope][3789][source_tripwire]") {
+    const auto source = read_server_cpp();
+    const auto detail = strip_line_comments(route_block(source, R"(/api/executions/([^/]+))"));
+    const auto summary =
+        strip_line_comments(route_block(source, R"(/api/executions/([^/]+)/summary)"));
+    const auto agents =
+        strip_line_comments(route_block(source, R"(/api/executions/([^/]+)/agents)"));
+    const auto children =
+        strip_line_comments(route_block(source, R"(/api/executions/([^/]+)/children)"));
+    // The audit call must be nested directly inside `if (gate.scope) { ... }`
+    // — a caller with no engaged scope always has `!scope` visibility true
+    // (execution_scope_rules.hpp), so this branch's audit is reachable ONLY
+    // when a real confinement decision could have produced it.
+    static const std::regex gated_audit(
+        R"(if\s*\(gate\.scope\)\s*\{\s*\(void\)audit_log\(req,\s*"execution\.read",\s*"denied")");
+    for (const auto* block : {&detail, &summary, &agents, &children})
+        CHECK(std::regex_search(*block, gated_audit));
+}
+
+TEST_CASE("legacy executions confined routes: an empty resolved username "
+          "fails closed with 503 rather than falling through to agent-only "
+          "visibility (#3789 Gate 8, security-guardian LOW / unhappy-path UP-6)",
+          "[execution][scope][3789][source_tripwire]") {
+    const auto source = read_server_cpp();
+    const auto list_route = route_block(source, R"(web_server_->Get("/api/executions",)");
+    const auto detail = route_block(source, R"(/api/executions/([^/]+))");
+    const auto summary = route_block(source, R"(/api/executions/([^/]+)/summary)");
+    const auto agents = route_block(source, R"(/api/executions/([^/]+)/agents)");
+    const auto rerun = route_block(source, R"(/api/executions/([^/]+)/rerun)");
+    const auto cancel = route_block(source, R"(/api/executions/([^/]+)/cancel)");
+    const auto children = route_block(source, R"(/api/executions/([^/]+)/children)");
+    static const char* kGuardLiteral = "unable to resolve caller identity for a confined read";
+    for (const auto* block :
+        {&list_route, &detail, &summary, &agents, &rerun, &cancel, &children})
+        CHECK(block->find(kGuardLiteral) != std::string::npos);
 }

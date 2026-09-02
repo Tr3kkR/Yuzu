@@ -17278,10 +17278,9 @@ private:
             // unfiltered COUNT(*) query per confined LIST call (real cost
             // on the exact route already flagged for scan-depth amplification,
             // consistency-auditor #3789 Finding 1 / chaos-injector CH-6).
-            // Deliberately deferred, not an oversight — tracked as a
-            // follow-up (audit-coherence issue) rather than blocking this
-            // migration. a4_error mints a correlation id lazily on any
-            // 503/400 branch below.
+            // Deliberately deferred, not an oversight — tracked as
+            // follow-up #3832 rather than blocking this migration. a4_error
+            // mints a correlation id lazily on any 503/400 branch below.
             auto gate = require_fleet_read(req, res, "Execution", "Read");
             if (!gate.admitted)
                 return; // gate already wrote the response.
