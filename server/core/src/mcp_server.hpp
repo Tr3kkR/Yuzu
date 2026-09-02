@@ -317,8 +317,11 @@ public:
     /// shares the extracted function like the classify+authorize half
     /// always did). Kill switch checked AFTER classify+authorize, so it can
     /// never mask a `Forbidden`/`ApprovalRequired` verdict with a
-    /// weaker-sounding one. Because both halves now call the SAME shared
-    /// functions `finalize_classified_command` calls, the existing
+    /// weaker-sounding one. Because the kill-switch half now calls the SAME
+    /// `kill_switch_denial` function `finalize_classified_command` calls (and
+    /// the classify+authorize half already called the SAME
+    /// `classify_and_authorize_dispatch` function `build_classified_command`
+    /// calls), the existing
     /// `finalize_classified_command`/`kill_switch_denial` tests in
     /// `tests/unit/server/test_dispatch_chokepoint.cpp` (KillSwitched refusal,
     /// legacy-open-when-unwired, canonical-plugin/action consultation) cover

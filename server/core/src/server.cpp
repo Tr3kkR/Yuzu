@@ -1423,12 +1423,14 @@ public:
                           "(`build_classified_command`), labelled by which gate refused. "
                           "MCP's `execute_instruction` has two ADDITIONAL, independent "
                           "emitters on this same series that refuse BEFORE dispatch_fn is ever "
-                          "called: the C8 pre-mint gate (#3685, all six reasons as of #3687) "
-                          "denying locally before an approval ticket is minted or consumed, "
-                          "and the main-handler pre-dispatch authorization dry run (#3687, "
-                          "all six reasons) denying locally before dispatch_fn's own internal "
-                          "chokepoint would otherwise be reached. `kill_switched` is an "
-                          "operator-thrown emergency stop, deliberately distinct from the "
+                          "called: the C8 pre-mint gate (#3685; as of #3687, every reason "
+                          "EXCEPT `approval_required`, which at C8 is the cue to mint a ticket, "
+                          "not a denial) denying locally before an approval ticket is minted or "
+                          "consumed, and the main-handler pre-dispatch authorization dry run "
+                          "(#3687, all six reasons, including `approval_required` for tiers "
+                          "that never reach C8) denying locally before dispatch_fn's own "
+                          "internal chokepoint would otherwise be reached. `kill_switched` is "
+                          "an operator-thrown emergency stop, deliberately distinct from the "
                           "`forbidden` authorization verdict.",
                           "counter");
         for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",

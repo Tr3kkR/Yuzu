@@ -2896,9 +2896,10 @@ surface dispatched it**:
 - **MCP** (`execute_instruction` at `operator` tier — `supervised` tier already goes through the
   approval workflow): the denial is now a discriminated JSON-RPC error naming the reason
   (`error.data.reason: "approval_required"`), not the `no_agents_reached` tool result an
-  offline/unreachable agent gets (CLOSED by #3687 — a genuine `no_agents_reached` means offline or
-  an empty target, full stop; you no longer need to manually check whether a pair is gated before
-  trusting that result).
+  offline/unreachable agent gets (CLOSED by #3687 — a `no_agents_reached` result no longer needs a
+  manual check for whether a pair is gated before you trust it, aside from the same narrow
+  dry-run-then-real-check TOCTOU window every pre-dispatch authorization check in this codebase
+  accepts).
 - **Schedules**: a schedule dispatching a gated pair now requires an approval ticket exactly like
   the interactive governed path (`ScheduleRunner` mints one and holds the occurrence until an
   admin approves it via the existing `/api/approvals` workflow) — this was already the behavior

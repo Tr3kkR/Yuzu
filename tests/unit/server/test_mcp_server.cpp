@@ -8213,6 +8213,48 @@ TEST_CASE("MCP #3687 (Gate 6 UP-5): ApprovalRequired at C8 pre-mint is NOT a den
     CHECK_FALSE(dispatched); // not consumed either — this is the mint response
 }
 
+TEST_CASE("MCP #3687 (Gate 6 quality-engineer gap): unwired authorizer fails CLOSED AT C8 "
+          "PRE-MINT too — supervised tier, no ticket minted, dispatch_fn NOT invoked",
+          "[mcp][pg][integration][execute][3687][approval][up5]") {
+    // The pre-existing "unwired authorizer fails CLOSED" test above only
+    // covers the main-handler backstop (tier "operator", which never reaches
+    // C8 at all). C8's OWN fail-closed guard (mcp_server.cpp, immediately
+    // before pre_mint_caller is derived) is a separate `if
+    // (!authorize_dispatch_fn_)` block introduced by the UP-5 fix — nothing
+    // previously exercised it independently. A regression scoped to only
+    // that guard (e.g. an inverted condition) would go undetected without
+    // this test.
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr; // wired, so C8 reaches the authorize_dispatch_fn_ check
+    ts.authorize_dispatch_fn_for_test = {}; // genuinely unwired
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> std::pair<std::string, int> {
+        dispatched = true;
+        return {"cmd", 1};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("dispatch authorization is unavailable") !=
+          std::string::npos);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"].contains("correlation_id"));
+    CHECK(appr.pending_count() == 0); // no ticket minted at the C8 fail-closed guard either
+    CHECK_FALSE(dispatched);
+}
+
 // ── 36. Audit on success ─────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integration][execute]") {
