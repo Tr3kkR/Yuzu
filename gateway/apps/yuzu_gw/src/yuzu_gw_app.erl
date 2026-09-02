@@ -15,6 +15,7 @@
 -export([apply_env_overrides/0, evaluate_cookie/3]).  %% exported for testing
 -export([client_has_https/1, client_tls_posture/1, servers_have_tls/1]). %% for testing
 -export([evaluate_upstream_posture/2, listener_tls_traps/1]).            %% for testing
+-export([evaluate_mgmt_posture/3]).                                      %% for testing
 
 %%--------------------------------------------------------------------
 %% application callbacks
@@ -51,18 +52,24 @@ do_start() ->
         {error, Reason} ->
             {error, Reason};
         ok ->
-            %% Attach telemetry/prometheus handlers.
-            yuzu_gw_telemetry:setup(),
-
-            %% Start Prometheus HTTP exporter for /metrics endpoint.
-            Port = application:get_env(yuzu_gw, prometheus_port, 9568),
-            application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
-            {ok, _} = prometheus_httpd:start(),
-            logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
-
-            %% Start the supervision tree.
-            yuzu_gw_sup:start_link()
+            case check_mgmt_listener_posture() of
+                {error, Reason2} -> {error, Reason2};
+                ok               -> do_start_services()
+            end
     end.
+
+do_start_services() ->
+    %% Attach telemetry/prometheus handlers.
+    yuzu_gw_telemetry:setup(),
+
+    %% Start Prometheus HTTP exporter for /metrics endpoint.
+    Port = application:get_env(yuzu_gw, prometheus_port, 9568),
+    application:set_env(prometheus, prometheus_http, [{port, Port}, {path, "/metrics"}]),
+    {ok, _} = prometheus_httpd:start(),
+    logger:info("Prometheus metrics endpoint started on port ~p", [Port]),
+
+    %% Start the supervision tree.
+    yuzu_gw_sup:start_link().
 
 %%--------------------------------------------------------------------
 %% Distribution cookie guard (#659)
@@ -338,6 +345,125 @@ check_upstream_tls_posture() ->
           ok | {error, unverified_upstream_tls}.
 evaluate_upstream_posture(unverified, false) -> {error, unverified_upstream_tls};
 evaluate_upstream_posture(_Posture, _Allow)  -> ok.
+
+%%--------------------------------------------------------------------
+%% Mgmt-listener posture guard (#1422)
+%%--------------------------------------------------------------------
+
+%% @private Fail-closed guard for the PRIVILEGED command plane: refuse to boot
+%% when a management_pb listener is network-reachable without the full #1422
+%% posture (strict mTLS + the SPKI-pin auth_fun + configured pins). A
+%% mgmt listener without it hands fleet-wide command execution to any peer
+%% that can reach the port — the finding this guard makes non-recurring.
+%%
+%% Placement caveat: grpcbox is an application DEPENDENCY, so its listeners
+%% are already up when this runs; refusing here halts the release moments
+%% after listen. In that window the router/registry are not yet started, so
+%% a mgmt RPC cannot dispatch — acceptable, and consistent with the other
+%% posture guards in this module. A pre-listen validator inside the vendored
+%% grpcbox is tracked follow-up hardening.
+%%
+%% Escape hatch: {yuzu_gw, allow_insecure_mgmt} set to the literal `true`
+%% boots anyway with a loud warning — an ACKNOWLEDGEMENT for lab/UAT rigs
+%% (which the tracked rig configs set explicitly), not a mitigation.
+-spec check_mgmt_listener_posture() -> ok | {error, insecure_mgmt_listener}.
+check_mgmt_listener_posture() ->
+    Servers = application:get_env(grpcbox, servers, []),
+    Pins = application:get_env(yuzu_gw, mgmt_peer_pins, []),
+    Allow = application:get_env(yuzu_gw, allow_insecure_mgmt, false) =:= true,
+    case evaluate_mgmt_posture(Servers, Pins, Allow) of
+        ok ->
+            ok;
+        {ok_insecure, Details} ->
+            logger:warning(
+                "Management listener(s) ~p lack the #1422 secure posture but "
+                "{yuzu_gw, allow_insecure_mgmt} is true — booting anyway. This "
+                "plane fans commands to the ENTIRE fleet; this override is for "
+                "isolated lab/UAT rigs only, never production.", [Details]),
+            ok;
+        {error, {insecure_mgmt_listener, Details}} ->
+            logger:critical(
+                "Refusing to start: management listener(s) ~p are network-"
+                "reachable without the required posture (strict mTLS with "
+                "certfile+keyfile+cacertfile, verify_peer, fail_if_no_peer_cert, "
+                "auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1, and non-empty "
+                "{yuzu_gw, mgmt_peer_pins}). Anyone reaching this port could "
+                "otherwise command the entire fleet (#1422). Fix the grpcbox "
+                "listener config (see config/sys.config.prod), bind it to "
+                "loopback, or — isolated lab/UAT rigs ONLY — set "
+                "{yuzu_gw, allow_insecure_mgmt} to true.", [Details]),
+            {error, insecure_mgmt_listener}
+    end.
+
+%% @doc Pure mgmt-posture policy decision — exported for testing. Returns a
+%% per-listener defect list keyed by listen port; the escape hatch converts a
+%% refusal into {ok_insecure, Details} (boot + warn), never a silent pass.
+-spec evaluate_mgmt_posture(term(), term(), boolean()) ->
+          ok | {ok_insecure, [term()]} | {error, {insecure_mgmt_listener, [term()]}}.
+evaluate_mgmt_posture(Servers, Pins, Allow) when is_list(Servers) ->
+    Details = [{listener_port(S), mgmt_defects(S, Pins)}
+               || S <- Servers, is_mgmt_listener(S),
+                  not loopback_bound(S),
+                  mgmt_defects(S, Pins) =/= []],
+    case {Details, Allow} of
+        {[], _}     -> ok;
+        {_, true}   -> {ok_insecure, Details};
+        {_, false}  -> {error, {insecure_mgmt_listener, Details}}
+    end;
+evaluate_mgmt_posture(_Servers, _Pins, _Allow) ->
+    %% Unrecognisable servers config: nothing provably exposes management_pb.
+    ok.
+
+%% @private A listener serving the management proto. Identified by
+%% service_protos — never by port or the advisory yuzu_gw env keys.
+-spec is_mgmt_listener(term()) -> boolean().
+is_mgmt_listener(S) when is_map(S) ->
+    Protos = opt_value(service_protos, maps:get(grpc_opts, S, #{})),
+    is_list(Protos) andalso lists:member(management_pb, Protos);
+is_mgmt_listener(_) ->
+    false.
+
+%% @private Loopback-only binds have no network attack surface. A missing or
+%% unrecognised ip is EXPOSED (grpcbox defaults to {0,0,0,0}).
+-spec loopback_bound(map()) -> boolean().
+loopback_bound(S) ->
+    case maps:get(ip, maps:get(listen_opts, S, #{}), undefined) of
+        {127, _, _, _}            -> true;
+        {0, 0, 0, 0, 0, 0, 0, 1} -> true;
+        _                         -> false
+    end.
+
+%% @private Everything wrong with one mgmt listener's posture. `ssl => true`
+%% alone is NOT TLS: grpcbox_pool silently falls back to TCP unless certfile,
+%% keyfile AND cacertfile are all present. TLS with verify_none would let a
+%% self-signed cert reach the auth_fun, and without fail_if_no_peer_cert a
+%% certless peer skips it entirely — both count as defects. The auth_fun must
+%% be exactly the approved pin callback, and the pin set non-empty.
+-spec mgmt_defects(map(), term()) -> [atom()].
+mgmt_defects(S, Pins) ->
+    T = maps:get(transport_opts, S, #{}),
+    GrpcOpts = maps:get(grpc_opts, S, #{}),
+    HasMaterial = lists:all(fun(K) -> has_material(K, T) end,
+                            [certfile, keyfile, cacertfile]),
+    %% verify / fail_if_no_peer_cert default to the patched grpcbox's strict
+    %% values when omitted, so absent is fine; an explicit relaxation is not.
+    Verify = case opt_value(verify, T) of undefined -> verify_peer; V -> V end,
+    FailNoPeer = case opt_value(fail_if_no_peer_cert, T) of
+                     undefined -> true;
+                     F -> F
+                 end,
+    Checks =
+        [{plaintext, opt_value(ssl, T) =/= true},
+         {missing_cert_material, not HasMaterial},
+         {verify_not_peer, opt_value(ssl, T) =:= true andalso
+                           Verify =/= verify_peer},
+         {peer_cert_not_required, opt_value(ssl, T) =:= true andalso
+                                  FailNoPeer =/= true},
+         {missing_or_wrong_auth_fun,
+          maps:get(auth_fun, GrpcOpts, undefined) =/=
+              fun yuzu_gw_authz:check_mgmt_peer/1},
+         {no_mgmt_peer_pins, not (is_list(Pins) andalso Pins =/= [])}],
+    [Defect || {Defect, true} <- Checks].
 
 -spec tls_word(boolean()) -> string().
 tls_word(true)  -> "TLS";

@@ -28,8 +28,31 @@ strict_configs() ->
     ["config/sys.config.prod",
      "../deploy/docker/reference-gateway-sys.config"].
 
+%% Tracked LAB-RIG configs whose mgmt listener is deliberately plaintext on
+%% 0.0.0.0 behind the explicit acknowledgement hatch (their composes keep
+%% :50063 unpublished). The docker-compose.uat.yml INLINE config carries the
+%% same hatch but is YAML-embedded, so it cannot be consulted here.
+rig_configs() ->
+    ["../deploy/docker/gateway-sys.config",
+     "../deploy/config/uat/gateway-sys.config",
+     "../deploy/docker/demo-gateway-sys.config"].
+
 consult_strict_configs_test_() ->
     [{Path, fun() -> check_strict(Path) end} || Path <- strict_configs()].
+
+consult_rig_configs_test_() ->
+    [{Path, fun() -> check_rig(Path) end} || Path <- rig_configs()].
+
+%% A rig config must parse, must carry the LITERAL hatch (so the boot guard
+%% warns instead of refusing), and must still pass evaluate_mgmt_posture the
+%% way the running gateway will evaluate it.
+check_rig(Path) ->
+    Cfg = consult(Path),
+    YuzuEnv = proplists:get_value(yuzu_gw, Cfg, []),
+    ?assertEqual(true, proplists:get_value(allow_insecure_mgmt, YuzuEnv)),
+    Pins = proplists:get_value(mgmt_peer_pins, YuzuEnv, []),
+    ?assertMatch({ok_insecure, _},
+                 yuzu_gw_app:evaluate_mgmt_posture(servers(Cfg), Pins, true)).
 
 dev_config_mgmt_is_loopback_test() ->
     Cfg = consult("config/sys.config"),

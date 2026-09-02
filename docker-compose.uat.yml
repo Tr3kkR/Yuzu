@@ -38,7 +38,12 @@ configs:
               {circuit_breaker_reset_timeout_ms, 10000},
               {circuit_breaker_max_reset_timeout_ms, 300000},
               {backpressure_threshold, 1000},
-              {hash_ring_vnodes, 256}
+              {hash_ring_vnodes, 256},
+              %% #1422 escape hatch - UAT ONLY: the mgmt listener below is
+              %% plaintext on 0.0.0.0 and the gateway otherwise refuses to
+              %% boot. Safe only while :50063 stays unpublished on this
+              %% compose network.
+              {allow_insecure_mgmt, true}
           ]},
           {grpcbox, [
               {client, #{channels => [

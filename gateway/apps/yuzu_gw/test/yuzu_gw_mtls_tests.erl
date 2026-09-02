@@ -478,3 +478,113 @@ run_all([Cmd | Rest]) ->
         nomatch -> run_all(Rest);
         _ -> {error, {openssl_missing, Out}}
     end.
+
+%%%-------------------------------------------------------------------
+%%% Mgmt-listener boot-guard policy (#1422) — evaluate_mgmt_posture/3
+%%%-------------------------------------------------------------------
+
+-define(PIN_FUN, fun yuzu_gw_authz:check_mgmt_peer/1).
+
+secure_mgmt() ->
+    #{grpc_opts => #{service_protos => [management_pb],
+                     services => #{},
+                     auth_fun => ?PIN_FUN},
+      listen_opts => #{port => 50063, ip => {0, 0, 0, 0}},
+      transport_opts => #{ssl => true, certfile => "c.pem", keyfile => "k.pem",
+                          cacertfile => "ca.pem"}}.
+
+pins() -> [{cert_file, "srv.pem"}].
+
+with_transport(Fun) ->
+    S = secure_mgmt(),
+    S#{transport_opts := Fun(maps:get(transport_opts, S))}.
+
+mgmt_posture_secure_ok_test() ->
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([secure_mgmt()], pins(), false)).
+
+mgmt_posture_loopback_exempt_test() ->
+    %% Loopback (v4 and v6) plaintext mgmt is the dev posture — no network
+    %% attack surface, boots without the hatch.
+    Plain = fun(Ip) ->
+        #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+          listen_opts => #{port => 50063, ip => Ip}}
+    end,
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([Plain({127, 0, 0, 1})], [], false)),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(
+                       [Plain({0, 0, 0, 0, 0, 0, 0, 1})], [], false)).
+
+mgmt_posture_wildcard_plaintext_refused_test() ->
+    Plain = #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+              listen_opts => #{port => 50063, ip => {0, 0, 0, 0}}},
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([Plain], [], false),
+    ?assert(lists:member(plaintext, Defects)).
+
+mgmt_posture_missing_ip_is_exposed_test() ->
+    %% grpcbox defaults a missing ip to {0,0,0,0} — the guard must too.
+    Plain = #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+              listen_opts => #{port => 50063}},
+    ?assertMatch({error, {insecure_mgmt_listener, _}},
+                 yuzu_gw_app:evaluate_mgmt_posture([Plain], [], false)).
+
+mgmt_posture_escape_hatch_boots_with_warning_result_test() ->
+    Plain = #{grpc_opts => #{service_protos => [management_pb], services => #{}},
+              listen_opts => #{port => 50063, ip => {0, 0, 0, 0}}},
+    ?assertMatch({ok_insecure, [{50063, _}]},
+                 yuzu_gw_app:evaluate_mgmt_posture([Plain], [], true)).
+
+mgmt_posture_tcp_fallback_refused_test() ->
+    %% ssl => true WITHOUT full cert material: grpcbox_pool silently serves
+    %% plaintext TCP — must be refused, not treated as TLS.
+    S = with_transport(fun(T) -> maps:remove(cacertfile, T) end),
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(missing_cert_material, Defects)).
+
+mgmt_posture_verify_none_refused_test() ->
+    %% TLS + verify_none would hand the auth_fun a SELF-SIGNED cert — the
+    %% CA gate must stay in front of the pin.
+    S = with_transport(fun(T) -> T#{verify => verify_none} end),
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(verify_not_peer, Defects)).
+
+mgmt_posture_optional_peer_cert_refused_test() ->
+    %% fail_if_no_peer_cert=false: a certless peer skips the auth_fun
+    %% entirely (grpcbox only authenticates a PRESENTED cert).
+    S = with_transport(fun(T) -> T#{fail_if_no_peer_cert => false} end),
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(peer_cert_not_required, Defects)).
+
+mgmt_posture_wrong_auth_fun_refused_test() ->
+    S0 = secure_mgmt(),
+    Grpc = maps:get(grpc_opts, S0),
+    Wrong = S0#{grpc_opts := Grpc#{auth_fun := fun erlang:is_binary/1}},
+    Missing = S0#{grpc_opts := maps:remove(auth_fun, Grpc)},
+    lists:foreach(fun(S) ->
+        {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+            yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+        ?assert(lists:member(missing_or_wrong_auth_fun, Defects))
+    end, [Wrong, Missing]).
+
+mgmt_posture_empty_pins_refused_test() ->
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([secure_mgmt()], [], false),
+    ?assert(lists:member(no_mgmt_peer_pins, Defects)).
+
+mgmt_posture_non_mgmt_listener_ignored_test() ->
+    %% The wildcard one-way-TLS agent listener (verify_none, no auth_fun) is
+    %% NOT a mgmt listener — the guard must not refuse it.
+    Agent = #{grpc_opts => #{service_protos => [agent_pb], services => #{}},
+              listen_opts => #{port => 50051, ip => {0, 0, 0, 0}},
+              transport_opts => #{ssl => true, certfile => "c", keyfile => "k",
+                                  cacertfile => "ca", verify => verify_none,
+                                  fail_if_no_peer_cert => false}},
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([Agent], [], false)).
+
+mgmt_posture_malformed_entries_tolerated_test() ->
+    %% Non-map junk in the servers list can't be proven to expose the mgmt
+    %% proto — the guard skips it (the tls-trap logger covers misconfig).
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([not_a_map, []], [], false)),
+    ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(undefined, [], false)).
