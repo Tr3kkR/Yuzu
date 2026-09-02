@@ -4529,16 +4529,23 @@ McpServer::HandlerFn McpServer::build_handler(
                                 break;
                             case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss: {
                                 // #3685 governance-round-2 (Doomgoose colleague review,
-                                // item 3): C8-ONLY deviation from Policy B. REST's
-                                // `/api/command` switch (server.cpp) and this same
-                                // handler's main-handler backstop switch below (~7896)
-                                // both keep Policy B UNCHANGED — explicit fall-through
-                                // to the shared dispatch chokepoint's own unconditional
-                                // classify-miss denial — because an independent early
-                                // denial there would only DUPLICATE evidence the
-                                // chokepoint already produces (it denies a classify-miss
-                                // unconditionally either way; there is no escape to
-                                // close, only evidence to not duplicate).
+                                // item 3): C8-ONLY deviation from Policy B, as it stood
+                                // at #3685 time. REST's `/api/command` switch (server.cpp)
+                                // STILL keeps Policy B unchanged today — explicit
+                                // fall-through to the shared dispatch chokepoint's own
+                                // unconditional classify-miss denial, because an
+                                // independent early denial there would only DUPLICATE
+                                // evidence the chokepoint already produces (it denies a
+                                // classify-miss unconditionally either way; there is no
+                                // escape to close, only evidence to not duplicate).
+                                // #3687 UPDATE: this same handler's main-handler backstop
+                                // (below, ~8203) no longer keeps Policy B — it is now
+                                // dry-run-mediated (`AuthorizeDispatchFn`), denying a
+                                // classify-miss locally before `dispatch_fn`, same as C8
+                                // already did. So as of #3687, C8 and the main-handler
+                                // backstop AGREE (both deny locally, no ticket / no
+                                // dispatch attempt); only REST still differs by falling
+                                // through to the chokepoint.
                                 //
                                 // C8 is different: it runs BEFORE a supervised-tier
                                 // approval ticket is minted. Falling through here does

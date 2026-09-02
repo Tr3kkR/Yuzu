@@ -6940,18 +6940,36 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
 // #1398 (quality-engineer, Gate 3): no prior test wired a fake dispatch_fn
 // that consults the REAL chokepoint (classify_and_authorize_dispatch) rather
 // than fabricating a bare {command_id, 0} directly — so nothing pinned what
-// an MCP caller ACTUALLY experiences today when a gated pair denies at the
-// chokepoint, as opposed to when an agent is genuinely offline. Production's
+// an MCP caller ACTUALLY experiences when a gated pair denies AT DISPATCH_FN
+// ITSELF, as opposed to when an agent is genuinely offline. Production's
 // dispatch_confined (server.cpp) does exactly this: `if (!classified) return
 // {command_id, 0};` — a chokepoint denial and an unreachable agent are
-// indistinguishable at this boundary. This test locks that collapse in
-// explicitly, as a known-imperfect but INTENTIONAL regression guard: #1398
-// Rung 4 (tracked, not yet shipped) is the closure that gives a gate denial
-// its own discriminated JSON-RPC error instead of this shared envelope. If
-// this test starts failing because the envelope changed shape WITHOUT Rung 4
-// having shipped a real discriminator, that is a regression, not progress.
-TEST_CASE("MCP execute_instruction: a real chokepoint ApprovalRequired denial "
-          "collapses into the same no_agents_reached envelope as an offline agent (#1398)",
+// indistinguishable at THAT boundary.
+//
+// #3687 UPDATE: #1398 Rung 4 has now shipped — for the ORDINARY case, a real
+// MCP caller no longer experiences this collapse at all. The pre-dispatch
+// authorization dry run (`authorize_dispatch_fn_`, consulted before
+// dispatch_fn is ever called) now denies an ApprovalRequired-shaped call with
+// its own discriminated JSON-RPC error, and dispatch_fn's internal chokepoint
+// is never reached. This test's OWN construction, however, does not exercise
+// that ordinary path: it fabricates the ApprovalRequired denial inside the
+// fake `dispatch_fn` closure below, against a registry (`kGatedFixture`) the
+// dry run seam (`authorize_dispatch_fn_for_test`, left at its default —
+// unconditionally-succeeding — stub) is never told about. So the dry run
+// here says "allow" while `dispatch_fn`'s own internal check denies — the
+// residual case where the two checks (necessarily separate in production
+// too: the dry run and dispatch_fn's real chokepoint are two calls, not one,
+// racing over the same live state) can disagree. What this test now pins is
+// that residual: when dispatch_fn's own chokepoint denies something the
+// pre-dispatch dry run did not catch, the caller still gets the pre-#3687
+// collapsed `no_agents_reached` envelope, not a discriminated error — because
+// the dry run is a UX improvement layered in front of the real enforcement
+// point, not a second copy of it. If this test starts failing because the
+// envelope changed shape for THIS specific dry-run-allows/dispatch_fn-denies
+// scenario, that is a regression in the documented residual, not progress.
+TEST_CASE("MCP execute_instruction: a chokepoint ApprovalRequired denial the pre-dispatch dry "
+          "run did not catch still collapses into the no_agents_reached envelope (#1398, "
+          "residual post-#3687)",
           "[mcp][integration][execute][1398]") {
     using yuzu::server::CommandCapability;
     using yuzu::server::CommandCapabilityRegistry;
@@ -7006,10 +7024,14 @@ TEST_CASE("MCP execute_instruction: a real chokepoint ApprovalRequired denial "
 
     auto body = nlohmann::json::parse(res->body);
     auto& sc = body["result"]["structuredContent"];
-    // Rung-4-pending: today this is IDENTICAL to the offline-agent envelope
-    // asserted in "MCP Integration: execute_instruction zero agents reached"
-    // above — no `approval_required`/`ApprovalRequired` discriminator exists
-    // in this response yet.
+    // Residual post-#3687 (see the TEST_CASE-level comment above): IDENTICAL
+    // to the offline-agent envelope asserted in "MCP Integration:
+    // execute_instruction zero agents reached" above — no `approval_required`
+    // /`ApprovalRequired` discriminator exists in THIS response, because this
+    // test's fake dispatch_fn denies against a registry the pre-dispatch dry
+    // run (left at its default-allow stub) was never told about. A caller
+    // whose ApprovalRequired-ness IS visible to authorize_dispatch_fn_ gets
+    // the new discriminated error instead — see the "[3687]" test cases.
     CHECK(sc["status"] == "no_agents_reached");
     CHECK(sc["agents_reached"] == 0);
     CHECK_FALSE(sc.contains("approval_required"));

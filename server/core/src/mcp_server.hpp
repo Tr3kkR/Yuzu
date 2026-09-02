@@ -275,11 +275,16 @@ public:
     /// fn reaching a live request means the wiring itself regressed.
     ///
     /// A WIRED fn returning `Unclassified`/`Ambiguous` (an honest classify
-    /// miss, not an absent fn) is the DIFFERENT, unchanged Policy-B case:
-    /// `execute_instruction` falls through and the existing dispatch
-    /// chokepoint denies a real miss on its own terms, exactly as before
-    /// this fn existed — see `dispatch_destructive_gate.hpp`'s
-    /// `DestructiveTargetingVerdict::ClassifyMiss`.
+    /// miss, not an absent fn) is the DIFFERENT Policy-B case — see
+    /// `dispatch_destructive_gate.hpp`'s `DestructiveTargetingVerdict::
+    /// ClassifyMiss`. Pre-#3687 this fell all the way through to the
+    /// existing dispatch chokepoint, which denied a real miss on its own
+    /// terms. #3687 changed WHERE that denial happens on the main-handler
+    /// path: `AuthorizeDispatchFn`'s own pre-dispatch dry run (below) now
+    /// denies a classify-miss locally, with a discriminated error, before
+    /// `dispatch_fn` is ever called — the chokepoint itself is unchanged,
+    /// only reached one call earlier. REST's `/api/command` still falls
+    /// through to that chokepoint unchanged (Policy B, as before).
     using ClassifyFn =
         std::function<std::expected<yuzu::server::CommandCapability,
                                     yuzu::server::ClassificationError>(
@@ -301,11 +306,21 @@ public:
     /// RBAC binder `build_classified_command` itself consults, never a
     /// re-implemented slice — Decision 7 F fix,
     /// `docs/security-reviews/1398-dispatch-approval-gate-design.md`) and
-    /// then, only on success, the SAME per-action kill-switch check
-    /// (`PluginConfigStore::action_allowed`) `finalize_classified_command`
-    /// runs — same order (kill switch checked AFTER classify+authorize, so
-    /// it can never mask a `Forbidden`/`ApprovalRequired` verdict with a
-    /// weaker-sounding one).
+    /// then, only on success, the SAME per-action kill-switch DECISION
+    /// (`PluginConfigStore::action_allowed`, unset store == legacy-open)
+    /// `finalize_classified_command` also gates on — same order (kill
+    /// switch checked AFTER classify+authorize, so it can never mask a
+    /// `Forbidden`/`ApprovalRequired` verdict with a weaker-sounding one).
+    /// That half is an EQUIVALENT RE-EXPRESSION, not the identical call:
+    /// `finalize_classified_command`'s signature also builds the wire
+    /// `pb::CommandRequest` (`command_id`/`target_arm`/`execution_id`/
+    /// `parameters`/...), none of which exist yet in a pre-dispatch dry run,
+    /// so the production closure re-expresses just the kill-switch boolean
+    /// inline (`action_allowed(plugin, action)`) rather than calling that
+    /// function. Both reduce to the identical condition today — verified by
+    /// test — but a future change to `finalize_classified_command`'s
+    /// kill-switch clause must be mirrored here by hand; it will not be
+    /// caught by sharing code, only by the tests pinning both.
     ///
     /// FAIL-CLOSED contract, matching `ClassifyFn` immediately above (the
     /// OPPOSITE default posture from most `*Fn` seams in this file): an

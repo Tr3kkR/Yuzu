@@ -22420,16 +22420,26 @@ private:
             // #3687 — wired UNCONDITIONALLY, same reasoning as
             // set_capability_classify_fn immediately above (capability_registry_
             // is a plain ServerImpl member, never conditional on another store's
-            // presence). Composes the SAME two decisions
-            // build_classified_command makes, in the SAME order, via the SAME
-            // shared has_permission binder (dispatch_has_permission above) and
-            // the SAME PluginConfigStore::action_allowed kill-switch check
-            // (finalize_classified_command's contract) — never a re-implemented
-            // slice of either. `plugin_config_store_` is read live through
-            // `this` (not captured by value), so this wiring is safe
-            // regardless of construction order relative to that store; an
-            // unset store means legacy-open for the kill-switch gate ONLY,
-            // mirroring build_classified_command's own unwired contract.
+            // presence). Composes the SAME two DECISIONS build_classified_command
+            // makes, in the SAME order. The classify+authorize half genuinely
+            // calls the shared code: classify_and_authorize_dispatch, via the
+            // SAME has_permission binder (dispatch_has_permission above) —
+            // never a re-implemented slice. The kill-switch half is an
+            // EQUIVALENT RE-EXPRESSION, not a shared call:
+            // finalize_classified_command's own signature also builds the wire
+            // pb::CommandRequest (command_id/target_arm/execution_id/
+            // parameters/...), none of which exist here — this is a pre-dispatch
+            // dry run, not a dispatch — so the boolean condition
+            // (`plugin_config_store_ != nullptr && !action_allowed(...)`) is
+            // written out inline instead, reduced to the identical condition
+            // finalize_classified_command applies today (pinned by test), but
+            // NOT sharing code with it — a future change to that function's
+            // kill-switch clause must be mirrored here by hand. `plugin_config_
+            // store_` is read live through `this` (not captured by value), so
+            // this wiring is safe regardless of construction order relative to
+            // that store; an unset store means legacy-open for the kill-switch
+            // gate ONLY, mirroring build_classified_command's own unwired
+            // contract.
             // Per McpServer::AuthorizeDispatchFn's fail-closed contract
             // (mcp_server.hpp), omitting this call refuses every
             // execute_instruction call outright, not merely a degraded tool.
