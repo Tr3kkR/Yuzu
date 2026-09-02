@@ -204,6 +204,17 @@ over the five legacy tables (`guaranteed_state_rules`/`guardian_meta`/
 `guardian_agent_rule_status`/`guaranteed_state_events`/`guardian_observations`) instead
 — silent unless real rows are found, never blocks boot.
 
+**Consequence, specific to this store.** Every other store in this retirement batch
+loses merely operational or cosmetic state if the "no real legacy data" premise turns
+out to be locally false for some install (a stray notification feed, a stale discovery
+scan). This store is different: a legacy `guaranteed-state.db` genuinely holding real
+Guardian rules now produces a boot-time WARN log line and nothing else — the rules are
+never loaded, and enforcement silently starts from an empty rule set rather than
+resuming the operator's prior policy. This is a strictly worse consequence class than
+the rest of the batch, and it rests on the same production-fleet premise as every other
+store here; if that premise is ever locally wrong for a Guardian install specifically,
+the operator's actual protection posture is what's at stake, not just convenience.
+
 ## Follow-ups
 
 - #2634-parity counters land here from day one (this ADR's retention section).

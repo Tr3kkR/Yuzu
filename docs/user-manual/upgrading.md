@@ -2378,15 +2378,52 @@ abort/503, never a silent empty/"fully compliant" enforced set. `GET
 /api/v1/guaranteed-state/device-compliance` returns **503** rather than a
 misleadingly-empty or false-compliant result when the underlying read degrades;
 Guardian deploy/delete dashboard actions show a degraded-modal rather than
-reporting success. There is no dedicated backfill-outcome metric for this store
-(matching its own precedent stores, `GuaranteedStateStore`/`DeviceTokenStore`,
-which also rely on the boot log + `/readyz` rather than a Prometheus counter for
-a boot-fatal event) — a refused boot never serves `/metrics` at all, so the boot
+reporting success. There is no dedicated backfill-outcome metric for this store —
+a schema-migration failure is boot-fatal and never serves `/metrics`, so the boot
 log and `/readyz` are the channels to watch during an upgrade.
 
 **Verify:** after the server reports ready, `/guardian` shows the expected Baselines
 (re-authored via the Guardian UI/REST API on a fresh install, or already-live
 Postgres data on a redeploy).
+
+## Guardian rules, events, and DEX observations retire their legacy-SQLite path (GuaranteedStateStore, ADR-0038)
+
+`GuaranteedStateStore` — the live agent-side policy enforcement store (`/guardian`
+rule authoring, drift/remediation events, DEX observations) — no longer copies a
+legacy `guaranteed-state.db` file into Postgres on first boot.
+
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres
+build of this store, so there was no real `guaranteed-state.db` data to carry
+over — the one-time backfill mechanism this store originally shipped was retired
+under ADR-0009's fresh-start-by-default amendment (see ADR-0038's Update).
+
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `guaranteed-state.db` file with real content **does NOT** fail startup
+  and its content is **never imported** — the server opens it read-only, purely to
+  count rows across `guaranteed_state_rules`/`guardian_meta`/
+  `guardian_agent_rule_status`/`guaranteed_state_events`/`guardian_observations`
+  for a diagnostic warning, then boots fresh-started regardless of what it finds.
+  If any of those tables has rows, it logs a `GuaranteedStateStore`
+  legacy-row-count warning at WARN; boot proceeds unaffected either way.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
+
+**This is a stronger warning than it looks.** Unlike the other stores retiring
+their legacy-SQLite path in this same release, a genuinely non-empty
+`guaranteed-state.db` here means real Guardian rules an operator authored are
+silently NOT loaded — enforcement resumes from an empty rule set, not the
+operator's prior policy. If you see the legacy-row-count warning above and the
+environment genuinely has real rules to keep, there is no automated recovery
+path: re-author the equivalent rules against the new Postgres-backed store via
+the Guardian UI/REST API before relying on it, and confirm the expected rules
+are actually present (see Verify below) rather than assuming they carried over.
+
+**Verify:** after the server reports ready, `/guardian` shows the expected rules
+(re-authored via the Guardian UI/REST API on a fresh install, or already-live
+Postgres data on a redeploy) — do not rely on the absence of the legacy-row-count
+warning alone as confirmation that nothing was lost.
 
 ## Compliance policy engine moves to Postgres (PolicyStore, ADR-0056)
 

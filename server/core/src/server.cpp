@@ -5752,6 +5752,7 @@ public:
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "result_sets.db",
                                                          "ResultSetStore",
                                                          {"result_sets", "result_set_members"});
+                spdlog::info("ResultSetStore initialized (schema result_set_store)");
             }
         }
 
@@ -6209,6 +6210,7 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "notifications.db",
                                                          "NotificationStore", {"notifications"});
+                spdlog::info("NotificationStore initialized (schema notification_store)");
                 // #3261: wire the consumer immediately after construction,
                 // inside the full-success branch - the old top-of-ctor
                 // wiring block ran before this store existed and never fired.
@@ -6673,6 +6675,7 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "deployment-jobs.db",
                                                          "DeploymentStore", {"deployment_jobs"});
+                spdlog::info("DeploymentStore initialized (schema deployment_store)");
             }
         }
 

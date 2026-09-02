@@ -1546,6 +1546,12 @@ sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
 sum(rate(yuzu_server_product_pack_read_degrade_total[5m])) by (reason) > 0
 ```
 
+`yuzu_server_product_pack_backfill_total{result}` (the one-time legacy backfill outcome)
+was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real `product-packs.db` data to migrate. See
+ADR-0054's Update.
+
 ## Instruction store metrics (content-plane catalog, ADR-0058)
 
 The `InstructionStore` (`InstructionDefinition -> InstructionSet -> ProductPack`, schema

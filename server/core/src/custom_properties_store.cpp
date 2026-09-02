@@ -19,7 +19,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <system_error>
 
 namespace yuzu::server {
 
