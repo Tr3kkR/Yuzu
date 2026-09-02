@@ -53,6 +53,15 @@ maintainer at nathan.dornbrook@gmail.com.
    meson compile -C build-linux
    ```
 
+## Agent and instruction files
+
+`CLAUDE.md` and `AGENTS.md` are contents pages, not knowledge bases: they load into every agent
+session, so anything added to them is paid on every session whether or not the work touches that
+subject. Before adding to either — or to the routed-concern tables under `.claude/` — read
+**`docs/instruction-file-standard.md`**. It gives the placement ladder (a hook, a header comment at
+the site, a `docs/` file plus a routed-concern row, a routed-concern row alone, and only then an
+instruction file) and the budget CI enforces.
+
 ## Architecture
 
 See [`docs/architecture.md`](docs/architecture.md) for how components interact.
