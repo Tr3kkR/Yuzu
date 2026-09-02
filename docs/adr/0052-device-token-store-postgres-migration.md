@@ -550,3 +550,27 @@ in fact catalog `yuzu_agents_registered_total`/`yuzu_agents_connected` either �
 curated query/dashboard reference, not an exhaustive metrics catalog — so this is a pre-existing
 gap affecting the whole `yuzu_agents_*` family, not one this round newly introduces; a metrics
 catalog pass is a separate, larger piece of work.)
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+**Supersedes the "Backfill is NOT skippable on the strength of that dormancy" caution above.**
+That caution (written 2026-08-18) reasoned that the `acc6c481a..2fcfb95b5` window meant a real
+`device-tokens.db` with genuinely issued tokens *could* exist even though the store is dormant
+today. ADR-0009's fresh-start-by-default amendment (2026-08-25, one week later) establishes the
+blanket program-wide fact this per-store hedge did not yet have available: no production Yuzu
+fleet has ever run a pre-Postgres build of *any* store (`project_no-production-fleet-fresh-build`
+standing fact) — this store's historical SQLite-era construction window included, since Yuzu had
+no production deployments during it either. The hedge was reasonable given what was known at the
+time; the later blanket fact resolves it the same direction the other 17 already-migrated stores
+were resolved.
+
+`DeviceTokenStore::migrate_from_sqlite()`, its `LegacyDeviceTokenRow`/`LegacyStep`/`Sha256Stream`
+helpers, and the `sqlite_backfill_source` marker table are removed
+(`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623). Unlike a store with a live
+Postgres deployment, this store's `migrations()` were never run against any real database at all —
+nothing in production ever constructed `DeviceTokenStore` even after this ADR's PG migration
+merged (see "Dormancy" above), so there is no drift risk from editing schema version 1 in place
+(the `sqlite_backfill_source` `CREATE TABLE` is simply deleted from it) rather than issuing a
+version-bumped `DROP TABLE IF EXISTS` migration. This is the same practical justification
+PolicyStore's removal used (ADR-0009 §"authoring contract"), reached by a different route: that
+store's v1 had never *shipped*; this store's v1 had never *run*.
