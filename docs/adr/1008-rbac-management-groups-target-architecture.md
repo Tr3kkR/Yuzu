@@ -1,14 +1,15 @@
 ---
-status: proposed (numbered ADR-1008; pending /governance review and Dave's final acceptance)
+status: proposed
 date: 2026-09-02
 owner: Dave Rae
-deciders: Dave Rae (pending)
+deciders: Dave Rae (pending -- numbered ADR-1008, committed for /governance review, not yet
+  through it; see Binding status below)
 scope: server -- target access-control architecture for RBAC + Management Groups
 depends-on: ADR-0017, ADR-0033, ADR-1006 (this document's decisions must compose with, not
   re-decide, the frozen contracts in these three)
-context-refs: ADR-0006, ADR-0031, ADR-0032, ADR-0041, ADR-0042, ADR-1005,
-  docs/auth-engine-principals-design.md, #388, #480, #1362, #1453, #1496, #1715,
-  #1842, #2485, #2665, #2670, #2677, #2721, #2809, #3290, #3489
+context-refs: ADR-0006, ADR-0031 (presentation-core-engine-decomposition), ADR-0032, ADR-0041,
+  ADR-0042, ADR-1005, docs/auth-engine-principals-design.md, #388, #480, #1362, #1453, #1496,
+  #1715, #1842, #2485, #2665, #2670, #2677, #2721, #2809, #3290, #3489
 supersedes: nothing (net-new target-architecture record; ADR-0017/1006 remain the accepted
   contracts this one builds forward from)
 ---
@@ -101,13 +102,11 @@ Both matter equally for calling this subsystem gold-standard; only the first sho
 
 ## Decision
 
-Eleven architectural decisions, D1-D11. (An earlier draft had twelve, separately numbering D7
-non-human attenuation and D12 explainability; both are kept here as their own headings because
-each names a distinct requirement even though D7 is implemented via D3/D5's primitives and D12
-via D8/D9's, but they are cross-referenced rather than pretended away. A prior revision of this
-document claimed the fold reduced the count to nine and then listed sequencing criteria only
-through "D2-D9" -- both were arithmetic errors, caught in the second Sol review, and are fixed
-throughout this revision.)
+Eleven architectural decisions, D1-D11. An earlier draft separately numbered a twelfth,
+explainability; its content is folded into D9 (cross-referenced there) rather than kept as its
+own heading, since D7 (which does keep its own heading) names a distinct non-human-attenuation
+requirement but the former D12 does not -- it is entirely implemented via D8/D9's primitives. See
+the Governance log for this and an earlier, now-fixed decision-count arithmetic error.
 
 ### D1 -- The securable catalogue is one source of truth, enforced at every gate, not just tool registration
 
@@ -151,10 +150,21 @@ RBAC and be self-granted `Administrator` regardless of their actual standing aut
 Disabling RBAC is symmetric: audited, MFA-stepped-up, reversible. A failed transaction is
 reported to the caller (`set_rbac_enabled`'s current `void` return must change to support this).
 
+**"Same transaction," named (Gate-2 governance finding):** the Administrator-existence check
+spans two currently separate stores -- the grant lives in `RbacStore`, the human's active-account
+status lives in `AuthDB` -- and neither exposes a joint transaction primitive to the other today,
+even though both are constructed over the same underlying Postgres pool. This decision requires
+building one (e.g. the enable transaction takes its connection from whichever store owns the
+toggle write and passes it to an explicit `is_user_active_on(conn, username)`-shaped call on the
+other, rather than two sequential, non-transactional reads); it is not a detail D2 can leave
+implicit, because a non-transactional version of this check reopens exactly the zero-active-
+Administrators race this decision exists to close.
+
 *Non-conformance (defect) today:* no code path can enable RBAC at all (#388); `set_rbac_enabled`
-cannot report failure to a caller. *Not yet built:* the bootstrap-grant conditioning and audit
-event described above have no code to violate them yet, precisely because no enable path exists
--- they are binding on whatever implements D2, not a claim about current behavior.
+cannot report failure to a caller. *Not yet built:* the bootstrap-grant conditioning, the
+cross-store transactional check, and the audit event described above have no code to violate
+them yet, precisely because no enable path exists -- they are binding on whatever implements D2,
+not a claim about current behavior.
 
 ### D3 -- One assignment chokepoint for every principal type and scope; deny at assignment level is a decided, not silent, extension of the frozen lattice
 
@@ -240,7 +250,10 @@ questions and merging weakens one or complicates the other):
 1. **Single-target writes** -- `require_scoped_permission(..., agent_id)`, the existing
    per-device pattern.
 2. **Fan-out dispatch** -- `dispatch_confined_arms` / `derive_exec_visible` / `authz::meet`, the
-   existing per-dispatch-arm intersection (ADR-0033 §2's targeting model).
+   existing per-dispatch-arm intersection (the `∩` narrowing formula ADR-0033 §1 states, applied
+   at the dispatch-targeting seam `docs/mcp-server.md`'s routed concern names -- not §2, which is
+   the capability-declaration registry D1 already cites correctly; a Gate-3 governance review
+   caught this mis-citation).
 3. **List/fan-out reads and bulk mutation targets** -- the ADR-0017 admit-then-filter triad
    (`authorize_list_read` / `require_fleet_read` / `require_list_read`) plus the built-but-unwired
    `confine_agent_target` for the write-target case ADR-0017 did not cover.
@@ -445,8 +458,13 @@ sentence.
    root and credential, and triggers a **`full_sync=true`** distribution on any transition it
    finds (orphan or adoption) rather than waiting for an unrelated change to surface it --
    per the correction above, a `full_sync=false` push would not actually enforce anything the
-   sweep just decided. The sweep interval is
-   implementation detail; that a sweep must exist at all is the decision.
+   sweep just decided. The sweep must carry the same kind of explicit bound `PolicyEvaluator`
+   already does (a tick, a grace period, and a floor -- `docs/user-manual/policy-engine.md`'s
+   10s/15s/60s-floor shape is the cited precedent, not the exact numbers); an unbounded or
+   implementation-defined-with-no-floor interval would satisfy this sub-clause's letter while
+   defeating "bounded, prompt pause" in substance (a Gate-2 governance finding). The exact
+   values are implementation, but the requirement that a floor and default be stated up front,
+   the same standard D9 already holds itself to for its own operational-cost parameters, is not.
 4. **Credential recheck.** For Schedules, ADR-0032 Decision 7 already decides this: its text
    names "a schedule" outright, requires recording the arming credential (not only the arming
    human), and states plainly that revocation, expiry, or deletion of that credential stops the
@@ -461,7 +479,11 @@ sentence.
    scheduled or background run" without Decision 7's operator-facing qualifier; whether that
    sentence already reaches Guardian on its own is left unargued here, because D6's mechanism is
    at least as strict as any such reading would require -- the question has no normative effect
-   on what this document actually does.)
+   on what this document actually does. Correction (Gate-3 governance review): the phrase "a
+   scheduled or background run" sits as a row INSIDE §7's four-eyes comparison table, not
+   separately from it, and §7 opens with an explicit caution against reusing that resolution as
+   a general identity-collapsing rule outside four-eyes -- this document's independent D6
+   authority is the operative basis for Guardian, not an unqualified reading of that phrase.)
 
    **Unified in shape across live and durable dispatch:**
 
@@ -547,8 +569,12 @@ sentence.
    for schedules; Guardian has no equivalent check at all. What genuinely is missing: `Schedule` records only
    `created_by` (a username), not the credential the armer used, so there is nothing yet for a
    revoked/expired/rotated credential to be checked against, and the RBAC-authority denial
-   `resolve_caller` triggers (counted by `arming_check`'s `yuzu_schedule_arming_denied_total`) is
-   silent per-schedule, visible only in an aggregate counter, not a per-schedule surfaced state.
+   `resolve_caller` triggers (a distinct path from `arming_check`'s own
+   `yuzu_schedule_arming_denied_total` -- `resolve_caller`'s account-non-existence case flows
+   through the `AnonymousOperator` refusal into `yuzu_server_dispatch_denied_total{reason=...}`;
+   this is a second Gate-2 correction to the same attribution, having survived one prior fix
+   elsewhere in this document -- see the Governance log) is silent per-schedule, visible only in
+   an aggregate counter, not a per-schedule surfaced state.
    Closing this means: recording
    the arming credential at arm time (sub-clause 4); on the first denied fire from either RBAC-
    authority loss or credential invalidity, transitioning the schedule to an audited, surfaced
@@ -583,7 +609,8 @@ sentence.
    decision does not foreclose one being proposed later for some dispatcher this document did not
    examine, but it sets the bar rather than leaving it undefined: this codebase already has a
    working precedent for exactly this shape of problem -- the auth subsystem's break-glass
-   account and ADR-0031's break-glass Core recovery ingress, both built on the explicit principle
+   account and ADR-0031 (presentation-core-engine-decomposition)'s break-glass Core recovery
+   ingress, both built on the explicit principle
    that "no filter and no gate is skipped because the surface is called break-glass." Any future
    institutional-controller exception must be built the same way: narrow, named, individually
    reviewed as its own ADR-0033 amendment (not silently absorbed into whatever PR implements this
@@ -733,16 +760,38 @@ permissions view and simulator this decision's engine would enable.
 
 ### D10 -- Time-bound, scoped grants are a distinct RBAC primitive from session elevation
 
-A grant may carry a validity window (`valid_from`/`valid_until`) enforced at the D3 chokepoint on
-every read of that grant, independent of the existing JIT session-elevation mechanism. JIT
-elevation promotes a session to full admin temporarily; it is neither role-specific nor
-scope-specific and must not be credited as satisfying this decision.
+A grant may carry a validity window (`valid_from`/`valid_until`), independent of the existing JIT
+session-elevation mechanism. JIT elevation promotes a session to full admin temporarily; it is
+neither role-specific nor scope-specific and must not be credited as satisfying this decision.
 
-Any cache that memoizes a decision keyed on a validity window or on the D4 effective-authority
-computation is bound by the existing invalidation rule this codebase has already stated twice
-(ADR-0033 §3; ADR-0017 INV-8): no such cache may key on an input unless every path that shrinks
-that input invalidates it. This decision does not introduce a new invalidation mechanism; it
-inherits the existing one and must not skip it.
+**Enforcement seam, corrected (Gate-2 governance finding):** an earlier draft named "the D3
+chokepoint... on every read of that grant" as where expiry is enforced. That is wrong on its
+face -- D3 is explicitly, in its own heading, a **write** chokepoint (`validate_assignment`,
+scoped to assignment and revocation). The seam that actually reads a grant to answer a
+permission question is `check_permission` / `visible_agents_for_permission` today, and D8's
+Request-free decision core once that exists. Expiry must be checked there, not at D3; D3's role
+is limited to rejecting an already-expired window at assignment time, which is necessary but not
+what makes an in-flight grant stop being honored once its window closes.
+
+**Cache correctness, corrected (Gate-2 governance finding):** this decision's first draft claimed
+a validity window is already covered by "the existing invalidation rule this codebase has
+already stated twice (ADR-0033 §3; ADR-0017 INV-8): no such cache may key on an input unless
+every path that shrinks that input invalidates it. This decision does not introduce a new
+invalidation mechanism; it inherits the existing one." That claim is false assurance, not
+compliance: the codebase's actual invalidation rule (`RbacStore::perm_cache_`, keyed off a
+durable `write_generation` counter bumped only *inside a mutation transaction*) invalidates on
+writes. A validity window's expiry is not a write -- nothing bumps the generation when
+`valid_until` merely elapses, so a decision cached before expiry can keep answering "allow"
+after expiry until some unrelated mutation happens to invalidate the cache, which could be an
+arbitrarily long time. The ADR-0033 §3 / ADR-0017 INV-8 rule is real and still applies to every
+input it already covers (mutations); it simply does not, on its own, cover a purely time-driven
+shrink, and this document was wrong to imply otherwise. This decision therefore DOES introduce
+one new requirement beyond the inherited rule: any cache serving a validity-window-bearing
+decision must either bound its entry's lifetime to `valid_until` (never cache past the window's
+own expiry) or re-read `now()` against the stored window on every hit rather than trusting a
+cached "allow" unconditionally. Whichever of the two an implementation picks, it is new
+construction this decision adds, not something the existing mutation-triggered rule already
+provides for free.
 
 *Not yet built* (not a defect -- this capability has never existed): only JIT-to-admin exists;
 no assignment record carries a validity window. Access-review's `flagged_revoke` intentionally
@@ -1096,14 +1145,59 @@ ordinary review" rule going forward.
     Governance section above. D1-D5, D7-D11 held with no changes needed. Verdict: not ready
     without this round's fixes; ready once they land, which they now have.
 
-Before this is proposed as a real, numbered ADR (Dave's `1xxx` block per the numbering note in
-`docs/adr/README.md`): a `security-guardian` + `architect` review given the subject matter, and
-the standard governance pipeline once an implementation PR ladder is opened against it -- the same
-gates every accepted architecture decision in this codebase goes through, not a heightened bar
-specific to this document. D6's implementers should read ADR-0032 Decision 7's text directly
-before building the Guardian mechanism, the same way any implementer reads the ADR they are
-building a novel extension of, but that is ordinary diligence, not a precondition on the decision
-itself. Given how much of D6's mechanics were still wrong through six rounds of review, whoever
-picks up its implementation should re-verify sub-clauses 3 and 4 against the code one more time
-before writing to them, rather than trusting this document's citations as a substitute for that
-read.
+13. **Fold `/governance` Gates 2-3 (2026-09-02).** Committed as `ADR-1008` (Dave's `1xxx` block
+    per `docs/adr/README.md`; the number reserved above, "0066," was itself wrong -- 0xxx is the
+    platform block, not Dave's -- caught before this round's agents ran) and run through the real
+    pipeline for the first time: `security-guardian` + `docs-writer` (Gate 2), `architect`
+    (Gate 3, triggered as normative cross-cutting architecture text extending the ADR-0031/32/33
+    decomposition). One BLOCKING finding, from `security-guardian`: **D10's original text claimed
+    a validity-window cache was already covered by the existing mutation-triggered invalidation
+    rule (ADR-0033 §3 / ADR-0017 INV-8) and cited "the D3 chokepoint" as the enforcement seam --
+    both wrong.** D3 is a write-only chokepoint by its own heading; the actual read seam is
+    `check_permission`/`visible_agents_for_permission` (D8's future decision core). And the
+    inherited rule invalidates on mutations, not on a validity window's wall-clock expiry --
+    nothing bumps `RbacStore`'s durable generation when `valid_until` merely elapses, so a cached
+    "allow" could survive expiry until an unrelated mutation happened to invalidate it. This was
+    false assurance in the ADR text (a future implementer following D10 literally would ship a
+    cache that never actually expires a grant), not a defect in shipped code -- D10 is fixed
+    to name the correct seam and to require the cache either bound its lifetime to `valid_until`
+    or re-check `now()` on every hit, as a new requirement this decision adds rather than one it
+    could claim to inherit for free. Verified directly against `rbac_store.hpp`/`.cpp`'s actual
+    `perm_cache_`/`write_generation` mechanism before accepting the finding. Two MEDIUM findings,
+    both fixed: D2's "same transaction" spans two stores (`RbacStore`, `AuthDB`) with no existing
+    joint-transaction primitive between them, now named explicitly as something D2 must build,
+    not assume; D6 sub-clause 3's periodic re-evaluation sweep had no stated bound, now required
+    to state an explicit tick/grace/floor the way `PolicyEvaluator` already does. Remaining
+    findings were citation-location errors, all fixed: D5 miscited ADR-0033 §2 (capability
+    declarations) for its fan-out-dispatch intersection when the actual anchor is §1's narrowing
+    law; D6 sub-clause 4 misdescribed where ADR-0033 §7's "scheduled or background run" phrase
+    sits (inside its four-eyes table, not separately from it) and missed that §7 opens with a
+    caution against reusing it outside four-eyes; D6 sub-clause 5 repeated a resolve_caller/
+    arming_check counter conflation this document had already once corrected elsewhere (Governance
+    entry 10) -- a second instance of the same attribution error surviving a first fix, worth
+    naming plainly rather than smoothing over. `docs-writer` found the frontmatter `status:` field
+    carrying explanatory prose that belongs in `deciders:`/the body (fixed), a false claim that a
+    since-removed "D12" heading still exists (fixed), and an opening paragraph under "## Decision"
+    that led with draft-history trivia before D1 (trimmed). Both `docs-writer` and `architect`
+    independently flagged the same pre-existing repo-wide `ADR-0031` number collision (two
+    accepted ADRs share it); this document's own bare citations are now disambiguated, though the
+    collision itself is out of this document's scope to fix. `architect` separately noted that the
+    prior round's "D1-D5, D7-D11 held with no changes needed" claim (entry 12, immediately above)
+    was itself not quite true -- the D5 miscitation this round fixed had already survived that
+    claim once -- recorded here rather than edited into the historical entry, since the entry
+    accurately reports what that round believed at the time. `compliance-officer`/`sre`/
+    `enterprise-readiness` (Gate 6) and the happy-path/unhappy-path/consistency-auditor triad
+    (Gate 4) are outstanding as of this entry. Verdict: not ready without this round's fixes;
+    re-verify once the remaining gates complete.
+
+Gate 2 (`security-guardian` + `docs-writer`) and Gate 3 (`architect`) have now run against this
+document as ADR-1008, per entry 13 above. Remaining before acceptance: Gate 4
+(happy-path/unhappy-path/consistency-auditor), Gate 6 (compliance-officer/sre/enterprise-
+readiness), and Dave's final sign-off -- the same gates every accepted architecture decision in
+this codebase goes through, not a heightened bar specific to this document. D6's implementers
+should still read ADR-0032 Decision 7's text directly before building the Guardian mechanism, the
+same way any implementer reads the ADR they are building a novel extension of, but that is
+ordinary diligence, not a precondition on the decision itself. Given how much of D6's mechanics
+were still wrong through six rounds of review plus this governance round, whoever picks up its
+implementation should re-verify sub-clauses 3 and 4 against the code one more time before writing
+to them, rather than trusting this document's citations as a substitute for that read.
