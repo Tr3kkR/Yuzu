@@ -179,7 +179,7 @@ json file_hash_equals_params() {
           {"description", "Hashing-DoS cap (bytes). A file larger than this reports <oversize> "
                           "rather than being hashed. A non-negative-integer value above the "
                           "maximum, in either JSON form, is rejected at authoring time; a "
-                          "non-integer numeric value (a float, a negative number) is rejected as "
+                          "other numeric value (a float, or a negative number) is rejected as "
                           "malformed, the same as an unparseable string. A rule already stored "
                           "above the ceiling before this check existed is not retroactively "
                           "rejected - the agent silently clamps to the ceiling on arm, with a "

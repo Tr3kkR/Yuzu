@@ -424,6 +424,18 @@ TEST_CASE("#2233 item 6 / Gate 8: a JSON float or negative max_bytes is rejected
     auto neg_res = derive_rule_spec(neg, "fh", 1, true, "audit");
     REQUIRE(neg_res.error.has_value());
     CHECK(neg_res.error->message.find("positive integer") != std::string::npos);
+
+    // A literal that overflows uint64_t: nlohmann parses this as number_float (no
+    // C++ literal can construct it directly - std::numeric_limits<uint64_t>::max()
+    // is 18446744073709551615, one less), so it hits the same !is_number_unsigned()
+    // shape reject as the float/negative cases above, not the ceiling check.
+    json overflow = json::parse(R"({"assertion":{"params":{"max_bytes":18446744073709551616}}})");
+    json over_body = file_hash_rule_body(nullptr);
+    over_body["assertion"]["params"]["max_bytes"] = overflow["assertion"]["params"]["max_bytes"];
+    REQUIRE(over_body["assertion"]["params"]["max_bytes"].is_number_float());
+    auto over_res = derive_rule_spec(over_body, "fh", 1, true, "audit");
+    REQUIRE(over_res.error.has_value());
+    CHECK(over_res.error->message.find("positive integer") != std::string::npos);
 }
 
 TEST_CASE("PR5: service-running/stopped with a valid service_name authors a structured spec",
