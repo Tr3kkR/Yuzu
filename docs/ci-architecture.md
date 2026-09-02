@@ -156,16 +156,23 @@ the corpus and publishes the coverage report the PR job uses for
 affected-target pruning. State is GHA artifacts on 90-day retention and
 self-heals: if it expires or a download fails, PR runs degrade OPEN to
 seed corpora + keep-all pruning (slower, never a false green skip on that
-fully-expired path; short of expiry, though, a stale-but-unexpired coverage
-report can still prune an affected target — a tracked follow-up), and the
-next batch run regrows it.
+fully-expired path). Short of expiry, `cflite-pr.yml`'s "Check
+coverage-artifact age" step (#3770) guards the remaining gap — a
+stale-but-unexpired `cifuzz-coverage-latest` older than 30 days (3x the
+~10-day measured refresh cadence) is treated as untrustworthy and the job
+forces `keep-unaffected-fuzz-targets: true` instead of letting build_fuzzers
+prune against it, logging which branch it took as a `::notice::`. A
+fresh-timestamp, stale-content artifact (e.g. from a main-ref dispatch)
+would still slip this age check, but `cflite-batch.yml`'s dev ref-guards
+close the known producer of that case. The next healthy batch run regrows
+both the corpus and a fresh coverage report.
 Expiry-by-inactivity files no issue — only a RED run alerts, so a long
 quiet period degrades silently. `prune` is dispatch-only — it replaces the
 corpus wholesale, so it never runs unattended. A red batch run auto-files
 a `cflite-batch-broken` issue (the `nightly-broken` pattern, minus the
 merge discipline — it is a repair prompt, not a gate); while it is open,
-coverage staleness silently degrades PR-time pruning, so treat it as
-same-week work.
+coverage staleness silently degrades PR-time pruning **within** the 30-day
+window the age gate above doesn't cover, so treat it as same-week work.
 
 ### Capability matrix drift gate (`check-capability-matrix.sh`, #2204)
 

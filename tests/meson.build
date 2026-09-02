@@ -973,6 +973,14 @@ if build_server
       'unit/server/test_security_headers.cpp',
       'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
       'unit/server/test_principal_quota.cpp', # PR 4.4 per-principal quota cap primitive
+      'unit/server/test_ota_transfer_watchdog.cpp', # OTA transfer deadline watchdog (#911 UP-101)
+      'unit/server/test_ota_download_bound.cpp', # OTA admission + identity gates over real gRPC (#913/#416)
+      'unit/server/test_ota_transfer_rules.cpp', # OTA chunk-write outcome decision (#911/#934/#941)
+      'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
+      'unit/server/test_ota_audit_key.cpp', # OTA identity-deny audit bucket key (#416/#913)
+      'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
+      'unit/server/test_ota_stalled_write.cpp', # TryCancel unblocks a stalled sync Write (#911 UP-101)
+      'unit/server/test_server_ota_options.cpp', # OTA CLI/env contract + gRPC bound derivation (#913/#911)
       'unit/server/test_principal_quota_denial.cpp', # PR 4.4 dual-transport classifier lock (#2291)
       'unit/server/test_principal_quota_chokepoint.cpp', # PR 4.4 chokepoint wiring coverage
       'unit/server/test_grpc_on_behalf_enforce.cpp', # ADR-1005 PR 1.1 gRPC end-to-end enforcement
@@ -1110,7 +1118,9 @@ if build_server
     # catch2_nomain_dep (#1648/#3507): yuzu_server_tests supplies its own
     # main() via unit/test_runner_main.cpp (shared with yuzu_agent_tests), so
     # it links Catch2 without Catch2Main.
-    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, dependency('openssl', required: true, include_type: 'system')],
+    # cli11_dep: test_server_ota_options.cpp parses real CLI::App argv in-process
+    # to pin the OTA flag/env contract (header-only, no link cost).
+    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system')],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
   # promised): test() entries over the SAME binary, partitioned by Catch2

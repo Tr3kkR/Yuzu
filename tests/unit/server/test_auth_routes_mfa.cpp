@@ -821,6 +821,38 @@ TEST_CASE("POST /login/mfa/enroll completes enforced enrollment: 200 + cookie + 
     CHECK(status->enrolled);
 }
 
+TEST_CASE("POST /login/mfa/enroll for an already-enrolled account audits mfa.enroll.race, "
+          "not a rejected code (#3777)",
+          "[pg][mfa][enroll][routes][auth_routes]") {
+    // A concurrent verify can enrol the account between this pending token's
+    // mint and its verify — mfa_verify_enrollment then returns
+    // MfaAlreadyEnrolled. That benign race must be audited distinctly
+    // (CC7.2), never as a rejected code or a store outage, and must not mint a
+    // session. Simulate the concurrent winner by enrolling alice out-of-band.
+    AuthRoutesHarness h;
+    h.cfg.mfa_enforcement = "required";
+    auto step1 =
+        h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
+                    "application/x-www-form-urlencoded");
+    REQUIRE(step1->status == 202);
+    auto body = nlohmann::json::parse(step1->body);
+    std::string pending = body.at("mfa_pending_token");
+    std::string secret = body.at("secret_base32");
+
+    h.enroll_mfa("alice"); // the concurrent winner enrols the account
+
+    auto step2 = h.sink.Post("/login/mfa/enroll",
+                             form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 0)}}),
+                             "application/x-www-form-urlencoded");
+    REQUIRE(step2);
+    CHECK(step2->status == 409); // distinct benign outcome — not 401 "wrong code", not 503
+    CHECK(step2->body.find("already enrolled") != std::string::npos);
+    CHECK(step2->get_header_value("Set-Cookie").empty()); // no session minted
+    // Audited as a race, NOT mislabelled as a rejected-code attempt or an outage.
+    CHECK(h.count_audits("mfa.enroll.race", "alice") >= 1);
+    CHECK(h.count_audits("mfa.enroll.failed", "alice") == 0);
+}
+
 TEST_CASE("POST /login under mfa_enforcement=admin-only: admin enrolls, regular user logs in "
           "normally",
           "[pg][mfa][enroll][routes][auth_routes]") {

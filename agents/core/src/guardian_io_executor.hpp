@@ -195,15 +195,21 @@ template <class Fn>
 
 class GuardianIoExecutor {
 public:
-    /// Process-wide ceiling on concurrent bounded-I/O workers, and the compile-time
-    /// tripwire for the per-class quotas. The process bound is DERIVED as the sum of
-    /// the class quotas (see the ctor), which makes the per-class bulkheads EXACT: a
-    /// class cap always binds before the process bound can, so no class is ever starved
-    /// by another saturating a different lane (ADR-0021 rung 9a, R3 - this replaces the
-    /// prior independent `total_quota{8} < sum(10)`, which let File+Registry starve
-    /// Service to 1 of its 3 slots with nothing wedged). A new IoClass or a raised
-    /// default that pushes the sum past this ceiling fails the static_assert below:
-    /// raise the ceiling deliberately, or shrink a class - never silently oversubscribe.
+    /// Ceiling on concurrent bounded-I/O workers PER EXECUTOR INSTANCE (renamed in
+    /// spirit but not in name - sre Gate 6, #2233 item 3: this was a genuine
+    /// process-wide ceiling until that PR added a second, deliberately-independent
+    /// GuardianIoExecutor instance for Guardian spark arm/disarm alongside
+    /// GuardianStateReader's own state-read instance - real process-wide worst case
+    /// is now the SUM across every live instance, not this constant alone), and the
+    /// compile-time tripwire for the per-class quotas. The bound is DERIVED as the
+    /// sum of the class quotas (see the ctor), which makes the per-class bulkheads
+    /// EXACT within one instance: a class cap always binds before the instance
+    /// bound can, so no class is ever starved by another saturating a different
+    /// lane (ADR-0021 rung 9a, R3 - this replaces the prior independent
+    /// `total_quota{8} < sum(10)`, which let File+Registry starve Service to 1 of
+    /// its 3 slots with nothing wedged). A new IoClass or a raised default that
+    /// pushes the sum past this ceiling fails the static_assert below: raise the
+    /// ceiling deliberately, or shrink a class - never silently oversubscribe.
     static constexpr int kMaxProcessIoWorkers = 10;
 
     struct Config {
