@@ -221,8 +221,12 @@ never had real legacy data to protect.
 `sqlite_column_exists`, `LegacyPackRow`, `LegacyItemRow`, `sha256_hex`, `append_field`,
 `canonicalize_legacy`, `safe`) are removed (`chore/retire-migrate-from-sqlite-batch-b`,
 tracking issue #3623). `sqlite_backfill_source` — whose entire purpose was the backfill
-idempotency marker — is dropped via a version-bumped `{2, "DROP TABLE IF EXISTS
-sqlite_backfill_source;"}` migration, not edited into v1: this store IS constructed in
+idempotency marker — is dropped via a version-bumped `{3, "DROP TABLE IF EXISTS
+sqlite_backfill_source;"}` migration, appended after the already-shipped `{2, ...}`
+idempotency-key `ALTER TABLE` rather than reusing its slot — an earlier revision of this
+removal renumbered v2 to v3 instead of appending, which would have re-applied the ALTER
+on any database already at v2 and failed the store closed on boot (caught in adversarial
+review, fixed before merge). Not edited into v1: this store IS constructed in
 production, so v1 has actually run against real dev/UAT databases. `server.cpp`'s boot
 path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over `product_packs`/
 `product_pack_items` instead — silent unless real rows are found, never blocks boot.

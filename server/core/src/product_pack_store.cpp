@@ -213,19 +213,23 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE TABLE deleted_pack_ids ("
          "  pack_id    TEXT PRIMARY KEY,"
          "  deleted_at BIGINT NOT NULL);"},
-        // migrate_from_sqlite() retired (ADR-0009 fresh-start-by-default, #3623) —
-        // sqlite_backfill_source's sole purpose was the backfill idempotency marker,
-        // which no longer has a writer. Version-bumped (not edited into v1) because
-        // v1 has actually run against real dev/UAT databases — see ADR-0054's Update.
-        {2, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
         // F033/#3481: optional client-supplied Idempotency-Key dedup. NULL for every install that
         // doesn't supply one — a plain (non-partial) unique index would work identically here
         // (Postgres already treats every NULL as distinct in a unique index), but the partial
         // form skips indexing the common keyless case.
-        {3,
+        {2,
          "ALTER TABLE product_packs ADD COLUMN idempotency_key TEXT;"
          "CREATE UNIQUE INDEX idx_product_packs_idempotency_key ON product_packs(idempotency_key) "
          "WHERE idempotency_key IS NOT NULL;"},
+        // migrate_from_sqlite() retired (ADR-0009 fresh-start-by-default, #3623) —
+        // sqlite_backfill_source's sole purpose was the backfill idempotency marker,
+        // which no longer has a writer. Appended at the next free version (3) rather
+        // than reusing v2 — v2 (the idempotency-key ALTER above) has actually run
+        // against real dev/UAT databases, and PgMigrationRunner tracks a bare version
+        // integer with no content check, so renumbering an already-shipped migration
+        // makes any database already at v2 re-apply it and fail closed on boot. See
+        // ADR-0054's Update.
+        {3, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
     };
     return kMigrations;
 }
