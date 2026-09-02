@@ -12,8 +12,7 @@
  * suite (ADR-0009) was removed as part of a fresh-start-by-default policy
  * change (ADR-0009 amendment, 2026-08-25) -- no production fleet has ever
  * run a pre-Postgres build. CustomPropertiesStore::migrate_from_sqlite()
- * itself is UNCHANGED and still present (its removal is a separate, later
- * step).
+ * itself was retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  */
 
 #include <catch2/catch_test_macros.hpp>

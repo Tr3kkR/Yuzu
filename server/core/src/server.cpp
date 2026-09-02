@@ -6122,11 +6122,13 @@ public:
         // `custom_properties_store`) — construction fail-CLOSED per ADR-0012
         // §1 (same template as ManagementGroupStore above): a reachable
         // database whose schema can't migrate/open is a fatal startup error,
-        // never a serve-degraded asset-tagging substrate. `migrate_from_sqlite`
-        // runs the one-time, idempotent legacy-`custom-properties.db` backfill
-        // (ADR-0009) — AUTHORITATIVE operator-authored data means a backfill
-        // failure is ALSO fatal (never serve on top of partially-migrated
-        // custom properties/schemas).
+        // never a serve-degraded asset-tagging substrate. NO backfill
+        // (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the
+        // legacy custom-properties.db is never copied; the detect-and-warn
+        // obligation still applies (this store holds real operator-authored
+        // data), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             custom_properties_store_ = std::make_unique<CustomPropertiesStore>(*pg_pool_);
             if (!custom_properties_store_->is_open()) {
@@ -6136,17 +6138,9 @@ public:
                 startup_failed_ = true;
             } else {
                 custom_properties_store_->set_metrics(&metrics_);
-                auto props_db = cfg_.db_dir() / "custom-properties.db";
-                if (!custom_properties_store_->migrate_from_sqlite(props_db)) {
-                    spdlog::error("[PG] Refusing to start: custom-properties legacy-SQLite "
-                                  "backfill failed (see prior log lines) — custom_properties_store "
-                                  "is the AUTHORITATIVE asset-tagging substrate and must not serve "
-                                  "partially-migrated data. Operator remediation: repair {} or move "
-                                  "it aside to skip the backfill (custom properties/schemas in it "
-                                  "will NOT carry over)",
-                                  props_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "custom-properties.db", "CustomPropertiesStore",
+                    {"custom_properties", "custom_property_schemas"});
             }
         }
 

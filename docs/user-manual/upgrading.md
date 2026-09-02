@@ -1879,7 +1879,7 @@ records the one-time backfill outcome (`completed` / `fresh` / `failed`).
 and dynamic-group scope expressions are unchanged — only the storage substrate
 and the fail-closed read posture change.
 
-## Custom properties migrate to Postgres (mandatory backfill, ADR-0045)
+## Custom properties migrate to Postgres (ADR-0045)
 
 The `CustomPropertiesStore` — operator-authored per-agent metadata (properties
 and their optional type/validation schemas) used in scope expressions via
@@ -1888,48 +1888,26 @@ server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
 `custom_properties_store`. It reuses the existing shared connection pool —
 **no new connection flag or config is required**.
 
-**This is NOT a fresh-start cutover.** Custom properties and their schemas are
-irreducible operator-authored asset-tagging data — losing them would silently
-break any `props.<key>`-scoped dispatch, policy, or push rule. The migration
-performs a **mandatory one-time backfill** on first Postgres boot:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `custom-properties.db` data to carry over — the
+one-time mandatory backfill this section originally described was retired under
+ADR-0009's fresh-start-by-default amendment (see ADR-0045's Update).
 
-- **What is preserved:** every property (agent, key, value, type) and every
-  property schema (key, display name, type, description, validation regex)
-  carry over exactly.
-- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
-  Postgres write error, an unreadable legacy DB, or a holder-side
-  fingerprint-verification refusal (see below) — the server **refuses to
-  boot** rather than come up with partial data. The backfill marker is only
-  stamped on success, so a failed attempt is **retried on the next start**
-  once you have fixed the underlying cause.
-- **Legacy file moved aside after a verified backfill.** Once the backfill is
-  confirmed complete, `custom-properties.db` is renamed to
-  `custom-properties.db.migrated-<epoch>` (the server never reads it again).
-  If you do not see this file appear, the backfill did not run to completion.
-  Keep the renamed file until you have confirmed properties/schemas look
-  correct, then treat it as an operator-managed backup and dispose of it per
-  your data-retention policy.
-- **Multi-replica deployments: boot the replica holding the authoritative
-  `custom-properties.db` FIRST.** Unlike this store's SQLite era, a
-  multi-replica Postgres deployment shares ONE `custom_properties_store`
-  schema — the first replica to complete the backfill wins, and every other
-  replica's boot verifies its own local legacy file against what actually
-  landed rather than trusting the shared completion marker blindly. If two
-  replicas hold genuinely different legacy content (an unusual topology for
-  this store — `custom-properties.db` is ordinarily a single server's local
-  file, not something expected to diverge across replicas of the same
-  logical deployment), the second replica to boot refuses with a
-  **HOLDER-SIDE VERIFICATION FAILED** error rather than silently accepting
-  or silently overwriting the winner's data — see
-  `docs/ops-runbooks/custom-properties-store-backfill-recovery.md` for the
-  recovery procedure.
-- **Budget for a longer first boot.** First boot takes longer than usual while
-  the backfill runs; a large `custom-properties.db` (many agents/properties)
-  extends this further. **Widen your own orchestrator's startup budget
-  accordingly** (Kubernetes `startupProbe` failure/period budget, or the
-  Docker Compose healthcheck `start_period`) so it does not kill the server
-  mid-backfill and restart it into the same long boot repeatedly — do not
-  treat a slower-than-normal first boot as a hang.
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `custom-properties.db` file with real content **does NOT** fail startup
+  and its content is **never imported** — the server opens it read-only, purely to
+  count rows across `custom_properties`/`custom_property_schemas` for a diagnostic
+  warning, then boots fresh-started regardless of what it finds. If either table has
+  rows, it logs a `CustomPropertiesStore` legacy-row-count warning at WARN; boot
+  proceeds unaffected either way. If you see this warning and the environment
+  genuinely has real properties/schemas to keep, there is no automated recovery
+  path: re-author the equivalent properties/schemas against the new Postgres-backed
+  store via `PUT /api/agents/:id/properties/:key` / `POST /api/property-schemas`
+  before relying on it.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Operator-visible behaviour change (fail-closed reads).** After cutover, a
 `props.<key>`-feeding read that degrades (store not open, pool-acquire
@@ -1943,8 +1921,6 @@ than an empty list. Watch the new
 non-zero rate means `props.<key>`-scoped rules may be silently matching
 nobody, not that operators removed the properties (see `docs/user-manual/
 metrics.md` and the shipped `YuzuCustomPropertiesReadDegraded` alert).
-`yuzu_server_custom_properties_backfill_total{result}` records the one-time
-backfill outcome.
 
 **Operator-visible behaviour change (fail-closed writes, 2026-08-14 follow-up).**
 `PUT /api/agents/:id/properties/:key` and `POST /api/property-schemas` now return

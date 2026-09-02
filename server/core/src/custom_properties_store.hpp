@@ -50,23 +50,15 @@
 /// — pooled connections carry no per-store `search_path`. Mutate-and-return
 /// uses `RETURNING` (the #1033-banning idiom), never `sqlite3_changes()`.
 ///
-/// **Backfill (ADR-0009): mandatory, one-time, idempotent, fail-closed.**
-/// `migrate_from_sqlite()` follows the `RbacStore` post-#2703 reference shape
-/// (`docs/postgres-store-playbook.md` "Local source absence never creates
-/// terminal migration state on its own") unmodified: a SHA-256 content
-/// fingerprint of the legacy `custom-properties.db` is stamped alongside the
-/// completion marker in the SAME transaction via a monotonic-promotion
-/// upsert (never a plain `ON CONFLICT DO NOTHING`, which cannot distinguish
-/// two racing replicas with identical legacy content from two with
-/// DIFFERENT real content), so a later boot that still holds a local legacy
-/// file verifies the marker was actually derived from THIS file's content
-/// before trusting it (never a bare "marker present -> skip").
+/// `migrate_from_sqlite()` retired (chore/retire-migrate-from-sqlite-batch-b,
+/// #3623): no production fleet ever ran a pre-Postgres build of this store —
+/// see ADR-0045's Update. `server.cpp` now runs a detect-and-warn probe over
+/// the legacy file instead.
 
 #include <libpq-fe.h> // PGconn — private_ methods below take a live connection; see api_token_store.hpp's rationale for including directly rather than forward-declaring libpq's private `pg_conn` tag.
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -135,18 +127,11 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_custom_properties_backfill_total{result}`). Set ONCE
+    /// Wire a metrics registry for the read-degrade counter
+    /// (`yuzu_server_custom_properties_read_degrade_total{reason}`). Set ONCE
     /// during single-threaded startup, before serving begins; a null registry
     /// (the default, e.g. in unit tests) disables emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
-
-    /// One-time, idempotent legacy-SQLite backfill (ADR-0009), run at startup
-    /// before serving. Returns false (fail-closed — the server MUST refuse to
-    /// start) on any error, including a holder-side fingerprint-verification
-    /// failure. See the header comment above and the .cpp for the full
-    /// decision tree (mirrors `RbacStore::migrate_from_sqlite`, sized down).
-    bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Property CRUD ────────────────────────────────────────────────────
 

@@ -1477,7 +1477,11 @@ PostgreSQL store (authoritative posture).
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_custom_properties_read_degrade_total{reason}` | counter | A `props.<key>` scope-feeding read (the bulk `get_values_for_keys` preload `AgentRegistry::evaluate_scope` uses, or a direct property read) degraded instead of returning a result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). **A non-zero rate means a `props.<key>`-scoped dispatch/policy/push rule is aborting scope evaluation** — every caller collapses that abort to "zero targets matched," so this is NOT the same as "operators removed the properties." |
-| `yuzu_server_custom_properties_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres backfill at boot (ADR-0045). `result` ∈ `success` (legacy `custom-properties.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable legacy file, or a holder-side fingerprint-verification refusal on a multi-replica boot with divergent legacy content; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
+
+`yuzu_server_custom_properties_backfill_total{result}` (the one-time SQLite→Postgres backfill
+outcome) was retired along with `migrate_from_sqlite()` itself
+(chore/retire-migrate-from-sqlite-batch-b, #3623) — no production fleet ever ran a pre-Postgres
+build, so there was no real `custom-properties.db` data to migrate. See ADR-0045's Update.
 
 ## Notification store metrics (dashboard feed, ADR-0046)
 
@@ -1491,9 +1495,6 @@ PostgreSQL store (authoritative posture).
 # props.<key> scope reads degrading → scoped dispatch/policy/push rules may be
 # silently matching nobody. (Shipped as the YuzuCustomPropertiesReadDegraded alert.)
 sum(rate(yuzu_server_custom_properties_read_degrade_total[5m])) by (reason) > 0
-
-# One-time custom-properties backfill failed → server refused to boot (ADR-0045).
-sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 0
 
 # One-time notification backfill failed → server refused to boot (ADR-0046).
 sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
