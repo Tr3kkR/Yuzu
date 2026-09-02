@@ -54,7 +54,13 @@ fi
 # own environment (\getenv, psql 15+; this image ships 18) rather than -v,
 # so it is never in argv, which the HOST process table exposes even for
 # container processes (F7/#3859) — environ is owner-only, argv is not.
-psql -v ON_ERROR_STOP=1 \
+# -X/--no-psqlrc: \getenv keeps the password out of the ECHOED INPUT LINE,
+# but \gexec separately echoes the fully-substituted query text under an
+# active ECHO setting — so a .psqlrc under this role's $HOME (the same
+# /var/lib/postgresql this image tells operators to mount a volume at)
+# setting `\set ECHO all` would still print the password via \gexec's echo,
+# same disclosure class as the native script's -X fix (gov Gate 4, #3859).
+psql -X -v ON_ERROR_STOP=1 \
      -v yuzu_user="${YUZU_DB_USER}" \
      -v yuzu_db="${YUZU_DB_NAME}" \
      --username "${POSTGRES_USER}" --dbname postgres <<'EOSQL'

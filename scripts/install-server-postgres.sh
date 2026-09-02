@@ -151,6 +151,10 @@ if [[ "$role_exists" != "1" ]]; then
   # world-readable via /proc/<pid>/cmdline and ps for the psql child's
   # lifetime (F7/#3859). It never touches raw SQL — :'yuzu_pass' still goes
   # through psql's own SQL-literal quoting, same S2 property as above.
+  # \set rather than \getenv (the container init script's twin, gov Gate 4,
+  # #3859): \getenv is psql 15+ only, and this script's target is whatever
+  # psql ships with the host's local cluster — including distro-default
+  # psql 13/14 (RHEL9, older Ubuntu). Don't "simplify" this to \getenv.
   # -X/--no-psqlrc: the postgres OS user's ~/.psqlrc is untrusted input to
   # this script — an `ECHO all` setting there would otherwise echo the raw
   # \set line (password included) to stdout (gov Gate 2, #3859).
