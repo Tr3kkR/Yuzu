@@ -588,3 +588,15 @@ mgmt_posture_malformed_entries_tolerated_test() ->
     %% proto — the guard skips it (the tls-trap logger covers misconfig).
     ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture([not_a_map, []], [], false)),
     ?assertEqual(ok, yuzu_gw_app:evaluate_mgmt_posture(undefined, [], false)).
+
+mgmt_posture_proplist_transport_refused_test() ->
+    %% A PROPLIST transport_opts with {ssl,true} + full material is the
+    %% is_tls_trap shape: grpcbox only enables TLS on the MAP form, so this
+    %% listener serves plaintext TCP — the guard must refuse it, not read
+    %% the proplist as TLS.
+    S = (secure_mgmt())#{transport_opts := [{ssl, true}, {certfile, "c.pem"},
+                                            {keyfile, "k.pem"},
+                                            {cacertfile, "ca.pem"}]},
+    {error, {insecure_mgmt_listener, [{50063, Defects}]}} =
+        yuzu_gw_app:evaluate_mgmt_posture([S], pins(), false),
+    ?assert(lists:member(plaintext, Defects)).

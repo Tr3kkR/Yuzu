@@ -452,8 +452,11 @@ mgmt_defects(S, Pins) ->
                      undefined -> true;
                      F -> F
                  end,
+    %% grpcbox selects TLS only when transport_opts is a MAP with ssl => true —
+    %% a PROPLIST carrying {ssl, true} still serves plaintext TCP (the same
+    %% shape is_tls_trap/1 flags), so the guard must demand the map form.
     Checks =
-        [{plaintext, opt_value(ssl, T) =/= true},
+        [{plaintext, not (is_map(T) andalso maps:get(ssl, T, undefined) =:= true)},
          {missing_cert_material, not HasMaterial},
          {verify_not_peer, opt_value(ssl, T) =:= true andalso
                            Verify =/= verify_peer},
