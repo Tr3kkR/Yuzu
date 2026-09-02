@@ -339,6 +339,7 @@ DESCRIPTOR_TEST("antivirus", "antivirus", 3, "products", "status", "av_exclusion
 DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
 DESCRIPTOR_TEST("windows_updates", "windows_updates", 4, "installed", "missing", "pending_reboot", "patch_connectivity")
 DESCRIPTOR_TEST("sccm", "sccm", 2, "client_version", "site")
+DESCRIPTOR_TEST("filesystem_posture", "filesystem_posture", 3, "mounts", "quotas", "snapshots")
 
 // ============================================================================
 // Section 2: URL validation (mirrors http_client anonymous namespace)
