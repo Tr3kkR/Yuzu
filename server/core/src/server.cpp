@@ -2704,10 +2704,19 @@ public:
                           "counter");
         metrics_.counter("yuzu_exec_outbox_reap_clock_anomaly_total");
         metrics_.describe("yuzu_exec_outbox_store_degrade_total",
-                          "event_outbox reap passes that failed outright (pool/query degradation), "
-                          "distinct from a clock-anomaly decline",
+                          "event_outbox reap OR cross-replica poll passes that failed outright "
+                          "(pool/query degradation), distinct from a clock-anomaly decline",
                           "counter");
         metrics_.counter("yuzu_exec_outbox_store_degrade_total");
+        // HA WS-2a-2 (ADR-2002 §5): events re-published onto this replica's
+        // in-memory bus by the cross-replica delivery poll — i.e. events that
+        // ORIGINATED on another replica and were fanned out to this replica's
+        // live SSE subscribers. Zero on a single-replica deployment.
+        metrics_.describe("yuzu_exec_outbox_poll_published_total",
+                          "Durable event_outbox rows re-published cross-replica onto this "
+                          "replica's in-memory SSE bus by the WS-2a-2 delivery poll",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_poll_published_total");
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
@@ -19967,6 +19976,28 @@ private:
                                 // with nothing to grep for.
                                 spdlog::warn("event_outbox reap failed: {}",
                                              reaped.error());
+                                metrics_.counter("yuzu_exec_outbox_store_degrade_total")
+                                    .increment();
+                            }
+                        }
+
+                        // 2h) HA WS-2a-2 (ADR-2002 §5): cross-replica event
+                        // delivery. Runs EVERY tick (~2s) — NOT on the reap's
+                        // 60s cadence — so a live SSE subscriber on this replica
+                        // sees events that originated on OTHER replicas with
+                        // ~tick latency. (A LISTEN/NOTIFY hint to cut that to
+                        // near-zero is a deferred optimization; the durable
+                        // outbox + horizon poll is the correctness substrate.) A
+                        // degrade does NOT advance the in-memory horizon, so the
+                        // window is re-read next tick (a duplicate, never a gap).
+                        if (execution_tracker_ && execution_tracker_->is_open()) {
+                            if (auto published = execution_tracker_->poll_event_outbox_once()) {
+                                if (*published > 0)
+                                    metrics_.counter("yuzu_exec_outbox_poll_published_total")
+                                        .increment(static_cast<double>(*published));
+                            } else {
+                                spdlog::warn("event_outbox cross-replica poll failed: {}",
+                                             published.error());
                                 metrics_.counter("yuzu_exec_outbox_store_degrade_total")
                                     .increment();
                             }
