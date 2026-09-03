@@ -14,8 +14,11 @@
  * Two SDK surfaces are soft-guarded via `__has_include`, and neither guard's
  * failure is allowed to silently look like success:
  *   - `<dskquota.h>` (quota state); a build lacking it reports every volume
- *     `unavailable` and degrades the result. This one degrades GRACEFULLY:
- *     dskquota needs no dedicated import library.
+ *     `unavailable` and degrades the result. Unlike VSS this needs no
+ *     dedicated import library, so the fallback is genuinely REACHABLE -- but
+ *     it is still not a SUPPORTED configuration: the dispatcher suite asserts
+ *     that no leg ever reports its own guard excluded it, so such a build
+ *     fails its tests by design (Gate 4, consistency-auditor CA-4).
  *   - `<vsbackup.h>` (VSS shadow-copy enumeration); the guarded fallback emits
  *     an honest `none` row. **In practice that fallback is unreachable**, and
  *     saying otherwise would overstate it (governance Gate 3,
@@ -658,14 +661,26 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
         const HRESULT next_hr = snapshots->Next(1, &prop, &fetched);
 
         // `fetched`, NOT the HRESULT, decides whether the provider wrote
-        // anything into `prop`. A zero fetch (S_FALSE) is the normal end of
-        // the walk and leaves nothing to own; a genuinely FAILED result is a
-        // partial read and must not be allowed to read as "no more snapshots".
-        if (fetched != 1) {
+        // anything into `prop`. Three cases, and they are NOT interchangeable
+        // (Gate 4, unhappy-path UP-2 -- an earlier revision collapsed the
+        // second into the first, so an over-fetch reported a healthy EMPTY
+        // host on a machine that had snapshots, and leaked the block):
+        //
+        //   fetched == 0  -> normal end of the walk (S_FALSE). Nothing owned.
+        //   fetched  > 1  -> the enumerator ignored our celt of 1. We cannot
+        //                    own or free what we cannot address, so this is an
+        //                    enumeration FAILURE, never an end-of-walk.
+        //   fetched == 1  -> the contract we asked for; fall through and own.
+        if (fetched == 0) {
             if (FAILED(next_hr)) {
                 enum_failed = true;
                 enum_hr = next_hr;
             }
+            break;
+        }
+        if (fetched != 1) {
+            enum_failed = true;
+            enum_hr = SUCCEEDED(next_hr) ? E_UNEXPECTED : next_hr;
             break;
         }
 
@@ -764,11 +779,21 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
             mark_result_partial(ctx, "windows:vss", detail);
         return;
     }
-    // Gate 3 (cpp-safety F3): only claim an empty machine when the walk
-    // actually completed. A truncated walk that emitted nothing is not "no
-    // shadow copies present".
-    if (emitted == 0 && !truncated) {
-        write_snapshot_row(ctx, "-", "-", "none", "no shadow copies present on any volume");
+    // Only claim an empty machine when the walk was COMPLETE AND UNNARROWED.
+    // Gate 3 (cpp-safety F3) gated this on `truncated`; Gate 4
+    // (consistency-auditor CA-3) found the other two narrowing paths reach
+    // here too -- a failed SetContext enumerates a narrower context, and a
+    // skipped non-snapshot object means the walk did not see everything. Any
+    // of the three makes "no shadow copies present" a claim the code cannot
+    // support, so each gets its own honest sentinel instead.
+    if (emitted == 0) {
+        if (!truncated && !context_narrowed && !skipped_wrong_type) {
+            write_snapshot_row(ctx, "-", "-", "none", "no shadow copies present on any volume");
+        } else {
+            write_snapshot_row(ctx, "-", "-", "none",
+                               "no shadow copies observed, but the enumeration was incomplete "
+                               "-- see the degraded status for why");
+        }
     }
     // mark_result_partial ASSIGNS -- last writer wins for the reported
     // provenance -- so these run least-material first, leaving the most
@@ -822,6 +847,12 @@ int emit_mounts(yuzu::CommandContext& ctx) {
 }
 
 int emit_quotas(yuzu::CommandContext& ctx) {
+    // UP-4 (Gate 4): the per-volume quota work calls primary_mount_point and
+    // GetVolumeInformationW, which is exactly what this guard exists to make
+    // safe -- a not-ready removable or BitLocker-locked volume otherwise pops
+    // the session-0 hard-error dialog and blocks a dispatch worker. It was
+    // scoped to enumerate_volume_guid_paths and emit_mounts only.
+    ThreadErrorModeGuard err_guard{SEM_FAILCRITICALERRORS};
     bool enum_ok = false;
     DWORD enum_err = 0;
     // A mid-walk FindNextVolumeW failure still leaves `volumes` holding
@@ -851,6 +882,9 @@ int emit_quotas(yuzu::CommandContext& ctx) {
 }
 
 int emit_snapshots(yuzu::CommandContext& ctx) {
+    // UP-4: the VSS leg resolves each snapshot's originating volume through
+    // primary_mount_point, so it needs the same hard-error suppression.
+    ThreadErrorModeGuard err_guard{SEM_FAILCRITICALERRORS};
     // Deliberately does NOT enumerate volumes first, unlike emit_mounts and
     // emit_quotas. IVssBackupComponents::Query returns every shadow copy on
     // the machine in one call and each carries its own originating volume,

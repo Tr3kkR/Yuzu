@@ -55,6 +55,7 @@
 #include <limits>
 #include <mutex>
 #include <span>
+#include <string> // std::string -- denied_detail; previously transitive
 #include <vector>
 
 namespace yuzu::filesystem_posture {
@@ -170,6 +171,11 @@ int emit_quotas(yuzu::CommandContext& ctx) {
         return 0;
     }
 
+    // UP-3/CA-2: recorded in the loop, reported after it, so a denial cannot be
+    // overwritten by a later mount's generic degradation.
+    bool any_permission_denied = false;
+    std::string denied_detail;
+
     for (const struct statfs& s : snap.entries) {
         if (!is_quota_capable_fstype(s.f_fstypename)) {
             // Leg-level fstype decision, deliberately outside the classifier:
@@ -214,9 +220,20 @@ int emit_quotas(yuzu::CommandContext& ctx) {
         // distinguished a denial (EPERM/EACCES) from a generic unavailability,
         // so the reported STATUS distinguishes them too rather than collapsing
         // both to CONSTRAINED.
+        //
+        // UP-3/CA-2 (Gate 4, raised independently by unhappy-path and
+        // consistency-auditor): set_result_status ASSIGNS, so marking a denial
+        // HERE let a later mount's generic partial overwrite it and the leg
+        // discarded a cause it had already established. The denial is recorded
+        // and re-reported once after the walk, matching the end-of-run summary
+        // shape the Linux and Windows legs already use.
         if (state == QuotaState::PermissionDenied) {
-            mark_result_denied(ctx, "macos:getattrlist",
-                               std::string(s.f_mntonname) + ": " + std::strerror(err));
+            if (!any_permission_denied) {
+                any_permission_denied = true;
+                denied_detail = std::string(s.f_mntonname) + ": " + std::strerror(err);
+            }
+            mark_result_partial(ctx, "macos:getattrlist",
+                                std::string(s.f_mntonname) + ": " + std::strerror(err));
         } else if (state == QuotaState::Unavailable) {
             mark_result_partial(ctx, "macos:getattrlist",
                                 std::string(s.f_mntonname) + ": " + std::strerror(err));
@@ -231,6 +248,13 @@ int emit_quotas(yuzu::CommandContext& ctx) {
                             : std::nullopt,
                         kQuotaDetail);
     }
+
+    // Reported LAST so it survives set_result_status's last-writer-wins
+    // assignment. A mixed walk that saw a real denial reports the denial:
+    // that is the one cause an operator can act on.
+    if (any_permission_denied)
+        mark_result_denied(ctx, "macos:getattrlist", denied_detail);
+
     return 0;
 }
 
@@ -244,6 +268,9 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
     bool any_row = false;
     bool any_failure = false;
     bool any_success = false; // a probe that returned cleanly, names or not
+    // UP-3/CA-2: same deferral as emit_quotas above.
+    bool any_permission_denied = false;
+    std::string denied_detail;
 
     for (const struct statfs& s : snap.entries) {
         if (std::string_view(s.f_fstypename) != "apfs")
@@ -262,10 +289,13 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
             // exactly the over-attribution Gate 2 flagged elsewhere.
             const std::string detail =
                 std::string(s.f_mntonname) + ": " + std::strerror(open_err);
-            if (open_err == EACCES || open_err == EPERM)
-                mark_result_denied(ctx, "macos:fs_snapshot_list", detail);
-            else
-                mark_result_partial(ctx, "macos:fs_snapshot_list", detail);
+            if (open_err == EACCES || open_err == EPERM) {
+                if (!any_permission_denied) {
+                    any_permission_denied = true;
+                    denied_detail = detail;
+                }
+            }
+            mark_result_partial(ctx, "macos:fs_snapshot_list", detail);
             continue;
         }
 
@@ -343,6 +373,10 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
             write_snapshot_row(ctx, "-", "-", "none", "no APFS snapshots present");
         }
     }
+
+    // Reported LAST, for the same last-writer-wins reason as emit_quotas.
+    if (any_permission_denied)
+        mark_result_denied(ctx, "macos:fs_snapshot_list", denied_detail);
 
     return 0;
 }

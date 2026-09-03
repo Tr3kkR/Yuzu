@@ -54,7 +54,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "getmntinfo(3) MNT_NOWAIT", nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 1, "FindFirstVolumeW + GetVolumeInformationW + GetDiskFreeSpaceExW",
+        {YUZU_SUPPORT_CONSTRAINED, 1,
+         "FindFirstVolumeW + GetVolumeInformationW + GetDriveTypeW + GetDiskFreeSpaceExW",
          "enumerates local volumes only; a mapped network drive is not a volume and is not "
          "listed, and no per-mount option string exists so that column reads '-'"},
     },
@@ -64,16 +65,19 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 1, "quotactl(2) Q_GETFMT",
          "reports per-mount quota-subsystem state only; per-user and per-group limits are not "
          "enumerated, and a mount whose source is not a block device (overlay, tmpfs, network) "
-         "reports no_block_device"},
+         "reports no_block_device; a walk in which every probed device returns EPERM/EACCES "
+         "reports permission_denied rather than a generic degradation"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "getattrlist(2) ATTR_VOL_QUOTA_SIZE/ATTR_VOL_RESERVED_SIZE",
          "volume-level quota and reserved size only; per-user and per-group quotas do not exist "
          "on APFS (quotactl returns ENOTSUP on every APFS mount while succeeding on HFS+), so no "
-         "per-identity rows are reported"},
+         "per-identity rows are reported; a volume the agent may not read reports "
+         "permission_denied"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "IDiskQuotaControl (dskquota.h)",
          "volume quota state and default limit/threshold only, opened read-only; per-user quota "
-         "entries are not enumerated; a build whose SDK lacks dskquota.h reports unavailable; "
+         "entries are not enumerated; a volume that denies the query reports permission_denied; "
+         "a build whose SDK lacks dskquota.h reports unavailable; "
          "compiled and linked on a live Windows host but not asserted against one with quotas "
          "configured, so the populated-quota path is unexercised"},
     },

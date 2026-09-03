@@ -105,6 +105,16 @@ std::vector<std::string> split_row(const std::string& row) {
 }
 #endif // !_WIN32
 
+// UP-5 (Gate 4, unhappy-path): the "a degraded run must be explicable from its
+// own rows" invariants below were each gated on CONSTRAINED alone. This change
+// made PERMISSION_DENIED reachable from these very legs, so on exactly the
+// hosts where degradation happens — an unprivileged one — those invariants
+// silently asserted nothing. Both statuses are degradations and both must be
+// explicable.
+bool is_degraded(YuzuResultStatus s) {
+    return s == YUZU_RESULT_STATUS_CONSTRAINED || s == YUZU_RESULT_STATUS_PERMISSION_DENIED;
+}
+
 std::vector<std::string> captured_rows(const std::string& captured) {
     std::vector<std::string> out;
     std::istringstream ss(captured);
@@ -286,7 +296,7 @@ TEST_CASE("filesystem_posture plugin: mounts action shape", "[filesystem_posture
     // degradation model and asserting it on another), so it is scoped rather
     // than weakened for everyone.
 #ifndef _WIN32
-    if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
+    if (is_degraded(result.result_status)) {
         bool any_degraded_row = false;
         for (const auto& r : rows) {
             const auto f = split_row(r);
@@ -327,16 +337,19 @@ TEST_CASE("filesystem_posture plugin: quotas action shape", "[filesystem_posture
     }
 
     // CDX-P2-03: a degraded quota run must be explicable from its own rows.
-    // emit_quotas marks the result partial exactly when a probe returns
-    // permission_denied or unavailable, and both states are visible in the
-    // row's state column -- so CONSTRAINED with every row healthy means the
-    // status is lying.
+    // emit_quotas degrades exactly when a probe returns permission_denied or
+    // unavailable, and both states are visible in the row's state column -- so
+    // a degraded status with every row healthy means the status is lying.
+    // Since CP-1 a denial reports PERMISSION_DENIED rather than CONSTRAINED,
+    // which is why the guard below tests is_degraded() and not one status
+    // (Gate 4, consistency-auditor CA-5a: the narrower guard silently stopped
+    // covering the denial case it was written for).
     //
     // POSIX ONLY, for the same reason as the mounts invariant above: the
     // Windows leg marks partial on a volume-enumeration failure, which is not
     // visible in any row.
 #ifndef _WIN32
-    if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
+    if (is_degraded(result.result_status)) {
         bool any_degraded_row = false;
         for (const auto& r : rows) {
             const auto f = split_row(r);
@@ -403,7 +416,7 @@ TEST_CASE("filesystem_posture plugin: snapshots action shape",
     // nothing. Naming the scope keeps that honest instead of leaving it
     // looking like a cross-platform invariant.
 #ifdef __APPLE__
-    if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
+    if (is_degraded(result.result_status)) {
         bool any_unhealthy_row = false;
         for (const auto& r : rows) {
             const auto f = split_row(r);
