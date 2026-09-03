@@ -15243,7 +15243,15 @@ private:
             const auto containment_gate = make_containment_gate(plugin, action);
             // #3424/#3511: same lifecycle as containment_gate — one registry
             // read for the whole request, shared by every arm branch below.
-            const auto plugin_missing = registry_.ids_missing_plugin(plugin);
+            // BR-009: `classified->wire().plugin()`, NOT the raw `plugin`
+            // local — `classify()` is case-insensitive (command_capability.hpp)
+            // and `finalize_classified_command` builds the wire command from
+            // the catalogue-resolved spelling, so a caller who dispatches with
+            // valid-but-non-canonical casing (e.g. "TAR") must be checked
+            // against the SAME spelling every agent's self-reported inventory
+            // uses, or every agent that genuinely has the plugin is spuriously
+            // flagged absent (governance Gate 2 finding, self-review round).
+            const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
 
             int sent = 0;
             // #881: filled by whichever arm branch below actually ran, then
@@ -22942,8 +22950,9 @@ private:
         // check at all.
         const auto containment_gate = make_containment_gate(plugin, action);
         // #3424/#3511: same lifecycle as containment_gate — one registry read
-        // for this dispatch.
-        const auto plugin_missing = registry_.ids_missing_plugin(plugin);
+        // for this dispatch. BR-009: `classified->wire().plugin()`, not the
+        // raw `plugin` local — see the /api/command sibling site's comment.
+        const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
         auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
             /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing);
