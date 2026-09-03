@@ -23,12 +23,11 @@
  * case uses plain YUZU_REQUIRE_PG_DB, per the plain-migration-test carve-out
  * documented on that macro.
  *
- * No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
- * TEST_CASE suite was removed as part of a fresh-start-by-default policy
- * change (ADR-0009 amendment) -- no production fleet has ever run a
- * pre-Postgres build. QuarantineStore::migrate_from_sqlite() itself is
- * UNCHANGED and still present in production code; only this file's test
- * coverage of it was removed.
+ * No legacy-SQLite backfill test coverage: `QuarantineStore::migrate_from_sqlite()` itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0047 Update, 2026-09-03) -- no
+ * production fleet has ever run a pre-Postgres build, so the mandatory fingerprint-verified
+ * backfill never had real legacy data to protect. `server.cpp` now runs
+ * `legacy_sqlite_probe::warn_if_legacy_rows` over `quarantine_records` instead.
  */
 
 #include "quarantine_store.hpp"

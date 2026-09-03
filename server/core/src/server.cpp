@@ -5728,11 +5728,17 @@ public:
         // Postgres store (ADR-0006/ADR-0047, schema `quarantine_store`) —
         // construction fail-CLOSED per ADR-0012 §1: a reachable database
         // whose schema can't migrate/open is a fatal startup error, never a
-        // serve-degraded state. `migrate_from_sqlite` runs the one-time,
-        // idempotent legacy-`quarantine.db` backfill (ADR-0009) — an active
-        // quarantine record is live security containment state, so backfill
-        // is MANDATORY and a failure is ALSO fatal (never serve on top of
-        // partially-migrated quarantine data).
+        // serve-degraded state. NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment): the legacy quarantine.db is
+        // never copied; the detect-and-warn obligation still applies (an
+        // active quarantine record is live security containment state, not
+        // expendable telemetry), so legacy_sqlite_probe::warn_if_legacy_rows()
+        // opens the legacy file read-only and warns (with a row count) only
+        // if it actually holds rows. A real legacy quarantine record found
+        // this way means the server's view no longer reflects it — the
+        // device is NOT re-quarantined in Postgres, though agent-side
+        // firewall enforcement (§11.7, out of scope for this store) may
+        // still be in effect independently.
         if (pg_pool_ && !startup_failed_) {
             quarantine_store_ = std::make_unique<QuarantineStore>(*pg_pool_);
             if (!quarantine_store_->is_open()) {
@@ -5742,24 +5748,9 @@ public:
                 startup_failed_ = true;
             } else {
                 quarantine_store_->set_metrics(&metrics_);
-                auto quar_db = cfg_.db_dir() / "quarantine.db";
-                if (!quarantine_store_->migrate_from_sqlite(quar_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: quarantine legacy-SQLite backfill failed — "
-                        "quarantine_store is AUTHORITATIVE and must not serve partially-"
-                        "migrated data. Operator remediation depends on the SPECIFIC reason "
-                        "logged above, not on this line alone: if it names a corrupt/truncated/"
-                        "unreadable {} or a fingerprint refusal BEFORE any insert happened, "
-                        "nothing has been migrated yet and moving it aside safely skips the "
-                        "backfill (its quarantine history, including any ACTIVE record, will "
-                        "NOT carry over — verify no device should currently be quarantined "
-                        "before doing this). If it instead names a row-insert or completion-"
-                        "marker problem, this replica's rows may ALREADY be durably inserted "
-                        "in Postgres — do NOT move the file aside without first checking "
-                        "quarantine_store.quarantine_records for the affected agent_id(s).",
-                        quar_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "quarantine.db",
+                                                         "QuarantineStore",
+                                                         {"quarantine_records"});
             }
         }
         // Scope-walking result sets (capability §30). Migrated Postgres store
