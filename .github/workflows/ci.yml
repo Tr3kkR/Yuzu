@@ -84,9 +84,12 @@ concurrency:
   #
   # Canary-specific consequence (#3889): if the canary's vcpkg-canary cache
   # entry is ever evicted under pool pressure, the resulting cold rebuild
-  # (~65-70 min) only completes and re-saves on a push to dev/main — a PR
-  # cancelled mid-rebuild by its own next push repeats the cold rebuild on
-  # every subsequent push, never self-healing until dev/main lands one.
+  # (~65-70 min) needs to run to completion to save a fresh entry. On an
+  # actively-iterated PR, cancel-in-progress means each push cancels the
+  # prior run before it can finish and save — so that PR repeats the full
+  # cold rebuild on every push, never catching up, until either a push
+  # lands with no immediate follow-up or dev/main (which queues instead of
+  # cancelling) completes one and re-warms the shared scope.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
