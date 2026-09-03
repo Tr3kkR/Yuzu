@@ -8,10 +8,8 @@
 ##            GetDiskFreeSpaceExW (mounts); IDiskQuotaControl GetQuotaState /
 ##            GetDefaultQuotaLimit / GetDefaultQuotaThreshold, initialized
 ##            bReadWrite=FALSE
-##            (quotas — compile-verified only, not exercised against a live
-##            Windows host in this change), VSS shadow-copy enumeration
-##            (snapshots — compile-verified only, not exercised against a
-##            live Windows host in this change)
+##            (quotas), IVssBackupComponents::Query — VSS shadow-copy
+##            enumeration (snapshots; requires administrative rights)
 ##   Linux:   /proc/self/mountinfo (mounts), quotactl(Q_GETFMT) per
 ##            mounted filesystem (quotas), Btrfs/LVM snapshot metadata
 ##            (snapshots — capability, not inventory)
@@ -110,9 +108,9 @@ metadata:
     Reports volume-level disk quota state. This is volume-level quota only
     everywhere — no per-user or per-group breakdown is reported on any
     platform. On Windows reads IDiskQuotaControl GetQuotaState/GetDefaultQuotaLimit via
-    IDiskQuotaControl, initialized read-only (bReadWrite=FALSE); this leg
-    is compile-verified only — not exercised against a live Windows host
-    in this change. On Linux reads quotactl(Q_GETFMT) per mounted
+    IDiskQuotaControl, initialized read-only (bReadWrite=FALSE); it is
+    compiled and linked on Windows but has not been asserted against a
+    host with quotas configured. On Linux reads quotactl(Q_GETFMT) per mounted
     filesystem. On macOS the volume-level quota IS probed on APFS and HFS+ via
     getattrlist and reports none/configured (state=unsupported_fs is emitted only
     for a non-APFS/HFS mount): APFS has no per-user
@@ -182,8 +180,12 @@ metadata:
   version: 1.0.0
   description: >
     Enumerates filesystem snapshots. On Windows enumerates VSS shadow
-    copies; this leg is compile-verified only — not exercised against a
-    live Windows host in this change. On Linux reports Btrfs/LVM snapshot
+    copies via IVssBackupComponents::Query, one row per snapshot, whose
+    name column is the snapshot GUID and detail column the shadow-copy
+    device path. That leg REQUIRES ADMINISTRATIVE RIGHTS: the agent runs
+    as LocalSystem today so it succeeds, but under an unprivileged service
+    account it reports permission_denied rather than an empty set. On
+    Linux reports Btrfs/LVM snapshot
     CAPABILITY, not an inventory of existing snapshots: the columns
     describe what the mechanism supports on this host, not a live
     snapshot list. On macOS enumerates APFS snapshots; a snapshot shared
