@@ -1436,11 +1436,17 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // sent-label is written (item 7 PR-Ag). Live / compliance / health entries carry no
         // batch key → no-op.
         //
-        // Captures the journal HANDLE, not `this` (C0 #2298): the wrap runs on the drain-worker
-        // thread, and re-reading the lifecycle_journal_ member from there would be an unlocked
-        // read of engine state - and taking mtx_ to read it safely would deadlock against
-        // stop(), which joins this worker while holding mtx_. Resolved here, once, and held by
-        // shared_ptr so the wrap cannot outlive what it points at.
+        // Captures the journal HANDLE, not `this` (C0 #2298): re-reading the lifecycle_journal_
+        // member from wherever this wrap runs would be an unlocked read of engine state, and
+        // taking mtx_ to read it safely risks a deadlock on any thread stop() joins while
+        // holding mtx_. Resolved here, once, and held by shared_ptr so the wrap cannot outlive
+        // what it points at. (#2233 item 4, revised: this wrap - the `send` passed to
+        // GuardianOutboxDrainWorker - no longer necessarily runs ON the drain-worker thread at
+        // all; drain_bounded() routes it through GuardianOutboxSendExecutor's detached worker,
+        // guardian_outbox_send_executor.hpp. mark_batch_sent()'s kv_ write below is therefore a
+        // THIRD caller into KvStore alongside persist()/prune()/page_into_window() - safe only
+        // because KvStore serialises its single connection under its own mutex; see the CONCURRENCY
+        // paragraph in guardian_lifecycle_journal.hpp, which this caller does not appear in by name.)
         auto journal = lifecycle_journal_; // shared: the wrap keeps it alive on its own
         auto journaled_send = [journal, send = std::move(send)](const OutboxEntry& e) -> SendResult {
             const SendResult r = send(e);

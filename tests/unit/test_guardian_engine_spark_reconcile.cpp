@@ -1798,10 +1798,16 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
 
 TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins the drain worker",
           "[spark][guardian][reconcile][journal][chaos]") {
-    // stop() joins the drain worker, and that join is a blocking wait on a send that may be
-    // blackholed. A persist placed only AFTER the join never runs if a supervisor's stop
-    // timeout or an operator kill lands in that window, and the staged records are destroyed -
-    // real loss of an audit record, not the at-least-once redelivery the design guarantees.
+    // stop() joins the drain worker. Before #2233 item 4, that join was an unbounded blocking
+    // wait on whatever thread the injected send happened to be running on; since item 4
+    // (guardian_outbox_send_executor.hpp) the worker's own wait on a stalled send is bounded to
+    // kGuardianSendOfferWait, so the join this test parks against is now bounded too - but a
+    // bound is not zero, and a persist placed only AFTER the join still never runs if a
+    // supervisor's stop timeout or an operator kill lands in that (now much shorter) window,
+    // destroying the staged records - real loss of an audit record, not the at-least-once
+    // redelivery the design guarantees. The property under test - persist-before-join, not
+    // persist-only-after - is unchanged by item 4; only how long "still blocked" stays
+    // observable changed (bounded ~200ms now, not indefinite).
     //
     // The observable has to be taken WHILE the join is still blocked; asserting after stop()
     // returns cannot tell the two orderings apart, because the post-join flush persists the

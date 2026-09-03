@@ -32,13 +32,17 @@
  * SINGLE-FLIGHT BY CONSTRUCTION: exactly one send may be in flight at a time
  * (the underlying gRPC stream requires serialized Write() calls; concurrent
  * sends would also reorder delivery). offer() enforces this itself - it never
- * spawns a second worker while one is running. A caller MUST NOT poll a
- * DIFFERENT entry while a send is in flight for one it does not recognise;
- * offer() detects that (by `event_id`, the wire idempotency key already fixed
- * at enqueue - guardian_outbox.hpp) and treats it as Retain without touching
- * the stale in-flight worker, which is left to finish and publish into a
- * result nobody will ever read (safe: State outlives it via shared_ptr, same
- * as guardian_io_executor.hpp's orphan contract).
+ * spawns a second worker while one is running. When the caller offers a
+ * DIFFERENT entry than the one in flight (by `event_id`, the wire idempotency
+ * key already fixed at enqueue - guardian_outbox.hpp - a generation-supersede
+ * purge or a withdrawal moved the log's head while the old head's send was
+ * still running), offer() does NOT touch that orphaned worker - no second
+ * concurrent Write() on the same stream - but it MUST eventually reclaim the
+ * slot once the orphan finishes, discarding its now-unattributable result, or
+ * every later offer() call would find in_flight permanently true against an
+ * event_id that can never recur and never launch again (found in governance
+ * review of this file's first draft, independently by two reviewers; direct
+ * regression coverage: tests/unit/test_guardian_outbox_send_executor.cpp).
  *
  * ORPHAN-EXIT CONTRACT: reuses the exact hazard guardian_io_executor.hpp
  * documents - a worker wedged in a blocking syscall cannot be joined or
@@ -99,19 +103,36 @@ public:
         bool need_launch = false;
         {
             std::lock_guard<std::mutex> lk{state_->mu};
+            if (state_->in_flight && state_->in_flight_event_id != entry.event_id) {
+                // The head entry changed under us (generation-supersede purge or a
+                // withdrawal - both ORDINARY operations, not a rare race) while a
+                // send for the OLD head was still running. That worker is orphaned
+                // (still holds stream_write_mu_ until it finishes).
+                if (!state_->done) {
+                    // Still genuinely running. Cannot touch it and must not submit a
+                    // second concurrent Write() on the same stream - try again next
+                    // tick. Once it finishes, the branch below reclaims the slot; NOT
+                    // reclaiming here unconditionally (an earlier version of this
+                    // function never reclaimed at all) would otherwise wedge every
+                    // future send permanently, since `event_id` never repeats.
+                    return SendResult::Retain;
+                }
+                // The stale worker already finished. Its result (Sent/Retain, or a
+                // thrown exception now sitting in eptr) applies to an entry that no
+                // longer exists in the log - there is nothing correct to do with it
+                // except discard it; reporting it against THIS entry would
+                // misattribute a success/failure that never happened to it. Reclaim
+                // the slot and fall through to launch a fresh worker below.
+                state_->in_flight = false;
+                state_->done = false;
+                state_->eptr = nullptr;
+            }
             if (!state_->in_flight) {
                 if (state_->stopping)
                     return SendResult::Retain; // do not spawn new work once stopping
                 need_launch = true;
-            } else if (state_->in_flight_event_id != entry.event_id) {
-                // The head entry changed under us (generation-supersede purge) while
-                // a send for the OLD head was still running. That worker is now
-                // orphaned (still holds stream_write_mu_ until it finishes) - do not
-                // touch it and do not submit a second concurrent Write(). Its
-                // eventual result is read by nobody; State stays alive for it via
-                // shared_ptr.
-                return SendResult::Retain;
             }
+            // else: in_flight for THIS SAME entry - fall through to the wait below.
         }
         if (need_launch && !launch(entry, send))
             return SendResult::Retain; // launch failed (thread exhaustion); retry next tick
@@ -144,7 +165,12 @@ public:
     }
 
     /// For GuardianEngine::active_io_workers() (the orphan-exit contract's sole
-    /// source of truth) - 0 or 1, since this executor is single-flight.
+    /// source of truth) - normally 0 or 1 (this executor is single-flight in the
+    /// sense that at most one send is ever ADMITTED), but can transiently read 2:
+    /// offer() reclaiming a finished-but-orphaned worker (a stale event_id whose
+    /// AliveTicket has not yet reached its thread-exit decrement) can launch a new
+    /// one before the old ticket's count-1 has run. Harmless for the orphan-exit
+    /// contract itself, which only distinguishes zero from nonzero.
     [[nodiscard]] std::size_t active_worker_count() const {
         std::lock_guard<std::mutex> lk{state_->mu};
         return static_cast<std::size_t>(state_->worker_count);
@@ -190,49 +216,88 @@ private:
     /// and publishes the result; returns false only if the OS refused to create the
     /// thread (mirrors guardian_io_executor.hpp's LaunchFailed path).
     bool launch(const OutboxEntry& entry, const SendFn& send) {
-        // Constructed (and counted, via its self-locking ctor) BEFORE the launch
-        // attempt, inside a shared_ptr so a launch failure's synchronous destruction
-        // and a launched worker's eventual thread-exit destruction both go through
-        // the same self-locking decrement path.
-        auto ticket = std::make_shared<AliveTicket>(state_);
-        auto st = state_;
-        auto worker = [st, ticket, entry, send]() mutable noexcept {
-            SendResult r = SendResult::Retain;
-            std::exception_ptr eptr;
-            try {
-                r = send(entry);
-            } catch (...) {
-                // Preserve the throw for offer() to re-raise on the CALLER's thread -
-                // drain_log_unlocked's own catch is what counts send_exceptions_ and
-                // distinguishes a permanently-unsendable entry from an ordinary Retain
-                // (guardian_spark_runtime.cpp); swallowing it here would silently lose
-                // that signal. current_exception() is noexcept; the copy into `eptr`
-                // is not documented noexcept by the standard, so it gets its own
-                // firewall - a double-fault here degrades to an ordinary Retain rather
-                // than escaping this noexcept lambda and terminating the agent.
+        // Bookkeeping FIRST, under its own lock, BEFORE the worker is spawned - not
+        // after. A fast `send` can complete, lock state_->mu, and publish done=true
+        // before this function ever reaches a post-spawn lock acquisition (verified:
+        // reproduced ~1-in-1000 with a fast, always-succeeding send in a tight loop).
+        // Writing in_flight/in_flight_event_id/done=false only AFTER spawn_detached()
+        // returns would then let this write clobber the worker's already-published
+        // done=true back to false, and nothing ever sets it true again - the entry
+        // wedges permanently, silently, for the life of the process. in_flight/
+        // in_flight_event_id/done have exactly one writer (this function, called only
+        // from offer(), which has exactly one caller thread), so writing them before
+        // the worker can possibly touch `done` is race-free by construction.
+        {
+            std::lock_guard<std::mutex> lk{state_->mu};
+            state_->in_flight = true;
+            state_->in_flight_event_id = entry.event_id;
+            state_->done = false;
+        }
+        // Everything from here through spawn_detached() can throw std::bad_alloc:
+        // make_shared<AliveTicket>, copying `entry`/`send` into the worker lambda's
+        // captures, and spawn_detached's own payload allocation (guardian_io_executor.hpp's
+        // own doc). ALL of it is inside one try, and any failure - a thrown bad_alloc
+        // OR spawn_detached returning false for an OS-level refusal - takes the SAME
+        // rollback path below. An uncaught throw here would unwind past the bookkeeping
+        // written above with in_flight left true and no worker ever created to set
+        // done=true, wedging this entry exactly like the ordering bug this function's
+        // rewrite fixed (verified in review) - just triggered by allocation failure
+        // instead of a timing race. None of these failures are specific to `entry` (they
+        // are thread/memory exhaustion, not an unsendable payload), so all are mapped to
+        // a plain launch failure - the caller retries next tick - rather than let a
+        // bad_alloc escape into drain_log_unlocked's catch and be miscounted as a
+        // send_exceptions_ hit.
+        bool launched = false;
+        try {
+            // Constructed (and counted, via its self-locking ctor) BEFORE the launch
+            // attempt, inside a shared_ptr so a launch failure's synchronous destruction
+            // and a launched worker's eventual thread-exit destruction both go through
+            // the same self-locking decrement path.
+            auto ticket = std::make_shared<AliveTicket>(state_);
+            auto st = state_;
+            auto worker = [st, ticket, entry, send]() mutable noexcept {
+                SendResult r = SendResult::Retain;
+                std::exception_ptr eptr;
                 try {
-                    eptr = std::current_exception();
+                    r = send(entry);
                 } catch (...) {
-                    eptr = nullptr;
+                    // Preserve the throw for offer() to re-raise on the CALLER's thread -
+                    // drain_log_unlocked's own catch is what counts send_exceptions_ and
+                    // distinguishes a permanently-unsendable entry from an ordinary Retain
+                    // (guardian_spark_runtime.cpp); swallowing it here would silently lose
+                    // that signal. current_exception() is noexcept; the copy into `eptr`
+                    // is not documented noexcept by the standard, so it gets its own
+                    // firewall - a double-fault here degrades to an ordinary Retain rather
+                    // than escaping this noexcept lambda and terminating the agent.
+                    try {
+                        eptr = std::current_exception();
+                    } catch (...) {
+                        eptr = nullptr;
+                    }
                 }
-            }
-            {
-                std::lock_guard<std::mutex> lk{st->mu};
-                st->result = r;
-                st->eptr = eptr;
-                st->done = true;
-            }
-            st->cv.notify_all();
-            // `ticket` destructs at lambda-scope exit, after notify_all - the last
-            // observable point before this OS thread actually exits. Its dtor
-            // self-locks, so this runs safely with no lock held on this thread.
-        };
-        if (!io_detail::spawn_detached(std::move(worker)))
-            return false; // `ticket`'s local copy above already dropped -> worker_count back to 0
-        std::lock_guard<std::mutex> lk{state_->mu};
-        state_->in_flight = true;
-        state_->in_flight_event_id = entry.event_id;
-        state_->done = false;
+                {
+                    std::lock_guard<std::mutex> lk{st->mu};
+                    st->result = r;
+                    st->eptr = eptr;
+                    st->done = true;
+                }
+                st->cv.notify_all();
+                // `ticket` destructs at lambda-scope exit, after notify_all - the last
+                // observable point before this OS thread actually exits. Its dtor
+                // self-locks, so this runs safely with no lock held on this thread.
+            };
+            launched = io_detail::spawn_detached(std::move(worker));
+        } catch (...) {
+            launched = false;
+        }
+        if (!launched) {
+            // Any partially-constructed ticket's local copy has already dropped by now
+            // (try/catch unwound it, or the false-return path never released it) ->
+            // worker_count is back to 0 either way.
+            std::lock_guard<std::mutex> lk{state_->mu};
+            state_->in_flight = false;
+            return false;
+        }
         return true;
     }
 
