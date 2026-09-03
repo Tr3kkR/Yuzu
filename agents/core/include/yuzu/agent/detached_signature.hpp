@@ -12,10 +12,35 @@
 /// separate governance findings are pinned in the comments below.
 ///
 /// WHAT IT DOES NOT DO: it does not bind a signature to a filename or a version.
-/// The signature covers file CONTENT only. Callers that need a name or version
-/// binding must provide it themselves — the plugin loader does so with its
-/// allowlist, and the updater does so with the server-supplied SHA-256 and the
-/// semver downgrade check, both of which it applies BEFORE getting here.
+/// The signature covers file CONTENT only.
+///
+/// For the PLUGIN loader that is sufficient: its allowlist supplies the name
+/// binding, and the allowlist is local operator configuration, not something the
+/// party being defended against can author.
+///
+/// For the OTA path it is NOT, and the residual is deliberate and documented
+/// rather than closed here. `CheckForUpdate` carries `latest_version` and
+/// `sha256`, and BOTH are supplied by the same server the signature exists to
+/// distrust. So a malicious or impersonated server can serve a GENUINELY signed
+/// OLD agent binary — a real release, with a real signature over its real bytes
+/// — while claiming `latest_version="99.0.0"` and a `sha256` recomputed over
+/// those same bytes. Every check the agent applies passes: the hash matches, the
+/// semver comparison sees an upgrade, and this function verifies a true
+/// signature. The agent installs a known-vulnerable build and reports itself
+/// current. That is the classic ROLLBACK attack, and neither the hash nor the
+/// downgrade check defends against it, because the adversary authors both.
+///
+/// What this verifier DOES close is the substitution of ARBITRARY bytes: the
+/// server can no longer serve a binary that was never signed by the operator's
+/// own signing key. The attacker is confined to the set of binaries that key has
+/// signed at some point — a materially smaller set than "anything", and the
+/// reason this is worth shipping — but that set is not {the latest release}.
+///
+/// Closing the residual requires binding the VERSION into the signed material —
+/// signing a manifest of (version, digest) rather than the raw binary, the way
+/// TUF does — which changes the release-signing format and is tracked separately.
+/// Do NOT describe this path as closing the malicious-server threat until that
+/// lands.
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
@@ -35,13 +60,20 @@ namespace yuzu::agent {
 /// failure mode that is invisible by construction.
 inline constexpr std::string_view kSignatureRefusalReasons[] = {"missing", "untrusted", "invalid"};
 
-/// Upper bound on a detached signature, shared by both callers.
+/// Upper bound on a detached signature read from a FILE by this binary.
 ///
 /// A PEM CMS detached signature is a few KB — a signer chain plus one digest.
 /// The bound exists because a whole-file read has none of its own: the plugin
-/// path reads a sibling `.sig` from a root-owned directory, and the OTA path
-/// reads a sidecar off the server, and neither should be able to exhaust memory
-/// on a malformed or hostile file.
+/// loader reads a sibling `.sig` off disk and should not be able to exhaust
+/// memory on a malformed or hostile file.
+///
+/// Its only consumer is `plugin_loader.cpp`. The OTA path does NOT read this
+/// constant: it receives the signature over the wire, already bounded by the
+/// SERVER's own `yuzu::server::kMaxSignatureBytes` (which refuses to serve an
+/// over-cap sidecar) and by gRPC's message limit. Those two constants live in
+/// different binaries with no shared header, so their equal value is incidental
+/// — do not treat either as enforcing the other, and do not "unify" them by
+/// citing this one in server code.
 inline constexpr std::size_t kMaxSignatureBytes = 64 * 1024;
 
 /// Why a signature did not verify. Callers map this onto their own

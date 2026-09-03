@@ -71,9 +71,29 @@ enum class SidecarOutcome {
 /// anchored agent would then refuse the package, in both enforcement modes, and
 /// rotating a signing key is exactly the sequence that walks into it.
 ///
-/// Returns false only when a NON-EMPTY signature could not be written; the sidecar
-/// is then removed again, so the package is left honestly unsigned rather than
-/// carrying a partial signature.
+/// Does `signature_pem` have the shape of a PEM-armoured CMS signature?
+///
+/// A pure, cheap SHAPE check — NOT a verification. It cannot tell a valid
+/// signature from a well-formed one over the wrong bytes; only the agent's
+/// `verify_detached_cms` decides that, and it needs a trust bundle the server
+/// does not have.
+///
+/// It exists because the one sidecar state every surface agrees is servable is
+/// also the one nobody validates: a well-sized file of garbage is stored, the
+/// settings column reports "signed", the server serves it, and every anchored
+/// agent then refuses the package in BOTH enforcement modes — including
+/// permissive, where the documented contract is that unsigned packages are
+/// accepted with a warning. The operator's only signal is a fleet gauge rising
+/// after the fact. Catching the obvious case at upload turns that into an
+/// immediate, attributable rejection.
+[[nodiscard]] bool looks_like_pem_cms(const std::string& signature_pem);
+
+/// Returns false only when a NON-EMPTY signature could not be written. In that
+/// case any PREVIOUS sidecar is deliberately LEFT IN PLACE: a stale signature
+/// makes agents refuse (fail closed), whereas removing it would leave the new
+/// binary unsigned and permissive agents would apply it UNVERIFIED. The caller
+/// must surface the failure — the package is now in a state the operator has to
+/// resolve, not one to report as success.
 [[nodiscard]] bool replace_signature_sidecar(const std::filesystem::path& sidecar,
                                              const std::string& signature_pem);
 

@@ -29,6 +29,7 @@
 #endif
 
 using yuzu::server::kMaxSignatureBytes;
+using yuzu::server::looks_like_pem_cms;
 using yuzu::server::read_signature_sidecar;
 using yuzu::server::replace_signature_sidecar;
 using yuzu::server::SidecarOutcome;
@@ -205,7 +206,7 @@ TEST_CASE("sidecar: a zero-byte signature is refused, not served as signed",
     CHECK(out.empty());
 }
 
-TEST_CASE("sidecar: a failed replace leaves the package honestly unsigned",
+TEST_CASE("sidecar: a failed replace KEEPS the predecessor rather than stripping a signature",
           "[ota][sidecar]") {
     // THE FAILURE PATH TWO REVIEWERS FOUND INDEPENDENTLY. The binary is
     // overwritten before the sidecar is replaced, so a write or rename failure
@@ -230,11 +231,56 @@ TEST_CASE("sidecar: a failed replace leaves the package honestly unsigned",
 
     CHECK_FALSE(replace_signature_sidecar(sig, "v2-signature"));
 
-    // The contract: a failed replace removes the stale predecessor, so what
-    // remains is honestly unsigned rather than wrongly signed over new bytes.
-    CHECK_FALSE(fs::exists(sig));
+    // THE CONTRACT, and the reason it is the way round it is: a failed replace
+    // LEAVES the predecessor. Enumerating the windows shows only one is unsafe.
+    // Old-binary + new-signature and new-binary + old-signature both make every
+    // anchored agent REFUSE — fail-closed, recoverable, loud. New-binary + NO
+    // signature is the one state where a permissive agent applies the binary
+    // UNVERIFIED, which is precisely what this feature exists to prevent.
+    //
+    // So removing the predecessor here would convert a benign, ordinary failure
+    // — on Windows, a concurrent CheckForUpdate holding the sidecar open without
+    // FILE_SHARE_DELETE is enough to fail the rename — into silently stripping a
+    // VALID signature. The caller reports the failure instead; the operator
+    // retries the upload.
+    CHECK(fs::exists(sig));
     std::string out;
-    CHECK(read_signature_sidecar(sig, out) == SidecarOutcome::kAbsent);
+    REQUIRE(read_signature_sidecar(sig, out) == SidecarOutcome::kServed);
+    CHECK(out == "v1-signature");
 
     fs::remove_all(tmp);
+}
+
+TEST_CASE("PEM CMS shape check accepts what the agent accepts", "[ota][signature][sidecar]") {
+    // Both armour spellings OpenSSL emits for a detached CMS signature reach
+    // CMS_verify, so rejecting either at upload would refuse a signature the
+    // agent would have honoured.
+    CHECK(looks_like_pem_cms("-----BEGIN CMS-----\nMIIB\n-----END CMS-----\n"));
+    CHECK(looks_like_pem_cms("-----BEGIN PKCS7-----\nMIIB\n-----END PKCS7-----\n"));
+
+    // Leading commentary is what `openssl cms -sign` itself emits in some
+    // configurations, and is not grounds for refusal.
+    CHECK(looks_like_pem_cms("comment\n-----BEGIN CMS-----\nMIIB\n-----END CMS-----\n"));
+}
+
+TEST_CASE("PEM CMS shape check rejects the states nothing else catches",
+          "[ota][signature][sidecar]") {
+    // The case that motivated it: well-sized garbage. Stored, reported "signed",
+    // served, then refused by every anchored agent in BOTH modes.
+    CHECK_FALSE(looks_like_pem_cms(std::string(4096, 'x')));
+
+    // A truncated upload — header present, footer never arrived. This is why the
+    // check is a header/footer PAIR and not a `starts_with`.
+    CHECK_FALSE(looks_like_pem_cms("-----BEGIN CMS-----\nMIIB\n"));
+
+    // Footer before header is not a valid block either.
+    CHECK_FALSE(looks_like_pem_cms("-----END CMS-----\n-----BEGIN CMS-----\n"));
+
+    // A private key, or any other PEM object, is not a CMS signature.
+    CHECK_FALSE(looks_like_pem_cms("-----BEGIN PRIVATE KEY-----\nx\n-----END PRIVATE KEY-----\n"));
+
+    // Mismatched armour: the footer must match the header that was found.
+    CHECK_FALSE(looks_like_pem_cms("-----BEGIN CMS-----\nMIIB\n-----END PKCS7-----\n"));
+
+    CHECK_FALSE(looks_like_pem_cms(""));
 }

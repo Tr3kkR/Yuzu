@@ -1567,6 +1567,22 @@ upgrades are unaffected; the change is entirely agent-side.
 behave exactly as before: the downloaded binary is checked against the
 server-supplied SHA-256 and applied. Signature verification is entirely opt-in.
 
+**What signing does and does not close — read this before relying on it.** With a
+trust bundle configured, a compromised or impersonated update server can no
+longer push a binary your signing key never signed. That is the substitution
+attack, and it is closed.
+
+It does NOT close ROLLBACK. The signature covers the binary's CONTENT only, while
+`latest_version` and the SHA-256 both come from the server. So a hostile server
+can still serve a genuinely signed OLD release — one you really did sign — while
+labelling it a newer version and quoting a hash computed over those same bytes.
+Every agent-side check passes and the endpoint installs a real but outdated,
+possibly known-vulnerable build, then reports itself up to date. Closing this
+needs the version bound into the signed material (a signed manifest, TUF-style),
+which is not in this release. Treat signing as confining an attacker to *binaries
+you have signed*, not to *the binary you meant to ship*, and keep retiring the
+signing key's authority over withdrawn releases accordingly.
+
 **New on-disk artifact — the trust anchor.** `/etc/yuzu-agent/certs/` on Linux
 and macOS, `C:\ProgramData\Yuzu\agent-certs\` on Windows, created by the
 installers. It is deliberately NOT the server's `/etc/yuzu/certs` — that path is
@@ -2313,9 +2329,12 @@ worth acting on; a flat non-zero number is not proof that those machines are
 still stuck. To confirm current state, check whether the affected endpoints'
 reported agent version is advancing.
 
-**A refusing agent still cannot tell you WHY.** There is no status-report RPC on the update path, so the reason (missing,
-untrusted chain, or invalid signature) appears only in that endpoint's own log —
-the gauge tells you how many are affected, not what to fix. Verify on a pilot
+**A refusing agent still cannot tell you WHY.** There is no status-report RPC on
+the update path, so the reason appears only in that endpoint's own log — the
+gauge tells you how many are affected, not what to fix. The strings to grep for
+are `untrusted chain` and `invalid signature`; an unsigned package logs
+`update package is unsigned and --update-require-signature is set` (`missing` is
+the metric label for that case, not text that appears in the log). Verify on a pilot
 group before a fleet-wide flip.
 
 Signature verification runs after the hash check and before anything irreversible

@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iterator>
 #include <system_error>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -54,18 +55,23 @@ SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar, std:
 
 namespace {
 
-/// Remove BOTH the staging file and any surviving predecessor.
+/// Remove the staging file only.
 ///
-/// The binary is overwritten in place BEFORE this runs, so leaving the previous
-/// `.sig` behind on a failure leaves a signature over bytes that no longer exist
-/// — which every anchored agent then refuses, in both enforcement modes, making
-/// that package permanently undeliverable. Removing the predecessor leaves the
-/// package honestly unsigned instead, which is what the caller reports.
-void discard_both(const std::filesystem::path& tmp, const std::filesystem::path& sidecar) {
+/// DELIBERATELY NOT the surviving predecessor. Enumerating the windows shows why:
+/// old-binary + new-signature fails closed; new-binary + old-signature fails
+/// closed; new-binary + NO signature is the one unsafe state, because a permissive
+/// agent applies it UNVERIFIED. So destroying a signature must be an operator's
+/// explicit choice to upload unsigned — never a failure recovery.
+///
+/// The concrete case: on Windows a concurrent CheckForUpdate holds the sidecar
+/// open without FILE_SHARE_DELETE, so the rename fails with a sharing violation.
+/// Removing the predecessor there would silently strip a VALID signature during
+/// an ordinary re-upload, and permissive agents would then apply the new binary
+/// unverified. Leaving it makes them refuse instead, which is the safe direction,
+/// and the caller reports the failure so the operator knows to retry.
+void discard_staging(const std::filesystem::path& tmp) {
     std::error_code ec;
     std::filesystem::remove(tmp, ec);
-    ec.clear();
-    std::filesystem::remove(sidecar, ec);
 }
 
 } // namespace
@@ -77,6 +83,26 @@ SidecarOutcome signature_sidecar_outcome(const std::filesystem::path& sidecar) {
     // decision site, and it is paid only on the settings fragment.
     std::string ignored;
     return read_signature_sidecar(sidecar, ignored);
+}
+
+bool looks_like_pem_cms(const std::string& signature_pem) {
+    // Accept both armour spellings OpenSSL emits for a detached CMS signature:
+    // `CMS` from `openssl cms -sign`, `PKCS7` from the older `smime`/`pkcs7`
+    // tooling. Both are what `CMS_verify` consumes, so refusing either at upload
+    // would reject signatures the agent would have accepted.
+    static constexpr std::string_view kHeaders[] = {"-----BEGIN CMS-----",
+                                                    "-----BEGIN PKCS7-----"};
+    for (const auto header : kHeaders) {
+        const auto begin = signature_pem.find(header);
+        if (begin == std::string::npos)
+            continue;
+        // The matching footer must follow the header, so a file carrying only an
+        // armour line, or a truncated upload, is still rejected.
+        std::string footer("-----END ");
+        footer.append(header.substr(std::string_view("-----BEGIN ").size()));
+        return signature_pem.find(footer, begin + header.size()) != std::string::npos;
+    }
+    return false;
 }
 
 bool replace_signature_sidecar(const std::filesystem::path& sidecar,
@@ -102,7 +128,7 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
         if (out)
             out.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
         if (!out) {
-            discard_both(tmp, sidecar);
+            discard_staging(tmp);
             return false;
         }
     } // closed before the rename: a rename over an open handle is not portable
@@ -110,7 +136,7 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
     std::error_code ren_ec;
     std::filesystem::rename(tmp, sidecar, ren_ec);
     if (ren_ec) {
-        discard_both(tmp, sidecar);
+        discard_staging(tmp);
         return false;
     }
     return true;

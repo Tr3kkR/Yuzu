@@ -33,5 +33,14 @@
   surfaced fleet-wide as `yuzu_fleet_ota_signature_refusing_agents`, since the
   update path has no status-report RPC and the agent has no metrics endpoint —
   without that gauge a fleet-wide refusal would only be visible in per-endpoint
-  logs. See "Signing update binaries" in the server administration manual, including why the transitional unsigned-allowed
-  mode is a downgrade oracle and why a failing agent is currently silent.
+  logs. **Scope, stated plainly: this closes
+  SUBSTITUTION, not ROLLBACK.** The signature covers the binary's content, while
+  the version and the hash are still supplied by the server being distrusted, so
+  a hostile server can serve a genuinely signed OLD release under a newer version
+  label and every agent-side check passes. The attacker is confined to binaries
+  the operator's key has signed — a far smaller set than "anything", which is why
+  this ships — but not to the intended one; closing that needs the version bound
+  into the signed material (a signed manifest) and is tracked separately. See
+  "Signing update binaries" in the server administration manual, including why
+  the transitional unsigned-allowed mode is a downgrade oracle and why a failing
+  agent is currently silent.

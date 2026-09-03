@@ -987,7 +987,7 @@ described below.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `yuzu_agent_ota_signature_refused_total{reason}` | counter | An OTA package was refused for a signature reason. `reason` is a closed set: `missing` (no signature, with `--update-require-signature` set), `untrusted` (the signer does not chain to the configured trust bundle, or its leaf lacks the codeSigning EKU), `invalid` (the signature is malformed, or does not cover these bytes). Cumulative for the life of the agent process. |
+| `yuzu_agent_ota_signature_refused_total{reason}` | counter | An OTA package was refused for a signature reason. `reason` is a closed set: `missing` (no signature, with `--update-require-signature` set), `untrusted` (the signer does not chain to the configured trust bundle, or its leaf lacks the codeSigning EKU, or **the trust bundle itself could not be read** — an unreadable or missing bundle proves nothing, so it is counted as a trust failure rather than a pass, and is the most likely cause if this counter jumps on a host right after a config change), `invalid` (the signature is malformed, or does not cover these bytes). Cumulative for the life of the agent process. |
 
 **How it reaches you.** The total across all three reasons is carried on the
 agent heartbeat as the status tag `yuzu.ota_signature_refused`, and the server

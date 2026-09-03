@@ -2214,9 +2214,12 @@ std::string SettingsRoutes::render_updates_fragment() {
                          SidecarOutcome::kServed
                          ? std::string("<span title=\"A detached signature is stored "
                                        "for this package\">signed</span>")
-                         : std::string("<span style=\"color:#8b949e\" title=\"No signature "
-                                       "stored. Agents running --update-require-signature "
-                                       "will refuse this package.\">unsigned</span>")) +
+                         : std::string("<span style=\"color:#8b949e\" title=\"No usable "
+                                       "signature is being served: either none is stored, or "
+                                       "the stored one is unreadable, empty or over the size "
+                                       "cap (see the server log). Agents running "
+                                       "--update-require-signature will refuse this "
+                                       "package.\">unsigned</span>")) +
                     "</td>"
                     "<td>"
                     "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
@@ -2281,7 +2284,9 @@ std::string SettingsRoutes::render_updates_fragment() {
             // Optional detached CMS signature (#416/#3807). Without this input
             // the documented signing workflow is unreachable from the UI and an
             // operator would ship an unsigned package believing it signed.
-            "<div class=\"form-row\">"
+            // `mini-field`, matching every sibling in this inline row — `form-row`
+            // is the stacked full-width variant and breaks the row's layout.
+            "<div class=\"mini-field\">"
             "<label>Signature <span class=\"muted\">(optional, .sig)</span></label>"
             // No accept filter: ".sig" is only convention — ".p7s" and ".pem" are
             // common names for the same detached CMS blob, and filtering the picker
@@ -5409,6 +5414,28 @@ void SettingsRoutes::register_routes(
         if (rollout_pct > 100)
             rollout_pct = 100;
 
+        // Shape-check the signature BEFORE the binary is written. A well-sized
+        // file of garbage would otherwise be stored, reported "signed" by the
+        // settings column, served by CheckForUpdate, and then refused by every
+        // anchored agent in BOTH enforcement modes — including permissive, where
+        // the documented contract is that unsigned packages are accepted with a
+        // warning. The operator's only signal would be a fleet gauge rising after
+        // the fact.
+        //
+        // Placed here, ahead of the write, so a rejection leaves the PREVIOUS
+        // package and its signature completely untouched: the operator retries an
+        // upload rather than recovering a half-replaced package.
+        if (!signature_pem.empty() && !looks_like_pem_cms(signature_pem)) {
+            spdlog::warn("OTA upload for {}/{}: rejected — the signature is not PEM-armoured CMS",
+                         platform, arch);
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"That signature file is not a PEM CMS )"
+                           R"(signature (expected a -----BEGIN CMS----- block). Nothing was )"
+                           R"(changed.","level":"error"}})");
+            res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            return;
+        }
+
         auto orig_name =
             uploaded.filename.empty() ? "yuzu-agent-" + platform + "-" + arch : uploaded.filename;
 
@@ -5457,9 +5484,18 @@ void SettingsRoutes::register_routes(
         // replace_signature_sidecar is UNCONDITIONAL — see its header for why an
         // unsigned re-upload must not inherit the previous signature.
         if (!replace_signature_sidecar(update_registry_->signature_path(pkg), signature_pem)) {
-            spdlog::error("OTA package {}: signature sidecar could not be written; the "
-                          "package remains registered as UNSIGNED",
+            // The BINARY landed and the SIGNATURE did not, so this upload is a
+            // partial success and must never be reported as a plain one. Any
+            // previous sidecar is deliberately left in place (see the function's
+            // header): agents then refuse, which is the safe direction, but the
+            // package is NOT deliverable until the operator retries.
+            spdlog::error("OTA package {}: the binary was written but its signature sidecar "
+                          "was NOT; the package is not deliverable until this upload is retried",
                           pkg.filename);
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Binary uploaded but the signature could )"
+                           R"(not be stored - the package is NOT deliverable. Retry the upload.")"
+                           R"(,"level":"error"}})");
         } else if (!signature_pem.empty()) {
             spdlog::info("OTA package {}: detached signature stored ({} bytes)", pkg.filename,
                          signature_pem.size());
