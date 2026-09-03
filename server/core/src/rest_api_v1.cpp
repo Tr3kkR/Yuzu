@@ -247,6 +247,13 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
         // #2466/#2406: surface a dropped denial-audit via Sec-Audit-Failed (the
         // 403 stands — a denial commits no mutation, so it does not fail closed;
         // the header carries the audit-persist gap, matching the route successes).
+        // DELIBERATE (adversarial-review K6): the header is kept on this denial
+        // even though the caller is the default-deny engine class — the coarse
+        // "audit is down" bit it exposes is marginal (during an outage every
+        // engine-principal MUTATION already fails closed fleet-wide), keeping
+        // Sec-Audit-Failed uniform across every response whose audit dropped is a
+        // monitoring virtue, and defenders get the drop server-side regardless via
+        // the audit-emit-failed metric + warn log independent of this header.
         (void)detail::emit_behavioral_audit(audit, req, res, action, "denied", target, "",
                                             "engine_session_denied");
         res.status = 403;
@@ -3552,6 +3559,13 @@ void RestApiV1::register_routes(
                                  .add("created_at", p.created_at)
                                  .add("active_credential_count", active_creds));
                  }
+                 // #2466/#2406 read posture (header-only, set-and-proceed): a READ
+                 // whose audit drops sets Sec-Audit-Failed and STILL serves — it
+                 // commits no state and discloses only authz-topology metadata
+                 // (ids/owners/grants), not per-person PII, so it deliberately does
+                 // NOT fail closed like the behavioural-PII device/network reads.
+                 // Do not copy this (void)-discard onto a route where fail-closed is
+                 // required. Rationale: rest-api.md / auth-architecture.md.
                  (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.list",
                                                      "success", "EnginePrincipal", "",
                                                      "count=" + std::to_string(principals.size()));
@@ -3835,9 +3849,9 @@ void RestApiV1::register_routes(
             // unrecorded mint must not return the one-time secret. On a dropped
             // audit the secret is discarded (never placed in the 503 body). The
             // credential now exists but is unusable; the operator reconciles via
-            // GET (it is listed) and rotates or revokes+re-mints it. Deliberate
-            // secret-withholding posture per ADR-1005 "mutations fail closed on
-            // audit failure" (recovery detail in rest-api.md).
+            // GET (it is listed) and rotates it to obtain an audited secret.
+            // Deliberate secret-withholding posture per ADR-1005 "mutations fail
+            // closed on audit failure" (recovery detail in rest-api.md).
             if (!detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.mint", "success",
                     "EnginePrincipal", principal_id, "ttl_days=" + std::to_string(ttl_days))) {
@@ -3846,7 +3860,7 @@ void RestApiV1::register_routes(
                     detail::a4_error(res, "the credential was minted but its audit record could "
                                           "not be persisted; the secret was withheld. The "
                                           "credential exists but is unusable: list it and rotate "
-                                          "or revoke+re-mint to obtain an audited secret"),
+                                          "it to obtain an audited secret"),
                     "application/json");
                 return;
             }
@@ -4101,7 +4115,9 @@ void RestApiV1::register_routes(
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the rotation was confirmed but its audit record could "
-                                          "not be persisted; treat as unconfirmed and reconcile"),
+                                          "not be persisted; verify state via GET and reconcile "
+                                          "the audit gap out-of-band -- do NOT re-confirm (the "
+                                          "rotation is already resolved)"),
                     "application/json");
                 return;
             }
