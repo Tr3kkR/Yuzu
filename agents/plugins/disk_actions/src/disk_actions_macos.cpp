@@ -56,6 +56,10 @@ namespace {
 using yuzu::agent::ScopedCFRef;
 using yuzu::agent::ScopedIOObject;
 
+/// Bounds the provider walk. The measured chain is 7 hops; this is generous
+/// headroom without trusting an unbounded registry to terminate.
+constexpr int kMaxProviderDepth = 16;
+
 /// CFString -> UTF-8. Returns empty on any non-string or conversion failure;
 /// the caller decides what an absent value means, since "" and "-" are
 /// different facts at the row layer.
@@ -129,11 +133,44 @@ std::map<std::string, std::vector<std::string>> mount_points_by_bsd_name(bool& o
     return out;
 }
 
-/// Whole-disk BSD name for a partition ("disk0s2" -> "disk0"). Returns the
-/// input unchanged when it carries no slice suffix.
-std::string whole_disk_of(const std::string& bsd) {
-    const auto s = bsd.find('s', 4); // skip "disk"
-    return s == std::string::npos ? bsd : bsd.substr(0, s);
+/// The PHYSICAL whole disk backing an IOMedia object, resolved by walking the
+/// IOKit provider chain rather than by trimming the BSD name.
+///
+/// The string shortcut ("disk3s1" -> "disk3") is WRONG on APFS and was caught
+/// by running the leg rather than reading it: on this Mac `/` lives on
+/// disk3s1s1, whose "Part of Whole" is disk3 -- but disk3 is a SYNTHESIZED
+/// AppleAPFSMedia container whose physical store is disk0s2, on the real drive
+/// disk0. Trimming the name therefore stops at a virtual container and never
+/// reaches the physical device, which is the one thing this action exists to
+/// report: a failing drive must be nameable in terms of the volumes it serves.
+///
+/// The provider chain resolves it exactly (measured):
+///   AppleAPFSVolume disk3s1 -> AppleAPFSContainer -> AppleAPFSMedia disk3
+///     -> AppleAPFSContainerScheme -> IOMedia disk0s2 -> IOGUIDPartitionScheme
+///     -> IOMedia disk0 (Whole=YES)   <-- the answer
+///
+/// So: walk providers to the first entry that is an IOMedia AND is marked
+/// whole. The class test is load-bearing -- AppleAPFSMedia also reports
+/// Whole=YES, and accepting it would return the synthesized container again.
+std::string physical_whole_disk_of(io_registry_entry_t media) {
+    io_registry_entry_t node = media;
+    ScopedIOObject owned; // owns only the nodes WE step onto, never the caller's
+    for (int depth = 0; depth < kMaxProviderDepth && node; ++depth) {
+        io_name_t cls{};
+        IOObjectGetClass(node, cls);
+        ScopedCFRef<CFTypeRef> whole{
+            IORegistryEntryCreateCFProperty(node, CFSTR(kIOMediaWholeKey), kCFAllocatorDefault, 0)};
+        if (std::string_view(cls) == kIOMediaClass && cf_bool_true(whole.get())) {
+            ScopedCFRef<CFTypeRef> bsd{IORegistryEntryCreateCFProperty(node, CFSTR(kIOBSDNameKey),
+                                                                      kCFAllocatorDefault, 0)};
+            return cf_string(bsd.get());
+        }
+        io_registry_entry_t parent = 0;
+        if (IORegistryEntryGetParentEntry(node, kIOServicePlane, &parent) != KERN_SUCCESS) break;
+        owned.reset(parent); // releases the previous step, adopts this one
+        node = parent;
+    }
+    return {};
 }
 
 } // namespace
@@ -249,7 +286,9 @@ int emit_volumes(yuzu::CommandContext& ctx) {
             }
         }
 
-        write_volume_row(ctx, name, joined, whole_disk_of(name), "-", total,
+        std::string physical = physical_whole_disk_of(obj.get());
+        if (physical.empty()) physical = "-";
+        write_volume_row(ctx, name, joined, physical, "-", total,
                          mounts_ok ? "-" : "mount-point enumeration failed; the mapping column is "
                                            "incomplete");
         any_row = true;
