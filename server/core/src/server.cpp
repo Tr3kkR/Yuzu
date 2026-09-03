@@ -1942,14 +1942,6 @@ public:
                           "Delivery-log INSERTs (webhook_deliveries) that failed against an open "
                           "store - the delivery itself still ran; only its record did not persist",
                           "counter");
-        metrics_.describe("yuzu_server_webhook_backfill_total",
-                          "One-time legacy webhooks.db -> webhook_store PostgreSQL backfill "
-                          "outcome on every boot, by result (success = fresh install, "
-                          "already-migrated skip, or a completed migration; failed = fail-closed, "
-                          "boot refused, next start retries). ADR-0057.",
-                          "counter");
-        for (const auto result : {"success", "failed"})
-            metrics_.counter("yuzu_server_webhook_backfill_total", {{"result", result}});
         metrics_.describe("yuzu_server_offload_delivery_success_total",
                           "Offload-target deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_offload_delivery_failed_total",
@@ -6237,14 +6229,16 @@ public:
         // auth_key_provider_ rather than minting a second KeyProvider over
         // the same install-wide KEK): SecretCodec (ctor only) -> WebhookStore
         // (this ctor registers `secret` as the secret column) ->
-        // SecretCodec::init() -> migrate_from_sqlite (MANDATORY backfill,
-        // ADR-0009 — webhook configs+secrets are unconditionally mandatory,
-        // and ADR-0057 also treats the delivery log as mandatory: it is
-        // not TTL'd, so ResponseStore's "ages out" skip-justification does
-        // not hold, and one transaction already covers both tables at this
-        // scale). auth_key_provider_ is guaranteed non-null whenever this
-        // guard is reached — same reasoning as the plugin_config_store_
-        // block above.
+        // SecretCodec::init(). NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment, OffloadTargetStore/ResponseStore
+        // precedent): no production fleet has ever run a pre-Postgres build
+        // of this store, so there is no legacy webhooks.db content to
+        // protect — legacy_sqlite_probe::harden_legacy_file_0600 (this
+        // store's legacy file may hold a plaintext signing secret, ADR-0010
+        // §Consequences (a)) then warn_if_legacy_rows run instead, right
+        // after set_metrics() so the read-degrade counters are already live.
+        // auth_key_provider_ is guaranteed non-null whenever this guard is
+        // reached — same reasoning as the plugin_config_store_ block above.
         if (pg_pool_ && !startup_failed_) {
             webhook_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
             webhook_store_ = std::make_unique<WebhookStore>(*pg_pool_, *webhook_secret_codec_);
@@ -6271,67 +6265,51 @@ public:
                             init_res.error().message);
                         startup_failed_ = true;
                     } else {
-                        // set_metrics() BEFORE migrate_from_sqlite() — gov
-                        // Gate 3 sre: the old ordering left
-                        // yuzu_server_webhook_backfill_total{result} dead on
-                        // every production boot (metrics_ was still null at
-                        // the sole call site inside migrate_from_sqlite).
-                        // NotificationStore's equivalent block (above) is
-                        // the reference ordering this now matches.
                         webhook_store_->set_metrics(&metrics_);
-                        auto webhook_db = cfg_.db_dir() / "webhooks.db";
-                        if (!webhook_store_->migrate_from_sqlite(webhook_db)) {
-                            spdlog::error(
-                                "[PG] Refusing to start: webhook legacy-SQLite backfill failed "
-                                "(see prior log lines) — webhook_store is authoritative and must "
-                                "not serve partially-migrated secret-bearing data. Operator "
-                                "remediation: repair {} or move it aside to skip the backfill "
-                                "(existing webhooks/signing secrets in it will NOT carry over)",
-                                webhook_db.string());
-                            startup_failed_ = true;
-                        } else {
-                            spdlog::info("WebhookStore initialized (schema webhook_store; legacy "
-                                         "backfill source {})",
-                                         webhook_db.string());
-                            // #3261/#3294 lesson 10: wire the consumer only
-                            // inside the full-success branch — a top-of-ctor
-                            // wiring block that ran before this store
-                            // existed silently never fired.
-                            agent_service_.set_webhook_store(webhook_store_.get());
-                            // ADR-0010 §Decision 3 evidence surface (gov Gate
-                            // 6 compliance-officer, contract floor — the
-                            // decrypt-failure metric alone does not satisfy
-                            // ADR-0010's "emit an audit event + metric" rule).
-                            // Mirrors auth_secret_codec_'s hook exactly
-                            // (server.cpp:4176) — audit_store_ already exists
-                            // by this point (constructed above at :4093), so
-                            // no deferred-wiring step is needed here the way
-                            // AuthDB's block needed one. Lifetime: the lambda
-                            // captures `this` and reads `audit_store_` at
-                            // call time, never the pointer, so a later reset
-                            // store cannot dangle; stop() clears the hook
-                            // before destroying the codec (below).
-                            webhook_secret_codec_->set_audit_hook(
-                                [this](std::string_view verb, const std::string& detail_json) {
-                                    if (!audit_store_ || !audit_store_->is_open())
-                                        return;
-                                    const bool failure = (verb == "secret.decrypt_failure");
-                                    (void)audit_store_->log(
-                                        {.timestamp = std::time(nullptr),
-                                         .principal = "system:secret-codec",
-                                         .principal_role = "system",
-                                         .action = std::string(verb),
-                                         .target_type = "Secret",
-                                         .target_id = "webhook_store",
-                                         // detail_json carries AAD
-                                         // coordinates, kek_version and the
-                                         // failure class ONLY — never
-                                         // ciphertext, plaintext, DEK or key
-                                         // bytes (secret_codec.hpp).
-                                         .detail = detail_json,
-                                         .result = failure ? "failure" : "success"});
-                                });
-                        }
+                        legacy_sqlite_probe::harden_legacy_file_0600(cfg_.db_dir() /
+                                                                     "webhooks.db");
+                        legacy_sqlite_probe::warn_if_legacy_rows(
+                            cfg_.db_dir() / "webhooks.db", "WebhookStore",
+                            {"webhooks", "webhook_deliveries"});
+                        spdlog::info("WebhookStore initialized (schema webhook_store)");
+                        // #3261/#3294 lesson 10: wire the consumer only
+                        // inside the full-success branch — a top-of-ctor
+                        // wiring block that ran before this store
+                        // existed silently never fired.
+                        agent_service_.set_webhook_store(webhook_store_.get());
+                        // ADR-0010 §Decision 3 evidence surface (gov Gate
+                        // 6 compliance-officer, contract floor — the
+                        // decrypt-failure metric alone does not satisfy
+                        // ADR-0010's "emit an audit event + metric" rule).
+                        // Mirrors auth_secret_codec_'s hook exactly
+                        // (server.cpp:4176) — audit_store_ already exists
+                        // by this point (constructed above at :4093), so
+                        // no deferred-wiring step is needed here the way
+                        // AuthDB's block needed one. Lifetime: the lambda
+                        // captures `this` and reads `audit_store_` at
+                        // call time, never the pointer, so a later reset
+                        // store cannot dangle; stop() clears the hook
+                        // before destroying the codec (below).
+                        webhook_secret_codec_->set_audit_hook(
+                            [this](std::string_view verb, const std::string& detail_json) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                const bool failure = (verb == "secret.decrypt_failure");
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:secret-codec",
+                                     .principal_role = "system",
+                                     .action = std::string(verb),
+                                     .target_type = "Secret",
+                                     .target_id = "webhook_store",
+                                     // detail_json carries AAD
+                                     // coordinates, kek_version and the
+                                     // failure class ONLY — never
+                                     // ciphertext, plaintext, DEK or key
+                                     // bytes (secret_codec.hpp).
+                                     .detail = detail_json,
+                                     .result = failure ? "failure" : "success"});
+                            });
                     }
                 }
             }
