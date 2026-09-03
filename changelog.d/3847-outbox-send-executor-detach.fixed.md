@@ -5,9 +5,10 @@
   send. Previously, a sink that stopped responding — a half-open TCP connection, for
   example — could wedge the worker's retention and replay-paging cadence for as long as
   the stall lasted. The send now runs on its own bounded, detached worker with a per-lane
-  slot (one for lifecycle events, one for compliance/health events, so a slow lifecycle
-  send cannot silently delay compliance/health delivery either), covered by the same
-  orphan-exit shutdown contract already used for Guardian's other detached background
-  work. `prefer_spark` (the same switch the Guardian journal entries in this release refer
+  slot (one for lifecycle events, one for compliance/health events), so a slow lifecycle
+  send can no longer silently prevent a compliance/health send from being attempted at
+  all — the two lanes still share the same underlying gRPC stream write lock, so contention
+  on that lock is unchanged and out of scope for this fix. That worker is covered by the same
+  orphan-exit shutdown contract already used for Guardian's other detached background work. `prefer_spark` (the same switch the Guardian journal entries in this release refer
   to) is a compile-time default that cannot be changed without a rebuild, so the existing
   detection path is unaffected. (#3847, #2233 item 4)
