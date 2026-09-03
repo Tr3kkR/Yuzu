@@ -109,6 +109,9 @@ struct RestEngineRolesHarness {
     // session sets this to a predicate returning false — mirrors
     // McpTestServer's perm_override_for_test in test_mcp_server.cpp.
     std::function<bool(const std::string&, const std::string&)> perm_override;
+    // #2466/#2406: when false, audit_fn returns false (row NOT persisted) exactly
+    // as AuditStore::log does on a degraded store, so the route must fail closed.
+    bool audit_allow{true};
 
     struct AuditRecord {
         std::string action;
@@ -148,7 +151,7 @@ struct RestEngineRolesHarness {
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return true;
+            return audit_allow;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -392,4 +395,63 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: missing role field re
     auto res = h.assign("vuln", R"({})");
     REQUIRE(res);
     CHECK(res->status == 400);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2466/#2406: a role assign/unassign whose audit write drops FAILS CLOSED
+// (503 + Sec-Audit-Failed) — never success on an unrecorded grant mutation
+// (ADR-1005 "mutations fail closed on audit failure"). The read (GET roles)
+// PROCEEDS but sets the header. Driven by RestEngineRolesHarness::audit_allow.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST engine-principal roles: assign fails CLOSED (503 + Sec-Audit-Failed) "
+          "when its audit write drops",
+          "[pg][rest][engine_principal][rbac][audit_failclose]") {
+    RestEngineRolesHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        h.rbac_store->set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
+    REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
+               .has_value());
+
+    h.audit_allow = false;
+    auto res = h.assign("vuln", R"({"role":"EngineReader"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // The grant itself committed before the audit (fail-closed is about the
+    // RESPONSE, not a rollback) — the operator reconciles on the 503.
+    CHECK(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
+}
+
+TEST_CASE("REST engine-principal roles: unassign fails CLOSED (503 + Sec-Audit-Failed) "
+          "when its audit write drops",
+          "[pg][rest][engine_principal][rbac][audit_failclose]") {
+    RestEngineRolesHarness h;
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        h.rbac_store->set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
+    REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
+               .has_value());
+    REQUIRE(h.assign("vuln", R"({"role":"EngineReader"})")->status == 201);
+
+    h.audit_allow = false;
+    auto res = h.unassign("vuln", "EngineReader");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST engine-principal roles: GET roles (read) PROCEEDS 200 but sets "
+          "Sec-Audit-Failed when its audit write drops",
+          "[pg][rest][engine_principal][rbac][audit_failclose]") {
+    RestEngineRolesHarness h;
+    REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
+               .has_value());
+
+    h.audit_allow = false;
+    auto res = h.get_roles("vuln");
+    REQUIRE(res);
+    CHECK(res->status == 200); // data still served
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
 }

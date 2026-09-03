@@ -246,6 +246,11 @@ struct RestEngineHarness {
     bool session_present{true};
     bool perm_allow{true};
     bool step_up_allow{true};
+    // #2466/#2406: drive an audit-store persist failure. When false, the audit_fn
+    // returns false (row NOT persisted) exactly as AuditStore::log does on a
+    // degraded store — the routes must then fail closed (503 + Sec-Audit-Failed)
+    // on a mutation and set the header on a read/denial.
+    bool audit_allow{true};
 
     std::unordered_set<std::string> existing_users{"alice", "bob"};
 
@@ -299,7 +304,7 @@ struct RestEngineHarness {
                                const std::string& result, const std::string& target_type,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_type, target_id, detail});
-            return true;
+            return audit_allow;
         };
 
         auto step_up_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -1233,6 +1238,143 @@ TEST_CASE("Engine-principal REST: transfer-owner 200 success path (previously "
             found_audit = true;
     }
     CHECK(found_audit);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #2466/#2406: audit-store persist-failure handling. A privileged engine-
+// principal MUTATION whose audit row does not persist FAILS CLOSED (503 +
+// Sec-Audit-Failed) — never success on an unrecorded mutation (ADR-1005
+// "mutations fail closed on audit failure"). A READ / DENIAL commits no state,
+// so it PROCEEDS but still sets Sec-Audit-Failed (parity with the MCP twins'
+// audit_persisted:false). Driven by RestEngineHarness::audit_allow=false, which
+// makes audit_fn return false exactly as AuditStore::log does on a degraded
+// store. (assign/unassign role live on the RolesHarness — see that file's
+// [audit_failclose] cases.)
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("Engine-principal REST: a mutation whose audit write drops fails CLOSED "
+          "(503 + Sec-Audit-Failed)",
+          "[pg][rest][engine_principal][audit_failclose]") {
+    RestEngineHarness h;
+
+    SECTION("create") {
+        h.audit_allow = false;
+        auto r = h.create("audit-create");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->has_header("Sec-Audit-Failed"));
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+
+    SECTION("mint withholds the one-time secret") {
+        auto cres = h.create("audit-mint");
+        REQUIRE(cres);
+        REQUIRE(cres->status == 201);
+        auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+        h.audit_allow = false;
+        auto r = h.mint(pid);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // The one-time secret must NEVER appear in the fail-closed body.
+        CHECK(r->body.find("\"token\"") == std::string::npos);
+    }
+
+    SECTION("rotate withholds the one-time secret") {
+        auto [pid, raw1] = h.create_and_mint("audit-rotate");
+        (void)raw1;
+        h.audit_allow = false;
+        auto r = h.rotate(pid);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(r->body.find("\"token\"") == std::string::npos);
+    }
+
+    SECTION("confirm") {
+        auto [pid, raw1] = h.create_and_mint("audit-confirm");
+        (void)raw1;
+        auto rot = h.rotate(pid);
+        REQUIRE(rot);
+        REQUIRE(rot->status == 200);
+        auto tid = nlohmann::json::parse(rot->body)["data"]["token_id"].get<std::string>();
+        auto sec = nlohmann::json::parse(rot->body)["data"]["token"].get<std::string>();
+        h.audit_allow = false;
+        auto r = h.confirm(pid, tid, sec);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+
+    SECTION("revoke") {
+        auto cres = h.create("audit-revoke");
+        REQUIRE(cres);
+        REQUIRE(cres->status == 201);
+        auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+        h.audit_allow = false;
+        auto r = h.revoke(pid);
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+
+    SECTION("transfer-owner") {
+        auto cres = h.create("audit-transfer");
+        REQUIRE(cres);
+        REQUIRE(cres->status == 201);
+        auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+        h.audit_allow = false;
+        auto r = h.transfer(pid, "bob");
+        REQUIRE(r);
+        CHECK(r->status == 503);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+}
+
+TEST_CASE("Engine-principal REST: a READ whose audit write drops PROCEEDS (200) but "
+          "sets Sec-Audit-Failed",
+          "[pg][rest][engine_principal][audit_failclose]") {
+    RestEngineHarness h;
+    auto cres = h.create("audit-read");
+    REQUIRE(cres);
+    REQUIRE(cres->status == 201);
+    auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+    h.audit_allow = false;
+
+    SECTION("list") {
+        auto r = h.list();
+        REQUIRE(r);
+        CHECK(r->status == 200); // data still served
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+
+    SECTION("get") {
+        auto r = h.get(pid);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+
+    SECTION("no-admin auditor") {
+        auto r = h.no_admin_audit();
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+}
+
+TEST_CASE("Engine-principal REST: the §9 engine-session denial surfaces a dropped "
+          "denial audit via Sec-Audit-Failed (the 403 stands)",
+          "[pg][rest][engine_principal][audit_failclose]") {
+    RestEngineHarness h;
+    // A denial commits no mutation, so the 403 stays; a dropped denial audit
+    // must not be silent — the header carries it.
+    h.session_principal_kind = "engine";
+    h.audit_allow = false;
+    auto r = h.rotate("engine:whatever"); // deny belt fires before any store lookup
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

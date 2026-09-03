@@ -244,8 +244,11 @@ static bool deny_engine_session(const auth::Session& s, const httplib::Request& 
                                 httplib::Response& res, const RestApiV1::AuditFn& audit,
                                 const char* action, const char* target) {
     if (s.principal_kind == "engine" || s.auth_source == "engine_token") {
-        if (audit)
-            audit(req, action, "denied", target, "", "engine_session_denied");
+        // #2466/#2406: surface a dropped denial-audit via Sec-Audit-Failed (the
+        // 403 stands — a denial commits no mutation, so it does not fail closed;
+        // the header carries the audit-persist gap, matching the route successes).
+        (void)detail::emit_behavioral_audit(audit, req, res, action, "denied", target, "",
+                                            "engine_session_denied");
         res.status = 403;
         res.set_content(detail::a4_error(res, "engine principals cannot access this endpoint"),
                         "application/json");
@@ -2537,8 +2540,9 @@ void RestApiV1::register_routes(
                  }
                  // M2: audit the privilege-enumeration read (CC7.2) — the
                  // assign/unassign mutations are audited, so must this read.
-                 (void)audit_fn(req, "engine_principal.role.listed", "success", "EnginePrincipal",
-                                principal_id, "");
+                 (void)detail::emit_behavioral_audit(audit_fn, req, res,
+                                                     "engine_principal.role.listed", "success",
+                                                     "EnginePrincipal", principal_id, "");
                  res.set_content(ok_json(arr.str()), "application/json");
              });
 
@@ -2613,8 +2617,9 @@ void RestApiV1::register_routes(
             const std::string kUniformReject =
                 "role '" + role_name + "' cannot be assigned to this engine principal";
             if (!rbac_store->get_role(role_name)) {
-                (void)audit_fn(req, "engine_principal.role.assigned", "denied", "EnginePrincipal",
-                               principal_id, role_name + ": unknown role");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.role.assigned", "denied",
+                    "EnginePrincipal", principal_id, role_name + ": unknown role");
                 res.status = 400;
                 res.set_content(detail::a4_error(res, kUniformReject), "application/json");
                 return;
@@ -2632,14 +2637,28 @@ void RestApiV1::register_routes(
                 // as a 4xx denial, never a 500 (design §4.2 "no admin,
                 // ever"). The specific reason is audited; the client sees the
                 // same uniform message as the unknown-role case (M1).
-                (void)audit_fn(req, "engine_principal.role.assigned", "denied", "EnginePrincipal",
-                               principal_id, role_name + ": " + result.error());
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.role.assigned", "denied",
+                    "EnginePrincipal", principal_id, role_name + ": " + result.error());
                 res.status = 400;
                 res.set_content(detail::a4_error(res, kUniformReject), "application/json");
                 return;
             }
-            (void)audit_fn(req, "engine_principal.role.assigned", "success", "EnginePrincipal",
-                           principal_id, role_name);
+            // #2466/#2406: a privileged engine-principal mutation whose audit row
+            // did not persist FAILS CLOSED — never return success on an unrecorded
+            // mutation (ADR-1005 "mutations fail closed on audit failure"; the MCP
+            // twin surfaces the same gap via audit_persisted:false).
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.role.assigned",
+                                               "success", "EnginePrincipal", principal_id,
+                                               role_name)) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the role assignment took effect but its audit record "
+                                          "could not be persisted; treat as unconfirmed and "
+                                          "reconcile"),
+                    "application/json");
+                return;
+            }
             res.status = 201;
             res.set_content(ok_json(JObj()
                                         .add("assigned", true)
@@ -2681,8 +2700,18 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
-            (void)audit_fn(req, "engine_principal.role.unassigned", "success", "EnginePrincipal",
-                           principal_id, role_name);
+            // #2466/#2406: fail closed — never report an unassign that was not audited.
+            if (!detail::emit_behavioral_audit(audit_fn, req, res,
+                                               "engine_principal.role.unassigned", "success",
+                                               "EnginePrincipal", principal_id, role_name)) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the role unassignment took effect but its audit record "
+                                          "could not be persisted; treat as unconfirmed and "
+                                          "reconcile"),
+                    "application/json");
+                return;
+            }
             res.set_content(ok_json(JObj().add("unassigned", true).str()), "application/json");
         });
 
@@ -3460,13 +3489,25 @@ void RestApiV1::register_routes(
                  if (!result) {
                      res.status = engine_store_error_status(result.error());
                      res.set_content(detail::a4_error(res, result.error()), "application/json");
-                     (void)audit_fn(req, "engine_principal.create", "failure", "EnginePrincipal",
-                                    principal_id, result.error());
+                     (void)detail::emit_behavioral_audit(
+                         audit_fn, req, res, "engine_principal.create", "failure",
+                         "EnginePrincipal", principal_id, result.error());
                      return;
                  }
-                 (void)audit_fn(req, "engine_principal.create", "success", "EnginePrincipal",
-                                principal_id,
-                                "owner=" + owner_username + "; classification=" + classification);
+                 // #2466/#2406: fail closed — a created engine principal whose
+                 // creation audit did not persist must not read as success.
+                 if (!detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.create",
+                                                    "success", "EnginePrincipal", principal_id,
+                                                    "owner=" + owner_username +
+                                                        "; classification=" + classification)) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "the engine principal was created but its audit "
+                                               "record could not be persisted; treat as "
+                                               "unconfirmed and reconcile"),
+                         "application/json");
+                     return;
+                 }
                  res.status = 201;
                  res.set_content(ok_json(JObj().add("principal_id", principal_id).str()),
                                  "application/json");
@@ -3511,8 +3552,9 @@ void RestApiV1::register_routes(
                                  .add("created_at", p.created_at)
                                  .add("active_credential_count", active_creds));
                  }
-                 (void)audit_fn(req, "engine_principal.list", "success", "EnginePrincipal", "",
-                                "count=" + std::to_string(principals.size()));
+                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.list",
+                                                     "success", "EnginePrincipal", "",
+                                                     "count=" + std::to_string(principals.size()));
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(principals.size())),
                                  "application/json");
              });
@@ -3578,8 +3620,9 @@ void RestApiV1::register_routes(
                      .add("revoked_at", row.revoked_at)
                      .add("created_by", row.created_by)
                      .raw("active_credentials", creds.str());
-                 (void)audit_fn(req, "engine_principal.get", "success", "EnginePrincipal",
-                                principal_id, "");
+                 (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.get",
+                                                     "success", "EnginePrincipal", principal_id,
+                                                     "");
                  res.set_content(ok_json(data.str()), "application/json");
              });
 
@@ -3645,8 +3688,9 @@ void RestApiV1::register_routes(
                     // the identity, never proceed on an assumed-zero count.
                     res.status = 503;
                     res.set_content(detail::a4_error(res, creds_res.error()), "application/json");
-                    (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                                   principal_id, creds_res.error());
+                    (void)detail::emit_behavioral_audit(
+                        audit_fn, req, res, "engine_principal.revoke", "failure", "EnginePrincipal",
+                        principal_id, creds_res.error());
                     return;
                 }
                 creds_revoked = *creds_res;
@@ -3655,8 +3699,9 @@ void RestApiV1::register_routes(
             if (!revoke_res) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, revoke_res.error()), "application/json");
-                (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                               principal_id, revoke_res.error());
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.revoke",
+                                                    "failure", "EnginePrincipal", principal_id,
+                                                    revoke_res.error());
                 return;
             }
             bool revoked = *revoke_res;
@@ -3667,14 +3712,26 @@ void RestApiV1::register_routes(
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "failed to revoke engine principal — try again"),
                                 "application/json");
-                (void)audit_fn(req, "engine_principal.revoke", "failure", "EnginePrincipal",
-                               principal_id, "store_unavailable");
+                (void)detail::emit_behavioral_audit(audit_fn, req, res, "engine_principal.revoke",
+                                                    "failure", "EnginePrincipal", principal_id,
+                                                    "store_unavailable");
                 return;
             }
-            (void)audit_fn(req, "engine_principal.revoke", "success", "EnginePrincipal",
-                           principal_id,
-                           "credentials_revoked=" + std::to_string(creds_revoked) +
-                               (superseded_by.empty() ? "" : "; superseded_by=" + superseded_by));
+            // #2466/#2406: fail closed — the revoke committed (credentials already
+            // killed above), but an unrecorded revoke must not read as success.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.revoke", "success", "EnginePrincipal",
+                    principal_id,
+                    "credentials_revoked=" + std::to_string(creds_revoked) +
+                        (superseded_by.empty() ? "" : "; superseded_by=" + superseded_by))) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the engine principal was revoked but its audit record "
+                                          "could not be persisted; treat as unconfirmed and "
+                                          "reconcile"),
+                    "application/json");
+                return;
+            }
             res.set_content(
                 ok_json(JObj().add("revoked", true).add("credentials_revoked",
                                                         static_cast<int64_t>(creds_revoked)).str()),
@@ -3769,12 +3826,27 @@ void RestApiV1::register_routes(
                 }
                 res.status = status;
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
-                (void)audit_fn(req, "engine_principal.credential.mint", "failure", "EnginePrincipal",
-                               principal_id, result.error());
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "failure",
+                    "EnginePrincipal", principal_id, result.error());
                 return;
             }
-            (void)audit_fn(req, "engine_principal.credential.mint", "success", "EnginePrincipal",
-                           principal_id, "ttl_days=" + std::to_string(ttl_days));
+            // #2466/#2406: fail closed — the credential was minted, but an
+            // unrecorded mint must not return the one-time secret. On a dropped
+            // audit the secret is discarded (never placed in the 503 body); the
+            // operator reconciles by listing/rotating. (Fraser-approved posture
+            // for the secret-returning routes.)
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.mint", "success",
+                    "EnginePrincipal", principal_id, "ttl_days=" + std::to_string(ttl_days))) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the credential was minted but its audit record could "
+                                          "not be persisted; the secret was withheld — rotate to "
+                                          "obtain a fresh, audited credential"),
+                    "application/json");
+                return;
+            }
             res.status = 201;
             // create_token returns only the raw secret; look up the freshly
             // minted row (the newest active credential) for its token_id so a
@@ -3852,14 +3924,28 @@ void RestApiV1::register_routes(
             if (!result) {
                 res.status = engine_store_error_status(result.error());
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
-                (void)audit_fn(req, "engine_principal.credential.rotate", "failure",
-                               "EnginePrincipal", principal_id, result.error());
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.rotate", "failure",
+                    "EnginePrincipal", principal_id, result.error());
                 return;
             }
             // The reveal IS the success audit for this route — see the
             // comment above the route registration.
-            (void)audit_fn(req, "engine_principal.credential.reveal", "success", "EnginePrincipal",
-                           principal_id, "rotate");
+            // #2466/#2406: fail closed — the reveal IS this route's success audit,
+            // so a dropped reveal-audit means the raw secret would leave the server
+            // with no audit-chain row. Withhold it and 503; the operator rotates
+            // again for an audited credential. (Fraser-approved for secret routes.)
+            if (!detail::emit_behavioral_audit(audit_fn, req, res,
+                                               "engine_principal.credential.reveal", "success",
+                                               "EnginePrincipal", principal_id, "rotate")) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the credential was rotated but the reveal audit could "
+                                          "not be persisted; the secret was withheld — rotate "
+                                          "again to obtain a fresh, audited credential"),
+                    "application/json");
+                return;
+            }
             // rotate_engine_credential returns only the raw secret; look up
             // the successor for its token_id + expires_at/overlap_expires_at
             // — mirrors the MCP rotate_engine_credential twin's correlation
@@ -3956,8 +4042,9 @@ void RestApiV1::register_routes(
                                                  {.remediation = "pass the token_id returned by "
                                                                  "the rotate response"}),
                                 "application/json");
-                (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
-                               "EnginePrincipal", principal_id, "token_id required");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.confirm", "failure",
+                    "EnginePrincipal", principal_id, "token_id required");
                 return;
             }
             // #3015 proof-of-possession: the caller must ALSO present the
@@ -3974,8 +4061,9 @@ void RestApiV1::register_routes(
                                                                  "rotate returned in the request "
                                                                  "body's \"secret\" field"}),
                                 "application/json");
-                (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
-                               "EnginePrincipal", principal_id, "secret required");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.confirm", "failure",
+                    "EnginePrincipal", principal_id, "secret required");
                 return;
             }
             auto confirmed = token_store->confirm_rotation(principal_id, confirm_token_id,
@@ -3991,16 +4079,27 @@ void RestApiV1::register_routes(
                                     {.remediation =
                                          confirm_rotation_error_remediation(confirmed.error())}),
                                 "application/json");
-                (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
-                               "EnginePrincipal", principal_id, confirmed.error());
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.confirm", "failure",
+                    "EnginePrincipal", principal_id, confirmed.error());
                 return;
             }
             confirm_metric("success");
             // Success detail records WHICH credential was confirmed — the
             // store validated confirm_token_id equals the pending successor's
             // token_id, so this is server-verified and not the raw secret.
-            (void)audit_fn(req, "engine_principal.credential.confirm", "success", "EnginePrincipal",
-                           principal_id, "token_id=" + confirm_token_id);
+            // #2466/#2406: fail closed — the rotation was confirmed (predecessor
+            // retired), but an unrecorded confirm must not read as success.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.credential.confirm", "success",
+                    "EnginePrincipal", principal_id, "token_id=" + confirm_token_id)) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "the rotation was confirmed but its audit record could "
+                                          "not be persisted; treat as unconfirmed and reconcile"),
+                    "application/json");
+                return;
+            }
             res.set_content(ok_json(JObj().add("confirmed", true).str()), "application/json");
         });
 
@@ -4074,8 +4173,9 @@ void RestApiV1::register_routes(
             if (!transfer_res) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, transfer_res.error()), "application/json");
-                (void)audit_fn(req, "engine_principal.transfer_owner", "failure",
-                               "EnginePrincipal", principal_id, transfer_res.error());
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.transfer_owner", "failure",
+                    "EnginePrincipal", principal_id, transfer_res.error());
                 return;
             }
             bool transferred = *transfer_res;
@@ -4084,13 +4184,24 @@ void RestApiV1::register_routes(
                 res.set_content(
                     detail::a4_error(res, "failed to transfer ownership — try again"),
                     "application/json");
-                (void)audit_fn(req, "engine_principal.transfer_owner", "failure",
-                               "EnginePrincipal", principal_id, "store_unavailable");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.transfer_owner", "failure",
+                    "EnginePrincipal", principal_id, "store_unavailable");
                 return;
             }
-            (void)audit_fn(req, "engine_principal.transfer_owner", "success", "EnginePrincipal",
-                           principal_id,
-                           "old_owner=" + existing.owner_username + "; new_owner=" + new_owner);
+            // #2466/#2406: fail closed — ownership transferred, but an unrecorded
+            // transfer must not read as success.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.transfer_owner", "success",
+                    "EnginePrincipal", principal_id,
+                    "old_owner=" + existing.owner_username + "; new_owner=" + new_owner)) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "ownership was transferred but its audit record could "
+                                          "not be persisted; treat as unconfirmed and reconcile"),
+                    "application/json");
+                return;
+            }
             res.set_content(ok_json(JObj().add("transferred", true).str()), "application/json");
         });
 
@@ -4148,8 +4259,9 @@ void RestApiV1::register_routes(
                 res.set_content(
                     detail::a4_error(res, "rbac reference data unavailable — cannot verify"),
                     "application/json");
-                (void)audit_fn(req, "engine_principal.audit.no_admin", "failure", "AuditLog",
-                               "no-admin", "rbac_resolution_failed");
+                (void)detail::emit_behavioral_audit(
+                    audit_fn, req, res, "engine_principal.audit.no_admin", "failure", "AuditLog",
+                    "no-admin", "rbac_resolution_failed");
                 return;
             }
             const std::size_t full_grant_size = all_securables.size() * all_operations.size();
@@ -4199,8 +4311,9 @@ void RestApiV1::register_routes(
 
             const bool ok = violations.size() == 0;
             std::string data = JObj().add("ok", ok).raw("violations", violations.str()).str();
-            (void)audit_fn(req, "engine_principal.audit.no_admin", "success", "AuditLog",
-                           "no-admin", "violations=" + std::to_string(violations.size()));
+            (void)detail::emit_behavioral_audit(
+                audit_fn, req, res, "engine_principal.audit.no_admin", "success", "AuditLog",
+                "no-admin", "violations=" + std::to_string(violations.size()));
             res.set_content(ok_json(data), "application/json");
         });
 
