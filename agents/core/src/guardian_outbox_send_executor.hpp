@@ -262,28 +262,32 @@ private:
         // in_flight_event_id/done have exactly one writer (this function, called only
         // from offer(), which has exactly one caller thread), so writing them before
         // the worker can possibly touch `done` is race-free by construction.
-        {
-            std::lock_guard<std::mutex> lk{state_->mu};
-            state_->in_flight = true;
-            state_->in_flight_event_id = entry.event_id;
-            state_->done = false;
-        }
+        //
         // Everything from here through spawn_detached() can throw std::bad_alloc:
+        // the in_flight_event_id string copy just below (governance Gate 8 cpp-safety
+        // finding - an earlier draft placed this bookkeeping BEFORE the try, so a
+        // thrown bad_alloc on the copy itself left in_flight=true uncaught, the same
+        // wedge class one statement earlier than the guarded region started),
         // make_shared<AliveTicket>, copying `entry`/`send` into the worker lambda's
         // captures, and spawn_detached's own payload allocation (guardian_io_executor.hpp's
         // own doc). ALL of it is inside one try, and any failure - a thrown bad_alloc
         // OR spawn_detached returning false for an OS-level refusal - takes the SAME
-        // rollback path below. An uncaught throw here would unwind past the bookkeeping
-        // written above with in_flight left true and no worker ever created to set
-        // done=true, wedging this entry exactly like the ordering bug this function's
-        // rewrite fixed (verified in review) - just triggered by allocation failure
-        // instead of a timing race. None of these failures are specific to `entry` (they
-        // are thread/memory exhaustion, not an unsendable payload), so all are mapped to
-        // a plain launch failure - the caller retries next tick - rather than let a
-        // bad_alloc escape into drain_log_unlocked's catch and be miscounted as a
-        // send_exceptions_ hit.
+        // rollback path below. An uncaught throw here would unwind with in_flight left
+        // true and no worker ever created to set done=true, wedging this entry exactly
+        // like the ordering bug this function's rewrite fixed (verified in review) -
+        // just triggered by allocation failure instead of a timing race. None of these
+        // failures are specific to `entry` (they are thread/memory exhaustion, not an
+        // unsendable payload), so all are mapped to a plain launch failure - the caller
+        // retries next tick - rather than let a bad_alloc escape into
+        // drain_log_unlocked's catch and be miscounted as a send_exceptions_ hit.
         bool launched = false;
         try {
+            {
+                std::lock_guard<std::mutex> lk{state_->mu};
+                state_->in_flight = true;
+                state_->in_flight_event_id = entry.event_id;
+                state_->done = false;
+            }
             // Constructed (and counted, via its self-locking ctor) BEFORE the launch
             // attempt, inside a shared_ptr so a launch failure's synchronous destruction
             // and a launched worker's eventual thread-exit destruction both go through
