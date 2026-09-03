@@ -6,11 +6,12 @@
  * Section (E1): parser fixtures driven from the REAL captures at
  * scratchpad/devteam-wave6-1b-fsposture/captures/ (see captures/PROVENANCE.md
  * for the full provenance table); each fixture below carries that file's
- * label verbatim in a comment. Two groups are NOT capture-backed and are
+ * label verbatim in a comment. One group is NOT capture-backed and is
  * labelled accordingly: classify_quotactl_errno's non-observed errno rows
- * (documented-inference from quotactl(2), peer M7), and
- * parse_gmt_multistring's synthetic round-trip (no Windows host was
- * available 2026-09-02).
+ * (documented-inference from quotactl(2), peer M7). The former
+ * parse_gmt_multistring synthetic round-trip was removed with its parser
+ * when the Windows snapshots leg moved to VSS/COM (verified on a live
+ * Windows host 2026-09-03), so no synthetic fixture remains here.
  *
  * Section (E2): formatter smoke tests (peer H2) -- this is what compiles
  * AND EXECUTES filesystem_posture_legs.hpp in wave 1, the same wave that
@@ -376,71 +377,6 @@ TEST_CASE("filesystem_posture: parse_fs_snapshot_list_buffer -- zero attr_length
     put_u32(unterminated, 24, 8);
     put_u32(unterminated, 28, 1);
     CHECK(parse_fs_snapshot_list_buffer(unterminated, 1).malformed);
-}
-
-namespace {
-// Test-local encoder for parse_gmt_multistring's synthetic round-trip below --
-// NOT part of the plugin's own decode surface.
-std::vector<std::byte> encode_gmt_multistring(const std::vector<std::string>& names) {
-    std::vector<std::byte> buf;
-    auto push_u16 = [&buf](char16_t c) {
-        buf.push_back(static_cast<std::byte>(c & 0xFF));
-        buf.push_back(static_cast<std::byte>((c >> 8) & 0xFF));
-    };
-    for (const auto& n : names) {
-        for (char c : n)
-            push_u16(static_cast<char16_t>(static_cast<unsigned char>(c)));
-        push_u16(0);
-    }
-    push_u16(0); // terminating empty string (double-NUL)
-    return buf;
-}
-} // namespace
-
-// synthetic round-trip of the documented SRV_SNAPSHOT_ARRAY grammar -- NOT an
-// OS capture; no Windows host was available 2026-09-02.
-TEST_CASE("filesystem_posture: parse_gmt_multistring -- synthetic round-trip",
-         "[filesystem_posture]") {
-    std::vector<std::string> names = {"@GMT-2026.01.01-00.00.00", "@GMT-2026.06.15-12.30.00"};
-    auto buf = encode_gmt_multistring(names);
-    auto result = parse_gmt_multistring(std::span<const std::byte>(buf));
-    CHECK_FALSE(result.malformed);
-    CHECK_FALSE(result.truncated);
-    REQUIRE(result.names.size() == 2);
-    CHECK(result.names[0] == names[0]);
-    CHECK(result.names[1] == names[1]);
-}
-
-// synthetic round-trip of the documented SRV_SNAPSHOT_ARRAY grammar -- NOT an
-// OS capture; no Windows host was available 2026-09-02.
-TEST_CASE("filesystem_posture: parse_gmt_multistring -- max_names caps the walk",
-         "[filesystem_posture]") {
-    auto buf = encode_gmt_multistring({"@GMT-1", "@GMT-2", "@GMT-3"});
-    auto result = parse_gmt_multistring(std::span<const std::byte>(buf), /*max_names=*/1);
-    CHECK(result.truncated);
-    CHECK(result.names.size() == 1);
-}
-
-// synthetic round-trip of the documented SRV_SNAPSHOT_ARRAY grammar -- NOT an
-// OS capture; no Windows host was available 2026-09-02.
-TEST_CASE("filesystem_posture: parse_gmt_multistring -- exactly-full list immediately followed "
-         "by the terminator is not truncated (peer PKG-007)",
-         "[filesystem_posture]") {
-    auto buf = encode_gmt_multistring({"@GMT-1", "@GMT-2"});
-    auto result = parse_gmt_multistring(std::span<const std::byte>(buf), /*max_names=*/2);
-    CHECK_FALSE(result.truncated);
-    REQUIRE(result.names.size() == 2);
-}
-
-// synthetic round-trip of the documented SRV_SNAPSHOT_ARRAY grammar -- NOT an
-// OS capture; no Windows host was available 2026-09-02.
-TEST_CASE("filesystem_posture: parse_gmt_multistring -- truncated buffer (no terminating NUL) "
-         "sets malformed",
-         "[filesystem_posture]") {
-    std::vector<std::byte> buf = {std::byte{'@'}, std::byte{0}}; // one code unit, no terminator
-    auto result = parse_gmt_multistring(std::span<const std::byte>(buf));
-    CHECK(result.malformed);
-    CHECK(result.names.empty());
 }
 
 // ============================================================================

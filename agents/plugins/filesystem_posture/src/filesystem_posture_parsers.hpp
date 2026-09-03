@@ -104,42 +104,6 @@ inline std::int32_t read_le_i32(std::span<const std::byte> buf, std::size_t offs
     return v;
 }
 
-// Minimal UTF-16 (with surrogate-pair support) -> UTF-8 encoder for
-// parse_gmt_multistring's decoded names.
-inline std::string utf16_to_utf8(const std::u16string& s) {
-    std::string out;
-    out.reserve(s.size());
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        char32_t cp = s[i];
-        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.size() && s[i + 1] >= 0xDC00 &&
-            s[i + 1] <= 0xDFFF) {
-            const char32_t lo = s[i + 1];
-            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-            ++i;
-        } else if (cp >= 0xD800 && cp <= 0xDFFF) {
-            // Unpaired high or low surrogate -- never emit invalid UTF-8 for
-            // it; replace with U+FFFD per the standard Unicode fallback.
-            cp = 0xFFFD;
-        }
-        if (cp <= 0x7F) {
-            out.push_back(static_cast<char>(cp));
-        } else if (cp <= 0x7FF) {
-            out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else if (cp <= 0xFFFF) {
-            out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        } else {
-            out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-            out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-        }
-    }
-    return out;
-}
-
 } // namespace detail
 
 // ── mountinfo ────────────────────────────────────────────────────────────
@@ -606,51 +570,6 @@ inline SnapshotNames parse_fs_snapshot_list_buffer(std::span<const std::byte> bu
         offset += record_length;
     }
     return out;
-}
-
-/**
- * Decode a little-endian UTF-16 double-NUL-terminated multistring (the
- * documented SRV_SNAPSHOT_ARRAY / FSCTL_SRV_ENUMERATE_SNAPSHOTS wire shape:
- * name1\0 name2\0 ... nameN\0 \0) into UTF-8 names. Stops at the terminating
- * empty string. Every 2-byte code-unit read is bounds-checked before it
- * happens; running out of bytes before a terminating NUL sets
- * `malformed = true` and stops the walk. Capped at `max_names`.
- */
-inline SnapshotNames parse_gmt_multistring(std::span<const std::byte> utf16le_bytes,
-                                           std::size_t max_names = 1024) {
-    SnapshotNames out{{}, false, false};
-    std::size_t pos = 0;
-    for (;;) {
-        if (out.names.size() >= max_names) {
-            // An exactly-full list followed immediately by the terminating
-            // empty string is NOT truncated -- peek for the double-NUL
-            // terminator before declaring truncation.
-            if (pos + 2 <= utf16le_bytes.size() && utf16le_bytes[pos] == std::byte{0} &&
-                utf16le_bytes[pos + 1] == std::byte{0}) {
-                return out;
-            }
-            out.truncated = true;
-            return out;
-        }
-        std::u16string current;
-        for (;;) {
-            if (pos + 2 > utf16le_bytes.size()) {
-                out.malformed = true;
-                return out;
-            }
-            const auto lo = std::to_integer<unsigned char>(utf16le_bytes[pos]);
-            const auto hi = std::to_integer<unsigned char>(utf16le_bytes[pos + 1]);
-            pos += 2;
-            const auto unit =
-                static_cast<char16_t>(static_cast<unsigned>(lo) | (static_cast<unsigned>(hi) << 8));
-            if (unit == 0)
-                break;
-            current.push_back(unit);
-        }
-        if (current.empty())
-            return out; // double-NUL: end of multistring, success
-        out.names.push_back(detail::utf16_to_utf8(current));
-    }
 }
 
 } // namespace yuzu::filesystem_posture

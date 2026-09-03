@@ -2,22 +2,32 @@
  * filesystem_posture_win.cpp — Windows leg entry points for the
  * filesystem_posture plugin (mounts/quotas/snapshots).
  *
- * COMPILE-VERIFIED ONLY (all three entry points below): this TU is checked
- * with `clang++ -fsyntax-only` on macOS with its body preprocessed away
- * (nothing here compiles outside `#if defined(_WIN32)`) and is expected to
- * build under MSVC in CI, but NO PART OF IT has been exercised against a
- * live Windows host in this change -- not the volume-enumeration walk, not
- * the IDiskQuotaControl COM path, not the FSCTL_SRV_ENUMERATE_SNAPSHOTS
- * buffer decode. The MSVC CI leg is the first real compiler this file sees;
- * a live Windows agent run is the first real runtime exercise.
+ * HOST-VERIFIED on the-rig (DESKTOP-04DNSIG, Windows SDK 10.0.26100.0, MSVC
+ * Build Tools 2022) on 2026-09-03: this TU compiles clean under real MSVC
+ * (zero errors, zero warnings), the plugin's unit suite passes there
+ * (145 assertions / 23 cases), and the snapshots leg was exercised against
+ * three live VSS shadow copies. The volume-enumeration walk and the
+ * IDiskQuotaControl quota path are compiled and linked but have not been
+ * asserted against a host with quotas configured, so their runtime
+ * behaviour past "it runs" is still unproven.
  *
  * Two SDK surfaces are soft-guarded because their availability at build time
- * is not something this host can verify, and neither guard's failure is
- * allowed to silently look like success:
+ * is not something a non-Windows host can verify, and neither guard's failure
+ * is allowed to silently look like success:
  *   - `<dskquota.h>` (quota state) via `__has_include`; a build lacking it
  *     reports every volume `unavailable` and degrades the result.
- *   - `FSCTL_SRV_ENUMERATE_SNAPSHOTS` (shadow-copy enumeration) via
- *     `#ifdef`; an SDK too old to define it reports the same way.
+ *   - `<vsbackup.h>` (VSS shadow-copy enumeration) via `__has_include`; a
+ *     build lacking it reports the same way.
+ *
+ * Snapshots do NOT use `FSCTL_SRV_ENUMERATE_SNAPSHOTS`, which an earlier
+ * revision of this file did. That control is not declared by ANY header in
+ * SDK 10.0.26100.0 -- verified twice on the-rig: a direct probe fails
+ * `C2065: undeclared identifier`, and the shipped DLL contained the
+ * "built without FSCTL_SRV_ENUMERATE_SNAPSHOTS" sentinel, proving the guard
+ * had compiled the real path out and the leg was a permanent fallback row.
+ * It is also the wrong question: it is an SMB *server*-side control listing
+ * the previous versions a share exposes to clients, not the shadow copies a
+ * volume holds. See the mechanism banner above emit_snapshot_rows_vss.
  *
  * Every OS call here is read-only: no write/format/delete right is ever
  * requested on a volume handle, quota control instance, or drive.
@@ -32,12 +42,23 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
-#include <winioctl.h>
 
 #include <win_com.hpp>
 #include <win_str.hpp>
 
 #include "filesystem_posture_legs.hpp"
+
+// VSS must be included BEFORE the initguid.h block below. initguid.h switches
+// DEFINE_GUID from "declare" to "allocate storage", and that switch applies to
+// every header processed AFTER it -- letting it reach the VSS headers would
+// define GUIDs that vssapi.lib already exports and risk LNK2005. Including VSS
+// first keeps its GUIDs as plain declarations resolved from the import library.
+#if __has_include(<vsbackup.h>)
+#define YUZU_FSPOSTURE_HAVE_VSS 1
+#include <vss.h>
+#include <vswriter.h> // both are prerequisites of vsbackup.h, in this order
+#include <vsbackup.h>
+#endif
 
 // initguid.h must precede dskquota.h in exactly this TU: it makes dskquota.h
 // DEFINE (not merely declare) CLSID_DiskQuotaControl / IID_IDiskQuotaControl
@@ -51,9 +72,8 @@
 #include <cstddef>
 #include <format>
 #include <optional>
-#include <span>
 #include <string>
-#include <cstring> // std::memcpy for the FSCTL framing header
+#include <string_view>
 #include <vector>
 
 namespace yuzu::filesystem_posture {
@@ -458,147 +478,205 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
 #endif // YUZU_FSPOSTURE_HAVE_DSKQUOTA
 
 // ── snapshots ────────────────────────────────────────────────────────────
+//
+// MECHANISM: VSS/COM (IVssBackupComponents::Query), replacing
+// FSCTL_SRV_ENUMERATE_SNAPSHOTS. The file banner records why the FSCTL was
+// both unavailable on the current SDK and the wrong question.
+//
+// VERIFIED on the-rig 2026-09-03 against three live shadow copies (Windows
+// SDK 10.0.26100.0). Query returns every snapshot process-wide in one call
+// and each carries its own originating volume, so this leg -- unlike
+// emit_mounts/emit_quotas -- does not enumerate volumes first.
+//
+// PRIVILEGE, measured rather than assumed:
+//   NT AUTHORITY\SYSTEM           CreateVssBackupComponents -> S_OK, 3 found
+//   NT AUTHORITY\LOCAL SERVICE    -> E_ACCESSDENIED (0x80070005)
+//   NT AUTHORITY\NETWORK SERVICE  -> E_ACCESSDENIED (0x80070005)
+// The Windows agent service runs as LocalSystem today (#1442), so this leg
+// works as shipped. When #1442 moves it to NT SERVICE\YuzuAgent the call
+// becomes E_ACCESSDENIED -- which is why a denial is reported as an explicit
+// PERMISSION_DENIED degradation below and must never be allowed to read as
+// an empty, healthy snapshot set. The descriptor's fallback prose says the
+// same thing in operator terms.
+//
+// NO CoInitializeSecurity call anywhere in this leg: it is a process-global,
+// once-only setting and a plugin must never impose one on its host agent.
+// Verified as SYSTEM that CreateVssBackupComponents/Query both succeed under
+// a bare CoInitializeEx(MTA) -- exactly what yuzu::shared::win::ComInit does.
 
-#ifdef FSCTL_SRV_ENUMERATE_SNAPSHOTS
+#if defined(YUZU_FSPOSTURE_HAVE_VSS)
 
-void emit_snapshot_rows_fsctl(yuzu::CommandContext& ctx, const std::vector<std::wstring>& volumes) {
-    bool any_failure = false;
-    DWORD first_failure_err = 0;
-    bool any_tokens = false;
-    bool any_truncated = false;
+/// RAII owner for the heap strings VSS allocates into a VSS_SNAPSHOT_PROP.
+/// Next() fills a fresh property block on every iteration, so this must free
+/// on EVERY loop turn, including the early-continue paths. Unwrapped manual
+/// cleanup in new C++ is a governance policy floor, not a style preference.
+class ScopedSnapshotProp {
+public:
+    explicit ScopedSnapshotProp(VSS_SNAPSHOT_PROP& p) : p_(&p) {}
+    ~ScopedSnapshotProp() {
+        if (p_) ::VssFreeSnapshotProperties(p_);
+    }
+    ScopedSnapshotProp(const ScopedSnapshotProp&) = delete;
+    ScopedSnapshotProp& operator=(const ScopedSnapshotProp&) = delete;
 
-    for (const auto& vol : volumes) {
-        const std::string mp = yuzu::win::from_wide(primary_mount_point(vol).c_str());
+private:
+    VSS_SNAPSHOT_PROP* p_;
+};
 
-        // CreateFileW wants the volume root WITHOUT the trailing backslash
-        // that GetVolumeInformationW/GetDriveTypeW/GetDiskFreeSpaceExW need.
-        std::wstring root = vol;
-        if (!root.empty() && root.back() == L'\\')
-            root.pop_back();
+std::string guid_to_string(const GUID& g) {
+    wchar_t buf[64] = {};
+    if (::StringFromGUID2(g, buf, 64) == 0) return "-";
+    return yuzu::win::from_wide(buf);
+}
 
-        // Read-only rights ONLY. FILE_READ_DATA is required: the FSCTL's
-        // CTL_CODE carries FILE_READ_DATA access, and opening with
-        // FILE_READ_ATTRIBUTES|SYNCHRONIZE alone fails ACCESS_DENIED on
-        // every volume -- a self-inflicted rights bug that this function's
-        // own failure/empty distinction would otherwise misreport as a
-        // genuine FSCTL failure.
-        const HANDLE raw_handle =
-            ::CreateFileW(root.c_str(), FILE_READ_ATTRIBUTES | FILE_READ_DATA | SYNCHRONIZE,
-                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                         FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        const ScopedFileHandle handle(raw_handle);
-        if (!handle.valid()) {
-            any_failure = true;
-            if (first_failure_err == 0)
-                first_failure_err = ::GetLastError();
+/// Renders a VSS step failure for both the row `detail` and the
+/// mark_result_partial provenance. E_ACCESSDENIED is named explicitly: it is
+/// the one failure here an operator can actually act on, and it is what
+/// #1442 will turn this leg into fleet-wide.
+std::string vss_failure_detail(std::string_view step, HRESULT hr) {
+    if (hr == E_ACCESSDENIED) {
+        return std::format("{} denied (0x{:08X}): VSS snapshot enumeration requires "
+                           "administrative rights, which this agent service account lacks",
+                           step, static_cast<unsigned long>(hr));
+    }
+    return std::format("{} failed: 0x{:08X}", step, static_cast<unsigned long>(hr));
+}
+
+void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
+    // Every early return below writes BOTH a `none` row and a partial mark:
+    // a failure must stay distinguishable from a genuinely empty snapshot
+    // set, which is the same peer-H6 rule the retired FSCTL path carried.
+    const auto fail = [&ctx](std::string_view step, HRESULT hr) {
+        const std::string detail = vss_failure_detail(step, hr);
+        write_snapshot_row(ctx, "-", "-", "none", detail);
+        mark_result_partial(ctx, "windows:vss", detail);
+    };
+
+    yuzu::shared::win::ComInit com;
+    if (!com.ok()) {
+        constexpr const char* kDetail = "COM initialisation failed";
+        write_snapshot_row(ctx, "-", "-", "none", kDetail);
+        mark_result_partial(ctx, "windows:vss", kDetail);
+        return;
+    }
+
+    yuzu::shared::win::ComPtr<IVssBackupComponents> backup;
+    HRESULT hr = ::CreateVssBackupComponents(backup.put());
+    if (FAILED(hr) || !backup) {
+        fail("CreateVssBackupComponents", hr);
+        return;
+    }
+
+    hr = backup->InitializeForBackup();
+    if (FAILED(hr)) {
+        fail("InitializeForBackup", hr);
+        return;
+    }
+
+    // VSS_CTX_ALL so both persistent backup snapshots and the
+    // client-accessible ones behind "Previous Versions" / System Restore are
+    // enumerated; the default context reports only a subset. A failure here
+    // is NOT fatal -- the query still runs at the default context -- but it
+    // narrows what can be seen, so it is recorded rather than swallowed.
+    const bool context_narrowed = FAILED(backup->SetContext(VSS_CTX_ALL));
+
+    yuzu::shared::win::ComPtr<IVssEnumObject> snapshots;
+    hr = backup->Query(GUID_NULL, VSS_OBJECT_NONE, VSS_OBJECT_SNAPSHOT, snapshots.put());
+    if (FAILED(hr) || !snapshots) {
+        fail("Query", hr);
+        return;
+    }
+
+    // Bound the walk. Next() is driven by a storage provider this process
+    // does not control, so the loop carries its own ceiling for the same
+    // reason the macOS leg caps fs_snapshot_list; the cap matches that leg's
+    // so the two platforms' truncation semantics stay comparable.
+    constexpr std::size_t kMaxSnapshots = 1024;
+
+    std::size_t emitted = 0;
+    bool truncated = false;
+    bool enum_failed = false;
+    HRESULT enum_hr = S_OK;
+    bool skipped_wrong_type = false;
+
+    for (;;) {
+        VSS_OBJECT_PROP prop{};
+        ULONG fetched = 0;
+        const HRESULT next_hr = snapshots->Next(1, &prop, &fetched);
+        if (next_hr != S_OK || fetched != 1) {
+            // S_FALSE with a zero fetch is the normal end of the walk; a
+            // genuinely FAILED result is a partial read and must not be
+            // allowed to read as "no more snapshots".
+            if (FAILED(next_hr)) {
+                enum_failed = true;
+                enum_hr = next_hr;
+            }
+            break;
+        }
+
+        // Only a snapshot-typed property owns snapshot strings. Freeing the
+        // Snap arm of the union on any other type would free the wrong arm,
+        // so such an entry is skipped WITHOUT constructing the RAII owner.
+        if (prop.Type != VSS_OBJECT_SNAPSHOT) {
+            skipped_wrong_type = true;
             continue;
         }
 
-        std::vector<std::byte> buf(65536);
-        DWORD returned = 0;
-        const BOOL ok =
-            ::DeviceIoControl(handle.get(), FSCTL_SRV_ENUMERATE_SNAPSHOTS, nullptr, 0, buf.data(),
-                              static_cast<DWORD>(buf.size()), &returned, nullptr);
-        if (!ok) {
-            any_failure = true;
-            if (first_failure_err == 0)
-                first_failure_err = ::GetLastError();
-            continue;
-        }
+        const ScopedSnapshotProp owner(prop.Obj.Snap);
+        const VSS_SNAPSHOT_PROP& snap = prop.Obj.Snap;
 
-        // Fixed 3-ULONG header: NumberOfSnapShots, NumberOfSnapShotsReturned,
-        // SnapShotArraySize -- the trailing bytes are the UTF-16LE
-        // double-NUL multistring.
-        constexpr std::size_t kHeaderBytes = 3 * sizeof(ULONG);
-        if (returned < kHeaderBytes) {
-            any_failure = true;
-            if (first_failure_err == 0)
-                first_failure_err = ERROR_INVALID_DATA;
-            continue;
-        }
+        // m_pwszOriginalVolumeName is a volume GUID path in exactly the form
+        // primary_mount_point() expects, so a snapshot maps to the same
+        // mount-point vocabulary the mounts action reports.
+        const std::wstring original =
+            snap.m_pwszOriginalVolumeName ? snap.m_pwszOriginalVolumeName : L"";
+        const std::string mount_point =
+            original.empty() ? std::string("-")
+                             : yuzu::win::from_wide(primary_mount_point(original).c_str());
+        const std::string name = guid_to_string(snap.m_SnapshotId);
+        const std::string device = snap.m_pwszSnapshotDeviceObject
+                                       ? yuzu::win::from_wide(snap.m_pwszSnapshotDeviceObject)
+                                       : std::string("-");
 
-        // CDX-P2-06: the three framing ULONGs were documented but never read,
-        // so the walker parsed everything after the header regardless of what
-        // the driver said the array actually contains. Read them and let them
-        // bound the walk. All three are native-endian in a locally-filled
-        // DeviceIoControl buffer, so memcpy rather than a byte-order helper.
-        // NumberOfSnapShots is the TOTAL the volume holds; only
-        // NumberOfSnapShotsReturned and SnapShotArraySize bound THIS reply, so
-        // the total is read for completeness and deliberately not used as a
-        // bound (governance CE-1 -- the earlier comment overclaimed that all
-        // three bound the walk).
-        [[maybe_unused]] ULONG number_of_snapshots = 0;
-        ULONG number_returned = 0;
-        ULONG array_size_bytes = 0;
-        std::memcpy(&number_of_snapshots, buf.data() + 0 * sizeof(ULONG), sizeof(ULONG));
-        std::memcpy(&number_returned, buf.data() + 1 * sizeof(ULONG), sizeof(ULONG));
-        std::memcpy(&array_size_bytes, buf.data() + 2 * sizeof(ULONG), sizeof(ULONG));
-
-        const std::size_t available = returned - kHeaderBytes;
-        // A declared array larger than what was actually returned means the
-        // reply is short: the payload cannot be trusted to be complete.
-        if (static_cast<std::size_t>(array_size_bytes) > available) {
-            any_failure = true;
-            if (first_failure_err == 0)
-                first_failure_err = ERROR_INVALID_DATA;
-            continue;
-        }
-        // Trust the DECLARED length over the returned byte count -- trailing
-        // bytes beyond SnapShotArraySize are not part of the multistring.
-        const std::size_t payload_bytes =
-            array_size_bytes > 0 ? static_cast<std::size_t>(array_size_bytes) : available;
-
-        const std::span<const std::byte> payload(buf.data() + kHeaderBytes, payload_bytes);
-        // NumberOfSnapShotsReturned bounds how many names the array may hold.
-        const SnapshotNames names =
-            parse_gmt_multistring(payload, number_returned > 0
-                                              ? static_cast<std::size_t>(number_returned)
-                                              : 1024);
-        if (names.malformed) {
-            any_failure = true;
-            if (first_failure_err == 0)
-                first_failure_err = ERROR_INVALID_DATA;
-            continue;
-        }
-        if (names.truncated) {
-            any_truncated = true;
-        }
-        // SG-3: an internally inconsistent but "successful" reply -- declaring
-        // more snapshots than it delivers -- previously parsed to a short list
-        // with malformed=false and truncated=false, i.e. a clean COMPLETE
-        // inventory that silently omits entries. Compare against the driver's
-        // own declared count.
-        if (number_returned > 0 && names.names.size() < static_cast<std::size_t>(number_returned)) {
-            any_truncated = true;
-        }
-        for (const auto& name : names.names) {
-            write_snapshot_row(ctx, mp, name, "vss", "-");
-            any_tokens = true;
+        write_snapshot_row(ctx, mount_point, name, "vss", device);
+        ++emitted;
+        if (emitted >= kMaxSnapshots) {
+            truncated = true;
+            break;
         }
     }
 
-    // Failure must be distinguishable from emptiness (peer H6): an
-    // ERROR_INVALID_FUNCTION on every volume must never masquerade as "no
-    // backups". Only report the clean, genuinely-empty sentinel when every
-    // volume's DeviceIoControl actually succeeded.
-    if (any_failure) {
-        const std::string detail =
-            std::format("FSCTL_SRV_ENUMERATE_SNAPSHOTS failed: {}", first_failure_err);
-        write_snapshot_row(ctx, "-", "-", "none", detail);
-        mark_result_partial(ctx, "windows:fsctl_snapshots", detail);
-    } else if (!any_tokens) {
-        write_snapshot_row(ctx, "-", "-", "none", "no shadow copies exposed on any volume");
-    } else if (any_truncated) {
-        // Tokens were found and emitted, but at least one volume's list hit
-        // parse_gmt_multistring's 1024-entry cap -- the visible rows are
-        // real, but the set is known incomplete, so this must not read as a
-        // clean, complete result.
-        mark_result_partial(ctx, "windows:fsctl_snapshots",
-                            "snapshot list truncated at 1024 entries on at least one volume");
+    if (enum_failed) {
+        const std::string detail = vss_failure_detail("IVssEnumObject::Next", enum_hr);
+        // Rows already emitted are real; only a walk that produced nothing
+        // needs the `none` sentinel to carry the failure.
+        if (emitted == 0) write_snapshot_row(ctx, "-", "-", "none", detail);
+        mark_result_partial(ctx, "windows:vss", detail);
+        return;
+    }
+    if (emitted == 0) {
+        write_snapshot_row(ctx, "-", "-", "none", "no shadow copies present on any volume");
+    }
+    // mark_result_partial ASSIGNS -- last writer wins for the reported
+    // provenance -- so these run least-material first, leaving the most
+    // material cause (an incomplete list) as the one an operator sees.
+    if (skipped_wrong_type) {
+        mark_result_partial(ctx, "windows:vss",
+                            "the provider returned a non-snapshot object; it was skipped");
+    }
+    if (context_narrowed) {
+        mark_result_partial(
+            ctx, "windows:vss",
+            "SetContext(VSS_CTX_ALL) failed; only the default snapshot context was enumerated");
+    }
+    if (truncated) {
+        mark_result_partial(
+            ctx, "windows:vss",
+            std::format("snapshot list truncated at the {}-entry cap", kMaxSnapshots));
     }
 }
 
-#endif // FSCTL_SRV_ENUMERATE_SNAPSHOTS
+#endif // YUZU_FSPOSTURE_HAVE_VSS
 
 } // namespace
 
@@ -660,31 +738,18 @@ int emit_quotas(yuzu::CommandContext& ctx) {
 }
 
 int emit_snapshots(yuzu::CommandContext& ctx) {
-    bool enum_ok = false;
-    DWORD enum_err = 0;
-    // Same partial-enumeration handling as emit_quotas: volumes collected
-    // before a mid-walk FindNextVolumeW failure are still queried below,
-    // never discarded outright.
-    const std::vector<std::wstring> volumes = enumerate_volume_guid_paths(enum_ok, enum_err);
-
-    if (!enum_ok) {
-        const std::string detail = std::format("volume enumeration failed: {}", enum_err);
-        // Only when volumes is empty do we have nothing left to try the
-        // FSCTL against, so only then does the top-level "none" sentinel
-        // need to carry this failure -- otherwise emit_snapshot_rows_fsctl
-        // below reports on the volumes that WERE collected.
-        if (volumes.empty())
-            write_snapshot_row(ctx, "-", "-", "none", detail);
-        mark_result_partial(ctx, "windows:fsctl_snapshots", detail);
-    }
-    if (!volumes.empty()) {
-#ifdef FSCTL_SRV_ENUMERATE_SNAPSHOTS
-        emit_snapshot_rows_fsctl(ctx, volumes);
+    // Deliberately does NOT enumerate volumes first, unlike emit_mounts and
+    // emit_quotas. IVssBackupComponents::Query returns every shadow copy on
+    // the machine in one call and each carries its own originating volume,
+    // so a volume walk here would add a second failure mode without adding
+    // any coverage -- a volume with no snapshots contributes nothing either
+    // way, and a snapshot whose volume the walk missed would be dropped.
+#if defined(YUZU_FSPOSTURE_HAVE_VSS)
+    emit_snapshot_rows_vss(ctx);
 #else
-        write_snapshot_row(ctx, "-", "-", "none", "built without FSCTL_SRV_ENUMERATE_SNAPSHOTS");
-        mark_result_partial(ctx, "windows:fsctl_snapshots", "built without FSCTL_SRV_ENUMERATE_SNAPSHOTS");
+    write_snapshot_row(ctx, "-", "-", "none", "built without the VSS SDK headers");
+    mark_result_partial(ctx, "windows:vss", "SDK header vsbackup.h not present at build time");
 #endif
-    }
     return 0;
 }
 

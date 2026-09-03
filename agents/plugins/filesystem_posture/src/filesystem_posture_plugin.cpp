@@ -33,9 +33,16 @@ namespace {
 //
 // ALEX RULING (plan gate, H6): the Windows legs ship CONSTRAINED, not
 // PLANNED -- the code is implemented and MSVC-compilable, so PLANNED would
-// misdescribe it. Every Windows leg's fallback prose carries the mandatory
-// honesty disclaimer stating this build was compile-verified only, with no
-// live Windows host available to exercise it.
+// misdescribe it.
+//
+// H6's "compile-verified only" disclaimer has been REMOVED from all three
+// Windows legs, because it is no longer true: the plugin was built with real
+// MSVC and its suite run on a live Windows host (the-rig, Windows SDK
+// 10.0.26100.0) on 2026-09-03, and the snapshots leg was exercised against
+// three live VSS shadow copies. Each Windows leg's fallback prose now states
+// that leg's REAL residual limitation instead of a blanket provenance
+// caveat. The quotas leg keeps an explicit unexercised-path caveat, since no
+// host with quotas configured was available to assert against.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "mounts",
@@ -49,8 +56,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "FindFirstVolumeW + GetVolumeInformationW + GetDiskFreeSpaceExW",
          "enumerates local volumes only; a mapped network drive is not a volume and is not "
-         "listed, and no per-mount option string exists so that column reads '-'; "
-         "compile-verified only -- not exercised against a live Windows host in this change"},
+         "listed, and no per-mount option string exists so that column reads '-'"},
     },
     {
         /* .action      = */ "quotas",
@@ -68,7 +74,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 1, "IDiskQuotaControl (dskquota.h)",
          "volume quota state and default limit/threshold only, opened read-only; per-user quota "
          "entries are not enumerated; a build whose SDK lacks dskquota.h reports unavailable; "
-         "compile-verified only -- not exercised against a live Windows host in this change"},
+         "compiled and linked on a live Windows host but not asserted against one with quotas "
+         "configured, so the populated-quota path is unexercised"},
     },
     {
         /* .action      = */ "snapshots",
@@ -86,11 +93,14 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "one row per (mount point, snapshot): an APFS snapshot visible under two mount points "
          "of the same volume lineage is reported under each"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 1, "FSCTL_SRV_ENUMERATE_SNAPSHOTS",
-         "reports the Previous-Versions (@GMT) shadow-copy tokens the volume exposes; a "
-         "DeviceIoControl failure is reported distinctly from an empty snapshot set and degrades "
-         "the result status; compile-verified only -- not exercised against a live Windows host "
-         "in this change"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "IVssBackupComponents::Query (VSS)",
+         "enumerates VSS shadow copies machine-wide, one row per snapshot, reporting its snapshot "
+         "ID and shadow-copy device path but no size or per-file content; REQUIRES ADMINISTRATIVE "
+         "RIGHTS -- the agent runs as LocalSystem today so this succeeds, but under the intended "
+         "unprivileged service account (#1442) CreateVssBackupComponents returns E_ACCESSDENIED "
+         "and the action reports permission_denied rather than an empty snapshot set; any VSS "
+         "failure is reported distinctly from a genuinely empty set and degrades the result "
+         "status"},
     },
 };
 
