@@ -5435,9 +5435,22 @@ void SettingsRoutes::register_routes(
                   if (pct > 100)
                       pct = 100;
 
+                  // Capture the PRIOR percentage before the write. It is the whole
+                  // evidentiary value of this row: #3692's scenario is an admin —
+                  // or a compromised admin session — silently de-prioritising a
+                  // mandatory security patch, and "rollout is 0%" does not
+                  // distinguish that from a package that was never rolled out.
+                  // "from=100% to=0%" does. `mandatory` is carried for the same
+                  // reason: it is what makes the de-prioritisation consequential.
+                  bool found = false;
+                  int prior_pct = 0;
+                  bool mandatory = false;
                   auto packages = update_registry_->list_packages();
                   for (auto pkg : packages) {
                       if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
+                          found = true;
+                          prior_pct = pkg.rollout_pct;
+                          mandatory = pkg.mandatory;
                           pkg.rollout_pct = pct;
                           update_registry_->upsert_package(pkg);
                           spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
@@ -5445,6 +5458,23 @@ void SettingsRoutes::register_routes(
                           break;
                       }
                   }
+
+                  // Audited AFTER the write, and reporting what actually happened.
+                  // A rollout change alters which endpoints receive a given binary,
+                  // so it belongs in the same evidence chain as the upload and the
+                  // delete; `spdlog::info` is the application log, not the audit
+                  // log, and nothing else in the request path emits an audit row.
+                  //
+                  // A request naming a package that does not exist changes nothing,
+                  // so it records `not_found` rather than a fictional success —
+                  // matching `delete_tag`'s established third token, and keeping
+                  // enumeration of package keys visible to a SIEM rule.
+                  audit_fn_(req, "ota.package.rollout_changed", found ? "success" : "not_found",
+                            "UpdatePackage", platform + "/" + arch + "/" + version,
+                            found ? "from=" + std::to_string(prior_pct) +
+                                        "% to=" + std::to_string(pct) +
+                                        "% mandatory=" + (mandatory ? "true" : "false")
+                                  : "no such package; rollout unchanged");
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
               });
