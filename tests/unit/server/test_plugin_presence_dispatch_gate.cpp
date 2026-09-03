@@ -410,12 +410,25 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
-    for (const auto& id : {"dev-A", "dev-B"}) {
-        registry.register_agent(make_presence_test_info(id));
+    {
+        // dev-A reports "tar" (the dispatched plugin) so it is genuinely
+        // reachable; dev-B reports a NON-EMPTY inventory that lacks "tar".
+        // Registering dev-B via the bare `make_presence_test_info` helper
+        // (no plugins at all) would instead hit `ids_missing_plugin`'s
+        // fail-open branch (empty inventory = unknown, not absent -- see
+        // the dedicated fail-open test above) and never land in
+        // `unknown_plugin`, so this test's REQUIRE below could never pass.
+        auto info_a = make_presence_test_info("dev-A");
+        info_a.add_plugins()->set_name("tar");
+        registry.register_agent(info_a);
+        auto info_b = make_presence_test_info("dev-B");
+        info_b.add_plugins()->set_name("os_info");
+        registry.register_agent(info_b);
+    }
+    for (const auto& id : {"dev-A", "dev-B"})
         registry.set_gateway_route(
             id, "test-gateway",
             {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
-    }
 
     yuzu::agent::v1::CommandRequest cmd;
     cmd.set_command_id("wiring-plugin-presence-cmd");
@@ -426,11 +439,6 @@ TEST_CASE("wire_and_dispatch_confined: a plugin-absent id's per-device concurren
 
     auto gate = ContainmentGate::exempt_control_plugin();
     std::vector<std::string> agent_ids{"dev-A", "dev-B"};
-
-    // dev-A has "tar", dev-B does not (registered with no plugins at all,
-    // per make_presence_test_info) -- wire_and_dispatch_confined computes
-    // its own registry read, so no per-agent setup beyond registration is
-    // needed for dev-B to land in `unknown_plugin` here.
     auto noop_audit = [](const std::string&, const std::string&, const std::string&,
                          const std::string&) {};
     const auto outcome = yuzu::server::wire_and_dispatch_confined(
