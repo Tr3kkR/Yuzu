@@ -28,8 +28,7 @@ metadata:
   version: 1.0.0
   description: >
     Lists mounted volumes with device, filesystem type, mount options, and
-    capacity. On Windows enumerates volumes via FindFirstVolumeW, reads labels and flags with GetVolumeInformationW and GetDriveTypeW, capacity with GetDiskFreeSpaceExW, and reads
-    per-volume capacity and filesystem type via GetVolumeInformationW. On
+    capacity. On Windows enumerates volumes via FindFirstVolumeW, reads labels and flags with GetVolumeInformationW and GetDriveTypeW, capacity with GetDiskFreeSpaceExW. On
     Linux parses /proc/self/mountinfo; a network-filesystem source (nfs,
     cifs, smbfs) reports its capacity columns as "-" rather than a
     misleading zero or stale figure, and a device-mapper source
@@ -114,7 +113,9 @@ metadata:
     IDiskQuotaControl, initialized read-only (bReadWrite=FALSE); this leg
     is compile-verified only — not exercised against a live Windows host
     in this change. On Linux reads quotactl(Q_GETFMT) per mounted
-    filesystem. On macOS reports state=unsupported: APFS has no per-user
+    filesystem. On macOS the volume-level quota IS probed on APFS and HFS+ via
+    getattrlist and reports none/configured (state=unsupported_fs is emitted only
+    for a non-APFS/HFS mount): APFS has no per-user
     or per-group quota mechanism at all, so there is no gap to report
     beyond the volume-level scope shared by every platform.
   tags: [storage, filesystem, quota, compliance]

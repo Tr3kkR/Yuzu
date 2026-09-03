@@ -19,7 +19,7 @@
 /// (enumerate filesystem snapshots) — are ReadOnly/None: none opens any
 /// handle for write, issues any mutating ioctl or FSCTL, or calls
 /// `fs_snapshot_create`/`fs_snapshot_delete`/`fs_snapshot_revert`. The
-/// Windows quota leg specifically initializes its `DISKQUOTA_USER_INFORMATION`
+/// Windows quota leg specifically initializes its `IDiskQuotaControl`
 /// control object read-only (`bReadWrite = FALSE`); no leg on any platform
 /// mutates volume, quota, or snapshot state. Grouped under the existing
 /// `Inventory` securable — the same read-only-fact-collection precedent

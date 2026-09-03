@@ -156,6 +156,7 @@ int emit_quotas(yuzu::CommandContext& ctx) {
 
     std::size_t non_block_device_count = 0;
     bool any_dev_probed = false;
+    bool any_quota_failure = false; // ANY degraded probe, not only an all-denied walk
     bool all_dev_permission_denied = true;
 
     for (const auto& entry : parse.entries) {
@@ -171,8 +172,18 @@ int emit_quotas(yuzu::CommandContext& ctx) {
                                  reinterpret_cast<char*>(&fmt));
         const int saved_errno = (rc == 0) ? 0 : errno;
         const QuotaState state = classify_quotactl_errno(saved_errno);
-        if (state != QuotaState::PermissionDenied)
+        if (state != QuotaState::PermissionDenied) {
             all_dev_permission_denied = false;
+        }
+        // G4-01/SG-1: all_dev_permission_denied is an ALL-or-nothing flag, so a
+        // single non-EPERM volume cleared it and the whole run reported clean
+        // success even when a peer volume was denied. Track failure
+        // independently, exactly as the macOS leg does -- one degraded probe
+        // degrades the run. NotEnabled/NoBlockDevice/UnsupportedFs are truthful
+        // complete answers and are deliberately NOT failures.
+        if (state == QuotaState::PermissionDenied || state == QuotaState::Unavailable) {
+            any_quota_failure = true;
+        }
 
         std::string detail;
         if (rc == 0) {
@@ -222,8 +233,14 @@ int emit_quotas(yuzu::CommandContext& ctx) {
 
     // Positioned LAST so its provenance is the one that survives
     // set_result_status's last-writer-wins assignment (peer M3).
-    if (any_dev_probed && all_dev_permission_denied)
+    if (any_dev_probed && all_dev_permission_denied) {
+        // Positioned LAST so this more actionable provenance survives
+        // last-writer-wins when both fire.
         mark_result_partial(ctx, "linux:quotactl", "quota query requires CAP_SYS_ADMIN");
+    } else if (any_quota_failure) {
+        mark_result_partial(ctx, "linux:quotactl",
+                            "quota query failed on at least one volume");
+    }
 
     return 0;
 }

@@ -223,11 +223,24 @@ TEST_CASE("filesystem_posture plugin: mounts action shape", "[filesystem_posture
     // Every host has at least a root mount.
     REQUIRE_FALSE(rows.empty());
 
-    // CDX-P2-03: emit_mounts only degrades when the mount enumeration itself
-    // fails -- and that path emits no rows at all. Rows present therefore
-    // means no degradation is reachable, so a CONSTRAINED status here is a
-    // defect by construction.
-    CHECK(result.result_status != YUZU_RESULT_STATUS_CONSTRAINED);
+    // CDX-P2-03, corrected for Linux (governance CP-1). The original assertion
+    // -- "rows present therefore no degradation is reachable" -- reasons from
+    // macOS, where emit_mounts returns early with no rows if getmntinfo fails.
+    // On Linux emit_mounts legitimately marks partial WHILE emitting rows (the
+    // 4 MiB read cap, a per-mount statvfs failure, a malformed line, the entry
+    // cap), and this test runs on the Linux CI leg -- one statvfs EACCES would
+    // have turned it red for a correct reason. Assert the same
+    // explicable-from-the-rows invariant the other two actions use: a degraded
+    // mounts run must show a row whose capacity columns degraded to "-".
+    if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
+        bool any_degraded_row = false;
+        for (const auto& r : rows) {
+            const auto f = split_row(r);
+            if (f.size() > 7 && (f[5] == "-" || f[6] == "-" || f[7] == "-"))
+                any_degraded_row = true;
+        }
+        CHECK(any_degraded_row);
+    }
 
     for (const auto& r : rows) {
         const auto f = split_fields_escape_aware(r);
@@ -267,7 +280,11 @@ TEST_CASE("filesystem_posture plugin: quotas action shape", "[filesystem_posture
         bool any_degraded_row = false;
         for (const auto& r : rows) {
             const auto f = split_row(r);
-            if (f.size() > 2 && (f[2] == "permission_denied" || f[2] == "unavailable"))
+            // f[2] is the SCOPE literal ("volume"); the state is f[3] -- as this
+            // same test's shape loop above asserts. Reading f[2] here made the
+            // invariant unreachable, so it asserted nothing on a healthy host
+            // and failed unconditionally on a degraded one (governance G4-03).
+            if (f.size() > 3 && (f[3] == "permission_denied" || f[3] == "unavailable"))
                 any_degraded_row = true;
         }
         CHECK(any_degraded_row);

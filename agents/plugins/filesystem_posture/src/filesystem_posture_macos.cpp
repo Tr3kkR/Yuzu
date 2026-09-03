@@ -287,6 +287,15 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
             any_failure = true;
             mark_result_partial(ctx, "macos:fs_snapshot_list",
                                 std::string(s.f_mntonname) + ": malformed reply buffer");
+            // SG-2/K10: the 1024-name cap was silently ignored here. The
+            // unbraced-if defect above was accidentally masking it by marking
+            // EVERY run partial; fixing that unmasked a genuine silent
+            // truncation. The Windows leg has always handled this flag.
+        } else if (parsed.truncated) {
+            any_failure = true;
+            mark_result_partial(ctx, "macos:fs_snapshot_list",
+                                std::string(s.f_mntonname) + ": snapshot list truncated at the "
+                                                             "1024-entry cap");
         } else {
             // A probe that returned cleanly is a SUCCESS even when it yielded
             // no names: "this volume has no snapshots" is an answer, not a

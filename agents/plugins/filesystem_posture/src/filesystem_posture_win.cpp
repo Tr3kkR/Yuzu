@@ -311,6 +311,7 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
     const bool com_ok = com.ok();
     bool any_ntfs = false;
     bool any_success = false;
+    bool any_quota_failure = false; // ANY degraded volume, not only an all-failed walk
 
     for (const auto& vol : volumes) {
         const std::wstring mount_w = primary_mount_point(vol);
@@ -320,6 +321,7 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
         const BOOL info_ok = ::GetVolumeInformationW(vol.c_str(), nullptr, 0, nullptr, nullptr,
                                                      nullptr, fs_name, MAX_PATH);
         if (!info_ok) {
+            any_quota_failure = true; // G4-01: a probe we could not complete
             write_quota_row(ctx, mp, QuotaState::Unavailable, std::nullopt, std::nullopt,
                             "volume filesystem type unavailable");
             continue;
@@ -340,12 +342,14 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
                               ((mount_w[0] >= L'A' && mount_w[0] <= L'Z') ||
                                (mount_w[0] >= L'a' && mount_w[0] <= L'z'));
         if (!lettered) {
+            any_quota_failure = true; // G4-01: a probe we could not complete
             write_quota_row(ctx, mp, QuotaState::Unavailable, std::nullopt, std::nullopt,
                             "volume has no drive letter");
             continue;
         }
 
         if (!com_ok) {
+            any_quota_failure = true; // G4-01: a probe we could not complete
             write_quota_row(ctx, mp, QuotaState::Unavailable, std::nullopt, std::nullopt,
                             "COM apartment initialization failed");
             continue;
@@ -366,6 +370,7 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
         }
 
         const auto write_hresult_failure = [&](HRESULT failed_hr) {
+            any_quota_failure = true; // G4-01: every HRESULT failure degrades the run
             if (failed_hr == E_ACCESSDENIED) {
                 write_quota_row(ctx, mp, QuotaState::PermissionDenied, std::nullopt, std::nullopt,
                                 "-");
@@ -401,6 +406,7 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
             // The mask covers 2 bits (0-3); DISABLED/TRACK/ENFORCE are the
             // only documented values. The remaining (reserved) value is not
             // a healthy default to fold silently into "configured".
+            any_quota_failure = true; // G4-01: reserved/unknown state is not a healthy answer
             write_quota_row(ctx, mp, QuotaState::Unavailable, std::nullopt, std::nullopt,
                             std::format("unrecognized quota state: {}", state));
             continue;
@@ -437,8 +443,15 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
         any_success = true;
     }
 
+    // G4-01/SG-1: !any_success is an ALL-or-nothing test, so ONE quota-enabled
+    // volume masked E_ACCESSDENIED on every peer -- the ordinary posture for a
+    // non-Administrator agent identity. Report any failure, and keep the
+    // all-failed message distinct because it is the more actionable one.
     if (any_ntfs && !any_success) {
         mark_result_partial(ctx, "windows:dskquota", "quota query failed on every NTFS volume");
+    } else if (any_quota_failure) {
+        mark_result_partial(ctx, "windows:dskquota",
+                            "quota query failed on at least one NTFS volume");
     }
 }
 
@@ -509,7 +522,12 @@ void emit_snapshot_rows_fsctl(yuzu::CommandContext& ctx, const std::vector<std::
         // the driver said the array actually contains. Read them and let them
         // bound the walk. All three are native-endian in a locally-filled
         // DeviceIoControl buffer, so memcpy rather than a byte-order helper.
-        ULONG number_of_snapshots = 0;
+        // NumberOfSnapShots is the TOTAL the volume holds; only
+        // NumberOfSnapShotsReturned and SnapShotArraySize bound THIS reply, so
+        // the total is read for completeness and deliberately not used as a
+        // bound (governance CE-1 -- the earlier comment overclaimed that all
+        // three bound the walk).
+        [[maybe_unused]] ULONG number_of_snapshots = 0;
         ULONG number_returned = 0;
         ULONG array_size_bytes = 0;
         std::memcpy(&number_of_snapshots, buf.data() + 0 * sizeof(ULONG), sizeof(ULONG));
@@ -542,8 +560,17 @@ void emit_snapshot_rows_fsctl(yuzu::CommandContext& ctx, const std::vector<std::
                 first_failure_err = ERROR_INVALID_DATA;
             continue;
         }
-        if (names.truncated)
+        if (names.truncated) {
             any_truncated = true;
+        }
+        // SG-3: an internally inconsistent but "successful" reply -- declaring
+        // more snapshots than it delivers -- previously parsed to a short list
+        // with malformed=false and truncated=false, i.e. a clean COMPLETE
+        // inventory that silently omits entries. Compare against the driver's
+        // own declared count.
+        if (number_returned > 0 && names.names.size() < static_cast<std::size_t>(number_returned)) {
+            any_truncated = true;
+        }
         for (const auto& name : names.names) {
             write_snapshot_row(ctx, mp, name, "vss", "-");
             any_tokens = true;

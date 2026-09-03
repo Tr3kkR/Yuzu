@@ -470,12 +470,28 @@ inline std::string normalize_mount_flags(std::string_view options_csv) {
     return out;
 }
 
-/// True for the fixed set of network filesystem types: nfs, nfs3, nfs4,
-/// cifs, smb3, smbfs, afs, ceph, glusterfs, and any "fuse.<suffix>" whose
-/// suffix is one of sshfs, s3fs, davfs, rclone.
+/// True for filesystem types whose `statvfs` can block indefinitely against an
+/// unreachable server.
+///
+/// WHY THIS MATTERS MORE THAN A CAPACITY COLUMN (governance G4-04): every agent
+/// command runs on ONE bounded pool shared with every other plugin, INCLUDING
+/// quarantine/containment dispatch. An uninterruptible `statvfs` permanently
+/// consumes a worker; a scheduled `mounts` instruction can exhaust the pool,
+/// after which no command reaches the host at all. A name this list misses is
+/// therefore an availability risk, not a missing number.
+///
+/// This is a DENY-list by name and is inherently incomplete -- the durable fix
+/// is to invert it to a known-local allowlist. Until then it covers the network
+/// and paravirtualised/cluster types whose backing store is remote: nfs*, cifs,
+/// smb3, smbfs, afs, ceph, glusterfs, 9p, virtiofs, lustre, beegfs, gfs2,
+/// ocfs2, autofs (a direct-map trigger point blocks on traversal), and any
+/// "fuse.<suffix>" that is network-backed.
 inline bool is_network_fstype(std::string_view fstype) {
-    constexpr std::string_view kExact[] = {"nfs",  "nfs3", "nfs4", "cifs",      "smb3",
-                                           "smbfs", "afs",  "ceph", "glusterfs"};
+    constexpr std::string_view kExact[] = {
+        "nfs",   "nfs3",     "nfs4",   "cifs",   "smb3",  "smbfs", "afs",
+        "ceph",  "glusterfs",
+        // G4-04 additions -- remote or cluster-backed, all able to block:
+        "9p",    "virtiofs", "lustre", "beegfs", "gfs2",  "ocfs2", "autofs"};
     for (auto s : kExact) {
         if (fstype == s)
             return true;
@@ -483,7 +499,9 @@ inline bool is_network_fstype(std::string_view fstype) {
     constexpr std::string_view kFusePrefix = "fuse.";
     if (fstype.rfind(kFusePrefix, 0) == 0) {
         auto suffix = fstype.substr(kFusePrefix.size());
-        constexpr std::string_view kFuseSuffixes[] = {"sshfs", "s3fs", "davfs", "rclone"};
+        constexpr std::string_view kFuseSuffixes[] = {"sshfs",  "s3fs",   "davfs",
+                                                     "rclone", "cephfs", "glusterfs",
+                                                     "nfs",    "smb"};
         for (auto s : kFuseSuffixes) {
             if (suffix == s)
                 return true;

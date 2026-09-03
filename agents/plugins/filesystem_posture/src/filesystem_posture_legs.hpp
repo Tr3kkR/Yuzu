@@ -10,10 +10,9 @@
  * the full pinned wire-format contract.
  *
  * This header DECLARES (never defines) the three per-OS entry points; each
- * leg TU defines exactly one. It DEFINES the pure row formatters, the
- * ctx::write_output wrapper functions (the ONLY call sites of
- * the only ROW writers in this plugin -- see the note at the wrappers),
- * and mark_result_partial().
+ * leg TU defines exactly one. It DEFINES the pure row formatters, the ctx
+ * wrappers around them (the only ROW writers in this plugin -- see the note
+ * at the wrappers), and mark_result_partial().
  */
 #pragma once
 
