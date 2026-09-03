@@ -107,8 +107,9 @@ metadata:
   description: >
     Reports volume-level disk quota state. This is volume-level quota only
     everywhere — no per-user or per-group breakdown is reported on any
-    platform. On Windows reads IDiskQuotaControl GetQuotaState/GetDefaultQuotaLimit via
-    IDiskQuotaControl, initialized read-only (bReadWrite=FALSE); it is
+    platform. On Windows reads IDiskQuotaControl (GetQuotaState /
+    GetDefaultQuotaLimit / GetDefaultQuotaThreshold), initialized
+    read-only (bReadWrite=FALSE); it is
     compiled and linked on Windows but has not been asserted against a
     host with quotas configured. On Linux reads quotactl(Q_GETFMT) per mounted
     filesystem. On macOS the volume-level quota IS probed on APFS and HFS+ via
@@ -183,7 +184,7 @@ metadata:
     copies via IVssBackupComponents::Query, one row per snapshot, whose
     name column is the snapshot GUID and detail column the shadow-copy
     device path. That leg REQUIRES ADMINISTRATIVE RIGHTS: the agent runs
-    as LocalSystem today so it succeeds, but under an unprivileged service
+    as LocalSystem today so it succeeds; under an unprivileged service
     account it reports permission_denied rather than an empty set. On
     Linux reports Btrfs/LVM snapshot
     CAPABILITY, not an inventory of existing snapshots: the columns

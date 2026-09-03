@@ -1,7 +1,7 @@
 /**
  * test_filesystem_posture_local_dispatcher.cpp — PKG-CORE (Wave-1): loads
- * the ACTUAL built filesystem_posture plugin (filesystem_posture
- * .dylib/.so/.dll)
+ * the ACTUAL built filesystem_posture plugin
+ * (filesystem_posture.dylib / .so / .dll)
  * via PluginHandle::load and drives it through yuzu::agent::LocalDispatcher
  * (test_network_config_local_dispatcher.cpp's pattern), exercising all three
  * actions' real per-OS legs end to end on the build host.

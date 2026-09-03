@@ -96,9 +96,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 1, "IVssBackupComponents::Query (VSS)",
          "enumerates VSS shadow copies machine-wide, one row per snapshot, reporting its snapshot "
          "ID and shadow-copy device path but no size or per-file content; REQUIRES ADMINISTRATIVE "
-         "RIGHTS -- the agent runs as LocalSystem today so this succeeds, but under the intended "
-         "unprivileged service account (#1442) CreateVssBackupComponents returns E_ACCESSDENIED "
-         "and the action reports permission_denied rather than an empty snapshot set; any VSS "
+         "RIGHTS -- the agent runs as LocalSystem today so this succeeds; under an unprivileged "
+         "service account CreateVssBackupComponents returns E_ACCESSDENIED and the action "
+         "reports permission_denied rather than an empty snapshot set; any VSS "
          "failure is reported distinctly from a genuinely empty set and degrades the result "
          "status"},
     },

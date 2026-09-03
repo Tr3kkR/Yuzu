@@ -99,26 +99,10 @@ private:
     DWORD prev_ = 0;
 };
 
-// RAII owner for a plain file/volume HANDLE (CloseHandle on scope exit).
-// Local to this TU: agents/shared/win_sc_handle.hpp's ScHandle closes via
-// CloseServiceHandle (a different API for a different handle kind), so it is
-// not the right owner for a CreateFileW volume-root handle.
-class ScopedFileHandle {
-public:
-    explicit ScopedFileHandle(HANDLE h) noexcept : h_(h) {}
-    ~ScopedFileHandle() {
-        if (valid())
-            ::CloseHandle(h_);
-    }
-    ScopedFileHandle(const ScopedFileHandle&) = delete;
-    ScopedFileHandle& operator=(const ScopedFileHandle&) = delete;
-
-    [[nodiscard]] HANDLE get() const { return h_; }
-    [[nodiscard]] bool valid() const { return h_ != nullptr && h_ != INVALID_HANDLE_VALUE; }
-
-private:
-    HANDLE h_ = INVALID_HANDLE_VALUE;
-};
+// (ScopedFileHandle lived here and was removed with the FSCTL snapshots path
+// that was its only consumer -- the VSS leg opens no volume handle at all. An
+// unused class definition draws no compiler warning, so nothing but a
+// deliberate sweep after the removal would have caught it.)
 
 // RAII owner for a volume-search handle from FindFirstVolumeW (closes via
 // FindVolumeClose, a different API from CloseHandle). Fix-round addition
@@ -484,32 +468,47 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
 // both unavailable on the current SDK and the wrong question.
 //
 // VERIFIED on the-rig 2026-09-03 against three live shadow copies (Windows
-// SDK 10.0.26100.0). Query returns every snapshot process-wide in one call
+// SDK 10.0.26100.0). Query returns every snapshot machine-wide in one call
 // and each carries its own originating volume, so this leg -- unlike
 // emit_mounts/emit_quotas -- does not enumerate volumes first.
 //
-// PRIVILEGE, measured rather than assumed:
+// PRIVILEGE. Measured on that host, and ONLY these three were measured:
 //   NT AUTHORITY\SYSTEM           CreateVssBackupComponents -> S_OK, 3 found
 //   NT AUTHORITY\LOCAL SERVICE    -> E_ACCESSDENIED (0x80070005)
 //   NT AUTHORITY\NETWORK SERVICE  -> E_ACCESSDENIED (0x80070005)
+//
 // The Windows agent service runs as LocalSystem today (#1442), so this leg
-// works as shipped. When #1442 moves it to NT SERVICE\YuzuAgent the call
-// becomes E_ACCESSDENIED -- which is why a denial is reported as an explicit
-// PERMISSION_DENIED degradation below and must never be allowed to read as
-// an empty, healthy snapshot set. The descriptor's fallback prose says the
-// same thing in operator terms.
+// works as shipped. Should #1442 move it to NT SERVICE\YuzuAgent, the call is
+// EXPECTED to return E_ACCESSDENIED -- expected, not measured: that account
+// was not among the three tested, and docs/agent-privilege-model.md shows it
+// being granted Administrators out of band for other actions, which would
+// change the answer. Either way a denial is reported as an explicit
+// PERMISSION_DENIED degradation below and must never read as an empty,
+// healthy snapshot set.
 //
 // NO CoInitializeSecurity call anywhere in this leg: it is a process-global,
 // once-only setting and a plugin must never impose one on its host agent.
 // Verified as SYSTEM that CreateVssBackupComponents/Query both succeed under
 // a bare CoInitializeEx(MTA) -- exactly what yuzu::shared::win::ComInit does.
+// Note ComInit also accepts RPC_E_CHANGED_MODE (another plugin already put
+// this pool thread in an STA); MSDN directs VSS requesters to an MTA, so VSS
+// would then run in an STA. No in-tree plugin initialises STA (grep:
+// zero COINIT_APARTMENTTHREADED), so this is latent, and any resulting
+// failure lands in the generic "failed: 0x…" branch rather than being
+// misreported as a privilege problem.
 
 #if defined(YUZU_FSPOSTURE_HAVE_VSS)
 
 /// RAII owner for the heap strings VSS allocates into a VSS_SNAPSHOT_PROP.
 /// Next() fills a fresh property block on every iteration, so this must free
-/// on EVERY loop turn, including the early-continue paths. Unwrapped manual
-/// cleanup in new C++ is a governance policy floor, not a style preference.
+/// on every exit from the turn on which it is CONSTRUCTED -- the normal end of
+/// the walk, the cap `break`, and any early exit added below it. The one
+/// `continue` above it deliberately constructs no owner and frees nothing; see
+/// the trade-off note at that branch. (An earlier revision of this comment
+/// claimed it freed on "every loop turn, including the early-continue paths",
+/// which the skip path contradicts -- governance Gate 2, docs-writer.)
+/// Unwrapped manual cleanup in new C++ is a governance policy floor, not a
+/// style preference.
 class ScopedSnapshotProp {
 public:
     explicit ScopedSnapshotProp(VSS_SNAPSHOT_PROP& p) : p_(&p) {}
@@ -535,21 +534,36 @@ std::string guid_to_string(const GUID& g) {
 /// #1442 will turn this leg into fleet-wide.
 std::string vss_failure_detail(std::string_view step, HRESULT hr) {
     if (hr == E_ACCESSDENIED) {
+        // "commonly indicates", not "lacks": E_ACCESSDENIED from a COM call
+        // can also arise from COM security negotiation or the VSS service's
+        // own ACL. Administrative rights are the overwhelmingly likely cause
+        // and the one an operator can act on, but asserting a single cause
+        // from a generic HRESULT would be stating more than the code knows.
         return std::format("{} denied (0x{:08X}): VSS snapshot enumeration requires "
-                           "administrative rights, which this agent service account lacks",
+                           "administrative rights; this commonly indicates the agent service "
+                           "account lacks them",
                            step, static_cast<unsigned long>(hr));
     }
     return std::format("{} failed: 0x{:08X}", step, static_cast<unsigned long>(hr));
 }
 
 void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
-    // Every early return below writes BOTH a `none` row and a partial mark:
+    // Every early return below writes BOTH a `none` row and a degraded mark:
     // a failure must stay distinguishable from a genuinely empty snapshot
     // set, which is the same peer-H6 rule the retired FSCTL path carried.
+    //
+    // A privilege denial gets PERMISSION_DENIED rather than CONSTRAINED, so a
+    // status-keyed consumer can tell "not allowed to read this" from any other
+    // degradation. The descriptor and four operator docs state that a denied
+    // read reports permission_denied; routing it here is what makes that
+    // sentence true rather than aspirational (governance Gate 2).
     const auto fail = [&ctx](std::string_view step, HRESULT hr) {
         const std::string detail = vss_failure_detail(step, hr);
         write_snapshot_row(ctx, "-", "-", "none", detail);
-        mark_result_partial(ctx, "windows:vss", detail);
+        if (hr == E_ACCESSDENIED)
+            mark_result_denied(ctx, "windows:vss", detail);
+        else
+            mark_result_partial(ctx, "windows:vss", detail);
     };
 
     yuzu::shared::win::ComInit com;
@@ -594,6 +608,14 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
     constexpr std::size_t kMaxSnapshots = 1024;
 
     std::size_t emitted = 0;
+    // The cap is counted in LOOP TURNS, not emitted rows. Counting rows would
+    // let the non-snapshot `continue` below bypass the counter entirely, so a
+    // provider that yields non-snapshot objects indefinitely would spin
+    // forever AND leak on every turn -- defeating the exact rationale the cap
+    // is here for, since Next() is driven by code this process does not
+    // control. Governance Gate 2 (security-guardian) caught this; the two
+    // decisions were individually fine and wrong in combination.
+    std::size_t iterations = 0;
     bool truncated = false;
     bool enum_failed = false;
     HRESULT enum_hr = S_OK;
@@ -614,9 +636,36 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
             break;
         }
 
-        // Only a snapshot-typed property owns snapshot strings. Freeing the
-        // Snap arm of the union on any other type would free the wrong arm,
-        // so such an entry is skipped WITHOUT constructing the RAII owner.
+        // Bound the WALK here, before any type dispatch, so every turn counts
+        // toward the ceiling whatever the provider returned.
+        if (++iterations > kMaxSnapshots) {
+            truncated = true;
+            break;
+        }
+
+        // Only a snapshot-typed property owns snapshot strings, so such an
+        // entry is skipped WITHOUT constructing the RAII owner.
+        //
+        // DELIBERATE TRADE-OFF, adjudicated at governance Gate 2 by
+        // security-guardian (NOT self-granted -- the policy floor on non-RAII
+        // cleanup requires an adjudicator who is not the author):
+        //
+        // this path frees nothing, so a non-snapshot entry leaks whatever
+        // strings its own union arm holds. Accepted because (a) the Query
+        // above asks for VSS_OBJECT_SNAPSHOT only, so the branch is
+        // unreachable in practice; (b) the alternative -- calling
+        // VssFreeSnapshotProperties on a union arm that is not a
+        // VSS_SNAPSHOT_PROP -- is undefined behaviour on data this process did
+        // not shape; and (c) the leak is BOUNDED by the kMaxSnapshots walk
+        // ceiling checked above, which is counted in loop turns precisely so
+        // this branch cannot spin. The branch is not silent either: it
+        // degrades the result below.
+        //
+        // A strictly better third option exists and is deferred, not rejected:
+        // switch on prop.Type and release VSS_PROVIDER_PROP's own strings with
+        // CoTaskMemFree (VSS publishes no VssFreeProviderProperties). Left out
+        // of this change because it is ~6 lines of untestable code on a branch
+        // no query can reach; filed as a follow-up.
         if (prop.Type != VSS_OBJECT_SNAPSHOT) {
             skipped_wrong_type = true;
             continue;
@@ -639,11 +688,7 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
                                        : std::string("-");
 
         write_snapshot_row(ctx, mount_point, name, "vss", device);
-        ++emitted;
-        if (emitted >= kMaxSnapshots) {
-            truncated = true;
-            break;
-        }
+        ++emitted; // rows only -- the walk ceiling is `iterations`, checked above
     }
 
     if (enum_failed) {

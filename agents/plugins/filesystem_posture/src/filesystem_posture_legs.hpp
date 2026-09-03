@@ -179,4 +179,28 @@ inline void mark_result_partial(yuzu::CommandContext& ctx, std::string_view prov
                           provenance);
 }
 
+/**
+ * Report a degradation whose cause is specifically a PRIVILEGE denial.
+ *
+ * Same shape and same "last call wins" semantics as mark_result_partial, but
+ * it sets YUZU_RESULT_STATUS_PERMISSION_DENIED rather than CONSTRAINED, so a
+ * status-keyed consumer can tell "this agent is not allowed to read that" from
+ * every other kind of degradation. The precedent is event_logs_plugin.cpp:136,
+ * which maps its own access-denied outcome to exactly this pair.
+ *
+ * This exists because the descriptor and four operator-facing docs state that
+ * a denied read "reports permission_denied". Before this helper that sentence
+ * was false -- the leg set CONSTRAINED like any other degradation -- which is
+ * a documented contract the code did not honour, not merely imprecise prose.
+ */
+inline void mark_result_denied(yuzu::CommandContext& ctx, std::string_view provenance,
+                               std::string_view reason = {}) {
+    if (reason.empty())
+        spdlog::warn("filesystem_posture: permission denied ({})", provenance);
+    else
+        spdlog::warn("filesystem_posture: permission denied ({}): {}", provenance, reason);
+    ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          provenance);
+}
+
 } // namespace yuzu::filesystem_posture
