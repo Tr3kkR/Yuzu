@@ -195,3 +195,25 @@ data).
   requirement for a migration that lands under this default. Every other Decision/Consequences
   bullet (the legacy-file rollback-window retention, the fail-closed construction posture, the
   secret-transform-never-copy rule for the documented-exception case) is untouched.
+
+  **Update (in-place-edit exception, stated precisely, 2026-09-02):** the sentence above —
+  "an in-place schema-DDL edit is safe only for a store whose schema version was never
+  shipped" — names the easy-to-check proxy, not the actual invariant it protects. The real
+  requirement is that no already-applied migration version's CONTENT changes: `PgMigrationRunner`
+  tracks a bare version integer and only ever applies a migration with `version > current`, so
+  editing an already-shipped version's SQL text in place is inert for any database that has
+  already passed it — the edited text simply never runs again there. "Never shipped" is one way
+  to guarantee that (an unshipped version has, by definition, never been applied to any
+  database); it is not the only way. `DeviceTokenStore`/`LicenseStore`/`SoftwareDeploymentStore`
+  (`chore/retire-migrate-from-sqlite-batch-b`, #3623) each shipped a v1 migration to `dev` but
+  are provably never constructed anywhere in production (their own ADR Updates — 0048/0051/0052
+  — verify this via `server.cpp` construction-site archaeology), so their v1 never ran against
+  any persistent database either, satisfying the actual invariant despite failing the literal
+  "never shipped" wording. The corrected rule: an in-place edit to an already-shipped migration
+  is safe when that version is proven to have never executed against a real database — whether
+  because it was never shipped, or because it shipped but the store was never constructed. What
+  remains unsafe either way, and is the actual hazard this ADR's original sentence exists to
+  prevent, is RENUMBERING an already-applied version to a higher slot — that forces the runner
+  to re-apply it, which is exactly the class of bug #3623's own `ProductPackStore` fix corrected
+  (a version-bumped `DROP` was mistakenly inserted at an already-shipped store's used slot,
+  renumbering its content to a higher version instead of being appended after it).

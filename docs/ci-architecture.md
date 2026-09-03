@@ -1391,10 +1391,15 @@ exact-hit on a repo doing ~75 commits/day, so every run saved a fresh multi-GB
 entry, the pool ran 7x over GitHub's 10 GB repo quota, and LRU eviction both
 degraded the canary (8-20 min rebuilds from week-old entries) and starved every
 other cache (measured 2026-09-01). One entry per 3-day bucket per scope now
-(~2-3 live, bounded by the cap below); ccache's own preprocessed-input hashing
+(~2-3 live, bounded by the cap below AND by `restore-keys` naming only the
+specific previous bucket — an open-ended prefix fallback defeats this bound
+by keeping any dead entry alive forever, since every fallback hit refreshes
+GitHub's last-accessed clock; measured 2026-09-02, `ci.yml`'s canary ccache
+restore step); ccache's own preprocessed-input hashing
 absorbs intra-bucket source drift, so hit-rate decay is capped at ~3 days of dev
-churn, and a job-level `CCACHE_MAXSIZE: 2G` keeps each entry from growing
-without bound. The ccache save is gated on the Build step having run, pass or
+churn, and a job-level `CCACHE_MAXSIZE` (2G originally, raised to 3G 2026-09-03
+after the 2G estimate proved low against measured 2.2-2.6 GB working sets)
+keeps each entry from growing without bound. The ccache save is gated on the Build step having run, pass or
 fail — a cancelled run leaves no thin entry, at the accepted cost that an early
 hard Build failure can occupy the bucket's key with a thin one (#3269,
 documented at the restore step); the vcpkg save is gated more strictly, on its

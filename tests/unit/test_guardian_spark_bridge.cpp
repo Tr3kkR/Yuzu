@@ -20,6 +20,7 @@
 using yuzu::agent::AssertionKind;
 using yuzu::agent::classify;
 using yuzu::agent::FileSparkParams;
+using yuzu::agent::kMaxFileHashBytes;
 using yuzu::agent::RegistrySparkParams;
 using yuzu::agent::RuleAssertion;
 using yuzu::agent::rule_assertion_from_rule;
@@ -212,6 +213,26 @@ TEST_CASE("rule_assertion_from_rule: a malformed max_bytes falls back to the def
     const auto a = rule_assertion_from_rule(r);
     REQUIRE(a.has_value());
     CHECK(a->max_bytes == default_assertion.max_bytes); // "123abc" -> default, NOT 123
+}
+
+TEST_CASE("rule_assertion_from_rule: an authored max_bytes over the #2233 item 6 ceiling "
+          "is clamped, never accepted unbounded",
+          "[spark][bridge][assertion]") {
+    const std::string over = std::to_string(kMaxFileHashBytes + 1);
+    const Rule r = make_rule("r", "file-change", "file-hash-equals", {{"max_bytes", over.c_str()}});
+    const auto a = rule_assertion_from_rule(r);
+    REQUIRE(a.has_value());
+    CHECK(a->max_bytes == kMaxFileHashBytes);
+}
+
+TEST_CASE("rule_assertion_from_rule: an authored max_bytes AT the #2233 item 6 ceiling "
+          "passes through unclamped",
+          "[spark][bridge][assertion]") {
+    const std::string at = std::to_string(kMaxFileHashBytes);
+    const Rule r = make_rule("r", "file-change", "file-hash-equals", {{"max_bytes", at.c_str()}});
+    const auto a = rule_assertion_from_rule(r);
+    REQUIRE(a.has_value());
+    CHECK(a->max_bytes == kMaxFileHashBytes);
 }
 
 TEST_CASE("rule_assertion_from_rule: file-exists defaults to expect_present, 'absent' flips it",

@@ -9,9 +9,7 @@
 /// **This store is DELIBERATELY DORMANT on `dev`** (ADR-0048 Context): nothing in `server.cpp`
 /// constructs a `LicenseStore`, and `rest_api_v1.{hpp,cpp}` registers `/api/v1/license*` routes
 /// only `if (license_store)`. Re-wiring construction is out of scope for this migration — this
-/// file migrates the persistence layer only. `migrate_from_sqlite` therefore also has zero
-/// production callers today; it is shipped and unit-tested, wired the moment a future change
-/// re-constructs the store. The expected legacy file is `license.db`.
+/// file migrates the persistence layer only.
 ///
 /// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and runtime. The
 /// database is the source of truth for license entitlement — a silently-empty
@@ -29,16 +27,14 @@
 /// Secrets (ADR-0010): `license_key_hash` is a SHA-256 verify-only hash — the raw license key is
 /// never persisted. No `SecretCodec` involvement (hash-only, not envelope-encrypted).
 ///
-/// **Mandatory backfill** (ADR-0009): `migrate_from_sqlite()` is idempotent PER DISTINCT
-/// LEGACY-FILE CONTENT (a SHA-256 fingerprint over BOTH tables' rows, or a sourceless sentinel),
-/// mirroring `DeploymentStore`'s design (`docs/adr/0043-...md`) most closely among the
-/// already-migrated Wave 2 stores — see the `.cpp`'s file header and ADR-0048 for the two-table
-/// extensions (row-count-prefixed section fingerprinting, half-schema-file rejection, and
-/// `license_alerts`' simpler natural-key backfill dedup).
+/// `migrate_from_sqlite()` retired (chore/retire-migrate-from-sqlite-batch-b, #3623): no
+/// production fleet ever ran a pre-Postgres build of this store, and this store additionally had
+/// zero production callers at all (DORMANT, above) — its `sqlite_backfill_source` marker table
+/// was never created in any real database, so removal edited migration v1 in place rather than
+/// version-bumping (see ADR-0048's Update).
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -92,16 +88,6 @@ public:
     LicenseStore& operator=(const LicenseStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
-
-    /// Legacy-SQLite backfill (ADR-0009/0048). Call once at server startup, before serving,
-    /// after construction has proven the Postgres schema is open. Idempotent PER DISTINCT
-    /// LEGACY-FILE CONTENT across BOTH tables (see the `.cpp` file header) — never a single
-    /// fleet-wide flag. Fails CLOSED on any error, including a legacy file holding exactly one
-    /// of the two expected tables (ADR-0048: no version of the shipped binary can produce that
-    /// shape, so it is treated as corruption). Returns true (no-op) when `legacy_db_path` does
-    /// not exist or holds neither table (fresh install). Opens the legacy file READ-ONLY and
-    /// never deletes/moves it.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// Validates `license_key`/`license.organization` are non-empty, hashes the key (SHA-256,
     /// never persisted raw), mints an id if `license.id` is empty, and inserts atomically via

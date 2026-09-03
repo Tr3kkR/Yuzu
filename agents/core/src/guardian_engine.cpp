@@ -37,6 +37,7 @@
 #include "guardian_journal_heartbeat.hpp" // GuardianJournalStats (item 7 PR-Ag §8)
 #include "guardian_lifecycle_journal.hpp" // durable lifecycle journal (item 7 PR-Ag)
 #include "guardian_outbox_drain_worker.hpp"
+#include "guardian_rule_eval.hpp" // clamp_max_hash_bytes, kMaxFileHashBytes (#2233 item 6)
 #include "guardian_scope_guard.hpp" // GuardianRollback (terminate-safe rollback)
 #include "guardian_spark_backend.hpp"
 #include "guardian_spark_bridge.hpp" // spark_spec_from_rule, rule_assertion_from_rule, classify
@@ -598,6 +599,11 @@ std::uint64_t GuardianEngine::priority_demoted() const {
     return spark_runtime_ ? spark_runtime_->priority_demoted() : 0;
 }
 
+std::uint64_t GuardianEngine::outbox_backpressure_drops() const { // #2993
+    std::lock_guard lock(mtx_);
+    return spark_runtime_ ? spark_runtime_->outbox_backpressure_drops() : 0;
+}
+
 std::map<SparkType, std::uint64_t> GuardianEngine::unsupported_counts_by_type() const {
     std::lock_guard lock(mtx_);
     std::map<SparkType, std::uint64_t> out;
@@ -1041,6 +1047,16 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
             // agent-side backstop (M1).
             if (fcfg.max_hash_bytes == 0)
                 fcfg.max_hash_bytes = default_max_bytes;
+            // #2233 item 6: hard ceiling on an authored value, single-sourced with the
+            // spark path's own clamp (guardian_spark_bridge.hpp) via
+            // clamp_max_hash_bytes - see that function's doc for why and the exact bound.
+            if (const auto clamped = clamp_max_hash_bytes(fcfg.max_hash_bytes);
+                clamped != fcfg.max_hash_bytes) {
+                spdlog::warn("Guardian: rule '{}' authored max_bytes={} exceeds the {}-byte "
+                            "ceiling - clamped (#2233 item 6)",
+                            fcfg.rule_id, fcfg.max_hash_bytes, kMaxFileHashBytes);
+                fcfg.max_hash_bytes = clamped;
+            }
             fcfg.settle_ms = aparam_u64("settle_ms", fcfg.settle_ms);
         } else {
             // file-exists: "absent" → drift when the file EXISTS; anything else

@@ -38,7 +38,15 @@ configs:
               {circuit_breaker_reset_timeout_ms, 10000},
               {circuit_breaker_max_reset_timeout_ms, 300000},
               {backpressure_threshold, 1000},
-              {hash_ring_vnodes, 256}
+              {hash_ring_vnodes, 256},
+              %% #1422 escape hatch - UAT ONLY: the mgmt listener below is
+              %% plaintext on 0.0.0.0; a gateway image carrying the #1422
+              %% mgmt-posture guard refuses to boot without this (the
+              %% release-pinned image above ignores the key until a release
+              %% ships the guard). Safe only while :50063 stays unpublished
+              %% on this compose network. Standing exception, revisit when
+              %% the rig TLS flip lands (#1422 follow-up).
+              {allow_insecure_mgmt, true}
           ]},
           {grpcbox, [
               {client, #{channels => [
@@ -296,7 +304,10 @@ services:
     restart: unless-stopped
     ports:
       - "50061:50051"   # Agent-facing gRPC (mapped to host 50061 to avoid conflict)
-      - "50063:50063"   # Management/command forwarding
+      # :50063 (management/command fan-out) is deliberately NOT published: this
+      # rig's mgmt plane is plaintext+unauthenticated (allow_insecure_mgmt), so
+      # it must stay reachable only from the compose network (the server dials
+      # gateway:50063). #1422.
       - "8081:8081"     # Health/readiness
       - "9568:9568"     # Prometheus metrics
     environment:

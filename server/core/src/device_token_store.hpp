@@ -12,10 +12,7 @@
 /// object") — the same two commits that produced `LicenseStore` (ADR-0048) and
 /// `SoftwareDeploymentStore`'s (ADR-0051) dormancy. This store is UNWIRED, not never-wired.
 /// Re-wiring construction is out of scope for this migration — this file migrates the
-/// persistence layer only. `migrate_from_sqlite` therefore also has zero production callers
-/// today; it is shipped and unit-tested, wired the moment a future change re-constructs the
-/// store. The expected legacy file is `device-tokens.db` (the pre-removal construction site's
-/// argument).
+/// persistence layer only.
 ///
 /// Posture (ADR-0012 §1): AUTHORITATIVE / fail-hard, both construction and runtime. This is an
 /// auth-credential store — a silently-empty/false read or a silently-swallowed revoke would be
@@ -40,21 +37,15 @@
 /// (hash-only, not envelope-encrypted) — this is why this store sits in Wave 3's "verify/hash"
 /// row rather than the SecretCodec-gated rows.
 ///
-/// **Mandatory backfill** (ADR-0009): `migrate_from_sqlite()` is idempotent PER DISTINCT
-/// LEGACY-FILE CONTENT (a SHA-256 fingerprint, or a sourceless sentinel), mirroring
-/// `DeploymentStore`'s (docs/adr/0043-...md) single-table design most closely among the
-/// already-migrated stores — see the `.cpp`'s file header and ADR-0052 for the
-/// IDENTITY/LIFECYCLE conflict-handling split, including the security-relevant asymmetry on
-/// `revoked` (a legacy row revoked but not yet reflected in Postgres fails the backfill closed —
-/// silently keeping Postgres's stale "still active" value would resurrect a token the operator
-/// revoked). Memory-bounded (#3399): the legacy table is streamed, not materialized — resident
-/// state is O(kBackfillBatchRows), regardless of legacy table size. Fail-closed and all-or-
-/// nothing: every failure (scan, validation, insert, conflict, marker stamp) leaves the backfill
-/// marker unstamped, so the next boot re-fingerprints and retries the whole file.
+/// `migrate_from_sqlite()` retired (chore/retire-migrate-from-sqlite-batch-b, #3623): no
+/// production fleet ever ran a pre-Postgres build of this store, and this store additionally had
+/// zero production callers at all (UNWIRED, above) — its `sqlite_backfill_source` marker table
+/// was never created in any real database, so removal edited migration v1 in place rather than
+/// version-bumping (ADR-0009's version-bump requirement protects a schema a live database may
+/// already have run; that never happened here).
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -164,14 +155,6 @@ public:
     DeviceTokenStore& operator=(const DeviceTokenStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
-
-    /// Legacy-SQLite backfill (ADR-0009/0052). Call once at server startup, before serving, after
-    /// construction has proven the Postgres schema is open. Idempotent PER DISTINCT LEGACY-FILE
-    /// CONTENT (see the `.cpp` file header) — never a single fleet-wide flag. Fails CLOSED on any
-    /// error. Returns true (no-op) when `legacy_db_path` does not exist or holds no
-    /// `device_auth_tokens` table (fresh install). Opens the legacy file READ-ONLY and never
-    /// deletes/moves it.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     /// Create a new device authorization token. Returns the raw token string (shown once) on
     /// success. `unexpected(msg)` is either caller-input validation (empty principal_id),

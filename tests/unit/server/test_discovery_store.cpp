@@ -17,8 +17,8 @@
  * No legacy-SQLite backfill test coverage: the dedicated [backfill] TEST_CASE
  * suite (2026-08-25) was removed as part of a fresh-start-by-default policy
  * change (ADR-0009 amendment) — no production fleet has ever run a
- * pre-Postgres build. DiscoveryStore::migrate_from_sqlite() itself is
- * UNCHANGED and still present (its removal is a separate, later step).
+ * pre-Postgres build. DiscoveryStore::migrate_from_sqlite() itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  *
  * Migrated Postgres store (ADR-0044, authoritative/fail-hard per ADR-0012
  * §1). PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set

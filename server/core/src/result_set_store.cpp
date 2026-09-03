@@ -7,14 +7,11 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
-#include "sqlite_raii.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
-#include <sqlite3.h>
 
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -172,13 +169,6 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE INDEX idx_result_sets_parent ON result_sets(parent_id);"
          "CREATE INDEX idx_result_sets_status ON result_sets(status);"
          "CREATE INDEX idx_result_set_members_dev ON result_set_members(device_id);"
-         // Backfill idempotency marker (ADR-0009). A dedicated row — NEVER
-         // inferred from result_sets being empty, since gc_sweep legitimately
-         // empties it over the store's lifetime.
-         "CREATE TABLE sqlite_backfill ("
-         "  id           SMALLINT PRIMARY KEY,"
-         "  completed_at BIGINT NOT NULL,"
-         "  CHECK (id = 1));"
          // Durable state for the gc_sweep retention clock guard (#2360 class;
          // routed-concern "Clock-guarded retention"). SHARED rows rather than
          // process-local members: on Postgres N server replicas each run the
@@ -190,6 +180,11 @@ const std::vector<pg::PgMigration>& migrations() {
          "CREATE TABLE gc_meta ("
          "  key   TEXT PRIMARY KEY,"
          "  value TEXT NOT NULL);"},
+        // migrate_from_sqlite() retired (ADR-0009 fresh-start-by-default, #3623) —
+        // sqlite_backfill's sole purpose was the backfill idempotency marker, which
+        // no longer has a writer. Version-bumped (not edited into v1) because v1 has
+        // actually run against real dev/UAT databases — see ADR-0036's Update.
+        {2, "DROP TABLE IF EXISTS sqlite_backfill;"},
     };
     return kMigrations;
 }
@@ -254,48 +249,6 @@ int count_pinned_on(PGconn* conn, const std::string& owner) {
     return to_int(PQgetvalue(res.get(), 0, 0));
 }
 
-// RAII owner for the legacy SQLite connection migrate_from_sqlite opens
-// read-only. sqlite3_close runs on scope exit — including exception unwind
-// (e.g. a std::bad_alloc thrown mid read-loop building a ResultSet/string) —
-// so no early-return/error path can leak the handle (gov cpp-safety). Local
-// to this file: the only sqlite3* connection this store ever opens (the
-// runtime store lives entirely on pg::PgPool). Pairs with the existing
-// per-statement `SqliteStmt` owner (sqlite_raii.hpp) for the prepare/step
-// loops below.
-class SqliteConnGuard {
-public:
-    SqliteConnGuard() = default;
-    ~SqliteConnGuard() { reset(); }
-
-    SqliteConnGuard(const SqliteConnGuard&) = delete;
-    SqliteConnGuard& operator=(const SqliteConnGuard&) = delete;
-    SqliteConnGuard(SqliteConnGuard&& o) noexcept : db_(o.db_) { o.db_ = nullptr; }
-    SqliteConnGuard& operator=(SqliteConnGuard&& o) noexcept {
-        if (this != &o) {
-            reset();
-            db_ = o.db_;
-            o.db_ = nullptr;
-        }
-        return *this;
-    }
-
-    /// Address for `sqlite3_open_v2(path, guard.addr(), flags, nullptr)`.
-    sqlite3** addr() noexcept { return &db_; }
-    sqlite3* get() const noexcept { return db_; }
-    explicit operator bool() const noexcept { return db_ != nullptr; }
-
-    /// Close early. Idempotent.
-    void reset() noexcept {
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-    }
-
-private:
-    sqlite3* db_{nullptr};
-};
-
 } // namespace
 
 // ── Construction ─────────────────────────────────────────────────────────────
@@ -313,243 +266,6 @@ ResultSetStore::ResultSetStore(pg::PgPool& pool) : pool_(pool) {
         return;
     }
     open_ = true;
-}
-
-// ── Backfill (ADR-0009) ──────────────────────────────────────────────────────
-
-bool ResultSetStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
-    if (!open_)
-        return false;
-
-    // Idempotency check: a dedicated marker row, never row-count-inferred
-    // (gc_sweep legitimately empties result_sets over the store's lifetime).
-    // Unbounded acquire() here is construction-time discipline (ADR-0012
-    // §2(a)) — this runs once at boot, before serving, same as the ctor.
-    {
-        auto lease = pool_.acquire();
-        if (!lease) {
-            spdlog::error("ResultSetStore::migrate_from_sqlite: no database connection");
-            return false;
-        }
-        pg::PgResult marker = pg::exec_params(
-            lease.get(), "SELECT 1 FROM result_set_store.sqlite_backfill LIMIT 1",
-            std::vector<std::string>{});
-        if (marker.status() != PGRES_TUPLES_OK) {
-            spdlog::error("ResultSetStore::migrate_from_sqlite: backfill-marker check failed: {}",
-                          PQerrorMessage(lease.get()));
-            return false;
-        }
-        if (PQntuples(marker.get()) > 0) {
-            spdlog::info("ResultSetStore::migrate_from_sqlite: already backfilled, skipping");
-            return true;
-        }
-    }
-
-    std::error_code ec;
-    if (!std::filesystem::exists(legacy_db_path, ec)) {
-        // Fresh install — nothing to backfill. Stamp the marker so this branch
-        // is not re-evaluated on every future boot.
-        auto lease = pool_.acquire();
-        if (!lease) {
-            spdlog::error("ResultSetStore::migrate_from_sqlite: no connection to stamp marker");
-            return false;
-        }
-        pg::PgResult r = pg::exec_params(
-            lease.get(),
-            "INSERT INTO result_set_store.sqlite_backfill (id, completed_at) VALUES (1, "
-            "$1::bigint) ON CONFLICT (id) DO NOTHING",
-            std::vector<std::string>{std::to_string(now_epoch())});
-        if (r.status() != PGRES_COMMAND_OK) {
-            spdlog::error("ResultSetStore::migrate_from_sqlite: failed to stamp marker: {}",
-                          PQerrorMessage(lease.get()));
-            return false;
-        }
-        spdlog::info("ResultSetStore::migrate_from_sqlite: no legacy {} — nothing to backfill",
-                     legacy_db_path.string());
-        return true;
-    }
-
-    // Read the legacy SQLite file READ-ONLY. It is retained by the caller
-    // (never deleted here) for the ADR-0009 one-release rollback window.
-    // RAII (gov cpp-safety): SqliteConnGuard/SqliteStmt close/finalize on
-    // every path — including an exception thrown mid read-loop (e.g. a
-    // std::bad_alloc building a ResultSet/string) — so no early return here
-    // can leak the connection or a prepared statement.
-    SqliteConnGuard legacy;
-    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
-                        nullptr) != SQLITE_OK) {
-        spdlog::error("ResultSetStore::migrate_from_sqlite: failed to open legacy {}: {}",
-                      legacy_db_path.string(),
-                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
-        return false;
-    }
-
-    std::vector<ResultSet> legacy_sets;
-    {
-        SqliteStmt s;
-        // ORDER BY created_at, id ASC (B3a): the self-referencing parent_id FK
-        // is NOT DEFERRABLE, so a child row's INSERT must never precede its
-        // parent's in the write transaction below. `id` embeds an epoch-ms
-        // prefix (generate_id()) — a finer-grained, still-lexically-ordered
-        // tiebreak for two rows created within the same created_at second.
-        const char* sql =
-            "SELECT id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, "
-            "parent_id, source_kind, source_payload, status, source_execution_id, matcher, "
-            "device_count FROM result_sets ORDER BY created_at ASC, id ASC;";
-        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
-            spdlog::error(
-                "ResultSetStore::migrate_from_sqlite: legacy result_sets query failed: {}",
-                sqlite3_errmsg(legacy.get()));
-            return false;
-        }
-        int step_rc = SQLITE_OK;
-        while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-            ResultSet r;
-            r.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
-            r.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
-            r.owner_principal =
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
-            r.created_at = sqlite3_column_int64(s.get(), 3);
-            r.ttl_at = sqlite3_column_int64(s.get(), 4);
-            r.last_used_at = sqlite3_column_int64(s.get(), 5);
-            r.pinned = sqlite3_column_int64(s.get(), 6) != 0;
-            if (sqlite3_column_type(s.get(), 7) != SQLITE_NULL)
-                r.parent_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 7)));
-            r.source_kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 8)));
-            r.source_payload =
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 9)));
-            r.status = result_set_status_from(
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 10))));
-            r.source_execution_id =
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 11)));
-            r.matcher = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 12)));
-            r.device_count = sqlite3_column_int64(s.get(), 13);
-            legacy_sets.push_back(std::move(r));
-        }
-        // H2 (governance): the loop above exits on ANY non-ROW code. Require
-        // the terminal code to be SQLITE_DONE — a corrupt page or I/O error
-        // mid-scan (SQLITE_CORRUPT/SQLITE_IOERR/...) otherwise truncates the
-        // legacy set silently, and the marker below would stamp the backfill
-        // complete over a partial copy, permanently (the marker short-circuits
-        // every later boot). ADR-0009: fail closed on ANY error — including
-        // read-side errors, not just insert-side ones.
-        if (step_rc != SQLITE_DONE) {
-            spdlog::error("ResultSetStore::migrate_from_sqlite: legacy result_sets scan aborted "
-                          "mid-read (rc={} {}): refusing to stamp a partial backfill",
-                          step_rc, sqlite3_errmsg(legacy.get()));
-            return false;
-        }
-        // s finalizes here (end of scope), before the next SqliteStmt opens.
-    }
-
-    std::vector<std::pair<std::string, std::string>> legacy_members; // (result_set_id, device_id)
-    {
-        SqliteStmt s;
-        const char* sql = "SELECT result_set_id, device_id FROM result_set_members;";
-        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
-            spdlog::error(
-                "ResultSetStore::migrate_from_sqlite: legacy result_set_members query failed: {}",
-                sqlite3_errmsg(legacy.get()));
-            return false;
-        }
-        int step_rc = SQLITE_OK;
-        while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-            legacy_members.emplace_back(
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0))),
-                safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1))));
-        }
-        // H2: same terminal-code discipline as the result_sets scan above.
-        if (step_rc != SQLITE_DONE) {
-            spdlog::error("ResultSetStore::migrate_from_sqlite: legacy result_set_members scan "
-                          "aborted mid-read (rc={} {}): refusing to stamp a partial backfill",
-                          step_rc, sqlite3_errmsg(legacy.get()));
-            return false;
-        }
-    }
-    // `legacy` closes here (end of function scope) via SqliteConnGuard's
-    // destructor — no explicit sqlite3_close() call needed on any path below.
-
-    spdlog::info("ResultSetStore::migrate_from_sqlite: backfilling {} result set(s), {} member "
-                 "row(s) from {}",
-                 legacy_sets.size(), legacy_members.size(), legacy_db_path.string());
-
-    // ONE transaction: fail closed on any error, nothing partially committed
-    // (ADR-0009 "fails closed on any error"). Unbounded with_txn (not
-    // with_txn_for): startup is serial, same discipline as the ctor's
-    // unbounded acquire() (ADR-0012 §2(a)). `failure_detail` (B3b) names the
-    // SPECIFIC offending row so the abort log is actionable, not opaque —
-    // the operator can inspect/fix that exact row in the retained read-only
-    // legacy file before restarting (the marker is never stamped on failure,
-    // so the next boot retries the whole backfill).
-    std::string failure_detail;
-    bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
-        for (const auto& r : legacy_sets) {
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "INSERT INTO result_set_store.result_sets "
-                "(id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, "
-                " parent_id, source_kind, source_payload, status, source_execution_id, matcher, "
-                " device_count) "
-                "VALUES ($1,$2,$3,$4::bigint,$5::bigint,$6::bigint,$7::boolean,$8,$9,$10,$11,"
-                "$12,$13,$14::bigint) ON CONFLICT (id) DO NOTHING",
-                std::vector<std::optional<std::string>>{
-                    r.id, r.name.empty() ? std::nullopt : std::optional<std::string>(r.name),
-                    r.owner_principal, std::to_string(r.created_at), std::to_string(r.ttl_at),
-                    std::to_string(r.last_used_at), std::string(r.pinned ? "true" : "false"),
-                    r.parent_id, r.source_kind, r.source_payload,
-                    std::string(to_string(r.status)), r.source_execution_id, r.matcher,
-                    std::to_string(r.device_count)});
-            if (res.status() != PGRES_COMMAND_OK) {
-                failure_detail = std::format("legacy result_sets row id='{}' (owner='{}'): {}",
-                                             r.id, r.owner_principal, PQerrorMessage(conn));
-                spdlog::error("ResultSetStore::migrate_from_sqlite: insert of {} failed: {}", r.id,
-                              PQerrorMessage(conn));
-                return false;
-            }
-        }
-        for (const auto& [rs_id, dev_id] : legacy_members) {
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
-                "VALUES ($1,$2) ON CONFLICT DO NOTHING",
-                std::vector<std::string>{rs_id, dev_id});
-            if (res.status() != PGRES_COMMAND_OK) {
-                failure_detail =
-                    std::format("legacy result_set_members row (result_set_id='{}', "
-                                "device_id='{}'): {}",
-                                rs_id, dev_id, PQerrorMessage(conn));
-                spdlog::error(
-                    "ResultSetStore::migrate_from_sqlite: member insert ({}, {}) failed: {}",
-                    rs_id, dev_id, PQerrorMessage(conn));
-                return false;
-            }
-        }
-        pg::PgResult marker = pg::exec_params(
-            conn,
-            "INSERT INTO result_set_store.sqlite_backfill (id, completed_at) VALUES (1, "
-            "$1::bigint) ON CONFLICT (id) DO NOTHING",
-            std::vector<std::string>{std::to_string(now_epoch())});
-        if (marker.status() != PGRES_COMMAND_OK) {
-            failure_detail = std::format("backfill marker stamp: {}", PQerrorMessage(conn));
-            spdlog::error("ResultSetStore::migrate_from_sqlite: failed to stamp backfill marker: {}",
-                          PQerrorMessage(conn));
-            return false;
-        }
-        return true;
-    });
-    if (!ok) {
-        spdlog::error(
-            "ResultSetStore::migrate_from_sqlite: backfill transaction failed and was rolled "
-            "back — result-set data NOT migrated. Offending: {}. Remediation: inspect/fix the "
-            "referenced row in the retained read-only legacy file ({}) — e.g. `sqlite3 {} "
-            "\"SELECT * FROM result_sets WHERE id='<id>'\"` — then restart the server; the "
-            "backfill marker was NOT stamped, so the next boot retries the whole backfill.",
-            failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
-            legacy_db_path.string(), legacy_db_path.string());
-        return false;
-    }
-    spdlog::info("ResultSetStore::migrate_from_sqlite: backfill complete");
-    return true;
 }
 
 // ── Create ───────────────────────────────────────────────────────────────────

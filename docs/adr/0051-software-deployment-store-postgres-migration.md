@@ -319,3 +319,29 @@ this store's tables are not high-volume, and once re-wired, boots are infrequent
   entirely out of scope for this migration and is not tracked by a follow-up issue here — the
   kickoff's instruction was explicit that resurrecting the shelved capability is a separate,
   future, explicit decision.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+**Supersedes the "Backfill is NOT skippable on the strength of dormancy" bullet above.** That
+bullet reasoned that the `acc6c481a..2fcfb95b5` window meant a real legacy SQLite file with
+genuine packages/deployments/agent statuses *could* exist even though the store is dormant today.
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes the blanket program-wide fact
+this per-store hedge did not yet have available: no production Yuzu fleet has ever run a
+pre-Postgres build of *any* store (`project_no-production-fleet-fresh-build` standing fact) — this
+store's historical SQLite-era construction window included, since Yuzu had no production
+deployments during it either.
+
+`SoftwareDeploymentStore::migrate_from_sqlite()` and its private helpers (`sha256_hex`,
+`append_field`, `canon_package`/`canon_deployment`/`canon_agent_status`,
+`canonicalize_legacy_snapshot`, `deployment_lifecycle_rank`, `LegacyTableStatus`/
+`legacy_has_table`, `safe`/`sqlite_text`) and the `sqlite_backfill_source` marker table are removed
+(`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623). `agent_lifecycle_rank` and
+`is_fk_violation` are KEPT — both have genuine production callers (`update_agent_status`'s status
+validation and its/`create_deployment`'s/`delete_package`'s FK-violation classification
+respectively) independent of backfill. This store's `migrations()` were never run against any real
+database at all — nothing in production ever constructed `SoftwareDeploymentStore` even after this
+ADR's PG migration merged (see "no production call site today" above) — so schema version 1 was
+edited in place (the `sqlite_backfill_source` `CREATE TABLE` deleted from it) rather than issuing a
+version-bumped `DROP TABLE IF EXISTS` migration, the same practical justification PolicyStore's
+removal used (ADR-0009 §"authoring contract"), reached the same way DeviceTokenStore's (ADR-0052)
+and LicenseStore's (ADR-0048) were: those stores' v1 had never *shipped* or never *run* either.

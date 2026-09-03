@@ -2375,12 +2375,18 @@ public:
                                 // evicted off the 5s priority lane. Sparse: non-zero only. Keys
                                 // pinned in guardian_health_heartbeat.hpp (drift-proofs the #2298
                                 // server-side rollup reader).
+                                // outbox_backpressure_drops (#2993): the MAIN compliance/health
+                                // outbox's own capacity-rejection counter, previously wired to
+                                // NOTHING in production - an on-call operator had no fleet
+                                // signal for a chronic main-outbox jam. Sparse: 0 omits its tag.
                                 emit_guardian_health_heartbeat_tags(
                                     tags,
                                     GuardianHealthStats{
                                         .unhealthy_suppressed = guardian_->unhealthy_suppressed(),
                                         .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
-                                        .priority_demoted = guardian_->priority_demoted()});
+                                        .priority_demoted = guardian_->priority_demoted(),
+                                        .outbox_backpressure_drops =
+                                            guardian_->outbox_backpressure_drops()});
                                 // F7 (#2298 rung 2): per-type CURRENT count of rules classified
                                 // Unsupported (neither backend enforces them) - fleet-loud via
                                 // mech_unsupported_total, sparse (0 omits its tag).

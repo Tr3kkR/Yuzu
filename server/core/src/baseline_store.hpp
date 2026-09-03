@@ -12,7 +12,9 @@
 /// docs/adr/0055-baseline-store-postgres-migration.md for the migration's
 /// posture decisions (this header follows that ADR verbatim) and
 /// docs/yuzu-guardian-design-v1.1.md §9.1/§24 for the schema + standing
-/// invariants.
+/// invariants. `migrate_from_sqlite()` retired
+/// (chore/retire-migrate-from-sqlite-batch-b, #3623) — see ADR-0055's Update;
+/// server.cpp now runs a detect-and-warn probe over the legacy file instead.
 ///
 /// Model recap (what this store persists):
 ///   - A Baseline groups one or more Guards (M:N, via `baseline_rules`) and
@@ -83,7 +85,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -141,30 +142,6 @@ public:
     BaselineStore& operator=(const BaselineStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
-
-    /// One-time, idempotent legacy-SQLite backfill (ADR-0009/0055). Call once
-    /// at server startup, before serving, after construction proved the
-    /// Postgres schema is open. All three tables in ONE transaction,
-    /// idempotent via a `baseline_store_meta` marker (`backfill_complete` +
-    /// a SHA-256 `backfill_source_fingerprint` over the legacy content,
-    /// RbacStore/TagStore post-#2703 shape) — a replica that still holds its
-    /// own local legacy file when the marker is already set VERIFIES that
-    /// file's content against the stored fingerprint before trusting the
-    /// marker (holder-side verification; docs/postgres-store-playbook.md
-    /// "Local source absence never creates terminal migration state on its
-    /// own"). Parent rows (`baselines`) are migrated per-row, direction-aware
-    /// on an `updated_at` conflict (identical / Postgres-ahead benign / legacy-
-    /// ahead-or-tied-differing fails closed — the DeploymentStore/TagStore
-    /// shape); a baseline's member + assignment children are copied ONLY when
-    /// its parent row was freshly inserted from legacy — a baseline that
-    /// already existed live (Postgres-ahead or identical) already has its
-    /// complete, authoritative children via `set_members`/`set_assignment`'s
-    /// own atomic full-replace semantics, so re-merging its legacy children
-    /// row-by-row would be redundant at best and a stale partial overwrite at
-    /// worst. FAILS CLOSED on any infrastructure error or an unresolved
-    /// direction conflict — the caller MUST treat `false` as fatal
-    /// (`startup_failed_ = true` in server.cpp), same as `!is_open()`.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Baseline CRUD ──────────────────────────────────────────────────────
     // create_baseline generates a 12-hex baseline_id when `b.baseline_id` is
