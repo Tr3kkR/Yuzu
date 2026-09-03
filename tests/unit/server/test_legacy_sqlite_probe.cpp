@@ -351,6 +351,48 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 hardens the resolved tar
     CHECK(link_status.type() == std::filesystem::file_type::symlink);
 }
 
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 cannot widen or redirect a chmod onto "
+          "a file it does not own",
+          "[legacy_sqlite_probe]") {
+    // Pins the ownership-gate half of the security argument in this header's doc comment: a
+    // symlink to a file this process does NOT own must fail the fchmod (EPERM, best-effort,
+    // logged, boot proceeds) rather than ever changing that file's mode -- the property that
+    // makes following the symlink (see the test above) safe against an attacker-planted link to
+    // an arbitrary file. Skipped when running as root, where the gate does not hold (fchmod as
+    // root can chmod anything) and the assertion below would be false by construction.
+    if (::geteuid() == 0)
+        SUCCEED("running as root -- the ownership gate does not apply, nothing to assert");
+    else {
+        const std::filesystem::path root_owned = "/etc/passwd"; // world-readable, root-owned
+        std::error_code st_ec;
+        const auto before = std::filesystem::status(root_owned, st_ec);
+        REQUIRE_FALSE(st_ec);
+        REQUIRE(before.type() == std::filesystem::file_type::regular);
+        const auto before_perms = before.permissions() & std::filesystem::perms::mask;
+
+        auto link = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_noowner_") += ".db";
+        REQUIRE(::symlink(root_owned.c_str(), link.string().c_str()) == 0);
+        struct Cleanup {
+            std::filesystem::path link;
+            ~Cleanup() {
+                std::error_code ec;
+                std::filesystem::remove(link, ec);
+            }
+        } cleanup{link};
+
+        yuzu::test::LogCapture cap;
+        harden_legacy_file_0600(link); // must not throw, must not touch /etc/passwd's mode
+        cap.stop();
+
+        std::error_code after_ec;
+        const auto after_perms =
+            std::filesystem::status(root_owned, after_ec).permissions() & std::filesystem::perms::mask;
+        REQUIRE_FALSE(after_ec);
+        CHECK(after_perms == before_perms); // unchanged -- the fchmod failed closed
+        CHECK(cap.text().find("could not set 0600") != std::string::npos);
+    }
+}
+
 TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 leaves a non-regular path (a FIFO) "
           "untouched without blocking",
           "[legacy_sqlite_probe]") {

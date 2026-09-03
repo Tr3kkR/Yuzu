@@ -200,14 +200,28 @@ inline void warn_if_legacy_rows(const std::filesystem::path& legacy_db_path,
 /// file it already owns, so a symlink planted by another principal at the legacy path either
 /// points at a file this process owns (narrowing it to 0600 is safe) or fails the `fchmod` with
 /// `EPERM` (logged, best-effort, boot proceeds) — it can never be used to widen or redirect
-/// access onto a file this process does not already control. Yuzu's server runs under a
-/// dedicated non-root service account (`docs/agent-privilege-model.md`), not root, so this
-/// ownership gate holds in the deployed configuration.
+/// access onto a file this process does not already control. The shipped server images run as
+/// a dedicated non-root account (`USER yuzu`, `deploy/docker/Dockerfile.server*`), not root, so
+/// this ownership gate holds in the deployed configuration. (`docs/agent-privilege-model.md`
+/// covers the separate agent-daemon account, not the server's — do not cite it here.)
 inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path) {
 #ifndef _WIN32
+    // RAII, not `agents/core/include/yuzu/agent/scoped_fd.hpp`'s `ScopedFd` -- that header is
+    // agent-only (yuzu::agent, a separate build target) and importing it into server code would
+    // be a cross-module layering violation. Local to this function: closes on every exit path
+    // (including a thrown spdlog::warn, which the prior hand-rolled `::close()`-before-every-
+    // `return` version did not guarantee).
+    struct OwnedFd {
+        int fd;
+        ~OwnedFd() {
+            if (fd >= 0)
+                ::close(fd);
+        }
+    };
+
     const auto chmod_owner_only = [](const std::filesystem::path& path, const char* what) {
-        const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY);
-        if (fd < 0) {
+        OwnedFd owned{::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY)};
+        if (owned.fd < 0) {
             if (errno != ENOENT)
                 spdlog::warn("legacy_sqlite_probe: could not open {} {} to harden its "
                             "permissions ({})",
@@ -215,21 +229,17 @@ inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path)
             return; // absent (ordinary case), or unreadable -- nothing to harden
         }
         struct stat st{};
-        if (::fstat(fd, &st) != 0) {
+        if (::fstat(owned.fd, &st) != 0) {
             spdlog::warn("legacy_sqlite_probe: could not stat {} {} to harden its permissions "
                         "({})",
                         what, path.string(), std::strerror(errno));
-            ::close(fd);
             return;
         }
-        if (!S_ISREG(st.st_mode)) {
-            ::close(fd); // not a regular file (dir/device/FIFO/socket) -- nothing to harden
-            return;
-        }
-        if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0)
+        if (!S_ISREG(st.st_mode))
+            return; // not a regular file (dir/device/FIFO/socket) -- nothing to harden
+        if (::fchmod(owned.fd, S_IRUSR | S_IWUSR) != 0)
             spdlog::warn("legacy_sqlite_probe: could not set 0600 on {} {}: {}", what,
                         path.string(), std::strerror(errno));
-        ::close(fd);
     };
 
     chmod_owner_only(legacy_db_path, "legacy file");
