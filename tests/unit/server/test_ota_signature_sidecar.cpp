@@ -19,6 +19,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
 #include <fstream>
 #include <string>
 
@@ -30,6 +31,7 @@
 
 using yuzu::server::kMaxSignatureBytes;
 using yuzu::server::looks_like_pem_cms;
+using yuzu::server::signature_sidecar_covers_binary;
 using yuzu::server::read_signature_sidecar;
 using yuzu::server::replace_signature_sidecar;
 using yuzu::server::SidecarOutcome;
@@ -283,4 +285,49 @@ TEST_CASE("PEM CMS shape check rejects the states nothing else catches",
     CHECK_FALSE(looks_like_pem_cms("-----BEGIN CMS-----\nMIIB\n-----END PKCS7-----\n"));
 
     CHECK_FALSE(looks_like_pem_cms(""));
+}
+
+TEST_CASE("a sidecar newer than its binary is reported as not covering it",
+          "[ota][sidecar]") {
+    // The invariant: a successful upload writes the sidecar FIRST and the binary
+    // second, so binary mtime >= sidecar mtime. A sidecar strictly NEWER proves
+    // the binary write never followed it -- the upload died or failed in
+    // between -- so the stored signature cannot cover the bytes on disk.
+    Dir d;
+    const auto bin = d.p / "yuzu-agent";
+    const auto sig = signature_sidecar_path(bin);
+
+    {
+        std::ofstream(bin.string(), std::ios::binary) << "binary-bytes";
+        std::ofstream(sig.string(), std::ios::binary) << "-----BEGIN CMS-----\nx\n-----END CMS-----\n";
+    }
+
+    // Consistent: binary written after the sidecar.
+    const auto t0 = fs::last_write_time(sig);
+    fs::last_write_time(bin, t0 + std::chrono::seconds(1));
+    CHECK(signature_sidecar_covers_binary(bin, sig));
+
+    // Equal timestamps count as consistent, so a coarse-granularity filesystem
+    // degrades to the old behaviour rather than to false alarms.
+    fs::last_write_time(bin, t0);
+    CHECK(signature_sidecar_covers_binary(bin, sig));
+
+    // The failure this exists to catch: sidecar landed, binary write did not.
+    fs::last_write_time(bin, t0 - std::chrono::seconds(1));
+    CHECK_FALSE(signature_sidecar_covers_binary(bin, sig));
+}
+
+TEST_CASE("an unreadable or absent sidecar is not evidence of a mismatch",
+          "[ota][sidecar]") {
+    // An absent sidecar is the ordinary unsigned case and must not render as a
+    // mismatch -- that would put a scary state on every unsigned package.
+    Dir d;
+    const auto bin = d.p / "yuzu-agent";
+    { std::ofstream(bin.string(), std::ios::binary) << "binary-bytes"; }
+    CHECK(signature_sidecar_covers_binary(bin, signature_sidecar_path(bin)));
+
+    // A sidecar with no binary beside it likewise proves nothing.
+    const auto orphan_sig = d.p / "gone.sig";
+    { std::ofstream(orphan_sig.string(), std::ios::binary) << "x"; }
+    CHECK(signature_sidecar_covers_binary(d.p / "gone", orphan_sig));
 }

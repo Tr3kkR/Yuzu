@@ -2212,8 +2212,23 @@ std::string SettingsRoutes::render_updates_fragment() {
                     (update_registry_ &&
                      signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
                          SidecarOutcome::kServed
-                         ? std::string("<span title=\"A detached signature is stored "
-                                       "for this package\">signed</span>")
+                         // A served signature that CANNOT cover the binary beside
+                         // it gets its own state. Reporting it as "signed" is the
+                         // worst of the three: the docs nominate this column as
+                         // the confirmation check, so the operator reads success
+                         // while every anchored agent refuses the package.
+                         ? (signature_sidecar_covers_binary(
+                                update_registry_->binary_path(pkg),
+                                update_registry_->signature_path(pkg))
+                                ? std::string("<span title=\"A detached signature is stored "
+                                              "for this package\">signed</span>")
+                                : std::string(
+                                      "<span style=\"color:#d29922\" title=\"The stored "
+                                      "signature is NEWER than the binary beside it, so it "
+                                      "cannot cover it - the upload did not complete. Agents "
+                                      "will refuse this package in both modes. Re-upload the "
+                                      "binary and its signature together.\">signature "
+                                      "mismatch</span>"))
                          : std::string("<span style=\"color:#8b949e\" title=\"No usable "
                                        "signature is being served: either none is stored, or "
                                        "the stored one is unreadable, empty or over the size "
@@ -5443,6 +5458,35 @@ void SettingsRoutes::register_routes(
             update_registry_->binary_path(UpdatePackage{platform, arch, "", "", orig_name});
         std::error_code ec;
         std::filesystem::create_directories(out_path.parent_path(), ec);
+
+        // SIDECAR FIRST, THEN THE BINARY. The order is the crash-safety argument,
+        // not a style choice. Writing the binary first leaves new-binary +
+        // no-signature if the process dies before the sidecar lands — and on the
+        // FIRST signed upload of a filename there is no predecessor to fall back
+        // on, so that window covers the whole signing-adoption rollout. That is
+        // the one state where a permissive agent applies an unverified binary.
+        //
+        // Reversed, every crash point is fail-closed: die after the sidecar and
+        // you have old-binary + new-signature; die after the binary and you have
+        // new-binary + new-signature with no package row, so nothing is
+        // advertised. Neither can be applied unverified.
+        //
+        // The path is derived from the filename alone (UpdateRegistry::
+        // signature_path -> binary_path = update_dir_ / filename), so it is known
+        // here, before `pkg` exists.
+        if (!replace_signature_sidecar(signature_sidecar_path(out_path), signature_pem)) {
+            // NOTHING has been written yet: the previous binary and its signature
+            // are both untouched, so this is a clean refusal, not a partial state.
+            spdlog::error("OTA upload for {}/{}: the signature sidecar could not be written; "
+                          "the previous package is unchanged",
+                          platform, arch);
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Could not store the signature. "
+                            "Nothing was changed \u2014 retry the upload.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
         {
             std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
             if (!f.is_open()) {
@@ -5452,6 +5496,17 @@ void SettingsRoutes::register_routes(
                 return;
             }
             f.write(uploaded.content.data(), static_cast<std::streamsize>(uploaded.content.size()));
+            // Same reasoning as the sidecar's own close: testing before
+            // destruction misses whatever ~ofstream flushes, and a truncated
+            // agent binary that reports success is a fleet-wide apply failure.
+            f.close();
+            if (!f) {
+                res.status = 500;
+                res.set_content("<span class=\"feedback-error\">Could not write the binary "
+                                "completely.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
         }
 
         auto sha = auth::AuthManager::sha256_hex(uploaded.content);
@@ -5478,28 +5533,22 @@ void SettingsRoutes::register_routes(
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
-        // Sidecar handling AFTER the package row exists, so a failure here leaves
-        // an unsigned-but-usable package rather than a registered package
-        // pointing at a half-written signature. The remove inside
-        // replace_signature_sidecar is UNCONDITIONAL — see its header for why an
-        // unsigned re-upload must not inherit the previous signature.
-        if (!replace_signature_sidecar(update_registry_->signature_path(pkg), signature_pem)) {
-            // The BINARY landed and the SIGNATURE did not, so this upload is a
-            // partial success and must never be reported as a plain one. Any
-            // previous sidecar is deliberately left in place (see the function's
-            // header): agents then refuse, which is the safe direction, but the
-            // package is NOT deliverable until the operator retries.
-            spdlog::error("OTA package {}: the binary was written but its signature sidecar "
-                          "was NOT; the package is not deliverable until this upload is retried",
-                          pkg.filename);
-            res.set_header("HX-Trigger",
-                           R"({"showToast":{"message":"Binary uploaded but the signature could )"
-                           R"(not be stored - the package is NOT deliverable. Retry the upload.")"
-                           R"(,"level":"error"}})");
-        } else if (!signature_pem.empty()) {
+        if (!signature_pem.empty())
             spdlog::info("OTA package {}: detached signature stored ({} bytes)", pkg.filename,
                          signature_pem.size());
-        }
+
+        // AUDIT. This changes what code the fleet will execute, so it belongs in
+        // the evidence store, not only in the server log. `signed=` is the field
+        // that matters: an upload with the Signature field left empty silently
+        // downgrades the package from signed to unsigned for every endpoint, and
+        // without this row that transition has no actor, no timestamp and no
+        // outcome. The sibling plugin_signing.bundle.* handler in this same file
+        // has recorded exactly this for its own trust artifact all along.
+        audit_fn_(req, "ota.package.uploaded", "success", "UpdatePackage",
+                  platform + "/" + arch + "/" + version,
+                  "file=" + orig_name + " sha256=" + sha +
+                      " signed=" + (signature_pem.empty() ? "false" : "true") +
+                      " rollout=" + std::to_string(rollout_pct) + "%");
 
         res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
     });
@@ -5536,6 +5585,11 @@ void SettingsRoutes::register_routes(
 
                     update_registry_->remove_package(platform, arch, version);
                     spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
+                    // Audited for the same reason as the upload: this removes a
+                    // binary AND its signature from the fleet's update surface.
+                    audit_fn_(req, "ota.package.deleted", "success", "UpdatePackage",
+                              platform + "/" + arch + "/" + version,
+                              "binary and signature sidecar removed");
                     res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
                 });
 

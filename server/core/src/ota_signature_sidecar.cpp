@@ -5,6 +5,14 @@
 #include <system_error>
 #include <string_view>
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace yuzu::server {
 
 std::filesystem::path signature_sidecar_path(const std::filesystem::path& binary) {
@@ -55,6 +63,37 @@ SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar, std:
 
 namespace {
 
+/// Flush a file or directory all the way to stable storage.
+///
+/// `std::ofstream` has no portable fsync, and this artifact is a security
+/// control: a signature that is "written" but not durable is indistinguishable
+/// from one that was never written, and the package then serves as unsigned.
+[[nodiscard]] bool fsync_path(const std::filesystem::path& p, bool is_directory) {
+#ifdef _WIN32
+    // Windows has no directory-handle flush through the CRT, and NTFS commits
+    // directory metadata with the file, so the directory case is a no-op here
+    // rather than a silent failure.
+    if (is_directory)
+        return true;
+    const int fd = ::_wopen(p.c_str(), _O_RDONLY | _O_BINARY);
+    if (fd < 0)
+        return false;
+    const bool ok = ::_commit(fd) == 0;
+    ::_close(fd);
+    return ok;
+#else
+    // O_RDONLY is sufficient for fsync on both files and directories, and is the
+    // only mode a directory can be opened in.
+    const int fd = ::open(p.c_str(), O_RDONLY);
+    if (fd < 0)
+        return false;
+    const bool ok = ::fsync(fd) == 0;
+    ::close(fd);
+    return ok;
+#endif
+}
+
+
 /// Remove the staging file only.
 ///
 /// DELIBERATELY NOT the surviving predecessor. Enumerating the windows shows why:
@@ -83,6 +122,21 @@ SidecarOutcome signature_sidecar_outcome(const std::filesystem::path& sidecar) {
     // decision site, and it is paid only on the settings fragment.
     std::string ignored;
     return read_signature_sidecar(sidecar, ignored);
+}
+
+bool signature_sidecar_covers_binary(const std::filesystem::path& binary,
+                                     const std::filesystem::path& sidecar) {
+    std::error_code sig_ec;
+    const auto sig_time = std::filesystem::last_write_time(sidecar, sig_ec);
+    if (sig_ec)
+        return true; // no sidecar, or unreadable: not evidence of a mismatch
+
+    std::error_code bin_ec;
+    const auto bin_time = std::filesystem::last_write_time(binary, bin_ec);
+    if (bin_ec)
+        return true;
+
+    return !(sig_time > bin_time);
 }
 
 bool looks_like_pem_cms(const std::string& signature_pem) {
@@ -125,13 +179,37 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
     tmp += ".tmp";
     {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (out)
-            out.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
         if (!out) {
             discard_staging(tmp);
             return false;
         }
-    } // closed before the rename: a rename over an open handle is not portable
+        out.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
+
+        // CLOSE EXPLICITLY AND RE-TEST. Testing the stream before it is destroyed
+        // checks only what reached the filebuf: anything still buffered is flushed
+        // by ~ofstream, whose failure NOBODY can read. On a full disk that returned
+        // success while renaming a ZERO-LENGTH file over a valid signature —
+        // reproduced on a full ramdisk, and the exact "one unsafe state" the header
+        // argues is unreachable by failure, since the package is then served
+        // unsigned and permissive agents apply the new binary UNVERIFIED.
+        out.close();
+        if (!out) {
+            discard_staging(tmp);
+            return false;
+        }
+    }
+
+    // Durability before publication. The rename is atomic with respect to a
+    // concurrent READER, which is what the comment above is about, but atomic is
+    // not durable: without this a crash shortly after an apparently-successful
+    // upload can expose the renamed name pointing at unflushed (zero-length)
+    // data — the same end state as the short write above, reached with no disk
+    // pressure at all. Both the file and the DIRECTORY entry need syncing; a
+    // failure here is a failure of the upload, not a warning.
+    if (!fsync_path(tmp, /*is_directory=*/false)) {
+        discard_staging(tmp);
+        return false;
+    }
 
     std::error_code ren_ec;
     std::filesystem::rename(tmp, sidecar, ren_ec);
@@ -139,6 +217,13 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
         discard_staging(tmp);
         return false;
     }
+
+    // Sync the directory so the RENAME itself survives a crash. Deliberately not
+    // fatal: at this point the sidecar is already in place and readable, so a
+    // failure to sync the directory entry is strictly weaker than the states
+    // above — reporting failure here would send the operator to recover a
+    // package that is actually correct.
+    (void)fsync_path(sidecar.parent_path(), /*is_directory=*/true);
     return true;
 }
 

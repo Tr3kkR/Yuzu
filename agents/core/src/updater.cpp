@@ -708,36 +708,15 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     spdlog::info("SHA-256 verified: {}", actual_hash);
 
-    // ── Step 4.5: Inode-equivalence pre-flight (POSIX, W2.3 / #806) ─────
-    //
-    // Confirm the inode our fd holds is the same one currently at
-    // `temp_path`. If a local attacker has unlinked our temp file and
-    // created a replacement at the same path (the documented attack), the
-    // inodes will differ — abort before apply_update consumes the path.
-    // The residual race window is from this stat() to the rename() inside
-    // apply_update, which is microseconds. A Linux-only follow-up could
-    // close it entirely via `linkat(AT_FDCWD, "/proc/self/fd/N", ...)`.
-#ifndef _WIN32
-    struct stat fd_st {};
-    struct stat path_st {};
-    if (::fstat(fd_guard.fd, &fd_st) < 0) {
-        cleanup_temp();
-        return std::unexpected(
-            UpdateError{std::format("fstat on update temp fd failed: {}", std::strerror(errno))});
-    }
-    if (::stat(temp_path.c_str(), &path_st) < 0 || path_st.st_ino != fd_st.st_ino ||
-        path_st.st_dev != fd_st.st_dev) {
-        cleanup_temp();
-        return std::unexpected(
-            UpdateError{"update temp file inode mismatch — possible TOCTOU swap attack detected"});
-    }
-#endif
 
     // ── Step 4.6: Verify the detached signature (#416/#3807) ──────────────
     //
-    // WHY HERE, precisely. This sits after the SHA-256 compare and after the
-    // inode pre-flight, and BEFORE Step 5 — which is the last point at which
-    // nothing irreversible has happened. Step 5 sets the execute bit on POSIX
+    // WHY HERE, precisely. This sits after the SHA-256 compare and BEFORE the
+    // Step 4.9 inode pre-flight, which is itself the last thing before Step 5 —
+    // the last point at which nothing irreversible has happened. The pre-flight
+    // deliberately runs AFTER this block, not before: verification streams the
+    // whole binary, so running the inode check first would leave that entire
+    // duration inside the race window it exists to close. Step 5 sets the execute bit on POSIX
     // (`apply_update`) and moves the LIVE executable aside on Windows; either
     // is past the point of no return. Everything above this line is still just
     // bytes in a temp file we can delete.
@@ -832,6 +811,40 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
                          config_.signature_trust_bundle.string());
         }
     }
+
+    // ── Step 4.9: Inode-equivalence pre-flight (POSIX, W2.3 / #806) ─────
+    //
+    // Confirm the inode our fd holds is the same one currently at `temp_path`.
+    // If a local attacker has unlinked our temp file and created a replacement
+    // at the same path (the documented attack), the inodes differ — abort before
+    // apply_update consumes the PATH.
+    //
+    // THIS MUST BE THE LAST THING BEFORE STEP 5, and it is numbered 4.9 rather
+    // than 4.5 to keep it that way. It guards the gap between this stat() and
+    // the path-based rename() inside apply_update, so anything inserted above it
+    // is outside the guard, and anything inserted BELOW it widens the gap
+    // directly. It previously ran before signature verification, which then
+    // grew to load the trust bundle and stream the entire binary through
+    // CMS_verify — hundreds of milliseconds for a large agent, not the
+    // microseconds this comment used to claim. That turned a theoretical race
+    // into a practical one on the exact path the signature check exists to
+    // protect. A Linux-only follow-up could close the remaining gap entirely
+    // via `linkat(AT_FDCWD, "/proc/self/fd/N", ...)`.
+#ifndef _WIN32
+    struct stat fd_st {};
+    struct stat path_st {};
+    if (::fstat(fd_guard.fd, &fd_st) < 0) {
+        cleanup_temp();
+        return std::unexpected(
+            UpdateError{std::format("fstat on update temp fd failed: {}", std::strerror(errno))});
+    }
+    if (::stat(temp_path.c_str(), &path_st) < 0 || path_st.st_ino != fd_st.st_ino ||
+        path_st.st_dev != fd_st.st_dev) {
+        cleanup_temp();
+        return std::unexpected(
+            UpdateError{"update temp file inode mismatch — possible TOCTOU swap attack detected"});
+    }
+#endif
 
     // ── Step 5: Apply the update (platform-specific binary replace) ────────
     //

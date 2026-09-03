@@ -55,22 +55,40 @@ enum class SidecarOutcome {
 [[nodiscard]] SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar,
                                                     std::string& out);
 
-/// The same decision without the read, for callers that only need the verdict.
+/// The same decision, for callers that only need the verdict and not the bytes.
 ///
-/// The Settings packages table renders one row per package and needs only
-/// "would this be served?"; going through the reading form made it pull up to
-/// 64 KB per package per render and throw it away.
+/// It DOES still read the file — it delegates to `read_signature_sidecar` and
+/// discards the buffer, deliberately, so that "would this be served?" has one
+/// implementation rather than two that can drift. What it saves the caller is
+/// the buffer, not the read: the Settings table renders one row per package and
+/// would otherwise have to hold up to 64 KB per package alive per render.
+/// (An earlier version of this comment claimed it avoided the read; it does not.)
 [[nodiscard]] SidecarOutcome signature_sidecar_outcome(const std::filesystem::path& sidecar);
 
-/// Replace the sidecar beside a freshly-uploaded binary.
+/// Can this sidecar possibly cover this binary? (OPERATOR-FACING ONLY.)
 ///
-/// THE REMOVE IS UNCONDITIONAL and is the reason this is one function rather than
-/// two. The binary is overwritten in place, so an operator re-uploading a rebuilt
-/// package under the same filename WITHOUT a signature would otherwise leave the
-/// previous `.sig` on disk — a signature over bytes that no longer exist. Every
-/// anchored agent would then refuse the package, in both enforcement modes, and
-/// rotating a signing key is exactly the sequence that walks into it.
+/// A successful upload writes the sidecar FIRST and the binary second, so the
+/// binary's mtime is always at or after the sidecar's. A sidecar STRICTLY NEWER
+/// than its binary therefore proves the binary write did not follow it — the
+/// upload died in between, or the binary write failed — and the stored signature
+/// cannot cover the bytes actually on disk.
 ///
+/// DELIBERATELY NOT CONSULTED BY THE WIRE PATH, and this is the one place the
+/// server and the settings column are allowed to disagree. They answer different
+/// questions. `CheckForUpdate` must keep SERVING the mismatched signature so
+/// agents verify it, fail, and refuse — fail-closed. Withholding it would make
+/// the package read as unsigned, and a permissive agent would then apply the
+/// binary UNVERIFIED, which is the single unsafe state this whole design avoids.
+/// The column's job is the opposite: tell the operator the truth, so "signed"
+/// never appears beside a package no agent can install.
+///
+/// Returns true when the pair is consistent, and when either mtime cannot be
+/// read (an unreadable file is not evidence of a mismatch). Equal timestamps
+/// count as consistent, so a filesystem with coarse mtime granularity degrades
+/// to today's behaviour rather than to false alarms.
+[[nodiscard]] bool signature_sidecar_covers_binary(const std::filesystem::path& binary,
+                                                   const std::filesystem::path& sidecar);
+
 /// Does `signature_pem` have the shape of a PEM-armoured CMS signature?
 ///
 /// A pure, cheap SHAPE check — NOT a verification. It cannot tell a valid
@@ -88,6 +106,21 @@ enum class SidecarOutcome {
 /// immediate, attributable rejection.
 [[nodiscard]] bool looks_like_pem_cms(const std::string& signature_pem);
 
+/// Replace the sidecar beside a freshly-uploaded binary.
+///
+/// REMOVAL IS UNCONDITIONAL FOR AN EMPTY SIGNATURE, and is the reason this is one
+/// function rather than two. The binary is overwritten in place, so an operator
+/// re-uploading a rebuilt package under the same filename WITHOUT a signature
+/// would otherwise leave the previous `.sig` on disk — a signature over bytes
+/// that no longer exist. Every anchored agent would then refuse the package, in
+/// both enforcement modes, and rotating a signing key is exactly the sequence
+/// that walks into it.
+///
+/// "Unconditional" scopes to THAT case alone — the operator explicitly chose to
+/// upload unsigned. It is emphatically NOT a failure recovery; see the next
+/// paragraph, and `discard_staging` in the .cpp for why the distinction is the
+/// difference between failing closed and shipping an unverified binary.
+///
 /// Returns false only when a NON-EMPTY signature could not be written. In that
 /// case any PREVIOUS sidecar is deliberately LEFT IN PLACE: a stale signature
 /// makes agents refuse (fail closed), whereas removing it would leave the new

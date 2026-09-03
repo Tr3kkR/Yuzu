@@ -113,6 +113,16 @@ openssl_ptr<X509_STORE> load_trust_store(const std::filesystem::path& bundle_pat
 std::optional<CmsVerifyError> verify_with_content_bio(BIO* content_bio,
                                                       std::string_view signature_pem,
                                                       const std::filesystem::path& trust_bundle_path) {
+    // Clear on ENTRY as well as on success. The queue is thread-local and shared
+    // with every other OpenSSL user in this process, so an error left behind by
+    // an earlier caller (a TLS handshake on this worker, say) would be drained by
+    // OUR drain_openssl_errors() and could set `chain_failure` — reporting an
+    // invalid-signature refusal as reason="untrusted" in both the log and the
+    // counter, and sending the operator to debug a certificate chain that is
+    // fine. It cannot cause a false PASS: the verdict comes from CMS_verify's
+    // return value, never from the queue. This only keeps the REASON honest.
+    ERR_clear_error();
+
     auto store = load_trust_store(trust_bundle_path);
     if (!store) {
         // Bundle unreadable → we cannot prove anything, so refuse to trust.
