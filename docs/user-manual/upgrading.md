@@ -953,6 +953,28 @@ What to expect / do:
   re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
 
+## Generic inventory store no longer reads or scrubs a legacy `inventory.db` (ADR-0037)
+
+`InventoryStore`'s one-time first-boot backfill from a legacy `inventory.db` SQLite file
+(`migrate_from_sqlite()`) has been retired (#3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real legacy data to migrate. Two separate behaviors changed:
+
+- A reachable Postgres database whose schema can't migrate or open **is** still a fatal startup
+  error (fail-closed), same as before.
+- A legacy `inventory.db` file with real content **does NOT** fail startup and its content is
+  **never imported** — the server opens it read-only, purely to count rows in `inventory_data`
+  for a diagnostic warning, then boots regardless of what it finds.
+- **`delete_agent()` no longer erases anything from a legacy `inventory.db` either** — the
+  previous "erase from Postgres AND the retained legacy SQLite copy" behaviour is gone. A
+  leftover legacy file is inert: never read on boot beyond the diagnostic warning above, and
+  never scrubbed by a device decommission. If your environment genuinely still has a legacy
+  `inventory.db` you need gone (e.g. for a completed decommission's data-retention obligations),
+  delete it manually.
+
+**Verify:** after the server reports ready, generic inventory reads (`GET /api/v1/inventory` or
+equivalent) behave exactly as before — this store's runtime read/write/query behavior is
+unchanged, only the one-time backfill and the legacy-file erasure are gone.
+
 ## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
 
 `CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version

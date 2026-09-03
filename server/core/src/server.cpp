@@ -6421,7 +6421,13 @@ public:
         // migrated to Postgres (ADR-0006/0008/0009/0037, schema `inventory_store`).
         // Coexists with the typed SoftwareInventoryStore below (that store's own
         // migration, not this one). Fails closed like every PG store: a reachable
-        // database whose schema/backfill cannot complete must not serve degraded.
+        // database whose schema cannot be created/opened must not serve degraded.
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment):
+        // the legacy inventory.db is never copied, and `delete_agent` no longer
+        // erases anything from it either — a leftover legacy file is inert. The
+        // detect-and-warn obligation still applies, so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             inventory_store_ = std::make_unique<InventoryStore>(*pg_pool_);
             if (!inventory_store_->is_open()) {
@@ -6430,26 +6436,14 @@ public:
                               "not be created/opened)");
                 startup_failed_ = true;
             } else {
-                auto inv_db = cfg_.db_dir() / "inventory.db";
-                if (!inventory_store_->migrate_from_sqlite(inv_db)) {
-                    spdlog::error("[PG] Refusing to start: generic inventory store backfill from "
-                                  "legacy {} failed (ADR-0009 fail-closed; see prior log lines). "
-                                  "Operator remediation: repair the file or quarantine it as an "
-                                  "operator-managed backup per ADR-0037 to skip "
-                                  "the backfill — gateway-connected live agents re-push generic "
-                                  "blobs on a changed/full report (weekly full floor); direct-"
-                                  "connected, offline, and decommissioned agents' "
-                                  "generic blobs need manual re-import (ADR-0037)",
-                                  inv_db.string());
-                    startup_failed_ = true;
-                } else {
-                    // Set-once before serving (race-free): wires the shared
-                    // read-degrade counter + the new ingest-drop/query-truncation
-                    // counters (governance IS3).
-                    inventory_store_->set_metrics(&metrics_);
-                    if (gateway_service_)
-                        gateway_service_->set_inventory_store(inventory_store_.get());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "inventory.db",
+                                                         "InventoryStore", {"inventory_data"});
+                // Set-once before serving (race-free): wires the shared
+                // read-degrade counter + the new ingest-drop/query-truncation
+                // counters (governance IS3).
+                inventory_store_->set_metrics(&metrics_);
+                if (gateway_service_)
+                    gateway_service_->set_inventory_store(inventory_store_.get());
             }
         }
 
