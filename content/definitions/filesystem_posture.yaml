@@ -4,8 +4,10 @@
 ## Plugin: filesystem_posture | Actions: mounts, quotas, snapshots
 ##
 ## Sources by platform:
-##   Windows: FindFirstVolumeW/GetVolumeInformationW/GetVolumeInformationW (mounts), DISKQUOTA_USER_
-##            INFORMATION via IDiskQuotaControl initialized bReadWrite=FALSE
+##   Windows: FindFirstVolumeW + GetVolumeInformationW + GetDriveTypeW +
+##            GetDiskFreeSpaceExW (mounts); IDiskQuotaControl GetQuotaState /
+##            GetDefaultQuotaLimit / GetDefaultQuotaThreshold, initialized
+##            bReadWrite=FALSE
 ##            (quotas — compile-verified only, not exercised against a live
 ##            Windows host in this change), VSS shadow-copy enumeration
 ##            (snapshots — compile-verified only, not exercised against a
@@ -26,7 +28,7 @@ metadata:
   version: 1.0.0
   description: >
     Lists mounted volumes with device, filesystem type, mount options, and
-    capacity. On Windows enumerates volumes via FindFirstVolumeW/GetVolumeInformationW and reads
+    capacity. On Windows enumerates volumes via FindFirstVolumeW, reads labels and flags with GetVolumeInformationW and GetDriveTypeW, capacity with GetDiskFreeSpaceExW, and reads
     per-volume capacity and filesystem type via GetVolumeInformationW. On
     Linux parses /proc/self/mountinfo; a network-filesystem source (nfs,
     cifs, smbfs) reports its capacity columns as "-" rather than a

@@ -437,15 +437,15 @@ agent_test_exe = executable(
                                                 # driven end to end via LocalDispatcher
                                                 # (installed_count only; the Windows leg covers the
                                                 # native rung-1 Uninstall-key registry read)
-    'unit/test_license_scan_actions.cpp',
+    'unit/test_license_scan_actions.cpp',    # Wave 4 PR4.3b: real license_scan.dylib/.so driven
+                                                # end to end via LocalDispatcher after the Linux-leg
+                                                # runner migration (POSIX-only, a no-op TU on Windows)
     'unit/test_filesystem_posture_parsers.cpp', # Wave 6 PR6.1-b: pure /proc/self/mountinfo, quotactl
                                                 # errno classification, fs_snapshot_list attrlist walk,
                                                 # and the legs.hpp pure row formatters
     'unit/test_filesystem_posture_local_dispatcher.cpp', # Wave 6 PR6.1-b: real filesystem_posture dylib
                                                 # driven end to end via LocalDispatcher (POSIX-only; a no-op
-                                                # TU on Windows via the file's own #ifndef _WIN32 guard)     # Wave 4 PR4.3b: real license_scan.dylib/.so driven
-                                                # end to end via LocalDispatcher after the Linux-leg
-                                                # runner migration (POSIX-only, a no-op TU on Windows)
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
