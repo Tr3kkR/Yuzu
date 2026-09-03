@@ -4,17 +4,17 @@
 ## Plugin: filesystem_posture | Actions: mounts, quotas, snapshots
 ##
 ## Sources by platform:
-##   Windows: GetLogicalDrives/GetVolumeInformationW (mounts), DISKQUOTA_USER_
+##   Windows: FindFirstVolumeW/GetVolumeInformationW/GetVolumeInformationW (mounts), DISKQUOTA_USER_
 ##            INFORMATION via IDiskQuotaControl initialized bReadWrite=FALSE
 ##            (quotas — compile-verified only, not exercised against a live
 ##            Windows host in this change), VSS shadow-copy enumeration
 ##            (snapshots — compile-verified only, not exercised against a
 ##            live Windows host in this change)
-##   Linux:   /proc/self/mountinfo (mounts), quotactl(Q_GETQUOTA) per
+##   Linux:   /proc/self/mountinfo (mounts), quotactl(Q_GETFMT) per
 ##            mounted filesystem (quotas), Btrfs/LVM snapshot metadata
 ##            (snapshots — capability, not inventory)
 ##   macOS:   getmntinfo (mounts), APFS per-volume quota state has no
-##            per-user/group equivalent (quotas), `tmutil`/APFS snapshot
+##            per-user/group equivalent (quotas), `fs_snapshot_list(2)`/APFS snapshot
 ##            enumeration (snapshots)
 
 ---
@@ -26,7 +26,7 @@ metadata:
   version: 1.0.0
   description: >
     Lists mounted volumes with device, filesystem type, mount options, and
-    capacity. On Windows enumerates volumes via GetLogicalDrives and reads
+    capacity. On Windows enumerates volumes via FindFirstVolumeW/GetVolumeInformationW and reads
     per-volume capacity and filesystem type via GetVolumeInformationW. On
     Linux parses /proc/self/mountinfo; a network-filesystem source (nfs,
     cifs, smbfs) reports its capacity columns as "-" rather than a
@@ -108,10 +108,10 @@ metadata:
   description: >
     Reports volume-level disk quota state. This is volume-level quota only
     everywhere — no per-user or per-group breakdown is reported on any
-    platform. On Windows reads DISKQUOTA_USER_INFORMATION via
+    platform. On Windows reads IDiskQuotaControl GetQuotaState/GetDefaultQuotaLimit via
     IDiskQuotaControl, initialized read-only (bReadWrite=FALSE); this leg
     is compile-verified only — not exercised against a live Windows host
-    in this change. On Linux reads quotactl(Q_GETQUOTA) per mounted
+    in this change. On Linux reads quotactl(Q_GETFMT) per mounted
     filesystem. On macOS reports state=unsupported: APFS has no per-user
     or per-group quota mechanism at all, so there is no gap to report
     beyond the volume-level scope shared by every platform.

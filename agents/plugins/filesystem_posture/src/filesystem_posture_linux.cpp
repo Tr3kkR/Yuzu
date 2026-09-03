@@ -226,8 +226,15 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
     std::string text;
     bool read_truncated = false;
     if (!read_mountinfo_capped(text, read_truncated)) {
-        mark_result_partial(ctx, "linux:mountinfo:snapshots", std::strerror(errno));
-        write_snapshot_row(ctx, "-", "-", "none", "no btrfs or device-mapper mount found");
+        // BR-001: acquisition FAILED, so we cannot assert "nothing found".
+        // The Windows leg keeps failure and genuine-emptiness as two
+        // distinguishable literals; match that here, or an unreadable
+        // /proc/self/mountinfo reads to an operator as a healthy host with
+        // no snapshot-capable mounts.
+        const std::string why = std::strerror(errno);
+        mark_result_partial(ctx, "linux:mountinfo:snapshots", why);
+        write_snapshot_row(ctx, "-", "-", "none",
+                           "could not read /proc/self/mountinfo: " + why);
         return 0;
     }
 

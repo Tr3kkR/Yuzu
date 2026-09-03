@@ -225,6 +225,7 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
     }
 
     bool any_row = false;
+    bool any_failure = false;
 
     for (const struct statfs& s : snap.entries) {
         if (std::string_view(s.f_fstypename) != "apfs")
@@ -235,6 +236,7 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
         // volume roots, so this is safe by construction.
         yuzu::agent::ScopedFd fd(::open(s.f_mntonname, O_RDONLY));
         if (!fd) {
+            any_failure = true;
             mark_result_partial(ctx, "macos:fs_snapshot_list",
                                 std::string(s.f_mntonname) + ": " + std::strerror(errno));
             continue;
@@ -252,6 +254,7 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
             rc = ::fs_snapshot_list(fd.get(), &al, buf.data(), buf.size(), 0);
         }
         if (rc < 0) {
+            any_failure = true;
             mark_result_partial(ctx, "macos:fs_snapshot_list",
                                 std::string(s.f_mntonname) + ": " + std::strerror(errno));
             continue;
@@ -264,6 +267,7 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
             any_row = true;
         }
         if (parsed.malformed)
+            any_failure = true;
             mark_result_partial(ctx, "macos:fs_snapshot_list",
                                 std::string(s.f_mntonname) + ": malformed reply buffer");
     }
@@ -273,8 +277,16 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
     // anywhere" fallback below is a single global row, distinct from that
     // per-mount behavior, and only fires when literally no APFS mount
     // yielded a name.
-    if (!any_row)
-        write_snapshot_row(ctx, "-", "-", "none", "no APFS snapshots present");
+    // BR-001: "no snapshots" and "every enumeration failed" are different
+    // facts and must not share one row. any_failure is set wherever a probe
+    // errored above; matching the Windows leg's failure-vs-empty contract.
+    if (!any_row) {
+        if (any_failure)
+            write_snapshot_row(ctx, "-", "-", "none",
+                               "APFS snapshot enumeration failed on every volume");
+        else
+            write_snapshot_row(ctx, "-", "-", "none", "no APFS snapshots present");
+    }
 
     return 0;
 }
