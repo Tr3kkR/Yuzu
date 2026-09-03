@@ -222,6 +222,45 @@ void UpdateRegistry::remove_package(const std::string& platform, const std::stri
     spdlog::info("UpdateRegistry: removed package {}/{}/{}", platform, arch, version);
 }
 
+UpdateRegistry::PackageLookupResult
+UpdateRegistry::find_package_checked(const std::string& platform, const std::string& arch,
+                                     const std::string& version) const {
+    // Deliberately NOT implemented on top of list_packages(): that read collapses
+    // every degrade onto an empty vector, which is precisely the distinction this
+    // function exists to preserve. Same three degrade paths, reported instead of
+    // erased.
+    PackageLookupResult out;
+    if (!open_) {
+        note_read_degrade(metrics_, kReasonStoreNotOpen);
+        return out; // kUnavailable
+    }
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        note_read_degrade(metrics_, kReasonPoolTimeout);
+        spdlog::error("UpdateRegistry: find_package skipped, no connection in time ({})",
+                      pool_.last_error());
+        return out;
+    }
+    const std::string sql = std::string("SELECT ") + kSelectCols +
+                            " FROM update_registry.update_packages"
+                            " WHERE platform = $1 AND arch = $2 AND version = $3";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{platform, arch, version});
+    if (res.status() != PGRES_TUPLES_OK) {
+        note_read_degrade(metrics_, kReasonQueryError);
+        spdlog::error("UpdateRegistry: find_package failed for {}/{}/{}: {}", platform, arch,
+                      version, PQerrorMessage(lease.get()));
+        return out;
+    }
+    if (PQntuples(res.get()) == 0) {
+        out.status = PackageLookup::kAbsent;
+        return out;
+    }
+    out.status = PackageLookup::kFound;
+    out.package = row_to_pkg(res.get(), 0);
+    return out;
+}
+
 std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
     std::vector<UpdatePackage> packages;
     if (!open_) {

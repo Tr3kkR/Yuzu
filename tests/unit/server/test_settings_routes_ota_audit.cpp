@@ -258,11 +258,50 @@ TEST_CASE("a rollout whose registry write does not commit is audited as failure,
     CHECK(row.action == "ota.package.rollout_changed");
     // Found, so not `denied`; not committed, so emphatically not `success`.
     CHECK(row.result == "failure");
-    CHECK(row.detail.find("from=") == std::string::npos);
+    // Pin the literal. Asserting only that "from=" is ABSENT would also pass on
+    // an empty detail, which is the weaker claim.
+    CHECK(row.detail == "attempted_from=100% attempted_to=0% mandatory=true "
+                        "outcome=write_not_committed");
 
     // And the state genuinely did not change, which is what makes a `success`
     // row here a lie rather than a harmless imprecision.
     auto pkgs = h.registry->list_packages();
     REQUIRE(pkgs.size() == 1);
     CHECK(pkgs.front().rollout_pct == 100);
+}
+
+TEST_CASE("a rollout against a DEGRADED registry is audited as failure, never as not_found",
+          "[ota][audit][settings_routes][pg]") {
+    // The distinction this case exists for. The store's ordinary reads fail SOFT
+    // (ADR-0061): a closed store, a pool timeout or a query error all return an
+    // EMPTY list, indistinguishable from "no packages configured". Deriving the
+    // audit result from that read would make a PG blip during a legitimate admin
+    // rollout say `denied` / `not_found` -- which audit-log.md tells operators is
+    // the filter for enumeration attempts. A database outage would manufacture
+    // security alerts AND record, in the evidence trail, that a package which
+    // exists did not.
+    //
+    // Dropping the table makes every read path degrade, which is exactly the
+    // condition under test here (unlike the not-committed case, which must keep
+    // the read working).
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/100, /*mandatory=*/true);
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult drop{PQexec(conn.get(), "DROP TABLE update_registry.update_packages")};
+        REQUIRE(drop.ok());
+    }
+
+    auto res = h.post_rollout("1.2.3", "0");
+    REQUIRE(res);
+    REQUIRE(h.audited.size() == 1);
+    const auto& row = h.audited.front();
+    CHECK(row.result == "failure");
+    CHECK(row.result != "denied");            // the whole point
+    CHECK(row.detail.find("not_found") == std::string::npos);
+    CHECK(row.detail.find("store_unavailable") != std::string::npos);
+    CHECK(row.detail.find("existence_unknown=true") != std::string::npos);
 }

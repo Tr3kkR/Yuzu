@@ -5445,23 +5445,32 @@ void SettingsRoutes::register_routes(
                   // distinguish that from a package that was never rolled out.
                   // "from=100% to=0%" does. `mandatory` is carried for the same
                   // reason: it is what makes the de-prioritisation consequential.
-                  std::optional<UpdatePackage> before;
+                  // find_package_checked, NOT list_packages: the ordinary reads on
+                  // this store fail SOFT, returning an empty vector on a closed
+                  // store, a pool-acquire timeout or a query error. That carve-out
+                  // (ADR-0061) was granted because no downstream branch treated an
+                  // empty list as a signal — and an audit branch does. Deriving
+                  // "not_found" from a soft-failed read would let a PG blip during
+                  // a legitimate admin rollout both manufacture key-enumeration
+                  // alerts (audit-log.md names `denied` as that filter) and assert,
+                  // in the evidence record, that a package which exists did not.
+                  auto lookup = update_registry_->find_package_checked(platform, arch, version);
                   bool committed = false;
-                  auto packages = update_registry_->list_packages();
-                  for (auto pkg : packages) {
-                      if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
-                          before = pkg; // the state the row reports as `from=`
-                          pkg.rollout_pct = pct;
-                          committed = update_registry_->upsert_package(pkg);
-                          if (committed)
-                              spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
-                                           version, pct);
-                          else
-                              spdlog::error("OTA rollout NOT applied for {}/{} v{}: the registry "
-                                            "write did not commit",
-                                            platform, arch, version);
-                          break;
-                      }
+                  if (lookup.status == UpdateRegistry::PackageLookup::kFound) {
+                      auto pkg = lookup.package;
+                      pkg.rollout_pct = pct;
+                      committed = update_registry_->upsert_package(pkg);
+                      if (committed)
+                          spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
+                                       version, pct);
+                      else
+                          spdlog::error("OTA rollout NOT applied for {}/{} v{}: the registry "
+                                        "write did not commit",
+                                        platform, arch, version);
+                  } else if (lookup.status == UpdateRegistry::PackageLookup::kUnavailable) {
+                      spdlog::error("OTA rollout for {}/{} v{}: the registry could not be read; "
+                                    "the package's existence is UNKNOWN, not absent",
+                                    platform, arch, version);
                   }
 
                   // Audited AFTER the write, and reporting what actually happened.
@@ -5487,14 +5496,37 @@ void SettingsRoutes::register_routes(
                   // evidence disagreeing with state, in the one record an incident
                   // responder is meant to be able to trust. `failure` is the
                   // documented token for a failure the handler audits itself.
-                  const char* result = !before ? "denied" : (committed ? "success" : "failure");
+                  // THREE DISTINCT OUTCOMES, and the store-degraded one is NOT
+                  // absence. `denied` is reserved for a package the store actually
+                  // reported as absent, because audit-log.md tells operators to
+                  // filter on it to surface enumeration; a degraded read reports
+                  // `failure`, which is the documented token for a failure the
+                  // handler audits itself. Neither the degraded nor the
+                  // uncommitted branch may claim a `from=`/`to=` transition — the
+                  // detail records what was ATTEMPTED, which asserts nothing false.
+                  const char* result = "failure";
+                  std::string detail;
+                  switch (lookup.status) {
+                  case UpdateRegistry::PackageLookup::kFound:
+                      result = committed ? "success" : "failure";
+                      detail = (committed ? "from=" : "attempted_from=") +
+                               std::to_string(lookup.package.rollout_pct) +
+                               (committed ? "% to=" : "% attempted_to=") + std::to_string(pct) +
+                               "% mandatory=" + (lookup.package.mandatory ? "true" : "false") +
+                               (committed ? "" : " outcome=write_not_committed");
+                      break;
+                  case UpdateRegistry::PackageLookup::kAbsent:
+                      result = "denied";
+                      detail = "not_found";
+                      break;
+                  case UpdateRegistry::PackageLookup::kUnavailable:
+                      result = "failure";
+                      detail = "attempted_to=" + std::to_string(pct) +
+                               "% outcome=store_unavailable existence_unknown=true";
+                      break;
+                  }
                   audit_fn_(req, "ota.package.rollout_changed", result, "UpdatePackage",
-                            platform + "/" + arch + "/" + version,
-                            !before ? std::string("not_found")
-                                    : (committed ? "from=" + std::to_string(before->rollout_pct) +
-                                                       "% to=" + std::to_string(pct) + "% mandatory=" +
-                                                       (before->mandatory ? "true" : "false")
-                                                 : "registry write did not commit; rollout unchanged"));
+                            platform + "/" + arch + "/" + version, detail);
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
               });

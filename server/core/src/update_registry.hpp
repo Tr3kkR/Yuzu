@@ -103,6 +103,36 @@ public:
     /// adversarial review 2026-08-28).
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
+    /// Outcome of a single-package lookup that distinguishes "not there" from
+    /// "the store could not answer".
+    ///
+    /// The ordinary reads on this store fail SOFT — a degraded `list_packages`
+    /// returns an EMPTY VECTOR, which reads as "no packages configured" (see the
+    /// posture note at the top of this file, and ADR-0061). That carve-out was
+    /// granted on the explicit premise that "no downstream branch treats an empty
+    /// list as an authorization or enforcement signal".
+    ///
+    /// An AUDIT branch does. `ota.package.rollout_changed` records `denied` /
+    /// `not_found` when the package is absent, and audit-log.md tells operators
+    /// that `result == "denied"` is the filter for enumeration attempts — so a
+    /// pool timeout or a PG blip during a legitimate admin rollout would both
+    /// manufacture key-enumeration alerts AND assert, in the evidence record,
+    /// that a package which exists did not. This lookup exists so that branch can
+    /// tell the two apart, without widening the fail-soft reads the rest of the
+    /// server depends on.
+    enum class PackageLookup { kFound, kAbsent, kUnavailable };
+
+    struct PackageLookupResult {
+        PackageLookup status{PackageLookup::kUnavailable};
+        UpdatePackage package{};
+    };
+
+    /// Find one package by its `(platform, arch, version)` key, reporting a
+    /// degraded store as `kUnavailable` rather than as absence.
+    [[nodiscard]] PackageLookupResult find_package_checked(const std::string& platform,
+                                                          const std::string& arch,
+                                                          const std::string& version) const;
+
     /// Insert or update a package row. Returns false when the write did NOT
     /// commit — a closed store, a pool-acquire timeout, or a query error.
     ///
