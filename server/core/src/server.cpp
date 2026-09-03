@@ -15487,7 +15487,7 @@ private:
             forward_gateway_pending();
 
             if (sent == 0) {
-                // #881: say WHICH kind of nothing. All three of these answered
+                // #881/#3511: say WHICH kind of nothing. All four of these answered
                 // "failed to send command to any agent", which reads as an
                 // agent-connectivity outage — so a fail-closed containment
                 // gate, which denies EVERY agent on EVERY dispatch fleet-wide,
@@ -22974,7 +22974,7 @@ private:
         note_unknown_plugin_dispatch("legacy", command_id, plugin, result.unknown_plugin_count);
 
         if (sent == 0) {
-            // Same three-way split as /api/command above — see the comment
+            // Same four-way split as /api/command above — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
             // operator to the wrong subsystem.

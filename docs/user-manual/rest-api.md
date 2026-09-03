@@ -1621,7 +1621,7 @@ Quarantine a device.
 > |---|---|---|
 > | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
 > | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
-> | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. | `null` — retrying will not help; check the plugin name/spelling instead |
+> | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. If the plugin name and spelling are correct and it genuinely is installed on the target, the agent's REPORTED inventory is stale: it is populated once at registration and does not refresh until the agent's management connection next re-registers (a reconnect — daemon restart, or any dropped/re-established connection) — this reason can persist until then even after installation completes. | `null` — retrying will not help; check the plugin name/spelling instead, or trigger a reconnect on the target agent if the plugin was only just installed |
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `reason` is a top-level key on the error object, not part of the A4
