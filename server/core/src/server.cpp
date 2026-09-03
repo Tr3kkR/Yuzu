@@ -121,14 +121,16 @@
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-// PR1.9c: the six capability spans build_classified_command's registry composes over — declared
-// by other packages (p1/p7/p10-p13), included (never authored) here at the composition site.
+// PR1.9c: the seven capability spans build_classified_command's registry composes over —
+// declared by other packages (p1/p7/p10-p13), included (never authored) here at the composition
+// site.
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "capability_decls/plugin_action_catalogue_b.hpp"
 #include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
+#include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -23058,7 +23060,7 @@ private:
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
     /// PR1.9c: the composed classification ruleset `build_classified_command`
-    /// consults on every dispatch — core (this package) plus the five
+    /// consults on every dispatch — core (this package) plus the six
     /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
     /// once: composing it is not itself a cached DECISION (ADR-0012 §4) —
     /// `classify_and_authorize_dispatch` still re-classifies and re-authorizes
@@ -23072,6 +23074,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_c(),
         yuzu::server::capdecls::plugin_action_catalogue_d(),
         yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
+        yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
