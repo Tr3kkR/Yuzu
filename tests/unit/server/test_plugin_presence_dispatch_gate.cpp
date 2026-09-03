@@ -387,8 +387,11 @@ TEST_CASE("ids_missing_plugin: a mixed fleet reports exactly the agents genuinel
 // `ids_missing_plugin` — that was the real bug (`server.cpp` called
 // `ids_missing_plugin(plugin)` with the raw caller string instead of
 // `ids_missing_plugin(classified->wire().plugin())`). Composing the two real
-// functions here closes that gap without needing to instantiate server.cpp's
-// route handler, which has no unit-test harness of its own.
+// functions here pins the INVARIANT the two call sites depend on (server.cpp
+// has no unit-test harness of its own to exercise the call sites directly) --
+// a regression back to the raw `plugin` local AT one of those two call sites
+// specifically would NOT be caught by this test, only a regression in this
+// composed invariant itself would be.
 TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
           "correctly finds an agent that reported it, where the raw caller "
           "casing would have wrongly reported it missing",

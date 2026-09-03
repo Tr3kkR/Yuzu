@@ -271,7 +271,7 @@ struct ConfinedDispatchOutcome {
     std::vector<std::string> not_sent;
     /// #3424: true when the quarantine gate itself failed closed (containment
     /// state unreadable) rather than a specific device being quarantined --
-    /// `ContainmentGate::fail_closed`, threaded out here because
+    /// `gate.enforced && gate.fail_closed`, threaded out here because
     /// `dispatch_confined_arms` reports every fail-closed denial as a
     /// `denied_quarantined_count` increment with no way for a caller to tell
     /// "the gate is degraded" from "these specific devices are contained"
