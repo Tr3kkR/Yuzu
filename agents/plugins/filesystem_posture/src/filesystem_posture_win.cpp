@@ -513,6 +513,26 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
 // PERMISSION_DENIED degradation below and must never read as an empty,
 // healthy snapshot set.
 //
+// KNOWN OPERATIONAL HAZARD -- NO DEADLINE ON THESE CALLS.
+// CreateVssBackupComponents/InitializeForBackup/SetContext/Query/Next are
+// synchronous cross-process COM, executed on a bounded agent dispatch-pool
+// worker, with no timeout. A wedged VSS service or a hung third-party writer
+// parks that worker permanently; a repeating scheduled `snapshots` instruction
+// parks one per fire, and once the pool and its queue are exhausted the agent
+// REJECTs EVERY command, not just this one -- the pool is shared with
+// quarantine/containment dispatch, so this is an availability coupling with a
+// security operation, not merely a slow read.
+//
+// Raised independently at governance Gate 4 (unhappy-path UP-1) and Gate 6
+// (sre S-3). Shipped deliberately, ALEX RULING: documented rather than bounded
+// here, because (a) every other plugin's OS calls are equally unbounded --
+// agents/plugins/ has no bounded_call site outside `discovery` -- so bounding
+// this one leg would be an inconsistent point fix, and (b) the obvious
+// mechanism is unsafe for COM: bounded_wait.hpp bounds the WAIT by abandoning
+// a DETACHED thread, and this plugin can be dlclosed out from under it. A
+// tree-wide bounding strategy is tracked as a follow-up issue; do not "fix"
+// this locally without reading that issue first.
+//
 // NO CoInitializeSecurity call anywhere in this leg: it is a process-global,
 // once-only setting and a plugin must never impose one on its host agent.
 // Verified as SYSTEM that CreateVssBackupComponents/Query both succeed under
