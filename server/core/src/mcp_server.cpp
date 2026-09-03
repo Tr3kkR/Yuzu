@@ -822,7 +822,17 @@ static const ToolDef kTools[] = {
      "error.data.reason is one of the six machine-readable values \"unclassified\", "
      "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
      "\"kill_switched\" - branch on this field, not on error.message text, which is prose and may "
-     "change.",
+     "change. "
+     "ZERO-AGENTS DISCRIMINATION (#3424/#3511): a SUCCESS envelope with agents_reached=0 also "
+     "carries a status enum, not just \"no_agents_reached\" - branch on status, not message text. "
+     "\"targets_quarantined\" and \"plugin_not_found\" are PERMANENT: retrying will not help "
+     "(retry_after_ms is null on both). \"containment_unreadable\" is a transient systemic gate "
+     "failure - retry_after_ms names the wait. \"no_agents_reached\" is the generic case (offline "
+     "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
+     "the offline-device case within it is retryable and a mixed cause must not be understated as "
+     "permanent. agents_quarantined/agents_unknown_plugin are "
+     "present on every zero-agents response with the exact counts, regardless of which status "
+     "matched, for a mixed-cause dispatch.",
      // NOTE (governance): these maxLength/maxItems bounds are the MCP SCHEMA
      // contract (A5 materiality backfill), and since #2437 they are ENFORCED
      // SERVER-SIDE ON EVERY PATH — the handler re-checks each one against the
@@ -841,16 +851,35 @@ static const ToolDef kTools[] = {
      R"j("scope":{"type":"string","maxLength":8192,"description":"Scope expression. Use __all__ for all agents, group:<id> for a group, or a scope DSL expression. Omit BOTH this and agent_ids to target all agents; supplying either one empty is rejected rather than widened to __all__. EXCEPTION (#3685): for a Destructive-classified plugin.action pair, supplying scope AT ALL - including __all__ alongside agent_ids - is refused; explicit agent_ids is the only way to target one."},)j"
      R"j("agent_ids":{"type":"array","minItems":1,"maxItems":10000,"items":{"type":"string","maxLength":128},"description":"Specific agent IDs to target. EXCLUSIVE with scope - supplying both is rejected, because the old precedence discarded this list in favour of the broader scope. Omit entirely to target all agents; an EMPTY array is rejected, because a target list that resolves to nothing must not silently widen to the whole fleet. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires this field, non-empty - omitting it is refused rather than treated as target-all."})j"
      R"j(},"required":["plugin","action"]})j",
-     // #2712: two fully self-contained, mutually-exclusive branches - each
+     // #2712: fully self-contained, mutually-exclusive branches - each
      // declares its OWN complete properties/required/additionalProperties:false
      // rather than sharing top-level properties with per-branch const/required,
-     // which would let the zero-agents document also satisfy the normal branch
+     // which would let a zero-agents document also satisfy the normal branch
      // (its required set is a strict subset of the zero-agents fields). Same
      // class of gap an adversarial review of batch 1 found in validate_scope's
      // looser oneOf - fixed there too in this commit.
+     //
+     // #3424/#3511: the single "no_agents_reached" zero-agents branch is now
+     // FOUR - one per status value the handler can emit (see the priority
+     // cascade at the dispatch site). retry_after_ms is a per-branch `const`,
+     // matching the exact literal the handler emits for that status - 5000 for
+     // the TWO retryable branches (containment_unreadable's systemic
+     // degradation, and no_agents_reached's own catch-all, which mixes a
+     // possible permanent approval-denial race with a possible genuinely
+     // offline device and so must not claim `null`/not-retryable either),
+     // null for the two permanent branches (targets_quarantined,
+     // plugin_not_found) - not a generic integer, so a client
+     // schema-validating the response catches drift between this contract and
+     // the handler the same way `agents_reached`'s own const already does.
+     // agents_quarantined/agents_unknown_plugin ride on every zero-agents
+     // branch (not just the one each "belongs" to) so a caller reading a
+     // mixed failure never has to infer a count from which branch matched.
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message"],"additionalProperties":false})j"
+     R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"targets_quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false})j"
      R"j(]})j"},
 
     // ── Live-query bundle (ADR-0011) — MCP/REST parity for /api/v1/bundles ─────
@@ -8920,9 +8949,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // re-derived here.
                 std::string command_id;
                 int agents_reached = 0;
+                yuzu::server::ConfinedDispatchOutcome dispatch_outcome;
                 try {
-                    std::tie(command_id, agents_reached) = dispatch_fn(
-                        plugin, action, agent_ids, scope, params, execution_id, caller);
+                    dispatch_outcome = dispatch_fn(plugin, action, agent_ids, scope, params,
+                                                   execution_id, caller);
+                    command_id = dispatch_outcome.command_id;
+                    agents_reached = dispatch_outcome.sent;
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
                     // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
@@ -8967,67 +8999,111 @@ McpServer::HandlerFn McpServer::build_handler(
                         spdlog::error("mcp_server: mark_cancelled failed for execution_id={}",
                                       execution_id);
                     }
+                    // #3424/#3511: "reachable" is no longer the only reason
+                    // this can be zero — a target that is QUARANTINED is
+                    // withheld by the containment gate, the gate itself can
+                    // fail closed (containment state unreadable), or the
+                    // dispatched plugin can be absent from every target's
+                    // reported inventory — three permanent-or-degraded
+                    // reasons a caller must not treat like a plain offline
+                    // device. #1398 (governance Gate 6 enterprise-readiness
+                    // finding) used to add a FOURTH cause here —
+                    // ExecuteGate::AdminOrApproval/AlwaysApproval denying a
+                    // non-admin, non-ticketed caller reached this exact code
+                    // path too. #3687 closes that for the ORDINARY case: the
+                    // pre-dispatch authorization dry run above
+                    // (authorize_dispatch_fn_) now denies
+                    // Unclassified/Ambiguous/AnonymousOperator/Forbidden/
+                    // ApprovalRequired/KillSwitched with a discriminated
+                    // JSON-RPC error BEFORE dispatch_fn is ever called, so
+                    // this code path is no longer reached for any of those
+                    // six reasons on a request whose RBAC/approval/
+                    // kill-switch state is unchanged between the dry run and
+                    // the real dispatch a moment later — the residual race
+                    // (state changing in that narrow window) still folds into
+                    // `no_agents_reached` below, same as before #3424/#3511.
+                    //
+                    // PRIORITY, matching /api/command's own cascade
+                    // (server.cpp): containment_unreadable first (a systemic
+                    // gate failure, not a per-target fact) — then
+                    // targets_quarantined — then plugin_not_found — then the
+                    // generic catch-all. `> 0`, not `== agent_ids.size()`:
+                    // a MIXED failure (some quarantined, some plugin-absent,
+                    // some genuinely offline) is still not "just offline",
+                    // and understating a permanent reason as retryable is the
+                    // worse mistake in either direction.
+                    std::string zero_status;
+                    std::string zero_message;
+                    std::string zero_retry_after_ms_json = "null";
+                    if (dispatch_outcome.containment_unreadable) {
+                        zero_status = "containment_unreadable";
+                        zero_message =
+                            "No agents reached: the quarantine containment gate's state is "
+                            "unreadable, so dispatch is failing closed rather than guessing who "
+                            "is quarantined. Retryable — the gate typically recovers within "
+                            "seconds once the containment store is reachable again.";
+                        zero_retry_after_ms_json = "5000";
+                    } else if (dispatch_outcome.denied_quarantined_count > 0) {
+                        zero_status = "targets_quarantined";
+                        zero_message =
+                            "No agents reached: every target was withheld by the quarantine "
+                            "containment gate. This is a permanent policy denial, not "
+                            "unreachability — retrying will not help. Check quarantine status, "
+                            "or release the device, before retrying.";
+                        zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.unknown_plugin_count > 0) {
+                        zero_status = "plugin_not_found";
+                        zero_message =
+                            "No agents reached: the dispatched plugin is not in any target "
+                            "agent's reported inventory, so the command was guaranteed to fail "
+                            "and was withheld before dispatch. This is permanent for the current "
+                            "plugin name — retrying will not help. Check discover_plugins for "
+                            "the correct name, or confirm the plugin is installed on the "
+                            "target(s).";
+                        zero_retry_after_ms_json = "null";
+                    } else {
+                        // Deliberately non-null, unlike its two permanent siblings
+                        // above: this catch-all is a MIX of "an approval denial
+                        // raced the dry run" (permanent) and "the device is
+                        // genuinely offline" (retryable), and the message itself
+                        // says so — it cannot promise retrying will help, but it
+                        // also must not claim retrying WON'T, which a `null` here
+                        // would (the convention this schema documents: `null` =
+                        // not retryable, non-null = retryable). 5000ms matches
+                        // this file's other retryable-condition branches.
+                        zero_status = "no_agents_reached";
+                        zero_message =
+                            "No agents reached: every target was either unreachable or denied "
+                            "approval-required by the dispatch gate (a residual race — see the "
+                            "authorize_dispatch_fn_ dry run above, #3687). An approval denial is "
+                            "a permanent policy refusal and retrying will not help; an offline "
+                            "device may reconnect — poll query_responses or dispatch via "
+                            "POST /api/instructions/{id}/execute, before retrying.";
+                        zero_retry_after_ms_json = "5000";
+                    }
                     // governance R1 unhappy-UP-7: structured signal so
                     // the agentic worker can branch on `status` without
                     // parsing the free-text message. The text content
                     // stays for backwards compatibility with workers
                     // that parse it; the status field is the stable
-                    // programmatic surface.
+                    // programmatic surface. Counts ride along on EVERY
+                    // branch (not only the branch each count "belongs" to)
+                    // so `status` is a hint a caller can act on immediately,
+                    // never the only source of truth for a mixed failure.
                     const std::string zero_payload =
                         JObj()
-                            .add("status", "no_agents_reached")
+                            .add("status", zero_status)
                             .add("command_id", command_id)
                             .add("execution_id", execution_id)
                             .add("agents_reached", 0)
                             .add("plugin", plugin)
                             .add("action", action)
-                            // #881: "reachable" is no longer the only reason
-                            // this can be zero — a target that is QUARANTINED
-                            // is withheld by the containment gate before
-                            // dispatch, which is a permanent policy denial,
-                            // not transient unreachability. #1398 (governance
-                            // Gate 6 enterprise-readiness finding) used to add
-                            // a THIRD cause here — ExecuteGate::AdminOrApproval
-                            // /AlwaysApproval denying a non-admin, non-ticketed
-                            // caller reached this exact code path too, since
-                            // mcp_server.cpp had no classify_and_authorize_
-                            // dispatch call of its own and the shared
-                            // dispatch_fn's internal chokepoint denial
-                            // surfaced as command_id/sent=0, same as offline
-                            // or quarantined. #3687 closes that for the
-                            // ORDINARY case: the pre-dispatch authorization
-                            // dry run above (authorize_dispatch_fn_) now
-                            // denies Unclassified/Ambiguous/AnonymousOperator/
-                            // Forbidden/ApprovalRequired/KillSwitched with a
-                            // discriminated JSON-RPC error BEFORE dispatch_fn
-                            // is ever called, so this code path is no longer
-                            // reached for any of those six reasons on a
-                            // request whose RBAC/approval/kill-switch state
-                            // is unchanged between the dry run and the real
-                            // dispatch a moment later. The message below still
-                            // names approval-required as a POSSIBLE cause
-                            // because that race — state changing in the
-                            // narrow window between the two checks — is not
-                            // eliminated, only made rare; a wider DispatchFn
-                            // return (never landing on this issue — see
-                            // #3687's own scope note) would be needed to
-                            // discriminate it from quarantine/offline
-                            // programmatically even in that residual case.
-                            // The authoritative answer for the common case is
-                            // now the discriminated pre-dispatch error itself;
-                            // for the residual race, it remains the
-                            // quarantine.dispatch_denied audit row,
-                            // yuzu_server_dispatch_target_rejected_total
-                            // {reason="quarantined"}, or
-                            // yuzu_server_dispatch_denied_total
-                            // {reason="approval_required"}.
-                            .add("message",
-                                 "No agents reached: every target was either unreachable, "
-                                 "withheld by the quarantine containment gate, or denied "
-                                 "approval-required by the dispatch gate. A quarantine or "
-                                 "approval denial is a permanent policy refusal and retrying "
-                                 "will not help — check quarantine status, or dispatch via "
-                                 "POST /api/instructions/{id}/execute, before retrying.")
+                            .add("message", zero_message)
+                            .raw("retry_after_ms", zero_retry_after_ms_json)
+                            .add("agents_quarantined",
+                                 static_cast<int64_t>(dispatch_outcome.denied_quarantined_count))
+                            .add("agents_unknown_plugin",
+                                 static_cast<int64_t>(dispatch_outcome.unknown_plugin_count))
                             .str();
                     mcp_audit("failure",
                               std::string("no_agents_reached execution_id=") + execution_id);
@@ -10032,10 +10108,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         *quarantine_store, agent_id,
                         [&](const std::unordered_map<std::string, std::string>& params)
                             -> std::pair<std::string, int> {
-                            return dispatch_fn ? dispatch_fn("quarantine", "quarantine",
-                                                             {agent_id}, /*scope=*/"", params,
-                                                             /*execution_id=*/"", quarantine_caller)
-                                                : std::pair<std::string, int>{};
+                            // ReapplyDispatchFn's narrower pair shape is deliberate --
+                            // see its own doc comment. `is_quarantine_control_plugin`
+                            // exempts the quarantine plugin's own actions from the
+                            // CONTAINMENT gate only (dispatch_confined_arms.hpp's
+                            // `compose_containment_gate`) -- it does NOT exempt them
+                            // from #3511's plugin-presence filter, which is sourced
+                            // unconditionally from `AgentRegistry::ids_missing_plugin`.
+                            // A reapply to an agent genuinely missing the quarantine
+                            // plugin is still withheld (correctly -- it would fail
+                            // regardless), it just can't be DISCRIMINATED as such
+                            // through this narrower return shape; see the caller's
+                            // `agents_reached == 0` handling, which reads this as an
+                            // ordinary unreached/retry case, not a permanent one.
+                            if (!dispatch_fn)
+                                return {};
+                            const auto outcome = dispatch_fn("quarantine", "quarantine", {agent_id},
+                                                             /*scope=*/"", params,
+                                                             /*execution_id=*/"", quarantine_caller);
+                            return {outcome.command_id, outcome.sent};
                         },
                         stored);
                     if (!reapply_res) {
@@ -10095,9 +10186,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         // #1398: quarantine_caller (defined above this if/else,
                         // shared with the reapply branch) already carries
                         // principal_is_admin/approval_provenance.
-                        std::tie(command_id, agents_reached) =
+                        const auto outcome =
                             dispatch_fn("quarantine", "quarantine", {agent_id}, /*scope=*/"",
                                         qparams, /*execution_id=*/"", quarantine_caller);
+                        command_id = outcome.command_id;
+                        agents_reached = outcome.sent;
                     } catch (const std::exception& e) {
                         dispatch_threw = true;
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",

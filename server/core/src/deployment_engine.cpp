@@ -136,10 +136,12 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
                 cand.push_back(d.agent_id);
         auto claimed = deps.store->claim_for_stage(deployment_id, cand);
         if (!claimed.empty()) {
-            const auto [cmd, sent] = deps.dispatch_fn(
+            const auto outcome = deps.dispatch_fn(
                 "content_dist", "stage", claimed, "",
                 {{"url", cfg.url}, {"filename", cfg.filename}, {"sha256", cfg.sha256}},
                 stage_execution_id(deployment_id), pipeline_caller);
+            const auto& cmd = outcome.command_id;
+            const auto sent = outcome.sent;
             // #3133 round-2 review MEDIUM: the claim used to be uncondition-
             // ally left in 'staging' with the dispatch result discarded — a
             // chokepoint-denied dispatch (caller lacks the classified
@@ -183,9 +185,11 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
                                                                 {"expected_hash", cfg.sha256}};
             if (!cfg.args.empty())
                 params["args"] = cfg.args;
-            const auto [cmd, sent] =
+            const auto outcome =
                 deps.dispatch_fn("content_dist", "execute_staged", claimed, "", params,
                                  exec_execution_id(deployment_id), pipeline_caller);
+            const auto& cmd = outcome.command_id;
+            const auto sent = outcome.sent;
             // Same settle-on-refusal as the stage claim above. The execute-once
             // property is PRESERVED, not weakened: claim_for_exec still claims
             // each row exactly once, and a row settled to 'failed' here was

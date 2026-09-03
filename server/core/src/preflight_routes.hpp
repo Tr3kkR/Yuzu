@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file preflight_routes.hpp
 /// The `/auto` PRE-FLIGHT page: a config section (per-check parameters +
 /// thresholds) → run across a cohort → a go/no-go result GROUPED BY DEVICE
@@ -102,7 +104,7 @@ public:
     using GroupMembersFn = std::function<std::vector<std::string>(const std::string& group_id)>;
     /// 6-param shared command_dispatch_fn — execution_id carried so responses
     /// correlate via query_by_execution (the runner reuses the SAME ids).
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

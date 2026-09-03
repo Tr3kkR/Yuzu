@@ -567,9 +567,11 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
         int agents_reached = 0;
         bool threw = false;
         try {
-            std::tie(command_id, agents_reached) =
+            const auto outcome =
                 d_.dispatch_fn(std::string(kQuarantinePluginName), std::string(kQuarantineStatusAction),
                               {agent_id}, /*scope_expr=*/"", /*parameters=*/{}, /*execution_id=*/"");
+            command_id = outcome.command_id;
+            agents_reached = outcome.sent;
         } catch (const std::exception&) {
             threw = true;
         }
@@ -609,10 +611,18 @@ bool QuarantineContainmentReconciler::reconcile_one(const std::string& agent_id,
     QuarantineRecord stored{};
     auto reapply_res = redispatch_stored_containment(
         *d_.quarantine_store, agent_id,
-        [&](const std::unordered_map<std::string, std::string>& params) {
-            return d_.dispatch_fn(std::string(kQuarantinePluginName),
-                                  std::string(kQuarantineApplyAction), {agent_id},
-                                  /*scope_expr=*/"", params, /*execution_id=*/"");
+        [&](const std::unordered_map<std::string, std::string>& params)
+            -> std::pair<std::string, int> {
+            // ReapplyDispatchFn's narrower pair shape is deliberate here — see
+            // that typedef's own doc comment; #3424/#3511's richer discriminators
+            // are for a caller that decides retry semantics from THIS call's
+            // result, which this reconciler tick does not (it already treats
+            // agents_reached==0 uniformly as "not reached" below).
+            const auto outcome =
+                d_.dispatch_fn(std::string(kQuarantinePluginName),
+                               std::string(kQuarantineApplyAction), {agent_id},
+                               /*scope_expr=*/"", params, /*execution_id=*/"");
+            return {outcome.command_id, outcome.sent};
         },
         stored);
     if (!reapply_res) {

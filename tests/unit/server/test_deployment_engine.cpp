@@ -73,7 +73,7 @@ struct Harness {
                                const std::unordered_map<std::string, std::string>&,
                                const std::string&,
                                const yuzu::server::DispatchCaller& caller)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             dispatched.push_back({action, agents});
             dispatch_callers.push_back(caller);
             // deny_dispatch mirrors a chokepoint refusal: dispatch_confined
@@ -81,7 +81,8 @@ struct Harness {
             // before classification), so a denied and a zero-reach dispatch
             // are indistinguishable to the engine — which is exactly why the
             // engine must settle the claim on ANY zero-sent outcome.
-            return {"cmd", deny_dispatch ? 0 : static_cast<int>(agents.size())};
+            return {.sent = deny_dispatch ? 0 : static_cast<int>(agents.size()),
+                   .command_id = "cmd"};
         };
         return d;
     }

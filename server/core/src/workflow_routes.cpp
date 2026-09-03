@@ -1774,13 +1774,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // to the ungated dispatch when unwired (test harnesses that
             // don't construct an ExecutionTracker), matching the
             // ConcurrencyDispatchFn doc contract.
-            auto [command_id, sent] =
+            auto dispatch_outcome =
                 cmd_dispatch_concurrency
                     ? cmd_dispatch_concurrency(def.plugin, def.action, target_ids, "", params,
                                               /*execution_id=*/"", caller, def.id,
                                               def.concurrency_mode)
                     : cmd_dispatch(def.plugin, def.action, target_ids, "", params,
                                    /*execution_id=*/"", caller);
+            const auto& command_id = dispatch_outcome.command_id;
+            const auto sent = dispatch_outcome.sent;
 
             if (sent == 0)
                 return std::unexpected<std::string>("no agents reached for " + instruction_id);
@@ -2157,13 +2159,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                           : yuzu::server::DispatchCaller{
                                 .exec_visible = yuzu::server::authz::deny_all()};
             // ADR-1007: per-device concurrency gate, when wired.
-            std::tie(command_id, sent) =
+            const auto dispatch_outcome =
                 cmd_dispatch_concurrency
                     ? cmd_dispatch_concurrency(def.plugin, def.action, agent_ids, dispatch_scope,
                                               params, execution_id, caller, def.id,
                                               def.concurrency_mode)
                     : cmd_dispatch(def.plugin, def.action, agent_ids, dispatch_scope, params,
                                    execution_id, caller);
+            command_id = dispatch_outcome.command_id;
+            sent = dispatch_outcome.sent;
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created

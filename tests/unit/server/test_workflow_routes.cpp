@@ -298,7 +298,7 @@ struct ExecHarness {
                                    const std::unordered_map<std::string, std::string>& params,
                                    const std::string& execution_id,
                                    const yuzu::server::DispatchCaller& caller)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             last_dispatch_execution_id = execution_id;
             // #2500: capture what the sink was actually asked to target.
             ++dispatch_calls;
@@ -309,7 +309,7 @@ struct ExecHarness {
             // into dispatch.
             last_dispatch_exec_visible = caller.exec_visible;
             last_dispatch_caller = caller;
-            return {dispatch_cmd_override, dispatch_sent_override};
+            return {.sent = dispatch_sent_override, .command_id = dispatch_cmd_override};
         };
 
         // PR 2.5 (#670): deps-struct refactor. WorkflowRoutes::register_routes

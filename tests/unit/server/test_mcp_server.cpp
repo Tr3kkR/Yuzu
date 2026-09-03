@@ -6105,14 +6105,14 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
         ts.last_dispatch_params = params;
         ts.last_dispatch_execution_id = execution_id;
-        return {"cmd-abc", 2};
+        return {.sent = 2, .command_id = "cmd-abc"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6171,10 +6171,10 @@ TEST_CASE("MCP execute_instruction derives the caller's exec_visible and threads
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
                         const yuzu::server::DispatchCaller& caller)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_exec_visible = caller.exec_visible;
-        return {"cmd-x", 0};
+        return {.sent = 0, .command_id = "cmd-x"};
     };
     ts.start_with_dispatch(dispatch, "operator");
     // Target agent-B (outside the caller's visible set). This asserts the
@@ -6205,9 +6205,9 @@ TEST_CASE("MCP execute_instruction threads the caller's principal into dispatch 
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
                         const yuzu::server::DispatchCaller& caller)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         captured = caller;
-        return {"cmd-x", 0};
+        return {.sent = 0, .command_id = "cmd-x"};
     };
     ts.start_with_dispatch(dispatch, "operator");
     auto res = ts.call(
@@ -6231,9 +6231,9 @@ TEST_CASE("MCP execute_instruction FAILS CLOSED when the exec-visible derivation
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
                         const yuzu::server::DispatchCaller& caller)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_exec_visible = caller.exec_visible;
-        return {"cmd-x", 0};
+        return {.sent = 0, .command_id = "cmd-x"};
     };
     ts.start_with_dispatch(dispatch, "operator");
     auto res = ts.call(
@@ -6257,9 +6257,9 @@ TEST_CASE("MCP execute_instruction hands dispatch an EMPTY principal when the Ca
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
                         const yuzu::server::DispatchCaller& caller)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         captured = caller;
-        return {"cmd-x", 0};
+        return {.sent = 0, .command_id = "cmd-x"};
     };
     ts.start_with_dispatch(dispatch, "operator");
     auto res = ts.call(
@@ -6291,14 +6291,14 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
         ts.last_dispatch_params = params;
         ts.last_dispatch_execution_id = execution_id;
-        return {"cmd-tracker", 3};
+        return {.sent = 3, .command_id = "cmd-tracker"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6373,9 +6373,9 @@ TEST_CASE("MCP #3685: operator-tier execute_instruction refuses with "
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6411,9 +6411,9 @@ TEST_CASE("MCP #3685: supervised-tier execute_instruction fails closed at the C8
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -6437,8 +6437,8 @@ TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"", 0};
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = ""};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6460,8 +6460,8 @@ TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"", 0};
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = ""};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6493,9 +6493,9 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd-abc", 1};
+        return {.sent = 1, .command_id = "cmd-abc"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6667,11 +6667,11 @@ TEST_CASE("MCP Integration: type-confused targeting is rejected, never widened t
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatch_calls;
         dispatched_ids = agent_ids;
         dispatched_scope = scope_expr;
-        return {"cmd-abc", 1};
+        return {.sent = 1, .command_id = "cmd-abc"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6762,7 +6762,7 @@ TEST_CASE("MCP Integration: an input-bound denial emits a counted, correlated au
     ts.metrics_for_test = &reg;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"", 0}; };
+                       const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 0, .command_id = ""}; };
     ts.start_with_dispatch(dispatch, "operator");
 
     const std::string big(129, 'a');
@@ -6899,8 +6899,8 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     McpTestServer ts;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-xyz", 0};
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = "cmd-xyz"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -6916,13 +6916,16 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     REQUIRE(content.size() >= 1);
 
     auto text_str = content[0]["text"].get<std::string>();
-    // #881: the message no longer ASSERTS unreachability, because a target can
-    // also be withheld by the containment gate — a permanent policy denial an
-    // agentic caller must not retry. Pin the two halves that carry that
-    // meaning rather than a prefix, so a future reword cannot quietly drop
-    // either one back to the old single-cause claim.
+    // #3424/#3511: this fake dispatch's outcome has containment_unreadable
+    // false, denied_quarantined_count 0, and unknown_plugin_count 0 -- the
+    // genuine catch-all case -- so it lands on the "no_agents_reached"
+    // branch (pinned via `sc["status"]` below), whose message no longer
+    // mentions quarantine at all: that reason now has its own dedicated
+    // status + message (see the sibling `[3424][3511]`-tagged test cases in
+    // this file for those). Pin the two halves of THIS branch's message so a
+    // future reword cannot quietly drop either.
     CHECK(text_str.find("No agents reached") != std::string::npos);
-    CHECK(text_str.find("quarantine containment gate") != std::string::npos);
+    CHECK(text_str.find("approval-required") != std::string::npos);
 
     // #2712: structuredContent mirrors content[0].text for the zero-agents
     // oneOf branch - status is the stable discriminator, agents_reached is
@@ -6935,6 +6938,127 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     CHECK(sc["status"] == "no_agents_reached");
     CHECK(sc["agents_reached"] == 0);
     CHECK(sc.contains("message"));
+    // Deliberately non-null: this catch-all mixes a possibly-permanent
+    // approval-denial race with a possibly-retryable offline device, and a
+    // `null` here would falsely tell an agentic caller retrying can never
+    // help (the convention this schema pins: null = not retryable).
+    REQUIRE(sc.contains("retry_after_ms"));
+    CHECK(sc["retry_after_ms"] == 5000);
+}
+
+TEST_CASE("MCP execute_instruction: every target quarantined reports status="
+          "targets_quarantined, non-retryable",
+          "[mcp][integration][execute][3424][3511]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0,
+               .denied_quarantined = {"agent-1"},
+               .denied_quarantined_count = 1,
+               .command_id = "cmd-quar"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":28,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "targets_quarantined");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc["retry_after_ms"].is_null());
+    CHECK(sc["agents_quarantined"] == 1);
+    CHECK(sc["agents_unknown_plugin"] == 0);
+    auto text_str = sc["message"].get<std::string>();
+    CHECK(text_str.find("quarantine") != std::string::npos);
+    CHECK(text_str.find("permanent") != std::string::npos);
+}
+
+TEST_CASE("MCP execute_instruction: a fail-closed containment gate reports status="
+          "containment_unreadable, retryable after 5000ms",
+          "[mcp][integration][execute][3424][3511]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = "cmd-degraded", .containment_unreadable = true};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":29,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "containment_unreadable");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc["retry_after_ms"] == 5000);
+}
+
+TEST_CASE("MCP execute_instruction: a plugin absent from every target's inventory reports "
+          "status=plugin_not_found, non-retryable",
+          "[mcp][integration][execute][3424][3511]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0,
+               .command_id = "cmd-noplugin",
+               .unknown_plugin = {"agent-1"},
+               .unknown_plugin_count = 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":30,"params":{"name":"execute_instruction","arguments":{"plugin":"totally_fake_plugin","action":"nope"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "plugin_not_found");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc["retry_after_ms"].is_null());
+    CHECK(sc["agents_quarantined"] == 0);
+    CHECK(sc["agents_unknown_plugin"] == 1);
+}
+
+TEST_CASE("MCP execute_instruction: a MIXED outcome (quarantined AND plugin-absent targets) "
+          "reports the higher-priority status but carries BOTH counts",
+          "[mcp][integration][execute][3424][3511]") {
+    // Priority cascade pinned: containment_unreadable > targets_quarantined >
+    // plugin_not_found > no_agents_reached (server.cpp's execute_instruction
+    // handler). A mixed failure must never understate a permanent reason as
+    // the weaker/generic one, and the response body must still let the
+    // caller see BOTH counts even though only one drives `status`.
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0,
+               .denied_quarantined = {"agent-1"},
+               .denied_quarantined_count = 1,
+               .command_id = "cmd-mixed",
+               .unknown_plugin = {"agent-2"},
+               .unknown_plugin_count = 1};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":31,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "targets_quarantined"); // wins over plugin_not_found
+    CHECK(sc["agents_quarantined"] == 1);
+    CHECK(sc["agents_unknown_plugin"] == 1); // still visible, not hidden by the status choice
 }
 
 // #1398 (quality-engineer, Gate 3): no prior test wired a fake dispatch_fn
@@ -7003,16 +7127,16 @@ TEST_CASE("MCP execute_instruction: a chokepoint ApprovalRequired denial the pre
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
-                        const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
         auto classified =
             yuzu::server::detail::classify_and_authorize_dispatch(registry, caller, plugin, action,
                                                                   always_allow);
         if (!classified) {
             chokepoint_denied =
                 classified.error().reason == DispatchDenialReason::ApprovalRequired;
-            return {"cmd-registry-set_value", 0}; // mirrors dispatch_confined's real shape
+            return {.sent = 0, .command_id = "cmd-registry-set_value"}; // mirrors dispatch_confined's real shape
         }
-        return {"cmd-registry-set_value", 1};
+        return {.sent = 1, .command_id = "cmd-registry-set_value"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7045,10 +7169,10 @@ TEST_CASE("MCP Integration: execute_instruction default scope __all__",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_scope = scope_expr;
         ts.last_dispatch_agent_ids = agent_ids;
-        return {"cmd-default", 1};
+        return {.sent = 1, .command_id = "cmd-default"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7072,10 +7196,10 @@ TEST_CASE("MCP Integration: execute_instruction explicit agent_ids",
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
-        return {"cmd-agents", 2};
+        return {.sent = 2, .command_id = "cmd-agents"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7098,9 +7222,9 @@ TEST_CASE("MCP Integration: execute_instruction params forwarding", "[mcp][integ
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_params = params;
-        return {"cmd-params", 1};
+        return {.sent = 1, .command_id = "cmd-params"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7122,9 +7246,9 @@ TEST_CASE("MCP Integration: execute_instruction non-string params", "[mcp][integ
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_params = params;
-        return {"cmd-nonstr", 1};
+        return {.sent = 1, .command_id = "cmd-nonstr"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7147,8 +7271,8 @@ TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode",
     ts.read_only_mode_ = true;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-ro", 1};
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-ro"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7170,8 +7294,8 @@ TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-ro", 1};
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-ro"};
     };
     ts.start_with_dispatch(dispatch, "readonly");
 
@@ -7193,10 +7317,10 @@ TEST_CASE("MCP Integration: execute_instruction operator tier proceeds",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
-        return {"cmd-op", 3};
+        return {.sent = 3, .command_id = "cmd-op"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7231,8 +7355,8 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier, no approval man
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-sup", 1};
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-sup"};
     };
     ts.start_with_dispatch(dispatch, "supervised"); // approval_manager_for_test == nullptr
 
@@ -7268,9 +7392,9 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier mints approval t
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd-sup", 1};
+        return {.sent = 1, .command_id = "cmd-sup"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -7304,9 +7428,9 @@ TEST_CASE("MCP Integration: execute_instruction operator tier carries no approva
     yuzu::server::ApprovalProvenance captured = yuzu::server::ApprovalProvenance::Ticket;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
         captured = caller.approval_provenance;
-        return {"cmd-op", 1};
+        return {.sent = 1, .command_id = "cmd-op"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7355,9 +7479,9 @@ TEST_CASE("MCP #3685: Destructive + omitted target is refused with the new envel
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7391,9 +7515,9 @@ TEST_CASE("MCP #3685: Destructive + scope target (real scope or __all__) is refu
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7423,10 +7547,10 @@ TEST_CASE("MCP #3685: Destructive + explicit valid agent_ids dispatches normally
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
-                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
         seen_ids = agent_ids;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7455,9 +7579,9 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -7549,9 +7673,9 @@ TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3): a classify-miss at C
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -7597,9 +7721,9 @@ TEST_CASE("MCP #3685 governance-round-2 (Doomgoose item 3 / Gate 8 round 3 item 
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -7635,9 +7759,9 @@ TEST_CASE("MCP #3685: a pre-seeded, already-approved untargeted-Destructive tick
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -7702,9 +7826,9 @@ TEST_CASE("MCP #3685: operator-tier Destructive refusal happens BEFORE execution
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7736,10 +7860,10 @@ TEST_CASE("MCP #3685: a Targeted Destructive call is NOT refused and still reach
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller& caller)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
         seen = caller.exec_visible;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7773,9 +7897,9 @@ TEST_CASE("MCP #3687: unwired authorizer fails CLOSED — every execute_instruct
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7819,9 +7943,9 @@ TEST_CASE("MCP #3687: Unclassified denial is discriminated, dispatch_fn NOT invo
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7853,9 +7977,9 @@ TEST_CASE("MCP #3687: Ambiguous denial is discriminated, dispatch_fn NOT invoked
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7884,9 +8008,9 @@ TEST_CASE("MCP #3687: AnonymousOperator denial is discriminated, dispatch_fn NOT
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7922,9 +8046,9 @@ TEST_CASE("MCP #3687: Forbidden denial is discriminated, dispatch_fn NOT invoked
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -7958,9 +8082,9 @@ TEST_CASE("MCP #3687: ApprovalRequired denial is discriminated (NOT the kApprova
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     // Operator tier: skips C8 entirely (auto-approved tier, no ticket ever
     // minted), so this proves the main-handler dry run denies on its own —
@@ -7998,9 +8122,9 @@ TEST_CASE("MCP #3687: KillSwitched denial is discriminated, dispatch_fn NOT invo
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -8030,11 +8154,11 @@ TEST_CASE("MCP #3687: a genuinely-authorized call still dispatches normally (no 
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
-                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
         CHECK(plugin == "os_info");
         CHECK(action == "version");
-        return {"cmd-3687", 3};
+        return {.sent = 3, .command_id = "cmd-3687"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -8068,9 +8192,9 @@ TEST_CASE("MCP #3687: a denial happens BEFORE execution-row creation — no phan
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -8113,9 +8237,9 @@ TEST_CASE("MCP #3687 (Gate 6 UP-5): a Forbidden pair is denied AT C8 PRE-MINT �
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -8153,9 +8277,9 @@ TEST_CASE("MCP #3687 (Gate 6 UP-5): a KillSwitched pair is denied AT C8 PRE-MINT
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -8192,9 +8316,9 @@ TEST_CASE("MCP #3687 (Gate 6 UP-5): ApprovalRequired at C8 pre-mint is NOT a den
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -8234,9 +8358,9 @@ TEST_CASE("MCP #3687 (Gate 6 quality-engineer gap): unwired authorizer fails CLO
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     ts.start_with_dispatch(dispatch, "supervised");
 
@@ -8261,8 +8385,8 @@ TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integr
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-audit", 2};
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 2, .command_id = "cmd-audit"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -8285,8 +8409,8 @@ TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-empty", 0};
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = "cmd-empty"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -8521,9 +8645,9 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
     ts.response_store_for_test = &store;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_execution_id = execution_id;
-        return {"cmd-loop", 1};
+        return {.sent = 1, .command_id = "cmd-loop"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -8571,8 +8695,8 @@ TEST_CASE("MCP query_responses: #3344 retry_after_ms confirms in-flight, absent 
     ts.metrics_for_test = &reg;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-poll-hint", 1};
+                        const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-poll-hint"};
     };
     ts.start_with_dispatch(dispatch, "operator");
 
@@ -10457,8 +10581,8 @@ bool audit_has(const std::vector<std::string>& log, const std::string& entry) {
 yuzu::server::mcp::McpServer::DispatchFn fake_bundle_dispatch() {
     return [](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
               const std::string&, const std::unordered_map<std::string, std::string>&,
-              const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-" + plugin + "-" + action, 1};
+              const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-" + plugin + "-" + action};
     };
 }
 } // namespace
@@ -10482,9 +10606,9 @@ TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
                                          const std::string&, const yuzu::server::DispatchCaller&)
-                               -> std::pair<std::string, int> {
+                               -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     });
     // Target agent-B, OUTSIDE the caller's visible set -> denied at the handler
     // (in_scope) BEFORE any dispatch: an error, never a bundle_id.
@@ -10527,9 +10651,9 @@ TEST_CASE("MCP execute_bundle threads the caller's principal_is_admin into Dispa
                                              const std::unordered_map<std::string, std::string>&,
                                              const std::string&,
                                              const yuzu::server::DispatchCaller& caller)
-                               -> std::pair<std::string, int> {
+                               -> yuzu::server::ConfinedDispatchOutcome {
         captured_admin = caller.principal_is_admin;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     });
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1398,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
@@ -10589,9 +10713,9 @@ TEST_CASE("MCP #3893: execute_bundle refuses the WHOLE call when ANY step is den
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
                                          const std::string&, const yuzu::server::DispatchCaller&)
-                               -> std::pair<std::string, int> {
+                               -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     });
 
     auto res = ts.call(
@@ -10631,9 +10755,9 @@ TEST_CASE("MCP #3893: execute_bundle unwired authorizer fails CLOSED at the MAIN
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
                                          const std::string&, const yuzu::server::DispatchCaller&)
-                               -> std::pair<std::string, int> {
+                               -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     });
 
     auto res = ts.call(
@@ -10669,9 +10793,9 @@ TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): ApprovalRequired at C8 pre-mint for e
         [&dispatched](const std::string&, const std::string&, const std::vector<std::string>&,
                      const std::string&, const std::unordered_map<std::string, std::string>&,
                      const std::string&, const yuzu::server::DispatchCaller&)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             dispatched = true;
-            return {"cmd", 1};
+            return {.sent = 1, .command_id = "cmd"};
         },
         "supervised");
 
@@ -10707,9 +10831,9 @@ TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is u
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
                                          const std::string&, const yuzu::server::DispatchCaller&)
-                               -> std::pair<std::string, int> {
+                               -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     });
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":91,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
@@ -10748,9 +10872,9 @@ TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO 
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
                                          const std::string&, const yuzu::server::DispatchCaller&)
-                               -> std::pair<std::string, int> {
+                               -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     });
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":96,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
@@ -10775,9 +10899,9 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp
     ts.start_with_dispatch([&calls](const std::string& plugin, const std::string& action,
                                     const std::vector<std::string>&, const std::string&,
                                     const std::unordered_map<std::string, std::string>&,
-                                    const std::string& correlation, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                                    const std::string& correlation, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         calls.push_back({plugin, action, correlation});
-        return {"cmd-" + plugin + "-" + action, 1};
+        return {.sent = 1, .command_id = "cmd-" + plugin + "-" + action};
     });
 
     auto res = ts.call(
@@ -10997,8 +11121,8 @@ TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[pg][
     ts.start_with_dispatch([](const std::string&, const std::string&,
                               const std::vector<std::string>&, const std::string&,
                               const std::unordered_map<std::string, std::string>&,
-                              const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {std::string{}, 0}; // reached no agent
+                              const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = std::string{}}; // reached no agent
     });
     auto disp = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":92,"params":{"name":"execute_bundle","arguments":{"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]}}})");
@@ -12218,9 +12342,9 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     int dispatch_calls = 0;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatch_calls;
-        return {"cmd-abc", 1};
+        return {.sent = 1, .command_id = "cmd-abc"};
     };
     McpTestServer ts;
     ts.approval_manager_for_test = &appr;
@@ -12973,8 +13097,8 @@ TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-dec
         auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                            const std::string&,
                            const std::unordered_map<std::string, std::string>&,
-                           const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-x", 1};
+                           const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 1, .command_id = "cmd-x"};
         };
         ts2.start_with_dispatch(dispatch, "supervised");
         auto undeclared = nlohmann::json::parse(
@@ -13008,10 +13132,10 @@ TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declar
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
             dispatched = true;
             captured_provenance = caller.approval_provenance;
-            return {"cmd-ok", 1};
+            return {.sent = 1, .command_id = "cmd-ok"};
         };
         ts.start_with_dispatch(dispatch, "supervised");
 
@@ -14126,14 +14250,14 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string&, const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller& caller) -> yuzu::server::ConfinedDispatchOutcome {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_params = params;
         ts.last_dispatch_exec_visible = caller.exec_visible;
         captured_provenance = caller.approval_provenance;
-        return {"cmd-quar", 1};
+        return {.sent = 1, .command_id = "cmd-quar"};
     };
     ts.start_with_dispatch(dispatch, "supervised"); // Security:Execute requires approval (C2)
 
@@ -14453,8 +14577,8 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
                        const std::vector<std::string>&, const std::string&,
                        const std::unordered_map<std::string, std::string>&,
                        const std::string&,
-                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-scope", 1};
+                       const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-scope"};
     };
     ts.start_with_dispatch(dispatch);
 
@@ -14522,9 +14646,9 @@ TEST_CASE("MCP #3893: quarantine_device Forbidden denial at the MAIN-HANDLER sit
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     // Empty tier ("" — not an MCP-tiered token, e.g. a dashboard/admin
     // session): tier_allows("", ...) admits it and requires_approval("", ...)
@@ -14572,9 +14696,9 @@ TEST_CASE("MCP #3893 (Gate 6 UP-5 parity): a Forbidden quarantine.quarantine pai
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     // supervised: requires_approval("supervised", "Security", "Execute") is
     // unconditionally true (mcp_policy.hpp) — quarantine.quarantine is live
@@ -14620,9 +14744,9 @@ TEST_CASE("MCP #3893: quarantine_device unwired authorizer fails CLOSED at the M
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     // Empty tier skips C8 entirely, same as the Forbidden-before-write test
     // above — reaches quarantine_device's own fail-closed guard directly.
@@ -14662,9 +14786,9 @@ TEST_CASE("MCP #3893: quarantine_device ApprovalRequired denial at the MAIN-HAND
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&, const yuzu::server::DispatchCaller&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd", 1};
+        return {.sent = 1, .command_id = "cmd"};
     };
     // Empty tier: skips C8's carve-out entirely, reaching the main-handler
     // check directly — unlike C8, this site has no pending ticket to poll,
@@ -14748,13 +14872,13 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
                         const std::string&,
-                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatch_calls;
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_params = params;
-        return {"cmd-retry", 1};
+        return {.sent = 1, .command_id = "cmd-retry"};
     };
     ts.start_with_dispatch(dispatch); // default tier: no approval gate, single-call round-trip
 
@@ -15783,8 +15907,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-bridge", 2};
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 2, .command_id = "cmd-bridge"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -15910,8 +16034,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-dup", 1};
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 1, .command_id = "cmd-dup"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -15936,7 +16060,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
             throw std::runtime_error("boom");
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -15954,8 +16078,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-zero", 0};
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 0, .command_id = "cmd-zero"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -15976,12 +16100,12 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                            const std::string& execution_id, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
             yuzu::server::AgentExecStatus a;
             a.agent_id = "agent-001";
             a.status = "success";
             tracker.update_agent_status(execution_id, a);
-            return {"cmd-early", 1};
+            return {.sent = 1, .command_id = "cmd-early"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -16011,8 +16135,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-armfault", 2};
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 2, .command_id = "cmd-armfault"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -16039,8 +16163,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-resvfault", 2};
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 2, .command_id = "cmd-resvfault"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -16061,8 +16185,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-subfault", 2};
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 2, .command_id = "cmd-subfault"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -16097,8 +16221,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-            return {"cmd-noexecrow", 2};
+                            const std::string&, const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            return {.sent = 2, .command_id = "cmd-noexecrow"};
         };
         ts.start_with_dispatch(dispatch, "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -16215,9 +16339,9 @@ TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain r
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&,
-                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         dispatched = true;
-        return {"cmd-dormant", 1};
+        return {.sent = 1, .command_id = "cmd-dormant"};
     };
     ts.start_with_dispatch(dispatch, "operator");
     ts.mcp.set_stream_bridge(&bridge);
@@ -16285,8 +16409,8 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&,
-                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-streamed", 2};
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 2, .command_id = "cmd-streamed"};
     };
     const auto audit_has = [&](const std::string& row) {
         return std::find(ts.audit_log.begin(), ts.audit_log.end(), row) != ts.audit_log.end();
@@ -16453,9 +16577,9 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
                 const std::string&,
-                const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
                 inner = call_sse(exec_body(745, /*with_token=*/true)); // same id, re-entrant
-                return {"cmd-dup-inflight", 2};
+                return {.sent = 2, .command_id = "cmd-dup-inflight"};
             },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -16637,9 +16761,9 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
                 const std::string&,
-                const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
                 (void)bridge.request_cancel(sid, nlohmann::json(780));
-                return {"cmd-cancelled", 2};
+                return {.sent = 2, .command_id = "cmd-cancelled"};
             },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
@@ -16659,7 +16783,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-none", 0}; },
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 0, .command_id = "cmd-none"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -16724,7 +16848,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 2, .command_id = "cmd-c9"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
         // Reserve leaves the record kArming, which is the only phase that has
@@ -16746,7 +16870,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 2, .command_id = "cmd-c9"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -16764,7 +16888,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 2, .command_id = "cmd-c9"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
         REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
@@ -16784,7 +16908,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 2, .command_id = "cmd-c9"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -16818,7 +16942,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9live", 2}; },
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 2, .command_id = "cmd-c9live"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -16856,7 +16980,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome { return {.sent = 2, .command_id = "cmd-c9"}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -16903,8 +17027,8 @@ TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
                        const std::string&,
-                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-ch56", 2};
+                       const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 2, .command_id = "cmd-ch56"};
     };
 
     SECTION("CH-5: a GET channel and a streamed POST spend the SAME global budget") {

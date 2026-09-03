@@ -1809,13 +1809,13 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& ids, const std::string&,
                         const std::unordered_map<std::string, std::string>& params)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
         CHECK(plugin == "tar");
         CHECK(action == "sql");
         REQUIRE(ids.size() == 1);
         seen_sql = params.count("sql") ? params.at("sql") : "";
-        return {"tar-deadbeef", fake_sent};
+        return {.sent = fake_sent, .command_id = "tar-deadbeef"};
     };
     std::vector<DexAgentResponse> fake_rows;
     auto responses = [&](const std::string& command_id, const std::string& /*agent_id*/) {

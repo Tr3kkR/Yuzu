@@ -1116,8 +1116,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
-                 auto [command_id, sent] =
+                 auto dispatch_outcome =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
                  if (sent == 0) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1312,8 +1314,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] =
+                 auto dispatch_outcome =
                      dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1523,8 +1527,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] = dispatch_fn_(
+                 auto dispatch_outcome = dispatch_fn_(
                      "tar", "status", agent_ids, /*scope_expr=*/"", params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  {
                      std::lock_guard<std::mutex> lk(tar_scan_mu_);
@@ -1736,9 +1742,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] = dispatch_fn_(
+                 auto dispatch_outcome = dispatch_fn_(
                      "tar", "configure", {device_id}, /*scope_expr=*/"",
                      params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.reenable", "failure",
@@ -1904,9 +1912,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] =
+                 auto dispatch_outcome =
                      dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params,
                                   caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.purge", "failure", "command", "",

@@ -1613,29 +1613,34 @@ Quarantine a device.
 > `agents_reached: 97` on a 100-device group is distinguishable from three
 > devices being offline. The dashboard toast says the same.
 >
-> **Its `503` now names the cause.** Three conditions previously shared one
-> body ("failed to send command to any agent"), and one of them is a
-> fleet-wide policy state rather than a transport failure:
+> **Its `503` now names the cause.** Four conditions previously shared one
+> body ("failed to send command to any agent"), and two of them are
+> fleet-wide/request-wide states rather than a transport failure:
 >
 > | `error.reason` | Meaning | `retry_after_ms` |
 > |---|---|---|
 > | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
 > | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
+> | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. | `null` — retrying will not help; check the plugin name/spelling instead |
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `reason` is a top-level key on the error object, not part of the A4
 > `error.data` envelope. The versioned dispatch routes
 > (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
 > do **not** yet carry this split — they answer their existing
-> "no agents reached" shapes for all three conditions, because the shared
-> dispatch closure returns only a sent count. Tracked as #3424. ADR-1007 added
-> a fourth cause to that same undifferentiated message on
+> "no agents reached" shapes for all four conditions, because their own
+> response-building code was not extended to surface the richer per-arm
+> result these routes' shared dispatch closure now carries (#3424 closed the
+> underlying signature gap for the whole codebase; extending every OTHER
+> route's response body to actually use the new fields is a separate,
+> smaller follow-up per route). ADR-1007 added
+> a fifth cause to that same undifferentiated message on
 > `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
 > named target may have been excluded by an already-open concurrency claim
 > rather than being unreachable at all — the response text now says so, and
 > points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
-> this is still prose inside the one undifferentiated 503 body, not a fourth
-> structured `error.reason` value — the same #3424 gap applies to it. The quarantine
+> this is still prose inside the one undifferentiated 503 body, not a fifth
+> structured `error.reason` value — the same other-routes gap applies to it. The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —
