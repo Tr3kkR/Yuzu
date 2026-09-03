@@ -22,8 +22,8 @@
  * No legacy-SQLite backfill test coverage: the dedicated [backfill] TEST_CASE
  * suite (2026-08-25) was removed as part of a fresh-start-by-default policy
  * change (ADR-0009 amendment) — no production fleet has ever run a
- * pre-Postgres build. DeploymentStore::migrate_from_sqlite() itself is
- * UNCHANGED and still present (its removal is a separate, later step).
+ * pre-Postgres build. DeploymentStore::migrate_from_sqlite() itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  *
  * Born-on-... migrated-to-Postgres store (ADR-0012 §1, authoritative/
  * fail-hard). PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails

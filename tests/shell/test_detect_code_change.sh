@@ -265,8 +265,35 @@ if [ -f "$workflow" ]; then
     "key: ccache-canary-x64-linux-.*hashFiles"
   expect_caller true  "canary ccache key is the time bucket" \
     'key: ccache-canary-x64-linux-\$\{\{ env\.CCACHE_BUCKET \}\}'
-  expect_caller true  "canary computes the time bucket from the runner clock" \
-    'CCACHE_BUCKET=\$\(\( \$\(date -u \+%s\) / 259200 \)\)'
+  # CCACHE_BUCKET and CCACHE_PREV_BUCKET must come from ONE runner-clock
+  # read: two independent `date` calls can straddle the 259200s boundary
+  # (self-healing next run, but pointless to risk when one read serves
+  # both — see the "Compute ccache time bucket" step's own comment).
+  expect_caller true  "canary reads the runner clock exactly once for both buckets" \
+    'now="\$\(date -u \+%s\)"'
+  expect_caller true  "canary derives CCACHE_BUCKET from that single clock read" \
+    'CCACHE_BUCKET=\$\(\( now / 259200 \)\)'
+  # The restore-keys fallback must name the SPECIFIC previous bucket, never
+  # a bare open-ended prefix — a prefix matches every entry this cache name
+  # has ever produced, including one left by a since-changed key format,
+  # and GitHub's restore-keys fallback hits refresh the last-accessed clock
+  # that would otherwise age a dead entry out. That dead entry (~2.4 GB,
+  # pre-dating this design) sat immortal in the pool for a day, pinning it
+  # near the 10 GB quota #3797 had just cleared (measured 2026-09-02).
+  expect_caller true  "canary derives CCACHE_PREV_BUCKET from the same single clock read" \
+    'CCACHE_PREV_BUCKET=\$\(\( now / 259200 - 1 \)\)'
+  # A pair of assertions checking only "the right value appears somewhere"
+  # and "a bare prefix isn't the first line" both pass even if a bare
+  # `ccache-canary-x64-linux-` fallback is ADDED as a trailing second
+  # restore-keys line — the exact hazard this test exists to catch,
+  # reintroduced further down instead of in place. Anchor the WHOLE
+  # restore-keys block instead: nothing may appear between the correct
+  # value and the next step, EXCEPT an inline `#` comment on the fallback
+  # line itself (`( #[^-]*)?` below) — a maintainer annotating this exact
+  # line is the single most likely harmless edit here, and this test
+  # exists to catch a real regression, not to red on a comment.
+  expect_caller true  "canary ccache restore-key fallback is the previous bucket and nothing else" \
+    'restore-keys: \| *ccache-canary-x64-linux-\$\{\{ env\.CCACHE_PREV_BUCKET \}\}( #[^-]*)? *- name'
   # #3269: a cancelled run must not write a thin ccache entry that later
   # same-source runs exact-hit and then decline to replace.
   expect_caller true  "canary ccache save is gated on the Build step outcome" \

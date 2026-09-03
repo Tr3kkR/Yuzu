@@ -2,9 +2,10 @@
 
 /// @file guardian_health_fleet_tags.hpp
 /// Reader side of the Guardian M1 health-stream fleet telemetry (#2298 gate 3, item
-/// 6d). Single source of truth for the three `yuzu.guardian_*` heartbeat tag keys this
-/// rollup consumes, the `yuzu_fleet_guardian_*` gauge names they roll up into, their
-/// HELP text, and the forged-value-safe parse of the agent-supplied values.
+/// 6d; #2993 added the 4th row below). Single source of truth for the
+/// `yuzu.guardian_*` heartbeat tag keys this rollup consumes, the
+/// `yuzu_fleet_guardian_*` gauge names they roll up into, their HELP text, and the
+/// forged-value-safe parse of the agent-supplied values.
 ///
 /// The writer is agents/core/src/guardian_health_heartbeat.hpp
 /// (`emit_guardian_health_heartbeat_tags`, `GuardianHealthStats`). Both sides are
@@ -23,8 +24,8 @@
 /// spark and journal pins when that hoist lands - do not let a future two-family sweep
 /// leave this one behind.
 ///
-/// SHAPE: flat and unlabelled, 3 counters, no age/MAX family (unlike the journal
-/// sibling - these three are all plain sparse cumulative counters, none of them a
+/// SHAPE: flat and unlabelled, 4 counters, no age/MAX family (unlike the journal
+/// sibling - these are all plain sparse cumulative counters, none of them a
 /// staleness clock). Name rule, asserted by the pin test: `gauge` == "yuzu_fleet_" +
 /// `tag` with its "yuzu." heartbeat-namespace prefix stripped.
 ///
@@ -61,7 +62,7 @@ struct GuardianHealthMetric {
 
 /// The full published set. Order matches GuardianHealthStats / the emit order in
 /// agents/core/src/guardian_health_heartbeat.hpp for reviewability; nothing depends on
-/// it. All 3 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
+/// it. All 4 are exported as `gauge` - a per-sweep recomputed fleet sum, cleared and
 /// rebuilt, never monotonic.
 ///
 /// ALERTING: THESE ARE MONITOR-ONLY, same posture and same reasons as the guardian
@@ -91,6 +92,12 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
      "type-lane cadence after K consecutive Unknown sweeps or T elapsed (M1 item (b), the "
      "read-flood guard for a rule stuck pending-initial). MONITOR-ONLY, same posture as "
      "the rest of this family"},
+    {"yuzu.guardian_outbox_backpressure_drops", "yuzu_fleet_guardian_outbox_backpressure_drops",
+     "Fleet sum of compliance/health entries rejected at the agent's MAIN outbox capacity "
+     "(#2993) - distinct from the lifecycle log's own backpressure counter, which rolls up "
+     "separately via guardian_journal_fleet_tags.hpp. A chronic per-agent jam here means "
+     "compliance/health drift is being lost, not just delayed. MONITOR-ONLY, same posture "
+     "as the rest of this family"},
 };
 
 /// Derived with std::size, never a literal - see the sibling table's comment in
@@ -98,10 +105,10 @@ inline constexpr GuardianHealthMetric kGuardianHealthMetrics[] = {
 /// waiting to happen.
 inline constexpr std::size_t kNGuardianHealthMetrics = std::size(kGuardianHealthMetrics);
 
-// Meta-signals: about the ROLLUP, not part of the 3-row table. Same rationale as the
-// guardian-journal pair - published on EVERY sweep including at 0, because they are
-// server-owned counts that always have a true value, so a 0 is a measurement, not a
-// fabrication.
+// Meta-signals: about the ROLLUP, not part of the row table above. Same rationale as
+// the guardian-journal pair - published on EVERY sweep including at 0, because they
+// are server-owned counts that always have a true value, so a 0 is a measurement, not
+// a fabrication.
 //
 // READ 0 CAREFULLY, same caveat as the journal reporting gauge: because the writer is
 // SPARSE (a 0 counter emits no tag), `reporting` counts agents with at least one
@@ -109,16 +116,18 @@ inline constexpr std::size_t kNGuardianHealthMetrics = std::size(kGuardianHealth
 // fleet with nothing currently errored/refreshed/demoted reads 0 legitimately.
 
 /// Agents whose latest heartbeat carried at least one parseable
-/// yuzu.guardian_unhealthy_*/guardian_priority_demoted tag.
+/// yuzu.guardian_unhealthy_*/guardian_priority_demoted/guardian_outbox_backpressure_drops
+/// tag.
 inline constexpr const char* kGuardianHealthReportingGauge = "yuzu_fleet_guardian_health_reporting";
 inline constexpr const char* kGuardianHealthReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
-    "yuzu.guardian_unhealthy_suppressed/refreshed or yuzu.guardian_priority_demoted tag "
-    "- the coverage denominator for the 3-counter family. Published every sweep "
-    "INCLUDING 0, unlike the 3 counters. READ 0 CAREFULLY: because the writer is SPARSE "
-    "(a 0 counter emits no tag), this counts agents with at least one NON-ZERO counter, "
-    "not agents whose Guardian health pipeline is working - a live fleet with nothing "
-    "currently errored/refreshed/demoted reads 0 legitimately";
+    "yuzu.guardian_unhealthy_suppressed/refreshed, yuzu.guardian_priority_demoted, or "
+    "yuzu.guardian_outbox_backpressure_drops tag - the coverage denominator for this "
+    "family. Published every sweep INCLUDING 0, unlike the counters above. READ 0 "
+    "CAREFULLY: because the writer is SPARSE (a 0 counter emits no tag), this counts "
+    "agents with at least one NON-ZERO counter, not agents whose Guardian health "
+    "pipeline is working - a live fleet with nothing currently errored/refreshed/"
+    "demoted/backpressured reads 0 legitimately";
 
 /// Health tags that were PRESENT on a heartbeat but failed the forged-value parse.
 inline constexpr const char* kGuardianHealthTagRejectedGauge =

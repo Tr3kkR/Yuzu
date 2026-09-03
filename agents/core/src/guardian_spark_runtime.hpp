@@ -555,6 +555,17 @@ public:
     /// capability change - but a drop here must be loudly observable, never
     /// silent). Takes only the outbox lock.
     [[nodiscard]] std::uint64_t lifecycle_backpressure_drops() const;
+    /// #2233 item 7 test seam: how many times enqueue_lifecycle_locked's log-once
+    /// branch actually fired an spdlog::warn (the FIRST capacity drop, arm or disarm
+    /// side combined) - distinct from lifecycle_backpressure_drops() above, which
+    /// counts every drop, logged or not. LogCapture (tests/unit/test_log_capture.hpp)
+    /// is documented unreliable for code compiled into this shared library, so this
+    /// object-state seam is the direct way to prove the log-once logic engaged,
+    /// mirroring GuardianEngine::last_rearm_degrade_message_for_test's own precedent
+    /// for the same class of gap. Lock-free.
+    [[nodiscard]] std::uint64_t lifecycle_backpressure_log_fires_for_test() const noexcept {
+        return lifecycle_backpressure_log_fires_.load(std::memory_order_relaxed);
+    }
 
     /// Cumulative count of drain sends that THREW (caught in drain(); the head is
     /// retained and that log's drain stops). A nonzero value means an entry could not be
@@ -788,6 +799,9 @@ private:
     std::atomic<std::uint64_t> journal_stage_failures_{0}; ///< disarm record un-buildable post-teardown
     std::atomic<std::uint64_t> journal_field_rejected_{0}; ///< NUL/oversized/non-UTF-8 field kept out
     std::atomic<std::uint64_t> journal_clock_rejected_{0}; ///< skewed clock (secs<=0) kept out (rev-4.1 #2)
+    /// #2233 item 7: incremented each time enqueue_lifecycle_locked's log-once branch
+    /// actually calls spdlog::warn (see lifecycle_backpressure_log_fires_for_test()).
+    std::atomic<std::uint64_t> lifecycle_backpressure_log_fires_{0};
     // Serialises drain() calls WITHOUT blocking enqueuers (they take outbox_mu_, not
     // this): drain() releases outbox_mu_ across each send, so two concurrent drainers
     // could otherwise both peek+send the same head. drain_once() is public, so this is

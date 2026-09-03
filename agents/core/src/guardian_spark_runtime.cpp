@@ -191,6 +191,61 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 
     std::uint64_t gen = 0;
     bool need_bounded_arm = false;
+
+    // #3831: this guard protects arming_keys_.emplace() (inside the locked block just
+    // below), but the bounded-arm work it must ALSO wrap (io_executor_.run(), much
+    // further down) runs OFF both locks in a separate region after that block has
+    // already closed. Promoted to function scope - one object spanning both regions -
+    // rather than declared at the io_executor_.run() call site (where it used to live):
+    // that placement meant its .fn ASSIGNMENT (a multi-capture closure exceeding
+    // libstdc++'s std::function SBO) ran AFTER arming_keys_.emplace() had already
+    // succeeded, so a bad_alloc during the assignment itself left the guard's fn empty
+    // (a no-op on destruction) with arming_keys_[key] permanently orphaned - every future
+    // attach_rule on that key failed-fast "busy" forever, no self-heal short of a
+    // restart. This reopens governance waiver g8b-saf-1 (which accepted that shape as
+    // "idiom-wide, not worth a special-case fix"); see #3831.
+    //
+    // .fn is assigned HERE, before registry_mu_ is even locked, so a throw during the
+    // assignment has nothing to roll back yet - matching prior_disarm_rollback /
+    // index_add_rollback's own armed-before-the-mutation-it-protects shape (PR #3821
+    // round 2/3). arming_emplaced starts false and flips true (a noexcept bool write,
+    // cannot itself introduce a new gap) immediately after arming_keys_.emplace()
+    // succeeds below - the guard is a no-op until then. gen is captured BY REFERENCE
+    // (not by value): it is not assigned its real value until just below, well after
+    // this closure is built.
+    //
+    // Lock order: this guard's fn takes registry_mu_, yet it is declared here while
+    // the caller has NOT locked it, and it can also FIRE while the locked block below
+    // still holds it. That is safe only because the block's own std::unique_lock is a
+    // NARROWER scope than this function-scope guard - C++ unwind always destructs the
+    // narrower scope's locals (releasing registry_mu_) before continuing to unwind this
+    // one, so fn's lock_guard never double-locks. Moving this declaration back inside
+    // that block would deadlock on exactly that unwind path.
+    bool arming_emplaced = false;
+    GuardianRollback arming_rollback;
+    arming_rollback.fn = [this, key, rule_id, &gen, &arming_emplaced] {
+        if (!arming_emplaced)
+            return; // arming_keys_.emplace() below never ran (or hasn't yet) - nothing to undo
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        if (const auto it = arming_keys_.find(key);
+            it != arming_keys_.end() && it->second.rule_id == rule_id && it->second.generation == gen)
+            arming_keys_.erase(it);
+        // NOT redundant with index_add_rollback in this guard's PRIMARY firing window.
+        // index_add_rollback is armed before index_->add() and committed at this locked
+        // block's own normal end (well before arming_emplaced can be true for any
+        // exception-reachable duration - nothing throwing runs between the two), so it
+        // has already gone out of scope by the time io_executor_.run() (much further
+        // down, off both locks) can throw and fire THIS guard - at that point this is
+        // the ONLY undo of index_->add() left. It is a harmless no-op (index_->remove_rule
+        // is documented idempotent) ONLY in the narrow window index_add_rollback still
+        // covers (a throw inside the locked block, before it commits) - do not delete
+        // this call as "redundant" without re-checking that later window. Also not a
+        // second copy of the class of duplication PR #3821 round 3 removed (that
+        // removed three IDENTICAL per-branch copies of the same undo within one window;
+        // this is a different guard's undo for a later, non-overlapping window).
+        index_->remove_rule(rule_id); // no-op if already withdrawn
+    };
+
     {
         std::unique_lock<std::mutex> lk{registry_mu_};
         if (stopping_)
@@ -278,6 +333,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             // full undo needed here, matching this branch's pre-#3821-round-3 own
             // rollback exactly - no separate guard needed for this branch).
             arming_keys_.emplace(key, InFlightArm{rule_id, gen, false}); // may throw -> index_add_rollback
+            arming_emplaced = true; // noexcept; arms arming_rollback's fn (#3831)
             need_bounded_arm = true;
         } else if (arm_edge) {
             // Inline type (Interval/Startup/Disk): unchanged synchronous arm, still
@@ -410,25 +466,20 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // INNER is backend_->arm()'s own synchronous refusal, matching this function's
     // own doc a few lines above.
     //
-    // Gate 8 re-review (security-guardian): a RAII GuardianRollback, matching this
-    // function's own convention, rather than a bare try/catch/cleanup/rethrow (an
-    // earlier draft of this exact fix used the latter and was flagged for it -
-    // inconsistent with how the OTHER rollback in this function, a few lines below,
-    // handles the same class of problem). Declared and armed BEFORE the risky
-    // off-lock call, committed only once it returns without throwing - if it DOES
-    // throw, this guard's destructor fires during that unwind (fn() itself takes
-    // registry_mu_, since it isn't held here) and undoes phase 1's arming_keys_/
-    // index_ bookkeeping. No live subscription exists to disarm here (the exception
-    // means we never got an io_result at all, successful or not) - the in-memory
-    // cleanup is all that is needed.
-    GuardianRollback arming_rollback;
-    arming_rollback.fn = [this, key, rule_id, gen] {
-        std::lock_guard<std::mutex> lk{registry_mu_};
-        if (const auto it = arming_keys_.find(key);
-            it != arming_keys_.end() && it->second.rule_id == rule_id && it->second.generation == gen)
-            arming_keys_.erase(it);
-        index_->remove_rule(rule_id); // no-op if already withdrawn
-    };
+    // arming_rollback (declared at function scope above, #3831) is committed just below
+    // once io_executor_.run() has returned without throwing. If it DOES throw, the
+    // guard's destructor fires during that unwind and undoes phase 1's
+    // arming_keys_/index_ bookkeeping - its fn was assigned back at function scope,
+    // before arming_keys_.emplace() ran, so a bad_alloc during that assignment itself
+    // (the original defect) has nothing left to leak. This in-memory cleanup is all
+    // THIS function needs to do: run()'s own worker lambda re-checks arming_keys_
+    // under registry_mu_ before treating a late success as still-wanted (still_wanted
+    // below) and self-disarms if not, so an abandoned-but-still-completing arm is
+    // covered independently of why the caller abandoned it. That self-disarm race is
+    // NOT airtight against every throw site inside io_executor_.run() itself (e.g. a
+    // std::mutex::lock() failure on its own post-launch wait, after the worker is
+    // already detached and running, is outside run()'s own try/catch) - a narrow,
+    // pre-existing gap in GuardianIoExecutor unrelated to #3831 and not fixed here.
     auto io_result = io_executor_.run(
         *io_class, key, cfg_.backend_op_deadline,
         [self_keepalive = shared_from_this(), backend = backend_, spec, key, rule_id,
@@ -954,6 +1005,29 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
             build_journal_record(rule_id, generation, event_id, ns, kind, guard_type, rule_name);
         std::lock_guard<std::mutex> ob{outbox_mu_};
         const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // throwing, rolls back arm
+        // #2233 item 7: a capacity-rejected lifecycle entry previously counted
+        // (lifecycle_backpressure_drops(), fleet-visible via the journal heartbeat) but
+        // was never itself logged - "loudly observable" per this log's own doc comment
+        // meant an aggregate a human had to go check, not a line an operator would see
+        // at the moment it happened. Log-once-then-count-only (n==1), mirroring
+        // drain_log_unlocked's identical shape for send-side losses just below - the
+        // counter, not a latch, still tracks every occurrence.
+        // Firewalled: this whole line is documented (a few lines above) as the LAST
+        // throwing op before the caller's noexcept commit, but spdlog::warn's own fmt
+        // formatting can allocate and throw. A throw here still rolls back cleanly
+        // (stage_pending_locked hasn't run yet, so attach_rule's rollback/
+        // index_add_rollback undo the arm with no phantom staged record) - firewalled
+        // anyway so a logging-only failure can never surprise a future reader of the
+        // "last throwing op" comment above.
+        if (!accepted && lifecycle_log_.backpressure_drops() == 1) {
+            lifecycle_backpressure_log_fires_.fetch_add(1, std::memory_order_relaxed);
+            try {
+                spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
+                            "rule '{}' dropped (further occurrences counted, not logged)",
+                            kind, rule_id);
+            } catch (...) {
+            }
+        }
         stage_pending_locked(std::move(record));                        // noexcept
         return accepted;
     }
@@ -978,7 +1052,26 @@ bool GuardianSparkRuntime::enqueue_lifecycle_locked(const std::string& rule_id,
     std::lock_guard<std::mutex> ob{outbox_mu_};
     stage_pending_locked(std::move(record)); // durable disarm staged first (noexcept)
     try {
-        return lifecycle_log_.enqueue(std::move(entry)); // best-effort live window
+        const bool accepted = lifecycle_log_.enqueue(std::move(entry)); // best-effort live window
+        // #2233 item 7 (see the ARM-side twin above for the full rationale). Distinct
+        // from THIS try's own catch just below: that one covers enqueue() itself
+        // throwing (not a capacity rejection, which enqueue() reports via its return
+        // value) - a genuinely different failure, so it must not double-log here. The
+        // separate construction try/catch above (agent_id/event_id/OutboxEntry/record
+        // build) already returned early on its own throw and never reaches this line.
+        if (!accepted && lifecycle_log_.backpressure_drops() == 1) {
+            lifecycle_backpressure_log_fires_.fetch_add(1, std::memory_order_relaxed);
+            // Firewalled (see ARM-side twin): a throw here must not fall into this
+            // try's own catch, which returns false and would misreport `accepted`
+            // (already true) as an enqueue rejection.
+            try {
+                spdlog::warn("Guardian spark: lifecycle audit log at capacity - '{}' entry for "
+                            "rule '{}' dropped (further occurrences counted, not logged)",
+                            kind, rule_id);
+            } catch (...) {
+            }
+        }
+        return accepted;
     } catch (...) {
         return false; // window enqueue failed post-teardown; the durable record already stands
     }

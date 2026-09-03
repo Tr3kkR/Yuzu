@@ -5,16 +5,13 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
-#include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
-#include <sqlite3.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -55,20 +52,17 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 
 // Gate 8 review of F035 (security-guardian/architect, both BLOCKING; same race RbacStore hit
 // and fixed as HIGH — CHAOS-1, see rbac_store.cpp's kRevokeCoordLockSql comment for the full
-// mechanism): without this, migrate_from_sqlite's tombstone check
-// (SELECT ... deleted_pack_ids) and its subsequent pack INSERT are two separate READ COMMITTED
-// statement snapshots — a concurrent uninstall() that commits its DELETE + tombstone INSERT in
-// the window between them is invisible to the already-taken SELECT snapshot, so the pack
-// resurrects despite the tombstone existing right next to it. Serializes every writer of the
-// erasure/backfill pair (uninstall()'s delete+tombstone, migrate_from_sqlite's
-// check-then-insert) against each other. MUST be acquired in its own statement, strictly
-// BEFORE the statement that checks-and-mutates — embedding it in the same statement does NOT
-// work (a single statement's snapshot is fixed before any of its own function calls run, incl.
-// a blocking pg_advisory_xact_lock). Coarse-grained (one fixed key, not per-pack-id): product
-// pack install/uninstall is operator-driven content-catalog management, never a hot path, so
-// store-wide serialization is cheap — same reasoning as RbacStore's coordination lock. Two-int32
-// form + the "yuzu" namespace constant matches house convention (pg_migration_runner.cpp,
-// auth_db.cpp, secret_codec.cpp, kek_op_lock.hpp, rbac_store.cpp).
+// mechanism): originally serialized uninstall()'s delete+tombstone against
+// migrate_from_sqlite's tombstone-check-then-insert (two separate READ COMMITTED statement
+// snapshots could otherwise let a concurrent backfill resurrect a pack uninstall() had just
+// tombstoned). migrate_from_sqlite is retired (#3623), so that specific race no longer has a
+// second writer to race against — kept in place as a no-longer-strictly-necessary but harmless
+// serialization of uninstall() against itself; removing it is a separate, undecided question
+// this removal deliberately does not resolve. Coarse-grained (one fixed key, not per-pack-id):
+// product pack install/uninstall is operator-driven content-catalog management, never a hot
+// path, so store-wide serialization is cheap — same reasoning as RbacStore's coordination lock.
+// Two-int32 form + the "yuzu" namespace constant matches house convention
+// (pg_migration_runner.cpp, auth_db.cpp, secret_codec.cpp, kek_op_lock.hpp, rbac_store.cpp).
 constexpr const char* kErasureCoordLockSql =
     "SELECT pg_advisory_xact_lock(2037545589, hashtext('product_pack_store:erasure_coordination'))";
 
@@ -77,8 +71,6 @@ constexpr const char* kErasureCoordLockSql =
 // a negative LIMIT. A hostile `?limit=-1` must clamp to the default, never surface as a 503.
 constexpr int kDefaultListLimit = 100;
 constexpr int kMaxListLimit = 10000;
-
-constexpr const char* kSourcelessFingerprint = "sourceless";
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -113,11 +105,6 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
 // mask a cold `get()` one from ever logging).
 DegradeSampler g_list_sampler;
 DegradeSampler g_get_sampler;
-
-// Only used against legacy SQLite text columns (may be nullptr).
-const char* safe(const char* p) {
-    return p ? p : "";
-}
 
 std::string gen_id() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
@@ -189,117 +176,6 @@ std::string text_col(PGresult* res, int row, int col) {
     return PQgetisnull(res, row, col) ? std::string{} : std::string(PQgetvalue(res, row, col));
 }
 
-// Whether sqlite_master lists a table named `table_name`; `nullopt` on a schema-probe DB error
-// (never conflated with "table absent"). Mirrors license_store.cpp's sqlite_table_exists.
-std::optional<bool> sqlite_table_exists(sqlite3* db, const char* table_name) {
-    SqliteStmt probe;
-    if (sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?;",
-                           -1, probe.addr(), nullptr) != SQLITE_OK)
-        return std::nullopt;
-    sqlite3_bind_text(probe.get(), 1, table_name, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(probe.get()) != SQLITE_ROW)
-        return std::nullopt;
-    return sqlite3_column_int64(probe.get(), 0) > 0;
-}
-
-// Whether `table_name` has a column named `column_name` — the pre-7.13 vintage check. A legacy
-// file last written by a pre-7.13 binary predates the `verified` column (it was patched in by a
-// raw `ALTER TABLE` the pre-migration constructor ran outside the migration list; this migration
-// retires that shim and folds `verified` into schema v1 instead). `nullopt` on a probe DB error.
-std::optional<bool> sqlite_column_exists(sqlite3* db, const char* table_name,
-                                         const char* column_name) {
-    SqliteStmt probe;
-    std::string sql = std::string("SELECT 1 FROM pragma_table_info('") + table_name +
-                      "') WHERE name=? LIMIT 1";
-    if (sqlite3_prepare_v2(db, sql.c_str(), -1, probe.addr(), nullptr) != SQLITE_OK)
-        return std::nullopt;
-    sqlite3_bind_text(probe.get(), 1, column_name, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(probe.get());
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
-        return std::nullopt;
-    return rc == SQLITE_ROW;
-}
-
-// ── Legacy row shapes (backfill only) ───────────────────────────────────────
-
-struct LegacyPackRow {
-    std::string id, name, version, description, yaml_source;
-    std::int64_t installed_at{0};
-    bool verified{false};
-};
-
-struct LegacyItemRow {
-    std::string pack_id, kind, item_id, name, yaml_source;
-};
-
-std::string sha256_hex(const std::string& in) {
-    unsigned char md[EVP_MAX_MD_SIZE];
-    unsigned int len = 0;
-    if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
-        return {};
-    static const char* kHex = "0123456789abcdef";
-    std::string out;
-    out.reserve(static_cast<std::size_t>(len) * 2);
-    for (unsigned int i = 0; i < len; ++i) {
-        out.push_back(kHex[md[i] >> 4]);
-        out.push_back(kHex[md[i] & 0x0f]);
-    }
-    return out;
-}
-
-// Length-prefixed (`<byte-length>:<bytes>`, the netstring/bencode technique — see
-// LicenseStore/DeploymentStore's canonicalize_legacy for the injectivity rationale): a raw
-// delimiter byte embedded in a field can't be confused with a real field boundary.
-void append_field(std::string& out, std::string_view field) {
-    out += std::to_string(field.size());
-    out += ':';
-    out += field;
-}
-
-// Canonicalizes BOTH legacy tables into one stable, order-independent, injective fingerprint
-// input. Each table's section is prefixed with its own row count (LicenseStore's two-section
-// extension) — without that, a section boundary could be ambiguous even though every row within
-// a section is unambiguous.
-std::string canonicalize_legacy(const std::vector<LegacyPackRow>& packs,
-                                const std::vector<LegacyItemRow>& items) {
-    std::vector<std::string> pack_rows;
-    pack_rows.reserve(packs.size());
-    for (const auto& p : packs) {
-        std::string r;
-        append_field(r, p.id);
-        append_field(r, p.name);
-        append_field(r, p.version);
-        append_field(r, p.description);
-        append_field(r, p.yaml_source);
-        append_field(r, std::to_string(p.installed_at));
-        append_field(r, p.verified ? "1" : "0");
-        pack_rows.push_back(std::move(r));
-    }
-    std::sort(pack_rows.begin(), pack_rows.end());
-
-    std::vector<std::string> item_rows;
-    item_rows.reserve(items.size());
-    for (const auto& it : items) {
-        std::string r;
-        append_field(r, it.pack_id);
-        append_field(r, it.kind);
-        append_field(r, it.item_id);
-        append_field(r, it.name);
-        append_field(r, it.yaml_source);
-        item_rows.push_back(std::move(r));
-    }
-    std::sort(item_rows.begin(), item_rows.end());
-
-    std::string canon = "product-pack-legacy-fingerprint-v1\n";
-    append_field(canon, std::to_string(pack_rows.size()));
-    for (const auto& r : pack_rows)
-        canon += r;
-    append_field(canon, std::to_string(item_rows.size()));
-    for (const auto& r : item_rows)
-        canon += r;
-    return canon;
-}
-
 // ── Migration DDL ────────────────────────────────────────────────────────────
 
 const std::vector<pg::PgMigration>& migrations() {
@@ -307,8 +183,7 @@ const std::vector<pg::PgMigration>& migrations() {
     // Runtime statements below schema-qualify explicitly. `verified` is folded into v1 here —
     // the pre-migration SQLite store patched it in via a raw ALTER TABLE run outside the
     // migration list on every construction (a pre-7.13 compat shim); on Postgres the schema is
-    // born fresh, so that shim has no reason to exist. `migrate_from_sqlite` still reads a
-    // pre-7.13 legacy file correctly (see the column-probe helper above).
+    // born fresh, so that shim has no reason to exist.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE TABLE product_packs ("
@@ -328,18 +203,13 @@ const std::vector<pg::PgMigration>& migrations() {
          "  yaml_source  TEXT NOT NULL DEFAULT '',"
          "  PRIMARY KEY (pack_id, item_id));"
          "CREATE INDEX idx_pack_items_pack ON product_pack_items(pack_id);"
-         // ADR-0009 backfill idempotency — content-fingerprinted, not a single fleet-wide
-         // completion flag (see migrate_from_sqlite's doc comment).
-         "CREATE TABLE sqlite_backfill_source ("
-         "  fingerprint  TEXT PRIMARY KEY,"
-         "  completed_at BIGINT NOT NULL);"
          // ADR-0009 erasure-consistency (RbacStore's `revoked_seed_defaults` is the precedent
          // for this shape — a dedicated suppression table, never a plain DELETE an idempotent
          // reseed/backfill would silently undo). `uninstall()` stamps a row here in the SAME
-         // transaction as its DELETEs; `migrate_from_sqlite` consults it before treating an
-         // unmatched legacy pack id as fresh content, so a stale/redeployed replica's legacy
-         // file can never resurrect a pack this store has already reported erased. See
-         // migrate_from_sqlite's doc comment for the full hazard this closes.
+         // transaction as its DELETEs. `migrate_from_sqlite` (retired, #3623) used to consult
+         // it before treating an unmatched legacy pack id as fresh content — kept as-is despite
+         // that consumer's removal; whether this table is now itself vestigial is a separate,
+         // undecided question this removal deliberately does not resolve.
          "CREATE TABLE deleted_pack_ids ("
          "  pack_id    TEXT PRIMARY KEY,"
          "  deleted_at BIGINT NOT NULL);"},
@@ -351,6 +221,15 @@ const std::vector<pg::PgMigration>& migrations() {
          "ALTER TABLE product_packs ADD COLUMN idempotency_key TEXT;"
          "CREATE UNIQUE INDEX idx_product_packs_idempotency_key ON product_packs(idempotency_key) "
          "WHERE idempotency_key IS NOT NULL;"},
+        // migrate_from_sqlite() retired (ADR-0009 fresh-start-by-default, #3623) —
+        // sqlite_backfill_source's sole purpose was the backfill idempotency marker,
+        // which no longer has a writer. Appended at the next free version (3) rather
+        // than reusing v2 — v2 (the idempotency-key ALTER above) has actually run
+        // against real dev/UAT databases, and PgMigrationRunner tracks a bare version
+        // integer with no content check, so renumbering an already-shipped migration
+        // makes any database already at v2 re-apply it and fail closed on boot. See
+        // ADR-0054's Update.
+        {3, "DROP TABLE IF EXISTS sqlite_backfill_source;"},
     };
     return kMigrations;
 }
@@ -609,7 +488,7 @@ ProductPackStore::ProductPackStore(pg::PgPool& pool) : pool_(pool) {
     // ran a pre-fix build of this branch's v1), the runner sees version 1 already applied and
     // silently skips it, leaving `deleted_pack_ids` missing — this table-presence smoke-read
     // catches that and fails CLOSED (ADR-0012 §1) rather than surfacing as a raw "relation does
-    // not exist" on the first uninstall()/migrate_from_sqlite call.
+    // not exist" on the first uninstall() call.
     pg::PgResult smoke = pg::exec_params(
         lease.get(), "SELECT 1 FROM product_pack_store.deleted_pack_ids LIMIT 0",
         std::vector<std::string>{});
@@ -622,423 +501,6 @@ ProductPackStore::ProductPackStore(pg::PgPool& pool) : pool_(pool) {
         return;
     }
     open_ = true;
-}
-
-// ── Backfill (ADR-0009/0054) ─────────────────────────────────────────────────
-
-bool ProductPackStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
-    if (!open_)
-        return false;
-
-    // Mirrors CustomPropertiesStore's #1675 convention: "failed"/"fresh"/"success" only — the
-    // already-processed fast-skip path (below) emits no metric at all, matching that precedent
-    // exactly (a boot that does nothing new to the backfill state has nothing to count).
-    const auto backfill_metric = [this](const char* result) {
-        if (metrics_)
-            metrics_->counter("yuzu_server_product_pack_backfill_total", {{"result", result}})
-                .increment();
-    };
-
-    std::error_code ec;
-    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
-    if (ec) {
-        spdlog::error("ProductPackStore::migrate_from_sqlite: cannot stat legacy path {}: {}",
-                      legacy_db_path.string(), ec.message());
-        backfill_metric("failed");
-        return false;
-    }
-
-    std::string fingerprint;
-    std::vector<LegacyPackRow> legacy_packs;
-    std::vector<LegacyItemRow> legacy_items;
-
-    if (!legacy_exists) {
-        fingerprint = kSourcelessFingerprint;
-    } else {
-        // SqliteDb/SqliteStmt (gov cpp-safety): close/finalize on every path, including an
-        // exception thrown mid read-loop.
-        SqliteDb legacy;
-        if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
-                            nullptr) != SQLITE_OK) {
-            spdlog::error("ProductPackStore::migrate_from_sqlite: failed to open legacy {}: {}",
-                          legacy_db_path.string(),
-                          legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
-            backfill_metric("failed");
-            return false;
-        }
-
-        auto packs_probe = sqlite_table_exists(legacy.get(), "product_packs");
-        auto items_probe = sqlite_table_exists(legacy.get(), "product_pack_items");
-        if (!packs_probe || !items_probe) {
-            spdlog::error("ProductPackStore::migrate_from_sqlite: schema probe failed on legacy "
-                          "{}: {}",
-                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
-            backfill_metric("failed");
-            return false;
-        }
-        const bool has_packs = *packs_probe;
-        const bool has_items = *items_probe;
-
-        if (!has_packs && !has_items) {
-            // Present-but-schema-less file — same "nothing to protect" class as no file at all.
-            fingerprint = kSourcelessFingerprint;
-        } else if (has_packs != has_items) {
-            // The shipped binary always creates both tables together (schema v1) — this shape
-            // is not producible by any released version, so treat it as corrupt/hand-edited and
-            // fail closed rather than guess.
-            spdlog::error(
-                "ProductPackStore::migrate_from_sqlite: legacy {} has exactly one of "
-                "{{product_packs, product_pack_items}} present (product_packs={}, "
-                "product_pack_items={}) — refusing (fail-closed): the shipped binary always "
-                "creates both together, this looks like a corrupt or hand-edited file",
-                legacy_db_path.string(), has_packs, has_items);
-            backfill_metric("failed");
-            return false;
-        } else {
-            // Pre-7.13 vintage check: a legacy file written before 7.13 has no `verified`
-            // column (it was patched in by a raw ALTER TABLE the pre-migration constructor ran
-            // on every boot, outside the migration list). Default verified=0 for that vintage —
-            // matches the pre-migration shim's own DEFAULT 0.
-            auto verified_col_probe = sqlite_column_exists(legacy.get(), "product_packs",
-                                                            "verified");
-            if (!verified_col_probe) {
-                spdlog::error("ProductPackStore::migrate_from_sqlite: column probe failed on "
-                              "legacy {}: {}",
-                              legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
-                backfill_metric("failed");
-                return false;
-            }
-            const bool has_verified_col = *verified_col_probe;
-
-            {
-                SqliteStmt s;
-                const char* sql =
-                    has_verified_col
-                        ? "SELECT id, name, version, description, yaml_source, installed_at, "
-                          "verified FROM product_packs ORDER BY id ASC;"
-                        : "SELECT id, name, version, description, yaml_source, installed_at "
-                          "FROM product_packs ORDER BY id ASC;";
-                if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
-                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy product_packs "
-                                  "query failed: {}",
-                                  sqlite3_errmsg(legacy.get()));
-                    backfill_metric("failed");
-                    return false;
-                }
-                int step_rc = SQLITE_OK;
-                while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-                    LegacyPackRow p;
-                    p.id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
-                    p.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
-                    p.version =
-                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
-                    p.description =
-                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3)));
-                    p.yaml_source =
-                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 4)));
-                    p.installed_at = sqlite3_column_int64(s.get(), 5);
-                    p.verified = has_verified_col && sqlite3_column_int64(s.get(), 6) != 0;
-                    legacy_packs.push_back(std::move(p));
-                }
-                // H2 (governance): require the terminal code to be SQLITE_DONE — a corrupt page
-                // or I/O error mid-scan otherwise truncates the legacy set silently, and the
-                // marker below would stamp the backfill complete over a partial copy,
-                // permanently.
-                if (step_rc != SQLITE_DONE) {
-                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy product_packs "
-                                  "scan aborted mid-read (rc={} {}): refusing to stamp a "
-                                  "partial backfill",
-                                  step_rc, sqlite3_errmsg(legacy.get()));
-                    backfill_metric("failed");
-                    return false;
-                }
-            }
-            {
-                SqliteStmt s;
-                const char* sql = "SELECT pack_id, kind, item_id, name, yaml_source FROM "
-                                  "product_pack_items ORDER BY pack_id ASC, item_id ASC;";
-                if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
-                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy "
-                                  "product_pack_items query failed: {}",
-                                  sqlite3_errmsg(legacy.get()));
-                    backfill_metric("failed");
-                    return false;
-                }
-                int step_rc = SQLITE_OK;
-                while ((step_rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-                    LegacyItemRow it;
-                    it.pack_id =
-                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0)));
-                    it.kind = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 1)));
-                    it.item_id =
-                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 2)));
-                    it.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 3)));
-                    it.yaml_source =
-                        safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 4)));
-                    legacy_items.push_back(std::move(it));
-                }
-                if (step_rc != SQLITE_DONE) {
-                    spdlog::error("ProductPackStore::migrate_from_sqlite: legacy "
-                                  "product_pack_items scan aborted mid-read (rc={} {}): "
-                                  "refusing to stamp a partial backfill",
-                                  step_rc, sqlite3_errmsg(legacy.get()));
-                    backfill_metric("failed");
-                    return false;
-                }
-            }
-
-            if (legacy_packs.empty() && legacy_items.empty()) {
-                fingerprint = kSourcelessFingerprint;
-            } else {
-                fingerprint = sha256_hex(canonicalize_legacy(legacy_packs, legacy_items));
-                if (fingerprint.empty()) {
-                    spdlog::error("ProductPackStore::migrate_from_sqlite: SHA-256 hashing "
-                                  "failed for legacy content at {} — refusing (fail-closed)",
-                                  legacy_db_path.string());
-                    backfill_metric("failed");
-                    return false;
-                }
-            }
-        }
-    }
-    // `legacy` (if opened) closed here via SqliteDb's destructor.
-
-    // Has THIS specific fingerprint already been processed? Unbounded acquire() here is
-    // construction-time discipline (ADR-0012 §2(a)) — this runs once at boot, before serving.
-    {
-        auto lease = pool_.acquire();
-        if (!lease) {
-            spdlog::error("ProductPackStore::migrate_from_sqlite: no database connection");
-            backfill_metric("failed");
-            return false;
-        }
-        pg::PgResult marker = pg::exec_params(
-            lease.get(),
-            "SELECT 1 FROM product_pack_store.sqlite_backfill_source WHERE fingerprint=$1",
-            std::vector<std::string>{fingerprint});
-        if (marker.status() != PGRES_TUPLES_OK) {
-            spdlog::error("ProductPackStore::migrate_from_sqlite: backfill-marker check failed: "
-                          "{}",
-                          PQerrorMessage(lease.get()));
-            backfill_metric("failed");
-            return false;
-        }
-        if (PQntuples(marker.get()) > 0) {
-            spdlog::debug("ProductPackStore::migrate_from_sqlite: fingerprint already "
-                          "processed, skipping");
-            return true;
-        }
-    }
-
-    if (fingerprint == kSourcelessFingerprint) {
-        auto lease = pool_.acquire();
-        if (!lease) {
-            spdlog::error("ProductPackStore::migrate_from_sqlite: no connection to stamp marker");
-            backfill_metric("failed");
-            return false;
-        }
-        pg::PgResult r = pg::exec_params(
-            lease.get(),
-            "INSERT INTO product_pack_store.sqlite_backfill_source (fingerprint, completed_at) "
-            "VALUES ($1, $2::bigint) ON CONFLICT (fingerprint) DO NOTHING",
-            std::vector<std::string>{fingerprint, std::to_string(now_epoch())});
-        if (r.status() != PGRES_COMMAND_OK) {
-            spdlog::error("ProductPackStore::migrate_from_sqlite: failed to stamp marker: {}",
-                          PQerrorMessage(lease.get()));
-            backfill_metric("failed");
-            return false;
-        }
-        spdlog::info("ProductPackStore::migrate_from_sqlite: no legacy product pack data at {} "
-                     "— nothing to backfill",
-                     legacy_db_path.string());
-        backfill_metric("fresh");
-        return true;
-    }
-
-    spdlog::info("ProductPackStore::migrate_from_sqlite: backfilling {} pack(s), {} item(s) "
-                 "from {}",
-                 legacy_packs.size(), legacy_items.size(), legacy_db_path.string());
-
-    // ONE transaction, parent-before-child (packs table fully inserted before any item row —
-    // satisfies the product_pack_items -> product_packs FK trivially, since the two are
-    // different tables rather than ResultSetStore's self-referencing case). Fail closed on any
-    // error (ADR-0009): nothing partially committed.
-    std::string failure_detail;
-    // ADR-0009 erasure consistency: pack ids this store has already reported erased via
-    // uninstall() (see deleted_pack_ids' schema comment). A legacy row naming one of these is
-    // NOT a conflict to compare against an existing row — there is no existing row, it was
-    // legitimately deleted — it is a resurrection attempt and must be silently skipped, along
-    // with every item row that belongs to it (an attempted item insert would otherwise hit the
-    // product_pack_items -> product_packs FK with no parent row and fail the whole backfill
-    // closed).
-    std::unordered_set<std::string> tombstoned_ids;
-    bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
-        // MUST be the first statement in this transaction — see kErasureCoordLockSql's comment.
-        // Without this, a concurrent uninstall() committing between one pack's tombstone check
-        // (below) and its INSERT is invisible to the check's already-taken snapshot.
-        pg::PgResult lk = pg::exec_params(conn, kErasureCoordLockSql, std::vector<std::string>{});
-        if (lk.status() != PGRES_TUPLES_OK) {
-            failure_detail = std::format("erasure-coordination lock: {}", PQerrorMessage(conn));
-            spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
-            return false;
-        }
-        for (const auto& p : legacy_packs) {
-            pg::PgResult tomb = pg::exec_params(
-                conn, "SELECT 1 FROM product_pack_store.deleted_pack_ids WHERE pack_id = $1",
-                std::vector<std::string>{p.id});
-            if (tomb.status() != PGRES_TUPLES_OK) {
-                failure_detail = std::format("legacy product_packs row id='{}': tombstone check "
-                                             "failed: {}",
-                                             p.id, PQerrorMessage(conn));
-                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
-                return false;
-            }
-            if (PQntuples(tomb.get()) > 0) {
-                spdlog::info("ProductPackStore::migrate_from_sqlite: legacy pack id='{}' was "
-                             "already uninstalled — skipping (not a conflict, a resurrection "
-                             "attempt from a stale legacy file)",
-                             p.id);
-                tombstoned_ids.insert(p.id);
-                continue;
-            }
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "INSERT INTO product_pack_store.product_packs "
-                "(id, name, version, description, yaml_source, installed_at, verified) "
-                "VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::boolean) ON CONFLICT (id) DO NOTHING "
-                "RETURNING id",
-                std::vector<std::string>{
-                    p.id, sanitize_pg_text(p.name), sanitize_pg_text(p.version),
-                    sanitize_pg_text(p.description), sanitize_pg_text(p.yaml_source),
-                    std::to_string(p.installed_at), p.verified ? "true" : "false"});
-            if (res.status() != PGRES_TUPLES_OK) {
-                failure_detail =
-                    std::format("legacy product_packs row id='{}': {}", p.id, PQerrorMessage(conn));
-                spdlog::error("ProductPackStore::migrate_from_sqlite: insert of {} failed: {}",
-                              p.id, PQerrorMessage(conn));
-                return false;
-            }
-            if (PQntuples(res.get()) > 0)
-                continue; // inserted cleanly — no conflict
-
-            // Conflict: a row with this id already exists (only plausible source: a
-            // cloned/restored legacy file backfilled on more than one replica — see
-            // product_pack_store.hpp, `id` is a 128-bit random surrogate, not a human-chosen
-            // key). Every product_packs column is write-once — no runtime method ever UPDATEs a
-            // pack row after install() inserts it — so there is no IDENTITY/LIFECYCLE partition
-            // to make here (unlike LicenseStore); read back and require full equality, fail
-            // closed on any mismatch.
-            std::string existing_sql =
-                std::string("SELECT ") + kPackCols + " FROM product_pack_store.product_packs "
-                "WHERE id=$1";
-            pg::PgResult existing =
-                pg::exec_params(conn, existing_sql.c_str(), std::vector<std::string>{p.id});
-            if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
-                failure_detail = std::format(
-                    "legacy product_packs row id='{}': conflicted on insert but the existing "
-                    "row could not be read back for comparison: {}",
-                    p.id, PQerrorMessage(conn));
-                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
-                return false;
-            }
-            const ProductPack stored = read_pack_row(existing.get(), 0);
-            const bool identical =
-                stored.name == sanitize_pg_text(p.name) &&
-                stored.version == sanitize_pg_text(p.version) &&
-                stored.description == sanitize_pg_text(p.description) &&
-                stored.yaml_source == sanitize_pg_text(p.yaml_source) &&
-                stored.installed_at == p.installed_at && stored.verified == p.verified;
-            if (!identical) {
-                failure_detail = std::format(
-                    "legacy product_packs row id='{}': conflicts with a differently-valued "
-                    "existing row (every column is write-once for this store — see "
-                    "product_pack_store.hpp file header)",
-                    p.id);
-                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
-                return false;
-            }
-            // Identical content — a benign replay from a shared/cloned legacy file.
-        }
-        for (const auto& it : legacy_items) {
-            if (tombstoned_ids.contains(it.pack_id))
-                continue; // parent pack was skipped above — see the tombstone check comment
-            pg::PgResult res = pg::exec_params(
-                conn,
-                "INSERT INTO product_pack_store.product_pack_items "
-                "(pack_id, kind, item_id, name, yaml_source) VALUES ($1,$2,$3,$4,$5) "
-                "ON CONFLICT (pack_id, item_id) DO NOTHING RETURNING pack_id",
-                std::vector<std::string>{it.pack_id, sanitize_pg_text(it.kind),
-                                         sanitize_pg_text(it.item_id), sanitize_pg_text(it.name),
-                                         sanitize_pg_text(it.yaml_source)});
-            if (res.status() != PGRES_TUPLES_OK) {
-                failure_detail = std::format("legacy product_pack_items row (pack_id='{}', "
-                                             "item_id='{}'): {}",
-                                             it.pack_id, it.item_id, PQerrorMessage(conn));
-                spdlog::error("ProductPackStore::migrate_from_sqlite: item insert ({}, {}) "
-                              "failed: {}",
-                              it.pack_id, it.item_id, PQerrorMessage(conn));
-                return false;
-            }
-            if (PQntuples(res.get()) > 0)
-                continue; // inserted cleanly
-
-            // Same reasoning as the packs loop above: item rows are also write-once (no
-            // runtime method ever UPDATEs one), so a conflict is only benign if identical.
-            pg::PgResult existing = pg::exec_params(
-                conn,
-                "SELECT kind, item_id, name, yaml_source FROM product_pack_store."
-                "product_pack_items WHERE pack_id=$1 AND item_id=$2",
-                std::vector<std::string>{it.pack_id, sanitize_pg_text(it.item_id)});
-            if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
-                failure_detail = std::format(
-                    "legacy product_pack_items row (pack_id='{}', item_id='{}'): conflicted on "
-                    "insert but the existing row could not be read back for comparison: {}",
-                    it.pack_id, it.item_id, PQerrorMessage(conn));
-                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
-                return false;
-            }
-            const ProductPackItem stored = read_item_row(existing.get(), 0);
-            const bool identical = stored.kind == sanitize_pg_text(it.kind) &&
-                                   stored.name == sanitize_pg_text(it.name) &&
-                                   stored.yaml_source == sanitize_pg_text(it.yaml_source);
-            if (!identical) {
-                failure_detail = std::format(
-                    "legacy product_pack_items row (pack_id='{}', item_id='{}'): conflicts "
-                    "with a differently-valued existing row",
-                    it.pack_id, it.item_id);
-                spdlog::error("ProductPackStore::migrate_from_sqlite: {}", failure_detail);
-                return false;
-            }
-        }
-        pg::PgResult marker = pg::exec_params(
-            conn,
-            "INSERT INTO product_pack_store.sqlite_backfill_source (fingerprint, completed_at) "
-            "VALUES ($1, $2::bigint) ON CONFLICT (fingerprint) DO NOTHING",
-            std::vector<std::string>{fingerprint, std::to_string(now_epoch())});
-        if (marker.status() != PGRES_COMMAND_OK) {
-            failure_detail = std::format("backfill marker stamp: {}", PQerrorMessage(conn));
-            spdlog::error("ProductPackStore::migrate_from_sqlite: failed to stamp backfill "
-                          "marker: {}",
-                          PQerrorMessage(conn));
-            return false;
-        }
-        return true;
-    });
-    if (!ok) {
-        spdlog::error(
-            "ProductPackStore::migrate_from_sqlite: backfill transaction failed and was rolled "
-            "back — product pack data NOT migrated. Offending: {}. Remediation: inspect/fix the "
-            "referenced row in the retained read-only legacy file ({}) — e.g. `sqlite3 {} "
-            "\"SELECT * FROM product_packs WHERE id='<id>'\"` — then restart the server; the "
-            "backfill marker was NOT stamped, so the next boot retries the whole backfill.",
-            failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
-            legacy_db_path.string(), legacy_db_path.string());
-        backfill_metric("failed");
-        return false;
-    }
-    spdlog::info("ProductPackStore::migrate_from_sqlite: backfill complete");
-    backfill_metric("success");
-    return true;
 }
 
 // ── Install ─────────────────────────────────────────────────────────────────
@@ -1679,9 +1141,8 @@ std::expected<void, std::string> ProductPackStore::uninstall(const std::string& 
         if (dp.status() != PGRES_COMMAND_OK)
             return false;
         // ADR-0009 erasure consistency: stamp the tombstone in the SAME transaction as the
-        // deletes, so migrate_from_sqlite can never observe a deletion without also observing
-        // its suppression marker (see the deleted_pack_ids schema comment / this store's
-        // migrate_from_sqlite doc comment).
+        // deletes (see the deleted_pack_ids schema comment — its original consumer,
+        // migrate_from_sqlite, is retired; the tombstone write itself is unchanged).
         pg::PgResult tomb = pg::exec_params(
             conn,
             "INSERT INTO product_pack_store.deleted_pack_ids (pack_id, deleted_at) "

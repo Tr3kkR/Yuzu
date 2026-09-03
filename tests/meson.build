@@ -487,7 +487,17 @@ agent_test_exe = executable(
   # agent_test_native_args carries darwin's -DYUZU_HAVE_SECURITY_FRAMEWORK
   # (Wave 4 PR4.3a) so test_installed_apps_macos_enrich.cpp compiles the real
   # SecStaticCode path instead of the header's no-op.
-  cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args,
+  # YUZU_AGENT_SRC_DIR (#2233 item 1 / #3831 source-tripwire tests): mirrors
+  # YUZU_SERVER_SRC_DIR below - mechanically scans the real agents/core/src tree at
+  # test run time rather than hand-copying a snippet that would go stale exactly like
+  # the ordering property it proves. Same backslash-normalisation requirement as that
+  # define: on Windows meson.project_source_root() is a native path, and unescaped
+  # backslashes either fail to compile or silently mangle the path (see that define's
+  # own comment for the full reasoning).
+  cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
+            ['-DYUZU_AGENT_SRC_DIR="' +
+             (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
+             '"'],
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
   # spdlog_dep (brings fmt): test_thread_pool.cpp instantiates spdlog logging in
@@ -997,6 +1007,7 @@ if build_server
       'unit/server/test_insecure_tls_gate.cpp',
       'unit/server/test_settings_routes_users.cpp',
       'unit/server/test_settings_routes_dex_alerts.cpp',
+      'unit/server/test_settings_routes_management_groups.cpp', # stored-XSS regression (mgmt-group name/id escaping)
       'unit/server/test_settings_routes_oidc.cpp',
       'unit/server/test_plugin_signing_helpers.cpp',
       'unit/server/test_store_errors.cpp',

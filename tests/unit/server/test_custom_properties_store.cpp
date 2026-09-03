@@ -12,8 +12,7 @@
  * suite (ADR-0009) was removed as part of a fresh-start-by-default policy
  * change (ADR-0009 amendment, 2026-08-25) -- no production fleet has ever
  * run a pre-Postgres build. CustomPropertiesStore::migrate_from_sqlite()
- * itself is UNCHANGED and still present (its removal is a separate, later
- * step).
+ * itself was retired (chore/retire-migrate-from-sqlite-batch-b, #3623).
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -78,19 +77,17 @@ PropsShared& props_shared() {
     return s;
 }
 
-// TRUNCATE all three tables (custom_properties_meta included so a stray
-// backfill-marker test run doesn't leak into a later CRUD test's fixture —
-// none of the CRUD/schema tests below touch it, but the reset should not
-// assume that stays true forever).
+// custom_properties_meta was the backfill idempotency marker table;
+// migrate_from_sqlite() (and the table itself) are retired (#3623) — nothing left
+// to TRUNCATE there.
 void props_reset() {
     auto lease = props_shared().pool->acquire();
     REQUIRE(lease);
-    auto trunc =
-        pg::exec_params(lease.get(),
-                        "TRUNCATE custom_properties_store.custom_properties, "
-                        "custom_properties_store.custom_property_schemas, "
-                        "custom_properties_store.custom_properties_meta RESTART IDENTITY CASCADE",
-                        std::vector<std::string>{});
+    auto trunc = pg::exec_params(lease.get(),
+                                 "TRUNCATE custom_properties_store.custom_properties, "
+                                 "custom_properties_store.custom_property_schemas "
+                                 "RESTART IDENTITY CASCADE",
+                                 std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
 }
 

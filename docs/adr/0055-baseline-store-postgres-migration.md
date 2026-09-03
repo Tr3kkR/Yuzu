@@ -303,3 +303,27 @@ concurrency replaces it. Mutate-and-return uses `RETURNING` (#1033); no
     accompanying Prometheus counter — sre disagreed with deferring this indefinitely
     given its repeat-fire characteristic on the enforcement chokepoint; kept log-only
     to avoid opening new metrics-plumbing surface mid-round — **#3516**.
+
+## Update (2026-09-02) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes a blanket
+program-wide fact this store's mandatory-backfill design predates: no production Yuzu
+fleet has ever run a pre-Postgres build of any store. The fingerprint-verified
+per-row-direction-aware backfill this ADR designed was real, working code — but it
+never had real legacy data to protect.
+
+`BaselineStore::migrate_from_sqlite()` and its private helpers (`sha256_hex`,
+`legacy_text`, `legacy_has_table`, `append_field`, `canonicalize_legacy_snapshot`,
+`fingerprint_legacy_snapshot`, `read_legacy_snapshot`, `legacy_fingerprint`, and the
+`LegacyBaselineRow`/`LegacyMemberRow`/`LegacyGroupRow`/`LegacySnapshot` types) are
+removed (`chore/retire-migrate-from-sqlite-batch-b`, tracking issue #3623).
+`baseline_store_meta` — whose entire purpose was the backfill idempotency marker
+(fingerprint + `backfill_complete`) — is dropped via a version-bumped `{2, "DROP TABLE
+IF EXISTS baseline_store_meta;"}` migration, not edited into v1: unlike the DORMANT
+trio (DeviceTokenStore/LicenseStore/SoftwareDeploymentStore), this store IS
+constructed in production, so v1 has actually run against real dev/UAT databases.
+`server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over the
+three legacy tables (`guaranteed_state_baselines`/`guaranteed_state_baseline_rules`/
+`guaranteed_state_baseline_groups`) instead — silent unless real rows are found, never
+blocks boot. This moots #3515 (the missing backfill-recovery runbook) — there is no
+backfill left to recover from.

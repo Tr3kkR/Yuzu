@@ -307,10 +307,28 @@ TEST_CASE("CommandDedupStore: open fails on a non-database file",
           "[command_dedup][lifecycle]") {
     const auto path = fresh_db_path();
     yuzu::test::TempDbFile guard{path};
+    // fresh_db_path()'s parent dir may not exist yet if no earlier case in this
+    // binary has created it — an unchecked ofstream open into a missing parent
+    // fails SILENTLY (no exception, no bytes written), and open() below then
+    // creates that same parent itself and succeeds against a fresh empty DB
+    // (#3744: misdiagnosed as a Windows/Defender visibility race — it reproduces
+    // on any platform once the shared temp dir doesn't already exist).
+    std::error_code ec;
+    fs::create_directories(path.parent_path(), ec);
+    REQUIRE_FALSE(ec);
     {
-        std::ofstream f(path);
+        std::ofstream f(path, std::ios::binary);
+        REQUIRE(f.is_open());
         f << "this is not a sqlite database";
+        REQUIRE(f.good());
+        f.flush();
+        REQUIRE(f.good());
     }
+    // f.good() alone doesn't prove the bytes reached disk: the actual flush/
+    // write happens in the destructor above, which can't propagate an I/O
+    // error — the explicit flush() + re-check makes the failure observable
+    // here instead of manifesting as a silent empty file for open() to accept.
+    REQUIRE(fs::file_size(path) > 0);
     // journal_mode/synchronous read-back or the schema DDL rejects a garbage file.
     auto result = CommandDedupStore::open(path);
     CHECK_FALSE(result.has_value());

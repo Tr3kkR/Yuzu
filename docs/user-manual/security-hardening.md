@@ -128,6 +128,18 @@ without `verify_peer`. Direct agent→server connections (no gateway) are alread
 mTLS over any network. Full detail + the deployment runbook: `docs/user-manual/gateway.md`
 "TLS posture" and `docs/pki-architecture.md` "Gateway TLS".
 
+The gateway **management plane** (`:50063`) — the port the server's command
+forwarding dials — is the highest-value gateway surface: whoever it admits can
+run commands on every connected agent. Its secure shape is strict mTLS **plus a
+peer pin** (#1422): the listener's `auth_fun` accepts only a client cert whose
+key matches `{yuzu_gw, mgmt_peer_pins}` (your server's cert) AND carries the
+`serverAuth` EKU — a CA-issued cert alone (any agent's leaf, the gateway's own
+leaf) is rejected with `UNAUTHENTICATED`. The gateway **refuses to boot** when a
+network-reachable mgmt listener lacks this posture; never set
+`{allow_insecure_mgmt, true}` outside an isolated lab rig, and never publish
+`:50063` from a plaintext stack. See `docs/user-manual/gateway.md` "TLS posture"
+for pin configuration and rotation.
+
 ## Secret Management
 
 **Never pass secrets via CLI flags** — they are visible in `ps aux`.

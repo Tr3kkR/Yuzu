@@ -287,6 +287,14 @@ rule_assertion_from_rule(const yuzu::guardian::v1::GuaranteedStateRule& rule) {
             // perpetual false compliant/drift) - treat 0 as unset and keep the default.
             if (out.max_bytes == 0)
                 out.max_bytes = default_max_bytes;
+            // #2233 item 6: hard ceiling on an authored value - see
+            // clamp_max_hash_bytes's own doc for why and the exact bound.
+            if (const auto clamped = clamp_max_hash_bytes(out.max_bytes); clamped != out.max_bytes) {
+                spdlog::warn("Guardian: rule '{}' authored max_bytes={} exceeds the {}-byte "
+                            "ceiling - clamped (#2233 item 6)",
+                            out.rule_id, out.max_bytes, kMaxFileHashBytes);
+                out.max_bytes = clamped;
+            }
             return out;
         }
         if (atype == "file-exists") {

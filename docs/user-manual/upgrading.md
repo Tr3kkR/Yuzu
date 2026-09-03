@@ -15,6 +15,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain is unchanged (still reads via the existing governed-shell path, a deliberate exception — see `docs/agent-spawn-sink-manifest.md`). No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`PatchManager` now runs on PostgreSQL (ADR-0062).** `/api/patches/*` (patch inventory + deployment tracking) moved off its own `patches.db` SQLite file onto the shared Postgres substrate (schema `patch_manager`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any deployment record that existed before upgrade is gone and must be re-created via `POST /api/patches/deploy`. Server startup now fails closed if the `patch_manager` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (`patch_manager` is now reported by both `/readyz` and `/healthz`, absent from both before this release). **Removed: automatic patch-deployment orchestration.** `PatchManager::execute_deployment()` (the scan → install → verify → reboot workflow) had zero production callers on any released build — nothing ever wired a dispatch/OS-lookup callback to it — and is deleted, not ported; `POST /api/patches/deploy` still creates a deployment + per-target rows, but nothing in the server drives them through that workflow automatically (see #3669, filed alongside this change, and `docs/capability-map.md` §8.3/§8.4/§8.6). **Patch inventory (`GET /api/patches`) is separately unwired**: `record_patches()`, the only method that writes it, also has no production caller — this predates the migration and is not something upgrading changes — so `GET /api/patches` returns empty in every real deployment today; see `docs/capability-map.md` §8.5/§8.7 and #3676. No operator action required beyond re-creating any in-flight deployment after upgrade. |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`WorkflowEngine` now runs on PostgreSQL (ADR-0064).** `/api/workflows*` and `/api/workflow-executions/*` moved off `workflows.db` SQLite onto the shared Postgres substrate (schema `workflow_engine`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any workflow definition and its execution history that existed before upgrade is gone; re-create workflows via `POST /api/workflows` (or product-pack re-install). Server startup now fails closed if the `workflow_engine` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (already reported before this release) and `/healthz` (newly reported — was absent before this release). **Delete semantics changed: `DELETE /api/workflows/:id` now soft-deletes.** The response shape is unchanged (`{"deleted": true|false}`), but a deleted workflow's row and its execution history are now retained internally rather than orphaned — this is not operator-visible today (no "show deleted workflows" surface exists), but a deleted workflow's `id` can never be reused. No operator action required. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Guardian file-hash `max_bytes` now has a hard ceiling (#2233).** An authored `file-hash-equals` rule's `max_bytes` (the hashing-DoS cap) was previously accepted unbounded from the authoring API. It is now clamped to 1 GiB (`kMaxFileHashBytes`) on the agent, and the server rejects a new/edited rule authoring a value above that ceiling in either JSON wire form (400). **Operator-visible only if you have a PRE-EXISTING `file-hash-equals` rule authored (before this release) with `max_bytes` above 1 GiB, watching a file at or above that size:** after upgrade, that file reports `<oversize>` instead of being hashed — a compliance-verdict change with no authoring-time signal (the rule already exists, so the new server-side reject cannot retroactively catch it). List your rules via `GET /api/v1/guaranteed-state/rules` (the route returns every rule; there is no server-side filter), check any `file-hash-equals` rule for `max_bytes` over 1073741824, and re-author within the ceiling if the larger cap was intentional. No operator action required otherwise. |
 | 0.14.x | 0.12.0 | 0.12.0 | **Fleet visualization intra-cube edges (PR 8).** `/viz/fleet` now draws faint white lines (opacity `0.3`) inside each machine cube connecting process dots that are reciprocal ends of a loopback TCP socket (127.0.0.1 / ::1). Two operator-visible changes: (a) **wire shape** — `/api/v1/viz/fleet/topology` `schema_minor` bumps `1 → 2` and a new optional `dst_pid` field appears on `scope: local` connection edges. Renderers that ignore unknown keys per the contract see no break; strict-validating consumers pinned to `schema_minor == 1` should relax their validator to `minimum: 1`. (b) **dropped unmatched halves** — unpaired Local-scope edges (kernel snapshot race during teardown, agent's 4096-connection cap cutting a partner) are now dropped server-side before serialisation. Integrations counting `connections` array length per machine as a proxy for active IPC pairs should re-baseline after upgrade; the count trends marginally lower. Lines appear only when the host has active loopback flows (e.g. Prometheus scraping node_exporter, a client talking to local Redis / Postgres); a fresh agent with no inter-process loopback shows process dots but no lines — expected, not a regression. |
 | 0.13.x | 0.12.0 | 0.12.0 | **Fleet visualization process layer.** `/viz/fleet` now renders interior process dots inside each machine cube, coloured by category (system/browser/database/web/runtime/other) — no operator action required, but operators upgrading from a 0.12.x build will see the dashboard suddenly populated with thousands of small spheres on next page load. Process data was already collected via `tar.fleet_snapshot` since 0.12.x; PR 7 only renders it. To suppress process visibility for specific agents (privacy-sensitive hosts, regulated workloads), set `process_enabled=false` on those agents via `tar.configure` — this also suppresses their dots on the visualization. Hover a dot to see pid/name/user/category; agent-controlled string fields are HTML-escaped and length-clamped before render. Per-cube dot count is soft-capped at 1000 for graceful degradation on heavily-threaded hosts; the cube tooltip still shows the true reported count. |
 | 0.12.x | 0.12.0 | 0.12.0 | **Build-time content auto-import.** All YAML files in `content/definitions/` (217 InstructionDefinitions) and `content/packs/` (10 InstructionSets at this version) are now embedded in the server binary and auto-imported on every startup. Existing operator-customised definitions with matching IDs are NEVER overwritten — conflicts are silently skipped. **Behaviour change for upgrades:** definitions that an operator previously DELETED via the REST API or dashboard will reappear after upgrade because the auto-import treats a missing row as "needs creation". To permanently suppress a shipped definition, set `enabled: false` via the dashboard or `PATCH /api/v1/definitions/{id}` rather than DELETE-ing the row. Each auto-import write emits an `audit_events.action="content.bundled_import"` row with `principal=system` so operators can audit which definitions were inserted at boot. **Yuzu dark navy palette + Inter webfont** (visual change every operator sees) and **Apache ECharts chart renderer** (replaces bespoke SVG; same payload contract — no operator migration required) ship in the same release. |
@@ -1686,41 +1687,33 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
-## Notification feed moves to PostgreSQL — history preserved (NotificationStore, ADR-0046)
+## Notification feed moves to PostgreSQL (NotificationStore, ADR-0046)
 
 `NotificationStore` — the dashboard toast/badge feed — moves from the SQLite
 `notifications.db` file to the server's PostgreSQL substrate in this release
-(ADR-0006 Wave 2, ADR-0046), schema `notification_store`. **Unread/dismissed
-state is preserved by a mandatory backfill, not a fresh start.** No new flag
-or environment variable is added (it reuses the shared server `PgPool`).
+(ADR-0006 Wave 2, ADR-0046), schema `notification_store`. No new flag or
+environment variable is added (it reuses the shared server `PgPool`).
 
-**What happens on first PG boot:**
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `notifications.db` data to carry over — the
+one-time mandatory backfill this section originally described was retired under
+ADR-0009's fresh-start-by-default amendment (see ADR-0046's Update).
 
-- A one-time, idempotent, **fail-closed** backfill copies every notification
-  out of the legacy `notifications.db` into `notification_store`, preserving
-  ids (so any bookmarked/linked notification id stays valid) and read/dismissed
-  state. The legacy file is moved aside once the backfill is verified.
-- **Startup failure mode changed.** Previously, a broken or unreadable
-  `notifications.db` degraded only the notification feature — the store ran
-  closed and `/api/notifications*` returned 503. **It now fails the whole
-  server boot** (matching every other Postgres-migrated store's fail-closed
-  contract): if the schema can't open, or the backfill can't complete, the
-  server logs `[PG] Refusing to start` and refuses to serve at all. If you
-  hit this, the log line names the legacy file and states the remediation:
-  repair it, or move it aside to skip the backfill (unread/dismissed history
-  in it will **not** carry over if you do).
-- **Multi-instance consolidation — boot the authoritative replica first.**
-  If you are consolidating multiple previously-independent server instances
-  (each with genuinely different local `notifications.db` content) onto one
-  shared Postgres for the first time, whichever instance boots first and
-  completes the backfill becomes the fleet's sole notification history — every
-  other instance's own legacy file will permanently fail closed (a
-  holder-side fingerprint mismatch) on every subsequent boot, requiring manual
-  reconciliation (move the losing instances' legacy files aside once you've
-  confirmed their content is disposable). This is the intended fail-loud
-  behavior, not a bug — there is no automated merge across independent legacy
-  files. Boot the instance holding the notification history you want to keep
-  first, same guidance as the RBAC store migration above.
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching every other Postgres-migrated store's
+  contract): the server logs `[PG] Refusing to start` and refuses to serve at all.
+- A legacy `notifications.db` file with real content **does NOT** fail startup and
+  its content is **never imported** — the server opens it read-only, purely to
+  count rows in `notifications` for a diagnostic warning, then boots fresh-started
+  regardless of what it finds. If that table has rows, it logs a
+  `NotificationStore` legacy-row-count warning at WARN; boot proceeds unaffected
+  either way. There is no automated recovery path for old unread/dismissed history
+  — this is display-only state (never an authorization, targeting, or enforcement
+  decision), so a fresh start is acceptable in a way it would not be for an
+  authoritative store.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Not affected:** `/api/notifications*` request/response behavior is
 unchanged — this is a storage-engine swap only, no API change.
@@ -1911,7 +1904,7 @@ records the one-time backfill outcome (`completed` / `fresh` / `failed`).
 and dynamic-group scope expressions are unchanged — only the storage substrate
 and the fail-closed read posture change.
 
-## Custom properties migrate to Postgres (mandatory backfill, ADR-0045)
+## Custom properties migrate to Postgres (ADR-0045)
 
 The `CustomPropertiesStore` — operator-authored per-agent metadata (properties
 and their optional type/validation schemas) used in scope expressions via
@@ -1920,48 +1913,26 @@ server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
 `custom_properties_store`. It reuses the existing shared connection pool —
 **no new connection flag or config is required**.
 
-**This is NOT a fresh-start cutover.** Custom properties and their schemas are
-irreducible operator-authored asset-tagging data — losing them would silently
-break any `props.<key>`-scoped dispatch, policy, or push rule. The migration
-performs a **mandatory one-time backfill** on first Postgres boot:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `custom-properties.db` data to carry over — the
+one-time mandatory backfill this section originally described was retired under
+ADR-0009's fresh-start-by-default amendment (see ADR-0045's Update).
 
-- **What is preserved:** every property (agent, key, value, type) and every
-  property schema (key, display name, type, description, validation regex)
-  carry over exactly.
-- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
-  Postgres write error, an unreadable legacy DB, or a holder-side
-  fingerprint-verification refusal (see below) — the server **refuses to
-  boot** rather than come up with partial data. The backfill marker is only
-  stamped on success, so a failed attempt is **retried on the next start**
-  once you have fixed the underlying cause.
-- **Legacy file moved aside after a verified backfill.** Once the backfill is
-  confirmed complete, `custom-properties.db` is renamed to
-  `custom-properties.db.migrated-<epoch>` (the server never reads it again).
-  If you do not see this file appear, the backfill did not run to completion.
-  Keep the renamed file until you have confirmed properties/schemas look
-  correct, then treat it as an operator-managed backup and dispose of it per
-  your data-retention policy.
-- **Multi-replica deployments: boot the replica holding the authoritative
-  `custom-properties.db` FIRST.** Unlike this store's SQLite era, a
-  multi-replica Postgres deployment shares ONE `custom_properties_store`
-  schema — the first replica to complete the backfill wins, and every other
-  replica's boot verifies its own local legacy file against what actually
-  landed rather than trusting the shared completion marker blindly. If two
-  replicas hold genuinely different legacy content (an unusual topology for
-  this store — `custom-properties.db` is ordinarily a single server's local
-  file, not something expected to diverge across replicas of the same
-  logical deployment), the second replica to boot refuses with a
-  **HOLDER-SIDE VERIFICATION FAILED** error rather than silently accepting
-  or silently overwriting the winner's data — see
-  `docs/ops-runbooks/custom-properties-store-backfill-recovery.md` for the
-  recovery procedure.
-- **Budget for a longer first boot.** First boot takes longer than usual while
-  the backfill runs; a large `custom-properties.db` (many agents/properties)
-  extends this further. **Widen your own orchestrator's startup budget
-  accordingly** (Kubernetes `startupProbe` failure/period budget, or the
-  Docker Compose healthcheck `start_period`) so it does not kill the server
-  mid-backfill and restart it into the same long boot repeatedly — do not
-  treat a slower-than-normal first boot as a hang.
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `custom-properties.db` file with real content **does NOT** fail startup
+  and its content is **never imported** — the server opens it read-only, purely to
+  count rows across `custom_properties`/`custom_property_schemas` for a diagnostic
+  warning, then boots fresh-started regardless of what it finds. If either table has
+  rows, it logs a `CustomPropertiesStore` legacy-row-count warning at WARN; boot
+  proceeds unaffected either way. If you see this warning and the environment
+  genuinely has real properties/schemas to keep, there is no automated recovery
+  path: re-author the equivalent properties/schemas against the new Postgres-backed
+  store via `PUT /api/agents/:id/properties/:key` / `POST /api/property-schemas`
+  before relying on it.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Operator-visible behaviour change (fail-closed reads).** After cutover, a
 `props.<key>`-feeding read that degrades (store not open, pool-acquire
@@ -1975,8 +1946,6 @@ than an empty list. Watch the new
 non-zero rate means `props.<key>`-scoped rules may be silently matching
 nobody, not that operators removed the properties (see `docs/user-manual/
 metrics.md` and the shipped `YuzuCustomPropertiesReadDegraded` alert).
-`yuzu_server_custom_properties_backfill_total{result}` records the one-time
-backfill outcome.
 
 **Operator-visible behaviour change (fail-closed writes, 2026-08-14 follow-up).**
 `PUT /api/agents/:id/properties/:key` and `POST /api/property-schemas` now return
@@ -1994,7 +1963,7 @@ unchanged; the `GET`/`DELETE` property routes and `GET` schema route keep their 
 response shapes — only the two write routes' failure-mode status codes changed, as
 described above.
 
-## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
+## Network-discovered device data migrates to Postgres (DiscoveryStore, ADR-0044)
 
 The `DiscoveryStore` — the network-discovered devices behind `POST /api/discovery/scan`
 and `GET /api/discovery/results` — moves from the SQLite `discovery.db` file to the
@@ -2002,66 +1971,33 @@ server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
 `discovery_store`. It reuses the existing shared connection pool — no new connection
 flag or config is required.
 
-**This is NOT a fresh-start cutover.** The `managed` flag an operator has set on a
-discovered device (confirming "this is my enrolled agent") is real, non-regenerable
-operator intent, so the migration performs a **mandatory one-time backfill** on first
-Postgres boot:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `discovery.db` data to carry over — the one-time
+mandatory backfill this section originally described was retired under ADR-0009's
+fresh-start-by-default amendment (see ADR-0044's Update).
 
-- **What is preserved:** every discovered device — IP/MAC/hostname, the `managed`
-  flag and its associated `agent_id`, and first-seen (`discovered_at`/`discovered_by`)
-  provenance — carries over (any field containing invalid UTF-8 or an embedded NUL
-  is scrubbed to U+FFFD on write, matching every other field in this store).
-- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
-  Postgres write error, an unreadable legacy DB, or a fingerprint mismatch (below) —
-  the server **refuses to boot** rather than come up with an empty or partial
-  discovered-device inventory. The backfill marker is only stamped on success, so a
-  failed attempt is **retried on the next start** once the underlying cause is fixed.
-- **Fingerprint-verified, not marker-only.** Unlike a plain "did the marker get
-  stamped" check, the backfill records a fingerprint of the migrated content
-  alongside the completion marker. On a multi-replica deployment sharing one
-  Postgres database, this lets a later-booting replica tell apart "this is the same
-  content I already migrated" from "a different replica's data was migrated, not
-  mine" — the latter fails closed rather than silently accepting a completion this
-  replica's own discovered devices were never part of. If you see a "HOLDER-SIDE
-  VERIFICATION FAILED" log line, do not force-boot around it: this indicates two
-  replicas each hold `discovery.db` files with genuinely different content, and an
-  operator needs to decide which is authoritative before either can proceed.
-- **A 0-byte `discovery.db` is refused, not treated as a fresh install.** SQLite
-  opens a 0-byte file as a valid empty database, which looks identical to "this
-  legacy store was created but never used" — but a genuine fresh install never has
-  a `discovery.db` file at all. If you see a log line saying this is "NOT a fresh
-  install... a truncated/corrupted real database", either delete the empty file and
-  retry (if the legacy store genuinely was never used) or restore `discovery.db`
-  from backup before retrying (if it held real data that got truncated).
-- **A conflict during backfill can also refuse the boot, not just a fingerprint
-  mismatch.** On a multi-replica deployment, if a live scan (or a `mark_managed`
-  call through a sibling replica) lands a row for an IP before this replica's own
-  backfill reaches it, and that legacy row was `managed=true` or had an
-  `agent_id` assigned, the backfill verifies the row already in Postgres carries
-  the same values before trusting the migration — refusing (with a
-  "reconciliation FAILED" log line naming the IP) rather than silently dropping
-  or misattributing an operator's managed-device assignment. **This does NOT
-  resolve itself on its own** — the legacy data is frozen and a retry
-  conflict-skips against the same mismatched row every time, so this replica
-  restart-loops until an operator manually reconciles: check
-  `discovery_store.discovered_devices` for the named IP to see which value is
-  actually correct, then either accept the value already in Postgres (delete the
-  legacy file and let this replica take the sourceless-skip path) or correct the
-  row via `mark_managed` before retrying.
-- **Legacy file moved aside after a verified backfill.** Once the backfill is
-  confirmed complete, `discovery.db` is renamed to
-  `discovery.db.migrated-<epoch>` (the server never reads it again). Keep the
-  renamed file until you have confirmed discovery data looks correct, then dispose
-  of it per your data-retention policy.
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `discovery.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count rows
+  in `discovered_devices` for a diagnostic warning, then boots fresh-started regardless
+  of what it finds. If that table has rows, it logs a `DiscoveryStore` legacy-row-count
+  warning at WARN; boot proceeds unaffected either way. If you see this warning and the
+  environment genuinely has real discovered-device data (particularly the operator-set
+  `managed` flag) to keep, there is no automated recovery path: re-run
+  `POST /api/discovery/scan` and re-apply `mark_managed` against the new Postgres-backed
+  store before relying on it.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Operator-visible behaviour change (fail-closed reads).** `GET /api/discovery/results`
 now returns **503** on a degraded read (store not open, pool-acquire timeout, or query
 error) instead of silently rendering an empty device list — previously, a local SQLite
 read essentially never failed short of file corruption, so this failure mode was not
-practically reachable. Watch the new `yuzu_server_discovery_read_degrade_total{reason}`
+practically reachable. Watch the `yuzu_server_discovery_read_degrade_total{reason}`
 counter — a non-zero rate means the discovery view is degraded, **not** that no devices
-were found. `yuzu_server_discovery_backfill_total{result}` records the one-time
-backfill outcome (`completed` / `fresh` / `failed`).
+were found.
 
 **Breaking — `POST /api/discovery/scan`'s response contract changed.** The endpoint no
 longer always returns `200 {"status":"ok",...}`: the response gains a `devices_failed`
@@ -2266,7 +2202,7 @@ bookkeeping's storage substrate changes. `POST /api/v1/quarantine` and
 `DELETE /api/v1/quarantine/{agent_id}`'s request/response shapes, and the MCP
 `quarantine_device` tool's ticket-then-recall approval flow, are unchanged.
 
-## Device tags migrate to Postgres (mandatory backfill, TagStore, ADR-0050)
+## Device tags migrate to Postgres (TagStore, ADR-0050)
 
 The `TagStore` — device tags behind `GET/PUT/DELETE /api/v1/tags`, the legacy
 `/api/tags*` routes, the MCP `get_tags`/`set_tag`/`delete_tag`/`search_agents_by_tag`
@@ -2274,70 +2210,27 @@ tools, and every `tag:<key>` scope expression — moves from the SQLite `tags.db
 to the server's PostgreSQL substrate in this release (ADR-0006 Wave 2 batch 3),
 schema `tag_store`, on the existing shared pool. Tags are **dispatch-critical**:
 scope expressions decide which agents a command reaches, and service-scoped API
-tokens are confined by the `service` tag — which is why every failure mode below
-fails closed rather than degrading silently.
+tokens are confined by the `service` tag — which is why the read/write failure
+modes below fail closed rather than degrading silently.
 
-**Before you upgrade**, sanity-check the legacy `tags.db` so a refusal surfaces in a
-planning window, not a maintenance one:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `tags.db` data to carry over — the one-time
+mandatory backfill this section originally described was retired under ADR-0009's
+fresh-start-by-default amendment (see ADR-0050's Update).
 
-```bash
-# Row count — sets the expectation for backfill duration (see below).
-sqlite3 /path/to/tags.db "SELECT count(*) FROM tags;"
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
 
-# updated_at must be INTEGER epoch seconds; TEXT/NULL values refuse the boot
-# (a structurally-wrong column would silently corrupt conflict ordering).
-sqlite3 /path/to/tags.db \
-  "SELECT agent_id, key, typeof(updated_at) FROM tags WHERE typeof(updated_at) != 'integer' LIMIT 5;"
-```
-
-- **What is preserved:** every tag row from every source — operator/dashboard
-  (`api`), MCP (`mcp`), server-internal (`server`), and agent-self-reported
-  (`agent`) — with its value, source, and `updated_at`. Agent-sourced tags would
-  also re-sync on each agent's next Register, but they are backfilled anyway so
-  `tag:`-scoped targeting has no gap between cutover and the fleet's next
-  Register cycle.
-- **Fail-closed boot, retried each start.** A backfill that cannot complete —
-  unreadable/corrupt `tags.db`, a non-INTEGER `updated_at` column, a Postgres
-  write error, a fingerprint mismatch, or a row-direction conflict (below) —
-  **refuses the boot** and retries on the next start. Under systemd this looks
-  like a restart loop ending in `failed` once `StartLimitBurst` is hit; the boot
-  log's `TagStore: migrate_from_sqlite:` lines carry the specific refusal, and
-  `docs/ops-runbooks/tag-store-backfill-recovery.md` maps each message to its
-  recovery.
-- **Backfill duration is unbounded and latency-driven — the orchestrator budget
-  is the real constraint.** The backfill inserts row-by-row (roughly two
-  database round trips per row) inside one transaction. No overall time limit
-  applies: the transaction's named 60 s bound covers only the wait to obtain a
-  pool connection, and the fixed 30 s per-statement limit is never approached
-  by single-row operations — so a large `tags.db` produces a LONG first boot,
-  not an automatic abort. Estimate: `row count × 2 × your server↔Postgres
-  round-trip latency` (10k rows ≈ seconds on a local/LAN database; at 1 ms
-  RTT, ~100k rows ≈ several minutes). **The actual oversized-file failure mode
-  is your orchestrator killing the server mid-backfill** (systemd start limits,
-  Kubernetes `startupProbe`, compose healthcheck `start_period`) — which is
-  safe (nothing commits; the next boot retries whole) but loops until the
-  budget is widened. So: check the row count pre-upgrade, widen the startup
-  budget to cover the estimate with margin, and test the upgrade against a
-  staging copy if the estimate is more than a couple of minutes.
-- **Fingerprint-verified, not marker-only** (the `DiscoveryStore`/`QuarantineStore`
-  shape — see those sections for the full multi-replica rationale): a later-booting
-  replica still holding its own `tags.db` verifies the file's content against the
-  recorded fingerprint before trusting an already-set completion marker, and a
-  `HOLDER-SIDE VERIFICATION FAILED` refusal means an operator decides which
-  replica's tags are authoritative — never force-boot around it.
-- **Direction-aware row conflicts (new in this store).** If Postgres already holds
-  a row for the same `(agent, key)` — a partial prior run, a concurrent replica,
-  or a rollback-then-roll-forward cycle — the backfill compares `updated_at`:
-  Postgres strictly ahead or identical is a benign skip; the LEGACY side strictly
-  ahead (or tied with different content) **refuses the boot**, because the legacy
-  file demonstrably holds a later write that silently keeping Postgres's value
-  would discard. **Treat this refusal as a data-integrity incident, not an
-  availability one** — the currently-served tag data may be the wrong side of an
-  operator-authored-data race; verify which side is authoritative (the log names
-  the exact row and both sides) before clearing anything.
-- **Legacy file moved aside after a verified backfill** (`tags.db.migrated-<epoch>`),
-  same one-release rollback window and re-verification semantics as the sibling
-  stores.
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `tags.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count
+  rows in `tags` for a diagnostic warning, then boots fresh-started regardless of
+  what it finds. If that table has rows, it logs a `TagStore` legacy-row-count
+  warning at WARN; boot proceeds unaffected either way. If you see this warning and
+  the environment genuinely has real tags to keep, there is no automated recovery
+  path: re-apply the equivalent tags against the new Postgres-backed store via
+  `PUT /api/v1/tags` / `set_tag` before relying on `tag:`-scoped targeting.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Operator-visible behaviour changes (fail-closed reads/writes).**
 
@@ -2360,12 +2253,8 @@ sqlite3 /path/to/tags.db \
   sustained refusal in the server log as an agent-configuration defect.
 
 **Verify:** after the server reports ready, `GET /api/v1/tags?agent_id=<id>` (or
-the device page) shows the same tags as before the upgrade, and
-`SELECT count(*) FROM tag_store.tags;` against Postgres matches
-`sqlite3 tags.db.migrated-<epoch> "SELECT count(*) FROM tags;"`.
-`yuzu_server_tag_store_backfill_total{result="success"}` confirms the backfill
-outcome (alert `YuzuTagStoreBackfillNotCompleted` keys on the ABSENCE of a
-success/fresh sample — a refused boot never serves `/metrics` at all).
+the device page) shows the expected tags (re-applied via the REST/MCP surface on a
+fresh install, or already-live Postgres data on a redeploy).
 
 ## ⚠️ Behaviour change: quarantine containment now covers IPv6, and reports honestly (#3282, #3283, #3284, #3285, #3286, #3260)
 
@@ -2420,66 +2309,37 @@ honest**, so expect these to fire more often after upgrading:
 
 Rollback is data-safe. A mixed fleet is safe: an older agent simply keeps the older, less
 honest plugin reporting until it is upgraded.
-## Product packs migrate to Postgres (mandatory backfill, ProductPackStore, ADR-0054)
+## Product packs migrate to Postgres (ProductPackStore, ADR-0054)
 
 The `ProductPackStore` — operator-installed product packs behind `POST/GET/DELETE
 /api/product-packs*` — moves from the SQLite `product-packs.db` file to the server's
 PostgreSQL substrate in this release (ADR-0006), schema `product_pack_store`, on the
-existing shared pool. Product packs are **authoritative operator-authored content**
-(build-time-seeded packs plus operator additions), not a cache, so the backfill is
-mandatory and fails closed rather than degrading silently — same posture class as
-`DiscoveryStore`/`QuarantineStore`.
+existing shared pool.
 
-- **What is preserved:** every pack row (id, name, version, description, YAML source,
-  install time, signature-verified flag) and every item row it contains, unchanged. A
-  legacy `product-packs.db` written before 7.13 (predating the `verified` column)
-  backfills correctly, defaulting `verified=false` for that vintage — matching the
-  pre-migration `ALTER TABLE ... DEFAULT 0` shim it replaces.
-- **Fail-closed boot, retried each start.** A backfill that cannot complete —
-  unreadable/corrupt `product-packs.db`, a half-schema file (only one of
-  `product_packs`/`product_pack_items` present — never producible by a shipped binary),
-  a mid-scan read error, a SHA-256 hashing failure, a Postgres write error, or a
-  differently-valued row conflict (below) — **refuses the boot** and retries on the next
-  start. The boot log's `ProductPackStore::migrate_from_sqlite:` lines carry the
-  specific refusal and, for a row conflict, the exact pack or item id involved.
-- **Fingerprint-verified marker, whole-file** (the `DiscoveryStore`/`QuarantineStore`
-  shape — a single SHA-256 over the legacy file's full canonicalized content, not
-  `TagStore`'s per-row `updated_at`-direction comparison): a completed backfill is
-  recorded once per distinct fingerprint, so re-running against the same unchanged file
-  is a fast no-op on every subsequent boot.
-- **Differently-valued conflicts refuse the boot; identical-content conflicts are a
-  benign no-op.** Every pack and item column is write-once (no runtime method ever
-  updates one after install), so if Postgres already holds a row for a pack/item id
-  this backfill is about to insert, the two are compared: byte-identical content
-  (a replayed/cloned legacy file, or two replicas that happened to install the same
-  pack independently) is a silent skip; ANY difference **refuses the boot** — this is
-  a genuine multi-replica divergence and there is no principled way to pick a side
-  automatically. Treat it as a data-integrity incident: the log names the exact pack
-  or item id; decide which replica's legacy file is authoritative, then repair or move
-  the losing file aside and restart.
-- **The legacy file is NOT moved aside after a successful backfill** (unlike
-  `TagStore`/`QuarantineStore`) — `product-packs.db` stays in place; the fingerprint
-  marker alone makes repeat boots against it idempotent, so there is nothing to clean
-  up before the next start.
-- **An uninstalled pack is never resurrected by a later backfill.** Because the legacy
-  file is never mutated, a redeployed or newly-joined replica may still carry a legacy
-  `product-packs.db` written before a pack was uninstalled elsewhere. `uninstall()`
-  records the deleted pack id in Postgres (`deleted_pack_ids`, in the same transaction
-  as the delete); `migrate_from_sqlite` checks it before treating an unmatched legacy
-  pack id as fresh content, so this case is a logged skip (not a boot refusal) rather
-  than a resurrection — matches `RbacStore`'s `revoked_seed_defaults` suppression-table
-  precedent for the same class of hazard. **Caveat (ADR-0009 update note):** this closes
-  the cross-replica case only. If you roll the server *binary* back to the pre-migration
-  release during the one-release rollback window, that binary reads `product-packs.db`
-  directly and does not know Postgres or the tombstone table exist — an uninstalled
-  pack's catalog listing can reappear for the duration of the rollback. The pack's
-  actual content is not restored — it was already deleted from its own separate stores
-  by `uninstall()` (a `PolicyFragment` still referenced by another policy is the one
-  documented exception, logged and non-fatal to the pack's own uninstall) — so this is a
-  stale listing, not reinstated content: a lookup that follows one of that listing's item
-  ids elsewhere (fetching or executing an instruction by id, for example) will 404
-  against content that's already gone, which is expected during the window, not a new
-  fault. It self-corrects on the next roll-forward.
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `product-packs.db` data to carry over — the
+one-time mandatory backfill this section originally described was retired under
+ADR-0009's fresh-start-by-default amendment (see ADR-0054's Update).
+
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `product-packs.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count rows
+  across `product_packs`/`product_pack_items` for a diagnostic warning, then boots
+  fresh-started regardless of what it finds. If either table has rows, it logs a
+  `ProductPackStore` legacy-row-count warning at WARN; boot proceeds unaffected either
+  way. If you see this warning and the environment genuinely has real installed packs
+  to keep, there is no automated recovery path: re-install the equivalent packs
+  against the new Postgres-backed store via `POST /api/product-packs` before relying
+  on it.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
+- `deleted_pack_ids` (the uninstall tombstone table) and its coordination lock are
+  unchanged by this retirement — they still exist and `uninstall()` still writes to
+  them; whether they are now themselves vestigial (their original purpose was
+  guarding against the now-retired backfill resurrecting an uninstalled pack) is a
+  separate, undecided question.
 
 **Operator-visible behaviour changes.**
 
@@ -2508,62 +2368,40 @@ mandatory and fails closed rather than degrading silently — same posture class
   verification path, or the `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS`
   operator escape hatch.
 
-**Verify:** after the server reports ready, `GET /api/product-packs` shows the same
-packs as before the upgrade, and `SELECT count(*) FROM product_pack_store.product_packs;`
-against Postgres matches `sqlite3 product-packs.db "SELECT count(*) FROM
-product_packs;"`. `yuzu_server_product_pack_backfill_total{result="success"}` advancing
-(or `"fresh"` on an install with no legacy data) confirms this boot's backfill outcome —
-both label values are pre-seeded to 0 at construction, so the series exists on every
-healthy boot; a genuinely fast-skipped restart (fingerprint already processed) leaves
-both at 0 too, which is expected and not a failure signal. The actual alerting
-shape (`YuzuProductPackBackfillNotCompleted`) keys on the ABSENCE of any
-`success`/`fresh` sample across a 15-minute window, not on any single value — a
-refused boot never serves `/metrics` at all, so no server in the window reporting
-either outcome is itself the signal of a fail-closed boot-refusal loop.
+**Verify:** after the server reports ready, `GET /api/product-packs` shows the expected
+packs (re-installed via the REST API on a fresh install, or already-live Postgres data
+on a redeploy).
 
-## Guardian Baselines migrate to Postgres (mandatory backfill, BaselineStore, ADR-0055)
+## Guardian Baselines migrate to Postgres (BaselineStore, ADR-0055)
 
 `BaselineStore` — Guardian's deployable Baseline unit (`/guardian` → Baselines,
 `GET /api/v1/guaranteed-state/device-compliance`) — moves from the SQLite
 `guardian-baselines.db` file to the server's PostgreSQL substrate in this release,
 schema `baseline_store`, on the existing shared pool. A **Baseline** is the only
 deployable unit in Guardian: what a deploy enforces across the fleet is read from
-each Baseline's `deployed_snapshot`, never its live member set — so, like every
-other store feeding an enforcement decision, the backfill is mandatory and fails
-closed rather than degrading silently.
+each Baseline's `deployed_snapshot`, never its live member set.
 
-- **What is preserved:** every Baseline (`baselines`), its member Guards
-  (`baseline_rules`), and its assignment of included/excluded management groups
-  (`baseline_groups`) — read inside one deferred SQLite transaction so the parent
-  and its children fingerprint against the same instant. A Baseline already live
-  in Postgres (a second replica booting against shared state, or a re-run after a
-  partial pass) keeps its own current members/assignment untouched by the legacy
-  backfill — only a freshly-inserted parent's children are copied.
-- **Fail-closed boot, retried each start.** A backfill that cannot complete —
-  an unreadable/corrupt legacy file, a SHA-256 fingerprint failure, a Postgres
-  write error, an invalid legacy `lifecycle`/assignment `disposition` value, a
-  name collision against a different already-live baseline_id, or a row-direction
-  conflict (below) — **refuses the boot** and retries on the next start. The boot
-  log's `BaselineStore: migrate_from_sqlite:` lines carry the specific refusal,
-  naming the offending Baseline id.
-- **Fingerprint-verified whole-file marker, with per-row direction-aware
-  conflicts.** A completed backfill is recorded once per distinct SHA-256
-  fingerprint over the legacy file's full canonicalized content (the
-  `DiscoveryStore`/`ProductPackStore` shape — a later-booting replica still
-  holding its own legacy file re-verifies against the recorded fingerprint before
-  trusting an already-set completion marker). Independently, if Postgres already
-  holds a row for a legacy Baseline's id, that ROW is compared on `updated_at`
-  (the `TagStore` shape): Postgres strictly ahead, or identical content, is a
-  benign skip; the legacy side strictly ahead (or tied with differing content)
-  **refuses the boot** — the legacy file demonstrably holds a later write that
-  silently keeping Postgres's value would discard. Treat this refusal as a
-  data-integrity incident, not an availability one: the log names the exact
-  Baseline id and both `updated_at` values; decide which side is authoritative
-  before restarting.
-- **Legacy file moved aside after a verified backfill**
-  (`guardian-baselines.db.migrated-<epoch>`), same one-release rollback window as
-  the sibling stores.
-- **Fresh installs are unaffected** — no legacy file, nothing to migrate.
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres build
+of this store, so there was no real `guardian-baselines.db` data to carry over — the
+one-time backfill mechanism this section originally described was retired under
+ADR-0009's fresh-start-by-default amendment (see ADR-0055's Update).
+
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed, matching the ladder's "authoritative" posture for this
+  store), same as every other born-on-Postgres store.
+- A legacy `guardian-baselines.db` file with real content **does NOT** fail startup
+  and its content is **never imported** — the server opens it read-only, purely to
+  count rows across `guaranteed_state_baselines`/`guaranteed_state_baseline_rules`/
+  `guaranteed_state_baseline_groups` for a diagnostic warning, then boots
+  fresh-started regardless of what it finds. If any of those tables has rows, it
+  logs a `BaselineStore` legacy-row-count warning at WARN; boot proceeds unaffected
+  either way. If you see this warning and the environment genuinely has real
+  Baselines to keep, there is no automated recovery path: re-author the equivalent
+  Baselines against the new Postgres-backed store via the Guardian UI/REST API
+  before relying on it.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
 
 **Operator-visible behaviour changes (fail-closed reads).** A degraded read on
 the enforcement-feeding path (`deployed_member_rule_ids()` — the source for the
@@ -2573,16 +2411,53 @@ abort/503, never a silent empty/"fully compliant" enforced set. `GET
 /api/v1/guaranteed-state/device-compliance` returns **503** rather than a
 misleadingly-empty or false-compliant result when the underlying read degrades;
 Guardian deploy/delete dashboard actions show a degraded-modal rather than
-reporting success. There is no dedicated backfill-outcome metric for this store
-(matching its own precedent stores, `GuaranteedStateStore`/`DeviceTokenStore`,
-which also rely on the boot log + `/readyz` rather than a Prometheus counter for
-a boot-fatal event) — a refused boot never serves `/metrics` at all, so the boot
+reporting success. There is no dedicated backfill-outcome metric for this store —
+a schema-migration failure is boot-fatal and never serves `/metrics`, so the boot
 log and `/readyz` are the channels to watch during an upgrade.
 
-**Verify:** after the server reports ready, `/guardian` shows the same Baselines
-(and each one's members/assignment) as before the upgrade, and
-`SELECT count(*) FROM baseline_store.baselines;` against Postgres matches
-`sqlite3 guardian-baselines.db.migrated-<epoch> "SELECT count(*) FROM baselines;"`.
+**Verify:** after the server reports ready, `/guardian` shows the expected Baselines
+(re-authored via the Guardian UI/REST API on a fresh install, or already-live
+Postgres data on a redeploy).
+
+## Guardian rules, events, and DEX observations retire their legacy-SQLite path (GuaranteedStateStore, ADR-0038)
+
+`GuaranteedStateStore` — the live agent-side policy enforcement store (`/guardian`
+rule authoring, drift/remediation events, DEX observations) — no longer copies a
+legacy `guaranteed-state.db` file into Postgres on first boot.
+
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres
+build of this store, so there was no real `guaranteed-state.db` data to carry
+over — the one-time backfill mechanism this store originally shipped was retired
+under ADR-0009's fresh-start-by-default amendment (see ADR-0038's Update).
+
+These are two SEPARATE failure/detection behaviors, not one — do not conflate them:
+
+- A reachable Postgres database whose schema can't migrate or open **is** a fatal
+  startup error (fail-closed), same as every other born-on-Postgres store.
+- A legacy `guaranteed-state.db` file with real content **does NOT** fail startup
+  and its content is **never imported** — the server opens it read-only, purely to
+  count rows across `guaranteed_state_rules`/`guardian_meta`/
+  `guardian_agent_rule_status`/`guaranteed_state_events`/`guardian_observations`
+  for a diagnostic warning, then boots fresh-started regardless of what it finds.
+  If any of those tables has rows, it logs a `GuaranteedStateStore`
+  legacy-row-count warning at WARN; boot proceeds unaffected either way.
+- **Fresh installs are unaffected** — no legacy file, nothing to warn about.
+
+**This is a stronger warning than it looks.** Unlike most other stores retiring
+their legacy-SQLite path in this same release, a genuinely non-empty
+`guaranteed-state.db` here means real Guardian rules an operator authored are
+silently NOT loaded — enforcement resumes from an empty rule set, not the
+operator's prior policy. (Guardian Baselines carry the same consequence — see
+the BaselineStore section above.) If you see the legacy-row-count warning above and the
+environment genuinely has real rules to keep, there is no automated recovery
+path: re-author the equivalent rules against the new Postgres-backed store via
+the Guardian UI/REST API before relying on it, and confirm the expected rules
+are actually present (see Verify below) rather than assuming they carried over.
+
+**Verify:** after the server reports ready, `/guardian` shows the expected rules
+(re-authored via the Guardian UI/REST API on a fresh install, or already-live
+Postgres data on a redeploy) — do not rely on the absence of the legacy-row-count
+warning alone as confirmation that nothing was lost.
 
 ## Compliance policy engine moves to Postgres (PolicyStore, ADR-0056)
 
@@ -2926,11 +2801,23 @@ surface dispatched it**:
   `result=denied`, `detail=reason=approval_required`) and counted
   (`yuzu_server_dispatch_denied_total{reason="approval_required"}`).
 - **MCP** (`execute_instruction` at `operator` tier — `supervised` tier already goes through the
-  approval workflow): the denial collapses into the SAME `no_agents_reached` tool result an
-  offline/unreachable agent gets, not a discriminated error — the JSON-RPC error-shaping closure
-  for this specific case is tracked separately (not yet shipped). If an MCP-driven automation
-  starts reporting "no agents reached" for a target you know is online, check whether the pair
-  it's calling is now gated before assuming a connectivity problem.
+  approval workflow): the denial is now a discriminated JSON-RPC error naming the reason
+  (`error.data.reason: "approval_required"`), not the `no_agents_reached` tool result an
+  offline/unreachable agent gets (CLOSED by #3687 — a `no_agents_reached` result no longer needs a
+  manual check for whether a pair is gated before you trust it, aside from the same narrow
+  dry-run-then-real-check TOCTOU window every pre-dispatch authorization check in this codebase
+  accepts). **`approval_required` is one of six discriminated reasons, not the only one** — the
+  same fix discriminates `Unclassified`/`Ambiguous`/`AnonymousOperator`/`Forbidden`/`KillSwitched`
+  too, so a caller that only added handling for this release's `approval_required` change gets no
+  warning that `Forbidden` (the most common denial in practice — a caller with no covering grant
+  at all, not just an ungated approval gap) now arrives as the same kind of discriminated
+  JSON-RPC error rather than the old `no_agents_reached`/ambiguous-success shape. **This coverage
+  is no longer `execute_instruction`-only**: #3893 extended the identical pre-dispatch dry run
+  (both the C8 pre-mint check and the main-handler backstop) to `execute_bundle` (a denied step
+  now refuses the whole bundle call up front — previously an entirely-denied bundle returned a
+  false JSON-RPC success naming the requested step count) and `quarantine_device` (a denial now
+  runs before the quarantine record is written, and before dispatch, instead of mapping every
+  denial reason to the same "retry" hint an offline device gets).
 - **Schedules**: a schedule dispatching a gated pair now requires an approval ticket exactly like
   the interactive governed path (`ScheduleRunner` mints one and holds the occurrence until an
   admin approves it via the existing `/api/approvals` workflow) — this was already the behavior

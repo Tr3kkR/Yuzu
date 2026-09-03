@@ -464,6 +464,18 @@ spot check.
    discrimination beyond what Decision 7's pre-check closure already provides
    (an in-code follow-up note already flags the underlying limitation). Filed
    as **#3687**.
+   **2026-09-02 follow-up:** #3687 shipped a NARROWER fix than this item's
+   own title describes — a pre-dispatch dry-run closure (the same shape as
+   Decision 7's own `execute_instruction` pre-check, generalized via a shared
+   `dispatch_pairs_for(tool_name, args)` registration point to
+   `execute_bundle` and `quarantine_device` too, PR #3893), not a literal
+   `DispatchFn` signature widening. This is a deliberate choice, not a
+   shortfall — it matches Decision 7's own "do NOT widen `DispatchFn`"
+   constraint and covers every dispatch-capable MCP tool's denial
+   discrimination without the larger refactor a signature change would need.
+   No separate literal-widening issue is filed as a successor; #3687's own
+   acceptance criteria are satisfied by the narrower approach, and nothing
+   currently blocked on the wider signature.
 4. **RETRACTED — this item was itself wrong, twice.** The original ladder text
    ("thread a full `DispatchCaller` through `BundleOrchestrator`") was
    corrected during Rung 0 review to claim no follow-up was needed, on the
@@ -551,7 +563,7 @@ on any item. All required changes are folded into this revision:
 | Two content remaps (`set_dnd`, `list_jobs`) | architect + security | APPROVE | table updated, no longer "pending" |
 | manual->role-gated dual-effect framing | security | required change | folded in (remap table) |
 | Decision 6 (legacy-open) | architect + security | APPROVE | — |
-| Decision 7 (deny UX) | architect + security | required change | REST half folded in (Decision 2's F3 fix — the specific `ApprovalRequired` message + audit reason on `/api/command`). **Correction (2026-08-28, adversarial review):** the MCP pre-dispatch closure this row originally claimed was "folded in" was NOT implemented — `mcp_server.cpp` has no `classify_and_authorize_dispatch`/`build_classified_command` call. The chokepoint still enforces correctly via the existing `dispatch_fn` path (not a security gap), but a denied MCP caller today gets a misleading success-shaped `no_agents_reached` response and a phantom cancelled execution row instead of a discriminated error. This is genuinely Rung 4 work — see "What this ladder does NOT do" below — the doc was simply wrong to mark it done here. |
+| Decision 7 (deny UX) | architect + security | required change | REST half folded in (Decision 2's F3 fix — the specific `ApprovalRequired` message + audit reason on `/api/command`). **Correction (2026-08-28, adversarial review):** the MCP pre-dispatch closure this row originally claimed was "folded in" was NOT implemented — `mcp_server.cpp` has no `classify_and_authorize_dispatch`/`build_classified_command` call. The chokepoint still enforces correctly via the existing `dispatch_fn` path (not a security gap), but a denied MCP caller today gets a misleading success-shaped `no_agents_reached` response and a phantom cancelled execution row instead of a discriminated error. This is genuinely Rung 4 work — see "What this ladder does NOT do" below — the doc was simply wrong to mark it done here. **Follow-up (2026-09-02, #3687):** the MCP pre-dispatch closure this row's correction found missing has now shipped — `mcp_server.cpp`'s `execute_instruction` handler calls a pre-dispatch `AuthorizeDispatchFn` (composing `classify_and_authorize_dispatch` + the kill-switch check) before `dispatch_fn`, and a denied caller gets a discriminated JSON-RPC error, not `no_agents_reached`, with no execution row created. This closes the gap the 2026-08-28 correction above describes; that correction is left as-written as the historical record of what was found. |
 | Decision 8 (`executeRoles` retirement) | architect + security | APPROVE | — |
 | Rung-2 CI cross-check structure | architect | required change | folded in (parse-integrity assertion, embed_content.py semantics match) |
 | Follow-up #4 (BundleOrchestrator) | architect + security | doc correction | folded in — claim was stale, corrected |
