@@ -1121,10 +1121,26 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  auto& command_id = dispatch_outcome.command_id;
                  auto& sent = dispatch_outcome.sent;
                  if (sent == 0) {
+                     // #3424/#3511: don't blame connectivity for a fail-closed
+                     // containment gate, a quarantine denial, or a withheld
+                     // plugin-absent dispatch — same discrimination /api/command
+                     // already surfaces, so the operator reading THIS console
+                     // isn't pointed at the wrong remediation.
+                     const char* message = "No agents connected. Cannot dispatch command.";
+                     if (dispatch_outcome.containment_unreadable) {
+                         message = "Containment state is unreadable — dispatch is failing "
+                                    "closed and reaching no agent; check the quarantine store.";
+                     } else if (dispatch_outcome.denied_quarantined_count > 0) {
+                         message = "Every target is quarantined — dispatch was withheld, "
+                                    "not attempted.";
+                     } else if (dispatch_outcome.unknown_plugin_count > 0) {
+                         message = "The dispatched plugin is not in any target's reported "
+                                    "inventory — dispatch was withheld, not attempted.";
+                     }
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
-                         "No agents connected. Cannot dispatch command.</span>",
+                         " style=\"font-size:0.75rem;color:#f85149\">" +
+                             html_escape(message) + "</span>",
                          "text/html; charset=utf-8");
                      return;
                  }

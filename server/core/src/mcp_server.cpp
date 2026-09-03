@@ -9105,8 +9105,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             .add("agents_unknown_plugin",
                                  static_cast<int64_t>(dispatch_outcome.unknown_plugin_count))
                             .str();
-                    mcp_audit("failure",
-                              std::string("no_agents_reached execution_id=") + execution_id);
+                    mcp_audit("failure", zero_status + " execution_id=" + execution_id);
                     res.set_content(
                         success_response(id, tool_result(zero_payload, kObjectOutputSchema)),
                         "application/json");

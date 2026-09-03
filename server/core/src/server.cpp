@@ -11827,8 +11827,9 @@ private:
                      {{"route", std::string(route)},
                       {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}})
             .increment(static_cast<double>(count));
-        spdlog::warn("dispatch withheld: command={} plugin={} reason=unknown_plugin agents={}",
-                     command_id, plugin, count);
+        spdlog::warn(
+            "dispatch withheld: route={} command={} plugin={} reason=unknown_plugin agents={}",
+            route, command_id, plugin, count);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a

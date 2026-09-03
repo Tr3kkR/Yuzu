@@ -1613,7 +1613,12 @@ Quarantine a device.
 > always present, `0` on a clean dispatch — so `agents_reached: 97` on a
 > 100-device group is distinguishable from three devices being offline, and a
 > MIXED partial dispatch (some reached, some plugin-absent) is never silently
-> invisible in the response. The dashboard toast says the same.
+> invisible in the response. The dashboard's own execute console
+> (`/api/dashboard/execute`, a separate HTML-fragment handler, not this route)
+> now names the same containment/quarantine/plugin-absence causes on a
+> zero-agents-reached dispatch; it does not yet surface withheld counts on a
+> MIXED partial dispatch the way this route's success body does — tracked as a
+> follow-up.
 >
 > **Its `503` now names the cause.** Four conditions previously shared one
 > body ("failed to send command to any agent"), and two of them are
