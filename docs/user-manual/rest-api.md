@@ -7480,6 +7480,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 
 **Reconnect / replay:** the server keeps a per-execution ring buffer of up to 1000 events covering ~30 seconds of activity. Browsers' `EventSource` automatically sends `Last-Event-ID` on reconnect; the server replays events whose monotonic id is greater than that value before resuming live publication.
 
+**Cross-replica delivery (HA WS-2a-2).** On a multi-replica HA deployment, events that originate on another server replica are delivered onto this replica's live stream by a ~2s cross-replica poll, so a subscriber sees live progress driven from any replica; this delivery is at-least-once (a duplicate may be re-sent, never dropped). The `id:` field is unchanged — it stays a per-channel monotonic value assigned in publish order, so `Last-Event-ID` / `?since` reconnect works exactly as before on the replica you are connected to. Reconnect *across* replicas after a failover is not yet loss-free — see `docs/executions-history-ladder.md`. Single-replica deployments are unaffected.
+
 **Event types:**
 
 | Event | Emitted on | Payload (JSON in `data:`) |

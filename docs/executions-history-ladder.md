@@ -377,6 +377,42 @@ than letting them go silent.
   already lives with; it is documented here for agentic-client authors
   who write reconnect logic against the executions ladder rather than
   the dashboard's bootstrap path.
+- **Cross-replica live delivery (HA WS-2a-2).** Each server replica runs
+  a ~2s poll (`ExecutionTracker::poll_event_outbox_once`) that drains the
+  durable `event_outbox` for events which originated on OTHER replicas
+  and re-publishes them onto the local in-memory bus, so a subscriber
+  sees live progress driven from any replica. The poll cursors on a
+  Postgres commit-settle horizon (`w_xid < pg_snapshot_xmin(...)`) — its
+  live forward delivery is gapless, at-least-once, and skips this
+  replica's own already-published rows. Its horizon is initialized at
+  ExecutionTracker CONSTRUCTION (before SSE admission), so events that
+  commit during the boot→first-poll window are delivered, not ceded. A
+  long-running transaction anywhere on the substrate pins the horizon and
+  DELAYS (never drops) cross-replica delivery until it commits.
+  Single-replica deployments are a no-op here (nothing foreign to deliver).
+- **The live bus `id` is the per-channel counter, not the durable id
+  (HA WS-2a-2 Option A).** The durable global `event_outbox.event_id`
+  (a fleet-wide Postgres IDENTITY) is kept in the outbox — it drives the
+  poll's settle-horizon cursor and the later durable failover replay — but
+  it is deliberately NOT used as the live SSE `id`. Assigning it at INSERT
+  and publishing post-commit would let two concurrent same-execution
+  transitions invert id-vs-publish order and strand a committed event from
+  a cursor-based (`ev.id > since_id`) subscriber on a SINGLE replica. So
+  the bus id stays the per-channel counter assigned in publish order under
+  the channel mutex (buffer order == id order, reconnect-safe), and the
+  cross-replica poll re-publishes foreign events through the same path
+  (they too get a monotonic local counter id).
+- **Reconnect across replicas is NOT yet loss-free (WS-2a-2 slice
+  boundary).** Single-replica reconnect is safe (ring order == id order).
+  But a subscriber that fails over to a DIFFERENT replica holds a
+  `Last-Event-ID` that is that replica's LOCAL counter — meaningless on
+  the new one. Loss-free cross-replica reconnect needs the durable outbox
+  replay, served by `execution_id ORDER BY event_id`, with the durable
+  `event_id` becoming the cross-replica cursor (and delivered in id order
+  to avoid the commit-inversion skip). That is the WS-2a-2 follow-up slice
+  and a precondition for enabling a second replica (ADR-2002 "no committed
+  event lost across failover"). Until it ships, cross-replica failover
+  reconnect is not covered.
 
 ## Catastrophic invariants (routed-concern detail)
 
