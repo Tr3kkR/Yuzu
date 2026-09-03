@@ -29,6 +29,7 @@
 
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteErrMsg;
+using yuzu::server::legacy_sqlite_probe::harden_legacy_file_0600;
 using yuzu::server::legacy_sqlite_probe::warn_if_legacy_rows;
 
 TEST_CASE("legacy_sqlite_probe: silent when the legacy file does not exist",
@@ -250,5 +251,94 @@ TEST_CASE("legacy_sqlite_probe: warns (does not silently skip) when the legacy p
     // THIS (whole-file stat() failure) branch specifically.
     CHECK(text.find("could not be checked") != std::string::npos);
     CHECK(text.find("table '") == std::string::npos);
+}
+
+// ── harden_legacy_file_0600 (#3623, generalized from WebhookStore's own inline
+// 0600+sidecar block, PR #3563) ──────────────────────────────────────────────
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 restricts the main file and both "
+          "sidecars to owner-only",
+          "[legacy_sqlite_probe]") {
+    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_") += ".db";
+    std::ofstream(legacy_path) << "dummy-content";
+    std::vector<std::filesystem::path> sidecars;
+    for (const char* suffix : {"-wal", "-shm"}) {
+        auto side = legacy_path;
+        side += suffix;
+        std::ofstream(side) << "dummy-sidecar-content";
+        sidecars.push_back(side);
+    }
+    struct Cleanup {
+        std::vector<std::filesystem::path> paths;
+        ~Cleanup() {
+            std::error_code ec;
+            for (const auto& p : paths)
+                std::filesystem::remove(p, ec);
+        }
+    } cleanup{{legacy_path, sidecars[0], sidecars[1]}};
+
+    // Group/world-readable to start, matching the unclean-shutdown-leftover
+    // shape the real code path defends against.
+    const auto wide_open = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                           std::filesystem::perms::group_read | std::filesystem::perms::others_read;
+    for (const auto& p : {legacy_path, sidecars[0], sidecars[1]})
+        std::filesystem::permissions(p, wide_open, std::filesystem::perm_options::replace);
+
+    harden_legacy_file_0600(legacy_path);
+
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    for (const auto& p : {legacy_path, sidecars[0], sidecars[1]}) {
+        std::error_code st_ec;
+        const auto perms = std::filesystem::status(p, st_ec).permissions();
+        REQUIRE_FALSE(st_ec);
+        CHECK((perms & std::filesystem::perms::mask) == owner_only);
+    }
+}
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 is a silent no-op when the legacy "
+          "file and its sidecars are absent",
+          "[legacy_sqlite_probe]") {
+    auto path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_absent_");
+    REQUIRE_FALSE(std::filesystem::exists(path));
+
+    yuzu::test::LogCapture cap;
+    harden_legacy_file_0600(path); // must not throw
+    cap.stop();
+    CHECK(cap.text().find("legacy_sqlite_probe") == std::string::npos);
+}
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 refuses to chmod through a symlink",
+          "[legacy_sqlite_probe]") {
+    auto target = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_symtarget_") += ".db";
+    std::ofstream(target) << "dummy-content";
+    auto link = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_symlink_") += ".db";
+    REQUIRE(::symlink(target.string().c_str(), link.string().c_str()) == 0);
+    struct Cleanup {
+        std::filesystem::path target, link;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(target, ec);
+            std::filesystem::remove(link, ec);
+        }
+    } cleanup{target, link};
+
+    // Wide-open on the TARGET — if harden_legacy_file_0600 followed the
+    // symlink (the default `permissions()` behaviour it must NOT exhibit),
+    // this would flip to owner-only.
+    const auto wide_open = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+                           std::filesystem::perms::group_read | std::filesystem::perms::others_read;
+    std::filesystem::permissions(target, wide_open, std::filesystem::perm_options::replace);
+
+    yuzu::test::LogCapture cap;
+    harden_legacy_file_0600(link);
+    cap.stop();
+
+    std::error_code st_ec;
+    const auto target_perms = std::filesystem::status(target, st_ec).permissions();
+    REQUIRE_FALSE(st_ec);
+    // Target UNCHANGED — the whole point of the symlink refusal.
+    CHECK((target_perms & std::filesystem::perms::mask) == wide_open);
+    CHECK(cap.text().find("symlink") != std::string::npos);
 }
 #endif // _WIN32

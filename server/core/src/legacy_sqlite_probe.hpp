@@ -17,15 +17,16 @@
 /// Never reads column data, never mutates the legacy file, never itself
 /// constitutes a backfill — this is detection only.
 ///
-/// No 0600/sidecar hardening here. ADR-0010 §Consequences (a)'s "force 0600
-/// before the first read" obligation applies specifically to a legacy file
-/// that may hold a PLAINTEXT secret column (`RuntimeConfigStore`,
-/// `WebhookStore`); a caller whose legacy table(s) hold no secret material
-/// has no such obligation and can use this helper as-is. A future
-/// secret-bearing caller should either harden the file itself before
-/// calling this, or extend this helper rather than fork it — do not copy
-/// `RuntimeConfigStore::warn_if_legacy_data_present`'s 0600 block into a
-/// store that doesn't need it.
+/// `warn_if_legacy_rows` itself has no 0600/sidecar hardening. ADR-0010
+/// §Consequences (a)'s "force 0600 before the first read" obligation applies
+/// specifically to a legacy file that may hold a PLAINTEXT secret column
+/// (`RuntimeConfigStore`, `WebhookStore`); a caller whose legacy table(s)
+/// hold no secret material has no such obligation and can call
+/// `warn_if_legacy_rows` as-is. A secret-bearing caller instead calls
+/// `harden_legacy_file_0600` (below) FIRST — extending this header per its
+/// own instruction rather than forking a bespoke copy, #3623/WebhookStore
+/// the first consumer (superseding `migrate_from_sqlite_impl`'s own inline
+/// 0600+sidecar block, PR #3563).
 
 #include "sqlite_raii.hpp"
 
@@ -159,6 +160,59 @@ inline void warn_if_legacy_rows(const std::filesystem::path& legacy_db_path,
                         "boot if still needed",
                         store_name, legacy_db_path.string(), table, count);
     }
+}
+
+/// Force POSIX 0600 (owner read/write only) on a legacy SQLite file AND its `-wal`/`-shm`
+/// sidecars, for a caller whose legacy file may hold plaintext secret material (ADR-0010
+/// §Consequences (a)) — generalizes `WebhookStore::migrate_from_sqlite_impl`'s own inline
+/// 0600+sidecar block (PR #3563) per this header's "extend, never fork" instruction above.
+/// Call this BEFORE `warn_if_legacy_rows` for a secret-bearing store.
+///
+/// POSIX-only, internally guarded (`#ifndef _WIN32`) so the call site itself stays
+/// platform-agnostic — a Windows build compiles this as a no-op (no compensating Windows ACL
+/// exists for this path today, tracked separately, issue #3593).
+///
+/// Best-effort and never throws: a failure to chmod is logged and does NOT block boot — this
+/// runs ahead of `warn_if_legacy_rows`, which is itself never fatal. Refuses to touch a symlink
+/// at any of the three paths (main file or either sidecar) — `std::filesystem::permissions()`
+/// follows symlinks by default, so an attacker-controlled symlink at the legacy path could
+/// otherwise redirect the chmod onto an unrelated file; checked via `symlink_status()`, which
+/// (unlike `status()`) reports the link itself rather than following it.
+inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path) {
+#ifndef _WIN32
+    const auto chmod_owner_only = [](const std::filesystem::path& path, const char* what) {
+        std::error_code sym_ec;
+        const auto st = std::filesystem::symlink_status(path, sym_ec);
+        if (sym_ec)
+            return; // can't even stat it -- nothing to harden
+        if (st.type() == std::filesystem::file_type::symlink) {
+            spdlog::warn("legacy_sqlite_probe: refusing to chmod {} {} -- it is a symlink, not "
+                        "a regular file (would otherwise redirect the chmod onto its target)",
+                        what, path.string());
+            return;
+        }
+        if (st.type() != std::filesystem::file_type::regular)
+            return; // absent, or not a regular file -- nothing to harden
+
+        std::error_code ec;
+        std::filesystem::permissions(path,
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace, ec);
+        if (ec)
+            spdlog::warn("legacy_sqlite_probe: could not set 0600 on {} {}: {}", what,
+                        path.string(), ec.message());
+    };
+
+    chmod_owner_only(legacy_db_path, "legacy file");
+    for (const char* suffix : {"-wal", "-shm"}) {
+        auto side = legacy_db_path;
+        side += suffix;
+        chmod_owner_only(side, "legacy sidecar");
+    }
+#else
+    (void)legacy_db_path;
+#endif
 }
 
 } // namespace yuzu::server::legacy_sqlite_probe
