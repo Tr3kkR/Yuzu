@@ -205,6 +205,16 @@ int emit_quotas(yuzu::CommandContext& ctx) {
             rc == 0 ? static_cast<unsigned long long>(reply.reserved) : 0;
         const QuotaState state = classify_getattrlist_quota(rc, err, quota_size, reserved_size);
 
+        // CDX-P2-04: the row alone is not enough. set_result_status defaults to
+        // UNDECLARED, from which the agent derives coarse SUCCESS -- so a
+        // permission-denied or unavailable probe would otherwise be reported as
+        // a clean run. UnsupportedFs is NOT a degradation: it is a truthful,
+        // complete answer for a filesystem that has no volume quotas.
+        if (state == QuotaState::PermissionDenied || state == QuotaState::Unavailable) {
+            mark_result_partial(ctx, "macos:getattrlist",
+                                std::string(s.f_mntonname) + ": " + std::strerror(err));
+        }
+
         write_quota_row(ctx, s.f_mntonname, state,
                         state == QuotaState::Configured
                             ? std::optional<unsigned long long>(quota_size)
@@ -226,6 +236,7 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
 
     bool any_row = false;
     bool any_failure = false;
+    bool any_success = false; // a probe that returned cleanly, names or not
 
     for (const struct statfs& s : snap.entries) {
         if (std::string_view(s.f_fstypename) != "apfs")
@@ -266,10 +277,23 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
             write_snapshot_row(ctx, s.f_mntonname, name, "apfs", "-");
             any_row = true;
         }
-        if (parsed.malformed)
+        // BRACES ARE LOAD-BEARING. Without them only the assignment is
+        // guarded and mark_result_partial runs on EVERY successfully-probed
+        // mount, so a healthy host permanently reports CONSTRAINED/PARTIAL
+        // with a fabricated "malformed reply buffer" provenance -- which
+        // makes real degradation indistinguishable from the constant noise.
+        // Apple Clang catches exactly this with -Wmisleading-indentation.
+        if (parsed.malformed) {
             any_failure = true;
             mark_result_partial(ctx, "macos:fs_snapshot_list",
                                 std::string(s.f_mntonname) + ": malformed reply buffer");
+        } else {
+            // A probe that returned cleanly is a SUCCESS even when it yielded
+            // no names: "this volume has no snapshots" is an answer, not a
+            // failure. Tracked separately from any_row so the summary below
+            // can tell "none anywhere" from "some volumes failed".
+            any_success = true;
+        }
     }
 
     // Rows are keyed by mount point and never deduplicated/unioned across
@@ -281,11 +305,18 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
     // facts and must not share one row. any_failure is set wherever a probe
     // errored above; matching the Windows leg's failure-vs-empty contract.
     if (!any_row) {
-        if (any_failure)
+        if (any_failure && !any_success) {
             write_snapshot_row(ctx, "-", "-", "none",
                                "APFS snapshot enumeration failed on every volume");
-        else
+        } else if (any_failure) {
+            // Mixed: some volumes answered cleanly with no snapshots, others
+            // failed. Claiming "every volume" would be false (CDX-P2-10).
+            write_snapshot_row(ctx, "-", "-", "none",
+                               "no APFS snapshots present on the volumes that could be "
+                               "read; enumeration failed on at least one other volume");
+        } else {
             write_snapshot_row(ctx, "-", "-", "none", "no APFS snapshots present");
+        }
     }
 
     return 0;

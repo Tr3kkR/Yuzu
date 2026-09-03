@@ -12,7 +12,8 @@
  * This header DECLARES (never defines) the three per-OS entry points; each
  * leg TU defines exactly one. It DEFINES the pure row formatters, the
  * ctx::write_output wrapper functions (the ONLY call sites of
- * ctx.write_output in this plugin), and mark_result_partial().
+ * the only ROW writers in this plugin -- see the note at the wrappers),
+ * and mark_result_partial().
  */
 #pragma once
 
@@ -129,7 +130,11 @@ inline std::string format_snapshot_row(std::string_view mount_point, std::string
     return out;
 }
 
-// ── ctx wrappers: the ONLY call sites of ctx.write_output in this plugin ──
+// ── ctx wrappers: the only ROW writers in this plugin ──
+// Every pipe-delimited ROW is emitted here and nowhere else. One non-row
+// ctx.write_output exists, for the unknown-action diagnostic in
+// filesystem_posture_plugin.cpp; it emits no kind token and is separately
+// escaped. Claiming these are the ONLY write_output sites was false (CDX-P2-08).
 
 inline void write_mount_row(yuzu::CommandContext& ctx, std::string_view mount_point,
                             std::string_view device, std::string_view fstype,

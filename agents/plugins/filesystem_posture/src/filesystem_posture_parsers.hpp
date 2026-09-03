@@ -535,7 +535,15 @@ inline SnapshotNames parse_fs_snapshot_list_buffer(std::span<const std::byte> bu
         const std::int32_t attr_dataoffset = detail::read_le_i32(buf, offset + 24);
         const std::uint32_t attr_length = detail::read_le_u32(buf, offset + 28);
 
-        if (record_length == 0 || offset + record_length > buf.size()) {
+        // A record must be at least as long as its own fixed header, and must
+        // fit in the buffer. Checking only `record_length == 0` lets a record
+        // that does not CONTAIN its header through: with record_length=30,
+        // attr_dataoffset=4, attr_length=2 the name span computes to
+        // [28,30) -- inside the header's own attr_length field -- and
+        // name_end_in_record (30) > record_length (30) is false, so the
+        // fabricated bytes were accepted as a snapshot name with malformed=0.
+        // Both external reviewers reproduced exactly that case.
+        if (record_length < 32 || offset + record_length > buf.size()) {
             out.malformed = true;
             break;
         }
@@ -547,7 +555,13 @@ inline SnapshotNames parse_fs_snapshot_list_buffer(std::span<const std::byte> bu
         const std::uint64_t name_end_in_record = name_start_in_record + attr_length;
         // attr_length includes the terminating NUL (pinned layout), so a
         // zero length is itself malformed -- there is no name to recover.
-        if (attr_length == 0 || name_end_in_record > record_length) {
+        // The name span must lie strictly BEYOND the 32-byte header as well as
+        // within the record. Without the first clause a small dataoffset walks
+        // the name back over the header fields themselves (see the record_length
+        // guard above) -- the span would be in-bounds for the buffer and still
+        // be pure fabrication.
+        if (attr_length == 0 || name_start_in_record < 32 ||
+            name_end_in_record > record_length) {
             out.malformed = true;
             break;
         }

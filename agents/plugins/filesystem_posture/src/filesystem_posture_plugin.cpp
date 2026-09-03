@@ -19,6 +19,8 @@
 
 #include "filesystem_posture_legs.hpp"
 
+#include <yuzu/string_utils.hpp>
+
 #include <string>
 #include <string_view>
 
@@ -128,7 +130,13 @@ public:
         if (action == "snapshots")
             return yuzu::filesystem_posture::emit_snapshots(ctx);
 
-        ctx.write_output(std::string{"unknown action: "} + std::string{action});
+        // CDX-P2-08: `action` is request-supplied and lands in a pipe-delimited
+        // stream, so it goes through the shared escaper like every other
+        // untrusted field. This is a fourth ctx.write_output site: it is NOT a
+        // row (no leading kind token), which is why it does not use the legs.hpp
+        // wrappers -- see the corrected comment there.
+        ctx.write_output(std::string{"unknown action: "} +
+                         yuzu::util::safe_output_field(action));
         return 1;
     }
 };

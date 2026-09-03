@@ -53,6 +53,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <cstring> // std::memcpy for the FSCTL framing header
 #include <vector>
 
 namespace yuzu::filesystem_posture {
@@ -503,9 +504,38 @@ void emit_snapshot_rows_fsctl(yuzu::CommandContext& ctx, const std::vector<std::
             continue;
         }
 
-        const std::span<const std::byte> payload(buf.data() + kHeaderBytes,
-                                                  returned - kHeaderBytes);
-        const SnapshotNames names = parse_gmt_multistring(payload);
+        // CDX-P2-06: the three framing ULONGs were documented but never read,
+        // so the walker parsed everything after the header regardless of what
+        // the driver said the array actually contains. Read them and let them
+        // bound the walk. All three are native-endian in a locally-filled
+        // DeviceIoControl buffer, so memcpy rather than a byte-order helper.
+        ULONG number_of_snapshots = 0;
+        ULONG number_returned = 0;
+        ULONG array_size_bytes = 0;
+        std::memcpy(&number_of_snapshots, buf.data() + 0 * sizeof(ULONG), sizeof(ULONG));
+        std::memcpy(&number_returned, buf.data() + 1 * sizeof(ULONG), sizeof(ULONG));
+        std::memcpy(&array_size_bytes, buf.data() + 2 * sizeof(ULONG), sizeof(ULONG));
+
+        const std::size_t available = returned - kHeaderBytes;
+        // A declared array larger than what was actually returned means the
+        // reply is short: the payload cannot be trusted to be complete.
+        if (static_cast<std::size_t>(array_size_bytes) > available) {
+            any_failure = true;
+            if (first_failure_err == 0)
+                first_failure_err = ERROR_INVALID_DATA;
+            continue;
+        }
+        // Trust the DECLARED length over the returned byte count -- trailing
+        // bytes beyond SnapShotArraySize are not part of the multistring.
+        const std::size_t payload_bytes =
+            array_size_bytes > 0 ? static_cast<std::size_t>(array_size_bytes) : available;
+
+        const std::span<const std::byte> payload(buf.data() + kHeaderBytes, payload_bytes);
+        // NumberOfSnapShotsReturned bounds how many names the array may hold.
+        const SnapshotNames names =
+            parse_gmt_multistring(payload, number_returned > 0
+                                              ? static_cast<std::size_t>(number_returned)
+                                              : 1024);
         if (names.malformed) {
             any_failure = true;
             if (first_failure_err == 0)

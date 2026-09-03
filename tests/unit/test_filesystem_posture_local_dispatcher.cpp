@@ -65,6 +65,32 @@ std::vector<std::string> split_fields_escape_aware(const std::string& row) {
 // let a wrong-prefix row disappear silently instead of failing the shape
 // assertions below, so every row -- not just the ones matching the expected
 // prefix -- must be checked.
+// CDX-P2-03 / K2: the real-action tests below asserted rc and row shape but
+// never result_status, so a leg that reports CONSTRAINED/PARTIAL on a
+// perfectly healthy host passed 238 assertions cleanly. That is exactly how
+// the unbraced-if defect (every macOS snapshots run falsely PARTIAL, with a
+// fabricated "malformed reply buffer" provenance) shipped green.
+//
+// The assertion is deliberately an INVARIANT rather than "status must be OK":
+// a host with a genuinely unreadable volume SHOULD report PARTIAL, and the
+// test must not fail there. What must always hold is that a degraded status
+// is EXPLICABLE FROM THE OUTPUT -- if the run says it degraded, some row has
+// to show it.
+std::vector<std::string> split_row(const std::string& row) {
+    std::vector<std::string> f;
+    std::string cur;
+    for (char c : row) {
+        if (c == '|') {
+            f.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    f.push_back(cur);
+    return f;
+}
+
 std::vector<std::string> captured_rows(const std::string& captured) {
     std::vector<std::string> out;
     std::istringstream ss(captured);
@@ -197,6 +223,12 @@ TEST_CASE("filesystem_posture plugin: mounts action shape", "[filesystem_posture
     // Every host has at least a root mount.
     REQUIRE_FALSE(rows.empty());
 
+    // CDX-P2-03: emit_mounts only degrades when the mount enumeration itself
+    // fails -- and that path emits no rows at all. Rows present therefore
+    // means no degradation is reachable, so a CONSTRAINED status here is a
+    // defect by construction.
+    CHECK(result.result_status != YUZU_RESULT_STATUS_CONSTRAINED);
+
     for (const auto& r : rows) {
         const auto f = split_fields_escape_aware(r);
         REQUIRE(f.size() == 9);
@@ -225,6 +257,21 @@ TEST_CASE("filesystem_posture plugin: quotas action shape", "[filesystem_posture
         CHECK(f[2] == "volume");
         CHECK(one_of(f[3], kQuotaTokens, std::size(kQuotaTokens)));
     }
+
+    // CDX-P2-03: a degraded quota run must be explicable from its own rows.
+    // emit_quotas marks the result partial exactly when a probe returns
+    // permission_denied or unavailable, and both states are visible in the
+    // row's state column -- so CONSTRAINED with every row healthy means the
+    // status is lying.
+    if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
+        bool any_degraded_row = false;
+        for (const auto& r : rows) {
+            const auto f = split_row(r);
+            if (f.size() > 2 && (f[2] == "permission_denied" || f[2] == "unavailable"))
+                any_degraded_row = true;
+        }
+        CHECK(any_degraded_row);
+    }
 }
 
 TEST_CASE("filesystem_posture plugin: snapshots action shape",
@@ -247,6 +294,26 @@ TEST_CASE("filesystem_posture plugin: snapshots action shape",
         REQUIRE(f.size() == 5);
         CHECK(f[0] == "snapshot");
         CHECK(one_of(f[3], kSnapshotKinds, std::size(kSnapshotKinds)));
+    }
+
+    // CDX-P2-03 / K1 REGRESSION PIN: this is the assertion whose absence let
+    // an unbraced `if` report CONSTRAINED/PARTIAL on every macOS snapshots
+    // run, with a fabricated "malformed reply buffer" provenance, while 238
+    // assertions passed. A healthy row is (kind=apfs, detail="-") or the
+    // single genuinely-empty "none" sentinel; if EVERY row is healthy the run
+    // must not claim it degraded.
+    if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
+        bool any_unhealthy_row = false;
+        for (const auto& r : rows) {
+            const auto f = split_row(r);
+            if (f.size() < 5)
+                continue;
+            const bool healthy_named = (f[3] == "apfs" && f[4] == "-");
+            const bool healthy_empty = (f[3] == "none" && f[4] == "no APFS snapshots present");
+            if (!healthy_named && !healthy_empty)
+                any_unhealthy_row = true;
+        }
+        CHECK(any_unhealthy_row);
     }
 }
 

@@ -145,6 +145,12 @@ int emit_quotas(yuzu::CommandContext& ctx) {
         mark_result_partial(ctx, "linux:mountinfo:quotas", std::strerror(errno));
         return 0;
     }
+    // CDX-P2-05: emit_mounts already reports this; quotas must too, or a
+    // truncated mountinfo silently narrows the set of volumes probed and the
+    // run still reports clean success.
+    if (read_truncated) {
+        mark_result_partial(ctx, "linux:mountinfo", "file exceeded 4 MiB read cap");
+    }
 
     const MountinfoParse parse = parse_proc_mountinfo(text);
 
@@ -236,6 +242,11 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
         write_snapshot_row(ctx, "-", "-", "none",
                            "could not read /proc/self/mountinfo: " + why);
         return 0;
+    }
+    // CDX-P2-05: a truncated read means the snapshot-capability answer was
+    // computed over an incomplete mount list.
+    if (read_truncated) {
+        mark_result_partial(ctx, "linux:mountinfo", "file exceeded 4 MiB read cap");
     }
 
     const MountinfoParse parse = parse_proc_mountinfo(text);
