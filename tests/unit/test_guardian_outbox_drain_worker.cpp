@@ -1580,6 +1580,73 @@ TEST_CASE("item 4: a stalled send is single-flight, never resubmitted while in f
     worker.stop();
 }
 
+TEST_CASE("item 4 regression: a stalled lifecycle send does not starve compliance delivery",
+          "[spark][guardian][drain][chaos]") {
+    // #3847/#2233 item 4, governance Gate 4 unhappy-path finding UP-1 (BLOCKING, found in
+    // this fix's first draft): GuardianOutboxDrainWorker used ONE shared
+    // GuardianOutboxSendExecutor across BOTH the lifecycle log and the compliance/health
+    // log. A slow-but-succeeding lifecycle send made the compliance drain_log_unlocked call
+    // hit the SAME executor's mismatch-orphan branch and return Retain WITHOUT EVER
+    // invoking the compliance send - silent, repeated starvation of an entire audit lane,
+    // not just the stalled entry. Exercises the real GuardianOutboxDrainWorker wiring
+    // (unlike test_guardian_outbox_send_executor.cpp's isolated single-lane coverage),
+    // since the bug lived in the TWO-CALL structure this class routes through, not in the
+    // executor class itself. Fixed by giving each lane its own executor instance.
+    //
+    // Lifecycle is stalled INDEFINITELY (CV-gated, not a fixed sleep): a bounded stall long
+    // enough to exceed kGuardianSendOfferWait once still lets compliance ship as soon as
+    // lifecycle's OWN send finally resolves and its single shared slot frees up - both the
+    // single-executor and two-executor designs would eventually satisfy that. The property
+    // that actually distinguishes them is compliance shipping WHILE lifecycle's send is
+    // STILL provably running - which the single-executor design can never do (the shared
+    // slot stays occupied for the send's whole duration, however long that is).
+    JournalRig rig;
+
+    std::mutex lifecycle_mu;
+    std::condition_variable lifecycle_cv;
+    bool release_lifecycle{false};
+    std::atomic<int> lifecycle_invocations{0};
+    std::atomic<int> compliance_invocations{0};
+    auto send = [&](const OutboxEntry& e) -> SendResult {
+        if (e.domain == OutboxDomain::Lifecycle) {
+            lifecycle_invocations.fetch_add(1);
+            std::unique_lock<std::mutex> lk{lifecycle_mu};
+            lifecycle_cv.wait(lk, [&] { return release_lifecycle; });
+            return SendResult::Sent;
+        }
+        compliance_invocations.fetch_add(1);
+        return SendResult::Sent; // instant
+    };
+
+    GuardianOutboxDrainWorker worker(*rig.rt, send, /*periodic_bound_ms=*/20);
+    worker.start();
+
+    // Lifecycle entry: attach_rule enqueues an "armed" lifecycle entry immediately.
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE(spin_until([&] { return lifecycle_invocations.load() >= 1; }, 3s)); // now stuck
+
+    // Compliance entry: a real drift verdict on a SEPARATE rule, enqueued only AFTER
+    // lifecycle is confirmed stuck - a real drain pass has to run the compliance phase
+    // while lifecycle's slot is still occupied for this to prove anything.
+    REQUIRE(rig.rt->attach_rule("cmp", file_spec("/cmp"), file_exists_rule("cmp"), true));
+    rig.reader->file = read_known(FileSnapshot{.exists = false});
+    rig.rt->evaluate_key(spark_key(file_spec("/cmp")), EvalReason::Convergence);
+
+    // THE regression: compliance ships WHILE lifecycle is still parked (never released).
+    // Pre-fix (one shared executor) this times out - the compliance send is never even
+    // attempted while the shared slot is held by lifecycle's still-running worker.
+    CHECK(spin_until([&] { return compliance_invocations.load() >= 1; }, 3s));
+    CHECK(lifecycle_invocations.load() == 1); // lifecycle's send never resolved during that wait
+
+    {
+        std::lock_guard<std::mutex> lk{lifecycle_mu};
+        release_lifecycle = true;
+    }
+    lifecycle_cv.notify_all();
+    REQUIRE(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+    worker.stop();
+}
+
 // ---------------------------------------------------------------------------
 // Round 4 (#2345 review): lane fairness under the WALL bound, and the
 // headroom/refill contract. Each asserts the mechanism's own observable.
