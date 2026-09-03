@@ -1,6 +1,7 @@
 /**
  * test_filesystem_posture_local_dispatcher.cpp — PKG-CORE (Wave-1): loads
- * the ACTUAL built filesystem_posture plugin (filesystem_posture.dylib/.so)
+ * the ACTUAL built filesystem_posture plugin (filesystem_posture
+ * .dylib/.so/.dll)
  * via PluginHandle::load and drives it through yuzu::agent::LocalDispatcher
  * (test_network_config_local_dispatcher.cpp's pattern), exercising all three
  * actions' real per-OS legs end to end on the build host.
@@ -12,13 +13,21 @@
  * '|' as '\|', so a naive split('|') would overcount fields on any row
  * whose escaped text happens to contain a pipe.
  *
- * POSIX-only (macOS + Linux) -- Windows legs are compile-verified only, not
- * exercised against a live host in this change (see the plugin's own
- * descriptor fallback prose).
+ * RUNS ON ALL THREE PLATFORMS. This TU was previously `#ifndef _WIN32`,
+ * guarded solely by the since-retired "Windows legs are compile-verified
+ * only" stance -- LocalDispatcher and PluginHandle are both platform-neutral,
+ * so nothing technical required the exclusion. That guard is why a Windows
+ * snapshots leg built on FSCTL_SRV_ENUMERATE_SNAPSHOTS -- a control no header
+ * in SDK 10.0.26100.0 declares, so the real path was compiled OUT -- shipped
+ * green: no test ever loaded the Windows plugin.
+ *
+ * Note that the row-shape assertions alone would NOT have caught it: the
+ * compiled-out leg emitted a perfectly well-formed
+ * `snapshot|-|-|none|built without FSCTL_SRV_ENUMERATE_SNAPSHOTS` row. The
+ * assertion that catches it is the BUILD-COMPLETENESS one below, which fails
+ * when a leg reports that its own SDK guard excluded it.
  */
 #include <catch2/catch_test_macros.hpp>
-
-#ifndef _WIN32
 
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
@@ -116,7 +125,9 @@ void require_plugin_or_skip() {
          "test (run from the build root, or via `meson test`, to exercise it)");
 }
 
-#if defined(__APPLE__)
+#if defined(_WIN32)
+constexpr const char* kPluginExt = ".dll";
+#elif defined(__APPLE__)
 constexpr const char* kPluginExt = ".dylib";
 #else
 constexpr const char* kPluginExt = ".so";
@@ -137,6 +148,8 @@ fs::path find_filesystem_posture_plugin() {
     candidates.emplace_back(fs::path{".."} / "agents" / "plugins" / "filesystem_posture" /
                             lib_name);
     candidates.emplace_back(fs::path{"build-macos"} / "agents" / "plugins" /
+                            "filesystem_posture" / lib_name);
+    candidates.emplace_back(fs::path{"build-windows"} / "agents" / "plugins" /
                             "filesystem_posture" / lib_name);
     candidates.emplace_back(fs::path{"build-linux"} / "agents" / "plugins" /
                             "filesystem_posture" / lib_name);
@@ -232,6 +245,16 @@ TEST_CASE("filesystem_posture plugin: mounts action shape", "[filesystem_posture
     // have turned it red for a correct reason. Assert the same
     // explicable-from-the-rows invariant the other two actions use: a degraded
     // mounts run must show a row whose capacity columns degraded to "-".
+    //
+    // POSIX ONLY. On Windows emit_mounts also marks partial for a
+    // FindFirstVolumeW/FindNextVolumeW failure, which is an ENUMERATION-level
+    // degradation with no row of its own -- every row already emitted stays
+    // healthy, so a Windows CONSTRAINED run legitimately shows no degraded
+    // row and this invariant would fail for a correct reason. That is the
+    // same class of mistake as CP-1 (reasoning from one platform's
+    // degradation model and asserting it on another), so it is scoped rather
+    // than weakened for everyone.
+#ifndef _WIN32
     if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
         bool any_degraded_row = false;
         for (const auto& r : rows) {
@@ -241,6 +264,7 @@ TEST_CASE("filesystem_posture plugin: mounts action shape", "[filesystem_posture
         }
         CHECK(any_degraded_row);
     }
+#endif
 
     for (const auto& r : rows) {
         const auto f = split_fields_escape_aware(r);
@@ -276,6 +300,11 @@ TEST_CASE("filesystem_posture plugin: quotas action shape", "[filesystem_posture
     // permission_denied or unavailable, and both states are visible in the
     // row's state column -- so CONSTRAINED with every row healthy means the
     // status is lying.
+    //
+    // POSIX ONLY, for the same reason as the mounts invariant above: the
+    // Windows leg marks partial on a volume-enumeration failure, which is not
+    // visible in any row.
+#ifndef _WIN32
     if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
         bool any_degraded_row = false;
         for (const auto& r : rows) {
@@ -289,6 +318,23 @@ TEST_CASE("filesystem_posture plugin: quotas action shape", "[filesystem_posture
         }
         CHECK(any_degraded_row);
     }
+#endif
+
+    // BUILD-COMPLETENESS (Windows). A row whose detail says the leg was built
+    // without its own SDK header means the __has_include guard excluded the
+    // real implementation and this build ships a permanent stub. That is a
+    // BUILD defect, not a host condition, so it fails here rather than being
+    // reported as a runtime degradation an operator might rationalise away.
+    // quota row: quota|mount|volume|state|limit|reserved|detail -> detail is f[6].
+#ifdef _WIN32
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        if (f.size() > 6) {
+            INFO("quota row: " << r);
+            CHECK(f[6].find("built without") == std::string::npos);
+        }
+    }
+#endif
 }
 
 TEST_CASE("filesystem_posture plugin: snapshots action shape",
@@ -319,6 +365,13 @@ TEST_CASE("filesystem_posture plugin: snapshots action shape",
     // assertions passed. A healthy row is (kind=apfs, detail="-") or the
     // single genuinely-empty "none" sentinel; if EVERY row is healthy the run
     // must not claim it degraded.
+    //
+    // Scoped to __APPLE__: both "healthy" shapes it tests for are literally
+    // the macOS leg's (kind "apfs", and that leg's exact empty sentinel), so
+    // on any other platform it is satisfied by construction and asserts
+    // nothing. Naming the scope keeps that honest instead of leaving it
+    // looking like a cross-platform invariant.
+#ifdef __APPLE__
     if (result.result_status == YUZU_RESULT_STATUS_CONSTRAINED) {
         bool any_unhealthy_row = false;
         for (const auto& r : rows) {
@@ -332,6 +385,25 @@ TEST_CASE("filesystem_posture plugin: snapshots action shape",
         }
         CHECK(any_unhealthy_row);
     }
+#endif
+
+    // BUILD-COMPLETENESS (Windows) -- THE REGRESSION PIN FOR THIS LEG.
+    // The retired FSCTL_SRV_ENUMERATE_SNAPSHOTS implementation emitted a
+    // well-formed `snapshot|-|-|none|built without FSCTL_SRV_ENUMERATE_SNAPSHOTS`
+    // row on every run, because no header in SDK 10.0.26100.0 declares that
+    // control, so its #ifdef compiled the real path out. Every shape and
+    // vocabulary assertion above passed on it. This is the assertion that
+    // fails on a leg whose SDK guard excluded its own implementation.
+    // snapshot row: snapshot|mount|name|kind|detail -> detail is f[4].
+#ifdef _WIN32
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        if (f.size() > 4) {
+            INFO("snapshot row: " << r);
+            CHECK(f[4].find("built without") == std::string::npos);
+        }
+    }
+#endif
 }
 
-#endif // !_WIN32
+// (end of the formerly Windows-excluded region -- see the banner)
