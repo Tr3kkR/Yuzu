@@ -4570,9 +4570,12 @@ public:
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
             // versions. The CA root key itself is a 0600 file via default_certs, never in this
-            // DB. Born-on-PG like the other migrated stores: fail-closed on open, then a
-            // MANDATORY backfill of the legacy ca.db (issued-cert + CRL history is compliance
-            // evidence, ADR-0053 — refuse boot rather than serve a knowingly-incomplete trail).
+            // DB. Born-on-PG like the other migrated stores: fail-closed on open. NO backfill
+            // (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the legacy ca.db is
+            // never copied; the detect-and-warn obligation still applies (issued-cert/CRL
+            // history is compliance evidence, not expendable telemetry), so
+            // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file read-only and
+            // warns (with a row count) only if it actually holds rows.
             if (pg_pool_ && !startup_failed_) {
                 ca_store_ = std::make_unique<CaStore>(*pg_pool_);
                 if (!ca_store_->is_open()) {
@@ -4581,17 +4584,9 @@ public:
                                   "created/opened)");
                     startup_failed_ = true;
                 } else {
-                    auto ca_db = cfg_.db_dir() / "ca.db";
-                    if (!ca_store_->migrate_from_sqlite(ca_db)) {
-                        spdlog::error("[PG] Refusing to start: ca store backfill from legacy {} "
-                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
-                                      "log lines). The issued-cert/CRL evidence chain must be "
-                                      "complete before serving; the next boot retries. Operator "
-                                      "remediation: repair the file, or quarantine it aside if it "
-                                      "is unrecoverable.",
-                                      ca_db.string());
-                        startup_failed_ = true;
-                    }
+                    legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "ca.db", "CaStore",
+                                                             {"ca_root", "ca_issued",
+                                                              "ca_crl_versions"});
                 }
             }
             // PR 10 hardening — wire AuditStore into FleetTopologyStore

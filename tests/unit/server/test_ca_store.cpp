@@ -13,11 +13,11 @@
  *  - CRL numbering + record/latest roundtrip, publish_next_crl atomic allocation,
  *    record_crl's duplicate-version refusal.
  *
- * No legacy-SQLite backfill test coverage: the dedicated backfill TEST_CASE suite
- * (ADR-0009/0053) was removed as part of a fresh-start-by-default policy change
- * (ADR-0009 amendment, 2026-08-25) -- no production fleet has ever run a
- * pre-Postgres build. CaStore::migrate_from_sqlite() itself is UNCHANGED and
- * still present (its removal is a separate, later step).
+ * No legacy-SQLite backfill test coverage: `CaStore::migrate_from_sqlite()` itself was retired
+ * (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0053 Update, 2026-09-03) -- no production
+ * fleet has ever run a pre-Postgres build, so the mandatory three-table fingerprinted backfill
+ * never had real legacy data to protect. `server.cpp` now runs
+ * `legacy_sqlite_probe::warn_if_legacy_rows` over the three legacy tables instead.
  *
  * Migrated-to-Postgres store (ADR-0012 §1, authoritative/fail-hard). PG-gated: skips when
  * YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken (test_helpers.hpp skip-vs-fail
