@@ -236,7 +236,12 @@ int emit_quotas(yuzu::CommandContext& ctx) {
     if (any_dev_probed && all_dev_permission_denied) {
         // Positioned LAST so this more actionable provenance survives
         // last-writer-wins when both fire.
-        mark_result_partial(ctx, "linux:quotactl", "quota query requires CAP_SYS_ADMIN");
+        // CP-1 (Gate 3, cross-platform): this branch has already CLASSIFIED the
+        // cause -- every probed device returned EPERM/EACCES -- so it reports
+        // PERMISSION_DENIED rather than generic CONSTRAINED. The sibling
+        // any_quota_failure branch below deliberately does NOT: its causes are
+        // mixed, and claiming a denial there would be a guess.
+        mark_result_denied(ctx, "linux:quotactl", "quota query requires CAP_SYS_ADMIN");
     } else if (any_quota_failure) {
         mark_result_partial(ctx, "linux:quotactl",
                             "quota query failed on at least one volume");

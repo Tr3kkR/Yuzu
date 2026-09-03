@@ -6,9 +6,13 @@
  * Section (E1): parser fixtures driven from the REAL captures at
  * scratchpad/devteam-wave6-1b-fsposture/captures/ (see captures/PROVENANCE.md
  * for the full provenance table); each fixture below carries that file's
- * label verbatim in a comment. One group is NOT capture-backed and is
- * labelled accordingly: classify_quotactl_errno's non-observed errno rows
- * (documented-inference from quotactl(2), peer M7). The former
+ * label verbatim in a comment. SEVERAL groups are not capture-backed, and
+ * each is labelled at its own fixture rather than counted here — the
+ * non-observed errno rows of classify_quotactl_errno and
+ * classify_getattrlist_quota, parse_btrfs_super_options,
+ * is_device_mapper_source, and the mountinfo malformed probe. (An earlier
+ * revision of this sentence claimed exactly one such group, which was already
+ * false when written — governance Gate 3, quality-engineer.) The former
  * parse_gmt_multistring synthetic round-trip was removed with its parser
  * when the Windows snapshots leg moved to VSS/COM (verified on a live
  * Windows host 2026-09-03), so no synthetic fixture remains here.

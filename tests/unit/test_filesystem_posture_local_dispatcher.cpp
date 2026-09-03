@@ -85,6 +85,10 @@ std::vector<std::string> split_fields_escape_aware(const std::string& row) {
 // test must not fail there. What must always hold is that a degraded status
 // is EXPLICABLE FROM THE OUTPUT -- if the run says it degraded, some row has
 // to show it.
+// Every caller sits inside #ifndef _WIN32 / #ifdef __APPLE__, so on the MSVC
+// leg this would be an unreferenced static function — silent at /W3 but
+// -Wunused-function under clang-cl (Gate 3, cpp-expert).
+#ifndef _WIN32
 std::vector<std::string> split_row(const std::string& row) {
     std::vector<std::string> f;
     std::string cur;
@@ -99,6 +103,7 @@ std::vector<std::string> split_row(const std::string& row) {
     f.push_back(cur);
     return f;
 }
+#endif // !_WIN32
 
 std::vector<std::string> captured_rows(const std::string& captured) {
     std::vector<std::string> out;
@@ -205,6 +210,13 @@ int exercise_mark_result_partial(YuzuCommandContext* raw, const char* /*action*/
     return 0;
 }
 
+int exercise_mark_result_denied(YuzuCommandContext* raw, const char* /*action*/,
+                                const YuzuParam* /*params*/, std::size_t /*param_count*/) {
+    yuzu::CommandContext ctx{raw};
+    yuzu::filesystem_posture::mark_result_denied(ctx, "denied", "access denied");
+    return 0;
+}
+
 } // namespace
 
 TEST_CASE("filesystem_posture: mark_result_partial's degraded status and last-writer provenance "
@@ -219,6 +231,25 @@ TEST_CASE("filesystem_posture: mark_result_partial's degraded status and last-wr
     CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(result.result_provenance == "second");
+}
+
+// QE-2 (Gate 3, quality-engineer): mark_result_denied is the whole of SG-2's
+// closure — the descriptor and four operator-facing docs state that a denied
+// read reports `permission_denied`, and before this test nothing asserted the
+// helper set that status rather than CONSTRAINED. Platform-neutral: a synthetic
+// descriptor through LocalDispatcher, no OS call and no plugin load.
+TEST_CASE("filesystem_posture: mark_result_denied reports PERMISSION_DENIED, not CONSTRAINED",
+         "[filesystem_posture][status]") {
+    YuzuPluginDescriptor descriptor{};
+    descriptor.execute = &exercise_mark_result_denied;
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(&descriptor, "probe");
+
+    CHECK(result.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
+    CHECK(result.result_status != YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "denied");
 }
 
 TEST_CASE("filesystem_posture plugin: mounts action shape", "[filesystem_posture][posix_actions]") {

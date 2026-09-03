@@ -10,9 +10,9 @@
  */
 #pragma once
 
+#include <cstddef> // std::size_t, std::byte -- previously transitive via <span>/<vector>
 #include <cstdint>
 #include <cstring>
-#include <optional>
 #include <span>
 #include <string>
 #include <string_view>

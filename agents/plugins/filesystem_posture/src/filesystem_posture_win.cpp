@@ -11,13 +11,19 @@
  * asserted against a host with quotas configured, so their runtime
  * behaviour past "it runs" is still unproven.
  *
- * Two SDK surfaces are soft-guarded because their availability at build time
- * is not something a non-Windows host can verify, and neither guard's failure
- * is allowed to silently look like success:
- *   - `<dskquota.h>` (quota state) via `__has_include`; a build lacking it
- *     reports every volume `unavailable` and degrades the result.
- *   - `<vsbackup.h>` (VSS shadow-copy enumeration) via `__has_include`; a
- *     build lacking it reports the same way.
+ * Two SDK surfaces are soft-guarded via `__has_include`, and neither guard's
+ * failure is allowed to silently look like success:
+ *   - `<dskquota.h>` (quota state); a build lacking it reports every volume
+ *     `unavailable` and degrades the result. This one degrades GRACEFULLY:
+ *     dskquota needs no dedicated import library.
+ *   - `<vsbackup.h>` (VSS shadow-copy enumeration); the guarded fallback emits
+ *     an honest `none` row. **In practice that fallback is unreachable**, and
+ *     saying otherwise would overstate it (governance Gate 3,
+ *     plugin-developer): meson requires `vssapi` unconditionally on Windows,
+ *     and an SDK without `<vsbackup.h>` has no `vssapi.lib` either, so such a
+ *     build fails at CONFIGURE time and never reaches this code. The guard is
+ *     kept as defence in depth and to keep the TU self-describing, not because
+ *     it is a supported configuration.
  *
  * Snapshots do NOT use `FSCTL_SRV_ENUMERATE_SNAPSHOTS`, which an earlier
  * revision of this file did. That control is not declared by ANY header in
@@ -316,6 +322,10 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
     bool any_ntfs = false;
     bool any_success = false;
     bool any_quota_failure = false; // ANY degraded volume, not only an all-failed walk
+    // CP-1 (Gate 3): the per-volume loop already distinguishes E_ACCESSDENIED,
+    // but the summary below reported every cause as generic CONSTRAINED. Track
+    // whether a denial was actually seen so the reported STATUS can say so.
+    bool any_permission_denied = false;
 
     for (const auto& vol : volumes) {
         const std::wstring mount_w = primary_mount_point(vol);
@@ -376,6 +386,7 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
         const auto write_hresult_failure = [&](HRESULT failed_hr) {
             any_quota_failure = true; // G4-01: every HRESULT failure degrades the run
             if (failed_hr == E_ACCESSDENIED) {
+                any_permission_denied = true;
                 write_quota_row(ctx, mp, QuotaState::PermissionDenied, std::nullopt, std::nullopt,
                                 "-");
             } else {
@@ -451,11 +462,24 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
     // volume masked E_ACCESSDENIED on every peer -- the ordinary posture for a
     // non-Administrator agent identity. Report any failure, and keep the
     // all-failed message distinct because it is the more actionable one.
+    //
+    // CP-1: where a denial was actually observed, report PERMISSION_DENIED
+    // rather than generic CONSTRAINED -- the all-failed case is the ordinary
+    // posture for a non-Administrator agent identity, so collapsing it to
+    // CONSTRAINED hid the single most actionable cause. A mixed walk with no
+    // denial seen stays CONSTRAINED: claiming a denial there would be a guess.
     if (any_ntfs && !any_success) {
-        mark_result_partial(ctx, "windows:dskquota", "quota query failed on every NTFS volume");
+        const char* detail = "quota query failed on every NTFS volume";
+        if (any_permission_denied)
+            mark_result_denied(ctx, "windows:dskquota", detail);
+        else
+            mark_result_partial(ctx, "windows:dskquota", detail);
     } else if (any_quota_failure) {
-        mark_result_partial(ctx, "windows:dskquota",
-                            "quota query failed on at least one NTFS volume");
+        const char* detail = "quota query failed on at least one NTFS volume";
+        if (any_permission_denied)
+            mark_result_denied(ctx, "windows:dskquota", detail);
+        else
+            mark_result_partial(ctx, "windows:dskquota", detail);
     }
 }
 
@@ -501,12 +525,19 @@ void emit_quota_rows_dskquota(yuzu::CommandContext& ctx, const std::vector<std::
 
 /// RAII owner for the heap strings VSS allocates into a VSS_SNAPSHOT_PROP.
 /// Next() fills a fresh property block on every iteration, so this must free
-/// on every exit from the turn on which it is CONSTRUCTED -- the normal end of
-/// the walk, the cap `break`, and any early exit added below it. The one
-/// `continue` above it deliberately constructs no owner and frees nothing; see
-/// the trade-off note at that branch. (An earlier revision of this comment
-/// claimed it freed on "every loop turn, including the early-continue paths",
-/// which the skip path contradicts -- governance Gate 2, docs-writer.)
+/// on every exit from the turn on which it is CONSTRUCTED. It is constructed
+/// immediately after a successful fetch and BEFORE every other decision, so
+/// the failed-status `break`, the cap `break`, the normal end of the walk, and
+/// any check added later are all covered by construction. The one `continue`
+/// -- the non-snapshot skip -- runs on a turn where no owner was constructed
+/// at all; see the trade-off note at that branch.
+///
+/// Two earlier revisions of this comment were wrong in opposite directions,
+/// which is why the ordering is spelled out rather than asserted: one claimed
+/// it freed on "every loop turn, including the early-continue paths" (the skip
+/// path contradicts that -- Gate 2, docs-writer), and the code then briefly
+/// checked the cap BEFORE constructing the owner, making the cap `break` leak
+/// (Gate 3, cpp-safety and cpp-expert, independently).
 /// Unwrapped manual cleanup in new C++ is a governance policy floor, not a
 /// style preference.
 class ScopedSnapshotProp {
@@ -524,7 +555,7 @@ private:
 
 std::string guid_to_string(const GUID& g) {
     wchar_t buf[64] = {};
-    if (::StringFromGUID2(g, buf, 64) == 0) return "-";
+    if (::StringFromGUID2(g, buf, static_cast<int>(std::size(buf))) == 0) return "-";
     return yuzu::win::from_wide(buf);
 }
 
@@ -625,10 +656,12 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
         VSS_OBJECT_PROP prop{};
         ULONG fetched = 0;
         const HRESULT next_hr = snapshots->Next(1, &prop, &fetched);
-        if (next_hr != S_OK || fetched != 1) {
-            // S_FALSE with a zero fetch is the normal end of the walk; a
-            // genuinely FAILED result is a partial read and must not be
-            // allowed to read as "no more snapshots".
+
+        // `fetched`, NOT the HRESULT, decides whether the provider wrote
+        // anything into `prop`. A zero fetch (S_FALSE) is the normal end of
+        // the walk and leaves nothing to own; a genuinely FAILED result is a
+        // partial read and must not be allowed to read as "no more snapshots".
+        if (fetched != 1) {
             if (FAILED(next_hr)) {
                 enum_failed = true;
                 enum_hr = next_hr;
@@ -636,15 +669,39 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
             break;
         }
 
-        // Bound the WALK here, before any type dispatch, so every turn counts
-        // toward the ceiling whatever the provider returned.
+        // OWNERSHIP IS TAKEN HERE, before ANY other decision, and that
+        // ordering is the whole point -- governance Gate 3 (cpp-safety and
+        // cpp-expert, independently) found that an earlier revision checked
+        // the walk ceiling BEFORE constructing the owner, so the truncation
+        // `break` discarded a fully-populated property block that nothing ever
+        // freed. Every check below is therefore safe to add: the owner is
+        // already alive on every path out of this turn.
+        //
+        // std::optional is what makes the ownership CONDITIONAL without a
+        // second owner type: ScopedSnapshotProp is non-copyable and
+        // non-movable, and emplace() constructs it in place.
+        const bool is_snapshot = (prop.Type == VSS_OBJECT_SNAPSHOT);
+        std::optional<ScopedSnapshotProp> owner;
+        if (is_snapshot)
+            owner.emplace(prop.Obj.Snap);
+
+        // A populated entry delivered alongside a failed status: own it (above)
+        // and then stop.
+        if (FAILED(next_hr)) {
+            enum_failed = true;
+            enum_hr = next_hr;
+            break;
+        }
+
+        // Bound the WALK, counted in loop turns rather than emitted rows, so
+        // the skip below cannot bypass the ceiling.
         if (++iterations > kMaxSnapshots) {
             truncated = true;
             break;
         }
 
         // Only a snapshot-typed property owns snapshot strings, so such an
-        // entry is skipped WITHOUT constructing the RAII owner.
+        // entry is skipped and no owner was constructed for it above.
         //
         // DELIBERATE TRADE-OFF, adjudicated at governance Gate 2 by
         // security-guardian (NOT self-granted -- the policy floor on non-RAII
@@ -666,12 +723,11 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
         // CoTaskMemFree (VSS publishes no VssFreeProviderProperties). Left out
         // of this change because it is ~6 lines of untestable code on a branch
         // no query can reach; filed as a follow-up.
-        if (prop.Type != VSS_OBJECT_SNAPSHOT) {
+        if (!is_snapshot) {
             skipped_wrong_type = true;
             continue;
         }
 
-        const ScopedSnapshotProp owner(prop.Obj.Snap);
         const VSS_SNAPSHOT_PROP& snap = prop.Obj.Snap;
 
         // m_pwszOriginalVolumeName is a volume GUID path in exactly the form
@@ -696,10 +752,22 @@ void emit_snapshot_rows_vss(yuzu::CommandContext& ctx) {
         // Rows already emitted are real; only a walk that produced nothing
         // needs the `none` sentinel to carry the failure.
         if (emitted == 0) write_snapshot_row(ctx, "-", "-", "none", detail);
-        mark_result_partial(ctx, "windows:vss", detail);
+        // Mirror the `fail` lambda's routing. Raised independently by
+        // cpp-safety and plugin-developer at Gate 3: without this branch a
+        // denial arriving MID-walk logged "requires administrative rights"
+        // while the typed status said CONSTRAINED -- the exact prose/status
+        // divergence the PERMISSION_DENIED work existed to close, surviving in
+        // the one site the first fix did not reach.
+        if (enum_hr == E_ACCESSDENIED)
+            mark_result_denied(ctx, "windows:vss", detail);
+        else
+            mark_result_partial(ctx, "windows:vss", detail);
         return;
     }
-    if (emitted == 0) {
+    // Gate 3 (cpp-safety F3): only claim an empty machine when the walk
+    // actually completed. A truncated walk that emitted nothing is not "no
+    // shadow copies present".
+    if (emitted == 0 && !truncated) {
         write_snapshot_row(ctx, "-", "-", "none", "no shadow copies present on any volume");
     }
     // mark_result_partial ASSIGNS -- last writer wins for the reported

@@ -210,7 +210,14 @@ int emit_quotas(yuzu::CommandContext& ctx) {
         // permission-denied or unavailable probe would otherwise be reported as
         // a clean run. UnsupportedFs is NOT a degradation: it is a truthful,
         // complete answer for a filesystem that has no volume quotas.
-        if (state == QuotaState::PermissionDenied || state == QuotaState::Unavailable) {
+        // CP-1 (Gate 3, cross-platform): classify_getattrlist_quota has already
+        // distinguished a denial (EPERM/EACCES) from a generic unavailability,
+        // so the reported STATUS distinguishes them too rather than collapsing
+        // both to CONSTRAINED.
+        if (state == QuotaState::PermissionDenied) {
+            mark_result_denied(ctx, "macos:getattrlist",
+                               std::string(s.f_mntonname) + ": " + std::strerror(err));
+        } else if (state == QuotaState::Unavailable) {
             mark_result_partial(ctx, "macos:getattrlist",
                                 std::string(s.f_mntonname) + ": " + std::strerror(err));
         }
@@ -247,9 +254,18 @@ int emit_snapshots(yuzu::CommandContext& ctx) {
         // volume roots, so this is safe by construction.
         yuzu::agent::ScopedFd fd(::open(s.f_mntonname, O_RDONLY));
         if (!fd) {
+            const int open_err = errno; // capture before anything else can clobber it
             any_failure = true;
-            mark_result_partial(ctx, "macos:fs_snapshot_list",
-                                std::string(s.f_mntonname) + ": " + std::strerror(errno));
+            // CP-1 (Gate 3): EACCES/EPERM on the volume root is a privilege
+            // denial and is reported as one; every other errno stays a generic
+            // degradation, because guessing a cause from an unrelated errno is
+            // exactly the over-attribution Gate 2 flagged elsewhere.
+            const std::string detail =
+                std::string(s.f_mntonname) + ": " + std::strerror(open_err);
+            if (open_err == EACCES || open_err == EPERM)
+                mark_result_denied(ctx, "macos:fs_snapshot_list", detail);
+            else
+                mark_result_partial(ctx, "macos:fs_snapshot_list", detail);
             continue;
         }
 
