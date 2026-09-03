@@ -250,8 +250,8 @@ struct ArmDispatchResult {
 /// `ArmDispatchResult` -- that struct has no concept of "the gate itself
 /// degraded" separate from a specific-quarantine denial (both fold into its
 /// `denied_quarantined_count`); this field is derived here, at the
-/// `resolve_and_dispatch_confined`/`wire_and_dispatch_confined` layer, from
-/// `gate.fail_closed` directly -- see its own doc comment below.
+/// `resolve_and_dispatch_confined`/`wire_and_dispatch_confined` layer, as
+/// `gate.enforced && gate.fail_closed` -- see its own doc comment below.
 struct ConfinedDispatchOutcome {
     int sent = 0;
     std::optional<std::string> scope_parse_error;
