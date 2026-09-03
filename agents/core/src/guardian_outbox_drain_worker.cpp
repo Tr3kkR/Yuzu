@@ -102,23 +102,26 @@ void GuardianOutboxDrainWorker::start() {
         }
         sig->cv.notify_all();
     });
-    // GuardianOutboxSendExecutor::set_completion_waker() exists (governance Gate 6 sre
-    // finding: a completed send whose result arrives AFTER wrapped_send()'s own bounded
-    // per-attempt wait already gave up would otherwise only be noticed on the next
-    // enqueue wake or the periodic backstop) but is deliberately NOT wired here. Wiring
-    // it made EVERY completed send bump sig_->gen and wake loop() immediately - which
-    // empirically broke "R4: a refill re-arm does not wait out the periodic bound"
+    // No completion-waker is wired here: a completed send whose result arrives AFTER
+    // wrapped_send()'s own bounded per-attempt wait (kGuardianSendOfferWait, 200ms)
+    // already gave up is only noticed on the next enqueue wake or the periodic
+    // backstop (periodic_bound_ms_, kDefaultPeriodicBoundMs = 5000ms in production) -
+    // a real cadence regression versus pre-fix behavior (governance Gate 6 sre
+    // finding). A WakeFn callback was built and wired once (stored in
+    // GuardianOutboxSendExecutor::State, called right after that class's own
+    // state_->cv.notify_all() in launch()'s worker lambda, under the same lock that
+    // publishes done=true) and made EVERY completed send bump sig_->gen and wake loop()
+    // immediately. That broke "R4: a refill re-arm does not wait out the periodic bound"
     // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
     // loop re-arms a forced page from ITS OWN internal refill logic with NO external
-    // wake, and the extra per-send wakes this introduced raced ahead of that logic,
-    // consuming/reordering the observable the test depends on. Reverted for the same
-    // reason offer()'s wake-on-stopping was reverted above: the benefit (avoiding a
-    // cadence-interval's worth of latency on an already-rare slow-but-healthy send) is
-    // smaller than the risk of redesigning another load-bearing pre-existing timing
-    // test in this file under this PR's own time budget. Left as a note for whoever
-    // revisits this trade-off - the mechanism exists and works in isolation (see
-    // guardian_outbox_send_executor.hpp / test_guardian_outbox_send_executor.cpp), it
-    // just is not safe to wire into THIS worker's cadence without also auditing every
+    // wake. Disabling the callback made the test pass again 4/4; the exact mechanism by
+    // which the extra per-send wakes broke it was not diagnosed. Reverted for the same
+    // reason offer()'s wake-on-stopping was reverted in
+    // guardian_outbox_send_executor.hpp's offer()/wait_until comment: the regression's
+    // cost is judged smaller than the risk of redesigning another load-bearing
+    // pre-existing timing test in this file under this PR's own time budget. The
+    // callback and its wiring were fully removed (not merely disabled) - left as a note
+    // for whoever revisits this trade-off, since re-adding it means also auditing every
     // existing test that assumes loop() wakes ONLY on enqueue/notify()/periodic-bound.
     thread_ = std::thread([this] {
         // TOP-LEVEL firewall. The inner passes are each firewalled, but the loop's own tail -

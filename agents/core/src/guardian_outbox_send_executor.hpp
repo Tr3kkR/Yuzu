@@ -183,21 +183,23 @@ public:
 
     // NOT PROVIDED: a callback fired after every completed send, so the caller's own
     // wake mechanism (e.g. the drain worker's Signal cv/gen) could learn promptly that
-    // a result is available even past offer()'s own bounded wait having given up -
-    // closing a throughput cliff a merely-slow-but-healthy connection would otherwise
-    // see degraded to the caller's backstop cadence (governance Gate 6 sre finding).
+    // a result is available even past offer()'s own bounded wait having given up. Its
+    // absence is a real cadence regression versus pre-fix behavior, not just a missed
+    // optimization: a send that runs longer than the caller's own bounded wait but
+    // still succeeds isn't re-checked until the caller's next enqueue or periodic
+    // backstop, where pre-fix (a blocking inline call) the next tick started as soon
+    // as the send returned (governance Gate 6 sre finding).
     // Built and wired once (a WakeFn callback stored in State, called right after this
     // class's own state_->cv.notify_all() in launch()'s worker lambda, under the same
-    // lock that publishes done=true); reverted because waking the drain worker's
-    // loop() on EVERY completed send - not just enqueues/notify()/the periodic bound -
-    // broke a load-bearing pre-existing timing test, "R4: a refill re-arm does not
-    // wait out the periodic bound" (test_guardian_outbox_drain_worker.cpp), whose
-    // whole point is proving loop() re-arms a forced page from its OWN internal logic
-    // with NO external wake; the extra per-send wakes raced ahead of that logic. The
-    // sre finding's cost (a cadence interval's worth of latency on an already-rare
-    // slow-but-healthy send, unreachable in production today) is smaller than the risk
-    // of redesigning ANOTHER load-bearing pre-existing test under this PR's own time
-    // budget - left here as a note for whoever revisits this trade-off.
+    // lock that publishes done=true); reverted after it empirically broke a
+    // load-bearing pre-existing timing test, "R4: a refill re-arm does not wait out
+    // the periodic bound" (test_guardian_outbox_drain_worker.cpp), whose whole point
+    // is proving loop() re-arms a forced page from its OWN internal logic with NO
+    // external wake. Disabling the callback made the test pass again 4/4; the exact
+    // mechanism by which the extra per-send wakes broke it was not diagnosed. The
+    // regression's cost is judged smaller than the risk of redesigning ANOTHER
+    // load-bearing pre-existing test under this PR's own time budget - left here as a
+    // note for whoever revisits this trade-off.
 
     /// For GuardianEngine::active_io_workers() (the orphan-exit contract's sole
     /// source of truth) - normally 0 or 1 (this executor is single-flight in the
