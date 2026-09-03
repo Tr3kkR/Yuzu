@@ -37,18 +37,38 @@ SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar, std:
 
 bool replace_signature_sidecar(const std::filesystem::path& sidecar,
                                const std::string& signature_pem) {
-    std::error_code stale_ec;
-    std::filesystem::remove(sidecar, stale_ec);
+    if (signature_pem.empty()) {
+        // Genuinely unsigned now: remove any predecessor. This is the case that
+        // must never be skipped — see the header.
+        std::error_code stale_ec;
+        std::filesystem::remove(sidecar, stale_ec);
+        return true;
+    }
 
-    if (signature_pem.empty())
-        return true; // the package is now honestly unsigned
+    // ATOMIC REPLACE, not remove-then-write. CheckForUpdate reads this path
+    // concurrently, so a remove followed by a write publishes a window in which
+    // the package is served UNSIGNED — brief, but an agent that polls inside it
+    // is refused under --update-require-signature, and the operator sees a
+    // spurious refusal with no cause to point at. Writing a sibling and renaming
+    // means a reader sees either the old signature or the new one, never neither.
+    auto tmp = sidecar;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (out)
+            out.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
+        if (!out) {
+            std::error_code rm_ec;
+            std::filesystem::remove(tmp, rm_ec);
+            return false;
+        }
+    } // closed before the rename: a rename over an open handle is not portable
 
-    std::ofstream out(sidecar, std::ios::binary | std::ios::trunc);
-    if (out)
-        out.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
-    if (!out) {
+    std::error_code ren_ec;
+    std::filesystem::rename(tmp, sidecar, ren_ec);
+    if (ren_ec) {
         std::error_code rm_ec;
-        std::filesystem::remove(sidecar, rm_ec);
+        std::filesystem::remove(tmp, rm_ec);
         return false;
     }
     return true;

@@ -158,3 +158,32 @@ TEST_CASE("sidecar: a signed re-upload replaces the previous signature", "[ota][
     REQUIRE(read_signature_sidecar(sig, out) == SidecarOutcome::kServed);
     CHECK(out == "new"); // not appended, not stale
 }
+
+TEST_CASE("sidecar: a signed replace never publishes an unsigned window",
+          "[ota][sidecar]") {
+    // CheckForUpdate reads this path concurrently, so a remove-then-write
+    // publishes a brief window in which the package is served UNSIGNED — an
+    // agent polling inside it is refused under --update-require-signature, with
+    // no cause an operator can point at. The replace is therefore write-sibling
+    // -then-rename. What this pins is the observable consequence: no temp file
+    // is left behind, and the sidecar is readable and correct immediately after.
+    Dir d;
+    const auto sig = d.p / "pkg.sig";
+    REQUIRE(replace_signature_sidecar(sig, "v1"));
+
+    REQUIRE(replace_signature_sidecar(sig, "v2"));
+    std::string out;
+    REQUIRE(read_signature_sidecar(sig, out) == SidecarOutcome::kServed);
+    CHECK(out == "v2");
+
+    // The staging sibling must not survive — a stray "<pkg>.sig.tmp" would be
+    // mistaken for a package named "<pkg>.sig" by a later directory listing.
+    CHECK_FALSE(fs::exists(d.p / "pkg.sig.tmp"));
+
+    int entries = 0;
+    for (const auto& e : fs::directory_iterator(d.p)) {
+        (void)e;
+        ++entries;
+    }
+    CHECK(entries == 1); // exactly the sidecar
+}

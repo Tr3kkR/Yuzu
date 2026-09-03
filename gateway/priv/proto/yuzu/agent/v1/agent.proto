@@ -274,9 +274,14 @@ message CheckForUpdateResponse {
   int64  file_size        = 6;  // Binary size in bytes
 
   // Detached PEM CMS signature over the binary (#416/#3807). Vendored copy kept
-  // in step with proto/yuzu/agent/v1/agent.proto: the gateway proxies these
-  // messages opaquely today, but a regeneration against a stale copy would drop
-  // the field and silently strip signatures in transit.
+  // in step with proto/yuzu/agent/v1/agent.proto.
+  //
+  // The gateway does NOT proxy the OTA RPCs today — yuzu_gw_agent_service.erl
+  // exports register/subscribe/heartbeat/execute_command/report_inventory and
+  // nothing else, so a gateway-fronted agent cannot complete an OTA pull at all.
+  // The mirrors are kept in step anyway because gpb silently drops any field
+  // absent from a module's vendored proto: if the OTA RPCs are ever proxied, a
+  // stale copy would strip signatures in transit rather than fail loudly.
   bytes  update_signature = 7;
 }
 
