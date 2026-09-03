@@ -321,8 +321,10 @@ TEST_CASE("UpdateRegistry: a store that fails to open degrades every method to a
 
     CHECK(reg.list_packages().empty());
     CHECK_FALSE(reg.latest_for("windows", "x86_64").has_value());
-    // Neither call should throw or crash against a never-opened store.
-    REQUIRE(reg.upsert_package(make_pkg()));
+    // Neither call should throw or crash against a never-opened store, and the
+    // write must REPORT that it did not commit — the degrade is the behaviour
+    // under test, so asserting the false is stronger than discarding it.
+    CHECK_FALSE(reg.upsert_package(make_pkg()));
     reg.remove_package("windows", "x86_64", "0.1.0");
     CHECK(reg.list_packages().empty());
 }
@@ -352,7 +354,7 @@ TEST_CASE("UpdateRegistry: read and write degrade counters increment on a store 
                           {{"reason", "store_not_open"}})
               .value() == 1.0);
 
-    REQUIRE(reg.upsert_package(make_pkg()));
+    CHECK_FALSE(reg.upsert_package(make_pkg()));
     CHECK(metrics.counter("yuzu_server_update_registry_write_degrade_total",
                           {{"reason", "store_not_open"}})
               .value() == 1.0);
