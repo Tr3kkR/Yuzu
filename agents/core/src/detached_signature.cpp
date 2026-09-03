@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <cstdint>
+#include <cstdio> // SEEK_SET / SEEK_CUR
 #include <limits>
 #include <memory>
 

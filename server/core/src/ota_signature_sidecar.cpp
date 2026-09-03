@@ -16,7 +16,15 @@ SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar, std:
     out.clear();
 
     std::error_code exists_ec;
-    if (!std::filesystem::exists(sidecar, exists_ec) || exists_ec)
+    const bool present = std::filesystem::exists(sidecar, exists_ec);
+    if (exists_ec) {
+        // A FAILED existence check is not an absence. EACCES or EIO on the parent
+        // directory would otherwise read as "unsigned" silently, and under
+        // --update-require-signature the fleet then refuses the package with no
+        // server-side cause to point at.
+        return SidecarOutcome::kUnreadable;
+    }
+    if (!present)
         return SidecarOutcome::kAbsent;
 
     // A SEPARATE error_code from the exists() call above: reusing one meant a
@@ -32,7 +40,43 @@ SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar, std:
         return SidecarOutcome::kUnreadable;
 
     out.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (out.empty()) {
+        // A zero-byte sidecar is NOT a signature. Served as-is it would put an
+        // empty string on the wire, which the agent reads as ABSENT — so in
+        // permissive mode it applies the binary UNVERIFIED while the operator's
+        // Signed column, reading only existence, says "signed". Refuse it here so
+        // both surfaces agree and the operator gets a log line.
+        out.clear();
+        return SidecarOutcome::kUnreadable;
+    }
     return SidecarOutcome::kServed;
+}
+
+namespace {
+
+/// Remove BOTH the staging file and any surviving predecessor.
+///
+/// The binary is overwritten in place BEFORE this runs, so leaving the previous
+/// `.sig` behind on a failure leaves a signature over bytes that no longer exist
+/// — which every anchored agent then refuses, in both enforcement modes, making
+/// that package permanently undeliverable. Removing the predecessor leaves the
+/// package honestly unsigned instead, which is what the caller reports.
+void discard_both(const std::filesystem::path& tmp, const std::filesystem::path& sidecar) {
+    std::error_code ec;
+    std::filesystem::remove(tmp, ec);
+    ec.clear();
+    std::filesystem::remove(sidecar, ec);
+}
+
+} // namespace
+
+SidecarOutcome signature_sidecar_outcome(const std::filesystem::path& sidecar) {
+    // Deliberately delegates rather than duplicating the ladder: two copies of
+    // "is this servable" is exactly how the column and the server came to
+    // disagree in the first place. The discarded buffer is the price of one
+    // decision site, and it is paid only on the settings fragment.
+    std::string ignored;
+    return read_signature_sidecar(sidecar, ignored);
 }
 
 bool replace_signature_sidecar(const std::filesystem::path& sidecar,
@@ -58,8 +102,7 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
         if (out)
             out.write(signature_pem.data(), static_cast<std::streamsize>(signature_pem.size()));
         if (!out) {
-            std::error_code rm_ec;
-            std::filesystem::remove(tmp, rm_ec);
+            discard_both(tmp, sidecar);
             return false;
         }
     } // closed before the rename: a rename over an open handle is not portable
@@ -67,8 +110,7 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
     std::error_code ren_ec;
     std::filesystem::rename(tmp, sidecar, ren_ec);
     if (ren_ec) {
-        std::error_code rm_ec;
-        std::filesystem::remove(tmp, rm_ec);
+        discard_both(tmp, sidecar);
         return false;
     }
     return true;

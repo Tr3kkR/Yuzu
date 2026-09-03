@@ -2204,16 +2204,14 @@ std::string SettingsRoutes::render_updates_fragment() {
                     // it an operator has no way to tell a signed package from an
                     // unsigned one short of reading server logs.
                     "<td style=\"font-size:0.75rem\">" +
-                    (update_registry_ && [&] {
-                         // The SAME decision CheckForUpdate makes, not just
-                         // exists(): an over-cap or unreadable sidecar is present
-                         // on disk but served as UNSIGNED, so exists() alone would
-                         // tell the operator "signed" while every agent is told
-                         // otherwise — the one thing this column exists to prevent.
-                         std::string ignored;
-                         return read_signature_sidecar(update_registry_->signature_path(pkg),
-                                                       ignored) == SidecarOutcome::kServed;
-                     }()
+                    // The SAME decision CheckForUpdate makes, not just exists():
+                    // an over-cap, unreadable or zero-byte sidecar is present on
+                    // disk but served as UNSIGNED, so exists() alone would tell
+                    // the operator "signed" while every agent is told otherwise —
+                    // the one thing this column exists to prevent.
+                    (update_registry_ &&
+                     signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
+                         SidecarOutcome::kServed
                          ? std::string("<span title=\"A detached signature is stored "
                                        "for this package\">signed</span>")
                          : std::string("<span style=\"color:#8b949e\" title=\"No signature "

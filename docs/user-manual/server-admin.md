@@ -1561,6 +1561,34 @@ registered an interval trigger expecting the old no-op behaviour will now
 have that trigger fire — this is the fix, not a regression. Server-only
 upgrades are unaffected; the change is entirely agent-side.
 
+### vNEXT — OTA update binary signing (#416)
+
+**Default behaviour is unchanged.** Agents that pass no `--update-trust-bundle`
+behave exactly as before: the downloaded binary is checked against the
+server-supplied SHA-256 and applied. Signature verification is entirely opt-in.
+
+**New on-disk artifact — the trust anchor.** `/etc/yuzu-agent/certs/` on Linux
+and macOS, `C:\ProgramData\Yuzu\agent-certs\` on Windows, created by the
+installers. It is deliberately NOT the server's `/etc/yuzu/certs` — that path is
+the server's own CA directory, which the server owns and re-tightens on boot, so
+no single mode serves both. You place the PEM bundle there yourself; nothing is
+installed into it.
+
+**Second new artifact — the signature sidecar.** An uploaded signature is stored
+as `<binary>.sig` beside the package in the update directory. Like the package
+itself it is node-local and not covered by the database backup: it is recreated
+by re-uploading the package with its signature, so it needs no separate
+backup step.
+
+**Two new agent flags**, both off by default: `--update-trust-bundle`
+(`YUZU_UPDATE_TRUST_BUNDLE`) and `--update-require-signature`
+(`YUZU_UPDATE_REQUIRE_SIGNATURE`). Setting the second without the first refuses
+to start, rather than running with enforcement silently inert.
+
+**Nothing to do on upgrade** unless you want signing. If you do, read *Signing
+update binaries* — in particular the two-stage rollout, because a fleet that
+enforces before every package is signed stops updating.
+
 ### vNEXT — Plugin code signing (#80)
 
 Plugin signature verification ships in two parts: an agent-side CMS verifier and a server-side Settings UI for managing the trust bundle. **Default behaviour is unchanged** — agents that do not pass `--plugin-trust-bundle` and operators that do not upload a bundle through the new Settings card see identical behaviour to prior releases (allowlist-only, sha256 hash check).
@@ -2055,6 +2083,10 @@ The server can distribute agent binary updates to enrolled endpoints.
 3. The server stores the binary (and the signature, if given) and assigns a
    version identifier.
 
+**Package filenames may not end in `.sig`** (case-insensitive); the upload is
+rejected with a 400. That suffix is reserved for signature sidecars, named
+`<binary>.sig`, so a package called `x.sig` would occupy package `x`'s slot.
+
 ### Promoting to Production
 
 1. In the OTA Updates list, locate the uploaded version.
@@ -2115,9 +2147,11 @@ openssl cms -sign -binary -outform PEM \
 
 **If your signing certificate chains through an intermediate**, add
 `-certfile intermediate.pem`. Without it the signature carries only the leaf, the
-agent cannot build the chain to your root, and verification fails with
-`unable to get local issuer certificate`. Two-tier PKIs are the normal enterprise
-case, so this is easy to hit.
+agent cannot build the chain to your root. Note the agent does NOT log OpenSSL's
+familiar `unable to get local issuer certificate` — CMS reports it as `untrusted
+chain` with `error:17000064:CMS routines::certificate verify error`, so grepping
+for the X509 string finds nothing. Two-tier PKIs are the normal enterprise case,
+so this is easy to hit.
 
 **Diagnosing a rejection.** The agent logs either `untrusted chain` or
 `invalid signature`. Be aware that a certificate-*profile* problem — a
@@ -2149,7 +2183,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM. The installer breaks ACL inheritance (`icacls /inheritance:r`) — without that, `%ProgramData%`'s inherited rights would let an unprivileged local user create the anchor file before you do. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged
@@ -2175,7 +2209,7 @@ editing the unit:
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
 | macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
-| Windows | `setx /M YUZU_UPDATE_TRUST_BUNDLE "C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem"` then restart the service, or add the flag to the service's binary path. |
+| Windows | Add the flag to the service's **binary path** (`sc.exe config YuzuAgent binPath= "... --update-trust-bundle C:\ProgramData\Yuzu\agent-certs\update-trust-bundle.pem"`). Prefer this over `setx /M`: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service — the bundle would stay unset and verification silently OFF while you believed it was on. If you do use `setx /M`, reboot. |
 
 Every flag below has the environment variable shown beside it:
 
@@ -2187,7 +2221,38 @@ Every flag below has the environment variable shown beside it:
 Setting `--update-require-signature` **without** a trust bundle refuses to start,
 rather than running with enforcement silently inert.
 
+### The verifier's catastrophic invariants
+
+Four properties of `agents/core/src/detached_signature.cpp` are recorded as
+catastrophic-if-violated in `.claude/routed-concerns.md`. They are stated here in
+full because that table is character-budgeted and carries only a pointer. Anyone
+changing that file must preserve all four.
+
+1. **`CMS_verify` must never receive `CMS_NO_SIGNER_CERT_VERIFY` or
+   `CMS_NO_CONTENT_VERIFY`.** Each individually disables one half of the check —
+   the certificate-chain validation or the content digest — while still returning
+   success. The call passes exactly `CMS_BINARY | CMS_DETACHED`.
+2. **The `X509_STORE` must keep `X509_PURPOSE_CODE_SIGN`.** Without it, any leaf
+   chaining to a trusted root becomes a signing authority — the normal case for an
+   internal PKI issuing mTLS and S/MIME from one root, so the consequence is not
+   hypothetical.
+3. **An unreadable trust bundle must fail CLOSED.** "Cannot check" is never
+   "checked out fine". The store load is the first check performed.
+4. **OTA verification stays after the SHA-256 compare and before apply**, reading
+   the HELD descriptor rather than re-opening the path. Apply is the point of no
+   return — the execute bit on POSIX, the live-binary move on Windows. Reading the
+   held descriptor is mandatory rather than preferable on Windows: the staged file
+   is opened `dwShareMode=0` and cannot be opened twice.
+
+Two further properties are load-bearing without being catastrophic:
+`--update-require-signature` governs **only** whether an ABSENT signature is
+tolerated — a present-but-invalid one is refused in both modes given a bundle —
+and the trust-anchor directory must stay root-owned and non-world-writable.
+
 ### Rotating the signing key
+
+**If you are enabling signing for the first time, read the two-stage rollout
+above first** — this section is about replacing a key you already use.
 
 The spec for this feature asked for custody and rotation guidance, and rotation
 is worth doing deliberately because the naive sequence strands a fleet.

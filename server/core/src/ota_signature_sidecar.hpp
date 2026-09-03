@@ -55,6 +55,13 @@ enum class SidecarOutcome {
 [[nodiscard]] SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar,
                                                     std::string& out);
 
+/// The same decision without the read, for callers that only need the verdict.
+///
+/// The Settings packages table renders one row per package and needs only
+/// "would this be served?"; going through the reading form made it pull up to
+/// 64 KB per package per render and throw it away.
+[[nodiscard]] SidecarOutcome signature_sidecar_outcome(const std::filesystem::path& sidecar);
+
 /// Replace the sidecar beside a freshly-uploaded binary.
 ///
 /// THE REMOVE IS UNCONDITIONAL and is the reason this is one function rather than

@@ -173,6 +173,16 @@ std::optional<std::string> verify_plugin_signature(const std::filesystem::path& 
     // update path (#416/#3807) receives its signature over the wire; the CMS
     // policy, the codeSigning-EKU purpose and the flag ban all live there now,
     // so the two callers cannot drift apart.
+    // BOUNDED. The lift replaced a streaming BIO_new_file with a whole-file read,
+    // which dropped the implicit bound the stream gave us: a plugin directory is
+    // root-owned, but a .sig symlinked at /dev/zero would otherwise be read until
+    // memory ran out. A detached CMS signature is a few KB; the server side caps
+    // the equivalent OTA sidecar at the same order.
+    std::error_code sig_sz_ec;
+    const auto sig_size = std::filesystem::file_size(sig_path, sig_sz_ec);
+    if (sig_sz_ec || sig_size > kMaxSignatureBytes) {
+        return std::string{kSignatureInvalidReason} + ": signature file unusable or too large";
+    }
     std::ifstream sig_in(sig_path, std::ios::binary);
     if (!sig_in) {
         return std::string{kSignatureInvalidReason} + ": cannot open signature file";

@@ -9,6 +9,7 @@ __declspec(allocate(".CRT$XCB"))
     [[maybe_unused]] static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
 #endif
 
+#include <yuzu/agent/detached_signature.hpp>
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/agent_csr.hpp>
 #include <yuzu/agent/cert_discovery.hpp>
@@ -2322,19 +2323,18 @@ public:
                             // patching, which is exactly the failure the signing
                             // work exists to make visible.
                             {
-                                const auto refused =
-                                    metrics_
-                                        .counter("yuzu_agent_ota_signature_refused_total",
-                                                 {{"reason", "missing"}})
-                                        .value() +
-                                    metrics_
-                                        .counter("yuzu_agent_ota_signature_refused_total",
-                                                 {{"reason", "untrusted"}})
-                                        .value() +
-                                    metrics_
-                                        .counter("yuzu_agent_ota_signature_refused_total",
-                                                 {{"reason", "invalid"}})
-                                        .value();
+                                // Summed over the SHARED reason list, not a
+                                // hardcoded copy: a reason added in updater.cpp
+                                // and forgotten here would be counted by neither
+                                // this tag nor the fleet gauge derived from it.
+                                double refused = 0.0;
+                                for (const auto reason :
+                                     yuzu::agent::kSignatureRefusalReasons) {
+                                    refused += metrics_
+                                                   .counter("yuzu_agent_ota_signature_refused_total",
+                                                            {{"reason", std::string(reason)}})
+                                                   .value();
+                                }
                                 tags["yuzu.ota_signature_refused"] =
                                     std::to_string(static_cast<int64_t>(refused));
                             }

@@ -68,7 +68,11 @@ TEST_CASE("detached CMS: a signature from a foreign CA is rejected as untrusted"
 
 TEST_CASE("detached CMS: a leaf without codeSigning EKU is rejected even under the trusted CA",
           "[signature][cms]") {
-    // THE CASE THE X509_PURPOSE SETTING EXISTS FOR. Internal PKIs very commonly
+    // The case X509_PURPOSE_CODE_SIGN exists for. Scope note, measured: DELETING
+    // that line entirely still fails this case, because CMS_verify falls back to
+    // OpenSSL's own smime_sign purpose, which also rejects a serverAuth leaf.
+    // What this case actually discriminates is the purpose being WEAKENED (e.g.
+    // to X509_PURPOSE_ANY), which is the realistic regression. Internal PKIs commonly
     // issue mTLS and S/MIME certs from the same root an operator would put in
     // this bundle. Without X509_PURPOSE_CODE_SIGN, trusting that root for
     // signing would silently make every cert it ever issued a signing authority.

@@ -187,3 +187,54 @@ TEST_CASE("sidecar: a signed replace never publishes an unsigned window",
     }
     CHECK(entries == 1); // exactly the sidecar
 }
+
+TEST_CASE("sidecar: a zero-byte signature is refused, not served as signed",
+          "[ota][sidecar]") {
+    // Served as-is, an empty sidecar puts an empty string on the wire. The agent
+    // tests `sig.empty()` and reads that as ABSENT — so in permissive mode it
+    // applies the binary UNVERIFIED, while the operator's Signed column (which
+    // only asks whether a file exists) says "signed". Two surfaces disagreeing
+    // about the same package is precisely what that column exists to prevent.
+    Dir d;
+    const auto sig = d.p / "pkg.sig";
+    write(sig, "");
+    REQUIRE(fs::exists(sig));
+
+    std::string out{"poison"};
+    CHECK(read_signature_sidecar(sig, out) == SidecarOutcome::kUnreadable);
+    CHECK(out.empty());
+}
+
+TEST_CASE("sidecar: a failed replace leaves the package honestly unsigned",
+          "[ota][sidecar]") {
+    // THE FAILURE PATH TWO REVIEWERS FOUND INDEPENDENTLY. The binary is
+    // overwritten before the sidecar is replaced, so a write or rename failure
+    // that left the PREVIOUS signature behind would leave it covering bytes that
+    // no longer exist — refused by every anchored agent in both modes, making the
+    // package permanently undeliverable while the log claimed it was unsigned.
+    //
+    // Forced realistically: <sig>.tmp is pre-created as a DIRECTORY, so the
+    // staging ofstream cannot open it, while the PARENT stays writable. That
+    // matters — an earlier version of this test made the parent read-only, but
+    // then the binary overwrite that precedes this call would have failed too, so
+    // it tested a state production never reaches AND defeated the cleanup it was
+    // checking for.
+    Dir d;
+    const auto sig = d.p / "pkg.sig";
+    REQUIRE(replace_signature_sidecar(sig, "v1-signature"));
+    REQUIRE(fs::exists(sig));
+
+    auto tmp = sig;
+    tmp += ".tmp";
+    fs::create_directory(tmp); // occupies the staging path
+
+    CHECK_FALSE(replace_signature_sidecar(sig, "v2-signature"));
+
+    // The contract: a failed replace removes the stale predecessor, so what
+    // remains is honestly unsigned rather than wrongly signed over new bytes.
+    CHECK_FALSE(fs::exists(sig));
+    std::string out;
+    CHECK(read_signature_sidecar(sig, out) == SidecarOutcome::kAbsent);
+
+    fs::remove_all(tmp);
+}

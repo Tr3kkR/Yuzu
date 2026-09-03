@@ -497,8 +497,11 @@ int main(int argc, char* argv[]) {
     // guard --plugin-require-signature carries (agent.cpp, governance hardening
     // round 1, UP-7), but is sited HERE rather than beside the plugin scan so it
     // cannot be skipped by a deployment that loads no plugins.
-    if (yuzu::agent::UpdateConfig{/*enabled=*/true, {}, cfg.update_trust_bundle,
-                                 cfg.update_require_signature}
+    // Designated initialisers, matching agent.cpp: positional init here is
+    // member-order-coupled, so a field inserted before signature_trust_bundle
+    // would silently rebind this guard's operands.
+    if (yuzu::agent::UpdateConfig{.signature_trust_bundle = cfg.update_trust_bundle,
+                                  .require_signature = cfg.update_require_signature}
             .would_fail_open()) {
         std::cerr << "--update-require-signature is set but --update-trust-bundle is empty. "
                      "Refusing to start: this combination would silently fail open (every OTA "

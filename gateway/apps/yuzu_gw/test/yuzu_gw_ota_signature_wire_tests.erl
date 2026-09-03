@@ -77,4 +77,8 @@ absent_signature_stays_absent_test() ->
             mandatory => false, eligible => true, file_size => 4096},
     Bin = agent_pb:encode_msg(Msg, 'yuzu.agent.v1.CheckForUpdateResponse'),
     Out = agent_pb:decode_msg(Bin, 'yuzu.agent.v1.CheckForUpdateResponse'),
-    ?assertEqual(<<>>, maps:get(update_signature, Out, <<>>)).
+    %% NO default argument: maps:get/3 would make this pass if the codec had
+    %% dropped update_signature entirely, which is the exact regression this
+    %% module exists to pin. proto3 emits the field unconditionally, so a bare
+    %% maps:get/2 is correct and discriminating.
+    ?assertEqual(<<>>, maps:get(update_signature, Out)).

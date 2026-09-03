@@ -129,7 +129,17 @@ Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 ; incompatible with an agent-readable anchor. Plugin code signing is unaffected
 ; and still uses <cert-dir>\plugin-trust-bundle.pem.
 ;
-; Administrators and SYSTEM only. NOTE: the agent service runs as LocalSystem, so
+; NOTE on the ACL: Inno's [Dirs] Permissions ADDS ACEs and cannot disable
+; inheritance, so this entry alone does NOT keep unprivileged users out --
+; %ProgramData% grants Users inheritable create rights, which would let a local
+; user plant update-trust-bundle.pem here before an operator provisions it. The
+; icacls [Run]
+; Break ACL inheritance on the trust-anchor directory (#416/#3807). Without it,
+; the inherited ProgramData rights let an unprivileged local user create the
+; anchor file before the operator does, defeating the verification it anchors.
+Filename: "{sys}\icacls.exe"; Parameters: """{commonappdata}\Yuzu\agent-certs"" /inheritance:r /grant:r ""*S-1-5-32-544:(OI)(CI)F"" ""*S-1-5-18:(OI)(CI)F"""; Flags: runhidden waituntilterminated; StatusMsg: "Securing the update trust-anchor directory..."
+ entry below breaks inheritance and is what actually enforces it.
+; The agent service runs as LocalSystem, so
 ; it is covered by system-full and CAN write here - this ACL keeps unprivileged
 ; local users out, not the agent itself. Inherent: a process able to replace the
 ; system binary can rewrite the file authorising the replacement. See "Signing

@@ -19,12 +19,30 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace yuzu::agent {
+
+/// The closed set of refusal reasons, so producers and consumers cannot drift.
+///
+/// `updater.cpp` labels a refusal with one of these; `agent.cpp` sums them onto
+/// the heartbeat. Those were two hardcoded lists, so a fourth reason would have
+/// been counted by neither the tag nor the fleet gauge derived from it — a new
+/// failure mode that is invisible by construction.
+inline constexpr std::string_view kSignatureRefusalReasons[] = {"missing", "untrusted", "invalid"};
+
+/// Upper bound on a detached signature, shared by both callers.
+///
+/// A PEM CMS detached signature is a few KB — a signer chain plus one digest.
+/// The bound exists because a whole-file read has none of its own: the plugin
+/// path reads a sibling `.sig` from a root-owned directory, and the OTA path
+/// reads a sidecar off the server, and neither should be able to exhaust memory
+/// on a malformed or hostile file.
+inline constexpr std::size_t kMaxSignatureBytes = 64 * 1024;
 
 /// Why a signature did not verify. Callers map this onto their own
 /// subject-specific reason strings, which is why this enum carries no prose.
