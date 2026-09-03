@@ -3833,17 +3833,20 @@ void RestApiV1::register_routes(
             }
             // #2466/#2406: fail closed — the credential was minted, but an
             // unrecorded mint must not return the one-time secret. On a dropped
-            // audit the secret is discarded (never placed in the 503 body); the
-            // operator reconciles by listing/rotating. (Fraser-approved posture
-            // for the secret-returning routes.)
+            // audit the secret is discarded (never placed in the 503 body). The
+            // credential now exists but is unusable; the operator reconciles via
+            // GET (it is listed) and rotates or revokes+re-mints it. Deliberate
+            // secret-withholding posture per ADR-1005 "mutations fail closed on
+            // audit failure" (recovery detail in rest-api.md).
             if (!detail::emit_behavioral_audit(
                     audit_fn, req, res, "engine_principal.credential.mint", "success",
                     "EnginePrincipal", principal_id, "ttl_days=" + std::to_string(ttl_days))) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the credential was minted but its audit record could "
-                                          "not be persisted; the secret was withheld — rotate to "
-                                          "obtain a fresh, audited credential"),
+                                          "not be persisted; the secret was withheld. The "
+                                          "credential exists but is unusable: list it and rotate "
+                                          "or revoke+re-mint to obtain an audited secret"),
                     "application/json");
                 return;
             }
@@ -3929,20 +3932,22 @@ void RestApiV1::register_routes(
                     "EnginePrincipal", principal_id, result.error());
                 return;
             }
-            // The reveal IS the success audit for this route — see the
-            // comment above the route registration.
-            // #2466/#2406: fail closed — the reveal IS this route's success audit,
-            // so a dropped reveal-audit means the raw secret would leave the server
-            // with no audit-chain row. Withhold it and 503; the operator rotates
-            // again for an audited credential. (Fraser-approved for secret routes.)
+            // #2466/#2406: fail closed — the reveal IS this route's success audit
+            // (see the comment above the route registration), so a dropped
+            // reveal-audit would let the raw secret leave the server with no
+            // audit-chain row. Withhold it and 503. Within the overlap window a
+            // re-rotate re-serves the SAME successor (an audited re-serve, not a
+            // new credential) — that is the operator's recovery; once the window
+            // lapses the pair must be revoked instead (recovery detail in rest-api.md).
             if (!detail::emit_behavioral_audit(audit_fn, req, res,
                                                "engine_principal.credential.reveal", "success",
                                                "EnginePrincipal", principal_id, "rotate")) {
                 res.status = 503;
                 res.set_content(
                     detail::a4_error(res, "the credential was rotated but the reveal audit could "
-                                          "not be persisted; the secret was withheld — rotate "
-                                          "again to obtain a fresh, audited credential"),
+                                          "not be persisted; the secret was withheld. Rotate again "
+                                          "within the overlap window to re-serve the same audited "
+                                          "successor secret"),
                     "application/json");
                 return;
             }

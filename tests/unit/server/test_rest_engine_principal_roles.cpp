@@ -435,11 +435,18 @@ TEST_CASE("REST engine-principal roles: unassign fails CLOSED (503 + Sec-Audit-F
                .has_value());
     REQUIRE(h.assign("vuln", R"({"role":"EngineReader"})")->status == 201);
 
+    // Precondition: the grant is live before the fail-closed unassign.
+    REQUIRE(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
+
     h.audit_allow = false;
     auto res = h.unassign("vuln", "EngineReader");
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    // Attribution (qe-SHOULD-2, parity with the assign case): the unassign
+    // COMMITTED — the grant is gone — though its audit dropped; the 503 is the
+    // audit failure, not a failed mutation.
+    CHECK_FALSE(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
 }
 
 TEST_CASE("REST engine-principal roles: GET roles (read) PROCEEDS 200 but sets "

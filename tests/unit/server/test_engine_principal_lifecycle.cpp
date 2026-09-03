@@ -1264,6 +1264,11 @@ TEST_CASE("Engine-principal REST: a mutation whose audit write drops fails CLOSE
         CHECK(r->status == 503);
         CHECK(r->has_header("Sec-Audit-Failed"));
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // Attribution (qe-SHOULD-1): the 503 is the DROPPED AUDIT, not a failed
+        // create — the principal committed to the store before the (failed) audit.
+        auto committed = h.engine_store->get("engine:audit-create");
+        REQUIRE(committed);
+        CHECK(committed->has_value());
     }
 
     SECTION("mint withholds the one-time secret") {
@@ -1278,6 +1283,8 @@ TEST_CASE("Engine-principal REST: a mutation whose audit write drops fails CLOSE
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         // The one-time secret must NEVER appear in the fail-closed body.
         CHECK(r->body.find("\"token\"") == std::string::npos);
+        // Attribution (qe-SHOULD-1): the credential committed (count 1) though its audit dropped.
+        CHECK(h.token_store->list_active_for_principal(pid).size() == 1);
     }
 
     SECTION("rotate withholds the one-time secret") {
@@ -1289,6 +1296,9 @@ TEST_CASE("Engine-principal REST: a mutation whose audit write drops fails CLOSE
         CHECK(r->status == 503);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(r->body.find("\"token\"") == std::string::npos);
+        // Attribution (qe-SHOULD-1): the successor was minted (overlap pair live)
+        // though the reveal audit dropped.
+        CHECK(h.token_store->list_active_for_principal(pid).size() == 2);
     }
 
     SECTION("confirm") {
@@ -1304,18 +1314,31 @@ TEST_CASE("Engine-principal REST: a mutation whose audit write drops fails CLOSE
         REQUIRE(r);
         CHECK(r->status == 503);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // Attribution (qe-SHOULD-1): the confirm committed — predecessor retired,
+        // the successor is now the sole active credential — though its audit dropped.
+        auto active = h.token_store->list_active_for_principal(pid);
+        REQUIRE(active.size() == 1);
+        CHECK(active[0].token_id == tid);
     }
 
     SECTION("revoke") {
-        auto cres = h.create("audit-revoke");
-        REQUIRE(cres);
-        REQUIRE(cres->status == 201);
-        auto pid = nlohmann::json::parse(cres->body)["data"]["principal_id"].get<std::string>();
+        // Mint a credential first, so the post-revoke "no active credentials"
+        // check is meaningful (a create-only principal has none to begin with).
+        auto [pid, raw1] = h.create_and_mint("audit-revoke");
+        (void)raw1;
+        REQUIRE(h.token_store->list_active_for_principal(pid).size() == 1);
         h.audit_allow = false;
         auto r = h.revoke(pid);
         REQUIRE(r);
         CHECK(r->status == 503);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // Attribution (qe-SHOULD-1): the revoke committed — the principal is now
+        // revoked AND its credential was killed — though its audit dropped.
+        auto committed = h.engine_store->get(pid);
+        REQUIRE(committed);
+        REQUIRE(committed->has_value());
+        CHECK((*committed)->lifecycle_state == "revoked");
+        CHECK(h.token_store->list_active_for_principal(pid).empty());
     }
 
     SECTION("transfer-owner") {
@@ -1328,6 +1351,11 @@ TEST_CASE("Engine-principal REST: a mutation whose audit write drops fails CLOSE
         REQUIRE(r);
         CHECK(r->status == 503);
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+        // Attribution (qe-SHOULD-1): ownership committed to "bob" though the transfer audit dropped.
+        auto committed = h.engine_store->get(pid);
+        REQUIRE(committed);
+        REQUIRE(committed->has_value());
+        CHECK((*committed)->owner_username == "bob");
     }
 }
 
