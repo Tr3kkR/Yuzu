@@ -2243,14 +2243,20 @@ jobs:
       # monotonically (measured 2.3-2.5 GB and climbing) and its copies
       # crowd the quota until GitHub's LRU eviction takes them AND every
       # other cache in the repo. One full canary build (~700 debug TUs,
-      # gcc-13, compressed) is ESTIMATED at 0.9-1.35 GB; 2G sits above that
-      # estimate's upper bound with margin (operator call: the ~0.5 GB of
-      # extra quota is noise, a cap that trims a live working set is not),
-      # while still bounding the entry at a fifth of the quota. ccache
-      # evicts its own oldest objects past the cap, which is the desired
-      # steady state; the 'ccache stats (canary)' step after Build shows
-      # whether the working set ever approaches it.
-      CCACHE_MAXSIZE: "2G"
+      # gcc-13, compressed) was ESTIMATED at 0.9-1.35 GB when the 2G cap
+      # was picked; that estimate was low. MEASURED 2026-09-02/03 across
+      # several warm, exact-key-hit runs: restored/working-set size sits
+      # at 2.2-2.6 GB, and the 'ccache stats (canary)' step after Build
+      # consistently showed the cap's own documented trigger for raising
+      # it — "Cache size" pegged at the ceiling (100%) with cleanups > 0
+      # (as high as 172 in one run) on an ordinary warm run, meaning the
+      # cap was trimming live, still-needed objects mid-build rather than
+      # just aging out stale ones. 3G sits above the measured working set
+      # with real margin while still bounding the entry at well under a
+      # third of the quota; ccache evicts its own oldest objects past the
+      # cap either way, so a too-low value costs wallclock (mid-build
+      # eviction churn), never correctness.
+      CCACHE_MAXSIZE: "3G"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
