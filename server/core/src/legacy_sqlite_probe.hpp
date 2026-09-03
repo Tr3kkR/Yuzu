@@ -186,9 +186,13 @@ inline void warn_if_legacy_rows(const std::filesystem::path& legacy_db_path,
 /// Resolves each path via a single `open()` (following a symlink exactly as the plain-`open()`
 /// call in `warn_if_legacy_rows`/`sqlite3_open_v2` does moments later) and then `fstat`/`fchmod`
 /// the resulting FILE DESCRIPTOR — never re-resolving the path a second time — so there is no
-/// TOCTOU window between "what we checked" and "what we chmod'd", and the file this function
-/// hardens is always the exact same file the probe goes on to open and read. An earlier revision
-/// instead used `symlink_status()` to detect and REFUSE to touch a symlinked path; that left a
+/// TOCTOU window WITHIN this function between "what it checked" and "what it chmod'd" (this is
+/// an intra-function guarantee only: this call and the later, separate `warn_if_legacy_rows`
+/// call at the same call site are still two independent path resolutions a microsecond apart —
+/// harmless in practice, since `warn_if_legacy_rows` never reads column data and a raced
+/// substitution inside the caller's own `db_dir` yields at most a wrong row-count log line, not
+/// a disclosure). An earlier revision of THIS function instead used `symlink_status()` to detect
+/// and REFUSE to touch a symlinked path; that left a
 /// gap both adversarial-review passes independently confirmed (2026-09-03): the probe still
 /// opened and read the symlink's target moments later, so a symlinked secret-bearing legacy file
 /// was read without ever being forced to 0600. Following the link here closes that gap.
@@ -210,36 +214,46 @@ inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path)
     // agent-only (yuzu::agent, a separate build target) and importing it into server code would
     // be a cross-module layering violation. Local to this function: closes on every exit path
     // (including a thrown spdlog::warn, which the prior hand-rolled `::close()`-before-every-
-    // `return` version did not guarantee).
+    // `return` version did not guarantee). Copy/move deleted -- a copy would double-close on
+    // scope exit (UB); no call site needs to transfer ownership, so deleted rather than moved.
     struct OwnedFd {
         int fd;
+        explicit OwnedFd(int f) noexcept : fd(f) {}
         ~OwnedFd() {
             if (fd >= 0)
                 ::close(fd);
         }
+        OwnedFd(const OwnedFd&) = delete;
+        OwnedFd& operator=(const OwnedFd&) = delete;
+        OwnedFd(OwnedFd&&) = delete;
+        OwnedFd& operator=(OwnedFd&&) = delete;
     };
 
     const auto chmod_owner_only = [](const std::filesystem::path& path, const char* what) {
         OwnedFd owned{::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY)};
         if (owned.fd < 0) {
-            if (errno != ENOENT)
+            const int open_errno = errno; // capture before any other call can touch it
+            if (open_errno != ENOENT)
                 spdlog::warn("legacy_sqlite_probe: could not open {} {} to harden its "
                             "permissions ({})",
-                            what, path.string(), std::strerror(errno));
+                            what, path.string(), std::strerror(open_errno));
             return; // absent (ordinary case), or unreadable -- nothing to harden
         }
         struct stat st{};
         if (::fstat(owned.fd, &st) != 0) {
+            const int fstat_errno = errno;
             spdlog::warn("legacy_sqlite_probe: could not stat {} {} to harden its permissions "
                         "({})",
-                        what, path.string(), std::strerror(errno));
+                        what, path.string(), std::strerror(fstat_errno));
             return;
         }
         if (!S_ISREG(st.st_mode))
             return; // not a regular file (dir/device/FIFO/socket) -- nothing to harden
-        if (::fchmod(owned.fd, S_IRUSR | S_IWUSR) != 0)
+        if (::fchmod(owned.fd, S_IRUSR | S_IWUSR) != 0) {
+            const int fchmod_errno = errno;
             spdlog::warn("legacy_sqlite_probe: could not set 0600 on {} {}: {}", what,
-                        path.string(), std::strerror(errno));
+                        path.string(), std::strerror(fchmod_errno));
+        }
     };
 
     chmod_owner_only(legacy_db_path, "legacy file");

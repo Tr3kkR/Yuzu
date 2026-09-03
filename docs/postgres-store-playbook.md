@@ -260,13 +260,18 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   whether the legacy file exists and is non-empty, and if so `spdlog::warn` a row/key count
   before proceeding fresh-started, so an environment where the "no production fleet" premise
   turns out to be locally wrong gets a loud signal instead of the silent loss `ResponseStore`'s
-  actual (undetected) behavior would otherwise reproduce for stateful config. **For a store with
-  no secret columns, prefer the shared `legacy_sqlite_probe::warn_if_legacy_rows`
+  actual (undetected) behavior would otherwise reproduce for stateful config. **Prefer the
+  shared `legacy_sqlite_probe::warn_if_legacy_rows`
   (`server/core/src/legacy_sqlite_probe.hpp`, introduced by ADR-0061) over hand-rolling this
   check** — it generalizes `RuntimeConfigStore::warn_if_legacy_data_present`'s single-table logic
-  to an arbitrary table list; a secret-bearing store still needs the 0600/sidecar hardening this
-  shared helper deliberately omits (see its own header comment) and should follow
-  `RuntimeConfigStore`'s hand-rolled variant instead. This default
+  to an arbitrary table list. **A secret-bearing store additionally calls the same header's
+  `harden_legacy_file_0600` FIRST** (0600 on the legacy file plus its `-wal`/`-shm` sidecars, via
+  a single `open()`+`fstat()`+`fchmod()` on one fd — no path re-resolution between check and
+  chmod, closing a symlink-TOCTOU gap two adversarial-review rounds found in an earlier revision;
+  #3623/WebhookStore is the first consumer). Do NOT model a new secret-bearing store's hardening
+  on `RuntimeConfigStore`'s own hand-rolled block any more — it still chmods by re-resolved
+  *path* (`std::filesystem::permissions()`), which carries that same unfixed TOCTOU shape
+  (tracked separately; not yet ported onto the shared helper). This default
   holds only while "no production fleet" stays true — if a real external deployment exists or
   is committed to before your store migrates, re-derive whether backfill is actually needed for
   THIS store in its own per-store ADR; don't cite this bullet as blanket cover once the premise

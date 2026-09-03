@@ -110,10 +110,25 @@ TEST_CASE("WebhookStore[pg]: create and list webhook", "[webhook_store][pg]") {
 
 TEST_CASE("WebhookStore[pg]: migration lands at v2 and drops sqlite_backfill_source (#3623)",
           "[webhook_store][pg][migration]") {
-    WebhookStorePg store;
+    // Deliberately NOT WebhookStorePg / webhook_store_pg_template -- both are backed by the
+    // process-wide PgTestTemplate (built once, cloned per fixture), so in a full suite run this
+    // store may already be at v2 by the time this test's clone is taken, making the version
+    // check a no-op read of someone else's already-completed migration rather than a genuine
+    // from-scratch v1->v2 run. YUZU_REQUIRE_PG_MIGRATION_DB is a private, unshared database, so
+    // the WebhookStore construction below always drives a real migration.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    yuzu::test::TempDir keys;
+    yuzu::server::FileKeyProvider provider(keys.path);
+    yuzu::server::pg::SecretCodec codec(provider);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    WebhookStore store{pool, codec};
+    REQUIRE(store.is_open());
 
-    yuzu::server::pg::PgConn conn{PQconnectdb(store.dsn().c_str())};
+    yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(codec.init(conn.get()).has_value());
+
     yuzu::server::pg::PgResult ver{PQexec(
         conn.get(), "SELECT version FROM public.schema_meta WHERE store = 'webhook_store'")};
     REQUIRE(ver.ok());

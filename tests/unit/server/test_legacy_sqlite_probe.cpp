@@ -358,12 +358,20 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 cannot widen or redirect
     // symlink to a file this process does NOT own must fail the fchmod (EPERM, best-effort,
     // logged, boot proceeds) rather than ever changing that file's mode -- the property that
     // makes following the symlink (see the test above) safe against an attacker-planted link to
-    // an arbitrary file. Skipped when running as root, where the gate does not hold (fchmod as
-    // root can chmod anything) and the assertion below would be false by construction.
+    // an arbitrary file. Skipped (not just "as root") wherever the ownership premise doesn't
+    // hold -- root can chmod anything, but so can a UID-remapped/rootless-container euid that
+    // happens to already own /etc/passwd -- either way the fchmod would SUCCEED, mutating a real
+    // system file instead of demonstrating the gate. Both checked before touching anything.
     if (::geteuid() == 0)
-        SUCCEED("running as root -- the ownership gate does not apply, nothing to assert");
+        SKIP("running as root -- the ownership gate does not apply, nothing to assert");
     else {
         const std::filesystem::path root_owned = "/etc/passwd"; // world-readable, root-owned
+        struct stat owner_check{};
+        REQUIRE(::stat(root_owned.c_str(), &owner_check) == 0);
+        if (owner_check.st_uid == ::geteuid())
+            SKIP("this process already owns /etc/passwd -- the ownership gate does not apply "
+                 "here, nothing to assert");
+
         std::error_code st_ec;
         const auto before = std::filesystem::status(root_owned, st_ec);
         REQUIRE_FALSE(st_ec);
@@ -397,8 +405,11 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 leaves a non-regular pat
           "untouched without blocking",
           "[legacy_sqlite_probe]") {
     // Guards the O_NONBLOCK choice: a plain open() on a FIFO with no writer blocks
-    // indefinitely, the same hazard warn_if_legacy_rows avoids via is_regular_file(). This test
-    // would hang the suite if that regressed.
+    // indefinitely, the same hazard warn_if_legacy_rows avoids via is_regular_file(). Wrapped in
+    // the same async+wait_for bound as the sibling FIFO test above (rather than calling
+    // synchronously) so a regression here fails this test with a clear message instead of
+    // hanging the whole suite -- see that test's file-header comment for why the process itself
+    // can still block past this bound on unwind even so.
     auto fifo_path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_fifo_");
     REQUIRE(::mkfifo(fifo_path.string().c_str(), 0600) == 0);
     struct Cleanup {
@@ -409,7 +420,8 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 leaves a non-regular pat
         }
     } cleanup{fifo_path};
 
-    harden_legacy_file_0600(fifo_path); // must return promptly, not block
-    SUCCEED("did not block on the FIFO");
+    auto fut = std::async(std::launch::async, [&] { harden_legacy_file_0600(fifo_path); });
+    const auto status = fut.wait_for(std::chrono::seconds(3));
+    REQUIRE(status == std::future_status::ready); // else: regressed off O_NONBLOCK, hung on open()
 }
 #endif // _WIN32
