@@ -6,6 +6,7 @@
 
 #include "ota_signature_sidecar.hpp"
 
+#include <atomic>
 #include <cstdio>
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
@@ -5466,23 +5467,34 @@ void SettingsRoutes::register_routes(
         std::error_code ec;
         std::filesystem::create_directories(out_path.parent_path(), ec);
 
-        // SIDECAR FIRST, THEN THE BINARY. The order is the crash-safety argument,
-        // not a style choice. Writing the binary first leaves new-binary +
-        // no-signature if the process dies before the sidecar lands — and on the
-        // FIRST signed upload of a filename there is no predecessor to fall back
-        // on, so that window covers the whole signing-adoption rollout. That is
-        // the one state where a permissive agent applies an unverified binary.
+        // ORDERING RULE: THE STEP THAT WEAKENS THE SIGNATURE GOES LAST.
         //
-        // Reversed, every crash point is fail-closed: die after the sidecar and
-        // you have old-binary + new-signature; die after the binary and you have
-        // new-binary + new-signature with no package row, so nothing is
-        // advertised. Neither can be applied unverified.
+        // Which step that is depends on the upload, so the order is not fixed:
         //
-        // The path is derived from the filename alone (UpdateRegistry::
+        //   signed upload   -> sidecar, then binary. Writing the binary first
+        //                      leaves new-binary + no-signature if we die in
+        //                      between, and on the FIRST signed upload of a
+        //                      filename there is no predecessor to fall back on,
+        //                      so that window spans the whole signing rollout.
+        //
+        //   unsigned upload -> binary, then remove the sidecar. Removing first
+        //                      leaves OLD-binary + no-signature if the binary
+        //                      write then fails, which strips protection from a
+        //                      package still being served. (This is the hole the
+        //                      first version of this reorder left: it removed
+        //                      unconditionally up front.)
+        //
+        // Both orders leave only fail-closed intermediates: a mismatched pair,
+        // which every anchored agent refuses. Never the unprotected pair.
+        //
+        // The sidecar path derives from the filename alone (UpdateRegistry::
         // signature_path -> binary_path = update_dir_ / filename), so it is known
         // here, before `pkg` exists.
-        if (!replace_signature_sidecar(signature_sidecar_path(out_path), signature_pem)) {
-            // NOTHING has been written yet: the previous binary and its signature
+        const auto sidecar_path = signature_sidecar_path(out_path);
+        const bool signed_upload = !signature_pem.empty();
+
+        if (signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
+            // Nothing has been written yet: the previous binary and its signature
             // are both untouched, so this is a clean refusal, not a partial state.
             spdlog::error("OTA upload for {}/{}: the signature sidecar could not be written; "
                           "the previous package is unchanged",
@@ -5500,16 +5512,26 @@ void SettingsRoutes::register_routes(
         // so the mtime consistency check sees a well-ordered pair and the column
         // reports "signed" for a package whose signature covers nothing that is
         // there. Staging keeps a partial write off the served path entirely.
+        //
+        // The staging name carries the request's own suffix: a fixed name lets two
+        // concurrent uploads of the same filename interleave into one file, and
+        // whichever rename loses publishes bytes that do not match its own row.
+        static std::atomic<unsigned long long> upload_seq{0};
         auto bin_tmp = out_path;
-        bin_tmp += ".upload.tmp";
+        bin_tmp += ".upload." + std::to_string(upload_seq.fetch_add(1)) + ".tmp";
+
+        const auto fail_binary = [&](const char* msg) {
+            std::error_code rm_ec;
+            std::filesystem::remove(bin_tmp, rm_ec);
+            res.status = 500;
+            res.set_content(std::string("<span class=\"feedback-error\">") + msg + "</span>",
+                            "text/html; charset=utf-8");
+        };
+
         {
             std::ofstream f(bin_tmp, std::ios::binary | std::ios::trunc);
             if (!f.is_open()) {
-                std::error_code rm_ec;
-                std::filesystem::remove(bin_tmp, rm_ec);
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write file.</span>",
-                                "text/html; charset=utf-8");
+                fail_binary("Cannot write file.");
                 return;
             }
             f.write(uploaded.content.data(), static_cast<std::streamsize>(uploaded.content.size()));
@@ -5518,23 +5540,35 @@ void SettingsRoutes::register_routes(
             // agent binary that reports success is a fleet-wide apply failure.
             f.close();
             if (!f) {
-                std::error_code rm_ec;
-                std::filesystem::remove(bin_tmp, rm_ec);
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Could not write the binary "
-                                "completely.</span>",
-                                "text/html; charset=utf-8");
+                fail_binary("Could not write the binary completely.");
                 return;
             }
+        }
+        // Durable before publication, matching the sidecar. Without this a crash
+        // just after the rename can expose the live name pointing at unflushed
+        // (zero-length) bytes.
+        if (!fsync_file(bin_tmp)) {
+            fail_binary("Could not flush the uploaded binary to disk.");
+            return;
         }
         std::error_code bin_ren_ec;
         std::filesystem::rename(bin_tmp, out_path, bin_ren_ec);
         if (bin_ren_ec) {
-            std::error_code rm_ec;
-            std::filesystem::remove(bin_tmp, rm_ec);
+            fail_binary("Could not publish the uploaded binary.");
+            return;
+        }
+
+        // The binary is live. NOW drop the signature, if this upload is unsigned —
+        // last, per the ordering rule above, so no failure above this line could
+        // have left the served package unprotected.
+        if (!signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
+            spdlog::error("OTA upload for {}/{}: the stale signature could not be removed; "
+                          "the package is served with a signature that does not cover it",
+                          platform, arch);
             res.status = 500;
-            res.set_content("<span class=\"feedback-error\">Could not publish the uploaded "
-                            "binary.</span>",
+            res.set_content("<span class=\"feedback-error\">The binary was published but its "
+                            "old signature could not be removed. Agents will refuse this "
+                            "package until you retry.</span>",
                             "text/html; charset=utf-8");
             return;
         }

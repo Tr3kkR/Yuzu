@@ -65,6 +65,15 @@ enum class SidecarOutcome {
 /// (An earlier version of this comment claimed it avoided the read; it does not.)
 [[nodiscard]] SidecarOutcome signature_sidecar_outcome(const std::filesystem::path& sidecar);
 
+/// Flush one already-written, already-closed FILE to stable storage.
+///
+/// Exposed so the OTA binary upload can stage-and-publish with the same
+/// durability discipline as the sidecar, rather than growing a second copy of
+/// the platform dance. Returns false if the file cannot be opened or the flush
+/// fails; callers treat that as a failed write, because a file that is "written"
+/// but not durable is indistinguishable from one that was never written.
+[[nodiscard]] bool fsync_file(const std::filesystem::path& path);
+
 /// Can this sidecar possibly cover this binary? (OPERATOR-FACING ONLY.)
 ///
 /// A successful upload writes the sidecar FIRST and the binary second, so the

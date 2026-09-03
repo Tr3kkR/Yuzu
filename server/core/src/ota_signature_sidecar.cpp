@@ -63,11 +63,6 @@ SidecarOutcome read_signature_sidecar(const std::filesystem::path& sidecar, std:
 
 namespace {
 
-/// Flush a file or directory all the way to stable storage.
-///
-/// `std::ofstream` has no portable fsync, and this artifact is a security
-/// control: a signature that is "written" but not durable is indistinguishable
-/// from one that was never written, and the package then serves as unsigned.
 /// Owns a raw descriptor for the duration of a scope.
 ///
 /// There is exactly one acquire/release pair below with no branch between them
@@ -95,6 +90,11 @@ private:
     int fd_;
 };
 
+/// Flush a file or directory all the way to stable storage.
+///
+/// `std::ofstream` has no portable fsync, and these artifacts are a security
+/// control: a file that is "written" but not durable is indistinguishable from
+/// one that was never written, and the package then serves as unsigned.
 [[nodiscard]] bool fsync_path(const std::filesystem::path& p, bool is_directory) {
 #ifdef _WIN32
     // Windows has no directory-handle flush through the CRT, and NTFS commits
@@ -153,6 +153,10 @@ SidecarOutcome signature_sidecar_outcome(const std::filesystem::path& sidecar) {
     // decision site, and it is paid only on the settings fragment.
     std::string ignored;
     return read_signature_sidecar(sidecar, ignored);
+}
+
+bool fsync_file(const std::filesystem::path& path) {
+    return fsync_path(path, /*is_directory=*/false);
 }
 
 bool signature_sidecar_covers_binary(const std::filesystem::path& binary,

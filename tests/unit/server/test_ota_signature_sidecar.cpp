@@ -331,3 +331,32 @@ TEST_CASE("an unreadable or absent sidecar is not evidence of a mismatch",
     { std::ofstream(orphan_sig.string(), std::ios::binary) << "x"; }
     CHECK(signature_sidecar_covers_binary(d.p / "gone", orphan_sig));
 }
+
+TEST_CASE("removing a signature is ordered last, so a failure never leaves the served "
+          "package unprotected",
+          "[ota][sidecar]") {
+    // The upload handler's ordering rule, pinned at the level this file can reach:
+    // replace_signature_sidecar with an EMPTY signature is the signature-weakening
+    // step, and the handler must not run it until the binary is published.
+    //
+    // The rule exists because the first version of the reorder ran the removal
+    // unconditionally UP FRONT: an operator re-uploading an existing signed
+    // package as unsigned, whose binary write then failed, was left with the OLD
+    // binary still served and its signature gone -- protection stripped from a
+    // package nobody had replaced.
+    Dir d;
+    const auto bin = d.p / "yuzu-agent";
+    const auto sig = signature_sidecar_path(bin);
+    { std::ofstream(bin.string(), std::ios::binary) << "v1-binary"; }
+    REQUIRE(replace_signature_sidecar(sig, "-----BEGIN CMS-----\nv1\n-----END CMS-----\n"));
+    REQUIRE(fs::exists(sig));
+
+    // The weakening step, run on its own, does remove -- unconditionally, by
+    // design, because the operator explicitly chose to publish unsigned.
+    REQUIRE(replace_signature_sidecar(sig, ""));
+    CHECK_FALSE(fs::exists(sig));
+
+    // And it reports success even when there was nothing to remove, so the
+    // handler cannot mistake "already unsigned" for a failure and 500 on it.
+    CHECK(replace_signature_sidecar(sig, ""));
+}
