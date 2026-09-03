@@ -12,6 +12,7 @@
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
+#include "guardian_joined_thread_role.hpp" // GuardianJoinedThreadRole (death test below)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
@@ -1342,9 +1343,14 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
     // abort itself never executed - so this proves the actual failure mode, in a subprocess,
     // because a passing run necessarily kills the process it happens in.
     //
-    // The hostile call is placed in the INJECTED SEND, deliberately: that is the real
-    // exposure (an arbitrary std::function supplied from agent.cpp), not the journal pointer
-    // the first hardening round guarded.
+    // The hostile call used to be placed in the INJECTED SEND (an arbitrary std::function
+    // supplied from agent.cpp) - but #2233 item 4 moved `send` onto GuardianOutboxSendExecutor's
+    // detached worker (guardian_outbox_send_executor.hpp), which stop() does NOT join, so a
+    // send taking mtx_ can no longer produce this deadlock and is no longer the exposure this
+    // test needs. This drives the hostile call directly from a thread wearing
+    // GuardianJoinedThreadRole instead - the same marker the REAL worker loop wears
+    // (guardian_outbox_drain_worker.cpp) - which proves the abort mechanism itself independent
+    // of which production call graph currently reaches the joined thread.
     if constexpr (!yuzu::agent::worker_mutex_guard_enabled()) {
         SUCCEED("WorkerHostileMutex is compiled out in this build; nothing to prove");
         return;
@@ -1370,34 +1376,24 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
             ::_exit(90); // distinct codes so the parent can tell setup failure from no-abort
         KvStore kv{std::move(*opened)};
 
-        SparkEngine spark_engine;
-        auto mech = std::make_unique<FakeServiceMechanism>();
-        if (!spark_engine.register_mechanism(SparkType::Service, std::move(mech)))
-            ::_exit(91);
-        spark_engine.start();
-
+        // No SparkEngine/wire_spark_engine needed - the hostile call below is driven directly,
+        // not through the drain worker's own call graph (see the comment above).
         GuardianEngine engine{&kv, "agent-death", /*prefer_spark=*/true};
         if (!engine.start_local())
             ::_exit(92);
 
-        // The send runs ON the worker thread and reaches for mtx_ via journal_stats().
-        engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
-                                 [&engine](const OutboxEntry&) {
-                                     (void)engine.journal_stats(); // takes mtx_ -> must abort
-                                     return SendResult::Sent;
-                                 });
-        if (engine.spark_availability() != GuardianEngine::SparkAvailability::Available)
-            ::_exit(93);
+        // A thread wearing the SAME marker the real drain worker's loop() wears, taking mtx_
+        // via journal_stats() - must abort. GuardianJoinedThreadRole's ctor runs on entry to
+        // the thread body, so this thread is "joined" for its entire lifetime, matching how
+        // loop() wears it for the worker's entire lifetime (guardian_outbox_drain_worker.cpp).
+        std::thread hostile([&engine] {
+            yuzu::agent::GuardianJoinedThreadRole role_marker;
+            (void)engine.journal_stats(); // takes mtx_ -> must abort
+        });
+        hostile.join(); // unreachable if the guard fires - the process aborts inside the thread
 
-        // Arm a rule so an "armed" lifecycle entry enters the outbox and the worker drains it
-        // through the hostile send.
-        gpb::GuaranteedStatePush p;
-        p.set_full_sync(true);
-        *p.add_rules() = make_service_rule("r1");
-        (void)yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString());
-
-        // If the guard works we never get here - the worker aborts the whole process. Give it
-        // a bounded window, then report "no abort" with a distinct code.
+        // If the guard works we never get here - the process aborts. Give it a bounded window,
+        // then report "no abort" with a distinct code.
         std::this_thread::sleep_for(std::chrono::seconds(5));
         ::_exit(94);
     }

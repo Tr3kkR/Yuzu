@@ -144,6 +144,12 @@ void GuardianOutboxDrainWorker::stop() {
         // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
         // already taken by an in-flight enqueue stays safe (still-alive Signal).
         rt_.set_outbox_enqueue_waker({});
+        // Stop admitting new detached sends (#2233 item 4); does not cancel one
+        // already in flight - that worker is covered by the orphan-exit contract
+        // (active_send_workers(), summed into GuardianEngine::active_io_workers()),
+        // not by this join. Before the join below, not after: the loop's own next
+        // wrapped_send() call must see stopping if it races this.
+        send_exec_.stop();
         sig_->cv.notify_all();
     }
     // The join is OUTSIDE the first_stop guard and keyed on joinable(), not on the
@@ -189,12 +195,15 @@ GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
     GuardianSparkRuntime::DrainLimits limits;
     limits.max_entries = maint_.drain_budget;
     limits.max_wall = maint_.drain_max_wall;
-    // Checked before EVERY send, not once per pass: a bounded pass is still a count bound,
-    // and one slow-but-succeeding send makes it arbitrarily long while GuardianEngine::stop()
-    // holds mtx_ waiting on our join (#2298 Sol review). The in-flight send cannot be
-    // interrupted; no further one starts.
+    // Checked before EVERY send, not once per pass: a bounded pass is still a count bound.
     limits.should_stop = [this] { return stop_requested(); };
-    return rt_.drain_bounded(send_, limits);
+    // Routed through wrapped_send(), not send_ directly (#2233 item 4): a stalled sink no
+    // longer makes this pass - or GuardianEngine::stop()'s join waiting on it (#2298 Sol
+    // review) - arbitrarily long. wrapped_send() bounds its own wait to
+    // kGuardianSendOfferWait and retains the head if the real send hasn't finished by then;
+    // the send itself keeps running detached (guardian_outbox_send_executor.hpp), covered by
+    // the orphan-exit contract rather than by this pass's own limits.
+    return rt_.drain_bounded([this](const OutboxEntry& e) { return wrapped_send(e); }, limits);
 }
 
 GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMaintenanceOps ops) {

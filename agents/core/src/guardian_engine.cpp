@@ -1528,7 +1528,12 @@ std::size_t GuardianEngine::active_io_workers() const {
     std::lock_guard lock(mtx_);
     // #2233 item 3: spark_runtime_'s own bounded arm/disarm executor is a SECOND
     // source of live backend I/O workers, distinct from spark_reader_'s state-read
-    // executor (guardian_spark_runtime.hpp - dedicated instance, never shared). Both
+    // executor (guardian_spark_runtime.hpp - dedicated instance, never shared).
+    // #2233 item 4 adds a THIRD: spark_drain_worker_'s detached outbox-send executor
+    // (guardian_outbox_send_executor.hpp) - its `send` callback captures AgentImpl
+    // state directly and is safe ONLY because this sum is what keeps main.cpp /
+    // service_win.cpp from tearing that state down while a send is still detached
+    // and running (see guardian_outbox_drain_worker.hpp's class doc). All three
     // must be summed here: this is the orphan-exit contract's sole source of truth
     // (hard_exit.hpp / guardian_io_executor.hpp) - main.cpp/service_win.cpp refuse
     // normal C++ teardown while this is nonzero, and a source left out of the sum
@@ -1536,6 +1541,8 @@ std::size_t GuardianEngine::active_io_workers() const {
     std::size_t n = spark_reader_ ? spark_reader_->active_io_workers() : 0;
     if (spark_runtime_)
         n += spark_runtime_->active_backend_op_workers();
+    if (spark_drain_worker_)
+        n += spark_drain_worker_->active_send_workers();
     return n;
 }
 
