@@ -27,12 +27,14 @@ for a non-`*Store`-suffixed class (the Wave-4 ladder-blind-spot components below
 > stays true** — re-derive per ADR-0009's amendment in your own store's ADR if that premise has
 > changed by the time you migrate; don't treat this banner as blanket cover once it has.
 > `AuditStore`'s already-shipped backfill stays — the case where this would matter most if the
-> premise ever flipped — and so does every OTHER already-migrated store's, this is not unique to
-> it. **`WebhookStore` (PR #3563) merged with a full `migrate_from_sqlite()` already built,
-> before this amendment could reach it** — too late to apply the "don't build it" guidance
-> retroactively; it instead joins the other already-migrated stores whose backfill TEST suite is
-> being retired in this same sweep (production-code removal deferred as a separate later step,
-> tracked in #3623). See its own row below.
+> premise ever flipped, and the sole remaining exception. Every OTHER already-migrated store's
+> production `migrate_from_sqlite()` has since been retired (tracking issue #3623, closed
+> 2026-09-03): `chore/retire-migrate-from-sqlite-batch-b` (#3898) retired 12 mechanical-shape
+> stores, `chore/retire-migrate-from-sqlite-batch-a` retired the remaining 6 (`WebhookStore`
+> included — it merged with a full `migrate_from_sqlite()` already built the same day this
+> amendment landed, too late for the "don't build it" guidance to reach it, per its own row's
+> RETIRED note below). See each retired store's own row for its specific marker-table
+> disposition and probe table list.
 >
 > **This is NOT the end of the ladder.** The `*Store`/auth-DB scope above was always the
 > boundary of what this document tracked — it never enumerated the server's other `sqlite3*`
@@ -218,7 +220,9 @@ the original ladder never tracked is now on Postgres.**
   (the original ADR-0009 generic-inventory pilot). None of the migrations since — `LicenseStore`,
   `DeploymentStore`, `SoftwareDeploymentStore`, `CaStore` — added its own dedicated
   previous-release-SQLite → new-release-Postgres assertion; each relies on the harness's generic
-  `fixtures-verify` pass instead. Each migrated store's own unit-test `migrate_from_sqlite` suite
-  covers the backfill logic with real legacy-schema fixtures, but not the end-to-end upgrade path.
-  Not solved here — flag for whoever next touches the upgrade harness or does a ladder-completeness
-  pass.
+  `fixtures-verify` pass instead. At the time this was noted, each migrated store's own unit-test
+  `migrate_from_sqlite` suite covered the backfill logic with real legacy-schema fixtures, but not
+  the end-to-end upgrade path — that unit-test coverage is now moot for every store whose
+  `migrate_from_sqlite()` has since been retired (#3623, including `CaStore` named above), since
+  there is no backfill logic left to cover. Not solved here — flag for whoever next touches the
+  upgrade harness or does a ladder-completeness pass.

@@ -305,21 +305,27 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   (`AuditStore` does this by fingerprint: a durable hash-shaped value written in the SAME
   transaction as the completion marker, re-derived from the file and compared at every later
   boot that still finds it) and refuse to serve on a mismatch, rather than silently reporting
-  success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` share the
+  success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` shared the
   first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
-  holder-side check to them is tracked, not yet done. `RbacStore` independently discovered and
+  holder-side check to them was tracked but is now moot — both stores' `migrate_from_sqlite()`
+  has since been retired entirely (`ResultSetStore` in #3898, `ManagementGroupStore` in #3623),
+  so there is no backfill left to port the check into. `RbacStore` independently discovered and
   fixed the identical shape (#2703, git-blamed to its original migration commit, not caught by
   that migration's own governance pass or two rounds of external review — only surfaced by a
-  wider-scope adversarial review) — it is now a SECOND reference implementation, right-sized for
-  a small, non-resumable, single-transaction legacy dataset rather than `AuditStore`'s larger
-  resumable-streaming one. **Trap a future port hits if it works from this paragraph's prose
-  instead of the actual code:** `AuditStore::stamp_complete` has two exemptions this description
-  doesn't spell out and `RbacStore`'s own first port missed both — (1) a **sourceless** writer
-  losing the trust-anchor race is NOT an error (it has no evidence worth protecting, so whichever
-  writer's `"sourceless"` value won is fine); (2) a **real** writer's content that fingerprints as
-  having nothing to protect (an empty/schema-less local file) should trust the marker rather than
-  refuse. Port the REFERENCE CODE (`audit_store.cpp`'s `stamp_complete`, or `rbac_store.cpp`'s
-  post-#2703 version) and diff your port against it line by line — not this summary.
+  wider-scope adversarial review), right-sized for a small, non-resumable, single-transaction
+  legacy dataset rather than `AuditStore`'s larger resumable-streaming one — but `RbacStore`'s
+  own `migrate_from_sqlite()` has since been retired (#3623), so that implementation is no
+  longer live code; find it via `git log`/the PR history if you need the worked example, but do
+  not expect to find it in `rbac_store.cpp` today. **Trap a future port hits if it works from
+  this paragraph's prose instead of the actual code:** `AuditStore::stamp_complete` (the sole
+  remaining live reference implementation — see ADR-0009's Update for why `AuditStore` is the
+  one store that keeps its backfill permanently) has two exemptions this description doesn't
+  spell out, and `RbacStore`'s own first port missed both when it was live — (1) a
+  **sourceless** writer losing the trust-anchor race is NOT an error (it has no evidence worth
+  protecting, so whichever writer's `"sourceless"` value won is fine); (2) a **real** writer's
+  content that fingerprints as having nothing to protect (an empty/schema-less local file)
+  should trust the marker rather than refuse. Port the REFERENCE CODE (`audit_store.cpp`'s
+  `stamp_complete`) and diff your port against it line by line — not this summary.
 - **Long-lived migration branches accumulate test-file drift against the pre-migration API —
   budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
   store via its old constructor fails to compile once the branch merges current `origin/dev` —

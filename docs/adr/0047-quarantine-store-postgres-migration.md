@@ -393,10 +393,12 @@ note.
   backfill pattern** (built into `RbacStore`/`DiscoveryStore`/every store using this shape, not
   unique to quarantine) — this migration faithfully follows the established, precedent-set
   pattern; fixing the pattern itself is out of this PR's scope and blast radius. Documented here so
-  an operator considering rollback-then-reupgrade is warned (see `upgrading.md` and the
-  `quarantine-store-backfill-recovery.md` runbook, both fixed in the Gate 6 hardening round), and
-  to be filed as a follow-up against the shared pattern (`docs/postgres-store-playbook.md`'s
-  ADR-0040 section) in this run's post-merge follow-up batch, not fixed for this store alone.
+  an operator considering rollback-then-reupgrade is warned (see `upgrading.md` and the (retired,
+  #3623) `quarantine-store-backfill-recovery.md` runbook, both fixed in the Gate 6 hardening
+  round). Moot for this store specifically since `migrate_from_sqlite()` itself was retired
+  (2026-09-03, see this ADR's own Update) — no rollback-then-reupgrade replay path remains; the
+  class-level gap in the shared ADR-0040 pattern may still apply to a sibling store that has not
+  yet retired its own backfill.
 - **UP-9: a connection dying after a write commits but before the client receives the
   acknowledgement is answered on retry as a business error** (`"device is already
   quarantined"`/`"device is not quarantined"`, both 400) rather than distinguished from a caller

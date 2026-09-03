@@ -1580,10 +1580,11 @@ Quarantine a device.
 >   this route validates `whitelist` at write time (`400` instead of `201`
 >   for a malformed value), the same rule MCP's `quarantine_device` already
 >   enforced — so a fresh write here can no longer land in this state. A
->   `validation_failed` reconcile now points at a record migrated from the
->   legacy `quarantine.db` (ADR-0047 backfill, which copies `whitelist`
->   verbatim with no validation) or one written via this route before
->   `d1f71c58f` shipped, not a fresh call. Either way, every reconcile
+>   `validation_failed` reconcile now points at a record written via this
+>   route before `d1f71c58f` shipped, or — on a fleet with pre-#3623 history
+>   — one migrated from a legacy `quarantine.db` by the since-retired
+>   `migrate_from_sqlite` backfill (ADR-0047, which copied `whitelist`
+>   verbatim with no validation), not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.
 >   That failure is loud, not silent — the device stays in
 >   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
@@ -3978,13 +3979,16 @@ Create a new webhook subscription.
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
-**Security — secret storage and the legacy-file retention window.** A configured signing secret
+**Security — secret storage, and a legacy file's disposal.** A configured signing secret
 is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database backup alone cannot
 recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
-recreate it. Deployments that upgraded from a release before the Postgres cutover retain the
-pre-cutover SQLite `webhooks.db` file for one release as a rollback net (ADR-0009); that file
-still holds signing secrets in **plaintext**. If your backup posture for that one-release window
-is unknown, rotate (delete-and-recreate) every webhook's secret once the window has closed.
+recreate it. No production fleet ever ran a pre-Postgres build of this store (#3623), so a
+legacy SQLite `webhooks.db` genuinely holding real data should not exist — but if one is
+somehow found on disk at boot (hardened to 0600, main file and any `-wal`/`-shm` sidecars, and
+warned about in the log), it still holds any signing secrets in **plaintext** and is never
+automatically deleted or rotated. If you find one and don't need it, delete it yourself; if any
+webhook it names might still be relying on that secret, rotate (delete-and-recreate) the
+corresponding webhook's secret via this store first.
 
 **Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the delivered event
 payload is transmitted in cleartext. Production deployments should use `https://` only. The
