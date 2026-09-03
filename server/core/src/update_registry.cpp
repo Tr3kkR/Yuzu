@@ -157,17 +157,17 @@ UpdateRegistry::UpdateRegistry(pg::PgPool& pool, const std::filesystem::path& up
 
 UpdateRegistry::~UpdateRegistry() = default;
 
-void UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
+bool UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
     if (!open_) {
         note_write_degrade(metrics_, kReasonStoreNotOpen);
-        return;
+        return false;
     }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         note_write_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: upsert_package skipped, no connection in time ({})",
                       pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -188,10 +188,11 @@ void UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
         note_write_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: upsert_package failed for {}/{}/{}: {}", pkg.platform,
                       pkg.arch, pkg.version, PQerrorMessage(lease.get()));
-        return;
+        return false;
     }
     spdlog::info("UpdateRegistry: upserted package {}/{}/{} ({})", pkg.platform, pkg.arch,
                  pkg.version, pkg.filename);
+    return true;
 }
 
 void UpdateRegistry::remove_package(const std::string& platform, const std::string& arch,

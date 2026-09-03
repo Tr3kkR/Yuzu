@@ -24,6 +24,7 @@
 #include "settings_routes.hpp"
 
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "test_route_sink.hpp"
 #include "update_registry.hpp"
 #include "../test_helpers.hpp"
@@ -34,6 +35,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <libpq-fe.h>
 
 #include <filesystem>
 #include <memory>
@@ -128,13 +130,15 @@ struct OtaAuditHarness {
         pkg.mandatory = mandatory;
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = 1024;
-        registry->upsert_package(pkg);
+        (void)registry->upsert_package(pkg);
     }
 
-    /// The rollout route parses an urlencoded body, so the content type matters:
-    /// `Post(path, body)` alone defaults to application/json and would leave
-    /// `req.params` empty, silently exercising the handler's fallback instead of
-    /// its production branch (the #1786 false-green).
+    /// The content type is passed explicitly because `TestRouteSink`'s contract
+    /// requires it for a form body. Note this route does NOT read `req.params` --
+    /// it calls `extract_form_value(req.body, ...)`, which is body-only -- so the
+    /// #1786 params-are-empty false-green does not apply here. Passing it anyway
+    /// keeps the request shaped like the production one rather than relying on
+    /// that implementation detail staying true.
     std::unique_ptr<httplib::Response> post_rollout(const std::string& version,
                                                     const std::string& pct) {
         return sink.Post("/api/settings/updates/linux/x86_64/" + version + "/rollout",
@@ -185,10 +189,15 @@ TEST_CASE("OTA rollout on a package that does not exist records not_found, not s
     CHECK(res->status == 200);
 
     // Recording a fictional success would put an event in the evidence store that
-    // never happened, and would hide package-key enumeration from a SIEM rule.
+    // never happened. The token is `denied` with the reason in `detail`, matching
+    // this file's own rejection branches (`user.delete` -> "denied" /
+    // "invalid_username") -- and, decisively, matching the filter audit-log.md
+    // tells operators to use for enumeration (`result == "denied"`). A bespoke
+    // fourth token would be invisible to that rule.
     REQUIRE(h.audited.size() == 1);
     CHECK(h.audited.front().action == "ota.package.rollout_changed");
-    CHECK(h.audited.front().result == "not_found");
+    CHECK(h.audited.front().result == "denied");
+    CHECK(h.audited.front().detail == "not_found");
     CHECK(h.audited.front().target_id == "linux/x86_64/9.9.9");
 
     // The real package is untouched.
@@ -211,4 +220,37 @@ TEST_CASE("OTA rollout percentage is clamped, and the row reports the CLAMPED va
     CHECK(h.audited.front().detail.find("from=10%") != std::string::npos);
     CHECK(h.audited.front().detail.find("to=100%") != std::string::npos);
     CHECK(h.registry->list_packages().front().rollout_pct == 100);
+}
+
+TEST_CASE("a rollout whose registry write does not commit is audited as failure, not success",
+          "[ota][audit][settings_routes][pg]") {
+    // The row reports a COMMITTED transition ("from=100% to=0%"). upsert_package
+    // degrades silently on a closed store, a pool-acquire timeout or a query
+    // error, so deriving the result from "we found the package" would let this
+    // row assert a change that never reached the database — evidence that
+    // disagrees with state, in the record an incident responder is supposed to be
+    // able to trust. This is the case an external functional reviewer asked for.
+    //
+    // The write is broken the bluntest honest way: drop the table out from under
+    // the handler after seeding, so the INSERT genuinely errors rather than being
+    // faked at the seam under test.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/100, /*mandatory=*/true);
+
+    {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult drop{PQexec(conn.get(), "DROP TABLE update_registry.update_packages")};
+        REQUIRE(drop.ok());
+    }
+
+    // list_packages now fails too, so the handler cannot even find the package.
+    // That is the honest outcome of a dead store and still must not be `success`.
+    auto res = h.post_rollout("1.2.3", "0");
+    REQUIRE(res);
+    REQUIRE(h.audited.size() == 1);
+    CHECK(h.audited.front().action == "ota.package.rollout_changed");
+    CHECK(h.audited.front().result != "success");
+    CHECK(h.audited.front().detail.find("from=") == std::string::npos);
 }

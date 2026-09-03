@@ -103,7 +103,17 @@ public:
     /// adversarial review 2026-08-28).
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    void upsert_package(const UpdatePackage& pkg);
+    /// Insert or update a package row. Returns false when the write did NOT
+    /// commit — a closed store, a pool-acquire timeout, or a query error.
+    ///
+    /// It returns a value rather than logging and moving on because a CALLER
+    /// AUDITS THIS. `ota.package.rollout_changed` reports a committed transition
+    /// ("from=100% to=0%"), and an audit row asserting a change that never
+    /// reached the database is worse than no row at all: it is evidence that
+    /// disagrees with the state, in the one record an incident responder is
+    /// supposed to be able to trust. Callers that do not audit may still ignore
+    /// the result; the log line is unchanged.
+    [[nodiscard]] bool upsert_package(const UpdatePackage& pkg);
     void remove_package(const std::string& platform, const std::string& arch,
                         const std::string& version);
     std::vector<UpdatePackage> list_packages() const;

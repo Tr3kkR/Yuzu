@@ -5375,7 +5375,10 @@ void SettingsRoutes::register_routes(
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
-        update_registry_->upsert_package(pkg);
+        // Upload path: the row is best-effort here and the failure is already
+        // visible in the log; the rollout path is the one that audits a committed
+        // transition and therefore must not discard this.
+        (void)update_registry_->upsert_package(pkg);
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
@@ -5442,19 +5445,21 @@ void SettingsRoutes::register_routes(
                   // distinguish that from a package that was never rolled out.
                   // "from=100% to=0%" does. `mandatory` is carried for the same
                   // reason: it is what makes the de-prioritisation consequential.
-                  bool found = false;
-                  int prior_pct = 0;
-                  bool mandatory = false;
+                  std::optional<UpdatePackage> before;
+                  bool committed = false;
                   auto packages = update_registry_->list_packages();
                   for (auto pkg : packages) {
                       if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
-                          found = true;
-                          prior_pct = pkg.rollout_pct;
-                          mandatory = pkg.mandatory;
+                          before = pkg; // the state the row reports as `from=`
                           pkg.rollout_pct = pct;
-                          update_registry_->upsert_package(pkg);
-                          spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
-                                       version, pct);
+                          committed = update_registry_->upsert_package(pkg);
+                          if (committed)
+                              spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
+                                           version, pct);
+                          else
+                              spdlog::error("OTA rollout NOT applied for {}/{} v{}: the registry "
+                                            "write did not commit",
+                                            platform, arch, version);
                           break;
                       }
                   }
@@ -5466,15 +5471,30 @@ void SettingsRoutes::register_routes(
                   // log, and nothing else in the request path emits an audit row.
                   //
                   // A request naming a package that does not exist changes nothing,
-                  // so it records `not_found` rather than a fictional success —
-                  // matching `delete_tag`'s established third token, and keeping
-                  // enumeration of package keys visible to a SIEM rule.
-                  audit_fn_(req, "ota.package.rollout_changed", found ? "success" : "not_found",
-                            "UpdatePackage", platform + "/" + arch + "/" + version,
-                            found ? "from=" + std::to_string(prior_pct) +
-                                        "% to=" + std::to_string(pct) +
-                                        "% mandatory=" + (mandatory ? "true" : "false")
-                                  : "no such package; rollout unchanged");
+                  // so it must not record a fictional success. The token is
+                  // `denied` with the reason in `detail`, NOT a bespoke
+                  // `not_found` result: this file's own rejection branches use
+                  // that shape (`user.delete` -> "denied" / "invalid_username"),
+                  // and audit-log.md's probe-detection recipe tells operators to
+                  // filter on `result == "denied"` to surface enumeration — a
+                  // fourth token would be invisible to exactly the rule this row
+                  // exists to feed.
+                  // THE RESULT IS DERIVED FROM THE COMMIT, NOT FROM THE LOOKUP.
+                  // `upsert_package` degrades silently on a closed store, a
+                  // pool-acquire timeout or a query error, so deriving `success`
+                  // from "we found the package" would let this row assert a
+                  // "from=100% to=0%" transition that never reached the database —
+                  // evidence disagreeing with state, in the one record an incident
+                  // responder is meant to be able to trust. `failure` is the
+                  // documented token for a failure the handler audits itself.
+                  const char* result = !before ? "denied" : (committed ? "success" : "failure");
+                  audit_fn_(req, "ota.package.rollout_changed", result, "UpdatePackage",
+                            platform + "/" + arch + "/" + version,
+                            !before ? std::string("not_found")
+                                    : (committed ? "from=" + std::to_string(before->rollout_pct) +
+                                                       "% to=" + std::to_string(pct) + "% mandatory=" +
+                                                       (before->mandatory ? "true" : "false")
+                                                 : "registry write did not commit; rollout unchanged"));
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
               });
