@@ -2140,6 +2140,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // Dispatch
         std::string command_id;
         int sent = 0;
+        // #3424/#3511: mirrors the outer command_id/sent pattern -- dispatch_outcome
+        // itself lives inside the try block below and goes out of scope at its
+        // closing brace, so the discriminator fields it carries must be copied out
+        // to these outer locals if the sent==0 branch further down is to use them.
+        bool containment_unreadable = false;
+        std::size_t denied_quarantined_count = 0;
+        std::size_t unknown_plugin_count = 0;
         try {
             // #2500: NAME the broadcast rather than expressing it as "both
             // fields happen to be empty". The shape check above guarantees that
@@ -2168,6 +2175,9 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                    execution_id, caller);
             command_id = dispatch_outcome.command_id;
             sent = dispatch_outcome.sent;
+            containment_unreadable = dispatch_outcome.containment_unreadable;
+            denied_quarantined_count = dispatch_outcome.denied_quarantined_count;
+            unknown_plugin_count = dispatch_outcome.unknown_plugin_count;
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created
@@ -2193,21 +2203,36 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 spdlog::error("workflow_routes: mark_cancelled failed for execution_id={}",
                               execution_id);
             }
-            // #881: "no agents reached" now covers a THIRD condition this
-            // route cannot see — every target withheld by the containment
-            // gate, or the gate failing closed fleet-wide because containment
-            // state is unreadable. The shared dispatch closure returns only a
-            // sent count, so the discriminator is not available here (#3424);
-            // until it is, the message must not assert unreachability, which
-            // is what sends an operator to the agent/networking team during a
-            // Postgres incident. ADR-1007 adds a FOURTH: for a `per-device`
-            // definition, every target may have been excluded by an already-open
-            // concurrency claim rather than being unreachable at all — check
-            // yuzu_server_dispatch_concurrency_skipped_total too.
+            // #881/#3424/#3511: "no agents reached" covers several distinct
+            // causes this route did not used to discriminate — every target
+            // withheld by quarantine, the containment gate failing closed
+            // fleet-wide, or (#3511) the dispatched plugin absent from every
+            // target's reported inventory. `dispatch_outcome` (above) has
+            // carried this discrimination since the #3424/#3511 widening of
+            // ConfinedDispatchOutcome; this route just wasn't reading it yet.
+            // ADR-1007 adds a further condition this struct does NOT carry:
+            // for a `per-device` definition, every target may have been
+            // excluded by an already-open concurrency claim rather than being
+            // unreachable at all — check yuzu_server_dispatch_concurrency_skipped_total
+            // too, same as before, folded into the generic catch-all below.
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"no agents reached: every target was unreachable, quarantined, withheld because containment state could not be read, or excluded by an in-flight per-device concurrency claim. Check GET /api/v1/quarantine, yuzu_server_quarantine_gate_total, and yuzu_server_dispatch_concurrency_skipped_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
-                "application/json");
+            if (containment_unreadable) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (denied_quarantined_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (unknown_plugin_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"no agents reached: every target was unreachable or excluded by an in-flight per-device concurrency claim. Check yuzu_server_dispatch_concurrency_skipped_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            }
             return;
         }
 
