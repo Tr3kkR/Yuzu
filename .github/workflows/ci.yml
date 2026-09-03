@@ -2349,17 +2349,22 @@ jobs:
         # heavy week was the residual risk) while keeping live entries to
         # ~2-3 per scope. At the 3G cap (raised from 2G — see the env
         # block above) and ccache's own measured ~1.1-1.3x overshoot past
-        # its cap before a cleanup pass catches up, that's ~6.6-9.4 GB of
-        # ccache alone in the worst case, before the ~2.24 GB vcpkg-canary
-        # entry or misc caches — tight against the 10 GB repo quota, not
-        # comfortably clear of it. vcpkg-canary is the more exposed entry
-        # if the pool is ever forced to evict (it restores earlier in the
-        # job, so it's the older of the two once a dead bucket ages out),
-        # and losing it costs a 65-70 min cold rebuild — far worse than
-        # the ccache churn this cap raise fixes. Daily buckets would
-        # re-crowd the quota further still. Verify on the first live 3G
-        # run: `Save ccache (canary)`'s archived-size log line comfortably
-        # under ~3.7 GB means the margin holds; near or over means either
+        # its cap before a cleanup pass catches up, that's 2x3.3 to 3x3.9
+        # = ~6.6-11.7 GB of ccache alone in the worst case (both dimensions
+        # at their max simultaneously — an outer bound, not the expected
+        # case; every run observed this session sat at 1-2 live entries,
+        # not 3), before the ~2.24 GB vcpkg-canary entry or misc caches —
+        # the true worst case is OVER the 10 GB repo quota, not merely
+        # tight against it. vcpkg-canary is the more exposed entry if the
+        # pool is ever forced to evict (it restores earlier in the job, so
+        # it's the older of the two once a dead bucket ages out), and
+        # losing it costs a 65-70 min cold rebuild — far worse than the
+        # ccache churn this cap raise fixes. Daily buckets would re-crowd
+        # the quota further still. Verify on the first live 3G run:
+        # `Save ccache (canary)`'s archived-size log line comfortably
+        # under ~3.7 GB (deliberately below the ~3.9 GB single-entry
+        # ceiling above, to alarm on drift before a run actually reaches
+        # it) means the margin holds; near or over means either
         # the overshoot ratio or the live-entry-count assumption above
         # needs re-measuring, not the cap re-raised blind.
         #
