@@ -1625,22 +1625,22 @@ Quarantine a device.
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `reason` is a top-level key on the error object, not part of the A4
-> `error.data` envelope. The versioned dispatch routes
-> (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
-> do **not** yet carry this split — they answer their existing
-> "no agents reached" shapes for all four conditions, because their own
+> `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
+> same three-`reason` split as `POST /api/command` above (`containment_unreadable`
+> / `quarantined` / `plugin_not_found`, same `retry_after_ms` values) —
+> closed alongside the architect finding that its response-building code
+> was reading `dispatch_outcome.command_id`/`.sent` only, discarding the
+> richer fields already available on the same struct. Its generic catch-all
+> (no `reason` key, matching the *(absent)* row above) additionally covers
+> ADR-1007's per-device concurrency-claim exclusion, unique to this route
+> since it — unlike `/api/command` — accepts a `concurrency_mode`: for a
+> `per-device` definition, every named target may have been excluded by an
+> already-open claim rather than being unreachable at all; the message
+> points at `yuzu_server_dispatch_concurrency_skipped_total`. The bundle and
+> result-set producers still do **not** carry this split — their own
 > response-building code was not extended to surface the richer per-arm
-> result these routes' shared dispatch closure now carries (#3424 closed the
-> underlying signature gap for the whole codebase; extending every OTHER
-> route's response body to actually use the new fields is a separate,
-> smaller follow-up per route). ADR-1007 added
-> a fifth cause to that same undifferentiated message on
-> `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
-> named target may have been excluded by an already-open concurrency claim
-> rather than being unreachable at all — the response text now says so, and
-> points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
-> this is still prose inside the one undifferentiated 503 body, not a fifth
-> structured `error.reason` value — the same other-routes gap applies to it. The quarantine
+> result their shared dispatch closure now carries (a separate, smaller
+> follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —
