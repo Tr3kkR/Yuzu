@@ -576,6 +576,20 @@ Plugins for file and directory operations.
 |---|---|
 | `free` | Report free and total bytes (and percent used) for the volume containing `path`. Parameter: `path` (string, optional -- volume root or any directory on the target volume; defaults to `C:\` on Windows / `/` on Linux/macOS). Returns `disk|<path>|<total_bytes>|<free_bytes>|<percent_used>` on success, `error|<msg>` with a non-zero exit on failure (same convention as os_info). |
 
+### filesystem_posture
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W L M |
+| **Description** | Mounted-volume inventory, volume-level disk quota state, and filesystem snapshot inventory. All three actions are read-only. |
+
+| Action | Description |
+|---|---|
+| `mounts` | List mounted volumes with device, filesystem type, mount options, capacity, and a fixed flags vocabulary (`ro rw nosuid nodev noexec noatime relatime removable remote cdrom`). On Windows uses `FindFirstVolumeW` + `GetVolumeInformationW` + `GetDriveTypeW` + `GetDiskFreeSpaceExW`. On Linux parses `/proc/self/mountinfo`; a network-filesystem source reports its capacity columns as `-`, and a device-mapper source may be dm-crypt/multipath rather than a volume manager. On macOS uses `getmntinfo`; an APFS snapshot shared by two mount points of one volume lineage is reported once per mount point. |
+| `quotas` | Report volume-level disk quota state -- volume-level only everywhere, no per-user/group breakdown on any platform. On Linux uses `quotactl(Q_GETFMT)` per mounted filesystem. On macOS probes APFS and HFS+ volumes via `getattrlist` and reports `none`/`configured`; only non-APFS/HFS mounts report `unsupported_fs`: APFS has no per-user or per-group quota mechanism at all. On Windows uses `IDiskQuotaControl`, initialized read-only (`bReadWrite=FALSE`); that leg is compiled and linked on Windows but has not been asserted against a host with quotas configured. |
+| `snapshots` | Enumerate filesystem snapshots. On Linux reports Btrfs/LVM snapshot capability, not a live inventory of existing snapshots. On macOS enumerates APFS snapshots, with the same shared-lineage per-mount-point caveat as `mounts`. On Windows enumerates VSS shadow copies via `IVssBackupComponents::Query` — one row per shadow copy, `name` being the snapshot GUID and `detail` the shadow-copy device path. **That leg requires administrative rights:** the agent runs as LocalSystem today so it succeeds; under an unprivileged service account it reports `permission_denied` rather than an empty snapshot set — see `docs/agent-privilege-model.md` for the measured per-identity results and the grant procedure. Backslashes in the emitted device path are normalised to forward slashes by the shared output escaper, so the `detail` value is an identifier rather than a path you can paste into a Windows shell. **Known hazard:** the VSS calls have no timeout, so a wedged VSS service or a hung third-party backup provider will park the agent worker that ran the action. A repeating schedule against such a host can exhaust the agent's dispatch pool, after which it rejects all commands until restarted — prefer on-demand invocation over a frequent schedule on hosts with third-party backup software, and treat an agent that rejects everything shortly after a scheduled `snapshots` run as a likely VSS wedge. |
+
 ---
 
 ## Execution
