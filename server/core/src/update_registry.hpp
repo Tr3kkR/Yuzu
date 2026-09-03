@@ -54,6 +54,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -133,5 +134,34 @@ private:
     std::filesystem::path update_dir_;
     yuzu::MetricsRegistry* metrics_{nullptr};
 };
+
+/// Is `name` safe to use as an OTA package filename? (#3863)
+///
+/// Every OTA artifact path is built as `update_dir_ / filename` — the binary, its
+/// `.sig` sidecar, and the `.upload.<n>.tmp` staging file. The filename arrives
+/// from an operator-supplied multipart part, so without this check a name of
+/// `../../../../etc/cron.d/x` escapes the update directory, and an ABSOLUTE name
+/// is worse still: `operator/` discards the left operand entirely when the right
+/// is absolute, so `/etc/cron.d/x` ignores `update_dir_` without needing any
+/// `..` at all. Either way the uploaded bytes land wherever the server account
+/// can write, which is arbitrary file write and, via cron or a unit file, code
+/// execution.
+///
+/// ALLOWLIST, NOT AN ESCAPE-SCAN. This accepts a bare filename and rejects
+/// everything else, rather than trying to strip or normalise a hostile one —
+/// normalising is where this class of bug comes back, because it invites
+/// "just one more" separator or encoding to be handled. Callers reject; nothing
+/// rewrites the operator's name behind their back.
+///
+/// Rejects: empty; `.` and `..`; anything containing `/`, `\\`, or `:`. The
+/// backslash and colon are rejected on every platform, not just Windows — the
+/// server may run on Windows, where both are path-significant (`:` also selects
+/// an NTFS alternate data stream), and a rule that varies by build host is a rule
+/// nobody can reason about.
+[[nodiscard]] inline bool is_safe_package_filename(std::string_view name) {
+    if (name.empty() || name == "." || name == "..")
+        return false;
+    return name.find_first_of("/\\:") == std::string_view::npos;
+}
 
 } // namespace yuzu::server

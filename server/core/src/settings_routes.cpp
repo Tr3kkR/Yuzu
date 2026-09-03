@@ -5462,6 +5462,20 @@ void SettingsRoutes::register_routes(
         auto orig_name =
             uploaded.filename.empty() ? "yuzu-agent-" + platform + "-" + arch : uploaded.filename;
 
+        // #3863: the name is operator-supplied and every artifact path is built
+        // from it — the binary, its .sig sidecar and the .upload staging file —
+        // so a traversal or absolute name writes all three outside update_dir_.
+        // Rejected BEFORE any path is derived from it.
+        if (!is_safe_package_filename(orig_name)) {
+            spdlog::warn("OTA upload for {}/{}: rejected unsafe package filename", platform, arch);
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">The package filename must be a plain "
+                            "filename \u2014 no directory separators, drive letters, or "
+                            "<code>..</code>.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
         auto out_path =
             update_registry_->binary_path(UpdatePackage{platform, arch, "", "", orig_name});
         std::error_code ec;

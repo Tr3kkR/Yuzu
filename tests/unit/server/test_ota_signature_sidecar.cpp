@@ -16,6 +16,7 @@
  */
 
 #include "ota_signature_sidecar.hpp"
+#include "update_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -359,4 +360,41 @@ TEST_CASE("removing a signature is ordered last, so a failure never leaves the s
     // And it reports success even when there was nothing to remove, so the
     // handler cannot mistake "already unsigned" for a failure and 500 on it.
     CHECK(replace_signature_sidecar(sig, ""));
+}
+
+TEST_CASE("package filenames that escape the update directory are refused (#3863)",
+          "[ota][sidecar][security]") {
+    using yuzu::server::is_safe_package_filename;
+
+    // Ordinary names an operator actually uploads.
+    CHECK(is_safe_package_filename("yuzu-agent-linux-x86_64"));
+    CHECK(is_safe_package_filename("yuzu-agent.exe"));
+    CHECK(is_safe_package_filename("yuzu-agent-0.12.0.tar.gz"));
+    CHECK(is_safe_package_filename("weird but legal name (1)"));
+
+    // Relative traversal: every artifact path is update_dir_ / filename, so this
+    // writes the binary, its sidecar and the staging file outside the directory.
+    CHECK_FALSE(is_safe_package_filename("../x"));
+    CHECK_FALSE(is_safe_package_filename("../../../../etc/cron.d/x"));
+    CHECK_FALSE(is_safe_package_filename(".."));
+    CHECK_FALSE(is_safe_package_filename("."));
+
+    // Absolute is strictly worse than traversal and needs no "..": operator/
+    // DISCARDS the left operand when the right is absolute, so update_dir_ is
+    // ignored entirely.
+    CHECK_FALSE(is_safe_package_filename("/etc/cron.d/x"));
+
+    // Rejected on every platform, not only Windows: the server may run there,
+    // where both are path-significant and ':' also selects an NTFS alternate
+    // data stream. A rule that varies by build host is one nobody can reason
+    // about.
+    CHECK_FALSE(is_safe_package_filename("..\\..\\x"));
+    CHECK_FALSE(is_safe_package_filename("C:\\windows\\x"));
+    CHECK_FALSE(is_safe_package_filename("file.exe:ads"));
+
+    // A subdirectory is not a traversal, but it is still not a bare filename and
+    // the allowlist refuses it rather than reasoning about where it lands.
+    CHECK_FALSE(is_safe_package_filename("sub/dir/agent"));
+
+    CHECK_FALSE(is_safe_package_filename(""));
 }
