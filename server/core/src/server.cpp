@@ -15531,15 +15531,24 @@ private:
                         {"action", action},
                         {"command_id", command_id},
                         {"scope", scope_expr}});
-            res.set_header(
-                "HX-Trigger",
-                "{\"showToast\":{\"message\":\"Command sent to " + std::to_string(sent) +
-                    " agent(s)" +
-                    (denied_quarantined_count == 0
-                         ? std::string{}
-                         : "; " + std::to_string(denied_quarantined_count) +
-                               " withheld (quarantined)") +
-                    "\",\"level\":\"success\"}}");
+            // #3424/#3511 (governance Gate 4 finding, independently raised by
+            // consistency-auditor and unhappy-path): a MIXED partial dispatch
+            // -- some reached, some withheld for plugin absence -- must be as
+            // visible as a mixed quarantine withholding already is, or the
+            // "a mixed cause is never invisible" property the zero-reach
+            // cascade goes out of its way to guarantee silently doesn't hold
+            // once sent > 0.
+            std::string toast_suffix;
+            if (denied_quarantined_count > 0)
+                toast_suffix +=
+                    "; " + std::to_string(denied_quarantined_count) + " withheld (quarantined)";
+            if (unknown_plugin_count > 0)
+                toast_suffix += "; " + std::to_string(unknown_plugin_count) +
+                                " withheld (plugin not found)";
+            res.set_header("HX-Trigger",
+                           "{\"showToast\":{\"message\":\"Command sent to " +
+                               std::to_string(sent) + " agent(s)" + toast_suffix +
+                               "\",\"level\":\"success\"}}");
             // #881: a PARTIAL dispatch must say so. Without this an operator
             // targeting a 100-device group with 3 contained devices reads
             // "Command sent to 97 agent(s)" and has no signal that 3 were
@@ -15552,6 +15561,7 @@ private:
                                 {"command_id", command_id},
                                 {"agents_reached", sent},
                                 {"withheld_quarantined", denied_quarantined_count},
+                                {"withheld_unknown_plugin", unknown_plugin_count},
                                 {"thead_html", agent_service_.thead_for_plugin(plugin)}})
                     .dump(),
                 "application/json");

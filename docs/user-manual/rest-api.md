@@ -1609,9 +1609,11 @@ Quarantine a device.
 > [Audit Log](audit-log.md)).
 >
 > **`POST /api/command` reports what it withheld.** The success body carries
-> `withheld_quarantined` — always present, `0` on a clean dispatch — so
-> `agents_reached: 97` on a 100-device group is distinguishable from three
-> devices being offline. The dashboard toast says the same.
+> `withheld_quarantined` and (#3424/#3511) `withheld_unknown_plugin` — both
+> always present, `0` on a clean dispatch — so `agents_reached: 97` on a
+> 100-device group is distinguishable from three devices being offline, and a
+> MIXED partial dispatch (some reached, some plugin-absent) is never silently
+> invisible in the response. The dashboard toast says the same.
 >
 > **Its `503` now names the cause.** Four conditions previously shared one
 > body ("failed to send command to any agent"), and two of them are

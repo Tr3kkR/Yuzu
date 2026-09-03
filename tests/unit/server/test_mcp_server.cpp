@@ -6947,7 +6947,7 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
 }
 
 TEST_CASE("MCP execute_instruction: every target quarantined reports status="
-          "targets_quarantined, non-retryable",
+          "quarantined, non-retryable",
           "[mcp][integration][execute][3424][3511]") {
     McpTestServer ts;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
@@ -6967,7 +6967,7 @@ TEST_CASE("MCP execute_instruction: every target quarantined reports status="
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     auto& sc = body["result"]["structuredContent"];
-    CHECK(sc["status"] == "targets_quarantined");
+    CHECK(sc["status"] == "quarantined");
     CHECK(sc["agents_reached"] == 0);
     CHECK(sc["retry_after_ms"].is_null());
     CHECK(sc["agents_quarantined"] == 1);
@@ -7031,7 +7031,7 @@ TEST_CASE("MCP execute_instruction: a plugin absent from every target's inventor
 TEST_CASE("MCP execute_instruction: a MIXED outcome (quarantined AND plugin-absent targets) "
           "reports the higher-priority status but carries BOTH counts",
           "[mcp][integration][execute][3424][3511]") {
-    // Priority cascade pinned: containment_unreadable > targets_quarantined >
+    // Priority cascade pinned: containment_unreadable > quarantined >
     // plugin_not_found > no_agents_reached (server.cpp's execute_instruction
     // handler). A mixed failure must never understate a permanent reason as
     // the weaker/generic one, and the response body must still let the
@@ -7056,7 +7056,7 @@ TEST_CASE("MCP execute_instruction: a MIXED outcome (quarantined AND plugin-abse
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     auto& sc = body["result"]["structuredContent"];
-    CHECK(sc["status"] == "targets_quarantined"); // wins over plugin_not_found
+    CHECK(sc["status"] == "quarantined"); // wins over plugin_not_found
     CHECK(sc["agents_quarantined"] == 1);
     CHECK(sc["agents_unknown_plugin"] == 1); // still visible, not hidden by the status choice
 }

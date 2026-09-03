@@ -825,7 +825,7 @@ static const ToolDef kTools[] = {
      "change. "
      "ZERO-AGENTS DISCRIMINATION (#3424/#3511): a SUCCESS envelope with agents_reached=0 also "
      "carries a status enum, not just \"no_agents_reached\" - branch on status, not message text. "
-     "\"targets_quarantined\" and \"plugin_not_found\" are PERMANENT: retrying will not help "
+     "\"quarantined\" and \"plugin_not_found\" are PERMANENT: retrying will not help "
      "(retry_after_ms is null on both). \"containment_unreadable\" is a transient systemic gate "
      "failure - retry_after_ms names the wait. \"no_agents_reached\" is the generic case (offline "
      "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
@@ -867,7 +867,7 @@ static const ToolDef kTools[] = {
      // degradation, and no_agents_reached's own catch-all, which mixes a
      // possible permanent approval-denial race with a possible genuinely
      // offline device and so must not claim `null`/not-retryable either),
-     // null for the two permanent branches (targets_quarantined,
+     // null for the two permanent branches (quarantined,
      // plugin_not_found) - not a generic integer, so a client
      // schema-validating the response catches drift between this contract and
      // the handler the same way `agents_reached`'s own const already does.
@@ -877,7 +877,7 @@ static const ToolDef kTools[] = {
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
-     R"j({"type":"object","properties":{"status":{"const":"targets_quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false})j"
      R"j(]})j"},
@@ -9026,7 +9026,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // PRIORITY, matching /api/command's own cascade
                     // (server.cpp): containment_unreadable first (a systemic
                     // gate failure, not a per-target fact) — then
-                    // targets_quarantined — then plugin_not_found — then the
+                    // quarantined — then plugin_not_found — then the
                     // generic catch-all. `> 0`, not `== agent_ids.size()`:
                     // a MIXED failure (some quarantined, some plugin-absent,
                     // some genuinely offline) is still not "just offline",
@@ -9044,7 +9044,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             "seconds once the containment store is reachable again.";
                         zero_retry_after_ms_json = "5000";
                     } else if (dispatch_outcome.denied_quarantined_count > 0) {
-                        zero_status = "targets_quarantined";
+                        zero_status = "quarantined";
                         zero_message =
                             "No agents reached: every target was withheld by the quarantine "
                             "containment gate. This is a permanent policy denial, not "
