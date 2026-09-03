@@ -1570,11 +1570,15 @@ route, neither the directory nor its ACL hardening exists after upgrading. Creat
 it before you enable signing, or `--update-trust-bundle` points at nothing:
 
 ```powershell
-# Windows, elevated. The inheritance break is the point: without it, %ProgramData%'s
+# Windows, elevated. The inheritance break is the point: without it, $env:ProgramData's
 # inherited rights let an unprivileged local user plant the anchor file before you do.
+# Keep icacls on ONE line -- a broken continuation runs the mkdir and silently skips
+# the hardening, which is the exact state this block exists to avoid.
 mkdir "C:\ProgramData\Yuzu\agent-certs"
-icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r ^
-  /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+
+# Verify: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each (OI)(CI)(F).
+icacls "C:\ProgramData\Yuzu\agent-certs"
 ```
 
 ```bash
@@ -1583,8 +1587,11 @@ mkdir -p /etc/yuzu-agent/certs && chown root:wheel /etc/yuzu-agent/certs
 chmod 755 /etc/yuzu-agent/certs
 ```
 
-Linux fleets upgrade through `.deb`/`.rpm`, whose post-install steps re-run on
-upgrade, so they need nothing here.
+Linux endpoints upgraded through `.deb`/`.rpm` need nothing here — Debian's
+post-install step re-runs on upgrade, and the RPM ships the directory in its
+payload. A Linux endpoint that upgraded by OTA self-update, however, is in the
+same position as Windows and macOS and needs `install -d -m 0755 -o root -g root
+/etc/yuzu-agent/certs`.
 
 **Default behaviour is unchanged.** Agents that pass no `--update-trust-bundle`
 behave exactly as before: the downloaded binary is checked against the
@@ -2258,7 +2265,7 @@ editing the unit:
 |---|---|
 | Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
 | macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
-| Windows | Add the flag to the service's **binary path**. **`sc.exe config binPath=` REPLACES THE ENTIRE COMMAND LINE — it does not append.** Capture the current one first with `sc qc YuzuAgent`, then re-issue it in full with the flag added, keeping the escaped inner quotes exactly as shown under "Installing the agent as a Windows service" below. Passing only the new flag drops `--server`, `--data-dir`, `--plugin-dir` and `--log-file`; the service then reaches RUNNING, fails closed on startup with no server or CA to pin, and the endpoint silently leaves the fleet while you believe you enabled signing. Prefer this over `setx /M`: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service — the bundle would stay unset and verification silently OFF while you believed it was on. If you do use `setx /M`, reboot. |
+| Windows | Add the flag to the service's **binary path**. **`sc.exe config binPath=` REPLACES THE ENTIRE COMMAND LINE — it does not append.** Capture the current one first with `sc qc YuzuAgent`, then re-issue it in full with the flag added, keeping the escaped inner quotes exactly as shown under **Windows Service Installation → Agent: `--install-service`** below. Passing only the new flag drops `--server`, `--data-dir`, `--plugin-dir` and `--log-file`; the service then reaches RUNNING, fails closed on startup with no server or CA to pin, and the endpoint silently leaves the fleet while you believe you enabled signing. Prefer this over `setx /M`: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service — the bundle would stay unset and verification silently OFF while you believed it was on. If you do use `setx /M`, reboot. |
 
 Every flag below has the environment variable shown beside it:
 
@@ -2323,12 +2330,12 @@ The only true withdrawal lever is the trust anchor itself, and it is blunt:
 
 1. **Issue a new signing key and certificate**, and re-sign every release you
    still want endpoints to accept.
-2. **Distribute a bundle containing only the new certificate** — not both. This
-   is the step that actually invalidates the withdrawn release, and it
-   invalidates your current ones too until step 1 has landed everywhere, which
-   is why step 1 comes first.
-3. **Re-upload the re-signed packages** before the new bundle reaches the fleet,
-   or anchored agents will refuse everything in the interim.
+2. **Re-upload the re-signed packages** to the server. Do this BEFORE the new
+   bundle reaches any endpoint: an agent that gets the new anchor while the
+   server is still serving old-key signatures refuses everything.
+3. **Distribute a bundle containing only the new certificate** — not both.
+   Last, because this is the step that actually invalidates the withdrawn
+   release, and until it lands the withdrawal has not happened.
 
 For a *suspected key compromise*, do the same but do not wait to batch it, and
 invert the ordering caution from *Rotating the signing key* below: there the old
@@ -3474,7 +3481,7 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/updates` | Render the OTA updates fragment (HTMX). |
-| `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart form). Parts: `file` (the binary, required), `signature` (an optional detached PEM CMS signature, ≤64 KB), `platform`, `arch`, `rollout_pct`, `mandatory`. Returns **500** if the signature is not a PEM CMS block, or if it could not be stored — in both cases **nothing is changed** and the previous package and signature are intact, so a scripted uploader should treat any non-2xx as "retry", never as "uploaded unsigned". Omitting `signature` on a re-upload **removes** any existing signature for that package. |
+| `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart form). Parts: `file` (the binary, required), `signature` (an optional detached PEM CMS signature, ≤64 KB), `platform`, `arch`, `rollout_pct`, `mandatory`. Returns **400** if the signature is not a PEM CMS block and **500** if it could not be stored or the binary could not be published — in every one of those cases **nothing is changed** and the previous package and signature are intact, so a scripted uploader should treat any non-2xx as "retry", never as "uploaded unsigned". Omitting `signature` on a re-upload **removes** any existing signature for that package. |
 | `DELETE` | `/api/settings/updates/{platform}/{arch}/{version}` | Delete an uploaded agent binary **and its signature sidecar**. |
 | `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Promote a version to production rollout. |
 

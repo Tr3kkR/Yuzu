@@ -2225,10 +2225,12 @@ std::string SettingsRoutes::render_updates_fragment() {
                                 : std::string(
                                       "<span style=\"color:#d29922\" title=\"The stored "
                                       "signature is NEWER than the binary beside it, so it "
-                                      "cannot cover it - the upload did not complete. Agents "
-                                      "will refuse this package in both modes. Re-upload the "
-                                      "binary and its signature together.\">signature "
-                                      "mismatch</span>"))
+                                      "cannot be confirmed to cover it. Usually an upload that "
+                                      "did not complete; a restore that did not preserve "
+                                      "timestamps looks the same. Agents refuse a signature "
+                                      "that does not verify, in both modes. Re-upload the "
+                                      "binary and its signature together to clear "
+                                      "it.\">signature mismatch</span>"))
                          : std::string("<span style=\"color:#8b949e\" title=\"No usable "
                                        "signature is being served: either none is stored, or "
                                        "the stored one is unreadable, empty or over the size "
@@ -5443,6 +5445,11 @@ void SettingsRoutes::register_routes(
         if (!signature_pem.empty() && !looks_like_pem_cms(signature_pem)) {
             spdlog::warn("OTA upload for {}/{}: rejected — the signature is not PEM-armoured CMS",
                          platform, arch);
+            // 400, not the httplib default. Leaving the status unset answered 200
+            // for an upload that wrote nothing, so a scripted uploader recorded
+            // success and the fleet silently kept the old package. 400 rather than
+            // 500 because the input is malformed — the server is fine.
+            res.status = 400;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"That signature file is not a PEM CMS )"
                            R"(signature (expected a -----BEGIN CMS----- block). Nothing was )"
@@ -5487,9 +5494,19 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // STAGE AND RENAME, for the same reason the sidecar does. Writing in place
+        // with ios::trunc means an ENOSPC part-way through leaves a TRUNCATED
+        // binary on the live path — and one whose mtime is NEWER than the sidecar,
+        // so the mtime consistency check sees a well-ordered pair and the column
+        // reports "signed" for a package whose signature covers nothing that is
+        // there. Staging keeps a partial write off the served path entirely.
+        auto bin_tmp = out_path;
+        bin_tmp += ".upload.tmp";
         {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+            std::ofstream f(bin_tmp, std::ios::binary | std::ios::trunc);
             if (!f.is_open()) {
+                std::error_code rm_ec;
+                std::filesystem::remove(bin_tmp, rm_ec);
                 res.status = 500;
                 res.set_content("<span class=\"feedback-error\">Cannot write file.</span>",
                                 "text/html; charset=utf-8");
@@ -5501,12 +5518,25 @@ void SettingsRoutes::register_routes(
             // agent binary that reports success is a fleet-wide apply failure.
             f.close();
             if (!f) {
+                std::error_code rm_ec;
+                std::filesystem::remove(bin_tmp, rm_ec);
                 res.status = 500;
                 res.set_content("<span class=\"feedback-error\">Could not write the binary "
                                 "completely.</span>",
                                 "text/html; charset=utf-8");
                 return;
             }
+        }
+        std::error_code bin_ren_ec;
+        std::filesystem::rename(bin_tmp, out_path, bin_ren_ec);
+        if (bin_ren_ec) {
+            std::error_code rm_ec;
+            std::filesystem::remove(bin_tmp, rm_ec);
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Could not publish the uploaded "
+                            "binary.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
 
         auto sha = auth::AuthManager::sha256_hex(uploaded.content);
@@ -5566,10 +5596,12 @@ void SettingsRoutes::register_routes(
                     auto arch = req.matches[2].str();
                     auto version = req.matches[3].str();
 
+                    bool matched = false;
                     auto packages = update_registry_->list_packages();
                     for (const auto& pkg : packages) {
                         if (pkg.platform == platform && pkg.arch == arch &&
                             pkg.version == version) {
+                            matched = true;
                             auto bin_path = update_registry_->binary_path(pkg);
                             std::error_code ec;
                             std::filesystem::remove(bin_path, ec);
@@ -5587,9 +5619,14 @@ void SettingsRoutes::register_routes(
                     spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
                     // Audited for the same reason as the upload: this removes a
                     // binary AND its signature from the fleet's update surface.
-                    audit_fn_(req, "ota.package.deleted", "success", "UpdatePackage",
-                              platform + "/" + arch + "/" + version,
-                              "binary and signature sidecar removed");
+                    // Report what actually happened. A delete naming a package that
+                    // is not there removes nothing, and recording that as a
+                    // successful removal puts a fictional event in the evidence
+                    // store — and hides probing of the endpoint from a SIEM rule.
+                    audit_fn_(req, "ota.package.deleted", matched ? "success" : "not_found",
+                              "UpdatePackage", platform + "/" + arch + "/" + version,
+                              matched ? "binary and signature sidecar removed"
+                                      : "no such package; nothing removed");
                     res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
                 });
 

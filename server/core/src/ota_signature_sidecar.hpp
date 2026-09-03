@@ -86,6 +86,12 @@ enum class SidecarOutcome {
 /// read (an unreadable file is not evidence of a mismatch). Equal timestamps
 /// count as consistent, so a filesystem with coarse mtime granularity degrades
 /// to today's behaviour rather than to false alarms.
+///
+/// IT IS A HEURISTIC, NOT A PROOF, IN BOTH DIRECTIONS. A restore or copy that
+/// does not preserve timestamps (`cp -r` without `-p` writes `agent.bin` before
+/// `agent.bin.sig`) yields a strictly-newer sidecar for a perfectly valid pair,
+/// so the operator-facing string says the pair cannot be CONFIRMED rather than
+/// asserting a failed upload. Nothing is gated on it — only the label.
 [[nodiscard]] bool signature_sidecar_covers_binary(const std::filesystem::path& binary,
                                                    const std::filesystem::path& sidecar);
 

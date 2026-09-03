@@ -21,7 +21,7 @@
   regardless of the require flag — only an ABSENT signature is tolerated, and
   only while the flag is off. The signature is produced by whoever builds the
   package (`openssl cms -sign -binary -outform PEM`), uploaded alongside it, and
-  stored beside it; the server never signs and is not trusted to. The Debian,
+  stored beside it; the server never signs and is not trusted to. The Debian, RPM,
   macOS and Windows packagers now create a dedicated trust-anchor directory
   (`/etc/yuzu-agent/certs`, `%ProgramData%\Yuzu\agent-certs`), which none of them
   did before — deliberately separate from the server's own CA directory, whose

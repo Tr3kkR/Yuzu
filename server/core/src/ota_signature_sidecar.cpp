@@ -68,6 +68,33 @@ namespace {
 /// `std::ofstream` has no portable fsync, and this artifact is a security
 /// control: a signature that is "written" but not durable is indistinguishable
 /// from one that was never written, and the package then serves as unsigned.
+/// Owns a raw descriptor for the duration of a scope.
+///
+/// There is exactly one acquire/release pair below with no branch between them
+/// today, so this is not fixing a live leak — it is making the next edit safe.
+/// An error-detail branch added between the open and the close is the ordinary
+/// way this function grows, and it would leak silently.
+class ScopedFd {
+public:
+    explicit ScopedFd(int fd) noexcept : fd_(fd) {}
+    ~ScopedFd() {
+        if (fd_ >= 0) {
+#ifdef _WIN32
+            ::_close(fd_);
+#else
+            ::close(fd_);
+#endif
+        }
+    }
+    ScopedFd(const ScopedFd&) = delete;
+    ScopedFd& operator=(const ScopedFd&) = delete;
+    [[nodiscard]] int get() const noexcept { return fd_; }
+    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
+
+private:
+    int fd_;
+};
+
 [[nodiscard]] bool fsync_path(const std::filesystem::path& p, bool is_directory) {
 #ifdef _WIN32
     // Windows has no directory-handle flush through the CRT, and NTFS commits
@@ -75,21 +102,25 @@ namespace {
     // rather than a silent failure.
     if (is_directory)
         return true;
-    const int fd = ::_wopen(p.c_str(), _O_RDONLY | _O_BINARY);
-    if (fd < 0)
+    // _O_WRONLY, NOT _O_RDONLY. `_commit` is FlushFileBuffers, which is documented
+    // to require GENERIC_WRITE; a read-only handle fails with ERROR_ACCESS_DENIED.
+    // Since a failed fsync fails the whole upload, getting this wrong made every
+    // signed upload on a Windows-hosted server return 500 while unsigned uploads
+    // kept working — the shape of breakage a smoke test walks straight past.
+    // No _O_TRUNC: the file is already written and closed, we only need a handle.
+    const ScopedFd fd(::_wopen(p.c_str(), _O_WRONLY | _O_BINARY));
+    if (!fd.valid())
         return false;
-    const bool ok = ::_commit(fd) == 0;
-    ::_close(fd);
-    return ok;
+    return ::_commit(fd.get()) == 0;
 #else
     // O_RDONLY is sufficient for fsync on both files and directories, and is the
-    // only mode a directory can be opened in.
-    const int fd = ::open(p.c_str(), O_RDONLY);
-    if (fd < 0)
+    // only mode a directory can be opened in — so POSIX needs no branch on the
+    // kind, and the parameter exists purely for the Windows arm above.
+    (void)is_directory;
+    const ScopedFd fd(::open(p.c_str(), O_RDONLY));
+    if (!fd.valid())
         return false;
-    const bool ok = ::fsync(fd) == 0;
-    ::close(fd);
-    return ok;
+    return ::fsync(fd.get()) == 0;
 #endif
 }
 
