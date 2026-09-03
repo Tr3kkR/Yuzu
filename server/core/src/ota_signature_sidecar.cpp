@@ -199,9 +199,16 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
     if (signature_pem.empty()) {
         // Genuinely unsigned now: remove any predecessor. This is the case that
         // must never be skipped — see the header.
+        //
+        // REPORT A REAL REMOVAL FAILURE. Swallowing the error_code made this
+        // return true unconditionally, so the caller's own failure branch was
+        // dead code and a sidecar that could not be deleted — the Windows
+        // sharing-violation case `discard_staging` cites — answered 200 while
+        // every anchored agent refused the package. `remove` returning false with
+        // no error means the file was already absent, which IS success here.
         std::error_code stale_ec;
         std::filesystem::remove(sidecar, stale_ec);
-        return true;
+        return !stale_ec;
     }
 
     // ATOMIC REPLACE, not remove-then-write. CheckForUpdate reads this path

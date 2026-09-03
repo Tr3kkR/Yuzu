@@ -76,8 +76,11 @@ enum class SidecarOutcome {
 
 /// Can this sidecar possibly cover this binary? (OPERATOR-FACING ONLY.)
 ///
-/// A successful upload writes the sidecar FIRST and the binary second, so the
-/// binary's mtime is always at or after the sidecar's. A sidecar STRICTLY NEWER
+/// A successful SIGNED upload writes the sidecar first and the binary second, so
+/// the binary's mtime is always at or after the sidecar's. (An unsigned upload
+/// runs the other way round — the binary first, then the removal — because the
+/// step that weakens the signature always goes last; it leaves no sidecar, so
+/// this function short-circuits on the unreadable-mtime path below.) A sidecar STRICTLY NEWER
 /// than its binary therefore proves the binary write did not follow it — the
 /// upload died in between, or the binary write failed — and the stored signature
 /// cannot cover the bytes actually on disk.
