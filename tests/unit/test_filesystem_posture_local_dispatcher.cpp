@@ -238,7 +238,7 @@ TEST_CASE("filesystem_posture: mark_result_partial's degraded status and last-wr
 // read reports `permission_denied`, and before this test nothing asserted the
 // helper set that status rather than CONSTRAINED. Platform-neutral: a synthetic
 // descriptor through LocalDispatcher, no OS call and no plugin load.
-TEST_CASE("filesystem_posture: mark_result_denied reports PERMISSION_DENIED, not CONSTRAINED",
+TEST_CASE("filesystem_posture: mark_result_denied reports PERMISSION_DENIED rather than CONSTRAINED",
          "[filesystem_posture][status]") {
     YuzuPluginDescriptor descriptor{};
     descriptor.execute = &exercise_mark_result_denied;
