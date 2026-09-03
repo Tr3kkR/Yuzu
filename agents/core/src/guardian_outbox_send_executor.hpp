@@ -134,8 +134,20 @@ public:
             }
             // else: in_flight for THIS SAME entry - fall through to the wait below.
         }
-        if (need_launch && !launch(entry, send))
-            return SendResult::Retain; // launch failed (thread exhaustion); retry next tick
+        if (need_launch) {
+            // Test seam: fires in the real race window between offer()'s decision
+            // (need_launch=true, state_->mu already released above) and the launch()
+            // call below - the exact gap a concurrent stop() can land in. Deterministic
+            // regression coverage for that race (governance's adversarial-review C1/F3
+            // finding, #3847 item 4 hardening) sets this to call stop() synchronously,
+            // on this same thread, right here, then asserts launch() below observes it
+            // and bails - the hook is what makes the interleave deterministic via call
+            // ordering, so it does not need (or use) a second real thread.
+            if (pre_launch_race_hook_for_test_)
+                pre_launch_race_hook_for_test_();
+            if (!launch(entry, send))
+                return SendResult::Retain; // launch failed (thread exhaustion, or stop() won the race); retry next tick
+        }
 
         std::unique_lock<std::mutex> lk{state_->mu};
         const auto deadline = std::chrono::steady_clock::now() + wait;
@@ -213,6 +225,12 @@ public:
         return static_cast<std::size_t>(state_->worker_count);
     }
 
+    /// Test-only synchronization seam - see the call site in offer() for what race it
+    /// exists to make deterministic. Production callers never set this.
+    void set_pre_launch_race_hook_for_test(std::function<void()> hook) {
+        pre_launch_race_hook_for_test_ = std::move(hook);
+    }
+
 private:
     struct State {
         std::mutex mu;
@@ -286,6 +304,20 @@ private:
         try {
             {
                 std::lock_guard<std::mutex> lk{state_->mu};
+                // Re-check stopping here, under the SAME lock stop() sets it under and
+                // offer() already read it under (above, before releasing state_->mu to
+                // call this function) - offer()'s own check has a gap between deciding
+                // need_launch and reaching this point, during which a concurrent stop()
+                // can run (adversarial review finding, #3847 item 4 hardening: neither
+                // internal governance round caught this, both external reviewers did,
+                // independently). This return precedes every State mutation below -
+                // in_flight is still false, no AliveTicket/worker exists yet - so it
+                // reaches neither the catch(...) block (nothing thrown) nor the
+                // post-try `if (!launched)` rollback further down (nothing was set that
+                // needs unsetting); it is exactly as if offer() had seen stopping=true
+                // itself, one step earlier.
+                if (state_->stopping)
+                    return false;
                 state_->in_flight = true;
                 state_->in_flight_event_id = entry.event_id;
                 state_->done = false;
@@ -343,6 +375,7 @@ private:
     }
 
     std::shared_ptr<State> state_;
+    std::function<void()> pre_launch_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
 };
 
 } // namespace yuzu::agent

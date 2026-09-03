@@ -163,6 +163,38 @@ TEST_CASE("a throwing send is re-thrown by the next offer() call, not swallowed 
     CHECK(threw);
 }
 
+TEST_CASE("item 4 regression: stop() closes the offer()-to-launch() admission race "
+          "(adversarial-review C1/F3 finding, found independently by both external reviewers "
+          "and missed by every internal governance round)",
+          "[spark][guardian][send_executor][chaos]") {
+    // offer() decides need_launch=true and releases state_->mu BEFORE calling launch() -
+    // a real gap a concurrent stop() can land in. set_pre_launch_race_hook_for_test()
+    // fires exactly in that gap, on the SAME calling thread, so this reproduces the race
+    // deterministically via call ordering rather than relying on actual thread scheduling.
+    GuardianOutboxSendExecutor exec;
+    auto entry = lifecycle_entry("e1");
+    std::atomic<int> invocations{0};
+    auto instant = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+
+    exec.set_pre_launch_race_hook_for_test([&] { exec.stop(); });
+
+    auto result = exec.offer(entry, instant, 200ms);
+    // launch()'s recheck of state_->stopping under state_->mu must see stop() having
+    // already run and bail - `instant` must never be called as a result of THIS call,
+    // and offer() must surface the ordinary launch-failed path (Retain), not a
+    // spuriously successful send.
+    REQUIRE(result.has_value());
+    CHECK(*result == SendResult::Retain);
+    CHECK(invocations.load() == 0);
+    // Unlike every other active_worker_count()==0 check in this file, this one does NOT
+    // need spin_until: no AliveTicket is ever constructed on this path (the bail-out in
+    // launch() precedes it), so there is no worker-thread-exit decrement to race against.
+    CHECK(exec.active_worker_count() == 0);
+}
+
 TEST_CASE("stop() prevents a new launch but does not disturb one already in flight",
           "[spark][guardian][send_executor]") {
     GuardianOutboxSendExecutor exec;
