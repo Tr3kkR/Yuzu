@@ -259,13 +259,51 @@ transfer, above) was real, working code that never had real legacy data to prote
 `canonicalize_legacy_snapshot`, `fingerprint_legacy_snapshot`, `legacy_rbac_fingerprint`) are
 removed (`chore/retire-migrate-from-sqlite-batch-a`, tracking issue #3623). `rbac_meta` — the
 durable k/v table that also holds the live `rbac_enabled` flag and `write_generation` counter —
-is NOT dropped; only its two backfill-only rows (`backfill_complete`,
-`backfill_source_fingerprint`) are, via a version-bumped `{4, "DELETE FROM rbac_meta WHERE key
-IN ('backfill_complete', 'backfill_source_fingerprint');"}` migration, appended after the
-already-shipped v1-v3 rather than edited in place: this store IS constructed in production, so
-v1-v3 have actually run against real dev/UAT databases. `kRevokeCoordLockSql` (the seed/revoke
-advisory-lock coordination) stays — `seed_defaults()` and `remove_permission()` both still use
-it; only its former third writer (the backfill's F1 revoke block) is gone.
+is NOT dropped, and (unlike the other 5 stores in this retirement, all of which DROP their
+whole marker table) its two backfill-only rows (`backfill_complete`,
+`backfill_source_fingerprint`) are NOT deleted either — they are POISONED in place, via a
+version-bumped v4 migration appended after the already-shipped v1-v3 rather than edited in
+place: this store IS constructed in production, so v1-v3 have actually run against real
+dev/UAT databases. `kRevokeCoordLockSql` (the seed/revoke advisory-lock coordination) stays —
+`seed_defaults()` and `remove_permission()` both still use it; only its former third writer
+(the backfill's F1 revoke block) is gone.
+
+**Poison, not delete — a real defect caught by governance unhappy-path (2026-09-03) in the
+first version of this migration, `{4, "DELETE FROM rbac_meta WHERE key IN (...)"}`.** The
+retired `migrate_from_sqlite()`'s own idempotency check (`marker_present`, now-deleted code,
+recoverable via `git show e2f745606:server/core/src/rbac_store.cpp`) treats marker ABSENCE as
+"never migrated" and, in that case, falls through past its own fingerprint-verification safety
+net straight to step 4 — an unconditional `INSERT ... ON CONFLICT (key) DO UPDATE SET value =
+EXCLUDED.value` on `rbac_enabled`, sourced from whatever a local legacy `rbac.db` file's
+`rbac_config.enabled` column holds. Deleting the marker rows made a pre-#3623 binary rolling
+back see exactly that "never migrated" state on ANY replica whose own local legacy file was
+never migrated-and-moved-aside on ITS OWN disk (a real scenario on a multi-replica deployment:
+one replica already fully migrated and renamed its legacy file, another rolled back or freshly
+joined the fleet still has its own untouched copy) — silently overwriting the live fleet-wide
+RBAC-enabled flag from stale rollback data, with no error and no operator-visible signal. The
+other 5 stores don't share this failure mode: their marker is a whole TABLE, and a `DROP TABLE`
+makes an old binary's marker `SELECT` fail outright (`42P01 undefined_table`, verified: all 5
+of `CaStore`/`ManagementGroupStore`/`QuarantineStore`/`InventoryStore`/`WebhookStore`'s retired
+marker-lookup code checks `status() != PGRES_TUPLES_OK` and refuses to boot on it) rather than
+silently reading as "0 rows, proceed as never-migrated" — the loud-outage-not-silent-corruption
+risk class user decision #4 (see the session record) actually intended to accept fleet-wide.
+RbacStore's DELETE-based approach reproduced a SILENT failure mode instead, on a false premise
+that it shared the other 5 stores' safety property.
+
+The fix poisons `backfill_source_fingerprint` to `'sourceless'` — the EXACT literal the retired
+code's own `kSourcelessFingerprint` constant held — so an old binary rolling back sees
+`marker_present=true` and takes ITS OWN existing fail-closed branches instead: no local legacy
+file present → returns immediately, silent, safe (the ordinary case, matching every other
+store); a local legacy file WITH real content present → refuses to auto-migrate ("no legacy
+rbac.db has been migrated for this fleet yet... refusing"), the same loud outage already
+accepted for the other 5 stores, never the silent overwrite. `backfill_complete` only needs to
+exist (the retired code checked its presence, never its value). See `rbac_store.cpp`'s v4
+migration comment for the full trace. **Epistemic status: `likely`, not `verified`** — this was
+traced against the retired code's actual source (not run) via `git show`; no old binary was
+booted against a poisoned database as part of this fix. The fix is not unit-testable from
+inside this codebase (the code it defends against no longer exists here) — the shipped
+regression test (`test_rbac_store.cpp`) covers only that the migration produces the intended
+poisoned state, not the old binary's resulting behavior against it.
 
 **Fixed a real gap in the original per-store probe table list, caught by an external review
 pass before merge:** an early draft of `server.cpp`'s replacement `warn_if_legacy_rows` call

@@ -6416,6 +6416,11 @@ public:
             } else {
                 legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "inventory.db",
                                                          "InventoryStore", {"inventory_data"});
+                // probe-then-set_metrics is this site's pre-existing order (unlike the other 5
+                // retired stores' set_metrics-then-probe) -- deliberately unchanged by #3623,
+                // functionally inert either way since the probe takes no metrics handle
+                // (governance consistency-auditor, 2026-09-03).
+                //
                 // Set-once before serving (race-free): wires the shared
                 // read-degrade counter + the new ingest-drop/query-truncation
                 // counters (governance IS3).

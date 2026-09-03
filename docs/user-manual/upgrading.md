@@ -1079,6 +1079,15 @@ The webhook HMAC signing secret is now envelope-encrypted at rest
   signing secrets) via `POST /api/webhooks` after the server starts. See
   [`rest-api.md`](rest-api.md#post-apiwebhooks) for guidance on securely
   disposing of a legacy file that still holds a plaintext secret.
+- **If you already upgraded through an EARLIER release** (one where the
+  now-retired backfill genuinely ran), check for a `webhooks.db.migrated-
+  <unix-epoch>` file (and its `-wal`/`-shm` sidecars) at the same directory —
+  that historical rename-on-success behavior is gone in this release (a
+  legacy file is never renamed any more), but a file it already produced is
+  NOT cleaned up by this upgrade and still holds every pre-cutover signing
+  secret in **plaintext**. Dispose of it securely if you no longer need it;
+  the current probe only checks the un-renamed `webhooks.db` path, so it will
+  never warn about a `.migrated-<epoch>` file left over from before.
 - **`POST`/`DELETE /api/webhooks` now distinguish a caller error from a store
   failure**: `POST` returns `400` for an invalid URL scheme (previously an
   ambiguous non-error response), and `GET`/`POST`/`DELETE /api/webhooks`
@@ -1444,6 +1453,15 @@ the equivalent roles/grants/groups against the new Postgres-backed store via
 the RBAC admin UI/REST API, and re-check `rbac_enabled` after boot (it seeds
 `false` on a fresh schema — it does NOT carry over from a legacy file, so an
 operator who had RBAC enabled must re-enable it explicitly).
+
+**Rollback caution.** Do not roll back to a build older than this release
+while a legacy `rbac.db` file with real content still sits at its configured
+path on any replica. An older binary's own (now-removed-from-current-code)
+backfill logic still runs on that replica and, seeing this database already
+past this migration, refuses to auto-migrate rather than silently doing
+anything to `rbac_enabled` — you'll see a clear startup refusal, not silent
+corruption, but it IS a startup refusal. Move the legacy file aside first if
+a rollback is genuinely needed.
 
 **What to expect / do:**
 

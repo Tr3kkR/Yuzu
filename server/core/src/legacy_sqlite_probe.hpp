@@ -27,6 +27,16 @@
 /// own instruction rather than forking a bespoke copy, #3623/WebhookStore
 /// the first consumer (superseding `migrate_from_sqlite_impl`'s own inline
 /// 0600+sidecar block, PR #3563).
+///
+/// NOT YET consolidated (governance Gate 3/4, 2026-09-03): `RuntimeConfigStore::
+/// warn_if_legacy_data_present` (`runtime_config_store.cpp`) still carries its OWN
+/// independent inline hardening, path-based (`std::filesystem::permissions()`, re-resolves
+/// the path rather than operating on one fd) rather than this header's `harden_legacy_file_0600`
+/// — it predates that function and was never ported onto it. It does NOT share the fd-based
+/// TOCTOU fix `harden_legacy_file_0600` got this same round. Tracked as a follow-up, out of
+/// #3623's scope (RuntimeConfigStore isn't one of the stores that PR retired) — do not treat
+/// `RuntimeConfigStore`'s block as a model for a NEW secret-bearing store; use
+/// `harden_legacy_file_0600` instead.
 
 #include "sqlite_raii.hpp"
 

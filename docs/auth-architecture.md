@@ -3772,8 +3772,15 @@ still consults it), the CHAOS-1 concurrency fix (`pg_advisory_xact_lock`, still 
 `remove_permission()` both still take it, only the backfill's third writer is gone), and the
 SHA-256 cross-replica marker fingerprinting — is gone. `RbacStore::migrate_from_sqlite()` and
 its backfill-only helpers are removed; the two backfill-only rows in `rbac_meta`
-(`backfill_complete`/`backfill_source_fingerprint`) are dropped via a version-bumped migration —
-`rbac_meta` itself stays, still holding `rbac_enabled`/`write_generation`. `server.cpp`'s boot
+(`backfill_complete`/`backfill_source_fingerprint`) are POISONED, not dropped, via a
+version-bumped migration — `backfill_source_fingerprint` is forced to the retired code's own
+`kSourcelessFingerprint` sentinel (`"sourceless"`), never deleted; `rbac_meta` itself stays,
+still holding `rbac_enabled`/`write_generation`. This is the one store in the retirement batch
+whose marker is ROWS rather than a whole table, and a bare `DELETE` (the first version of this
+migration, caught by governance unhappy-path before merge) would have let a pre-#3623 binary
+rolling back read the resulting absence as "never migrated" and fall straight through its own
+fingerprint-verification safety net into an unconditional overwrite of the live `rbac_enabled`
+flag from a local legacy file — see ADR-0041's Update for the full trace. `server.cpp`'s boot
 path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over `rbac_config` (the legacy table
 that held the enabled flag), `securable_types`, `operations`, `roles`, `role_permissions`,
 `principal_roles`, `groups`, and `group_members` instead — WARN-only, never refuse-boot, a

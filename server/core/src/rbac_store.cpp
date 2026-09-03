@@ -358,10 +358,11 @@ const std::vector<pg::PgMigration>& migrations() {
 
             -- Durable k/v (ADR-0041): the global `rbac_enabled` flag AND the
             -- cross-replica `write_generation` counter (bumped in the same txn
-            -- as every mutation). Originally also held the one-time
-            -- `backfill_complete`/`backfill_source_fingerprint` rows (v4 below
-            -- deletes them — their sole writer, migrate_from_sqlite, was
-            -- retired, #3623) — the table itself stays for the two live keys.
+            -- as every mutation). Also holds the one-time `backfill_complete`/
+            -- `backfill_source_fingerprint` rows — their sole writer,
+            -- migrate_from_sqlite, was retired (#3623), but v4 below POISONS
+            -- rather than deletes them (see that migration's own comment for
+            -- why: deleting them is unsafe for THIS store specifically).
             CREATE TABLE rbac_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -386,7 +387,8 @@ const std::vector<pg::PgMigration>& migrations() {
         // write itself fails loudly rather than silently landing and waiting
         // to be discovered on the next boot or refresh. Scoped to the one
         // key this applies to — every other `rbac_meta` value
-        // (`write_generation`) is not a boolean and must not be constrained.
+        // (`write_generation`, `backfill_complete`, `backfill_source_fingerprint`)
+        // is not a boolean and must not be constrained.
         {2, R"(
             ALTER TABLE rbac_meta ADD CONSTRAINT rbac_meta_enabled_canonical
                 CHECK (key <> 'rbac_enabled' OR value IN ('true', 'false'));
@@ -431,7 +433,44 @@ const std::vector<pg::PgMigration>& migrations() {
         // same table and are NOT touched). Appended at the next free slot, never renumbering
         // v1-v3 (PgMigrationRunner applies only version > current — renumbering an
         // already-shipped version re-applies it against a database that already ran it).
-        {4, "DELETE FROM rbac_meta WHERE key IN ('backfill_complete', 'backfill_source_fingerprint');"},
+        //
+        // POISONS, does NOT delete, the two marker rows -- unlike the other 5 retired stores
+        // (CaStore/ManagementGroupStore/QuarantineStore/InventoryStore/WebhookStore), whose
+        // marker is a whole TABLE a DROP removes entirely. Deleting these ROWS from a table
+        // that otherwise stays live (rbac_meta) is unsafe specifically for RbacStore: a
+        // pre-#3623 binary's own migrate_from_sqlite() (deleted from THIS codebase, but still
+        // the one running on any replica rolled back to an older release) treats marker ABSENCE
+        // as "never migrated" and falls through past its own fingerprint-verification safety
+        // net straight into an UNCONDITIONAL overwrite of the live rbac_enabled flag from
+        // whatever a local legacy rbac.db file's rbac_config.enabled column holds --
+        // `INSERT ... ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, no gate. The
+        // other 5 stores don't have this failure mode: an old binary's marker SELECT against a
+        // DROPped table fails outright (42P01) and that binary refuses to boot -- a loud
+        // outage, the accepted risk class this whole retirement already takes on (PR #3898
+        // precedent). Deleting these two rows instead reproduced a SILENT one: RBAC could be
+        // disabled (or unexpectedly re-enabled) fleet-wide with no error, on any replica that
+        // still has a legacy rbac.db sitting at its configured path un-migrated on its OWN
+        // local disk -- realistic on a multi-replica deployment (each replica has its own
+        // db_dir) if one replica rolls back, or a fresh/volume-reset replica joins a fleet
+        // whose Postgres has already run v4. Governance unhappy-path caught this (2026-09-03).
+        //
+        // The fix: force backfill_source_fingerprint to the EXACT literal the retired (pre-#3623)
+        // code compared against for its own "no real source" sentinel -- `kSourcelessFingerprint
+        // = "sourceless"`, verified via `git show e2f745606:server/core/src/rbac_store.cpp`; that
+        // constant no longer exists in THIS codebase, only in whatever old binary might roll
+        // back -- rather than deleting the row. An old binary rolling back then
+        // sees marker_present=true and takes its own existing fail-closed branches: no local
+        // legacy file -> returns immediately, silent, safe (the ordinary case, matching every
+        // other store); a local legacy file WITH real content -> refuses to auto-migrate
+        // ("no legacy rbac.db has been migrated for this fleet yet... refusing"), the same loud
+        // outage the other 5 stores already accept, never the silent overwrite. backfill_complete
+        // only needs to exist (old code checks presence, never reads its value).
+        {4, "INSERT INTO rbac_meta (key, value) VALUES "
+            "('backfill_complete', 'retired-see-adr-0041-update-2026-09-03') "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;"
+            "INSERT INTO rbac_meta (key, value) VALUES "
+            "('backfill_source_fingerprint', 'sourceless') "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;"},
     };
     return kMigrations;
 }
