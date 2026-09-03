@@ -1640,14 +1640,6 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
-        metrics_.describe("yuzu_server_rbac_backfill_total",
-                          "One-time legacy rbac.db -> rbac_store PostgreSQL backfill outcome on "
-                          "first PG boot, by result (fresh = no legacy DB, marked complete; "
-                          "completed = migrated + reconciled; failed = fail-closed, boot refused, "
-                          "next start retries).",
-                          "counter");
-        for (const auto result : {"fresh", "completed", "failed"})
-            metrics_.counter("yuzu_server_rbac_backfill_total", {{"result", result}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
@@ -5562,10 +5554,14 @@ public:
         // Initialize Phase 3: Security & RBAC stores (PostgreSQL, ADR-0041).
         // The authorization substrate — construction fail-closed (ADR-0007): a
         // failed open/migration refuses boot rather than serve with authz off.
-        // `migrate_from_sqlite` runs the MANDATORY one-time legacy-`rbac.db`
-        // backfill (ADR-0009/0041) — a failure there is ALSO fatal (never serve
-        // on top of a partially-migrated authorization config; losing a grant or
-        // the enabled flag is a fleet-wide authorization change nobody authored).
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment):
+        // the legacy rbac.db is never copied; the detect-and-warn obligation
+        // still applies (RBAC grants and the enabled flag are irreducible
+        // operator intent, not expendable telemetry), so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds
+        // rows — including `rbac_config`, the table holding the enabled flag,
+        // the row that matters most here.
         if (pg_pool_ && !startup_failed_) {
             rbac_store_ = std::make_unique<RbacStore>(*pg_pool_);
             if (!rbac_store_->is_open()) {
@@ -5574,19 +5570,11 @@ public:
                 startup_failed_ = true;
             } else {
                 rbac_store_->set_metrics(&metrics_);
-                auto rbac_db = cfg_.db_dir() / "rbac.db";
-                if (!rbac_store_->migrate_from_sqlite(rbac_db)) {
-                    spdlog::error("[PG] Refusing to start: RbacStore legacy-SQLite backfill from {} "
-                                  "failed (see prior log lines) — the authorization substrate is "
-                                  "authoritative and must not serve partially-migrated grants or a "
-                                  "lost rbac_enabled flag (mandatory backfill, ADR-0009/0041)",
-                                  rbac_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("RbacStore initialized (schema rbac_store; legacy backfill source "
-                                 "{})",
-                                 rbac_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "rbac.db", "RbacStore",
+                    {"rbac_config", "securable_types", "operations", "roles", "role_permissions",
+                     "principal_roles", "groups", "group_members"});
+                spdlog::info("RbacStore initialized (schema rbac_store)");
             }
         }
 

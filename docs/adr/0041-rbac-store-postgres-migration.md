@@ -245,3 +245,46 @@ chokepoint, `generation_view_stale_locked()`). One disambiguation this addendum 
 unrelated stampede-prevention/metrics-only interval governing how often a refresh may even be
 attempted). Never shipped to dev/main; no SOC 2 assessment period or deployed fleet carried the
 gap.
+
+## Update (2026-09-03) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production Yuzu
+fleet has ever run a pre-Postgres build of any store — the mandatory, `rbac_enabled`-flag-first,
+read-back-verified backfill this ADR designed (RBAC's own catastrophic-fail-open-if-lost flag
+transfer, above) was real, working code that never had real legacy data to protect.
+
+`RbacStore::migrate_from_sqlite()` and its private helpers (`legacy_has_table`, `sqlite_text`,
+`bool_lit`, `sha256_hex`, `kSourcelessFingerprint`, `append_field`, `LType`/`LRole`/`LPerm`/
+`LPrincipal`/`LGroup`/`LMember`, `LegacySnapshot`, `read_legacy_snapshot`,
+`canonicalize_legacy_snapshot`, `fingerprint_legacy_snapshot`, `legacy_rbac_fingerprint`) are
+removed (`chore/retire-migrate-from-sqlite-batch-a`, tracking issue #3623). `rbac_meta` — the
+durable k/v table that also holds the live `rbac_enabled` flag and `write_generation` counter —
+is NOT dropped; only its two backfill-only rows (`backfill_complete`,
+`backfill_source_fingerprint`) are, via a version-bumped `{4, "DELETE FROM rbac_meta WHERE key
+IN ('backfill_complete', 'backfill_source_fingerprint');"}` migration, appended after the
+already-shipped v1-v3 rather than edited in place: this store IS constructed in production, so
+v1-v3 have actually run against real dev/UAT databases. `kRevokeCoordLockSql` (the seed/revoke
+advisory-lock coordination) stays — `seed_defaults()` and `remove_permission()` both still use
+it; only its former third writer (the backfill's F1 revoke block) is gone.
+
+**Fixed a real gap in the original per-store probe table list, caught by an external review
+pass before merge:** an early draft of `server.cpp`'s replacement `warn_if_legacy_rows` call
+listed only `roles`/`role_permissions`/`principal_roles`/`groups`/`group_members` — omitting
+`rbac_config`, the actual legacy SQLite table `migrate_from_sqlite()` read the `rbac_enabled`
+flag from (see `read_legacy_snapshot`'s `has_table("rbac_config")` branch above; the Postgres
+side always stored the flag as a `rbac_meta` row, a different name, which is presumably how the
+gap was introduced). Without `rbac_config` in the probe list, a real legacy file with
+`rbac_enabled=true` would never trigger a warning — silently defeating the one detect-and-warn
+signal this retirement depends on for the store this ADR itself calls "the load-bearing
+invariant." The shipped probe list includes `rbac_config`, `securable_types`, and `operations`
+(also read into `LegacySnapshot` by the retired backfill) alongside the five originally listed.
+
+`server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over those eight
+legacy tables instead of the backfill — WARN-only (never refuse-boot) on a real legacy row
+found, the same posture as every other store in this retirement batch, despite RBAC's own
+"catastrophic fail-open" framing for a lost enabled flag: the WARN-only decision was reopened
+and explicitly reconsidered for this store specifically (not defaulted by uniformity with the
+others) before being confirmed, on the grounds that the underlying no-production-fleet fact this
+whole retirement rests on applies identically here, and a boot refusal on a false premise would
+itself be a fleet-wide authorization-substrate outage. An operator who sees the warning should
+check `rbac_enabled` after boot, not assume it carried over.

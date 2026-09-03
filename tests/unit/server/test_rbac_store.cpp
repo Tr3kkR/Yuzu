@@ -5,11 +5,11 @@
  * assignments, group membership, check_permission, deny-overrides-allow,
  * RBAC toggle, check_scoped_permission.
  *
- * No legacy-SQLite backfill test coverage: the dedicated [backfill] TEST_CASE
- * suite (2026-08-25) was removed as part of a fresh-start-by-default policy
- * change (ADR-0009 amendment) — no production fleet has ever run a
- * pre-Postgres build. RbacStore::migrate_from_sqlite() itself is UNCHANGED
- * and still present — its removal is a separate, later step.
+ * No legacy-SQLite backfill test coverage: `RbacStore::migrate_from_sqlite()` itself was
+ * retired (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0041 Update, 2026-09-03) -- no
+ * production fleet has ever run a pre-Postgres build, so the mandatory backfill never had real
+ * legacy data to protect. `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows` over
+ * the legacy tables (incl. `rbac_config`, the one that held the enabled flag) instead.
  */
 
 #include "management_group_store.hpp"
