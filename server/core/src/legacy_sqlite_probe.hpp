@@ -33,12 +33,20 @@
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
+#include <cerrno>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace yuzu::server::legacy_sqlite_probe {
 
@@ -173,35 +181,55 @@ inline void warn_if_legacy_rows(const std::filesystem::path& legacy_db_path,
 /// exists for this path today, tracked separately, issue #3593).
 ///
 /// Best-effort and never throws: a failure to chmod is logged and does NOT block boot — this
-/// runs ahead of `warn_if_legacy_rows`, which is itself never fatal. Refuses to touch a symlink
-/// at any of the three paths (main file or either sidecar) — `std::filesystem::permissions()`
-/// follows symlinks by default, so an attacker-controlled symlink at the legacy path could
-/// otherwise redirect the chmod onto an unrelated file; checked via `symlink_status()`, which
-/// (unlike `status()`) reports the link itself rather than following it.
+/// runs ahead of `warn_if_legacy_rows`, which is itself never fatal.
+///
+/// Resolves each path via a single `open()` (following a symlink exactly as the plain-`open()`
+/// call in `warn_if_legacy_rows`/`sqlite3_open_v2` does moments later) and then `fstat`/`fchmod`
+/// the resulting FILE DESCRIPTOR — never re-resolving the path a second time — so there is no
+/// TOCTOU window between "what we checked" and "what we chmod'd", and the file this function
+/// hardens is always the exact same file the probe goes on to open and read. An earlier revision
+/// instead used `symlink_status()` to detect and REFUSE to touch a symlinked path; that left a
+/// gap both adversarial-review passes independently confirmed (2026-09-03): the probe still
+/// opened and read the symlink's target moments later, so a symlinked secret-bearing legacy file
+/// was read without ever being forced to 0600. Following the link here closes that gap.
+/// `O_NONBLOCK` on open avoids the FIFO-with-no-writer block a plain `open()` would risk (same
+/// hazard `warn_if_legacy_rows` guards against via `is_regular_file` before its own open); the
+/// post-open `fstat` then refuses to chmod anything that isn't a regular file, so a FIFO,
+/// directory, device, or socket reached through the path is left untouched either way.
+/// `fchmod` is owner-gated by the kernel: this process can only ever narrow permissions on a
+/// file it already owns, so a symlink planted by another principal at the legacy path either
+/// points at a file this process owns (narrowing it to 0600 is safe) or fails the `fchmod` with
+/// `EPERM` (logged, best-effort, boot proceeds) — it can never be used to widen or redirect
+/// access onto a file this process does not already control. Yuzu's server runs under a
+/// dedicated non-root service account (`docs/agent-privilege-model.md`), not root, so this
+/// ownership gate holds in the deployed configuration.
 inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path) {
 #ifndef _WIN32
     const auto chmod_owner_only = [](const std::filesystem::path& path, const char* what) {
-        std::error_code sym_ec;
-        const auto st = std::filesystem::symlink_status(path, sym_ec);
-        if (sym_ec)
-            return; // can't even stat it -- nothing to harden
-        if (st.type() == std::filesystem::file_type::symlink) {
-            spdlog::warn("legacy_sqlite_probe: refusing to chmod {} {} -- it is a symlink, not "
-                        "a regular file (would otherwise redirect the chmod onto its target)",
-                        what, path.string());
+        const int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY);
+        if (fd < 0) {
+            if (errno != ENOENT)
+                spdlog::warn("legacy_sqlite_probe: could not open {} {} to harden its "
+                            "permissions ({})",
+                            what, path.string(), std::strerror(errno));
+            return; // absent (ordinary case), or unreadable -- nothing to harden
+        }
+        struct stat st{};
+        if (::fstat(fd, &st) != 0) {
+            spdlog::warn("legacy_sqlite_probe: could not stat {} {} to harden its permissions "
+                        "({})",
+                        what, path.string(), std::strerror(errno));
+            ::close(fd);
             return;
         }
-        if (st.type() != std::filesystem::file_type::regular)
-            return; // absent, or not a regular file -- nothing to harden
-
-        std::error_code ec;
-        std::filesystem::permissions(path,
-                                     std::filesystem::perms::owner_read |
-                                         std::filesystem::perms::owner_write,
-                                     std::filesystem::perm_options::replace, ec);
-        if (ec)
+        if (!S_ISREG(st.st_mode)) {
+            ::close(fd); // not a regular file (dir/device/FIFO/socket) -- nothing to harden
+            return;
+        }
+        if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0)
             spdlog::warn("legacy_sqlite_probe: could not set 0600 on {} {}: {}", what,
-                        path.string(), ec.message());
+                        path.string(), std::strerror(errno));
+        ::close(fd);
     };
 
     chmod_owner_only(legacy_db_path, "legacy file");

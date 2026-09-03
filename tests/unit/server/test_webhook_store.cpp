@@ -108,6 +108,25 @@ TEST_CASE("WebhookStore[pg]: create and list webhook", "[webhook_store][pg]") {
     CHECK((*hooks)[0].id == *id);
 }
 
+TEST_CASE("WebhookStore[pg]: migration lands at v2 and drops sqlite_backfill_source (#3623)",
+          "[webhook_store][pg][migration]") {
+    WebhookStorePg store;
+
+    yuzu::server::pg::PgConn conn{PQconnectdb(store.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult ver{PQexec(
+        conn.get(), "SELECT version FROM public.schema_meta WHERE store = 'webhook_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+    yuzu::server::pg::PgResult tbl{
+        PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.tables WHERE "
+                           "table_schema = 'webhook_store' AND table_name = "
+                           "'sqlite_backfill_source'")};
+    REQUIRE(tbl.ok());
+    CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
+}
+
 TEST_CASE("WebhookStore[pg]: create without a secret sets has_secret=false",
          "[webhook_store][pg]") {
     WebhookStorePg store;

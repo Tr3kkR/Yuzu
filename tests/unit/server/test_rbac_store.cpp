@@ -97,6 +97,30 @@ void seed_group_raw(PgPool& pool, const std::string& name, const std::string& de
     RbacStore store_var{rbac_pool_fx_};                                                             \
     REQUIRE(store_var.is_open())
 
+TEST_CASE("RbacStore migration lands at v4 and deletes the backfill marker rows (#3623)",
+          "[rbac_store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    RbacStore store{pool};
+    REQUIRE(store.is_open());
+
+    pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult ver{PQexec(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                        "'rbac_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "4");
+
+    // rbac_meta stays (it still holds rbac_enabled/write_generation) — only the two
+    // one-time backfill marker rows are gone.
+    pg::PgResult rows{PQexec(conn.get(),
+                             "SELECT COUNT(*) FROM rbac_store.rbac_meta WHERE key IN "
+                             "('backfill_complete', 'backfill_source_fingerprint')")};
+    REQUIRE(rows.ok());
+    CHECK(std::string(PQgetvalue(rows.get(), 0, 0)) == "0");
+}
+
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 TEST_CASE("RbacStore: open in-memory", "[rbac_store][db][pg]") {

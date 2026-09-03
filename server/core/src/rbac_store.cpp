@@ -386,8 +386,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // write itself fails loudly rather than silently landing and waiting
         // to be discovered on the next boot or refresh. Scoped to the one
         // key this applies to — every other `rbac_meta` value
-        // (`write_generation`, `backfill_complete`) is not a boolean and
-        // must not be constrained.
+        // (`write_generation`) is not a boolean and must not be constrained.
         {2, R"(
             ALTER TABLE rbac_meta ADD CONSTRAINT rbac_meta_enabled_canonical
                 CHECK (key <> 'rbac_enabled' OR value IN ('true', 'false'));

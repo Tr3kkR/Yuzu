@@ -308,8 +308,14 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 is a silent no-op when t
     CHECK(cap.text().find("legacy_sqlite_probe") == std::string::npos);
 }
 
-TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 refuses to chmod through a symlink",
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 hardens the resolved target when the "
+          "legacy path is a symlink",
           "[legacy_sqlite_probe]") {
+    // Superseded 2026-09-03 (adversarial review): an earlier revision REFUSED to touch a
+    // symlinked path, which left the real secret-bearing target ungated even though
+    // `warn_if_legacy_rows` follows the same symlink moments later and reads it. The fd-based
+    // rewrite below resolves the symlink via `open()` (exactly like that later probe open does)
+    // and hardens the resulting descriptor, so the real target ends up 0600 either way.
     auto target = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_symtarget_") += ".db";
     std::ofstream(target) << "dummy-content";
     auto link = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_symlink_") += ".db";
@@ -323,22 +329,45 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 refuses to chmod through
         }
     } cleanup{target, link};
 
-    // Wide-open on the TARGET — if harden_legacy_file_0600 followed the
-    // symlink (the default `permissions()` behaviour it must NOT exhibit),
-    // this would flip to owner-only.
     const auto wide_open = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
                            std::filesystem::perms::group_read | std::filesystem::perms::others_read;
     std::filesystem::permissions(target, wide_open, std::filesystem::perm_options::replace);
 
-    yuzu::test::LogCapture cap;
     harden_legacy_file_0600(link);
-    cap.stop();
 
+    const auto owner_only =
+        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
     std::error_code st_ec;
     const auto target_perms = std::filesystem::status(target, st_ec).permissions();
     REQUIRE_FALSE(st_ec);
-    // Target UNCHANGED — the whole point of the symlink refusal.
-    CHECK((target_perms & std::filesystem::perms::mask) == wide_open);
-    CHECK(cap.text().find("symlink") != std::string::npos);
+    // Target hardened — resolved through the symlink, not left wide-open.
+    CHECK((target_perms & std::filesystem::perms::mask) == owner_only);
+
+    // The link itself is untouched by the chmod (fchmod acts on the target's inode, not the
+    // link) and remains a symlink.
+    std::error_code lstat_ec;
+    const auto link_status = std::filesystem::symlink_status(link, lstat_ec);
+    REQUIRE_FALSE(lstat_ec);
+    CHECK(link_status.type() == std::filesystem::file_type::symlink);
+}
+
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 leaves a non-regular path (a FIFO) "
+          "untouched without blocking",
+          "[legacy_sqlite_probe]") {
+    // Guards the O_NONBLOCK choice: a plain open() on a FIFO with no writer blocks
+    // indefinitely, the same hazard warn_if_legacy_rows avoids via is_regular_file(). This test
+    // would hang the suite if that regressed.
+    auto fifo_path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_fifo_");
+    REQUIRE(::mkfifo(fifo_path.string().c_str(), 0600) == 0);
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    } cleanup{fifo_path};
+
+    harden_legacy_file_0600(fifo_path); // must return promptly, not block
+    SUCCEED("did not block on the FIFO");
 }
 #endif // _WIN32

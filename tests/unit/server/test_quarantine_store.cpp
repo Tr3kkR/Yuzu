@@ -486,4 +486,25 @@ TEST_CASE("QuarantineStore: a genuine v1->v2 upgrade (real ALTER against a popul
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());
     CHECK((*after)->last_applied_at == 5000);
+
+    // v3 (#3623, migrate_from_sqlite retired): the same construction call also runs the
+    // DROP TABLE against quarantine_meta — seeded by the v1 DDL above but never touched by
+    // v2's ALTER, so this is the only ladder test that actually exercises the drop landing
+    // against a populated (not merely fresh-templated) database.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult ver{PQexec(conn.get(),
+                            "SELECT version FROM public.schema_meta WHERE store = "
+                            "'quarantine_store'")};
+        REQUIRE(ver.ok());
+        REQUIRE(PQntuples(ver.get()) == 1);
+        CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "3");
+        PgResult tbl{PQexec(conn.get(),
+                            "SELECT COUNT(*) FROM information_schema.tables WHERE "
+                            "table_schema = 'quarantine_store' AND table_name = "
+                            "'quarantine_meta'")};
+        REQUIRE(tbl.ok());
+        CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
+    }
 }

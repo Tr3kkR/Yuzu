@@ -115,6 +115,27 @@ TEST_CASE("CaStore reports !is_open on a migration failure", "[ca_store][pg]") {
     REQUIRE_FALSE(store.is_open());
 }
 
+TEST_CASE("CaStore migration lands at v2 and drops sqlite_backfill_source (#3623)",
+          "[ca_store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult ver{PQexec(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                    "'ca_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+    PgResult tbl{PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.tables WHERE "
+                                    "table_schema = 'ca_store' AND table_name = "
+                                    "'sqlite_backfill_source'")};
+    REQUIRE(tbl.ok());
+    CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
+}
+
 // ── Root ──────────────────────────────────────────────────────────────────
 
 TEST_CASE("CaStore: opens with no root", "[ca_store][pg][root]") {
