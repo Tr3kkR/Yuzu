@@ -127,6 +127,13 @@ struct ExecHarness {
     /// non-default values.
     std::string dispatch_cmd_override;
     int dispatch_sent_override{0};
+    /// #3424/#3511 Gate 8 round-4 (quality-engineer): override the zero-reach
+    /// discriminator fields the stub's ConfinedDispatchOutcome carries, so a
+    /// test can exercise each of the 4-way 503 split's branches instead of
+    /// only the generic catch-all every prior test here left at defaults.
+    bool dispatch_containment_unreadable_override{false};
+    std::size_t dispatch_denied_quarantined_count_override{0};
+    std::size_t dispatch_unknown_plugin_count_override{0};
     /// PR 4 audit-coverage regression net: captures every audit_fn call
     /// the routes layer makes so tests can assert the SSE handler's
     /// audit-on-success / audit-absence-on-denied policy (qe-S4).
@@ -309,7 +316,11 @@ struct ExecHarness {
             // into dispatch.
             last_dispatch_exec_visible = caller.exec_visible;
             last_dispatch_caller = caller;
-            return {.sent = dispatch_sent_override, .command_id = dispatch_cmd_override};
+            return {.sent = dispatch_sent_override,
+                   .denied_quarantined_count = dispatch_denied_quarantined_count_override,
+                   .command_id = dispatch_cmd_override,
+                   .containment_unreadable = dispatch_containment_unreadable_override,
+                   .unknown_plugin_count = dispatch_unknown_plugin_count_override};
         };
 
         // PR 2.5 (#670): deps-struct refactor. WorkflowRoutes::register_routes
@@ -1367,6 +1378,60 @@ TEST_CASE("PR2 hardening — failed dispatch does NOT orphan a phantom 'running'
     auto execs = h.tracker->query_executions(q);
     REQUIRE(execs.size() == 1);
     CHECK(execs[0].status == "cancelled");
+}
+
+// #3424/#3511 Gate 8 round-4 (quality-engineer): the sibling above only
+// exercises the generic catch-all zero-reach branch (stub defaults). These
+// three pin the other branches of the same 4-way split, matching the
+// discrimination /api/command and MCP execute_instruction already had tests
+// for — this route's contract was documented in rest-api.md this same fix
+// round with no test coverage to back it.
+TEST_CASE("instruction execute: a fail-closed containment gate reports "
+          "reason=containment_unreadable, retryable after 5000ms",
+          "[pg][workflow][executions][execute][3424][3511]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-CU", "CU");
+    h.dispatch_containment_unreadable_override = true;
+    auto res = h.sink.Post("/api/instructions/def-CU/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["reason"] == "containment_unreadable");
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+}
+
+TEST_CASE("instruction execute: every target quarantined reports "
+          "reason=quarantined, non-retryable",
+          "[pg][workflow][executions][execute][3424][3511]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-QT", "QT");
+    h.dispatch_denied_quarantined_count_override = 1;
+    auto res = h.sink.Post("/api/instructions/def-QT/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["reason"] == "quarantined");
+    CHECK(body["error"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("instruction execute: a plugin absent from every target's inventory reports "
+          "reason=plugin_not_found, non-retryable",
+          "[pg][workflow][executions][execute][3424][3511]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-UP", "UP");
+    h.dispatch_unknown_plugin_count_override = 1;
+    auto res = h.sink.Post("/api/instructions/def-UP/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["reason"] == "plugin_not_found");
+    CHECK(body["error"]["retry_after_ms"].is_null());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

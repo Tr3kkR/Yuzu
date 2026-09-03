@@ -378,6 +378,66 @@ TEST_CASE("ids_missing_plugin: a mixed fleet reports exactly the agents genuinel
     CHECK_FALSE(missing.contains("dev-no-inventory"));
 }
 
+// ─── BR-009 regression: the plugin-presence filter must query the CANONICAL
+// spelling, never the caller's raw casing (Gate 8 round-4, quality-engineer) ───
+//
+// `finalize_classified_command`'s own BR-009 test (test_dispatch_chokepoint.cpp)
+// proves the wire command carries the canonical plugin name. It does NOT prove
+// server.cpp's call sites actually USE that canonical value when they call
+// `ids_missing_plugin` — that was the real bug (`server.cpp` called
+// `ids_missing_plugin(plugin)` with the raw caller string instead of
+// `ids_missing_plugin(classified->wire().plugin())`). Composing the two real
+// functions here closes that gap without needing to instantiate server.cpp's
+// route handler, which has no unit-test harness of its own.
+TEST_CASE("BR-009: ids_missing_plugin against the canonical wire plugin name "
+          "correctly finds an agent that reported it, where the raw caller "
+          "casing would have wrongly reported it missing",
+          "[server][dispatch][plugin_presence][registry][security][3424]") {
+    using yuzu::server::CommandCapability;
+    using yuzu::server::DispatchClass;
+    using yuzu::server::Mutability;
+    using yuzu::server::detail::finalize_classified_command;
+
+    constexpr CommandCapability kTarPurgeCap{
+        .plugin = "tar",
+        .action = "purge_source",
+        .dispatch_class = DispatchClass::Mutating,
+        .mutability = Mutability::Reversible,
+        .securable = "Infrastructure",
+        .operation = yuzu::server::authz::Operation::Write,
+        .risk_tier = yuzu::server::authz::RiskTier::Medium,
+        .system_reserved = false,
+    };
+    std::function<bool(std::string_view, std::string_view)> switch_on =
+        [](std::string_view, std::string_view) { return true; };
+
+    // A real caller dispatching with different-cased spelling — classify() is
+    // case-insensitive, so this is authorized against kTarPurgeCap exactly
+    // like test_dispatch_chokepoint.cpp's own BR-009 test.
+    auto classified = finalize_classified_command(kTarPurgeCap, switch_on, "TAR", "Purge_Source",
+                                                   "cmd-br009", {}, {}, 0, 0, {}, {});
+    REQUIRE(classified.has_value());
+    REQUIRE(classified->wire().plugin() == "tar");
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    auto info = make_presence_test_info("dev-A");
+    info.add_plugins()->set_name("tar"); // agent reports the canonical spelling
+    registry.register_agent(info);
+
+    // The fix: query with the canonical wire plugin — the agent has it.
+    const auto missing_canonical = registry.ids_missing_plugin(classified->wire().plugin());
+    CHECK_FALSE(missing_canonical.contains("dev-A"));
+
+    // The bug BR-009 fixed: querying with the raw caller casing instead would
+    // have wrongly reported dev-A as missing the plugin it genuinely has —
+    // pinned here so a future call-site regression back to the raw string is
+    // caught by this same test, not just by the composition it demonstrates.
+    const auto missing_raw_caller_casing = registry.ids_missing_plugin("TAR");
+    CHECK(missing_raw_caller_casing.contains("dev-A"));
+}
+
 // ─────────────── wire_and_dispatch_confined: claim-leak fix (ADR-1007) ───────────────
 //
 // [pg]: ExecutionTracker is Postgres-backed (ADR-0006) -- this section needs

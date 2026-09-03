@@ -6944,6 +6944,12 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     // help (the convention this schema pins: null = not retryable).
     REQUIRE(sc.contains("retry_after_ms"));
     CHECK(sc["retry_after_ms"] == 5000);
+
+    // Gate 8 round-4 (quality-engineer): the audited detail string must
+    // thread the discriminated zero_status, not a hardcoded literal that
+    // would silently go stale as soon as a second branch existed.
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("no_agents_reached") != std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction: every target quarantined reports status="
@@ -6975,6 +6981,8 @@ TEST_CASE("MCP execute_instruction: every target quarantined reports status="
     auto text_str = sc["message"].get<std::string>();
     CHECK(text_str.find("quarantine") != std::string::npos);
     CHECK(text_str.find("permanent") != std::string::npos);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("quarantined") != std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction: a fail-closed containment gate reports status="
@@ -6998,6 +7006,8 @@ TEST_CASE("MCP execute_instruction: a fail-closed containment gate reports statu
     CHECK(sc["status"] == "containment_unreadable");
     CHECK(sc["agents_reached"] == 0);
     CHECK(sc["retry_after_ms"] == 5000);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("containment_unreadable") != std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction: a plugin absent from every target's inventory reports "
@@ -7026,6 +7036,8 @@ TEST_CASE("MCP execute_instruction: a plugin absent from every target's inventor
     CHECK(sc["retry_after_ms"].is_null());
     CHECK(sc["agents_quarantined"] == 0);
     CHECK(sc["agents_unknown_plugin"] == 1);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("plugin_not_found") != std::string::npos);
 }
 
 TEST_CASE("MCP execute_instruction: a MIXED outcome (quarantined AND plugin-absent targets) "
