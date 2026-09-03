@@ -1710,13 +1710,6 @@ public:
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", reason}});
-        metrics_.describe("yuzu_server_mgmt_group_backfill_total",
-                          "Management-group legacy-SQLite backfill outcomes by result "
-                          "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
-                          "failed = fail-closed refusal). One-time at boot (ADR-0042)",
-                          "counter");
-        for (const auto result : {"completed", "fresh", "failed"})
-            metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
         // DiscoveryStore observability (ADR-0044). The read-degrade counter is
         // the fail-closed signal: a non-zero rate means list_devices could not
         // answer (store_not_open/pool_acquire_timeout/query_error) — /readyz
@@ -5676,10 +5669,13 @@ public:
         // (ADR-0006/ADR-0042, schema `management_group_store`) — construction
         // fail-CLOSED per ADR-0012 §1: a reachable database whose schema can't
         // migrate/open is a fatal startup error, never a serve-degraded
-        // confinement substrate. `migrate_from_sqlite` runs the one-time,
-        // idempotent legacy-`management-groups.db` backfill (ADR-0009) —
-        // AUTHORITATIVE confinement scope means a backfill failure is ALSO fatal
-        // (never serve on top of partially-migrated confinement config).
+        // confinement substrate. NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment): the legacy management-groups.db is
+        // never copied; the detect-and-warn obligation still applies
+        // (confinement groups are irreducible operator intent, not expendable
+        // telemetry), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             mgmt_group_store_ = std::make_unique<ManagementGroupStore>(*pg_pool_);
             if (!mgmt_group_store_->is_open()) {
@@ -5689,17 +5685,9 @@ public:
                 startup_failed_ = true;
             } else {
                 mgmt_group_store_->set_metrics(&metrics_);
-                auto mgmt_db = cfg_.db_dir() / "management-groups.db";
-                if (!mgmt_group_store_->migrate_from_sqlite(mgmt_db)) {
-                    spdlog::error("[PG] Refusing to start: management-group legacy-SQLite backfill "
-                                  "failed (see prior log lines) — management_group_store is the "
-                                  "AUTHORITATIVE confinement substrate and must not serve "
-                                  "partially-migrated data. Operator remediation: repair {} or move "
-                                  "it aside to skip the backfill (confinement groups in it will NOT "
-                                  "carry over)",
-                                  mgmt_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "management-groups.db", "ManagementGroupStore",
+                    {"management_groups", "management_group_members", "management_group_roles"});
             }
         }
         if (mgmt_group_store_ && mgmt_group_store_->is_open() && !startup_failed_) {

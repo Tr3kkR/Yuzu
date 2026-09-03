@@ -24,11 +24,16 @@
 /// construction on a pinned lease, schema-qualifies every runtime statement
 /// (`management_group_store.management_groups`). No `sqlite3_changes()` (#1033)
 /// — mutators use `RETURNING` / `PQcmdTuples`.
+///
+/// `migrate_from_sqlite()` retired (#3623, ADR-0042 Update): no production fleet ever ran a
+/// pre-Postgres build of this store, so the mandatory backfill it implemented never had real
+/// legacy data to protect. `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows`
+/// over `management_groups`/`management_group_members`/`management_group_roles` instead —
+/// silent unless real rows are found, never blocks boot.
 
 #include <atomic>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -92,15 +97,6 @@ public:
     /// Wire the Prometheus registry for the read-degrade + backfill counters.
     /// Optional; a null registry makes the counters no-ops.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
-
-    /// MANDATORY one-time backfill (ADR-0009/0042) from the legacy
-    /// `management-groups.db`: groups + members + role assignments. Idempotent
-    /// (durable marker), resumable, row-count reconciled, fail-CLOSED; the
-    /// legacy file is moved aside after a verified backfill. Management-group
-    /// config is irreducible operator intent (confinement scope) that cannot be
-    /// re-derived — a silent drop is a fail-open. Returns false on any failure
-    /// (the server then refuses to boot).
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Group CRUD (deny-or-benign display class — may stay plain) ───────────
     std::expected<std::string, std::string> create_group(const ManagementGroup& group);

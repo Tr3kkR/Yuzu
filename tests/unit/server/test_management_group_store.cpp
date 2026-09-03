@@ -10,8 +10,11 @@
  * (a construct-invalid pool), so it is deliberately NOT `[pg]`-tagged and runs
  * in every shard.
  *
- * migrate_from_sqlite backfill-contract coverage was retired 2026-08-25 (fresh-start-by-default,
- * ADR-0009 amendment) — no upgrade path exists for this store's legacy SQLite file.
+ * `ManagementGroupStore::migrate_from_sqlite()` itself was retired
+ * (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0042 Update, 2026-09-03) -- no
+ * production fleet has ever run a pre-Postgres build, so the mandatory backfill never had real
+ * legacy data to protect. `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows` over
+ * the three legacy tables instead.
  */
 
 #include "management_group_store.hpp"

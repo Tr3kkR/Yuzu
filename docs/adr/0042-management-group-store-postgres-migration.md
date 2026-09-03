@@ -121,3 +121,28 @@ today. `stop()` unwires from consumers then resets before `pg_pool_`; store in `
 ## Follow-ups
 
 - Wave 2 continues with `PolicyStore` next.
+
+## Update (2026-09-03) — `migrate_from_sqlite()` retired
+
+**Filename correction:** this ADR's Context/Backfill sections above name the legacy file
+`management_groups.db` (underscore); the actual filename the store has always used, both in
+`server.cpp`'s construction site and in `docs/user-manual/upgrading.md`, is
+`management-groups.db` (hyphen). Noted here rather than silently edited into the original text.
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production Yuzu
+fleet has ever run a pre-Postgres build of any store — the mandatory, streamed, fail-closed
+backfill this ADR designed (including the over-deep-tree refusal at backfill time) was real,
+working code that never had real legacy data to protect.
+
+`ManagementGroupStore::migrate_from_sqlite()` and its private helpers (`legacy_has_table`,
+`sqlite_text`, `kBackfillTxnTimeout`) are removed (`chore/retire-migrate-from-sqlite-batch-a`,
+tracking issue #3623). `mgmt_group_meta` — whose entire purpose was the backfill idempotency
+marker — is dropped via a version-bumped `{2, "DROP TABLE IF EXISTS mgmt_group_meta;"}`
+migration, appended after the already-shipped v1 rather than edited in place: this store IS
+constructed in production, so v1 has actually run against real dev/UAT databases. `server.cpp`'s
+boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over `management_groups`/
+`management_group_members`/`management_group_roles` instead of the backfill — WARN-only (never
+refuse-boot) on a real legacy row found, the same posture as every other store in this
+retirement batch. The over-deep-tree guard this ADR's "Hierarchy traversal" section describes as
+a backfill-time refusal has no remaining trigger — with the backfill gone, a corrupt/over-deep
+tree can only arise via the write path, which already caps depth at 5.
