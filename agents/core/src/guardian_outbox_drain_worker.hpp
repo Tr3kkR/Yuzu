@@ -378,16 +378,37 @@ public:
     /// alongside the state-reader and arm/disarm executors; see
     /// guardian_outbox_send_executor.hpp's header comment.
     [[nodiscard]] std::size_t active_send_workers() const {
-        return send_exec_.active_worker_count();
+        return lifecycle_send_exec_.active_worker_count() + compliance_send_exec_.active_worker_count();
     }
 
 private:
     void loop();
     /// The SendFn actually threaded through rt_.drain_bounded(): bounces each send
-    /// through send_exec_ so the worker thread never blocks on the real, injected
-    /// `send_` for longer than kGuardianSendOfferWait (#2233 item 4).
+    /// through a per-LANE GuardianOutboxSendExecutor so the worker thread never blocks
+    /// on the real, injected `send_` for longer than kGuardianSendOfferWait (#2233
+    /// item 4). TWO executors, not one: drain_bounded() calls this once for
+    /// lifecycle_log_ and once for outbox_ (compliance+health) per pass
+    /// (guardian_spark_runtime.cpp), and a SHARED single-flight slot across both lanes
+    /// would let a slow-but-succeeding lifecycle send silently starve compliance
+    /// delivery every pass - the compliance send would never even be INVOKED, hitting
+    /// the mismatch-orphan branch instead (governance Gate 4 unhappy-path finding
+    /// UP-1, derived BLOCKING: I5(b) unavailability on a path shared with an audit/
+    /// detection operation). This reintroduces the fairness the existing
+    /// guaranteed_attempts/compliance-reserve machinery in drain_bounded() already
+    /// protects, WITHOUT that machinery ever seeing it happen, since Retain here never
+    /// reaches drain_log_unlocked's own "did we actually try" accounting. Routed by
+    /// OutboxEntry::domain: Lifecycle is the only domain in lifecycle_log_
+    /// (guardian_outbox.hpp); Compliance/Health share outbox_ and therefore share the
+    /// second lane, matching drain_bounded()'s own two-call structure exactly. The two
+    /// lanes' detached sends CAN contend on agent.cpp's stream_write_mu_ if both are
+    /// in flight at once - that is the SAME pre-existing, already-disclaimed
+    /// contention this whole class's header names ("NOT a fix for stream_write_mu_
+    /// contention"), now on two detached threads instead of one; it never touches the
+    /// worker's own thread.
     [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
-        return send_exec_.offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
+        auto& exec = entry.domain == OutboxDomain::Lifecycle ? lifecycle_send_exec_
+                                                              : compliance_send_exec_;
+        return exec.offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
     }
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
     /// the one check loop() makes outside a try, and taking a mutex here would let
@@ -415,8 +436,11 @@ private:
     GuardianSparkRuntime& rt_;
     SendFn send_;
     /// Detaches the actual send call from this worker's own thread (#2233 item 4).
-    /// See guardian_outbox_send_executor.hpp for the full contract.
-    GuardianOutboxSendExecutor send_exec_;
+    /// TWO instances, one per drain lane - see wrapped_send()'s doc comment for why a
+    /// single shared slot silently starves one lane behind the other. See
+    /// guardian_outbox_send_executor.hpp for the per-instance contract.
+    GuardianOutboxSendExecutor lifecycle_send_exec_;
+    GuardianOutboxSendExecutor compliance_send_exec_;
     std::uint64_t periodic_bound_ms_;
     GuardianMaintenanceConfig maint_;
     std::shared_ptr<Signal> sig_;

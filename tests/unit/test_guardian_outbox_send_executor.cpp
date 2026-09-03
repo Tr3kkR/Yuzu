@@ -60,7 +60,12 @@ TEST_CASE("offer() completes synchronously for a fast send", "[spark][guardian][
     auto result = exec.offer(entry, instant, 200ms);
     REQUIRE(result.has_value());
     CHECK(*result == SendResult::Sent);
-    CHECK(exec.active_worker_count() == 0);
+    // done=true publishes before AliveTicket's destructor decrements worker_count (the
+    // worker still has to notify_all + return + let its captures unwind), so a
+    // same-thread check right after offer() observes done can race worker_count still
+    // reading 1 - spin_until it, matching every other active_worker_count()==0 check in
+    // this file (empirically confirmed flaky without this: governance Gate 4 happy-path).
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 
 TEST_CASE("offer() returns nullopt while the send is still stalled, then the result once released",

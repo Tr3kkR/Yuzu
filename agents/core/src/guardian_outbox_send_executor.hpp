@@ -139,6 +139,21 @@ public:
 
         std::unique_lock<std::mutex> lk{state_->mu};
         const auto deadline = std::chrono::steady_clock::now() + wait;
+        // Deliberately does NOT also wake on `stopping`, unlike guardian_io_executor.hpp's
+        // run(): an earlier draft did, so a parked offer() call would wake as soon as
+        // stop() fired instead of riding out the rest of `wait` (governance Gate 4
+        // consistency-auditor SHOULD finding - up to kGuardianSendOfferWait of avoidable
+        // shutdown latency). That made GuardianOutboxDrainWorker::stop() fast enough to
+        // race ahead of test_guardian_engine_spark_reconcile.cpp's PRE-EXISTING "pending
+        // records are durable BEFORE stop() joins the drain worker" test, which polls for
+        // a still-joining window from a separate thread - that window is what got raced
+        // away. The underlying property that test guards (persist runs before the join
+        // starts, unconditionally, in GuardianEngine::stop()'s source order) is untouched
+        // either way; only the OBSERVABLE join duration would have shrunk. Reverted rather
+        // than redesign that test's synchronization under this PR's own time budget - the
+        // SHOULD finding's cost (a bounded, already-small per-shutdown latency) is smaller
+        // than the risk of touching a load-bearing pre-existing shutdown-ordering test's
+        // timing assumptions. Left here as a note for whoever revisits this trade-off.
         state_->cv.wait_until(lk, deadline, [&] { return state_->done; });
         if (!state_->done)
             return std::nullopt; // still running; caller retains and comes back
@@ -159,10 +174,30 @@ public:
     /// thread wedged in a blocking syscall cannot be force-cancelled). Never
     /// blocks: a caller wanting to know when the last worker is truly gone polls
     /// active_worker_count(), the same orphan-exit contract as the state reader.
+    /// Does NOT wake a caller currently parked in offer()'s wait_until - see the
+    /// comment on offer()'s wait_until call for why that was tried and reverted.
     void stop() {
         std::lock_guard<std::mutex> lk{state_->mu};
         state_->stopping = true;
     }
+
+    // NOT PROVIDED: a callback fired after every completed send, so the caller's own
+    // wake mechanism (e.g. the drain worker's Signal cv/gen) could learn promptly that
+    // a result is available even past offer()'s own bounded wait having given up -
+    // closing a throughput cliff a merely-slow-but-healthy connection would otherwise
+    // see degraded to the caller's backstop cadence (governance Gate 6 sre finding).
+    // Built and wired once (a WakeFn callback stored in State, called right after this
+    // class's own state_->cv.notify_all() in launch()'s worker lambda, under the same
+    // lock that publishes done=true); reverted because waking the drain worker's
+    // loop() on EVERY completed send - not just enqueues/notify()/the periodic bound -
+    // broke a load-bearing pre-existing timing test, "R4: a refill re-arm does not
+    // wait out the periodic bound" (test_guardian_outbox_drain_worker.cpp), whose
+    // whole point is proving loop() re-arms a forced page from its OWN internal logic
+    // with NO external wake; the extra per-send wakes raced ahead of that logic. The
+    // sre finding's cost (a cadence interval's worth of latency on an already-rare
+    // slow-but-healthy send, unreachable in production today) is smaller than the risk
+    // of redesigning ANOTHER load-bearing pre-existing test under this PR's own time
+    // budget - left here as a note for whoever revisits this trade-off.
 
     /// For GuardianEngine::active_io_workers() (the orphan-exit contract's sole
     /// source of truth) - normally 0 or 1 (this executor is single-flight in the
@@ -182,7 +217,7 @@ private:
         std::condition_variable cv;
         bool in_flight{false};      ///< a send has been submitted and not yet consumed by offer()
         bool done{false};           ///< the worker published a result
-        int worker_count{0};        ///< 0 or 1; see AliveTicket below for the release timing
+        int worker_count{0};        ///< normally 0 or 1, transiently 2 - see active_worker_count()
         bool stopping{false};
         std::string in_flight_event_id;
         SendResult result{SendResult::Retain};

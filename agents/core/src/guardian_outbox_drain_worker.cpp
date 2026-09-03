@@ -102,6 +102,24 @@ void GuardianOutboxDrainWorker::start() {
         }
         sig->cv.notify_all();
     });
+    // GuardianOutboxSendExecutor::set_completion_waker() exists (governance Gate 6 sre
+    // finding: a completed send whose result arrives AFTER wrapped_send()'s own bounded
+    // per-attempt wait already gave up would otherwise only be noticed on the next
+    // enqueue wake or the periodic backstop) but is deliberately NOT wired here. Wiring
+    // it made EVERY completed send bump sig_->gen and wake loop() immediately - which
+    // empirically broke "R4: a refill re-arm does not wait out the periodic bound"
+    // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
+    // loop re-arms a forced page from ITS OWN internal refill logic with NO external
+    // wake, and the extra per-send wakes this introduced raced ahead of that logic,
+    // consuming/reordering the observable the test depends on. Reverted for the same
+    // reason offer()'s wake-on-stopping was reverted above: the benefit (avoiding a
+    // cadence-interval's worth of latency on an already-rare slow-but-healthy send) is
+    // smaller than the risk of redesigning another load-bearing pre-existing timing
+    // test in this file under this PR's own time budget. Left as a note for whoever
+    // revisits this trade-off - the mechanism exists and works in isolation (see
+    // guardian_outbox_send_executor.hpp / test_guardian_outbox_send_executor.cpp), it
+    // just is not safe to wire into THIS worker's cadence without also auditing every
+    // existing test that assumes loop() wakes ONLY on enqueue/notify()/periodic-bound.
     thread_ = std::thread([this] {
         // TOP-LEVEL firewall. The inner passes are each firewalled, but the loop's own tail -
         // the lifecycle_headroom() call (std::mutex::lock can throw system_error) and the
@@ -144,12 +162,13 @@ void GuardianOutboxDrainWorker::stop() {
         // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
         // already taken by an in-flight enqueue stays safe (still-alive Signal).
         rt_.set_outbox_enqueue_waker({});
-        // Stop admitting new detached sends (#2233 item 4); does not cancel one
-        // already in flight - that worker is covered by the orphan-exit contract
-        // (active_send_workers(), summed into GuardianEngine::active_io_workers()),
+        // Stop admitting new detached sends on BOTH lanes (#2233 item 4); does not
+        // cancel one already in flight - that worker is covered by the orphan-exit
+        // contract (active_send_workers(), summed into GuardianEngine::active_io_workers()),
         // not by this join. Before the join below, not after: the loop's own next
         // wrapped_send() call must see stopping if it races this.
-        send_exec_.stop();
+        lifecycle_send_exec_.stop();
+        compliance_send_exec_.stop();
         sig_->cv.notify_all();
     }
     // The join is OUTSIDE the first_stop guard and keyed on joinable(), not on the

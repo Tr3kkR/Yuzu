@@ -1446,7 +1446,7 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // guardian_outbox_send_executor.hpp. mark_batch_sent()'s kv_ write below is therefore a
         // THIRD caller into KvStore alongside persist()/prune()/page_into_window() - safe only
         // because KvStore serialises its single connection under its own mutex; see the CONCURRENCY
-        // paragraph in guardian_lifecycle_journal.hpp, which this caller does not appear in by name.)
+        // paragraph in guardian_lifecycle_journal.hpp, which names this caller explicitly.)
         auto journal = lifecycle_journal_; // shared: the wrap keeps it alive on its own
         auto journaled_send = [journal, send = std::move(send)](const OutboxEntry& e) -> SendResult {
             const SendResult r = send(e);
