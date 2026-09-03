@@ -5671,10 +5671,17 @@ void SettingsRoutes::register_routes(
                     // is not there removes nothing, and recording that as a
                     // successful removal puts a fictional event in the evidence
                     // store — and hides probing of the endpoint from a SIEM rule.
-                    audit_fn_(req, "ota.package.deleted", matched ? "success" : "not_found",
+                    //
+                    // The rejection token is `denied` with the reason in `detail`,
+                    // not a bespoke `not_found` result: this file's own rejection
+                    // branches use that shape (`user.delete` -> "denied" /
+                    // "invalid_username"), and audit-log.md's probe-detection
+                    // recipe tells operators to filter on `result == "denied"` —
+                    // so a fourth token would be invisible to exactly the rule
+                    // this row exists to feed.
+                    audit_fn_(req, "ota.package.deleted", matched ? "success" : "denied",
                               "UpdatePackage", platform + "/" + arch + "/" + version,
-                              matched ? "binary and signature sidecar removed"
-                                      : "no such package; nothing removed");
+                              matched ? "binary and signature sidecar removed" : "not_found");
                     res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
                 });
 
