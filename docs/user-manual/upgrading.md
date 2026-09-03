@@ -975,6 +975,16 @@ pre-Postgres build, so there was no real legacy data to migrate. Two separate be
 equivalent) behave exactly as before — this store's runtime read/write/query behavior is
 unchanged, only the one-time backfill and the legacy-file erasure are gone.
 
+**Rollback caution.** Rolling back to a build older than this release, against a database that
+has already run this store's retirement migration, **unconditionally** fails that older
+binary's boot with a Postgres `undefined_table` error on its own idempotency-marker check — not
+only when a legacy `inventory.db` happens to be present. This is a deliberate fail-safe (a clear
+startup error, never silent data loss), not a bug, but it means "just roll back the binary" is
+not a supported recovery path once this migration has run. The same is true for
+CaStore/ManagementGroupStore/QuarantineStore/WebhookStore below, each for its own dropped marker
+table; RbacStore is the one exception (see its own section) where rollback failure IS
+conditional on a real legacy file being present.
+
 ## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
 
 `CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version
@@ -1005,6 +1015,8 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
 - Every other CA behavior — revocation semantics, CRL numbering, the single
   `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
   `docs/adr/0053-ca-store-postgres-migration.md`.
+- **Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+  same unconditional rollback-refusal applies to this store (its own dropped marker table).
 - **New: an established, already-running default-cert install can now self-heal
   its own listener leaves without operator action.** This is not limited to a
   first-boot crash window — any boot where the on-disk `--ca-dir` default
@@ -1088,6 +1100,8 @@ The webhook HMAC signing secret is now envelope-encrypted at rest
   secret in **plaintext**. Dispose of it securely if you no longer need it;
   the current probe only checks the un-renamed `webhooks.db` path, so it will
   never warn about a `.migrated-<epoch>` file left over from before.
+- **Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+  same unconditional rollback-refusal applies to this store (its own dropped marker table).
 - **`POST`/`DELETE /api/webhooks` now distinguish a caller error from a store
   failure**: `POST` returns `400` for an invalid URL scheme (previously an
   ambiguous non-error response), and `GET`/`POST`/`DELETE /api/webhooks`
@@ -1880,6 +1894,9 @@ real management groups to keep, there is no automated recovery path**:
 re-author the equivalent groups/memberships/role assignments against the new
 Postgres-backed store via the REST API.
 
+**Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+same unconditional rollback-refusal applies to this store (its own dropped marker table).
+
 **Operator-visible behaviour change (fail-closed reads).** After cutover, a
 confinement-feeding read that degrades (store not open, pool-acquire timeout, or
 query error) now returns a distinguishable failure that the caller resolves to
@@ -2043,6 +2060,9 @@ this retirement batch — see ADR-0047's Update for the full reasoning. **If you
 the legacy-row-count warning and the environment genuinely has real quarantine
 records to keep, there is no automated recovery path**: re-quarantine the affected
 device(s) via `POST /api/v1/quarantine` after confirming which devices need it.
+
+**Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+same unconditional rollback-refusal applies to this store (its own dropped marker table).
 
 **Operator-visible behaviour change (fail-closed reads).** `GET /api/v1/quarantine`
 can now return **503** for two DISTINCT reasons — the response body's message

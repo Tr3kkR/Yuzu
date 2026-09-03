@@ -305,6 +305,20 @@ inside this codebase (the code it defends against no longer exists here) — the
 regression test (`test_rbac_store.cpp`) covers only that the migration produces the intended
 poisoned state, not the old binary's resulting behavior against it.
 
+**Deliberate side effect, assessed and accepted (governance Gate 6, compliance-officer,
+2026-09-04):** v4's `INSERT ... ON CONFLICT (key) DO UPDATE` unconditionally overwrites
+`backfill_source_fingerprint`, so on the rare database that reached this migration already
+holding a REAL (non-sourceless) fingerprint from a genuine completed backfill — only possible
+on a dev/UAT database per ADR-0009's "no production fleet" premise — that fingerprint's value
+is destroyed rather than preserved. This was considered and accepted, not overlooked: the
+fingerprint's only two consumers (the retired `migrate_from_sqlite()` idempotency check itself,
+and `docs/ops-runbooks/rbac-store-backfill-recovery.md`) are both deleted by this same PR, so
+nothing left in this codebase reads the value either way, and a real fingerprint is not a
+customer-facing evidence artifact — it never appeared in the SOC 2 evidence index. Preserving
+it conditionally (only overwrite when absent) was considered and rejected: it would leave two
+possible post-v4 states for the same migration step with no remaining reader to distinguish
+them, added complexity for a value nothing reads.
+
 **Fixed a real gap in the original per-store probe table list, caught by an external review
 pass before merge:** an early draft of `server.cpp`'s replacement `warn_if_legacy_rows` call
 listed only `roles`/`role_permissions`/`principal_roles`/`groups`/`group_members` — omitting
