@@ -2347,8 +2347,21 @@ jobs:
         # hashing. 3 days caps hit-rate decay at ~3 days of dev drift
         # (operator call over a weekly bucket, whose Thu/Fri decay on a
         # heavy week was the residual risk) while keeping live entries to
-        # ~2-3 per scope (<= ~6 GB at the 2G cap) — daily buckets would
-        # re-crowd the quota this change frees.
+        # ~2-3 per scope. At the 3G cap (raised from 2G — see the env
+        # block above) and ccache's own measured ~1.1-1.3x overshoot past
+        # its cap before a cleanup pass catches up, that's ~6.6-9.4 GB of
+        # ccache alone in the worst case, before the ~2.24 GB vcpkg-canary
+        # entry or misc caches — tight against the 10 GB repo quota, not
+        # comfortably clear of it. vcpkg-canary is the more exposed entry
+        # if the pool is ever forced to evict (it restores earlier in the
+        # job, so it's the older of the two once a dead bucket ages out),
+        # and losing it costs a 65-70 min cold rebuild — far worse than
+        # the ccache churn this cap raise fixes. Daily buckets would
+        # re-crowd the quota further still. Verify on the first live 3G
+        # run: `Save ccache (canary)`'s archived-size log line comfortably
+        # under ~3.7 GB means the margin holds; near or over means either
+        # the overshoot ratio or the live-entry-count assumption above
+        # needs re-measuring, not the cap re-raised blind.
         #
         # PREV_BUCKET exists only to bound the restore-keys fallback below
         # to the immediately preceding 3-day bucket — see that step for why
@@ -2470,11 +2483,15 @@ jobs:
 
       - name: ccache stats (canary)
         # The only ccache leg previously WITHOUT a stats step. Load-bearing
-        # for the CCACHE_MAXSIZE 2G sizing: the cap was estimated (one
-        # full canary build ~0.9-1.35 GB compressed), not measured — if
-        # "Cache size" here sits at the ceiling with cleanups > 0 on a
+        # for the CCACHE_MAXSIZE sizing: the original 2G cap was estimated
+        # (one full canary build ~0.9-1.35 GB compressed), not measured —
+        # if "Cache size" here sits at the ceiling with cleanups > 0 on a
         # warm run, the cap is trimming a live working set and should be
-        # raised. Informational only; never fails the job.
+        # raised. That's exactly what happened: measured 2026-09-02/03 at
+        # 2.0/2.0GB pegged with 172 cleanups on an ordinary warm run, cap
+        # raised to 3G — watch this same signal on 3G too (see the "Compute
+        # ccache time bucket" step's comment on the quota math this cap
+        # now sits against). Informational only; never fails the job.
         if: always()
         run: |
           set +e

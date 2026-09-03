@@ -1397,8 +1397,9 @@ by keeping any dead entry alive forever, since every fallback hit refreshes
 GitHub's last-accessed clock; measured 2026-09-02, `ci.yml`'s canary ccache
 restore step); ccache's own preprocessed-input hashing
 absorbs intra-bucket source drift, so hit-rate decay is capped at ~3 days of dev
-churn, and a job-level `CCACHE_MAXSIZE: 2G` keeps each entry from growing
-without bound. The ccache save is gated on the Build step having run, pass or
+churn, and a job-level `CCACHE_MAXSIZE` (2G originally, raised to 3G 2026-09-03
+after the 2G estimate proved low against measured 2.2-2.6 GB working sets)
+keeps each entry from growing without bound. The ccache save is gated on the Build step having run, pass or
 fail — a cancelled run leaves no thin entry, at the accepted cost that an early
 hard Build failure can occupy the bucket's key with a thin one (#3269,
 documented at the restore step); the vcpkg save is gated more strictly, on its
