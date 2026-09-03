@@ -225,15 +225,18 @@ TEST_CASE("OTA rollout percentage is clamped, and the row reports the CLAMPED va
 TEST_CASE("a rollout whose registry write does not commit is audited as failure, not success",
           "[ota][audit][settings_routes][pg]") {
     // The row reports a COMMITTED transition ("from=100% to=0%"). upsert_package
-    // degrades silently on a closed store, a pool-acquire timeout or a query
-    // error, so deriving the result from "we found the package" would let this
-    // row assert a change that never reached the database — evidence that
-    // disagrees with state, in the record an incident responder is supposed to be
-    // able to trust. This is the case an external functional reviewer asked for.
+    // degrades on a closed store, a pool-acquire timeout or a query error, so
+    // deriving the result from "we found the package" would let this row assert a
+    // change that never reached the database — evidence that disagrees with
+    // state, in the record an incident responder is supposed to be able to trust.
     //
-    // The write is broken the bluntest honest way: drop the table out from under
-    // the handler after seeding, so the INSERT genuinely errors rather than being
-    // faked at the seam under test.
+    // THE INJECTION HAS TO BREAK THE WRITE AND LEAVE THE READ WORKING, or the
+    // test proves nothing. A first version of this case dropped the table, which
+    // also broke `list_packages` — so the handler took the package-not-found path
+    // and the case passed against a deliberately broken build. A CHECK constraint
+    // the new value violates fails the INSERT ... ON CONFLICT DO UPDATE while
+    // SELECT keeps working, which is the state actually under test: found, not
+    // committed.
     YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
     OtaAuditHarness h{db.dsn()};
     h.seed(/*rollout_pct=*/100, /*mandatory=*/true);
@@ -241,16 +244,25 @@ TEST_CASE("a rollout whose registry write does not commit is audited as failure,
     {
         pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
         REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
-        pg::PgResult drop{PQexec(conn.get(), "DROP TABLE update_registry.update_packages")};
-        REQUIRE(drop.ok());
+        pg::PgResult c{PQexec(conn.get(), "ALTER TABLE update_registry.update_packages "
+                                          "ADD CONSTRAINT yuzu_test_no_zero_rollout "
+                                          "CHECK (rollout_pct <> 0)")};
+        REQUIRE(c.ok());
     }
 
-    // list_packages now fails too, so the handler cannot even find the package.
-    // That is the honest outcome of a dead store and still must not be `success`.
     auto res = h.post_rollout("1.2.3", "0");
     REQUIRE(res);
+
     REQUIRE(h.audited.size() == 1);
-    CHECK(h.audited.front().action == "ota.package.rollout_changed");
-    CHECK(h.audited.front().result != "success");
-    CHECK(h.audited.front().detail.find("from=") == std::string::npos);
+    const auto& row = h.audited.front();
+    CHECK(row.action == "ota.package.rollout_changed");
+    // Found, so not `denied`; not committed, so emphatically not `success`.
+    CHECK(row.result == "failure");
+    CHECK(row.detail.find("from=") == std::string::npos);
+
+    // And the state genuinely did not change, which is what makes a `success`
+    // row here a lie rather than a harmless imprecision.
+    auto pkgs = h.registry->list_packages();
+    REQUIRE(pkgs.size() == 1);
+    CHECK(pkgs.front().rollout_pct == 100);
 }
