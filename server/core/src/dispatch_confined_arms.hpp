@@ -241,12 +241,17 @@ struct ArmDispatchResult {
 /// dispatch_scope_ladder's own tests -- must not read `command_id` off its
 /// result.
 ///
-/// `containment_unreadable` / `unknown_plugin` / `unknown_plugin_count`
-/// (#3424/#3511) mirror `ArmDispatchResult`'s own fields of the same name --
-/// see that struct's doc comments above for what each means. Kept as
-/// separate fields here (not derived from `denied_quarantined_count`/etc. at
-/// read time) so every one of the 7 `DispatchFn` consumers reads the same
-/// shape regardless of which layer produced it.
+/// `unknown_plugin` / `unknown_plugin_count` (#3511) mirror `ArmDispatchResult`'s
+/// own fields of the same name -- see that struct's doc comments above for
+/// what each means. Kept as separate fields here (not derived from
+/// `denied_quarantined_count`/etc. at read time) so every one of the 7
+/// `DispatchFn` consumers reads the same shape regardless of which layer
+/// produced it. `containment_unreadable` (#3424) has NO counterpart on
+/// `ArmDispatchResult` -- that struct has no concept of "the gate itself
+/// degraded" separate from a specific-quarantine denial (both fold into its
+/// `denied_quarantined_count`); this field is derived here, at the
+/// `resolve_and_dispatch_confined`/`wire_and_dispatch_confined` layer, from
+/// `gate.fail_closed` directly -- see its own doc comment below.
 struct ConfinedDispatchOutcome {
     int sent = 0;
     std::optional<std::string> scope_parse_error;
