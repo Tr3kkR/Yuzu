@@ -294,6 +294,45 @@ TEST_CASE("#3966 fold-in: a thrown bad_alloc during admission rolls back and fre
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 
+TEST_CASE("#3966 fold-in: a thrown bad_alloc at the EARLIEST admission point (before any "
+          "State mutation, before the ticket is armed) also rolls back cleanly",
+          "[spark][guardian][send_executor][chaos]") {
+    // Distinct from the sibling test above: LaunchFaultForTest::Throw fires AFTER
+    // ticket->arm() and the worker lambda are already built, exercising the ARMED
+    // rollback (the ticket's own decrement). This fires right after the `stopping`
+    // recheck, before state_->in_flight_event_id is even written - the region the
+    // surrounding launch() comment calls "the ONE throwing step, FIRST" - exercising
+    // the UNARMED rollback (the ticket's no-op destructor) instead. No observable
+    // difference in outcome versus the sibling test is expected or asserted here (the
+    // surrounding try/catch's rollback is uniform regardless of exactly where within
+    // the guarded region a throw lands) - this exists for direct coverage of the
+    // earlier point, not because a defect was found there.
+    GuardianOutboxSendExecutor exec;
+    exec.set_launch_fault_for_test(GuardianOutboxSendExecutor::LaunchFaultForTest::ThrowBeforeCommit);
+    auto entry = lifecycle_entry("e1");
+    std::atomic<int> invocations{0};
+    auto instant = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+
+    auto result = exec.offer(entry, instant, 200ms);
+    REQUIRE(result.has_value());
+    CHECK(*result == SendResult::Retain);
+    CHECK(invocations.load() == 0);
+    CHECK(exec.active_worker_count() == 0); // no thread was ever spawned - no spin needed
+
+    exec.set_launch_fault_for_test(GuardianOutboxSendExecutor::LaunchFaultForTest::None);
+    std::optional<SendResult> retried;
+    REQUIRE(spin_until([&] {
+        retried = exec.offer(entry, instant, 200ms);
+        return retried.has_value();
+    }));
+    CHECK(*retried == SendResult::Sent);
+    CHECK(invocations.load() == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
 TEST_CASE("#3953 item 3: has_in_flight_send() reads true for a mismatched orphan too, "
           "not only the same-entry timeout case",
           "[spark][guardian][send_executor][chaos]") {
@@ -464,6 +503,43 @@ TEST_CASE("#3953 item 2: a mismatched orphan stalled past the threshold is count
             return b_result.has_value() && *b_result == SendResult::Sent;
         },
         3s));
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("#3953 item 2 follow-up: an orphan that crosses the stall threshold only AFTER "
+          "it stopped being polled 'still running' is still counted at reclaim",
+          "[spark][guardian][send_executor][chaos]") {
+    // The 'still running' mismatch branch calls check_stall_locked() itself (see the
+    // sibling test above), but only when offer() is actually called while the orphan
+    // is still in flight. If nothing polls the mismatch branch again before the
+    // orphan finishes, the ONLY chance to count its stall is at reclaim time - this
+    // pins that the reclaim branch (state_->done already true) also runs the check,
+    // rather than only reading a stall_logged flag that a "still running" poll never
+    // had the chance to set (governance Gate 6 sre finding: on today's code this
+    // orphan is silently, unboundedly undercounted).
+    GuardianOutboxSendExecutor exec{50ms};
+    StallingSend send_a;
+    auto entry_a = lifecycle_entry("event-a");
+    auto entry_b = lifecycle_entry("event-b");
+
+    auto first = exec.offer(entry_a, std::ref(send_a), 20ms);
+    CHECK_FALSE(first.has_value());
+    REQUIRE(spin_until([&] { return send_a.invocations.load() >= 1; }));
+
+    // Cross the 50ms threshold with NO interim offer() call on any entry - the
+    // mismatch branch's own check_stall_locked() must never fire for this orphan.
+    std::this_thread::sleep_for(80ms);
+    send_a.release();
+    // Wait for A's worker to fully finish and tear down WITHOUT ever calling offer()
+    // again, which would itself exercise the branch under test.
+    REQUIRE(spin_until([&] { return exec.active_worker_count() == 0; }, 3s));
+
+    // The FIRST offer() call for a different entry now reaches the reclaim branch
+    // directly - A is a mismatched orphan that is already done.
+    auto reclaimed = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 200ms);
+    REQUIRE(reclaimed.has_value());
+    CHECK(*reclaimed == SendResult::Sent);
+    CHECK(exec.send_stall_count() == 1);
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 

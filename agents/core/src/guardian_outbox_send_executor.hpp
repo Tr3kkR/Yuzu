@@ -80,8 +80,12 @@ public:
     /// regression coverage existed for either failure mode). `SpawnRefused` mirrors
     /// `io_detail::spawn_detached` returning false (the OS refused to create the
     /// thread); `Throw` mirrors a `std::bad_alloc` from anywhere in launch()'s guarded
-    /// region. Both take the SAME rollback path (see launch()).
-    enum class LaunchFaultForTest { None, SpawnRefused, Throw };
+    /// region, AFTER the ticket is armed and the worker lambda is built (the ARMED
+    /// rollback path); `ThrowBeforeCommit` mirrors the same failure at the EARLIEST
+    /// point in the guarded region - before any State mutation, before the ticket is
+    /// armed (the UNARMED rollback path). All three take the SAME outer rollback (see
+    /// launch()).
+    enum class LaunchFaultForTest { None, SpawnRefused, Throw, ThrowBeforeCommit };
 
     /// #3953 item 2: a send still in flight this long (measured from admission to
     /// completion, or to "still running" if not yet complete) is counted and logged

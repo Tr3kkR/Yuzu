@@ -415,6 +415,16 @@ public:
         stop_race_hook_for_test_ = std::move(hook);
     }
 
+    /// Test-only synchronization seam - see the call site in stop() (between the two
+    /// lane executors' own stop() calls) for the tolerated admission window it pins
+    /// (governance Gate 4 unhappy-path UP-4). Fire-once by construction (moved out and
+    /// invoked, see stop()) - both lane stop() calls are unconditional, not gated on
+    /// first_stop, so a second/idempotent stop() call must not re-fire this against an
+    /// already-stopped lane. Production callers never set this.
+    void set_between_lane_stops_hook_for_test(std::function<void()> hook) {
+        between_lane_stops_hook_for_test_ = std::move(hook);
+    }
+
 private:
     void loop();
     /// The SendFn actually threaded through rt_.drain_bounded(): bounces each send
@@ -493,6 +503,7 @@ private:
     bool started_{false};
     std::thread thread_;
     std::function<void()> stop_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::function<void()> between_lane_stops_hook_for_test_; ///< test seam; null = no-op, fire-once
     std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
     std::atomic<std::uint64_t> journal_maint_exceptions_{0}; ///< firewalled maintenance-pass throws (C0)
     /// Success stamps for the staleness gauges (item 6). Seeded at start() (clamped >= 1 so

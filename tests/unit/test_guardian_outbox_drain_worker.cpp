@@ -279,6 +279,57 @@ TEST_CASE("#3953 item 6: stop() closes both lane executors before publishing sig
     CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
 }
 
+TEST_CASE("#3953 item 6 follow-up: the gap BETWEEN the two lane executors' own stop() "
+          "calls still admits a compliance send after lifecycle already refuses",
+          "[spark][guardian][drain][chaos]") {
+    // Governance Gate 4 unhappy-path (UP-4): stop() calls lifecycle_send_exec_.stop()
+    // THEN compliance_send_exec_.stop() - a real, tolerated (per the orphan-exit
+    // contract) admission window exists between the two calls, and nothing previously
+    // exercised it in isolation. Never start()ed: offer()'s one-caller contract holds
+    // on THIS test thread.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    std::atomic<int> compliance_invocations{0};
+    std::atomic<int> lifecycle_invocations{0};
+    auto sink = [&](const OutboxEntry& e) -> SendResult {
+        // Sent, not Retain: wrapped_send()'s .value_or(Retain) makes Retain ambiguous
+        // between "refused" and "sent but retained" - Sent disambiguates admission.
+        if (e.domain == OutboxDomain::Lifecycle)
+            lifecycle_invocations.fetch_add(1);
+        else
+            compliance_invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rt, sink);
+
+    auto lifecycle_entry = OutboxEntry::lifecycle("r1", 1, "e-lifecycle",
+                                                   1'700'000'000'000'000'000, "armed");
+    GuardDrift drift;
+    drift.rule_id = "r2";
+    auto compliance_entry =
+        OutboxEntry::compliance("r2", 1, "e-compliance", 1'700'000'000'000'000'000, drift);
+
+    std::optional<SendResult> compliance_result;
+    std::optional<SendResult> lifecycle_result;
+    // Fires between lifecycle_send_exec_.stop() and compliance_send_exec_.stop(): at
+    // this instant lifecycle's lane already refuses, compliance's does not yet.
+    worker.set_between_lane_stops_hook_for_test([&] {
+        compliance_result = worker.wrapped_send_for_test(compliance_entry);
+        lifecycle_result = worker.wrapped_send_for_test(lifecycle_entry);
+    });
+
+    worker.stop();
+
+    REQUIRE(compliance_result.has_value());
+    REQUIRE(lifecycle_result.has_value());
+    CHECK(*compliance_result == SendResult::Sent);  // compliance's lane not yet stopped
+    CHECK(*lifecycle_result == SendResult::Retain); // lifecycle's lane already stopped
+    CHECK(compliance_invocations.load() == 1);
+    CHECK(lifecycle_invocations.load() == 0);
+    CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+}
+
 TEST_CASE("stop() is idempotent and joins cleanly with nothing pending",
           "[spark][guardian][drain]") {
     auto r = std::make_shared<FakeReader>();
