@@ -628,6 +628,31 @@ public:
     /// .cpp; revisit both together, do not diverge silently.
     [[nodiscard]] std::expected<EventOutboxReapOutcome, std::string> reap_event_outbox();
 
+    /// HA WS-2a-2 (ADR-2002 §5) cross-replica event delivery — ONE poll pass.
+    /// Reads the durably-SETTLED tail of `event_outbox` that ORIGINATED on OTHER
+    /// replicas and re-publishes each event onto THIS replica's in-memory
+    /// `ExecutionEventBus`, under its durable global `event_id` — so a live SSE
+    /// subscriber on this replica sees events produced on any replica. Meant to
+    /// be called on a tight cadence (~2s) from the maint thread; it is the SOLE
+    /// caller, so the in-memory cursor below needs no lock.
+    ///
+    /// Cursor: an in-memory xid8 HORIZON (`poll_horizon_`), init'd on the first
+    /// pass to the current all-committed xmin (skipping all pre-boot history — a
+    /// reconnecting subscriber replays history from the durable outbox by
+    /// execution_id, a SEPARATE path, not this live poll). Each pass reads
+    /// `w_xid IN [horizon, xmin)` skip-own, ORDER BY (w_xid, event_id), and
+    /// advances the horizon to xmin. See the DERIVATION at the definition for why
+    /// the xmin horizon — not a bare `event_id` cursor nor an `(w_xid,event_id)`
+    /// keyset — is the loss-free cursor (endorsed by the 2026-09-02 architect
+    /// review), and why the batch cap is a hard compile-time floor.
+    ///
+    /// Returns the count of events re-published this pass (0 on an empty window /
+    /// no bus attached / closed store / the first init pass), or `unexpected` on
+    /// a pool-acquire timeout or query failure — a failure does NOT advance the
+    /// horizon, so the window is re-read next pass (a duplicate, never a gap;
+    /// ADR-2002 §5 is at-least-once). The caller counts a degrade metric.
+    [[nodiscard]] std::expected<int, std::string> poll_event_outbox_once();
+
     /// Whether the store is usable (schema migrated). False after a failed
     /// migration — feeds the `/readyz` probe so a broken execution-history
     /// schema fails closed instead of serving errors (or silently wedging
@@ -689,6 +714,22 @@ private:
 
     pg::PgPool& pool_;
     bool open_{false};
+    /// HA WS-2a-2: this process's outbox instance identity (a boot-time random
+    /// hex string). Stamped as `origin_replica` on every durable append so the
+    /// cross-replica poll loop can SKIP this replica's own rows (already
+    /// published in-process) and re-publish only other replicas' events. A
+    /// LOCAL per-process id, deliberately NOT the cluster/node identity WS-3/WS-4
+    /// will introduce (fenced leader epoch, gateway routing) — those are a
+    /// broader concern and this may fold into them later. Empty only if secure
+    /// RNG failed at construction (logged); an empty id disables skip-own
+    /// self-exclusion, which is safe-but-chatty, never a correctness break.
+    std::string replica_id_;
+    /// HA WS-2a-2 cross-replica poll cursor (see poll_event_outbox_once). The
+    /// maint thread is the SOLE caller, so these are single-writer and unlocked.
+    /// `poll_horizon_` is an xid8 as decimal text ("" until the first pass
+    /// initializes it to the boot-time all-committed xmin).
+    std::string poll_horizon_;
+    bool poll_initialized_{false};
     /// Borrowed — owned by the server. nullptr = no SSE publishing.
     ExecutionEventBus* event_bus_{nullptr};
     /// Borrowed — owned by the server. nullptr = no metrics (ADR-1007).
