@@ -385,21 +385,32 @@ manufacture the empty-table window directly, on a live fleet, outside any planne
 narrowing it:
 
 ```sql
+-- v3, a separate migration from v2's DELETE (not folded into it, even though this branch has
+-- never shipped and editing v2 in place would violate no convention): a rig that already
+-- migrated to v2 alone before this fix existed picks v3 up on its next boot, same as any other
+-- upgrade, rather than depending on checking every local/dev Postgres instance for drift.
 ALTER TABLE audit_retention_meta ADD CONSTRAINT audit_retention_meta_no_retired_backfill_markers
     CHECK (key NOT IN ('backfill_complete', 'backfill_source_fingerprint'));
 ```
 
-Same shape as `RbacStore`'s own v4 constraint (`rbac_meta_enabled_canonical`) on the same
+Same shape as `RbacStore`'s own v2 constraint (`rbac_meta_enabled_canonical`) on the same
 key/value-meta table pattern — but where RbacStore's constraint narrows the *values* a key may
 hold, this one forbids the *keys* outright. With it in place, `stamp_complete`'s `INSERT` fails
-(`23514 check_violation`) on every sub-case above — marker absent or present, table empty or not,
-legacy file present or not — because all four routes converge on the same `INSERT INTO
-audit_retention_meta (key, value) VALUES ('backfill_complete', ...)` (or the fingerprint
-counterpart). `migrate_from_sqlite` then returns `false` and `server.cpp` sets
-`startup_failed_`, deterministically, not merely in the realistic case. This is the same class of
-guarantee the `DROP TABLE` group gets from `42P01`/`undefined_table` — a schema-level rejection,
-not a live-row-count race — while still leaving `audit_retention_meta` itself in place for the
-clock guard's permanent rows. Nothing in the current codebase writes either key any more
+(`23514 check_violation`, independent of `ON CONFLICT` arbitration — Postgres validates CHECK
+constraints before conflict resolution) on two of the four sub-cases above: marker-absent with an
+empty table (the UP-1 window itself) and a real local legacy file. The other two never reach an
+`INSERT` at all post-v3: a non-empty `audit_events` was already refused by the pre-existing
+`pg_rows_before` guard, unrelated to this fix, and marker-present is now structurally unreachable,
+since the marker can never be (re-)inserted. `migrate_from_sqlite` returns `false` on every one of
+the four, and `server.cpp` sets `startup_failed_`, deterministically, not merely in the realistic
+case. The refusal itself is the same class of guarantee the `DROP TABLE` group gets from
+`42P01`/`undefined_table` — a schema-level rejection, not a live-row-count race — while still
+leaving `audit_retention_meta` itself in place for the clock guard's permanent rows. One caveat
+this framing does not extend to: in the legacy-file-present sub-case, the old binary's row
+inserts into `audit_events` (each in their own idempotent transaction, `ON CONFLICT (id) DO
+NOTHING`) run and commit *before* the final `stamp_complete` call that now fails — the refusal
+here is loud and deterministic, but it is not zero-data-movement the way an `undefined_table`
+error on first touch is. Nothing in the current codebase writes either backfill key any more
 (`migrate_from_sqlite` and its helpers are fully deleted), so the constraint can never reject
 legitimate current-binary activity.
 

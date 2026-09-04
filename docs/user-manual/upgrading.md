@@ -1798,12 +1798,16 @@ file — an older binary's own (now-removed-from-current-code) backfill logic
 refuses to boot **unconditionally**, with or without a legacy `audit.db`
 present: seeing this database already past this migration (the marker rows
 are gone, but `audit_retention_meta` itself is not — see ADR-0040's Update),
-its own idempotency-marker write hits a CHECK constraint this migration also
-adds (`audit_retention_meta_no_retired_backfill_markers`) and fails with a
-Postgres `23514 check_violation`, on every path — table empty or not, legacy
+its own idempotency-marker write hits a CHECK constraint a following
+migration adds (`audit_retention_meta_no_retired_backfill_markers`) and
+fails with a Postgres `23514 check_violation`, table empty or not, legacy
 file present or not. This is the same class of guarantee the DROP-TABLE-group
-stores above get from their `undefined_table` error: a schema-level
-rejection, not a live-row-count race. "Just roll back the binary" is not a
+stores above get from their `undefined_table` error — a schema-level
+rejection, not a live-row-count race — with one caveat: if a legacy
+`audit.db` is present, the old binary's row inserts into `audit_events` still
+run and commit before this final write fails, so the refusal is loud and
+deterministic but not zero-data-movement the way a first-touch
+`undefined_table` error is. "Just roll back the binary" is not a
 supported recovery path once this migration has run, the same as every
 DROP-TABLE-group store above.
 
