@@ -2816,10 +2816,20 @@ TEST_CASE("File spark (real mechanism): a failed retire keeps the DirWatch alive
     // #2839 seam, which fires immediately before the allocating step — the same
     // "fault phase" idiom as SparkEngine::set_arm_fault_hook_for_test.
     //
-    // PRE-FIX this case crashes: the throw frees the live DirWatch and stop() then
-    // dereferences the null map entry. POST-FIX the throw lands BEFORE any ownership
-    // moves, so the watch stays whole in dirs_ — already `removing` and cancelled — and
-    // stop() reclaims it normally.
+    // PRE-FIX this case crashes, but WHICH dereference lands first is not predictable and
+    // this test does not claim it is. The by-value parameter had already taken ownership
+    // at the call, so the throw FREES the DirWatch; from that instant there are two live
+    // dangling references to it — the IOCP completion the kernel still holds (CancelIoEx
+    // was issued just before, so its ABORTED packet is typically already queued, and the
+    // worker will do `w->io_pending = false` on freed memory), and the moved-from (null)
+    // unique_ptr left in dirs_ because the caller's erase was skipped, which stop()'s
+    // cancel loop then dereferences. The worker usually gets there first. Both are the
+    // same defect; the fix removes the free, not one of the two readers.
+    //
+    // POST-FIX the throw lands BEFORE any ownership moves, so the watch stays whole in
+    // dirs_ — already `removing` and cancelled — and is reclaimed normally by whichever
+    // runs first: the worker's drop_watch() when the aborted completion drains, or
+    // stop().
     namespace fs = std::filesystem;
     const auto pid = std::to_string(::GetCurrentProcessId());
     const fs::path dir = fs::temp_directory_path() / ("yuzu_test_spark_2839_" + pid);
@@ -2866,9 +2876,11 @@ TEST_CASE("File spark (real mechanism): a failed retire keeps the DirWatch alive
     { std::ofstream(other) << "seed"; }
     CHECK(mech->watch("k2839b", FileSparkParams{other.string()}).has_value());
 
-    // And the retained watch is reclaimed by an ordinary stop(): it is cancelled and
-    // drained like any other, with no quarantine and no crash. PRE-FIX this line is where
-    // the null dirs_ entry was dereferenced.
+    // And the retained watch is reclaimed on an ordinary path — by the worker's
+    // drop_watch() if the aborted completion has already drained, otherwise by stop()'s
+    // own cancel-and-drain — with no quarantine and no crash either way. (drop_watch
+    // searches dirs_, ancestors_ AND retiring_, so it does not care which container the
+    // watch ended up in.)
     const auto t0 = std::chrono::steady_clock::now();
     CHECK_NOTHROW(mech->stop());
     CHECK(std::chrono::steady_clock::now() - t0 < 5000ms);
