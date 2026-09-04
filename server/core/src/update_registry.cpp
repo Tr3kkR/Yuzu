@@ -157,17 +157,17 @@ UpdateRegistry::UpdateRegistry(pg::PgPool& pool, const std::filesystem::path& up
 
 UpdateRegistry::~UpdateRegistry() = default;
 
-void UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
+bool UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
     if (!open_) {
         note_write_degrade(metrics_, kReasonStoreNotOpen);
-        return;
+        return false;
     }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         note_write_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: upsert_package skipped, no connection in time ({})",
                       pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -188,10 +188,11 @@ void UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
         note_write_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: upsert_package failed for {}/{}/{}: {}", pkg.platform,
                       pkg.arch, pkg.version, PQerrorMessage(lease.get()));
-        return;
+        return false;
     }
     spdlog::info("UpdateRegistry: upserted package {}/{}/{} ({})", pkg.platform, pkg.arch,
                  pkg.version, pkg.filename);
+    return true;
 }
 
 void UpdateRegistry::remove_package(const std::string& platform, const std::string& arch,
@@ -219,6 +220,115 @@ void UpdateRegistry::remove_package(const std::string& platform, const std::stri
         return;
     }
     spdlog::info("UpdateRegistry: removed package {}/{}/{}", platform, arch, version);
+}
+
+UpdateRegistry::RolloutChange UpdateRegistry::update_rollout_checked(const std::string& platform,
+                                                                     const std::string& arch,
+                                                                     const std::string& version,
+                                                                     int rollout_pct) {
+    RolloutChange out; // kUnavailable until proven otherwise
+    if (!open_) {
+        note_write_degrade(metrics_, kReasonStoreNotOpen);
+        return out;
+    }
+
+    // Acquire FIRST, then with_txn_on — deliberately not with_txn_for, which
+    // collapses "no connection" and "the transaction failed" into one false.
+    // This store reports its degrades BY REASON
+    // (yuzu_server_update_registry_write_degrade_total{reason}), and the whole
+    // point of this store's absent-vs-degraded distinction is not conflating
+    // causes; folding a pool timeout into query_error would undo that in the
+    // metric.
+    // Nothing runs between the acquire and the call, per with_txn_on's contract.
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease) {
+        note_write_degrade(metrics_, kReasonPoolTimeout);
+        spdlog::error("UpdateRegistry: update_rollout skipped, no connection in time ({})",
+                      pool_.last_error());
+        return out;
+    }
+
+    // ONE transaction, row-locked. The read that produces the audited `from=`
+    // and the write it describes must be the same transaction, or a concurrent
+    // write to this key can slip between them and the audit row asserts a
+    // transition from a value it did not replace. See the header comment.
+    //
+    // FOR UPDATE, not a bare SELECT: the lock is what makes a second writer on
+    // the same key wait rather than interleave. It is row-scoped, so rollouts of
+    // DIFFERENT packages still proceed concurrently.
+    const bool txn_ok = pool_.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult sel = pg::exec_params(
+            conn,
+            "SELECT rollout_pct, mandatory FROM update_registry.update_packages "
+            "WHERE platform = $1 AND arch = $2 AND version = $3 FOR UPDATE",
+            std::vector<std::string>{platform, arch, version});
+        if (sel.status() != PGRES_TUPLES_OK) {
+            spdlog::error("UpdateRegistry: update_rollout read failed for {}/{}/{}: {}", platform,
+                          arch, version, PQerrorMessage(conn));
+            return false; // roll back; out stays kUnavailable
+        }
+        if (PQntuples(sel.get()) == 0) {
+            // A genuine absence, reported by the store rather than inferred from
+            // a degrade. Commit the no-op so this is not confused with a failure.
+            out.status = PackageLookup::kAbsent;
+            return true;
+        }
+
+        // The file's own column helpers, not a hand-rolled atoi/char compare —
+        // they already handle NULL and the boolean spellings consistently.
+        //
+        // Recorded HERE, before the UPDATE is attempted, and deliberately: the
+        // row's existence and its prior values are established by this SELECT
+        // and stay true even if the write below fails. Setting them only on the
+        // success path collapsed a failed write onto kUnavailable, which then
+        // audited `existence_unknown=true` about a package the store had just
+        // returned. `committed` — set by the caller from the transaction's own
+        // outcome — is what says whether the write landed.
+        out.status = PackageLookup::kFound;
+        out.prior_rollout_pct = col_int(sel.get(), 0, 0);
+        out.prior_mandatory = col_bool(sel.get(), 0, 1);
+
+        // Writes ONLY rollout_pct. upsert_package writes the whole snapshot
+        // back, which is what let a concurrent writer's change to any other
+        // column be silently discarded by a rollout edit.
+        pg::PgResult upd = pg::exec_params(
+            conn,
+            "UPDATE update_registry.update_packages SET rollout_pct = $4::int "
+            "WHERE platform = $1 AND arch = $2 AND version = $3 RETURNING rollout_pct",
+            std::vector<std::string>{platform, arch, version, std::to_string(rollout_pct)});
+        if (upd.status() != PGRES_TUPLES_OK || PQntuples(upd.get()) == 0) {
+            spdlog::error("UpdateRegistry: update_rollout write failed for {}/{}/{}: {}", platform,
+                          arch, version, PQerrorMessage(conn));
+            return false;
+        }
+
+        return true;
+    });
+
+    // `status` survives a failed transaction; `committed` does not. The SELECT
+    // inside the transaction really did observe the row, so an existence and a
+    // prior value learned there stay known even though the write rolled back —
+    // and the caller audits both facts separately.
+    out.committed = txn_ok && out.status == PackageLookup::kFound;
+
+    if (!txn_ok) {
+        // A statement failed, or the COMMIT did not land. Neither is absence,
+        // and neither may claim a transition.
+        //
+        // A lost COMMIT RESPONSE after Postgres actually committed also lands
+        // here (pg_pool.hpp documents that ambiguity). That is safe for this
+        // caller and only for this caller: the audit row says `attempted_`, never
+        // that the value changed. Do NOT grow a compensating action on this
+        // branch without resolving the ambiguity first (pg_xact_status) — the
+        // #3481 CHAOS-1 trap.
+        note_write_degrade(metrics_, kReasonQueryError);
+        return out;
+    }
+    if (out.committed) {
+        spdlog::info("UpdateRegistry: rollout for {}/{}/{} {}% -> {}%", platform, arch, version,
+                     out.prior_rollout_pct, rollout_pct);
+    }
+    return out;
 }
 
 std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
