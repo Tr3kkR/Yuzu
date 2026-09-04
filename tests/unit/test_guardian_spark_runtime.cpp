@@ -2196,10 +2196,15 @@ TEST_CASE("#3816: a timeout followed by a LATE FAILED arm is not counted as a la
 
     b->fail_arm.store(true); // the parked call, once released, fails rather than succeeds
     b->release_hang();
-    // No counter this failure path touches ever increments, so there is nothing to
+    // No RUNTIME-level counter this failure path touches increments
+    // (backend_op_late_arms/arms/disarms all stay put), so there is nothing to
     // spin_until on to prove the worker resumed - give it ample bounded time (same
     // idiom test_guardian_io_executor.cpp uses to prove an erroneous action never
-    // happened) before asserting the negative.
+    // happened) before asserting the negative. The EXECUTOR's own T-agnostic
+    // Counters::abandoned DOES increment for this case (a late failure is still a
+    // normal, non-throwing fn() return, routed to on_abandoned same as a late
+    // success) - not testable from this file, since GuardianSparkRuntime exposes
+    // no executor-stats accessor; see test_guardian_io_executor.cpp's own coverage.
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(b->arms.load() == 0);      // arm() itself failed - no subscription ever minted
     CHECK(b->disarms.load() == 0);   // nothing to disarm

@@ -449,10 +449,11 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     // longer has a throwing wait-path to propagate (a wait-lock failure now folds
     // into a plain IoFailure::LaunchFailed return - see guardian_io_executor.hpp),
     // but this call expression's own ARGUMENT evaluation - `spec`'s copy into fn's
-    // capture, `shared_from_this()`'s documented bad_weak_ptr in on_abandoned's -
-    // still runs in THIS function's frame, before run() is even entered, and is
-    // still a live trigger for arming_rollback's guard, same reasoning as
-    // submit_disarm_off_lock's own try/catch a few functions above.
+    // capture, `shared_from_this()`'s documented bad_weak_ptr thrown while building
+    // on_abandoned's own capture list - still runs in THIS function's frame, before
+    // run() is even entered, and is still a live trigger for arming_rollback's
+    // guard, same reasoning as submit_disarm_off_lock's own try/catch a few
+    // functions above.
     auto io_result = io_executor_.run(
         *io_class, key, cfg_.backend_op_deadline,
         [backend = backend_, spec]() -> std::expected<std::uint64_t, std::string> {

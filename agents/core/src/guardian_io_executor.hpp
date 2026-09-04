@@ -424,7 +424,9 @@ public:
                     // noexcept lambda. TicketCore's own destructor (already a single
                     // unconditional acquisition, already runs at true worker-thread-
                     // exit) frees the key together with the inflight counters
-                    // instead - no new lock acquisition anywhere in this design.
+                    // instead - no new lock acquisition on this, the ORDINARY
+                    // abandoned-publish path (the separate, rare cleanup-failure
+                    // sub-path below DOES take one more, to count the failure).
                 }
                 st->cv.notify_all(); // after releasing the lock (unconditional,
                                      // matching the pre-existing idiom - harmless
@@ -475,6 +477,12 @@ public:
         }
 
         ticket.reset(); // success: drop the caller copy; the worker now owns the reservation
+        // Safe only because every worker code path first blocks on THIS SAME
+        // state_->mu (the caller's own wait_lk, held continuously from before this
+        // point) before it can reach a publish/abandon decision - no worker path
+        // bypasses that lock_guard to race TicketCore's destructor against the
+        // caller. A future worker early-return that skipped the lock would
+        // self-deadlock (or worse, race) here instead.
 
         state_->cv.wait_until(wait_lk, abs_deadline,
                               [&] { return cell->done || state_->stopping; });

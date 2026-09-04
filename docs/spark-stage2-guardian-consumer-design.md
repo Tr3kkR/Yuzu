@@ -679,8 +679,10 @@ The Pre-Stage-3 dependency above is otherwise unchanged by this landing.
 
 **#3816 (landed)**: item 3's bounded-wait deadline left a residual - a backend arm
 that succeeds just after its caller gives up can mint a live subscription nothing
-tracks. `GuardianIoExecutor::run()` now delivers every result exactly once, to
-either the caller's return value or an `on_abandoned(T&&)` callback, so
+tracks. `GuardianIoExecutor::run()` now delivers every result `fn()` returns
+normally exactly once, to either the caller's return value or an
+`on_abandoned(T&&)` callback (a thrown `fn()`/`WorkerThrew` has no `T` to
+deliver and correctly reaches neither), so
 `GuardianSparkRuntime`'s arm consumer can disarm a late success instead of leaking
 it; the state reader needs no callback (a late read is wasted work, nothing
 escapes). See `docs/spark-flip-gate.md` §3 row 3.
