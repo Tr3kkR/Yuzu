@@ -35,6 +35,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -236,6 +237,13 @@ public:
     /// `is_terminal` marks the execution as having reached completion;
     /// the channel keeps the buffer for `kRetentionAfterTerminalSec` so
     /// late reconnects can replay, then is GC'd on next sweep.
+    ///
+    /// The event id is the per-channel counter, assigned in PUBLISH order under
+    /// the channel mutex — buffer order == id order, so a `Last-Event-ID`
+    /// reconnect never skips an undelivered event (HA WS-2a-2 Option A: the
+    /// durable event_outbox.event_id is deliberately NOT the live bus id — see
+    /// the publish body). The HA cross-replica poll re-publishes foreign events
+    /// through this same path, so they too get a monotonic local counter id.
     void publish(const std::string& execution_id, const std::string& event_type,
                  const std::string& data, bool is_terminal = false);
 
