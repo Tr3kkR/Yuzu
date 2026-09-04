@@ -5,7 +5,7 @@ Issue #1398: an `InstructionDefinition`'s `approval.mode` was enforced only
 on the governed `POST /api/instructions/:id/execute` path, never on raw
 dispatch (`POST /api/command`, MCP `execute_instruction`). The fix adds an
 `ExecuteGate` dimension to `CommandCapability` (`command_capability.hpp`),
-authored per `plugin.action` row across the six `capability_decls/*.hpp`
+authored per `plugin.action` row across the seven `capability_decls/*.hpp`
 fragments, derived STRICTEST-WINS from every shipped definition targeting
 that pair (`auto` -> `None`, `role-gated` -> `AdminOrApproval`, `always` ->
 `AlwaysApproval`). This script is the mechanical guarantee that the
@@ -32,8 +32,8 @@ Three things checked against the real, integrated tree:
      named failure instead.
   3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
      an `.execute_gate` for must equal the number of rows it finds a
-     `.plugin`/`.action` pair for, and both must equal 184 (45+55+34+42+5+3
-     across the six fragments) — architect review requirement: a regex that
+     `.plugin`/`.action` pair for, and both must equal 187 (45+55+34+42+5+3+3
+     across the seven fragments) — architect review requirement: a regex that
      silently fails to associate a gate with its row must read as a hard
      failure, never as an absent gate.
 
@@ -46,7 +46,7 @@ what a defaulted definition means.
 
 Runnable standalone: `python3 tests/test_capability_gate_consistency.py`.
 Hermetic — reads only source files already on disk under this repository
-(content/definitions/*.yaml, the six capability_decls fragments); no
+(content/definitions/*.yaml, the seven capability_decls fragments); no
 subprocess, no network, no clock. Requires PyYAML, an existing hard build
 dependency (see embed_content.py) — not a new one for this repo.
 
@@ -85,10 +85,11 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_b.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_c.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
 ]
-# 3 + 5 + 45 + 55 + 34 + 42 — see command_capability.hpp's fragment doc
+# 3 + 5 + 45 + 55 + 34 + 42 + 3 — see command_capability.hpp's fragment doc
 # comments and the #1398 design doc's verified row-count audit.
-EXPECTED_TOTAL_ROWS = 184
+EXPECTED_TOTAL_ROWS = 187
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
@@ -227,7 +228,7 @@ def format_gaps(
 
 class TestGateConsistencyOnRealTree(unittest.TestCase):
     """The actual drift gate: parses the live repository and fails, naming
-    every gap, if content's approval.mode and the six capability-catalogue
+    every gap, if content's approval.mode and the seven capability-catalogue
     fragments' execute_gate have drifted apart.
     """
 
@@ -248,7 +249,7 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
         # anticipate) must fail loud here, not read as "no gate = fine".
         self.assertEqual(
             len(fragment_rows), pair_only_count,
-            f"parsed {pair_only_count} plugin/action pairs across the six fragments but "
+            f"parsed {pair_only_count} plugin/action pairs across the seven fragments but "
             f"only {len(fragment_rows)} had an associated .execute_gate — the row/gate "
             "regex has drifted apart from the fragment file format (or a row is missing "
             "its .execute_gate field, which should be a COMPILE failure via each "
@@ -257,9 +258,9 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
         )
         self.assertEqual(
             len(fragment_rows), EXPECTED_TOTAL_ROWS,
-            f"expected exactly {EXPECTED_TOTAL_ROWS} total capability rows across the six "
+            f"expected exactly {EXPECTED_TOTAL_ROWS} total capability rows across the seven "
             f"fragments, found {len(fragment_rows)} — update EXPECTED_TOTAL_ROWS if a row "
-            "was deliberately added or removed, after confirming the six per-file counts "
+            "was deliberately added or removed, after confirming the seven per-file counts "
             "in the #1398 design doc's row-count audit are updated too",
         )
         self.assertNotIn(
