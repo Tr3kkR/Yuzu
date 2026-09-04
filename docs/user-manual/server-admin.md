@@ -3784,6 +3784,14 @@ silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yu
 once the wedged target is resolved. Alert on the `failed` state; the old restart-forever
 behaviour hid a crash-looping agent.
 
+**Persisting deploy-time settings (systemd).** The `yuzu-agent` unit also loads an optional
+`EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env` (`-` = no error when absent, not shipped by
+the `.deb`/`.rpm` - operator-created), so `YUZU_AGENT_*` flags such as
+`YUZU_AGENT_SPARK_DISABLE` survive restarts and package upgrades instead of only a one-off
+command-line override. See [SparkEngine](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)
+for the specific rollback-lever case, and `docs/spark-flip-gate.md` §6 for the drill
+procedure and recovery from a malformed value (it shares the crash-loop backstop above).
+
 **Installation:**
 
 ```bash
