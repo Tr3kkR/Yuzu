@@ -14,7 +14,7 @@
 ##            account may do.
 ##   macOS:   IOKit IOBlockStorageDevice device characteristics (identity,
 ##            medium type, NVMe-SMART capability) for `smart`; IOKit IOMedia
-##            provider walk + getmntinfo(3) MNT_NOWAIT for `volumes`.
+##            provider walk + getmntinfo_r_np(3) MNT_NOWAIT for `volumes`.
 ##   Linux:   not implemented in this release — no mechanism could be bound
 ##            against real hardware, and shipping one written only from
 ##            documentation is how a leg reaches production doing nothing.
@@ -44,11 +44,17 @@ metadata:
     reachable only through a private, undocumented Apple interface, so health
     reports "unknown" there on every device. The Linux leg is not implemented
     in this release and says so.
+
+    Three columns carry FIXED vocabularies, emitted verbatim and safe to group
+    or alert on. health: ok, warning, failing, unknown (the device did not tell
+    us), unsupported (this OS leg cannot ask — every Linux row today).
+    bus: nvme, sata, usb, sas, virtual, unknown.
+    media: ssd, hdd, unknown. A value outside these sets is never emitted.
   tags: [storage, disk, health, smart, hardware]
 
 spec:
   type: question
-  platforms: [windows, linux, darwin]
+  platforms: [windows, darwin]
 
   execution:
     plugin: disk_actions
@@ -92,7 +98,8 @@ spec:
     mode: auto
 
   permissions:
-    executeRoles: [admin, operator, viewer]
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
 
 ---
 apiVersion: yuzu.io/v1alpha1
@@ -113,11 +120,18 @@ metadata:
     provider chain, so an APFS volume on a synthesized container correctly
     reports the underlying physical disk rather than the container. The Linux
     leg is not implemented in this release.
+
+    total_bytes here is RAW MEDIA CAPACITY, not filesystem capacity, and it is
+    NOT comparable with crossplatform.storage.mounts.total_bytes: on Windows it
+    is the sum of the volume's disk extents, on macOS the IOMedia size, while
+    the mounts action reports the filesystem's own total. fstype and total_bytes
+    are carried only to identify the volume in the join; for capacity reporting
+    use crossplatform.storage.mounts or crossplatform.storage.free.
   tags: [storage, disk, volume, mapping]
 
 spec:
   type: question
-  platforms: [windows, linux, darwin]
+  platforms: [windows, darwin]
 
   execution:
     plugin: disk_actions
@@ -157,4 +171,5 @@ spec:
     mode: auto
 
   permissions:
-    executeRoles: [admin, operator, viewer]
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]

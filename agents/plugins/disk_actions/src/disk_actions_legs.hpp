@@ -214,10 +214,6 @@ inline void mark_result_partial(yuzu::CommandContext& ctx, std::string_view prov
                           provenance);
 }
 
-/// A degradation whose cause is specifically a PRIVILEGE denial, so a
-/// status-keyed consumer can tell "not allowed to read that" from every other
-/// kind of degradation. Precedent: event_logs_plugin.cpp's access-denied
-/// mapping, and filesystem_posture's mark_result_denied.
 /// Report a capability that is ABSENT on this platform, as distinct from a
 /// read that partially degraded. Spec-axis review (F5) caught the Linux legs
 /// reporting CONSTRAINED/PARTIAL — "partial data" — for actions that are not
@@ -235,6 +231,12 @@ inline void mark_result_unavailable(yuzu::CommandContext& ctx, std::string_view 
                           provenance);
 }
 
+/// A degradation whose cause is specifically a PRIVILEGE denial, so a
+/// status-keyed consumer can tell "not allowed to read that" from every other
+/// kind of degradation — the two need different remediation, and only this one
+/// is fixed by granting the agent account a right. Precedent:
+/// event_logs_plugin.cpp's access-denied mapping, and filesystem_posture's
+/// mark_result_denied.
 inline void mark_result_denied(yuzu::CommandContext& ctx, std::string_view provenance,
                                std::string_view reason = {}) {
     if (reason.empty())

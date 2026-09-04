@@ -5,7 +5,7 @@ Issue #1398: an `InstructionDefinition`'s `approval.mode` was enforced only
 on the governed `POST /api/instructions/:id/execute` path, never on raw
 dispatch (`POST /api/command`, MCP `execute_instruction`). The fix adds an
 `ExecuteGate` dimension to `CommandCapability` (`command_capability.hpp`),
-authored per `plugin.action` row across the seven `capability_decls/*.hpp`
+authored per `plugin.action` row across the eight `capability_decls/*.hpp`
 fragments, derived STRICTEST-WINS from every shipped definition targeting
 that pair (`auto` -> `None`, `role-gated` -> `AdminOrApproval`, `always` ->
 `AlwaysApproval`). This script is the mechanical guarantee that the

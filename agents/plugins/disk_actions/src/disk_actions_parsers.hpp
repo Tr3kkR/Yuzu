@@ -96,6 +96,69 @@ enum class NvmeVerdict { Ok, Warning, Failing };
     return NvmeVerdict::Ok;
 }
 
+// ── degradation summary: the PURE precedence decision ───────────────────
+//
+// WHY THIS IS HERE. `set_result_status` ASSIGNS, so the LAST call wins, and
+// the legs therefore report their degradations least-material first. That
+// ordering is a real contract — reorder the `if` blocks and an operator sees a
+// different cause for the same run — but it lived as a hand-ordered sequence of
+// `if`s inside platform-guarded TUs that no unit suite loads. Governance found
+// every one of those paths unproven, and both the quality and safety reviewers
+// independently prescribed the same remedy: make the DECISION pure and leave
+// only flag-setting in the shell.
+//
+// The legs now fill a `DegradationFlags` and call `summarise_degradation`; the
+// precedence lives here, where every platform's suite can exercise it.
+
+/// Which degradations a leg observed. Ordered weakest to strongest, and the
+/// order of the FIELDS is not meaningful — `summarise_degradation` owns that.
+struct DegradationFlags {
+    bool fstype_unread{false};       ///< a filesystem-type query was refused
+    bool mounts_unread{false};       ///< mount-point enumeration failed
+    bool detail_unread{false};       ///< a per-item detail read failed
+    bool list_truncated{false};      ///< a reply carried fewer items than claimed
+    bool list_unread{false};         ///< an item list could not be read at all
+    bool enumeration_incomplete{false}; ///< the walk itself stopped early
+    bool denied{false};              ///< something refused us on privilege grounds
+};
+
+/// What a leg should report, or nullopt when the read was clean.
+///
+/// `denied` outranks everything: it is the one cause with a different
+/// remediation (grant the agent account a right), so it must survive
+/// last-writer-wins. Below it, strength runs from an incomplete ENUMERATION
+/// (the listing itself is short — the most material) down to a single missing
+/// column.
+enum class DegradationKind {
+    FstypeUnread,
+    MountsUnread,
+    DetailUnread,
+    ListTruncated,
+    ListUnread,
+    EnumerationIncomplete,
+    Denied,
+};
+
+[[nodiscard]] inline constexpr std::optional<DegradationKind>
+summarise_degradation(const DegradationFlags& f) noexcept {
+    // Strongest first: this returns the cause that must WIN, which is the one
+    // the leg reports LAST.
+    if (f.denied) return DegradationKind::Denied;
+    if (f.enumeration_incomplete) return DegradationKind::EnumerationIncomplete;
+    if (f.list_unread) return DegradationKind::ListUnread;
+    if (f.list_truncated) return DegradationKind::ListTruncated;
+    if (f.detail_unread) return DegradationKind::DetailUnread;
+    if (f.mounts_unread) return DegradationKind::MountsUnread;
+    if (f.fstype_unread) return DegradationKind::FstypeUnread;
+    return std::nullopt;
+}
+
+/// True when this cause is a privilege denial rather than a degradation, i.e.
+/// the leg must call mark_result_denied rather than mark_result_partial.
+[[nodiscard]] inline constexpr bool is_denial(DegradationKind k) noexcept {
+    return k == DegradationKind::Denied;
+}
+
 /// The whole-disk name for a partition, by string shape only.
 ///
 /// DELIBERATELY NOT USED BY THE macOS LEG, and kept here with that warning

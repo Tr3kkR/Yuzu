@@ -73,7 +73,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "IOCTL_STORAGE_QUERY_PROPERTY (StorageDeviceProperty + "
-         "StorageDeviceProtocolSpecificProperty, NVMe log page 0x02)",
+         "StorageDeviceSeekPenaltyProperty + StorageDeviceProtocolSpecificProperty, "
+         "NVMe log page 0x02)",
          "the device handle is opened with zero access rights, which an unprivileged service "
          "account may do; wear and spare figures come from the NVMe SMART/Health log and are "
          "therefore reported only for NVMe devices, with SATA and USB drives reporting identity "
@@ -86,13 +87,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "not implemented in this change: the physical-to-logical join is only meaningful "
          "alongside a bound smart leg, and the Linux smart leg is deferred with it"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 1, "IOKit IOMedia provider walk + getmntinfo(3) MNT_NOWAIT",
+        {YUZU_SUPPORT_CONSTRAINED, 1, "IOKit IOMedia provider walk + getmntinfo_r_np(3) MNT_NOWAIT",
          "one row per IOMedia object, keyed on that object's BSD name, carrying the physical whole "
          "disk that backs it and any mount points it serves; the physical disk is resolved by "
          "walking the IOKit provider chain, so a volume inside a synthesized APFS container "
-         "correctly reports the underlying drive rather than the container; a media object that "
-         "serves no mount point still reports its backing disk, and reports '-' for mount points "
-         "rather than being omitted"},
+         "correctly reports the underlying drive rather than the container; a media object that maps "
+         "nothing -- a whole disk serving no mount point -- is omitted, because this action "
+         "carries only the physical-to-logical join and such a row has no join to carry"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "FindFirstVolumeW + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS + "

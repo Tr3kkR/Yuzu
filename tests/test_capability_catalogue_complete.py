@@ -24,7 +24,7 @@ capability-catalogue headers. It fails, naming the exact offending
   1. A plugin declares an action that has no catalogue row anywhere across
      the eight sources (a MISSING row) — a plugin ships a capability the
      dispatch-classification layer would report `Unclassified` for.
-  2. One of the six per-group fragments declares a `plugin.action` no
+  2. One of the seven per-group fragments declares a `plugin.action` no
      plugin's `actions()` override names (a BOGUS row) — dead, unreachable
      catalogue data, or a typo that silently shadows the real action. (The
      core-owned fragment is exempt from this direction only:
@@ -156,8 +156,8 @@ def diff_catalogue(
 
     Returns `(missing, bogus, duplicates)`:
       - `missing`: plugin.action pairs a plugin declares that no source
-        (any of the six per-group headers, or core) covers.
-      - `bogus`: plugin.action pairs one of the six FRAGMENT files declares
+        (any of the seven per-group headers, or core) covers.
+      - `bogus`: plugin.action pairs one of the seven FRAGMENT files declares
         that no plugin actually has (core is exempt — see module docstring).
       - `duplicates`: plugin.action -> list of >=2 source labels that each
         declared it independently (across all eight sources, fragments and

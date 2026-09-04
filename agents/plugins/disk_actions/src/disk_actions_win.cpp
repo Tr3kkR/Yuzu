@@ -47,6 +47,22 @@
  *
  * Every OS call here is read-only: no write, format or delete right is ever
  * requested on a drive or volume handle.
+ *
+ * BOUNDING, and an honest statement of what is NOT bounded. Every
+ * DeviceIoControl below is synchronous on a handle opened without
+ * FILE_FLAG_OVERLAPPED, and there is no deadline on any of them. A wedged
+ * device -- a failing USB drive, a disconnected SAN LUN, a removable in a
+ * not-ready state -- therefore parks the dispatch-pool worker that called us,
+ * and enough of them would exhaust the pool. Two things bound the ordinary
+ * case: the probe stops at kMaxPhysicalDrives, and ThreadErrorModeGuard
+ * suppresses the session-0 hard-error dialog that would otherwise block on a
+ * not-ready volume. Neither bounds a driver that never returns.
+ *
+ * This is a PLATFORM GAP, not an omission here: agents/shared/bounded_wait.hpp
+ * bounds waits on futures and processes, and there is no in-tree precedent for
+ * bounding an ioctl/DeviceIoControl/IOKit call. Inventing a one-off here --
+ * abandoning a detached thread mid-ioctl on a device handle -- is materially
+ * riskier than the wedge it would paper over. Filed rather than improvised.
  */
 
 #if defined(_WIN32)
@@ -347,9 +363,13 @@ std::optional<NvmeHealth> query_nvme_health(HANDLE h) {
 }
 #endif // YUZU_DISKACTIONS_HAVE_NVME
 
+#if defined(YUZU_DISKACTIONS_HAVE_NVME)
 /// Adapt the pure verdict (disk_actions_parsers.hpp) to the row-layer token
 /// enum. The DECISION lives in the parsers header so every platform's unit
 /// suite can exercise it against fixtures; this is only the mapping.
+///
+/// Guarded because its only caller is the NVMe health path: on an SDK without
+/// <nvme.h> an unguarded definition is an unused function (C4505 / -Wunused-function).
 Health health_from_verdict(NvmeVerdict v) {
     switch (v) {
     case NvmeVerdict::Ok:      return Health::Ok;
@@ -358,6 +378,7 @@ Health health_from_verdict(NvmeVerdict v) {
     }
     return Health::Unknown;
 }
+#endif // YUZU_DISKACTIONS_HAVE_NVME
 
 } // namespace
 

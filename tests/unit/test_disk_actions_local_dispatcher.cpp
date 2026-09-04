@@ -558,6 +558,77 @@ TEST_CASE("disk_actions: a short NVMe reply is a failure to report, not a health
     CHECK(decode_nvme_health(exact).has_value());
 }
 
+// Governance (quality-engineer QE-3, cpp-safety DA-3, independently) found the
+// six degradation paths unreachable by any test: every one lives inside a
+// platform-guarded TU no suite loads, and the DOCUMENTED precedence rule --
+// set_result_status assigns, so the last call wins and causes are reported
+// least-material first -- could be reordered with nothing failing. The decision
+// moved into the pure layer precisely so these cases exist.
+TEST_CASE("disk_actions: a clean run reports no degradation", "[disk_actions][status]") {
+    using namespace yuzu::disk_actions;
+    CHECK_FALSE(summarise_degradation(DegradationFlags{}).has_value());
+}
+
+TEST_CASE("disk_actions: a privilege denial outranks every degradation",
+          "[disk_actions][status]") {
+    using namespace yuzu::disk_actions;
+    // Denial has a DIFFERENT remediation from every other cause -- grant the
+    // agent account a right -- so it must never be masked by a co-occurring
+    // degradation, however material that one is.
+    DegradationFlags f{};
+    f.denied = true;
+    f.enumeration_incomplete = true;
+    f.list_unread = true;
+    f.mounts_unread = true;
+    const auto k = summarise_degradation(f);
+    REQUIRE(k.has_value());
+    CHECK(*k == DegradationKind::Denied);
+    CHECK(is_denial(*k));
+}
+
+TEST_CASE("disk_actions: a short listing outranks a missing column",
+          "[disk_actions][status]") {
+    using namespace yuzu::disk_actions;
+    // An incomplete ENUMERATION is the most material non-privilege cause: the
+    // caller is missing whole rows, not one field of one row.
+    DegradationFlags f{};
+    f.enumeration_incomplete = true;
+    f.fstype_unread = true;
+    f.mounts_unread = true;
+    const auto k = summarise_degradation(f);
+    REQUIRE(k.has_value());
+    CHECK(*k == DegradationKind::EnumerationIncomplete);
+    CHECK_FALSE(is_denial(*k));
+}
+
+TEST_CASE("disk_actions: every degradation flag maps to its own cause",
+          "[disk_actions][status]") {
+    using namespace yuzu::disk_actions;
+    // Each flag alone must produce a DISTINCT kind. Collapsing two causes onto
+    // one value is how two different faults become one indistinguishable alert
+    // key -- the defect governance found in the volume_extents token.
+    struct Case { void (*set)(DegradationFlags&); DegradationKind want; };
+    const Case cases[] = {
+        {[](DegradationFlags& f) { f.fstype_unread = true; },          DegradationKind::FstypeUnread},
+        {[](DegradationFlags& f) { f.mounts_unread = true; },          DegradationKind::MountsUnread},
+        {[](DegradationFlags& f) { f.detail_unread = true; },          DegradationKind::DetailUnread},
+        {[](DegradationFlags& f) { f.list_truncated = true; },         DegradationKind::ListTruncated},
+        {[](DegradationFlags& f) { f.list_unread = true; },            DegradationKind::ListUnread},
+        {[](DegradationFlags& f) { f.enumeration_incomplete = true; }, DegradationKind::EnumerationIncomplete},
+        {[](DegradationFlags& f) { f.denied = true; },                 DegradationKind::Denied},
+    };
+    std::set<DegradationKind> seen;
+    for (const auto& c : cases) {
+        DegradationFlags f{};
+        c.set(f);
+        const auto k = summarise_degradation(f);
+        REQUIRE(k.has_value());
+        CHECK(*k == c.want);
+        seen.insert(*k);
+    }
+    CHECK(seen.size() == std::size(cases)); // no two flags collapse onto one cause
+}
+
 TEST_CASE("disk_actions: the name-derived whole disk is WRONG for APFS, deliberately",
           "[disk_actions][nvme]") {
     using namespace yuzu::disk_actions;
