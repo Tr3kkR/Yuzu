@@ -186,12 +186,13 @@ deploy panel for the same pre-flight run and click **Deploy go-cohort** again �
 server detects the in-flight deployment and re-attaches to it rather than starting
 a second one. A device that is offline (or a fail-closed containment-gate read) when
 its stage or execute step is dispatched is retried automatically on a later tick,
-while the page keeps polling — no need to delete and re-deploy; the device stays
-claimed and shows as still in-flight, not Failed, until it either reaches the agent
-or you close the page. A device that is quarantined or is missing the `content_dist`
-plugin is a permanent condition and fails immediately instead — those need an
-operator action (release the quarantine, install the plugin) before a re-deploy will
-help. The same engine is designed to be driven headless by an automation worker later.
+while the page keeps polling — no need to delete and re-deploy; the device is
+released back to in-flight (not Failed) so a later tick reclaims and redispatches
+it, until it either reaches the agent or you close the page. A device that is
+quarantined or is missing the `content_dist` plugin is a permanent condition and
+fails immediately instead — those need an operator action (release the
+quarantine, install the plugin) before a re-deploy will help. The same engine is
+designed to be driven headless by an automation worker later.
 
 ## Permissions
 

@@ -43,7 +43,8 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
                           std::string_view phase_label, const std::vector<std::string>& claimed,
                           const yuzu::server::ConfinedDispatchOutcome& outcome,
                           const std::string& claimed_step, const std::string& revert_step,
-                          const std::string& failed_step) {
+                          const std::string& failed_step,
+                          const yuzu::server::authz::VisibleSet& exec_visible) {
     if (claimed.empty())
         return;
 
@@ -112,17 +113,55 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
                                 .error = ""});
     }
 
-    // Residual catch-all: `outcome.sent == 0` with NEITHER a named-permanent
-    // id NOR a not_sent id accounts for the batch means dispatch never
-    // reached the per-id arm walk at all -- a chokepoint denial
-    // (`dispatch_confined`'s `if (!classified) return {command_id, 0};`,
-    // e.g. the caller lost the classified permission for
-    // content_dist.stage/execute_staged between claim and dispatch) or an
-    // authorization-scope drop before the walk. `ConfinedDispatchOutcome`
-    // carries no per-id identification for this class, so — unlike
-    // not_sent — there is no way to tell which of the remainder is
+    // Gate 4 happy-path finding, PR #3939 review round 3: an id in `claimed`
+    // that its caller's OWN exec_visible set no longer admits is dropped
+    // SILENTLY by the arm walk's `authz::filter_to_scope(*targets.agent_ids,
+    // exec_visible)` (dispatch_confined_arms.hpp's Ids arm) before its loop
+    // body -- the caller's own body never learns which id, only that
+    // `outcome.sent` ends up short. Rather than infer identity from
+    // arithmetic (unsound: `sent` is a COUNT, not a set of ids, so a
+    // claimed-minus-accounted residual cannot distinguish "was sent" from
+    // "was filtered" once `sent > 0`), recompute the SAME membership test
+    // the arm walk applies, directly: `settle_claimed_batch` already
+    // receives the identical `exec_visible` the dispatch call was made
+    // under (threaded from `advance()`'s `caller`/`pipeline_caller`), so
+    // `authz::in_scope` on each `claimed` id reproduces the walk's own drop
+    // point exactly, with no widening of `ConfinedDispatchOutcome` needed.
+    // Skip, not fail or revert-to-retry: this mirrors the pre-claim
+    // `mark_skipped`/'out of scope at dispatch' treatment for a device that
+    // drops out of scope before being claimed (`advance()`'s scan above) --
+    // terminal, so it stops blocking `complete_deployment`, and honest,
+    // since a caller-visibility narrowing (an entirely ordinary
+    // least-privilege RBAC layout, not degradation or attack -- see
+    // deployment_routes.cpp / server.cpp's `derive_exec_visible` wiring) is
+    // not evidence the device itself will ever come back into scope for
+    // THIS operator.
+    std::vector<DeviceTransition> skipped;
+    for (const auto& aid : claimed) {
+        if (accounted_ids.count(aid) || yuzu::server::authz::in_scope(exec_visible, aid))
+            continue;
+        if (accounted_ids.insert(aid).second)
+            skipped.push_back({.agent_id = aid,
+                               .from_step = claimed_step,
+                               .to_step = "skipped",
+                               .error = "out of scope at dispatch"});
+    }
+
+    // Residual: NEITHER a named-permanent id, a not_sent id, NOR an
+    // exec_visible-excluded id accounts for the batch, and NOTHING else in
+    // it was reached either -- dispatch never reached the per-id arm walk
+    // at all, a chokepoint denial (`dispatch_confined`'s
+    // `if (!classified) return {command_id, 0};`, e.g. the caller lost the
+    // classified permission for content_dist.stage/execute_staged between
+    // claim and dispatch). `ConfinedDispatchOutcome` carries no per-id
+    // identification for this class, so -- unlike the accounted classes
+    // above -- there is no way to tell which of the remainder is
     // responsible; fail the whole unaccounted remainder, matching this
-    // function's original (pre-review) behaviour for exactly this case.
+    // function's original (pre-review) behaviour for exactly this case. Only
+    // reachable when `outcome.sent == 0`: once ANY device in `claimed` is
+    // sent, denied, plugin-absent, not_sent, or exec_visible-excluded, the
+    // count and the identified ids line up exactly and this is empty by
+    // construction.
     if (outcome.sent == 0 && claimed.size() > accounted_ids.size()) {
         const std::string reason = phase +
                                    " dispatch refused or reached no agents (command " +
@@ -139,6 +178,8 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
         deps.store->apply_results(deployment_id, failed);
     if (!reverted.empty())
         deps.store->apply_results(deployment_id, reverted);
+    if (!skipped.empty())
+        deps.store->apply_results(deployment_id, skipped);
 }
 
 int response_score(const StoredResponse& r) {
@@ -267,7 +308,7 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
                 stage_execution_id(deployment_id), pipeline_caller);
             settle_claimed_batch(deps, deployment_id, "stage", claimed, outcome,
                                  step_token(Step::kStaging), step_token(Step::kPending),
-                                 step_token(Step::kFailed));
+                                 step_token(Step::kFailed), pipeline_caller.exec_visible);
         }
     }
 
@@ -297,7 +338,7 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
             // EXECUTION of a command that was never actually dispatched.
             settle_claimed_batch(deps, deployment_id, "execute", claimed, outcome,
                                  step_token(Step::kExecuting), step_token(Step::kStaged),
-                                 step_token(Step::kFailed));
+                                 step_token(Step::kFailed), pipeline_caller.exec_visible);
         }
     }
 

@@ -1404,8 +1404,15 @@ TEST_CASE("instruction execute: a malformed scope expression reports reason=inva
     REQUIRE(res);
     CHECK(res->status == 400);
     auto body = nlohmann::json::parse(res->body);
-    CHECK(body["error"].get<std::string>().find("unexpected token at offset 4") !=
+    // Structured shape (Gate 4 consistency-auditor finding F1): matches this
+    // handler's own local convention (the containment_unreadable/quarantined/
+    // plugin_not_found siblings just below), not a bare string.
+    CHECK(body["error"]["code"] == 400);
+    CHECK(body["error"]["reason"] == "invalid_scope");
+    CHECK(body["error"]["retry_after_ms"].is_null());
+    CHECK(body["error"]["message"].get<std::string>().find("unexpected token at offset 4") !=
           std::string::npos);
+    CHECK(body["meta"]["api_version"] == "v1");
 }
 
 TEST_CASE("instruction execute: a fail-closed containment gate reports "

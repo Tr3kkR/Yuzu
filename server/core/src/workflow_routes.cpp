@@ -2226,10 +2226,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // first, same priority as there, since a malformed
                 // expression is a caller error, not a fleet-state fact,
                 // and 400 (not 503) since this is a client mistake, not a
-                // server-side condition.
+                // server-side condition. Body shape matches the three 503
+                // siblings immediately below (this handler's own local
+                // convention, consistency-auditor Gate 4 finding F1) rather
+                // than a bare string -- `reason` names the branch and
+                // `retry_after_ms: null` is present per rest_a4_envelope.hpp's
+                // contract that the key is ALWAYS present, never omitted.
                 res.status = 400;
                 res.set_content(
-                    nlohmann::json({{"error", "invalid scope: " + *scope_parse_error}}).dump(),
+                    nlohmann::json({{"error",
+                                     {{"code", 400},
+                                      {"message", "invalid scope: " + *scope_parse_error},
+                                      {"reason", "invalid_scope"},
+                                      {"retry_after_ms", nullptr}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
                 return;
             }

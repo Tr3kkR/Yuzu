@@ -83,10 +83,19 @@ struct Harness {
             // engine must settle the claim on ANY zero-sent outcome.
             if (gate_unreadable)
                 return {.sent = 0, .command_id = "cmd", .containment_unreadable = true};
+            // Mirrors dispatch_confined_arms.hpp's own `filter_to_scope`
+            // pre-loop drop: an id outside the caller's exec_visible set
+            // never enters the arm walk at all, so it lands in NONE of
+            // sent/quarantined/withheld/offline -- exactly like production.
             std::vector<std::string> quarantined;
             std::vector<std::string> withheld;
             std::vector<std::string> offline;
+            int out_of_scope_count = 0;
             for (const auto& a : agents) {
+                if (out_of_exec_scope_agents.count(a)) {
+                    ++out_of_scope_count;
+                    continue;
+                }
                 // Mirrors dispatch_confined_arms.hpp's own priority: a
                 // quarantined-and-plugin-absent agent reports quarantined,
                 // the stronger fact -- checked first here too, so a test
@@ -99,7 +108,7 @@ struct Harness {
                     offline.push_back(a);
             }
             const int reached = deny_dispatch ? 0
-                                              : static_cast<int>(agents.size()) -
+                                              : static_cast<int>(agents.size()) - out_of_scope_count -
                                                     static_cast<int>(quarantined.size()) -
                                                     static_cast<int>(withheld.size()) -
                                                     static_cast<int>(offline.size());
@@ -119,6 +128,7 @@ struct Harness {
     std::unordered_set<std::string> unknown_plugin_agents;
     std::unordered_set<std::string> offline_agents;
     std::unordered_set<std::string> denied_quarantined_agents;
+    std::unordered_set<std::string> out_of_exec_scope_agents;
 
     int dispatch_count(const std::string& action, const std::string& agent) const {
         int n = 0;
@@ -428,6 +438,64 @@ TEST_CASE("deployment engine reverts (not fails) a device whose send simply fail
     CHECK(h.dispatch_count("stage", "a2") == 2);   // reclaimed and redispatched
     CHECK(step_of(store, id, "a2") == "staging");
     CHECK(step_of(store, id, "a3") == "failed");   // still untouched
+}
+
+TEST_CASE("deployment engine skips (not fails, not wedges) a device dropped by "
+          "exec_visible while a sibling is reached (Gate 4 happy-path finding, PR #3939 "
+          "review round 3: an id outside the caller's Execution:Execute-visible set is "
+          "silently absent from EVERY outcome bucket -- sent, denied_quarantined, "
+          "unknown_plugin, not_sent -- because dispatch_confined_arms.hpp's Ids-arm walk "
+          "drops it via filter_to_scope before the loop ever runs; the residual catch-all "
+          "was gated on outcome.sent == 0, so it never fired once ANY other device in the "
+          "same batch was reached, reproducing the mixed-batch wedge under an entirely "
+          "ordinary least-privilege RBAC layout)",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-exec-visible-narrowed";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1"), tgt("a2")}));
+
+    Harness h{store};
+    // a2 is in the frozen go-cohort and in `authorized` (Infrastructure:Read /
+    // devices_fn) -- it gets CLAIMED -- but the caller's separate
+    // Execution:Execute-derived exec_visible set has since narrowed to admit
+    // only a1 (e.g. a management-group-scoped grant), so the dispatch
+    // chokepoint's own arm walk drops a2 silently. `out_of_exec_scope_agents`
+    // mirrors the fake dispatch_fn's own view of that same narrowing; the
+    // caller passed to `advance()` below carries the real `exec_visible` so
+    // `settle_claimed_batch`'s own `authz::in_scope` recomputation sees it.
+    h.out_of_exec_scope_agents = {"a2"};
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1", "a2"};
+    auto narrowed_caller = test_caller();
+    narrowed_caller.exec_visible = authz::VisibleSet{std::unordered_set<std::string>{"a1"}};
+
+    advance(deps, id, cfg, authorized, narrowed_caller);
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(h.dispatch_count("stage", "a2") == 1); // claimed and dispatched — just filtered inside
+    CHECK(step_of(store, id, "a1") == "staging"); // reached — in flight, unchanged
+    // a2: NOT stuck in 'staging' forever (the confirmed gap) — terminal
+    // 'skipped', same semantic as the pre-claim mark_skipped path, so
+    // complete_deployment is never permanently blocked by it.
+    CHECK(step_of(store, id, "a2") == "skipped");
+    for (const auto& d : store.get_devices(id))
+        if (d.agent_id == "a2")
+            CHECK(d.error == "out of scope at dispatch");
+
+    // Tick 2: a1's stage response lands; deployment completes despite a2's
+    // terminal 'skipped' row — it no longer blocks completion.
+    h.poll[stage_execution_id(id)] = {{"a1", {1, "status|ok\nstaged_path|/p"}}};
+    advance(deps, id, cfg, authorized, narrowed_caller); // a1 staged → executing
+    h.poll[exec_execution_id(id)] = {{"a1", {2, "status|ok\nexit_code|0"}}};
+    advance(deps, id, cfg, authorized, narrowed_caller); // a1 executing → succeeded
+    CHECK(step_of(store, id, "a1") == "succeeded");
+    CHECK(step_of(store, id, "a2") == "skipped"); // still untouched
+    CHECK(store.get_deployment(id)->status == "complete");
 }
 
 TEST_CASE("deployment engine records a non-zero installer exit as failed",

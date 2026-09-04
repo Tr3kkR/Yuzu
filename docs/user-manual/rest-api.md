@@ -1633,11 +1633,20 @@ Quarantine a device.
 >
 > `reason` is a top-level key on the error object, not part of the A4
 > `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
-> same three-`reason` split as `POST /api/command` above (`containment_unreadable`
-> / `quarantined` / `plugin_not_found`, same `retry_after_ms` values) —
-> closed alongside the architect finding that its response-building code
+> same three-`reason` `503` split as `POST /api/command` above
+> (`containment_unreadable` / `quarantined` / `plugin_not_found`, same
+> `retry_after_ms` values) — closed alongside the architect finding that its
+> response-building code
 > was reading `dispatch_outcome.command_id`/`.sent` only, discarding the
-> richer fields already available on the same struct. Its generic catch-all
+> richer fields already available on the same struct.
+>
+> **A fourth, structurally distinct condition — `invalid_scope` — is `400`,
+> not part of the `503` table above.** This route (unlike `POST
+> /api/command`) accepts a caller-supplied `scope` expression; a malformed
+> one is a client mistake, not a fleet-state fact, so it reports
+> `error.reason: "invalid_scope"` at `400` with `retry_after_ms: null`,
+> checked before the `503` cascade so a bad expression is never shadowed by
+> `containment_unreadable`. Its generic catch-all
 > (no `reason` key, matching the *(absent)* row above) additionally covers
 > ADR-1007's per-device concurrency-claim exclusion, unique to this route
 > since it — unlike `/api/command` — accepts a `concurrency_mode`: for a
