@@ -5,6 +5,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <string_view>
+#include <unordered_set>
 
 namespace yuzu::server::deployment {
 
@@ -14,6 +16,104 @@ std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+// #3424/#3511 fix round (PR #3939 review, finding 2): the ORIGINAL version of
+// this function (pre-review) only ever checked `outcome.sent == 0` for the
+// WHOLE claimed batch, which had two confirmed bugs. (1) A transient
+// `containment_unreadable` (the gate itself failing closed, typically
+// recovering within seconds) was indistinguishable from a permanent refusal
+// and settled every claimed row straight to 'failed' — unrecoverable, when
+// the correct behaviour is to retry once the gate recovers. (2) In a MIXED
+// batch — some devices reached, others withheld individually for a named
+// permanent reason (quarantined, plugin absent) — `sent > 0` skipped the
+// rollback branch entirely, so the withheld devices' rows stayed claimed in
+// 'staging'/'executing' with NO transition ever able to move them out
+// (a withheld device never gets an agent response, so the response-derived
+// transitions at the top of `advance()` never fire for it either) —
+// `complete_deployment` blocks forever on that row: an unconditional,
+// state-machine-wedging hang on an entirely ordinary path (any deploy cohort
+// with mixed device inventory).
+//
+// `revert_step` is where a CLAIMED-but-not-individually-evaluated row goes
+// back to so a LATER tick's own candidate scan reclaims it — 'pending' for
+// the stage claim, 'staged' for the exec claim — never 'failed': the gate
+// degradation says nothing about these specific devices.
+void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_id,
+                          std::string_view phase_label, const std::vector<std::string>& claimed,
+                          const yuzu::server::ConfinedDispatchOutcome& outcome,
+                          const std::string& claimed_step, const std::string& revert_step,
+                          const std::string& failed_step) {
+    if (claimed.empty())
+        return;
+
+    if (outcome.containment_unreadable) {
+        // The gate itself failed closed — nothing in `claimed` was
+        // individually evaluated against quarantine/plugin-presence, so
+        // there is no per-device fact to act on, only a systemic one. Undo
+        // the claim entirely rather than fail it: a fail-closed gate
+        // typically recovers within seconds (matching the retry_after_ms:
+        // 5000 every other zero-reach cascade in this PR already promises).
+        std::vector<DeviceTransition> revert;
+        revert.reserve(claimed.size());
+        for (const auto& aid : claimed)
+            revert.push_back({.agent_id = aid,
+                              .from_step = claimed_step,
+                              .to_step = revert_step,
+                              .error = ""});
+        deps.store->apply_results(deployment_id, revert);
+        return;
+    }
+
+    // Named ids withheld for a PERMANENT reason — settled to 'failed'
+    // regardless of `outcome.sent`, so a mixed batch's withheld devices are
+    // never left stranded just because other devices in the same batch were
+    // reached.
+    std::unordered_set<std::string> permanent_ids;
+    std::vector<DeviceTransition> failed;
+    const std::string phase(phase_label);
+    for (const auto& aid : outcome.denied_quarantined) {
+        if (permanent_ids.insert(aid).second)
+            failed.push_back({.agent_id = aid,
+                              .from_step = claimed_step,
+                              .to_step = failed_step,
+                              .error = phase + " dispatch withheld: device is quarantined"});
+    }
+    for (const auto& aid : outcome.unknown_plugin) {
+        if (permanent_ids.insert(aid).second)
+            failed.push_back(
+                {.agent_id = aid,
+                 .from_step = claimed_step,
+                 .to_step = failed_step,
+                 .error = phase + " dispatch withheld: content_dist plugin not found on "
+                                  "this device's reported inventory"});
+    }
+
+    // Existing (pre-fix) behaviour, preserved exactly: when NOTHING in the
+    // batch was sent and nothing was named-withheld either (a plain
+    // zero-reach cause — offline devices, or a residual approval-required
+    // race — `ConfinedDispatchOutcome` carries no per-id identification for
+    // this class), fail the remainder of the batch too, matching what this
+    // function always did for the `sent == 0` case. When `sent > 0` and a
+    // remainder beyond the named-permanent ids was not reached, this is the
+    // SAME pre-existing limitation (no way to tell which of the remainder
+    // failed) — those rows are left claimed, exactly as every OTHER
+    // dispatch surface in this codebase already leaves an in-flight row
+    // for the next response poll to resolve.
+    if (outcome.sent == 0 && claimed.size() > permanent_ids.size()) {
+        const std::string reason = phase +
+                                   " dispatch refused or reached no agents (command " +
+                                   outcome.command_id + ", 0 sent)";
+        for (const auto& aid : claimed) {
+            if (permanent_ids.count(aid))
+                continue;
+            failed.push_back(
+                {.agent_id = aid, .from_step = claimed_step, .to_step = failed_step, .error = reason});
+        }
+    }
+
+    if (!failed.empty())
+        deps.store->apply_results(deployment_id, failed);
 }
 
 int response_score(const StoredResponse& r) {
@@ -140,33 +240,9 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
                 "content_dist", "stage", claimed, "",
                 {{"url", cfg.url}, {"filename", cfg.filename}, {"sha256", cfg.sha256}},
                 stage_execution_id(deployment_id), pipeline_caller);
-            const auto& cmd = outcome.command_id;
-            const auto sent = outcome.sent;
-            // #3133 round-2 review MEDIUM: the claim used to be uncondition-
-            // ally left in 'staging' with the dispatch result discarded — a
-            // chokepoint-denied dispatch (caller lacks the classified
-            // permission for content_dist.stage) or a zero-reach dispatch
-            // left every claimed row stuck in an active step forever, with
-            // no dispatched command and no transition to move it. Settle
-            // them to the terminal 'failed' with an honest error instead —
-            // via the same source-step-GUARDED transitions as every other
-            // mutation here, so a row a concurrent advance already moved is
-            // untouched. NOT 'pending': that would re-claim and re-deny on
-            // every tick forever. The authorization outcome itself is
-            // unchanged — the chokepoint already refused the dispatch; this
-            // only stops the state machine wedging on the refusal.
-            if (sent == 0) {
-                std::vector<DeviceTransition> rollback;
-                rollback.reserve(claimed.size());
-                for (const auto& aid : claimed)
-                    rollback.push_back({.agent_id = aid,
-                                        .from_step = step_token(Step::kStaging),
-                                        .to_step = step_token(Step::kFailed),
-                                        .error = "stage dispatch refused or reached no agents "
-                                                 "(command " +
-                                                 cmd + ", 0 sent)"});
-                deps.store->apply_results(deployment_id, rollback);
-            }
+            settle_claimed_batch(deps, deployment_id, "stage", claimed, outcome,
+                                 step_token(Step::kStaging), step_token(Step::kPending),
+                                 step_token(Step::kFailed));
         }
     }
 
@@ -188,25 +264,15 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
             const auto outcome =
                 deps.dispatch_fn("content_dist", "execute_staged", claimed, "", params,
                                  exec_execution_id(deployment_id), pipeline_caller);
-            const auto& cmd = outcome.command_id;
-            const auto sent = outcome.sent;
-            // Same settle-on-refusal as the stage claim above. The execute-once
-            // property is PRESERVED, not weakened: claim_for_exec still claims
-            // each row exactly once, and a row settled to 'failed' here was
-            // never dispatched anywhere — there is no second execution to
-            // guard against, only a wedge to release.
-            if (sent == 0) {
-                std::vector<DeviceTransition> rollback;
-                rollback.reserve(claimed.size());
-                for (const auto& aid : claimed)
-                    rollback.push_back({.agent_id = aid,
-                                        .from_step = step_token(Step::kExecuting),
-                                        .to_step = step_token(Step::kFailed),
-                                        .error = "execute dispatch refused or reached no agents "
-                                                 "(command " +
-                                                 cmd + ", 0 sent)"});
-                deps.store->apply_results(deployment_id, rollback);
-            }
+            // The execute-once property is PRESERVED, not weakened, by
+            // settle_claimed_batch's revert path below: claim_for_exec still
+            // claims each row exactly once per call, and a revert only
+            // returns a row to 'staged' so a LATER tick's claim_for_exec can
+            // claim it again — that is a second CLAIM, not a second
+            // EXECUTION of a command that was never actually dispatched.
+            settle_claimed_batch(deps, deployment_id, "execute", claimed, outcome,
+                                 step_token(Step::kExecuting), step_token(Step::kStaged),
+                                 step_token(Step::kFailed));
         }
     }
 

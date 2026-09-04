@@ -825,8 +825,10 @@ static const ToolDef kTools[] = {
      "change. "
      "ZERO-AGENTS DISCRIMINATION (#3424/#3511): a SUCCESS envelope with agents_reached=0 also "
      "carries a status enum, not just \"no_agents_reached\" - branch on status, not message text. "
-     "\"quarantined\" and \"plugin_not_found\" are PERMANENT: retrying will not help "
-     "(retry_after_ms is null on both). \"containment_unreadable\" is a transient systemic gate "
+     "\"invalid_scope\" and \"quarantined\" and \"plugin_not_found\" are PERMANENT: retrying "
+     "the same request will not help (retry_after_ms is null on all three) - \"invalid_scope\" "
+     "means the scope expression itself could not be parsed, a caller error, not a fleet fact. "
+     "\"containment_unreadable\" is a transient systemic gate "
      "failure - retry_after_ms names the wait. \"no_agents_reached\" is the generic case (offline "
      "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
      "the offline-device case within it is retryable and a mixed cause must not be understated as "
@@ -860,14 +862,16 @@ static const ToolDef kTools[] = {
      // looser oneOf - fixed there too in this commit.
      //
      // #3424/#3511: the single "no_agents_reached" zero-agents branch is now
-     // FOUR - one per status value the handler can emit (see the priority
-     // cascade at the dispatch site). retry_after_ms is a per-branch `const`,
+     // FIVE - one per status value the handler can emit (see the priority
+     // cascade at the dispatch site; "invalid_scope" added in the PR review
+     // fix round — scope_parse_error existed on ConfinedDispatchOutcome since
+     // #881 but this schema, like the handler, never surfaced it). retry_after_ms is a per-branch `const`,
      // matching the exact literal the handler emits for that status - 5000 for
      // the TWO retryable branches (containment_unreadable's systemic
      // degradation, and no_agents_reached's own catch-all, which mixes a
      // possible permanent approval-denial race with a possible genuinely
      // offline device and so must not claim `null`/not-retryable either),
-     // null for the two permanent branches (quarantined,
+     // null for the three permanent branches (invalid_scope, quarantined,
      // plugin_not_found) - not a generic integer, so a client
      // schema-validating the response catches drift between this contract and
      // the handler the same way `agents_reached`'s own const already does.
@@ -876,6 +880,7 @@ static const ToolDef kTools[] = {
      // mixed failure never has to infer a count from which branch matched.
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"invalid_scope"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
@@ -9035,7 +9040,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     std::string zero_status;
                     std::string zero_message;
                     std::string zero_retry_after_ms_json = "null";
-                    if (dispatch_outcome.containment_unreadable) {
+                    if (dispatch_outcome.scope_parse_error) {
+                        // #3424/#3511 fix-round (PR review): this field has
+                        // existed since #881/dispatch_scope_ladder.hpp, set by
+                        // wire_and_dispatch_confined for a malformed Scope-arm
+                        // expression, but this cascade never read it — a bad
+                        // scope silently fell into the generic
+                        // `no_agents_reached` catch-all and was reported as
+                        // retryable, when it is a caller input error that will
+                        // never succeed unchanged. Checked FIRST: it is a
+                        // request-shape defect, not a fact about fleet state,
+                        // so it must not be shadowed by containment_unreadable
+                        // even though both are theoretically possible together
+                        // (a bad expression is never evaluated against the
+                        // registry, so it cannot be).
+                        zero_status = "invalid_scope";
+                        zero_message = "No agents reached: the scope expression could not be "
+                                       "parsed (" +
+                                       *dispatch_outcome.scope_parse_error +
+                                       "). This is a caller error, not a fleet-state fact — "
+                                       "retrying the same scope will not help; fix the "
+                                       "expression and resubmit.";
+                        zero_retry_after_ms_json = "null";
+                    } else if (dispatch_outcome.containment_unreadable) {
                         zero_status = "containment_unreadable";
                         zero_message =
                             "No agents reached: the quarantine containment gate's state is "

@@ -7010,6 +7010,44 @@ TEST_CASE("MCP execute_instruction: a fail-closed containment gate reports statu
     CHECK(ts.audit_details.back().find("containment_unreadable") != std::string::npos);
 }
 
+TEST_CASE("MCP execute_instruction: a malformed scope expression reports status="
+          "invalid_scope, non-retryable, checked BEFORE containment_unreadable "
+          "(PR #3939 review, finding 5 -- scope_parse_error existed on "
+          "ConfinedDispatchOutcome since #881 but this cascade never read it)",
+          "[mcp][integration][execute][3424][3511]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        // A malformed scope AND a degraded gate would be mutually exclusive
+        // in production (a bad expression is never evaluated against the
+        // registry), but setting both here proves the priority ordering:
+        // invalid_scope must win, since it is a caller error the gate's
+        // state cannot change.
+        return {.sent = 0,
+               .scope_parse_error = "unexpected token at offset 4",
+               .command_id = "cmd-badscope",
+               .containment_unreadable = true};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3511,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","scope":"tag:(("}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "invalid_scope");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc["retry_after_ms"].is_null());
+    auto text_str = sc["message"].get<std::string>();
+    CHECK(text_str.find("unexpected token at offset 4") != std::string::npos);
+    CHECK(text_str.find("caller error") != std::string::npos);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("invalid_scope") != std::string::npos);
+}
+
 TEST_CASE("MCP execute_instruction: a plugin absent from every target's inventory reports "
           "status=plugin_not_found, non-retryable",
           "[mcp][integration][execute][3424][3511]") {
@@ -7043,11 +7081,12 @@ TEST_CASE("MCP execute_instruction: a plugin absent from every target's inventor
 TEST_CASE("MCP execute_instruction: a MIXED outcome (quarantined AND plugin-absent targets) "
           "reports the higher-priority status but carries BOTH counts",
           "[mcp][integration][execute][3424][3511]") {
-    // Priority cascade pinned: containment_unreadable > quarantined >
-    // plugin_not_found > no_agents_reached (server.cpp's execute_instruction
-    // handler). A mixed failure must never understate a permanent reason as
-    // the weaker/generic one, and the response body must still let the
-    // caller see BOTH counts even though only one drives `status`.
+    // Priority cascade pinned: invalid_scope > containment_unreadable >
+    // quarantined > plugin_not_found > no_agents_reached (mcp_server.cpp's
+    // execute_instruction handler). A mixed failure must never understate a
+    // permanent reason as the weaker/generic one, and the response body must
+    // still let the caller see BOTH counts even though only one drives
+    // `status`.
     McpTestServer ts;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,

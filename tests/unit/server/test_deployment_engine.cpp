@@ -81,13 +81,26 @@ struct Harness {
             // before classification), so a denied and a zero-reach dispatch
             // are indistinguishable to the engine — which is exactly why the
             // engine must settle the claim on ANY zero-sent outcome.
-            return {.sent = deny_dispatch ? 0 : static_cast<int>(agents.size()),
-                   .command_id = "cmd"};
+            if (gate_unreadable)
+                return {.sent = 0, .command_id = "cmd", .containment_unreadable = true};
+            std::vector<std::string> withheld;
+            for (const auto& a : agents)
+                if (unknown_plugin_agents.count(a))
+                    withheld.push_back(a);
+            const int reached =
+                deny_dispatch ? 0
+                              : static_cast<int>(agents.size()) - static_cast<int>(withheld.size());
+            return {.sent = reached,
+                   .command_id = "cmd",
+                   .unknown_plugin = withheld,
+                   .unknown_plugin_count = withheld.size()};
         };
         return d;
     }
 
     bool deny_dispatch{false};
+    bool gate_unreadable{false};
+    std::unordered_set<std::string> unknown_plugin_agents;
 
     int dispatch_count(const std::string& action, const std::string& agent) const {
         int n = 0;
@@ -244,6 +257,83 @@ TEST_CASE("deployment engine settles a claim to failed when the dispatch is refu
     auto dep = store.get_deployment(id);
     REQUIRE(dep);
     CHECK(dep->failed == 2);
+}
+
+TEST_CASE("deployment engine retries after a transient containment-gate failure instead of "
+          "permanently failing the claim (PR #3939 review, finding 2a)",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-gate-unreadable";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1")}));
+
+    Harness h{store};
+    h.gate_unreadable = true;
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1"};
+
+    // Tick 1: the device is claimed into 'staging', the gate itself is
+    // unreadable — a systemic, typically-transient condition, not a fact
+    // about this device — so the claim must be UNDONE (back to 'pending'),
+    // never settled to a permanent 'failed'.
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(step_of(store, id, "a1") == "pending");
+
+    // Tick 2: the gate recovers — the device is reclaimed (a SECOND stage
+    // dispatch, since the first was never actually delivered) and this
+    // time reaches the agent.
+    h.gate_unreadable = false;
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 2);
+    CHECK(step_of(store, id, "a1") == "staging");
+}
+
+TEST_CASE("deployment engine fails only the plugin-absent device in a mixed batch, leaving "
+          "the reached device in flight (PR #3939 review, finding 2b — was an unconditional "
+          "hang: sent>0 skipped rollback entirely, so the withheld row never left 'staging')",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-mixed-plugin-absent";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1"), tgt("a2")}));
+
+    Harness h{store};
+    h.unknown_plugin_agents = {"a2"}; // a1 reaches; a2 is withheld, individually
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1", "a2"};
+
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    // a2 was NAMED withheld — settled straight to 'failed', not stuck.
+    CHECK(step_of(store, id, "a2") == "failed");
+    for (const auto& d : store.get_devices(id))
+        if (d.agent_id == "a2")
+            CHECK(d.error.find("plugin not found") != std::string::npos);
+    // a1 was actually reached (part of `outcome.sent`) — stays claimed,
+    // awaiting its real response, exactly like any other in-flight device.
+    CHECK(step_of(store, id, "a1") == "staging");
+
+    // A repeated advance() must not re-claim or re-dispatch a1 (still
+    // in-flight, unresolved) or re-touch a2 (already terminal) — and the
+    // deployment does NOT complete while a1 remains in 'staging', which is
+    // exactly the wedge this fix closes for the WITHHELD row, without
+    // fabricating a resolution for the genuinely in-flight one.
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    auto dep = store.get_deployment(id);
+    REQUIRE(dep);
+    CHECK(dep->status == "running");
 }
 
 TEST_CASE("deployment engine records a non-zero installer exit as failed",

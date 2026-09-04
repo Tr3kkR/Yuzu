@@ -11244,8 +11244,8 @@ private:
                                                    caller.principal_role, command_id,
                                                    std::move(outcome.denied_quarantined));
         }
-        note_unknown_plugin_dispatch("dispatch_closure", command_id, plugin,
-                                     outcome.unknown_plugin_count);
+        audit_unknown_plugin_dispatch("dispatch_closure", caller.principal, caller.principal_role,
+                                      command_id, plugin, outcome.unknown_plugin_count);
 
         forward_gateway_pending();
         if (outcome.sent > 0)
@@ -11808,18 +11808,24 @@ private:
                           command_id, denied_count);
     }
 
-    // #3511: the plugin-presence sibling of the quarantine emitters above —
-    // deliberately much lighter. Quarantine is a POLICY decision (an operator
-    // or an incident response contained this device) and gets a durable audit
-    // row; plugin absence is an INVENTORY fact (this device never reported
-    // having the plugin) and does not — there is no decision here for an
-    // auditor to review, only an operational condition worth a metric and a
-    // log line so it is not silent. One call site's worth of ids only (no
-    // per-device cap/elision machinery): the caller already holds the exact
-    // count, and this never writes to the audit store, so there is no N-row
-    // cost to bound.
-    void note_unknown_plugin_dispatch(std::string_view route, const std::string& command_id,
-                                      const std::string& plugin, std::size_t count) {
+    // #3511: the plugin-presence sibling of the quarantine emitters above.
+    // CORRECTED (PR #3939 review): this used to be metric+log only, on the
+    // claimed grounds that plugin absence is an INVENTORY fact rather than a
+    // POLICY decision, so there was "nothing for an auditor to review." That
+    // reasoning does not survive contact with `docs/observability-conventions.md`'s
+    // MUST clause ("Denied operations MUST emit an audit event — spdlog::warn
+    // alone breaks the SOC 2 CC7.2 evidence chain") — a command an operator or
+    // agentic caller asked for was NOT delivered, which is exactly what that
+    // clause exists to make durable, independent of whether a human "decided"
+    // it. Mirrors `audit_quarantine_dispatch_fail_closed`'s shape exactly: ONE
+    // aggregate row per dispatch (`target_id="*"`), not one per withheld id —
+    // this is a single withholding decision applied to a batch, the same
+    // shape as a fail-closed gate denial, not a per-device fact worth its own
+    // row the way a specific quarantine denial is.
+    void audit_unknown_plugin_dispatch(std::string_view route, const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& plugin,
+                                       std::size_t count) {
         if (count == 0)
             return;
         metrics_
@@ -11830,6 +11836,22 @@ private:
         spdlog::warn(
             "dispatch withheld: route={} command={} plugin={} reason=unknown_plugin agents={}",
             route, command_id, plugin, count);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "command.dispatch_withheld";
+        ev.target_type = "Command";
+        ev.target_id = "*";
+        ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
+                    " reason=plugin_not_found agents=" + std::to_string(count);
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
+                          "agents={})",
+                          command_id, plugin, count);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a
@@ -15482,7 +15504,8 @@ private:
                                                        caller.principal_role, command_id,
                                                        std::move(denied_quarantined));
             }
-            note_unknown_plugin_dispatch("command", command_id, plugin, unknown_plugin_count);
+            audit_unknown_plugin_dispatch("command", caller.principal, caller.principal_role,
+                                          command_id, plugin, unknown_plugin_count);
 
             // Forward commands queued for gateway agents
             forward_gateway_pending();
@@ -22982,7 +23005,8 @@ private:
                                                    caller.principal_role, command_id,
                                                    std::move(result.denied_quarantined));
         }
-        note_unknown_plugin_dispatch("legacy", command_id, plugin, result.unknown_plugin_count);
+        audit_unknown_plugin_dispatch("legacy", caller.principal, caller.principal_role,
+                                      command_id, plugin, result.unknown_plugin_count);
 
         if (sent == 0) {
             // Same four-way split as /api/command above — see the comment
