@@ -46,14 +46,47 @@ std::string read_file(const fs::path& p) {
     return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
+/// Hex SHA-256 of `data`, or "" if OpenSSL fails.
+///
+/// DELIBERATELY ASSERTION-FREE, and this is load-bearing — it must stay that
+/// way. This runs on a gRPC HANDLER THREAD: FakeUpdateService::CheckForUpdate
+/// below calls it while the main test thread is running its own assertions.
+/// Catch2's REQUIRE/CHECK macros are NOT thread-safe — they mutate the run
+/// context's assertion counters and its expression-capture state with no
+/// synchronisation — so an assertion evaluated off the main thread corrupts
+/// that state and the process dies at whatever unrelated assertion the main
+/// thread reaches next.
+///
+/// That is not hypothetical: four REQUIREs lived here, and the Windows MSVC
+/// debug leg died with SIGSEGV (0xc0000005) three runs running, at three
+/// different sites (`Harness::start`'s REQUIRE, then read_file's REQUIRE
+/// twice) after 305, 34 and 694 cases respectively — the moving site and
+/// wildly varying case count being the race, not a deterministic fault. Every
+/// one of those reports carried Catch2's `{Unknown expression after the
+/// reported line}`, i.e. Catch2 could no longer reconstruct its own captured
+/// expression, which is the tell that its state — not the test's memory — was
+/// what got clobbered. The three sibling gRPC harness files
+/// (`server/test_ota_{download_bound,identity_mtls,stalled_write}.cpp`) run
+/// the same server-per-TEST_CASE pattern with ZERO macros in their handlers
+/// and have never crashed; this file was the only one in the whole test tree
+/// reaching a Catch2 macro from a handler thread.
+///
+/// An OpenSSL failure here returns "" rather than asserting. Nothing is
+/// silently swallowed: the empty hash cannot match the payload, so the agent
+/// refuses the update and the test fails on the MAIN thread with its own
+/// assertion.
 std::string sha256_hex_of(const std::string& data) {
     unsigned char md[EVP_MAX_MD_SIZE];
     unsigned int len = 0;
     ssl_ptr<EVP_MD_CTX> ctx{EVP_MD_CTX_new()};
-    REQUIRE(ctx);
-    REQUIRE(EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) == 1);
-    REQUIRE(EVP_DigestUpdate(ctx.get(), data.data(), data.size()) == 1);
-    REQUIRE(EVP_DigestFinal_ex(ctx.get(), md, &len) == 1);
+    if (!ctx)
+        return {};
+    if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1)
+        return {};
+    if (EVP_DigestUpdate(ctx.get(), data.data(), data.size()) != 1)
+        return {};
+    if (EVP_DigestFinal_ex(ctx.get(), md, &len) != 1)
+        return {};
     std::string hex;
     static const char* k = "0123456789abcdef";
     for (unsigned i = 0; i < len; ++i) {
@@ -64,6 +97,13 @@ std::string sha256_hex_of(const std::string& data) {
 }
 
 /// Serves one fixed payload, with a signature the test chooses.
+///
+/// NO CATCH2 MACRO MAY BE REACHED FROM THESE HANDLERS, directly or through a
+/// helper they call. They execute on gRPC handler threads while the main test
+/// thread is asserting, and Catch2's assertion state is not synchronised — see
+/// the note on sha256_hex_of above for the crash this caused. Validate on the
+/// main thread instead: return a wrong/empty value from the handler and assert
+/// on the observed outcome in the TEST_CASE body.
 class FakeUpdateService final : public pb::AgentService::Service {
   public:
     std::string payload;
@@ -129,21 +169,16 @@ struct Harness {
 
 /// ONE gRPC server for every TEST_CASE in this file, not one per case.
 ///
-/// This file used to build and tear down a real in-process gRPC server 7
-/// times sequentially. That repeated create/destroy churn — not a Shutdown/
-/// Wait ordering bug — is what crashed the Windows MSVC debug leg: a fix that
-/// made teardown provably correct (drop the channel, Shutdown(deadline),
-/// Wait(), then destroy the server while its service outlives it) shipped
-/// and the identical SIGSEGV at the SECOND harness's startup recurred
-/// unchanged on the next CI run, which rules out a teardown-ordering bug in
-/// THIS file's own code as the trigger. The other pre-existing gRPC harness
-/// files in this suite (`test_ota_download_bound.cpp`,
-/// `test_ota_identity_mtls.cpp`, `test_ota_stalled_write.cpp`) run many
-/// sequential TEST_CASEs without a reported crash, so the safe, structural
-/// fix is the one they don't need: never repeat the cycle at all. One server
-/// stood up on first use and torn down once, at process exit via this
-/// function-local static's destructor, removes the repeated-churn trigger by
-/// construction regardless of its exact mechanism.
+/// This is a cost reduction, NOT the fix for the Windows SIGSEGV — that was
+/// the cross-thread Catch2 assertion documented on sha256_hex_of above, and
+/// two successive attempts to explain the crash by this harness's lifecycle
+/// (first a Shutdown/Wait teardown-ordering theory, then repeated
+/// create/destroy churn) were both shipped and both disproven by the crash
+/// recurring unchanged. Recording that here so the next reader does not
+/// re-derive either dead end: the harness lifecycle was never the defect.
+///
+/// Kept because it is simply cheaper — one server bound, and one torn down at
+/// process exit via this function-local static, instead of seven of each.
 ///
 /// Safe to share: every TEST_CASE below already sets `svc.payload` and
 /// `svc.signature` explicitly before issuing its RPC (the two SECTIONs that
