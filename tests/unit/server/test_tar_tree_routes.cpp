@@ -114,12 +114,12 @@ struct TarHarness {
                                const std::string&,
                                const std::unordered_map<std::string, std::string>& params,
                                const DispatchCaller& caller)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             last_dispatch_caller = caller;
             const auto it = params.find("sql");
             const bool is_proc =
                 it != params.end() && it->second.find("$Process_Live") != std::string::npos;
-            return {is_proc ? kProcCmd : kTcpCmd, 1};
+            return {.sent = 1, .command_id = is_proc ? kProcCmd : kTcpCmd};
         };
         // #3133 review fix: mirrors the production idiom (resolve the session,
         // derive a real caller) closely enough for this harness's simplified

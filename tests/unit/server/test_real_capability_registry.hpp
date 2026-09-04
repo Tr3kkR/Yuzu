@@ -26,6 +26,7 @@
 #include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
+#include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "command_capability.hpp"
 
@@ -44,6 +45,7 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
+        capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     };

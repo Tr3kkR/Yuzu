@@ -90,15 +90,23 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
      next to the existing entries, matching `webhook_secret_codec_`'s. `RuntimeConfigStore`'s
      initial migration missed this; only an external adversarial review caught it (PR #3632).
    - **If your store retains a legacy SQLite file post-migration (backfilled OR warn-only),
-     force it — and any `-wal`/`-shm` sidecar — to 0600 (POSIX-only) BEFORE the first open,
-     every time you touch it, not just once.** ADR-0010 §Consequences (a): a file you're about
-     to read that may hold a plaintext secret column needs this regardless of whether you then
-     backfill from it or only detect-and-warn over it. An unclean pre-migration shutdown under
-     `journal_mode=WAL` can leave the pre-checkpoint plaintext sitting in a sidecar the main
-     file's own hardening never touches. Copy `webhook_store.cpp`'s
-     `migrate_from_sqlite_impl` block (or, for a warn-only store, `runtime_config_store.cpp`'s
-     `warn_if_legacy_data_present`) verbatim in shape. `RuntimeConfigStore`'s initial migration
-     missed the warn-only variant of this; same PR #3632 catch.
+     force it — and any `-wal`/`-shm`/`-journal` sidecar — to 0600 (POSIX-only) BEFORE the
+     first open, every time you touch it, not just once.** ADR-0010 §Consequences (a): a file
+     you're about to read that may hold a plaintext secret column needs this regardless of
+     whether you then backfill from it or only detect-and-warn over it. An unclean pre-migration
+     shutdown can leave pre-checkpoint plaintext sitting in a sidecar the main file's own
+     hardening never touches — `-wal`/`-shm` under `journal_mode=WAL`, `-journal` under the
+     rollback-journal default. **Call `legacy_sqlite_probe::harden_legacy_file_0600` (this
+     header, above) — do not hand-roll this.** `webhook_store.cpp`'s own inline
+     `migrate_from_sqlite_impl` block this helper was originally extracted from (PR #3563) no
+     longer exists — it was retired along with the rest of that function (#3623) — so
+     `harden_legacy_file_0600` is the ONLY current reference implementation, not a copy target
+     alongside it. For a warn-only store with no secret material, `runtime_config_store.cpp`'s
+     `warn_if_legacy_data_present` remains a valid model for the detection half only; its own
+     0600-hardening block is NOT yet consolidated onto the shared helper (tracked: #3959) and
+     should not be copied for NEW code — call `harden_legacy_file_0600` instead.
+     `RuntimeConfigStore`'s initial migration missed the warn-only variant of this; same PR
+     #3632 catch.
    - **Never sanitize a secret value before encrypting it.** `sanitize_pg_text()` (or any
      TEXT-column sanitizer) exists to make free-text safe for a PostgreSQL TEXT column; your
      secret's ciphertext column is BYTEA, so there is no storage reason to touch the plaintext's
@@ -260,13 +268,18 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   whether the legacy file exists and is non-empty, and if so `spdlog::warn` a row/key count
   before proceeding fresh-started, so an environment where the "no production fleet" premise
   turns out to be locally wrong gets a loud signal instead of the silent loss `ResponseStore`'s
-  actual (undetected) behavior would otherwise reproduce for stateful config. **For a store with
-  no secret columns, prefer the shared `legacy_sqlite_probe::warn_if_legacy_rows`
+  actual (undetected) behavior would otherwise reproduce for stateful config. **Prefer the
+  shared `legacy_sqlite_probe::warn_if_legacy_rows`
   (`server/core/src/legacy_sqlite_probe.hpp`, introduced by ADR-0061) over hand-rolling this
   check** — it generalizes `RuntimeConfigStore::warn_if_legacy_data_present`'s single-table logic
-  to an arbitrary table list; a secret-bearing store still needs the 0600/sidecar hardening this
-  shared helper deliberately omits (see its own header comment) and should follow
-  `RuntimeConfigStore`'s hand-rolled variant instead. This default
+  to an arbitrary table list. **A secret-bearing store additionally calls the same header's
+  `harden_legacy_file_0600` FIRST** (0600 on the legacy file plus its `-wal`/`-shm`/`-journal` sidecars, via
+  a single `open()`+`fstat()`+`fchmod()` on one fd — no path re-resolution between check and
+  chmod, closing a symlink-TOCTOU gap two adversarial-review rounds found in an earlier revision;
+  #3623/WebhookStore is the first consumer). Do NOT model a new secret-bearing store's hardening
+  on `RuntimeConfigStore`'s own hand-rolled block any more — it still chmods by re-resolved
+  *path* (`std::filesystem::permissions()`), which carries that same unfixed TOCTOU shape
+  (tracked separately; not yet ported onto the shared helper). This default
   holds only while "no production fleet" stays true — if a real external deployment exists or
   is committed to before your store migrates, re-derive whether backfill is actually needed for
   THIS store in its own per-store ADR; don't cite this bullet as blanket cover once the premise
@@ -305,21 +318,27 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   (`AuditStore` does this by fingerprint: a durable hash-shaped value written in the SAME
   transaction as the completion marker, re-derived from the file and compared at every later
   boot that still finds it) and refuse to serve on a mismatch, rather than silently reporting
-  success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` share the
+  success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` shared the
   first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
-  holder-side check to them is tracked, not yet done. `RbacStore` independently discovered and
+  holder-side check to them was tracked but is now moot — both stores' `migrate_from_sqlite()`
+  has since been retired entirely (`ResultSetStore` in #3898, `ManagementGroupStore` in #3623),
+  so there is no backfill left to port the check into. `RbacStore` independently discovered and
   fixed the identical shape (#2703, git-blamed to its original migration commit, not caught by
   that migration's own governance pass or two rounds of external review — only surfaced by a
-  wider-scope adversarial review) — it is now a SECOND reference implementation, right-sized for
-  a small, non-resumable, single-transaction legacy dataset rather than `AuditStore`'s larger
-  resumable-streaming one. **Trap a future port hits if it works from this paragraph's prose
-  instead of the actual code:** `AuditStore::stamp_complete` has two exemptions this description
-  doesn't spell out and `RbacStore`'s own first port missed both — (1) a **sourceless** writer
-  losing the trust-anchor race is NOT an error (it has no evidence worth protecting, so whichever
-  writer's `"sourceless"` value won is fine); (2) a **real** writer's content that fingerprints as
-  having nothing to protect (an empty/schema-less local file) should trust the marker rather than
-  refuse. Port the REFERENCE CODE (`audit_store.cpp`'s `stamp_complete`, or `rbac_store.cpp`'s
-  post-#2703 version) and diff your port against it line by line — not this summary.
+  wider-scope adversarial review), right-sized for a small, non-resumable, single-transaction
+  legacy dataset rather than `AuditStore`'s larger resumable-streaming one — but `RbacStore`'s
+  own `migrate_from_sqlite()` has since been retired (#3623), so that implementation is no
+  longer live code; find it via `git log`/the PR history if you need the worked example, but do
+  not expect to find it in `rbac_store.cpp` today. **Trap a future port hits if it works from
+  this paragraph's prose instead of the actual code:** `AuditStore::stamp_complete` (the sole
+  remaining live reference implementation — see ADR-0009's Update for why `AuditStore` is the
+  one store that keeps its backfill permanently) has two exemptions this description doesn't
+  spell out, and `RbacStore`'s own first port missed both when it was live — (1) a
+  **sourceless** writer losing the trust-anchor race is NOT an error (it has no evidence worth
+  protecting, so whichever writer's `"sourceless"` value won is fine); (2) a **real** writer's
+  content that fingerprints as having nothing to protect (an empty/schema-less local file)
+  should trust the marker rather than refuse. Port the REFERENCE CODE (`audit_store.cpp`'s
+  `stamp_complete`) and diff your port against it line by line — not this summary.
 - **Long-lived migration branches accumulate test-file drift against the pre-migration API —
   budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
   store via its old constructor fails to compile once the branch merges current `origin/dev` —

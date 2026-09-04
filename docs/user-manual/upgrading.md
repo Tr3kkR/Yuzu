@@ -10,7 +10,7 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 | 0.5.x | 0.5.0 | 0.5.0 | Compiler hardening flags (`-fstack-protector-strong`, `_FORTIFY_SOURCE=2`, full RELRO), config file permission enforcement (`0600` on Unix), SRI integrity attributes on CDN scripts, configurable trigger limit (default 2000), git-derived version strings, chargen instruction definitions. |
 | 0.6.x – 0.9.x | same as 0.5.x | same as 0.5.x | No on-disk format changes from 0.5.x; upgrade directly to 0.10.x. |
 | 0.10.x | 0.10.0 | 0.10.0 | Server-side schema migration runner wired into every SQLite store. Upgrading from 0.9.x or earlier is data-preserving: the first 0.10.x startup stamps each database at schema v1 and runs a one-time legacy compatibility shim for stores that historically added columns via silent `ALTER TABLE` (`api_token_store`, `instruction_store`, `patch_manager`, `policy_store`, `product_pack_store`, `response_store`). Failed migrations close the affected store's DB handle and are reported via `/readyz` with the failed store name — **check `/readyz`, not `/livez`, to confirm upgrade success**. |
-| 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the (keyword-scoped) sync populates. No config change required to benefit. **OIDC JWT signature verification now enforced on the Windows server (#1856/#1782, CRITICAL).** A Windows *server* build previously **skipped OIDC `id_token` signature verification entirely** — accepting forged RS256/384/512 tokens (session minting / account takeover). It now verifies on every platform via the same OpenSSL path. **Operator-visible only if you run a Windows server with OIDC SSO:** verification now genuinely depends on the IdP's JWKS being reachable, so a misconfigured or unreachable `jwks_uri` that the old Windows build *silently tolerated* (by accepting everything) will now cause **all OIDC logins to fail closed**. **Before upgrading a Windows + OIDC deployment**, confirm the server can reach the IdP `jwks_uri` and that system clock skew is within tolerance; if OIDC logins start failing fleet-wide post-upgrade, check JWKS reachability first. Local-password and API-token auth are unaffected; Linux/macOS servers already verified and are unchanged. |
+| 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the (keyword-scoped) sync populates. No config change required to benefit. **OIDC JWT signature verification now enforced on the Windows server (#1856/#1782, CRITICAL).** A Windows *server* build previously **skipped OIDC `id_token` signature verification entirely** — accepting forged RS256/384/512 tokens (session minting / account takeover). It now verifies on every platform via the same OpenSSL path. **Operator-visible only if you run a Windows server with OIDC SSO:** verification now genuinely depends on the IdP's JWKS being reachable, so a misconfigured or unreachable `jwks_uri` that the old Windows build *silently tolerated* (by accepting everything) will now cause **all OIDC logins to fail closed**. **Before upgrading a Windows + OIDC deployment**, confirm the server can reach the IdP `jwks_uri` and that system clock skew is within tolerance; if OIDC logins start failing fleet-wide post-upgrade, check JWKS reachability first. Local-password and API-token auth are unaffected; Linux/macOS servers already verified and are unchanged. **MCP `execute_instruction`'s zero-agents-reached response schema gained three new fields and a widened `status` enum (#3424/#3511).** The published `outputSchema`'s `oneOf` grew from 2 branches to 5: the success branch is unchanged, but the single `{status:"no_agents_reached", ...}` zero-reach branch is now four mutually-exclusive branches — `no_agents_reached` (same trigger condition, but now REQUIRES `retry_after_ms` where it was previously absent/unspecified), plus new `quarantined`, `containment_unreadable`, and `plugin_not_found` — each REQUIRING three new fields that were not previously present: `retry_after_ms` (a per-branch `const` — `5000` for the two retryable branches `containment_unreadable` and `no_agents_reached`, `null` for the two permanent branches `quarantined` and `plugin_not_found`), `agents_quarantined`, and `agents_unknown_plugin` (integer counts, present on every zero-reach branch regardless of which status matched). **Strict-validating consumers pinned to the old 2-branch `oneOf` or the old `no_agents_reached`-only zero-reach shape will reject a response using one of the three new statuses, or reject the new required fields on the shape they already recognized.** Relax any pinned `oneOf`/`const` validation to accept the widened schema (`GET /mcp/v1/` `tools/list` always reflects the current, authoritative shape) before upgrading an agentic client with strict response validation. A client that only branches on `status == "no_agents_reached"` string-equality (rather than treating an unrecognized status as "some non-retryable or retryable failure, check `message`") should add explicit handling for the three new values — see `docs/user-manual/mcp.md`'s `execute_instruction` row for the full semantics and retry guidance. **Alert-rule change (action may be required if you maintain a fork).** `YuzuDispatchTargetRejected`'s exclusion widens from `reason!="quarantined"` alone to `reason!~"quarantined\|unknown_plugin"` — same reasoning as the #881 exclusion above: a misconfigured automation retrying against an absent plugin is a caller mistake, not a fleet outage, and without the exclusion it clears the alert's `>3/15m` threshold on its own. If you maintain a fork of `docs/prometheus/yuzu-alerts.yml`, apply the same widened exclusion (`!~`, not `=~` — the fork's rule excludes both reasons, it does not match only them). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain read has ALSO moved off its governed-shell path in this same release (#3406): it now runs as a pre-split argv through the bounded runner, with the console user's home directory resolved in-process instead of by the shell. Output shape is unchanged. **One operator-visible correction:** when the console user cannot be determined — most often a slow or unreachable directory service on a domain-joined Mac — `certificates.list`/`details` with `store=login` or `all` now return an explicit `not_available|<reason>` row and mark the result PARTIAL. Previously that case silently dropped the login keychain and the list read as complete, and `details` could answer a confident `not_found` for a certificate it had never looked for. Expect to SEE partial results where output previously looked clean on such hosts; that is the bug being fixed, not a regression. No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **Fleet visualization three-tier layout + talking sockets + curved tube wires (PR 12).** `/viz/fleet` no longer renders machines on a single flat grid. Cubes now stack into three architectural tiers: frontend on the top Y plane, applications in the middle, databases on the bottom. Classification is heuristic — `classifyTier` reads listener-port hints (DB/web port sets) and process category, priority `db > web > app`. **Behavioural break for automation consumers:** if you scripted SIEM rules or dashboards that filter by "where a cube falls in the canvas", expect tier reassignments after upgrade. The wire change is *additive* — `schema_minor` bumps `3 → 4` with a new optional `local_addr` field on `ListenerSocket` carrying the kernel-reported bind address (server-side bounded at 64 bytes per field). Strict-validating consumers pinned to `schema_minor == 3` should relax their validator to `minimum: 3`. **Loopback-only listeners (`127.x`, `::1`, `[::1]`, `::ffff:127.x`) no longer appear on cube surfaces** — they're not reachable from other instances. **New talking-socket primitive:** each cube grows a ring of cool-blue dots on its BOTTOM face, one per unique outbound `(proto, dst_ip, dst_port)`; hover surfaces `talking: tcp → ip:port`. **Wire geometry changed:** cross-machine connections render as `THREE.TubeGeometry` along a `CubicBezierCurve3` with vertical end-tangents instead of 1px `THREE.Line` — wires drop straight down out of the source cube floor, run mostly-straight through space, and dock straight up into the destination's listener sphere. Screen-scrapers that parsed wire colour or geometry need updating. **Origin RGB `AxesHelper` removed** from the empty-scene scaffold — the three tier planes replace it as the orientation cue. **Default camera reframed** to `(45, 60, 45)` looking at the middle tier (was `(35, 30, 35)` looking at origin); bookmarked URLs will land on the new framing. Bundle size ~70 → ~84 KB. **Known limitation:** databases on non-standard ports (Postgres on 5431, etc.) misclassify as `app` tier unless their process is identified as `database` by the agent's process classifier. **Rolling-upgrade behaviour:** during a staged agent rollout, agents on a build older than the `tar.fleet_snapshot` action have no topology to push and appear in `/viz/fleet` as dimmed `stale` cubes until their agent is upgraded — this is expected, not a regression (previously such agents vanished from the visualization entirely once any agent pushed). **Kill-switch change:** `--viz-disable` now also `503`s the `/viz/fleet` and `/viz/host/<id>` page shells, not just the REST endpoints — an operator who sets the flag no longer sees a half-working page; it also writes a `server.viz_disabled` audit event at boot. **Governance Gate 7 hardening (no operator action required):** parser field caps on all agent-controlled strings, an IP-claim reclaim window so a crashed agent no longer strands its IPs forever, CAP-1 eviction keyed on the server clock, per-entry isolation in gateway `BatchHeartbeat` ingest, and a fix for a registration-replay storm under upstream flapping. **Scope-walking YAML `fromResultSet:` DSL (PR-E).** Policies whose `spec.scope:` used a `selector:` mapping block previously stored an empty scope (matched all devices — the selector was silently ignored). Existing rows are not migrated, but **re-creating or re-importing** such a policy after upgrade applies the selector as a real predicate and may narrow targeting — review the intended scope before re-import. Inline flow-mapping scope (`scope: {fromResultSet: x}`) is now rejected; use the block form. Result-set aliases referenced from `fromResultSet:` must be drawn from the `[A-Za-z0-9_.:*-]` charset (no spaces/quotes). **Inventory freshness gauge now server-clock-stamped (#1685).** `yuzu_inventory_stale_agents` keys on the server's receipt time, not the agent-supplied `collected_at`. A one-time migration (v3) at first 0.15.x startup clamps any `inventory_state` row whose `last_seen`/`first_seen` was stamped from a future-skewed agent clock back down to now. **Operator-visible:** if any agents had future-skewed clocks, the gauge may show a one-time *increase* post-upgrade as previously-hidden endpoints re-enter the staleness window with a fresh ~48h grace — genuinely active agents fall back out within two daily sync cycles; this is the intended security correction, not an incident. No operator action required (the `YuzuInventoryStaleAgents` alert ships disabled). **Rollback note:** downgrading the server below 0.15.x after v3 has run is data-safe (schema unchanged) but new inventory syncs revert to stamping `last_seen` from agent time, silently re-opening the clock-skew gap for those rows. **DEX application performance over time (opt-in).** New per-app, per-version CPU/working-set trend views (DEX → Performance → "Application performance over time"; REST `/api/v1/dex/perf/{apps,app,group}` + the `list_dex_perf_apps`/`get_dex_app_perf`/`get_dex_group_app_perf` MCP tools; per-device drill `GET /api/v1/dex/devices/{id}/app-perf`). **No action is required to upgrade, but the views are EMPTY until you opt in:** per-application sampling ships **off by default** (`procperf_enabled=false`) because it is usage-class telemetry (works-council-relevant). Enable `procperf_enabled=true` on the target devices via `tar.configure` (and leave the daily-sync master switch `--inventory-disable` unset). Data appears **after the first completed UTC midnight** on each opted-in device (the agent ships a daily summary, not immediately), and the trends lengthen as days accumulate (fleet ≤180 days, group ≤31 days). A freshly-enrolled or non-opted-in device shows an honest empty state ("no application performance history yet"), not a bug. The per-device drill is also reachable from a dashboard panel on the `/device` DEX lens ("Application performance over time" — same retained data, no live query, no `Execute` permission; no upgrade action needed). The per-device drill is behavioural PII — scoped + audited (`dex.device.app_perf.view`, fail-closed); the fleet and group aggregates suppress any app/version on fewer than 10 devices to a count only (no singling-out). **Response/execution reads fail closed on a corrupt RBAC store (#1634, partial).** The response readers (`query_responses` + `aggregate_responses` MCP tools, `GET /api/v1/executions/{id}/visualization`, `GET /api/responses/{id}` / `/aggregate` / `/export`) route through a per-agent management-group filter. **The only operator-visible change in this release** is fail-closed behavior under a **corrupt/load-failed `rbac.db`**: these surfaces now return zero rows (the legacy `/api/responses/{id}/aggregate` returns `503`) instead of exposing the whole fleet via the legacy read fallback. **Not yet changed:** under normal RBAC operation these reads are **not** management-group-scoped — a holder of global `Response:Read` still sees all agents' responses (the filter is inert under the current global gate; the gate change that makes scoping effective is tracked under #1634). RBAC explicitly disabled is unchanged. No operator action required. **MCP agentic write surface + A2 discovery + A4 error-shape (R2, #289 / #1794).** Five MCP write tools (`set_tag`/`delete_tag`/`approve_request`/`reject_request`/`quarantine_device`) ship with a ticket-then-recall approval flow, plus the `/api/v1/discover/*` discovery family. The approvals store gains additive `consumed_at` + `consumed_by` columns (auto-migrated at first startup; no operator action). **Breaking wire-shape change:** many `/api/v1` error bodies that were previously `{"error":"<string>"}` are now the nested A4 object `{"error":{"code","message","correlation_id",…}}` — a REST client that read `error` as a *string* must migrate to `error.code` / `error.message` (see `rest-api.md` §Error envelope). The MCP write surface is gated behind the existing tier model + a maker-checker approval workflow; audit `mcp.<tool>` covers every write. **NVD CVE-store schema migration (v1→v2) + full CPE version-range matching.** The server-side NVD store is reshaped on first startup (flat `cve` → normalized `cve` + `cve_match`); `/api/nvd/match` now evaluates real CPE version ranges. **Operator-visible on upgrade:** (a) the migration **drops and rebuilds the local CVE mirror** — vulnerability-matching coverage is reduced until the next NVD sync completes (rate-limited; up to a few hours without an API key), self-healing and logged with a warning at migration time; (b) `GET /api/nvd/status` `total_cves` now counts **distinct CVEs** (was one row per affected product) so it reads **lower** after upgrade even once fully synced, and near-zero during the rebuild window — **expected, not data loss**. Any SIEM/dashboard alerting on the `total_cves` magnitude should be re-baselined. No config change or action required. **NVD CVE sync now actually runs (was dormant).** A `rate_limit()` integer overflow meant the server-side NVD sync slept ~292 years before its first request, so it never populated on any prior deployment (`/api/nvd/status` `total_cves` stayed at the built-in seed). It now runs on startup. **Operator-visible:** (a) the server makes **new outbound HTTPS requests to `services.nvd.nist.gov`** — restricted-egress / air-gapped deployments that silently never reached it before may now log connection failures (set `--no-nvd-sync` to disable, or `--nvd-proxy`); (b) `total_cves` grows from the seed as the sync populates. No config change required to benefit. **NVD sync now builds the FULL CVE catalog (newest-first), not ~20 keywords.** The sync backfills every CVE published within a configurable window — `--nvd-backfill-years` / `YUZU_NVD_BACKFILL_YEARS` (default **8 years**; `0` = full history) — newest-first and **resumable across restarts**, then settles into a periodic last-modified freshness re-check. **Operator-visible:** the server makes sustained HTTPS requests to `services.nvd.nist.gov`, the local NVD DB grows into the hundreds of MB, and `/api/nvd/status` `total_cves` climbs continuously while `backfill_complete` stays `false` until the backfill floor is first reached — `last_sync_time` advances after every successful fetch window and is **not** a completion signal (use the new `backfill_complete` + `backfill_oldest_published` fields, and the `yuzu_nvd_total_cves` / `yuzu_nvd_backfill_complete` metrics, for progress). **`/api/nvd/status` `enabled` semantics corrected:** it now reflects whether sync is configured on, so under `--no-nvd-sync` it reports `enabled:false` (was `true`); a monitor keying on `enabled` to mean "mirror usable" should check `total_cves` instead. The initial backfill is NVD-rate-limited (hours without an `--nvd-api-key`, minutes with one) and resumes where it left off if interrupted. Set `--no-nvd-sync` to disable, `--nvd-proxy` for restricted egress. Product matching stays name-based (vendor-precise CPE identity pending ADR-0018). **Certificate inventory now reads System/SystemRoot keychains and Linux `/etc/ssl/certs` natively (no more `openssl`/`security` CLI shell-out for those stores).** The `certificates` plugin's `list`/`details`/`delete` actions are unchanged in output shape (same pipe-delimited columns, same field values) — this is a collection-mechanism change only, verified byte-parity against the prior CLI-based output. The macOS login keychain is unchanged (still reads via the existing governed-shell path, a deliberate exception — see `docs/agent-spawn-sink-manifest.md`). No operator action required; mixed old/new-agent fleets and rollback are safe (no server-side or schema change). |
 | 0.15.x (next) | 0.12.0 | 0.12.0 | **`PatchManager` now runs on PostgreSQL (ADR-0062).** `/api/patches/*` (patch inventory + deployment tracking) moved off its own `patches.db` SQLite file onto the shared Postgres substrate (schema `patch_manager`). **No data carries over from a pre-Postgres install** (fresh-start-by-default, ADR-0009) — any deployment record that existed before upgrade is gone and must be re-created via `POST /api/patches/deploy`. Server startup now fails closed if the `patch_manager` schema can't be created/opened — a posture upgrade from the SQLite era, where construction was unconditional/best-effort and no caller ever checked whether the store had actually opened; confirm success via `/readyz` (`patch_manager` is now reported by both `/readyz` and `/healthz`, absent from both before this release). **Removed: automatic patch-deployment orchestration.** `PatchManager::execute_deployment()` (the scan → install → verify → reboot workflow) had zero production callers on any released build — nothing ever wired a dispatch/OS-lookup callback to it — and is deleted, not ported; `POST /api/patches/deploy` still creates a deployment + per-target rows, but nothing in the server drives them through that workflow automatically (see #3669, filed alongside this change, and `docs/capability-map.md` §8.3/§8.4/§8.6). **Patch inventory (`GET /api/patches`) is separately unwired**: `record_patches()`, the only method that writes it, also has no production caller — this predates the migration and is not something upgrading changes — so `GET /api/patches` returns empty in every real deployment today; see `docs/capability-map.md` §8.5/§8.7 and #3676. No operator action required beyond re-creating any in-flight deployment after upgrade. |
@@ -953,6 +953,38 @@ What to expect / do:
   re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
 
+## Generic inventory store no longer reads or scrubs a legacy `inventory.db` (ADR-0037)
+
+`InventoryStore`'s one-time first-boot backfill from a legacy `inventory.db` SQLite file
+(`migrate_from_sqlite()`) has been retired (#3623) — no production fleet ever ran a
+pre-Postgres build, so there was no real legacy data to migrate. Two separate behaviors changed:
+
+- A reachable Postgres database whose schema can't migrate or open **is** still a fatal startup
+  error (fail-closed), same as before.
+- A legacy `inventory.db` file with real content **does NOT** fail startup and its content is
+  **never imported** — the server opens it read-only, purely to count rows in `inventory_data`
+  for a diagnostic warning, then boots regardless of what it finds.
+- **`delete_agent()` no longer erases anything from a legacy `inventory.db` either** — the
+  previous "erase from Postgres AND the retained legacy SQLite copy" behaviour is gone. A
+  leftover legacy file is inert: never read on boot beyond the diagnostic warning above, and
+  never scrubbed by a device decommission. If your environment genuinely still has a legacy
+  `inventory.db` you need gone (e.g. for a completed decommission's data-retention obligations),
+  delete it manually.
+
+**Verify:** after the server reports ready, generic inventory reads (`GET /api/v1/inventory` or
+equivalent) behave exactly as before — this store's runtime read/write/query behavior is
+unchanged, only the one-time backfill and the legacy-file erasure are gone.
+
+**Rollback caution.** Rolling back to a build older than this release, against a database that
+has already run this store's retirement migration, **unconditionally** fails that older
+binary's boot with a Postgres `undefined_table` error on its own idempotency-marker check — not
+only when a legacy `inventory.db` happens to be present. This is a deliberate fail-safe (a clear
+startup error, never silent data loss), not a bug, but it means "just roll back the binary" is
+not a supported recovery path once this migration has run. The same is true for
+CaStore/ManagementGroupStore/QuarantineStore/WebhookStore below, each for its own dropped marker
+table; RbacStore is the one exception (see its own section) where rollback failure IS
+conditional on a real legacy file being present.
+
 ## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
 
 `CaStore` (internal-CA root metadata, issued-certificate inventory, CRL version
@@ -961,11 +993,15 @@ read) moves from the SQLite `ca.db` file to the server's PostgreSQL substrate
 in this release (schema `ca_store`). The private CA root key is unaffected —
 it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`).
 
-- **Mandatory, automatic backfill on first boot.** The legacy `ca.db` (if
-  present) is read once at startup and its full issued-cert inventory + CRL
-  history is copied into `ca_store`, fingerprint-verified. The legacy file is
-  left in place, read-only, for one release as a rollback reference — it is
-  never deleted or written to.
+- **No legacy-SQLite migration path.** No production fleet ever ran a
+  pre-Postgres build of this store, so there was no real `ca.db` data to carry
+  over — the one-time backfill this section originally described was retired
+  under ADR-0009's fresh-start-by-default amendment (see ADR-0053's Update). A
+  reachable Postgres database whose schema can't migrate or open is still a
+  fatal startup error (fail-closed); a legacy `ca.db` file with real content
+  does NOT fail startup and its content is never imported — the server opens
+  it read-only, purely to count rows in `ca_root`/`ca_issued`/`ca_crl_versions`
+  for a diagnostic warning, then boots regardless of what it finds.
 - **New fail-closed-at-boot behaviour.** A genuine Postgres error while wiring
   the per-agent mTLS revocation checker at boot now refuses to start the
   server, rather than starting with revocation enforcement silently unwired.
@@ -979,6 +1015,8 @@ it was never in `ca.db` and stays a local file behind `KeyProvider` (`--ca-dir`)
 - Every other CA behavior — revocation semantics, CRL numbering, the single
   `sign_agent_csr` chokepoint — is unchanged. Detail: `docs/pki-architecture.md`,
   `docs/adr/0053-ca-store-postgres-migration.md`.
+- **Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+  same unconditional rollback-refusal applies to this store (its own dropped marker table).
 - **New: an established, already-running default-cert install can now self-heal
   its own listener leaves without operator action.** This is not limited to a
   first-boot crash window — any boot where the on-disk `--ca-dir` default
@@ -1031,27 +1069,39 @@ to the server's PostgreSQL substrate in this release (schema `webhook_store`).
 The webhook HMAC signing secret is now envelope-encrypted at rest
 (`SecretCodec`, AES-256-GCM, ADR-0010) instead of a plaintext column.
 
-- **Mandatory, automatic backfill on first boot, both tables.** The legacy
-  `webhooks.db` (if present) is read once at startup; every webhook's signing
-  secret is re-encrypted (never copied in plaintext), and every delivery
-  record carries over too (the delivery log has no expiry, so — unlike
-  `ResponseStore` below — it is not treated as skippable). A failed backfill
-  refuses to start the server (see remediation below).
+- **No legacy-SQLite migration path.** No production fleet ever ran a
+  pre-Postgres build of this store, so there was no real `webhooks.db` data
+  to carry over — the mandatory, both-tables backfill this section originally
+  described was retired under ADR-0009's fresh-start-by-default amendment
+  (see ADR-0057's Update). A reachable Postgres database whose schema can't
+  migrate or open is still a fatal startup error (fail-closed); a legacy
+  `webhooks.db` file with real content does NOT fail startup and its content
+  is never imported — the server hardens it to 0600 (main file and any
+  `-wal`/`-shm`/`-journal` sidecars, since it may still hold a pre-cutover
+  signing secret in plaintext — POSIX only, a no-op on Windows, #3593) and
+  counts rows in `webhooks`/`webhook_deliveries` for a diagnostic warning, then
+  boots regardless of what it finds. There is no move-aside: the legacy
+  file stays at its original path.
 - **New fail-closed-at-boot behaviour.** A Postgres/`SecretCodec` error at any
-  point in this store's boot sequence (schema migration, KEK verification, or
-  the backfill itself) now refuses to start the server, rather than starting
-  with webhooks silently unwired.
-- **If the backfill fails:** the boot log names the exact remediation — repair
-  `webhooks.db`, or move it aside to skip the backfill. Skipping means any
-  webhooks/signing secrets it held do **not** carry over; recreate them via
-  `POST /api/webhooks` after the server starts.
-- **Legacy file retention.** On a verified successful backfill, `webhooks.db`
-  is renamed to `webhooks.db.migrated-<unix-epoch>` alongside its `-wal`/`-shm`
-  sidecars — never deleted — and access is restricted to the owner where the
-  platform supports it. It still holds every pre-cutover signing secret in
-  **plaintext** for the one-release rollback window (ADR-0009); see
-  [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance if
-  your backup posture for that window is unknown.
+  point in this store's boot sequence (schema migration or KEK verification)
+  now refuses to start the server, rather than starting with webhooks
+  silently unwired.
+- **If you have a real `webhooks.db` you need re-imported:** there is no
+  automated recovery path — recreate the webhooks (and, if used, their
+  signing secrets) via `POST /api/webhooks` after the server starts. See
+  [`rest-api.md`](rest-api.md#post-apiwebhooks) for guidance on securely
+  disposing of a legacy file that still holds a plaintext secret.
+- **If you already upgraded through an EARLIER release** (one where the
+  now-retired backfill genuinely ran), check for a `webhooks.db.migrated-
+  <unix-epoch>` file (and its `-wal`/`-shm` sidecars) at the same directory —
+  that historical rename-on-success behavior is gone in this release (a
+  legacy file is never renamed any more), but a file it already produced is
+  NOT cleaned up by this upgrade and still holds every pre-cutover signing
+  secret in **plaintext**. Dispose of it securely if you no longer need it;
+  the current probe only checks the un-renamed `webhooks.db` path, so it will
+  never warn about a `.migrated-<epoch>` file left over from before.
+- **Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+  same unconditional rollback-refusal applies to this store (its own dropped marker table).
 - **`POST`/`DELETE /api/webhooks` now distinguish a caller error from a store
   failure**: `POST` returns `400` for an invalid URL scheme (previously an
   ambiguous non-error response), and `GET`/`POST`/`DELETE /api/webhooks`
@@ -1384,80 +1434,51 @@ legacy `analytics.db` is **never read** on upgrade.
   `changelog.d/20260816-analytics-session-id-hash.security.md` (assembled
   into the release's Security section at release time).
 
-## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
+## RBAC store moves to PostgreSQL (RbacStore → Postgres, ADR-0041)
 
 `RbacStore` — the authorization substrate holding **role definitions,
 role→permission grants, principal→role assignments, RBAC groups + membership,
 and the global `rbac_enabled` flag** — moves from the SQLite `rbac.db` file to
 the server's PostgreSQL substrate in this release (ADR-0041, Wave 2.1), schema
-`rbac_store`. **Unlike the AuthDB/ScimStore cutover below, this is NOT a
-fresh-start reset — your RBAC configuration is preserved by a mandatory
-backfill.** No new flag or environment variable is added (it reuses the shared
-server `PgPool`).
+`rbac_store`. No new flag or environment variable is added (it reuses the
+shared server `PgPool`).
 
-**What happens on first PG boot:**
+**No legacy-SQLite migration path.** No production fleet ever ran a
+pre-Postgres build of this store, so there was no real `rbac.db` data to carry
+over — the mandatory backfill this section originally described (including
+the `rbac_enabled`-flag-first transfer and the move-aside/fingerprint-verify
+mechanism) was retired under ADR-0009's fresh-start-by-default amendment (see
+ADR-0041's Update). These are two SEPARATE behaviors, not one — do not
+conflate them:
 
-- A one-time, idempotent, **fail-closed** backfill copies every role, grant,
-  group, and membership out of the legacy `rbac.db` into `rbac_store`. Operator
-  edits to seeded permissions are preserved — including a revoked built-in
-  default (`remove_permission`), which is **deleted** (matching legacy
-  exactly) rather than silently restored. The revocation itself is recorded
-  separately as reseed-suppression bookkeeping, so the deleted row cannot be
-  silently re-seeded on the very next restart, without ever becoming a real
-  authorization fact (never a `deny` row an unrelated role could be vetoed
-  by). This is the same mechanism `remove_permission()` itself uses for a
-  revocation made after upgrading. The
-  backfill reconciles counts (roles + grants + groups + members) and **refuses
-  the completion marker on any shortfall** — if it cannot complete, the server
-  **fails the boot closed** and retries on the next start (it never boots on a
-  partial authorization config).
-- **CRITICAL — the `rbac_enabled` flag is preserved and read-back-verified.** It
-  is migrated first, so an operator who had RBAC **enabled** stays enabled after
-  upgrade. (Losing this flag would silently boot the fleet RBAC-**off**, making
-  every confined operator fleet-wide-authorized — the migration is engineered
-  specifically to prevent that.) An unreadable **or non-canonical** durable
-  flag also refuses boot — a value other than exactly `true`/`false` is
-  rejected both by a schema-level constraint on write and by a strict parse on
-  every read, rather than being silently treated as `false`. That schema-level
-  constraint is itself a migration, so on the (unexpected) case of a
-  non-canonical value already sitting in the row from before this upgrade — a
-  hand-edit or a bug on an old release — the migration's own `ALTER TABLE ...
-  ADD CONSTRAINT` fails validation and the server refuses to boot with a raw
-  Postgres `23514 check_violation` rather than the app's own message. Recovery:
-  connect directly and correct the row (`UPDATE rbac_store.rbac_meta SET value
-  = 'false' WHERE key = 'rbac_enabled'`, or `'true'` if RBAC was genuinely
-  enabled) before restarting.
-- The legacy `rbac.db` file is **moved aside** only after the backfill is
-  verified — but a once-failed move-aside can leave it in place, and in that
-  case it **is** read again: every subsequent boot that still finds it
-  fingerprints its content (a SHA-256 content hash, stamped alongside the
-  completion marker) and re-verifies it against what was actually migrated,
-  refusing to boot rather than silently trust a marker this replica's own
-  file was never proven part of. This closes a multi-replica anti-pattern
-  (a fileless replica could otherwise foreclose migration for a sibling
-  genuinely holding the real file) but means an operator on a mixed-fleet
-  first boot or a retained legacy file may see one of a few distinct
-  refusals — `docs/ops-runbooks/rbac-store-backfill-recovery.md` covers each
-  and how to tell them apart. **On a multi-replica upgrade, boot the replica
-  holding the real, authoritative `rbac.db` first** — this lets the actual
-  migration land before any fileless/stale sibling replica boots and stamps a
-  sourceless marker, avoiding the refusals above entirely rather than having
-  to recover from one. A verified-match boot also retries the
-  move-aside automatically, so a once-failed rename does not need manual
-  cleanup once the underlying problem (e.g. a permissions issue) is fixed.
-  Keep the moved-aside copy until you have confirmed RBAC behaves as
-  expected, then remove it.
+- A reachable Postgres database whose schema can't migrate or open **is**
+  still a fatal startup error (fail-closed), unchanged from before.
+- A legacy `rbac.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to
+  count rows in `rbac_config` (the table that held the `rbac_enabled` flag),
+  `securable_types`, `operations`, `roles`, `role_permissions`,
+  `principal_roles`, `groups`, and `group_members` for a diagnostic warning,
+  then boots regardless of what it finds. Fresh installs are unaffected — no
+  legacy file, nothing to warn about.
+
+**If you see the legacy-row-count warning and the environment genuinely has
+real RBAC config to keep, there is no automated recovery path**: re-author
+the equivalent roles/grants/groups against the new Postgres-backed store via
+the RBAC admin UI/REST API, and re-check `rbac_enabled` after boot (it seeds
+`false` on a fresh schema — it does NOT carry over from a legacy file, so an
+operator who had RBAC enabled must re-enable it explicitly).
+
+**Rollback caution.** Do not roll back to a build older than this release
+while a legacy `rbac.db` file with real content still sits at its configured
+path on any replica. An older binary's own (now-removed-from-current-code)
+backfill logic still runs on that replica and, seeing this database already
+past this migration, refuses to auto-migrate rather than silently doing
+anything to `rbac_enabled` — you'll see a clear startup refusal, not silent
+corruption, but it IS a startup refusal. Move the legacy file aside first if
+a rollback is genuinely needed.
 
 **What to expect / do:**
 
-- **Widened startup budget on large RBAC datasets.** A fleet with many custom
-  roles / grants / groups will see a longer first-boot while the backfill
-  runs; this is one-time. Budget for it in the maintenance window and avoid
-  killing the server mid-backfill if you can help it — it is **not** resumable
-  (unlike AuditStore's larger, cursor-resumed migration): a killed boot is
-  data-safe (nothing is left half-migrated), but the next boot restarts the
-  whole backfill from scratch rather than continuing where it left off, so an
-  interruption costs you the full window again.
 - **Routine (not just one-time) boot-time cost, every deployment.** Every
   server boot's `seed_defaults()` reseed now coordinates its built-in-default
   grants against any concurrent revoke via a cluster-wide advisory lock
@@ -1466,8 +1487,8 @@ server `PgPool`).
   amount of boot time on every restart, not just first boot — but if you
   bulk-restart or scale out MANY replicas of the same RBAC-on-Postgres
   deployment **simultaneously**, their reseed passes serialize against each
-  other and against any in-flight legacy backfill, which can add up at large
-  replica counts. Prefer a rolling (not all-at-once) restart/redeploy
+  other, which can add up at large replica counts. Prefer a rolling (not
+  all-at-once) restart/redeploy
   strategy for this reason, as you likely already do for other reasons.
 - **Reads now FAIL CLOSED (deny-on-degrade).** A degraded or unreachable
   `rbac_store` (pool-acquire timeout, query error) now **denies** authorization
@@ -1614,10 +1635,10 @@ server `PgPool`).
   and this line must reach the operator regardless. If you rely on the log
   file or a structured log sink rather than captured stderr, this one line will not
   appear there; check container/service stderr capture for it instead.
-- Confirm on first boot: the backfill completion log line, no `RbacStore`
-  open/migrate errors, and that RBAC is still enabled if you had enabled it
-  (Settings → RBAC, or check that confined operators still see only their
-  scoped fleet).
+- Confirm on first boot: no `RbacStore` open/migrate errors, and that RBAC is
+  enabled if you intend it to be — remember it does NOT carry over from a
+  legacy `rbac.db` (Settings → RBAC, or check that confined operators see
+  only their scoped fleet).
 
 See `docs/auth-architecture.md` § "RbacStore — the authorization substrate" and
 [ADR-0041](../adr/0041-rbac-store-postgres-migration.md) for the full design.
@@ -1840,7 +1861,7 @@ re-emits `yuzu_server_audit_clock_anomaly_skips_total` on every pass (only a
 distinct anomaly does) — if you alerted on that counter's *cadence*, alert on a
 sustained increase instead. See
 [Audit Log](audit-log.md#the-retention-clock-guard).
-## Management-group confinement config migrates to Postgres (mandatory backfill, ADR-0042)
+## Management-group confinement config migrates to Postgres (ADR-0042)
 
 The `ManagementGroupStore` — the confinement hierarchy that backs operator
 scoping and the ADR-0017 `authorize_list_read` gate — moves from the SQLite
@@ -1850,41 +1871,31 @@ shared connection pool, so **no new connection flag or config is required** —
 the same `--postgres-dsn` / `YUZU_POSTGRES_DSN` that every other server store
 uses.
 
-**This is NOT a fresh-start cutover.** Unlike the AuthDB/ScimStore/API-token
-migrations above (which deliberately reset), a management group's hierarchy,
-static memberships, and group→role assignments are irreducible operator intent —
-losing them would silently widen or narrow confinement. So the migration
-performs a **mandatory one-time backfill** on first Postgres boot:
+**No legacy-SQLite migration path.** No production fleet ever ran a
+pre-Postgres build of this store, so there was no real `management-groups.db`
+data to carry over — the mandatory backfill this section originally described
+was retired under ADR-0009's fresh-start-by-default amendment (see ADR-0042's
+Update). These are two SEPARATE behaviors, not one:
 
-- **What is preserved:** every group (name, parent, membership type, scope
-  expression), every static membership record, and every group→role assignment
-  carry over exactly. Dynamic memberships re-resolve from their scope expression
-  on the next reconcile, as before.
-- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
-  Postgres write error, unreadable legacy DB, or the safety check below — the
-  server **refuses to boot** rather than come up with an empty or partial
-  confinement hierarchy (which would fail-open, exposing out-of-scope devices).
-  The backfill marker is only stamped on success, so a failed attempt is
-  **retried on the next start** once you have fixed the underlying cause; it
-  never proceeds with partial state.
-- **Legacy file moved aside after a verified backfill.** Once the backfill is
-  confirmed complete, `management-groups.db` is renamed to
-  `management-groups.db.migrated-<epoch>` (the server never reads it again). If
-  you do not see this file appear, the backfill did not run to completion —
-  investigate before assuming confinement is intact. Keep the renamed file until
-  you have confirmed scoping behaves correctly, then treat it as an
-  operator-managed backup and dispose of it per your data-retention policy.
-- **The backfill REFUSES an over-deep or cyclic legacy tree.** If the legacy
-  hierarchy contains a parent cycle or exceeds the maximum depth of 10 levels,
-  the backfill fails closed (and, per above, blocks boot). This can only happen
-  on a legacy DB that was hand-edited or corrupted outside the API (the create
-  path caps depth at 5). **Remediate by repairing the legacy tree** (flatten it
-  below 10 levels / break the cycle) **or moving `management-groups.db` aside
-  yourself** to start fresh — then restart. Do not force-boot around this: a
-  malformed hierarchy is exactly the state confinement must not silently accept.
-- **Widened startup budget.** First boot takes longer than usual while the
-  backfill runs; the server's startup readiness budget is widened to accommodate
-  it. Do not treat a slower-than-normal first boot as a hang.
+- A reachable Postgres database whose schema can't migrate or open **is**
+  still a fatal startup error (fail-closed), unchanged from before.
+- A legacy `management-groups.db` file with real content **does NOT** fail
+  startup and its content is **never imported** — the server opens it
+  read-only, purely to count rows in `management_groups`,
+  `management_group_members`, and `management_group_roles` for a diagnostic
+  warning, then boots regardless of what it finds (an empty confinement
+  hierarchy, same as a fresh install). The over-deep/cyclic-tree refusal this
+  section used to describe has no remaining trigger — the write path's
+  depth-5 cap is now the sole guard, since nothing backfills a legacy tree
+  past it anymore.
+
+**If you see the legacy-row-count warning and the environment genuinely has
+real management groups to keep, there is no automated recovery path**:
+re-author the equivalent groups/memberships/role assignments against the new
+Postgres-backed store via the REST API.
+
+**Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+same unconditional rollback-refusal applies to this store (its own dropped marker table).
 
 **Operator-visible behaviour change (fail-closed reads).** After cutover, a
 confinement-feeding read that degrades (store not open, pool-acquire timeout, or
@@ -1897,8 +1908,7 @@ Watch the new `yuzu_server_mgmt_group_read_degrade_total{reason}` counter — a
 non-zero rate means scoped operators are seeing reduced/empty lists because the
 confinement substrate is degraded, **not** that groups actually shrank (see
 `docs/user-manual/metrics.md` § "Management group metrics" and the shipped
-`YuzuMgmtGroupReadDegraded` alert). `yuzu_server_mgmt_group_backfill_total{result}`
-records the one-time backfill outcome (`completed` / `fresh` / `failed`).
+`YuzuMgmtGroupReadDegraded` alert).
 
 **Not affected:** the confinement hierarchy's semantics, the REST/MCP surface,
 and dynamic-group scope expressions are unchanged — only the storage substrate
@@ -2015,7 +2025,7 @@ fails to resolve a device's MAC this time will blank a previously known-good val
 than simply retry the earlier failure. See the REST API reference's Network Discovery
 section for the full response shapes.
 
-## Guardian quarantine records migrate to Postgres (mandatory backfill, QuarantineStore, ADR-0047)
+## Guardian quarantine records migrate to Postgres (QuarantineStore, ADR-0047)
 
 The `QuarantineStore` — the Guardian device-quarantine bookkeeping behind
 `POST /api/v1/quarantine`, `DELETE /api/v1/quarantine/{agent_id}`, and the MCP
@@ -2024,121 +2034,35 @@ PostgreSQL substrate in this release (ADR-0006 Wave 2), schema `quarantine_store
 reuses the existing shared connection pool — no new connection flag or config is
 required.
 
-**This is NOT a fresh-start cutover.** An active quarantine record is live security
-containment state — losing it would silently un-quarantine a device in the server's
-view — so the migration performs a **mandatory one-time backfill** on first Postgres
-boot:
+**No legacy-SQLite migration path.** No production fleet ever ran a pre-Postgres
+build of this store, so there was no real `quarantine.db` data to carry over — the
+mandatory, fingerprint-verified backfill this section originally described (all of
+the pre-upgrade checks, refusal conditions, and move-aside/fingerprint mechanics)
+was retired under ADR-0009's fresh-start-by-default amendment (see ADR-0047's
+Update). These are two SEPARATE behaviors, not one:
 
-**Before you upgrade**, check the legacy `quarantine.db` for the conditions that make
-the backfill refuse to boot (all listed below), so you can fix them ahead of a
-maintenance window rather than during one:
+- A reachable Postgres database whose schema can't migrate or open **is** still a
+  fatal startup error (fail-closed), unchanged from before.
+- A legacy `quarantine.db` file with real content **does NOT** fail startup and its
+  content is **never imported** — the server opens it read-only, purely to count
+  rows in `quarantine_records` for a diagnostic warning, then boots regardless of
+  what it finds.
 
-```bash
-# Row count against the 5,000 sanity cap.
-sqlite3 /path/to/quarantine.db "SELECT count(*) FROM quarantine_records;"
+**This is a stronger warning than it looks, and a deliberate choice despite the
+stakes.** Unlike most other stores retiring their legacy-SQLite path in this same
+release, a genuinely non-empty `quarantine.db` here means a device an operator
+quarantined is **not** re-quarantined in the server's view after upgrade — the
+server's view of containment does not include whatever the warning names, though
+agent-side firewall enforcement (out of scope for this store) may still be
+independently in effect. This was reopened and explicitly reconsidered for this
+store given the containment stakes, not defaulted by uniformity with the rest of
+this retirement batch — see ADR-0047's Update for the full reasoning. **If you see
+the legacy-row-count warning and the environment genuinely has real quarantine
+records to keep, there is no automated recovery path**: re-quarantine the affected
+device(s) via `POST /api/v1/quarantine` after confirming which devices need it.
 
-# Duplicate 'active' rows for the same agent (never enforced at the DB level
-# in the legacy schema — only an in-process mutex the server no longer runs did).
-sqlite3 /path/to/quarantine.db \
-  "SELECT agent_id, count(*) FROM quarantine_records WHERE status='active' GROUP BY agent_id HAVING count(*) > 1;"
-
-# Any status value other than 'active'/'released'.
-sqlite3 /path/to/quarantine.db \
-  "SELECT agent_id, status FROM quarantine_records WHERE status NOT IN ('active','released');"
-```
-
-If any query returns unexpected rows, resolve them in the legacy file before
-upgrading — `docs/ops-runbooks/quarantine-store-backfill-recovery.md` has the exact
-remediation for each. A 0-byte or otherwise corrupt/unreadable `quarantine.db` also
-refuses the boot; the queries above will simply fail to run against such a file,
-which is itself the signal to investigate before upgrading.
-
-- **What is preserved:** every quarantine record, active and released — agent_id,
-  status, who quarantined it, timestamps, the IP whitelist, and the reason — carries
-  over, in full history (not just the current active row).
-- **Fail-closed boot on backfill failure.** If the backfill cannot complete — a
-  Postgres write error, an unreadable legacy DB, an unrecognised legacy `status` value,
-  or a fingerprint mismatch (below) — the server **refuses to boot** rather than come
-  up with an empty or partial quarantine inventory. The backfill marker is only
-  stamped on success, so a failed attempt is **retried on the next start** once the
-  underlying cause is fixed.
-- **Fingerprint-verified, not marker-only**, the same shape `DiscoveryStore` uses
-  (see that section above for the full rationale): on a multi-replica deployment
-  sharing one Postgres database, a later-booting replica that still holds its own
-  legacy file verifies its content against the recorded fingerprint before trusting
-  an already-set completion marker. A "HOLDER-SIDE VERIFICATION FAILED" log line has
-  **two distinct causes, not one** — read it carefully rather than assuming the
-  multi-replica case: (1) two replicas each hold `quarantine.db` files with genuinely
-  different content — do not force-boot around it; an operator needs to decide which
-  is authoritative first; or (2) **this exact server** was rolled back to a
-  pre-ADR-0047 build after its backfill had already completed (see
-  [Rollback](#rollback) below), ran against the legacy file again, and is now being
-  re-upgraded — the file no longer matches what Postgres already holds. See
-  `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the recovery
-  procedure for each cause. Two narrower variants of the same "don't trust the marker
-  blindly" check also
-  refuse and require manual reconciliation: a marker set with **no** recorded
-  fingerprint at all (predates this mechanism) while this replica still holds real
-  legacy content, and a marker set **sourceless** (no replica has ever migrated real
-  content for this fleet yet) while this replica holds real content — in the second
-  case, refusing matters because a live `quarantine_device`/`release_device` call
-  could already have landed against the sourceless-stamped store, and blindly
-  migrating stale legacy content on top would silently clobber it.
-- **A 0-byte `quarantine.db` is refused, not treated as a fresh install** — same
-  rationale as `discovery.db` above (SQLite opens a 0-byte file as a valid empty
-  database, indistinguishable from "never used" without an explicit check, but a
-  genuine fresh install never has a file here at all).
-- **An unrecognised legacy `status` value refuses the boot.** The `status` column is
-  only ever `active` or `released`; a legacy row carrying anything else (e.g. from
-  manual DB surgery) fails the backfill closed with a log line naming the offending
-  `agent_id` and value, rather than silently inserting an unrecognised state or
-  silently dropping the row.
-- **More than one `active` record for the same agent in the legacy file also
-  refuses the boot.** The legacy SQLite schema never enforced "at most one active
-  record per agent" at the database level (only an in-process mutex the server no
-  longer runs did), so a legacy file could in principle hold a duplicate from
-  pre-existing data corruption or a hand-edited file. The backfill checks for this
-  before touching Postgres and names the offending `agent_id`, rather than aborting
-  mid-transaction on a raw database constraint-violation error.
-- **More than 5,000 legacy records refuses the boot** as a sanity cap sized against the
-  single backfill transaction's own time budget (the row-insert loop is one round-trip per
-  row under an exclusive cross-replica lock, so an oversized backfill would otherwise block
-  every OTHER replica's boot for its full duration). The cap counts every legacy record,
-  active and released — this store's retention is unbounded by design (no prune pass), so a
-  long-lived fleet's full quarantine history could plausibly approach this over years, unlike
-  a purely never-expected-to-bind DoS guard. `kMaxBackfillRows` is a compile-time constant,
-  not a runtime flag, and the legacy file must never be pruned to get under this cap —
-  a `quarantine_records` row is SOC 2 containment evidence, and this store's retention is
-  unbounded by design specifically so that evidence is never lost. See
-  `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the supported path (engage
-  engineering to raise the constant and rebuild) before you hit it.
-- **Legacy file moved aside after a verified backfill.** Once the backfill is
-  confirmed complete, `quarantine.db` is renamed to
-  `quarantine.db.migrated-<epoch>` (the server never reads it again). If the rename
-  itself fails (e.g. a permissions issue), this is logged as a warning and does
-  **not** block boot — the file is safe to archive or remove manually, and every
-  later boot re-verifies it by fingerprint before trusting the already-set marker,
-  so a lingering un-renamed file is never silently re-migrated. Keep the renamed
-  file (or the un-renamed original) until you have confirmed quarantine history
-  looks correct, then dispose of it per your data-retention policy.
-- **A same-boot race between two replicas migrating for the first time is
-  serialized, not refused.** If two replicas reach the backfill within the same
-  narrow window, one waits on the other under an internal database lock (bounded by
-  the same timeout as the backfill transaction itself) rather than both attempting
-  the insert; the loser then re-verifies by fingerprint as described above. This is
-  expected, self-resolving behavior on a fresh multi-replica rollout and does not
-  need operator action. **Edge case:** if the winner's own insert loop runs
-  unusually long (a very large legacy file close to the 5,000-row cap), the loser's
-  wait can itself exceed the lock timeout and produce a "backfill lock failed
-  (retryable on next boot...)" refusal instead of a clean serialize — this is not a
-  data problem, just retry booting that replica once the winner has finished.
-- **Budget for a longer first boot.** First boot takes longer than usual while the
-  backfill runs; a legacy `quarantine.db` closer to the 5,000-record cap extends
-  this further. **Widen your own orchestrator's startup budget accordingly**
-  (Kubernetes `startupProbe` failure/period budget, or the Docker Compose
-  healthcheck `start_period`) so it does not kill the server mid-backfill and
-  restart it into the same long boot repeatedly — do not treat a slower-than-normal
-  first boot as a hang.
+**Rollback caution:** see the InventoryStore section's "Rollback caution" note above — the
+same unconditional rollback-refusal applies to this store (its own dropped marker table).
 
 **Operator-visible behaviour change (fail-closed reads).** `GET /api/v1/quarantine`
 can now return **503** for two DISTINCT reasons — the response body's message
@@ -2163,38 +2087,10 @@ distinguishes them, since only one is covered by the existing metric:
   authorization-check message and the counter isn't moving, the RBAC/engine-principal
   path is what to investigate, not the quarantine store itself.
 
-`yuzu_server_quarantine_backfill_total{result}` records the one-time backfill outcome
-(`completed` / `fresh` / `failed`).
-
-**Verify:** after the server reports ready, confirm the migration actually moved
-your data — `GET /api/v1/quarantine` (quarantine has no dashboard surface — REST/MCP
-only) should show the same active quarantine records you had before upgrading, and
-`SELECT value FROM quarantine_store.quarantine_meta WHERE key = 'backfill_row_count';`
-against the Postgres database should match the row count you'd have gotten from
-`sqlite3 quarantine.db.migrated-<epoch> "SELECT count(*) FROM quarantine_records;"`
-against the moved-aside legacy file.
-
-**Rollback note:** downgrading below the ADR-0047 release is **not** a simple binary
-swap-back once the backfill has completed — the old binary reads `quarantine.db`,
-which has already been renamed to `quarantine.db.migrated-<epoch>` and is no longer
-at its expected path. **Both paths below set up the same later-boot hazard — gov-fix
-(docs-writer, Gate 8.2): the naive path is NOT benign, it was previously described as
-though it were.**
-
-- **If you restore a backed-up `quarantine.db`** (per the generic [Rollback](#rollback)
-  procedure below) and run the old binary for a while, creating new quarantine/release
-  activity in the restored file, a later **re-upgrade** hits the single-replica cause
-  of the "HOLDER-SIDE VERIFICATION FAILED" refusal described above.
-- **If you do a naive rollback with no restore**, the old binary finds no file at the
-  vacated path and behaves as a fresh install (an EMPTY quarantine view) — but its
-  constructor unconditionally runs `CREATE TABLE IF NOT EXISTS` on that path regardless
-  of whether any quarantine/release action ever happens, creating a present-but-empty
-  table. A present-but-empty table fingerprints as real content, not `sourceless`, so
-  **merely booting the old binary at all — zero quarantine activity, no restore — is
-  independently sufficient** to hit the identical refusal on a later re-upgrade.
-
-Either way, see `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the
-recovery procedure; do not repeatedly restart hoping it self-resolves, it will not.
+**Verify:** after the server reports ready, `GET /api/v1/quarantine` (quarantine has
+no dashboard surface — REST/MCP only) shows the expected active quarantine records —
+either already-live Postgres data on a redeploy, or an empty list plus the
+legacy-row-count warning above on a fresh install with a real legacy file.
 
 **Not affected:** the agent-side quarantine firewall enforcement (WFP/nftables/pf
 block-all + exceptions) is untouched by this migration — only the server-side

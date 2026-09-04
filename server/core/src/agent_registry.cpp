@@ -1359,6 +1359,18 @@ std::shared_ptr<AgentSession> AgentRegistry::get_session(const std::string& agen
     return it != agents_.end() ? it->second : nullptr;
 }
 
+std::unordered_set<std::string> AgentRegistry::ids_missing_plugin(std::string_view plugin) const {
+    std::unordered_set<std::string> missing;
+    std::lock_guard lock(mu_);
+    for (const auto& [id, s] : agents_) {
+        if (s->plugin_names.empty())
+            continue; // no reported inventory -- unknown, not absent; fail open
+        if (std::ranges::find(s->plugin_names, plugin) == s->plugin_names.end())
+            missing.insert(id);
+    }
+    return missing;
+}
+
 // Collect every from_result_set:<id> reference in a scope expression so the
 // resolver can preload owner-checked membership once per set. The scope AST is
 // a variant of Condition | Combinator (scope_engine.hpp); walk it recursively.
