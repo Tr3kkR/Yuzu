@@ -289,19 +289,73 @@ Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half
 is **boot-time, restart-required** - accepted with that limitation. **Scope note**: this
 procedure is a UAT-drill spec, written against zero production fleet. It is single-agent
 (one restart at a time) with no fleet-wide orchestration story - flipping this on N agents
-during a real incident is N individual restarts, not covered here. It also has no persistence
-mechanism wired into the shipped `yuzu-agent.service` unit today (tracked as #3851). Treat
-this as the drill procedure for evidence collection, not yet a production incident runbook.
+during a real incident is N individual restarts, not covered here. Persistence across restarts
+is the unit's `EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env` (#3851) - Linux/systemd
+packages; Windows and macOS service configuration is outside this issue, tracked at #3973.
+Treat this as the
+drill procedure for evidence collection, not yet a production incident runbook. **Path note**:
+deliberately `/etc/yuzu-agent/`, not the shared `/etc/yuzu/` - a co-installed `yuzu-server`
+package re-asserts `/etc/yuzu` as `0750 yuzu:yuzu` on every install/upgrade, and that
+different service account can unlink/replace a file inside it regardless of the file's own
+mode; `/etc/yuzu-agent/` has no such collision.
 
 1. Confirm current state: agent running with `prefer_spark` active, spark armed on at least one
    rule, drift/heartbeat evidence flowing (criterion 5's UAT smoke precondition).
-2. Flip the flag: set `--spark-disable` (or the equivalent config/env toggle feeding
-   `cfg_.spark_disable`) and restart the agent process. The boot-time branch at
-   `agent.cpp:1195–1197` short-circuits `SparkEngine` instantiation entirely when this is set -
-   `spark_engine_` stays null, and the boot log records the literal string (note: an em dash,
-   not a hyphen, at `agent.cpp:1196` - a plain-hyphen grep will not match it)
-   `"SparkEngine: disabled by --spark-disable — not instantiated; Guardian detection path =
-   legacy IGuard (enforcing)"`.
+2. Flip the flag - persist it, then restart.
+
+   **On Rig B (the §8 drill rig, foreground)** - this is the drill path, run this on the
+   shared box, not the systemd form below:
+   ```bash
+   YUZU_AGENT_SPARK_DISABLE=1 ./yuzu-agent ...
+   ```
+
+   **Production systemd form** (recorded here for the eventual incident runbook - do not run
+   this against a shared or hands-off host):
+   ```bash
+   sudo mkdir -p -m 0750 /etc/yuzu-agent
+   sudo touch /etc/yuzu-agent/yuzu-agent.env
+   sudo chown root:root /etc/yuzu-agent/yuzu-agent.env
+   sudo chmod 0600 /etc/yuzu-agent/yuzu-agent.env
+   sudoedit /etc/yuzu-agent/yuzu-agent.env   # replace any existing content with exactly one line: YUZU_AGENT_SPARK_DISABLE=1
+   sudo systemctl restart yuzu-agent
+   ```
+   Exactly one `YUZU_AGENT_SPARK_DISABLE=1` line - `sudoedit` opens existing content, so
+   replace it rather than appending on a repeat drill run; no `export`, no shell syntax, no
+   trailing inline comment (systemd's `EnvironmentFile=` parser does NOT strip a trailing
+   `# ...` the way a shell would; the whole rest of the line becomes part of the value, which
+   then fails CLI11 parsing at boot - see the recovery note below). An empty file (e.g. from
+   `touch` with no `sudoedit` yet) behaves exactly like a missing one - both apply zero
+   variables. Drop-in alternative: `sudo systemctl edit yuzu-agent` with `[Service]`
+   `Environment=YUZU_AGENT_SPARK_DISABLE=1` (`EnvironmentFile=` overrides `Environment=` when
+   both exist; an `ExecStart` override is unaffected, since the variable binds via
+   `->envname`, and a CLI flag always wins over the environment). Roll-forward: remove the
+   assignment and restart - not `=0` (works today, per CLI11's source, but the runbook
+   shouldn't couple to that implementation detail). **Package-upgrade note**: an `.rpm`
+   upgrade auto-restarts the unit (`%systemd_postun_with_restart`) and so picks up a pending
+   env-file change on its own; a `.deb` upgrade only reloads the unit definition (`systemctl
+   daemon-reload`) and does NOT restart the process - the env change stays pending until an
+   explicit or otherwise-triggered restart. **Recovery from a malformed value**: a bad value
+   (not a missing file - see above) fails CLI11 parsing at boot, and `Restart=always` +
+   `StartLimitBurst=5`/`StartLimitIntervalSec=300` (top of this unit) will crash-loop the
+   agent into `failed` state within ~50s. Fix or remove the offending line, then
+   `sudo systemctl reset-failed yuzu-agent` before `restart` - a plain `restart` alone does
+   NOT clear a `failed` state once the burst limit trips. The actual parse-error text is not
+   in yuzu's own logs (it fires before yuzu logging initializes) - it's in
+   `journalctl -u yuzu-agent`. Evidence it took - run the redirection inside the privileged
+   shell, not the calling one:
+   ```bash
+   pid="$(systemctl show -p MainPID --value yuzu-agent)"
+   sudo sh -c 'tr "\0" "\n" < "/proc/$1/environ" | grep -Fx "YUZU_AGENT_SPARK_DISABLE=1"' sh "$pid"
+   ```
+   (`systemctl show -p Environment` does not list `EnvironmentFile=`-sourced vars.) On Rig B
+   (foreground, no systemd unit), substitute the shell's own PID for `MainPID`: `pid=$!`
+   right after backgrounding the foreground command, or `pgrep -f yuzu-agent` if it's already
+   running - `systemctl show` has no unit to query for a bare foreground process. The
+   boot-time branch at `agent.cpp:1195–1197` short-circuits `SparkEngine` instantiation
+   entirely when this is set - `spark_engine_` stays null, and the boot log records the
+   literal string (note: an em dash, not a hyphen, at `agent.cpp:1196` - a plain-hyphen grep
+   will not match it) `"SparkEngine: disabled by --spark-disable — not instantiated; Guardian
+   detection path = legacy IGuard (enforcing)"`.
 3. Confirm legacy enforcement resumed: the same-boot `wire_spark_engine()` call
    (`agent.cpp:1254`) records `SparkAvailability::SparkDisabled`, and the `SparkDisabled` case
    of the backend-derivation log switch (`:1269–1272`) reports `detection backend = legacy`

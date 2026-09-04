@@ -9,6 +9,10 @@
 
 #include <yuzu/agent/updater.hpp>
 
+#include <yuzu/agent/detached_signature.hpp>
+
+#include <yuzu/metrics.hpp>
+
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 
@@ -33,7 +37,9 @@
 #define NOMINMAX
 #endif
 // clang-format off
-#include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
+#include <windows.h> // must precede bcrypt.h (defines NTSTATUS)
+#include <fcntl.h> // _O_RDONLY/_O_BINARY for the signature-verification handle bridge
+#include <io.h>    // _open_osfhandle, _close
 // clang-format on
 #include <bcrypt.h>
 #include <sddl.h>
@@ -525,7 +531,13 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
         sa.lpSecurityDescriptor = sd;
 
         h_guard.h = CreateFileW(temp_path.wstring().c_str(),
-                                GENERIC_WRITE | DELETE, // DELETE required for FileRenameInfo*
+                                // GENERIC_READ is required, not decorative: the share mode below
+                                // is 0, so this path cannot be opened a second time, and
+                                // signature verification therefore has to read the staged bytes
+                                // back through THIS handle. Without read access every signed
+                                // update fails verification and the agent stops updating.
+                                // DELETE is required for FileRenameInfo*.
+                                GENERIC_READ | GENERIC_WRITE | DELETE,
                                 0, // No sharing — load-bearing exclusive hold
                                 &sa,
                                 CREATE_NEW, // Atomic create; fail if exists
@@ -696,15 +708,128 @@ std::expected<bool, UpdateError> Updater::check_and_apply(void* raw_stub) {
 
     spdlog::info("SHA-256 verified: {}", actual_hash);
 
-    // ── Step 4.5: Inode-equivalence pre-flight (POSIX, W2.3 / #806) ─────
+
+    // ── Step 4.6: Verify the detached signature (#416/#3807) ──────────────
     //
-    // Confirm the inode our fd holds is the same one currently at
-    // `temp_path`. If a local attacker has unlinked our temp file and
-    // created a replacement at the same path (the documented attack), the
-    // inodes will differ — abort before apply_update consumes the path.
-    // The residual race window is from this stat() to the rename() inside
-    // apply_update, which is microseconds. A Linux-only follow-up could
-    // close it entirely via `linkat(AT_FDCWD, "/proc/self/fd/N", ...)`.
+    // WHY HERE, precisely. This sits after the SHA-256 compare and BEFORE the
+    // Step 4.9 inode pre-flight, which is itself the last thing before Step 5 —
+    // the last point at which nothing irreversible has happened. The pre-flight
+    // deliberately runs AFTER this block, not before: verification streams the
+    // whole binary, so running the inode check first would leave that entire
+    // duration inside the race window it exists to close. Step 5 sets the execute bit on POSIX
+    // (`apply_update`) and moves the LIVE executable aside on Windows; either
+    // is past the point of no return. Everything above this line is still just
+    // bytes in a temp file we can delete.
+    //
+    // WHY THIS IS NOT REDUNDANT WITH THE SHA-256. That hash arrives on the same
+    // gRPC channel that served the bytes, from the same server, so it proves the
+    // download was not corrupted and nothing more: anything able to substitute
+    // the binary substitutes the hash beside it. The signature is checked
+    // against a trust anchor placed on disk at install time, so it survives a
+    // compromised or impersonated server, which is the whole point of #416.
+    if (config_.signature_checking_enabled()) {
+        const std::string& sig = check_resp.update_signature();
+        if (sig.empty()) {
+            if (config_.require_signature) {
+                if (config_.metrics)
+                    config_.metrics
+                        ->counter("yuzu_agent_ota_signature_refused_total",
+                                  {{"reason", "missing"}})
+                        .increment();
+                cleanup_temp();
+                return std::unexpected(UpdateError{
+                    "update package is unsigned and --update-require-signature is set"});
+            }
+            // Transitional mode. This is a genuine downgrade oracle for as long
+            // as it is enabled — the agent cannot distinguish "server too old to
+            // sign" from "signature stripped in transit", because there is no
+            // capability handshake on this RPC surface. Loud on purpose.
+            spdlog::warn("OTA update {} is UNSIGNED and was accepted because "
+                         "--update-require-signature is not set. Authenticity was NOT verified; "
+                         "only the server-supplied hash was checked.",
+                         check_resp.latest_version());
+        } else {
+            // Verified from the HELD descriptor, never a re-opened path: the
+            // bytes checked are then provably the bytes that were hashed, and on
+            // Windows the staged file cannot be re-opened at all (dwShareMode=0).
+#ifdef _WIN32
+            // Bridge the HANDLE to a CRT descriptor through a DUPLICATE, so the
+            // descriptor we close cannot disturb the handle apply_update needs.
+            // RAII, because verify_detached_cms_fd allocates and can throw: a bare
+            // _close() after the call would leak a handle and a descriptor on
+            // every failure, once per six-hour update cycle.
+            struct ScopedOsfHandle {
+                HANDLE h{nullptr};
+                int fd{-1};
+                ~ScopedOsfHandle() {
+                    // _close owns the duplicated HANDLE once the bind succeeds,
+                    // so closing both would be a double-close. Exactly one runs.
+                    if (fd >= 0)
+                        ::_close(fd);
+                    else if (h)
+                        ::CloseHandle(h);
+                }
+            } dup;
+
+            if (!::DuplicateHandle(::GetCurrentProcess(), h_guard.h, ::GetCurrentProcess(), &dup.h,
+                                   0, FALSE, DUPLICATE_SAME_ACCESS)) {
+                cleanup_temp();
+                return std::unexpected(
+                    UpdateError{"cannot duplicate update file handle for signature verification"});
+            }
+            dup.fd = ::_open_osfhandle(reinterpret_cast<intptr_t>(dup.h), _O_RDONLY | _O_BINARY);
+            if (dup.fd < 0) {
+                cleanup_temp();
+                return std::unexpected(
+                    UpdateError{"cannot bind update file handle for signature verification"});
+            }
+            auto sig_err = verify_detached_cms_fd(dup.fd, sig, config_.signature_trust_bundle);
+#else
+            auto sig_err = verify_detached_cms_fd(fd_guard.fd, sig, config_.signature_trust_bundle);
+#endif
+            if (sig_err) {
+                if (config_.metrics)
+                    config_.metrics
+                        ->counter("yuzu_agent_ota_signature_refused_total",
+                                  {{"reason", sig_err->kind == CmsFailure::kUntrusted
+                                                  ? "untrusted"
+                                                  : "invalid"}})
+                        .increment();
+                // Refused in BOTH modes. require_signature governs whether an
+                // ABSENT signature is tolerated; a signature that is present and
+                // does not verify is always an active integrity failure.
+                spdlog::error("OTA update {} signature verification FAILED ({}): {}",
+                              check_resp.latest_version(),
+                              sig_err->kind == CmsFailure::kUntrusted ? "untrusted chain"
+                                                                      : "invalid signature",
+                              sig_err->detail);
+                cleanup_temp();
+                return std::unexpected(UpdateError{
+                    std::format("update signature verification failed: {}", sig_err->detail)});
+            }
+            spdlog::info("OTA update {} signature verified against {}", check_resp.latest_version(),
+                         config_.signature_trust_bundle.string());
+        }
+    }
+
+    // ── Step 4.9: Inode-equivalence pre-flight (POSIX, W2.3 / #806) ─────
+    //
+    // Confirm the inode our fd holds is the same one currently at `temp_path`.
+    // If a local attacker has unlinked our temp file and created a replacement
+    // at the same path (the documented attack), the inodes differ — abort before
+    // apply_update consumes the PATH.
+    //
+    // THIS MUST BE THE LAST THING BEFORE STEP 5, and it is numbered 4.9 rather
+    // than 4.5 to keep it that way. It guards the gap between this stat() and
+    // the path-based rename() inside apply_update, so anything inserted above it
+    // is outside the guard, and anything inserted BELOW it widens the gap
+    // directly. It previously ran before signature verification, which then
+    // grew to load the trust bundle and stream the entire binary through
+    // CMS_verify — hundreds of milliseconds for a large agent, not the
+    // microseconds this comment used to claim. That turned a theoretical race
+    // into a practical one on the exact path the signature check exists to
+    // protect. A Linux-only follow-up could close the remaining gap entirely
+    // via `linkat(AT_FDCWD, "/proc/self/fd/N", ...)`.
 #ifndef _WIN32
     struct stat fd_st {};
     struct stat path_st {};
