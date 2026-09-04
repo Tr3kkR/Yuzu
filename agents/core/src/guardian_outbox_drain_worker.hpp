@@ -440,9 +440,19 @@ private:
     /// contention"), now on two detached threads instead of one; it never touches the
     /// worker's own thread.
     [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
-        auto& exec = entry.domain == OutboxDomain::Lifecycle ? lifecycle_send_exec_
-                                                              : compliance_send_exec_;
-        return exec.offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
+        // Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value
+        // added without updating this routing is a compiler warning here, not a
+        // silent fall-through into whichever branch happens to be the fallback.
+        GuardianOutboxSendExecutor* exec = &compliance_send_exec_;
+        switch (entry.domain) {
+        case OutboxDomain::Lifecycle:
+            exec = &lifecycle_send_exec_;
+            break;
+        case OutboxDomain::Compliance:
+        case OutboxDomain::Health:
+            break;
+        }
+        return exec->offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
     }
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
     /// the one check loop() makes outside a try, and taking a mutex here would let

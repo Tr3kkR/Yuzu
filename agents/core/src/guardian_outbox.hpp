@@ -326,7 +326,19 @@ public:
     /// succeeds (the audit trail is not allowed to block or unwind a real
     /// detection-capability change); the caller should count/log this loudly
     /// rather than swallow it (see the header note on outbox-full-on-arm).
+    ///
+    /// Also returns false (no counter bump - this is a caller bug, not a capacity
+    /// condition) for a non-Lifecycle entry (#3953 item 4): production only ever
+    /// routes Lifecycle here (GuardianOutbox::enqueue's own mirror-image check
+    /// above rejects Lifecycle FOR compliance/health reasons), but the invariant
+    /// was previously enforced only by convention - three construction sites, no
+    /// assertion. Checked BEFORE the capacity check, deliberately: a wrong-domain
+    /// entry offered while this log happens to be at capacity must not increment
+    /// backpressure_drops_, since that counter means "a correct-domain entry was
+    /// rejected for capacity", not "a caller bug occurred".
     bool enqueue(OutboxEntry e) {
+        if (e.domain != OutboxDomain::Lifecycle)
+            return false;
         if (pending_.size() >= capacity_) {
             ++backpressure_drops_;
             return false;
