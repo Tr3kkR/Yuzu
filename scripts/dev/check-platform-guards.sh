@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# check-platform-guards.sh — prove a platform-guarded TU is EMPTY under the
-# other platform's preprocessing.
+# check-platform-guards.sh — prove a platform-guarded TU produces NO CODE under
+# the other platform's preprocessing.
 #
 # WHY THIS EXISTS. A test appended to a `#ifdef _WIN32` / `#ifndef _WIN32` file
 # lands after the closing `#endif` unless you look, and the local build cannot
@@ -10,9 +10,18 @@
 # outside its guard, and then the POSIX test placed outside ITS guard one commit
 # later, the second caught only by external review.
 #
-# The check is cheap and needs no SDK: preprocess each file under the OPPOSITE
-# platform's macro and require it to be syntactically empty, because a correctly
-# guarded file has nothing left to parse.
+# IT CHECKS EMPTINESS, NOT COMPILABILITY, and that distinction is the whole
+# point. An earlier revision of this script ran `-fsyntax-only` and treated a
+# successful compile as proof of emptiness. Both external reviewers broke it
+# within minutes by appending self-contained-but-valid code after the guard —
+# `static_assert(true, ...)`, a free function in an anonymous namespace — which
+# compiles happily and was reported as "ok ... is empty". A check that
+# false-passes the exact class it exists to catch is worse than no check,
+# because it is trusted. It now preprocesses with `-E -P` and rejects ANY
+# non-whitespace output, which is what "nothing is left" actually means.
+#
+# Needs no SDK: a correctly guarded file preprocesses to nothing regardless of
+# what headers the other platform would have required.
 #
 # Usage: bash scripts/dev/check-platform-guards.sh
 
@@ -30,14 +39,23 @@ checks=(
 rc=0
 for spec in "${checks[@]}"; do
     f="${spec%%:*}"; flag="${spec##*:}"
-    [ -f "$f" ] || { echo "  SKIP  $f (not present)"; continue; }
-    if "$CXX" -std=c++23 "$flag" -fsyntax-only "$f" 2>/dev/null; then
-        echo "  ok    $f is empty under $flag"
+    if [ ! -f "$f" ]; then
+        # A configured file that has vanished is a FAILURE, not a skip: a rename
+        # would otherwise drop its coverage silently.
+        echo "  FAIL  $f is configured for this check but does not exist (renamed or removed?)"
+        rc=1
+        continue
+    fi
+    # -E -P: preprocess only, no linemarkers. Anything surviving is real code.
+    leaked=$("$CXX" -std=c++23 "$flag" -E -P "$f" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$leaked" ]; then
+        echo "  ok    $f preprocesses to nothing under $flag"
     else
-        echo "  FAIL  $f has code OUTSIDE its platform guard (compiled under $flag)"
-        "$CXX" -std=c++23 "$flag" -fsyntax-only "$f" 2>&1 | head -5 | sed 's/^/        /'
+        echo "  FAIL  $f leaves code OUTSIDE its platform guard (under $flag)"
+        "$CXX" -std=c++23 "$flag" -E -P "$f" 2>/dev/null | grep -vE '^\s*$' | head -5 \
+            | sed 's/^/        /'
         rc=1
     fi
 done
-[ "$rc" -eq 0 ] && echo "check-platform-guards: all guarded TUs are correctly scoped."
+[ "$rc" -eq 0 ] && echo "check-platform-guards: all guarded TUs preprocess to nothing."
 exit "$rc"
