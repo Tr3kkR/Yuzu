@@ -167,30 +167,19 @@ struct Harness {
     }
 };
 
-/// ONE gRPC server for every TEST_CASE in this file, not one per case.
-///
-/// This is a cost reduction, NOT the fix for the Windows SIGSEGV — that was
-/// the cross-thread Catch2 assertion documented on sha256_hex_of above, and
-/// two successive attempts to explain the crash by this harness's lifecycle
-/// (first a Shutdown/Wait teardown-ordering theory, then repeated
-/// create/destroy churn) were both shipped and both disproven by the crash
-/// recurring unchanged. Recording that here so the next reader does not
-/// re-derive either dead end: the harness lifecycle was never the defect.
-///
-/// Kept because it is simply cheaper — one server bound, and one torn down at
-/// process exit via this function-local static, instead of seven of each.
-///
-/// Safe to share: every TEST_CASE below already sets `svc.payload` and
-/// `svc.signature` explicitly before issuing its RPC (the two SECTIONs that
-/// want no signature call `svc.signature.clear()`), so there is no
-/// leftover-state risk between cases, and Catch2 runs TEST_CASEs
-/// sequentially in this binary — never two of these concurrently.
-Harness& shared_harness() {
-    static Harness h;
-    if (!h.server)
-        h.start();
-    return h;
-}
+// A HARNESS IS PER-TEST_CASE, AND MUST STAY THAT WAY — do not hoist it into a
+// process-lifetime static to save the setup cost. That was tried, and it broke
+// `test_subprocess_runner.cpp`'s "does not leak an inherited non-CLOEXEC fd"
+// case on Linux: a server and client channel held open for the rest of the run
+// leave gRPC's event-engine descriptors live, that test `dup2`s over a
+// HARDCODED fd number (21) to plant a non-CLOEXEC fd, and it ends up stealing
+// the number from gRPC — which reopens it with FD_CLOEXEC set, failing the
+// case's own precondition assert. Building and dropping the server inside each
+// TEST_CASE keeps those descriptors out of the rest of the binary's fd space.
+//
+// The Windows SIGSEGV that prompted the hoist was never a harness-lifecycle
+// problem at all — see the note on sha256_hex_of above for what it actually
+// was.
 
 /// A throwaway "installed agent binary" for the updater to replace.
 struct FakeExe {
@@ -227,9 +216,10 @@ double refused(yuzu::MetricsRegistry& m, const char* reason) {
 TEST_CASE("updater: a correctly signed package is applied", "[updater][signing][grpc]") {
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness& h = shared_harness();
+    Harness h;
     h.svc.payload = read_file(f.artifact_file);
     h.svc.signature = read_file(f.sig_file);
+    h.start();
 
     Updater updater(cfg_with(f.trust_bundle, /*require=*/true), "test-agent", "0.1.0", "linux",
                     "x86_64", exe.path);
@@ -245,9 +235,10 @@ TEST_CASE("updater: a package signed by a FOREIGN CA is refused", "[updater][sig
     // distinguishes it.
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness& h = shared_harness();
+    Harness h;
     h.svc.payload = read_file(f.artifact_file);
     h.svc.signature = read_file(f.sig_file);
+    h.start();
 
     // Same package, same valid signature — but the agent trusts a different CA.
     yuzu::MetricsRegistry metrics;
@@ -274,9 +265,10 @@ TEST_CASE("updater: a present-but-invalid signature is refused in BOTH modes",
 
     for (const bool require : {false, true}) {
         FakeExe exe;
-        Harness& h = shared_harness();
+        Harness h;
         h.svc.payload = read_file(f.artifact_file);
         h.svc.signature = read_file(f.sig_file);
+        h.start();
 
         yuzu::MetricsRegistry metrics;
         // Signature is valid, but the agent trusts a different CA.
@@ -297,9 +289,10 @@ TEST_CASE("updater: a tampered payload increments the INVALID refusal counter",
     // real failure (a signature over different bytes) was unverified.
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness& h = shared_harness();
+    Harness h;
     h.svc.payload = read_file(f.artifact_file) + "-tampered";
     h.svc.signature = read_file(f.sig_file);
+    h.start();
 
     yuzu::MetricsRegistry metrics;
     Updater updater(cfg_with(f.trust_bundle, /*require=*/true, &metrics), "test-agent", "0.1.0",
@@ -314,9 +307,10 @@ TEST_CASE("updater: a tampered payload is refused even with a real signature",
           "[updater][signing][grpc]") {
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness& h = shared_harness();
+    Harness h;
     h.svc.payload = read_file(f.artifact_file) + "-tampered";
     h.svc.signature = read_file(f.sig_file); // signature covers the ORIGINAL bytes
+    h.start();
 
     Updater updater(cfg_with(f.trust_bundle, false), "test-agent", "0.1.0", "linux", "x86_64",
                     exe.path);
@@ -331,9 +325,10 @@ TEST_CASE("updater: an unsigned package is refused only when require is set",
 
     SECTION("require on → refused") {
         FakeExe exe;
-        Harness& h = shared_harness();
+        Harness h;
         h.svc.payload = read_file(f.artifact_file);
         h.svc.signature.clear();
+        h.start();
         yuzu::MetricsRegistry metrics;
         Updater updater(cfg_with(f.trust_bundle, /*require=*/true, &metrics), "test-agent", "0.1.0",
                         "linux", "x86_64", exe.path);
@@ -345,9 +340,10 @@ TEST_CASE("updater: an unsigned package is refused only when require is set",
 
     SECTION("require off → applied, transitional mode") {
         FakeExe exe;
-        Harness& h = shared_harness();
+        Harness h;
         h.svc.payload = read_file(f.artifact_file);
         h.svc.signature.clear();
+        h.start();
         Updater updater(cfg_with(f.trust_bundle, /*require=*/false), "test-agent", "0.1.0", "linux",
                         "x86_64", exe.path);
         auto r = updater.check_and_apply(h.stub.get());
@@ -363,9 +359,10 @@ TEST_CASE("updater: with no trust bundle configured, signatures are not checked 
     // "unset bundle" really does mean off, rather than accidentally enforcing.
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness& h = shared_harness();
+    Harness h;
     h.svc.payload = read_file(f.artifact_file);
     h.svc.signature = read_file(f.sig_file);
+    h.start();
 
     Updater updater(cfg_with(fs::path{}, /*require=*/false), "test-agent", "0.1.0", "linux",
                     "x86_64", exe.path);
