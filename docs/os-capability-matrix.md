@@ -491,6 +491,18 @@ implementation is.
 | os_info | uptime | linux | supported | 1 | /proc/uptime | - |
 | os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
 | os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
+| power_health | battery | linux | constrained | 1 | /sys/class/power_supply uevent parsing | fixture-verified; no live Linux venue in this run |
+| power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | - |
+| power_health | battery | windows | supported | 1 | GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is fixture-tested through the injected boundary and is UNVERIFIED on real battery hardware pending the reviewer's laptop run |
+| power_health | thermal | linux | constrained | 1 | /sys/class/thermal zone parsing | fixture-verified; no live Linux venue in this run |
+| power_health | thermal | macos | constrained | 1 | NSProcessInfo.thermalState + IOPMGetThermalWarningLevel | reports a 4-level thermal-pressure enum, never a temperature reading |
+| power_health | thermal | windows | constrained | 1 | PDH \\Thermal Zone Information(*)\\Temperature | zero live counter instances is the measured normal case on desktop hardware (the-rig, 2026-09-04); reports no_thermal_zones_exposed as an explicit success, never an error or a fabricated zero |
+| power_health | power_plan | linux | planned | 1 | platform_profile | declared only; not implemented in this package |
+| power_health | power_plan | macos | unsupported | - | - | macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted |
+| power_health | power_plan | windows | supported | 1 | PowrProf PowerEnumerate + PowerReadFriendlyName + PowerGetActiveScheme | 4 schemes verified live on the-rig, 2026-09-04 (agrees with powercfg /list) |
+| power_health | set_power_plan | linux | planned | 1 | platform_profile | declared only; not implemented in this package |
+| power_health | set_power_plan | macos | unsupported | - | - | macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted |
+| power_health | set_power_plan | windows | supported | 1 | PowrProf PowerSetActiveScheme | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
 | processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
