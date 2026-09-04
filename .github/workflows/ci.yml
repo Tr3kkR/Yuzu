@@ -81,6 +81,15 @@ concurrency:
   # killing 10+ min of compile work on rapid landings, and the
   # squash-merge-mid-CI race plausibly explained the irreproducible
   # post-squash Windows test failure (#501). PR-4 of the CI overhaul plan.
+  #
+  # Canary-specific consequence (#3889): if the canary's vcpkg-canary cache
+  # entry is ever evicted under pool pressure, the resulting cold rebuild
+  # (~65-70 min) needs to run to completion to save a fresh entry. On an
+  # actively-iterated PR, cancel-in-progress means each push cancels the
+  # prior run before it can finish and save — so that PR repeats the full
+  # cold rebuild on every push, never catching up, until either a push
+  # lands with no immediate follow-up or dev/main (which queues instead of
+  # cancelling) completes one and re-warms the shared scope.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -2317,6 +2326,13 @@ jobs:
         # `VCPKG_COMMIT` has never changed in this repo's history, so the
         # path that would resurrect a dead-format entry has never fired —
         # tracked as #3888.
+        #
+        # A miss here isn't announced anywhere a human would notice short of
+        # reading this step's raw log for "Cache not found" — a silent
+        # ~65-70 min cold rebuild reads as an unexplained slow job, not a
+        # flagged event. No aggregate signal for the shared cache pool's
+        # total usage exists either (would need an `actions: read`
+        # permission grant this job doesn't have). Both tracked as #3889.
         id: cache-vcpkg-canary
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:

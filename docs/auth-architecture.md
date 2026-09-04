@@ -2972,6 +2972,18 @@ walkthrough.
   grant, or a full securable × operation wildcard grant). Fails closed
   (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
   reference data can't be resolved.
+- **Audit-persist posture (#2466/#2406, ADR-1005 "mutations fail closed on
+  audit failure"):** every *mutating* engine-principal REST route fails closed
+  — `503` + `Sec-Audit-Failed: true` — if its audit row cannot persist, so a
+  privileged mutation never reports success on an unrecorded action (mint/rotate
+  additionally withhold the one-time secret); the MCP twins signal the same
+  non-fatally via `audit_persisted:false`. The *reads* instead set the header
+  and proceed: they commit no state and disclose only authorization **topology
+  metadata** (principal ids, owners, role grants), not per-person behavioural
+  PII — so the fail-closed-on-read posture that governs the device/network PII
+  reads (which exists to keep individual-identifying data off an unaudited
+  response) does not apply. Full contract: `docs/user-manual/rest-api.md`
+  "Engine Principals" → *Audit-persist failure*.
 - **Owner-delete interlock (two-mode enforcement):** a user who owns an
   active engine principal must not be silently removed, or the principal's
   audit trail loses its named responsible human. Enforcement mode is chosen
