@@ -288,7 +288,12 @@ spec:
     ttlSeconds: 60
 
   approval:
-    mode: always
+    # role-gated == ExecuteGate::AdminOrApproval, which is what the capability
+    # fragment authors. `always` would map to AlwaysApproval and contradict it:
+    # an Administrator may dispatch this directly, and everyone else needs an
+    # approval decision. tests/test_capability_gate_consistency.py enforces the
+    # agreement between these two declarations.
+    mode: role-gated
 
   permissions:
     executeRoles: [endpoint-admin]
