@@ -20,15 +20,18 @@ User=yuzu-agent
 Group=yuzu-agent
 # Optional environment file (leading '-' = no error when absent). Deliberately under
 # /etc/yuzu-agent/, NOT the shared /etc/yuzu/ (docs/agent-privilege-model.md's existing
-# convention for agent-owned config, matching agent.cfg/cert/): on a host that also runs
-# yuzu-server, the server .deb/.rpm postinst re-asserts /etc/yuzu as 0750 yuzu:yuzu on
-# every install/upgrade, and directory-write lets that DIFFERENT service account unlink
-# or replace any file inside regardless of the file's own mode - a root:root 0600 file
-# under /etc/yuzu is not actually confined against the server account. /etc/yuzu-agent/
-# has no such collision. Not shipped by the .deb/.rpm - create it by hand, root:root
-# 0600 (protects at rest and, on an agent-only host or under /etc/yuzu-agent/, stops the
-# yuzu-agent account altering its own boot posture too; not a secrets channel - the agent
-# still inherits every value it sets). Persists deploy-time YUZU_* settings across
+# convention for agent-dedicated config, matching agent.cfg/cert/ - "dedicated", not
+# "owned": this file is root:root, tighter than those siblings' root:agent, see below):
+# on a host that also runs yuzu-server, the server .deb/.rpm postinst re-asserts
+# /etc/yuzu as 0750 yuzu:yuzu on every install/upgrade, and directory-write lets that
+# DIFFERENT service account unlink or replace any file inside regardless of the file's
+# own mode - a root:root 0600 file under /etc/yuzu is not actually confined against the
+# server account. /etc/yuzu-agent/ has no such collision. Not shipped by the .deb/.rpm -
+# create it by hand, root:root 0600 (protects at rest and stops the yuzu-agent account
+# altering its own boot posture too - stricter than agent.cfg/cert's root:agent 0640
+# because systemd reads this one as root pre-exec, so the agent process never needs
+# read access to it at all; not a secrets channel regardless - the agent still inherits
+# every value it sets). Persists deploy-time YUZU_* settings across
 # restarts and upgrades, chiefly YUZU_AGENT_SPARK_DISABLE=1, the prefer_spark rollback
 # lever (#3851; see docs/user-manual/guaranteed-state.md "SparkEngine"). A missing or
 # unreadable file is silently skipped - rollback then silently does NOT apply, verify
