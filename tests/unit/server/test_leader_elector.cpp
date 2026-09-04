@@ -137,3 +137,31 @@ TEST_CASE("epoch_is_current fails closed when no leader row exists",
     CHECK_FALSE(
         LeaderElector::epoch_is_current(observer.get(), kServerBackgroundLeaderLock, 1));
 }
+
+// Fail-closed construction — invalid config never opens and never leads. These
+// need no database: the constructor returns before any PQconnectdb, so they
+// assert the early-return paths (invalid lock_name, empty dsn, empty holder_id)
+// leave the elector permanently non-open. Tagged [pg][store] to sit with the
+// sibling cases in the same shard; they never skip.
+TEST_CASE("LeaderElector fails closed on an invalid lock_name",
+          "[pg][store][leader-elector]") {
+    LeaderElector e(LeaderElector::Config{
+        .dsn = "postgresql://ignored", .holder_id = "holder-a", .lock_name = "Bad Name!"});
+    CHECK_FALSE(e.is_open());
+    CHECK_FALSE(e.try_acquire());
+    CHECK_FALSE(e.is_leader());
+}
+
+TEST_CASE("LeaderElector fails closed on an empty dsn (no libpq-default fallback)",
+          "[pg][store][leader-elector]") {
+    LeaderElector e(LeaderElector::Config{.dsn = "", .holder_id = "holder-a"});
+    CHECK_FALSE(e.is_open());
+    CHECK_FALSE(e.try_acquire());
+}
+
+TEST_CASE("LeaderElector fails closed on an empty holder_id",
+          "[pg][store][leader-elector]") {
+    LeaderElector e(LeaderElector::Config{.dsn = "postgresql://ignored", .holder_id = ""});
+    CHECK_FALSE(e.is_open());
+    CHECK_FALSE(e.try_acquire());
+}

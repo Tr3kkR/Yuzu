@@ -6,7 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include <charconv>
-#include <cctype>
+#include <cstring>
 
 namespace yuzu::server {
 
@@ -61,7 +61,7 @@ const std::vector<pg::PgMigration>& LeaderElector::migrations() {
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          "CREATE SEQUENCE IF NOT EXISTS leader_epoch_seq AS bigint;"
-         "CREATE TABLE leader_state ("
+         "CREATE TABLE IF NOT EXISTS leader_state ("
          "  lock_key             TEXT PRIMARY KEY,"
          "  current_leader_epoch BIGINT NOT NULL,"
          "  holder_id            TEXT NOT NULL,"
@@ -77,6 +77,16 @@ LeaderElector::LeaderElector(Config cfg)
       lock_key_(make_lock_key(cfg_.lock_name)) {
     if (!name_valid_) {
         spdlog::error("leader_elector: invalid lock_name; elector stays non-open (fail-closed)");
+        return;
+    }
+    // Fail closed on an empty DSN or holder_id rather than connecting: an empty
+    // DSN makes PQconnectdb silently fall back to libpq env/socket defaults, so
+    // two replicas could resolve DIFFERENT databases and each hold "the" leader
+    // lock — a silent split-brain of the leadership row (UP-3). An empty
+    // holder_id would satisfy the NOT NULL column but leave leadership
+    // unattributable (UP-7).
+    if (cfg_.dsn.empty() || cfg_.holder_id.empty()) {
+        spdlog::error("leader_elector: empty dsn or holder_id; elector stays non-open (fail-closed)");
         return;
     }
     std::lock_guard<std::mutex> lk(mu_);
@@ -95,7 +105,9 @@ bool LeaderElector::connect_locked() {
     // Never reassign the connection while a lock guard still references it.
     drop_leadership_locked();
     open_ = false;
-    if (!name_valid_)
+    // Fail closed on any invalid config on every (re)connect, not just at
+    // construction — heartbeat's failure path calls back in here (UP-3/UP-7).
+    if (!name_valid_ || cfg_.dsn.empty() || cfg_.holder_id.empty())
         return false;
 
     conn_ = pg::PgConn{PQconnectdb(cfg_.dsn.c_str())};

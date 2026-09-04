@@ -52,7 +52,6 @@
 #include "pg/pg_raii.hpp"
 #include "pg/pg_session_advisory_lock.hpp"
 
-#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -121,6 +120,16 @@ public:
     /// reference to the live elector. See the two-dispatch-planes note above:
     /// use this ONLY on leader-driven background claims, never on an
     /// operator-synchronous path.
+    ///
+    /// ISOLATION CONTRACT (the claim-side wiring, slice 3.3, MUST honour this).
+    /// This read must observe the LATEST COMMITTED epoch. Run it in a
+    /// READ COMMITTED transaction, or as the FIRST statement of the claim
+    /// transaction — never after an earlier statement in a REPEATABLE READ /
+    /// SERIALIZABLE transaction, whose snapshot was taken before a concurrent
+    /// handover committed. A snapshot predating the handover would return the
+    /// pre-handover epoch and ADMIT a stale ex-leader's claim, silently
+    /// defeating the fence. The primitive cannot enforce the caller's isolation
+    /// level, so the claim site owns satisfying this.
     [[nodiscard]] static bool epoch_is_current(PGconn* claim_conn,
                                                const std::string& lock_name,
                                                std::int64_t expected_epoch);
