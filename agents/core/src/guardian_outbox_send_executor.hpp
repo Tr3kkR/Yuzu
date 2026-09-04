@@ -542,6 +542,16 @@ private:
                 // one step earlier.
                 if (state_->stopping)
                     return false;
+                // Fault injection (#3966 fold-in, governance Gate 5 chaos CH-1):
+                // exercises the EARLIEST point in this locked block that could throw -
+                // before ANY State mutation, before the ticket is armed - the UNARMED
+                // rollback path. Distinct from LaunchFaultForTest::Throw below, which
+                // fires after both. Rollback here is trivial by construction (nothing
+                // was set, the ticket's destructor is a no-op), but nothing previously
+                // exercised this exact point directly.
+                if (launch_fault_for_test_.load(std::memory_order_relaxed) ==
+                    LaunchFaultForTest::ThrowBeforeCommit)
+                    throw std::bad_alloc{};
                 state_->in_flight_event_id = entry.event_id; // the ONE throwing step,
                                                               // FIRST - strong guarantee,
                                                               // in_flight still false
