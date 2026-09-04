@@ -58,6 +58,8 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <spdlog/spdlog.h> // #3953 items 1+2 - firewalled stall/orphan-exception logging
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -117,9 +119,25 @@ public:
         // NOT done under one held lock: launch() itself re-locks state_->mu for its
         // own bookkeeping (see below), and that mutex is not recursive.
         bool need_launch = false;
+        bool mismatch_still_running = false;
+        bool stopping_retain = false;
+        bool log_mismatch_stall = false;   ///< item 2: A itself just crossed the threshold
+        bool log_orphan_exception = false; ///< item 1: A's reclaimed result was a throw (first occurrence)
+        bool log_orphan_recovery = false;  ///< item 2: A had stalled earlier and just resolved
+        // The orphan's OWN event_id, captured under the lock before it can be
+        // overwritten by a later launch() - the mismatch-stall and orphan-recovery
+        // logs below are about the OLD (orphaned) entry, never about `entry` (the
+        // NEWLY offered one), so they must not use entry.event_id.
+        std::string orphan_event_id;
         {
+            // Every branch below sets a FLAG rather than `return`ing directly, so the
+            // lock is always released the ordinary way (this block's closing brace)
+            // before any post-lock logging or return - an orphan reclaimed in the SAME
+            // call that also observes `stopping` must still get its diagnostic logged
+            // (#3953 items 1+2), which an early return from inside the lock would skip.
             std::lock_guard<std::mutex> lk{state_->mu};
             if (state_->in_flight && state_->in_flight_event_id != entry.event_id) {
+                orphan_event_id = state_->in_flight_event_id;
                 // The head entry changed under us (generation-supersede purge or a
                 // withdrawal - both ORDINARY operations, not a rare race) while a
                 // send for the OLD head was still running. That worker is orphaned
@@ -131,25 +149,62 @@ public:
                     // reclaiming here unconditionally (an earlier version of this
                     // function never reclaimed at all) would otherwise wedge every
                     // future send permanently, since `event_id` never repeats.
-                    return SendResult::Retain;
+                    //
+                    // #3953 item 2: this is exactly the case a mismatched orphan can be
+                    // stalled indefinitely without ever being observed by the timeout
+                    // path below (that path only runs for the SAME entry) - checked
+                    // here too, under the same lock, so an orphan stuck this long is
+                    // still counted even though nothing ever waits on it directly.
+                    log_mismatch_stall = check_stall_locked();
+                    mismatch_still_running = true;
+                } else {
+                    // The stale worker already finished. Its result (Sent/Retain, or a
+                    // thrown exception now sitting in eptr) applies to an entry that no
+                    // longer exists in the log - there is nothing correct to do with it
+                    // except discard it; reporting it against THIS entry would
+                    // misattribute a success/failure that never happened to it. Reclaim
+                    // the slot and fall through to launch a fresh worker below.
+                    //
+                    // #3953 item 1: the discard itself is still correct (nothing else
+                    // to do with an orphan's result), but a THROWN result is real
+                    // evidence of a problem and is worth a diagnostic signal - count it
+                    // (first occurrence only logs; see the firewalled pattern this
+                    // mirrors in guardian_outbox_drain_worker.cpp).
+                    if (state_->eptr) {
+                        ++state_->orphan_exceptions_discarded;
+                        log_orphan_exception = (state_->orphan_exceptions_discarded == 1);
+                    }
+                    // #3953 item 2: an orphan that had stalled gets its recovery logged
+                    // here too - it never reaches the normal consumption path below.
+                    log_orphan_recovery = state_->stall_logged;
+                    state_->in_flight = false;
+                    state_->done = false;
+                    state_->eptr = nullptr;
                 }
-                // The stale worker already finished. Its result (Sent/Retain, or a
-                // thrown exception now sitting in eptr) applies to an entry that no
-                // longer exists in the log - there is nothing correct to do with it
-                // except discard it; reporting it against THIS entry would
-                // misattribute a success/failure that never happened to it. Reclaim
-                // the slot and fall through to launch a fresh worker below.
-                state_->in_flight = false;
-                state_->done = false;
-                state_->eptr = nullptr;
             }
-            if (!state_->in_flight) {
-                if (state_->stopping)
-                    return SendResult::Retain; // do not spawn new work once stopping
-                need_launch = true;
+            if (!mismatch_still_running) {
+                if (!state_->in_flight) {
+                    if (state_->stopping)
+                        stopping_retain = true; // do not spawn new work once stopping
+                    else
+                        need_launch = true;
+                }
+                // else: in_flight for THIS SAME entry - fall through to the wait below.
             }
-            // else: in_flight for THIS SAME entry - fall through to the wait below.
         }
+        // Lock released above (the block's closing brace) - every path funnels
+        // through here now, logging is done with no lock held.
+        if (log_orphan_exception)
+            log_orphan_exception_discarded();
+        if (log_orphan_recovery)
+            log_send_recovery(orphan_event_id);
+        if (mismatch_still_running) {
+            if (log_mismatch_stall)
+                log_send_stall(orphan_event_id);
+            return SendResult::Retain;
+        }
+        if (stopping_retain)
+            return SendResult::Retain; // do not spawn new work once stopping
         if (need_launch) {
             // Test seam: fires in the real race window between offer()'s decision
             // (need_launch=true, state_->mu already released above) and the launch()
@@ -186,17 +241,36 @@ public:
         // than the risk of touching a load-bearing pre-existing shutdown-ordering test's
         // timing assumptions. Left here as a note for whoever revisits this trade-off.
         state_->cv.wait_until(lk, deadline, [&] { return state_->done; });
-        if (!state_->done)
+        // #3953 item 2: evaluated UNCONDITIONALLY here, before checking `done` below -
+        // not gated on the timeout, so a send that crosses stall_threshold_ but still
+        // finishes DURING this same bounded wait is still counted (Fable's review: the
+        // original design gated this on `!state_->done`, which missed exactly that
+        // case). check_stall_locked() itself picks completed_at vs now() correctly for
+        // either outcome.
+        const bool log_new_stall = check_stall_locked();
+        if (!state_->done) {
+            lk.unlock();
+            if (log_new_stall)
+                log_send_stall(entry.event_id);
             return std::nullopt; // still running; caller retains and comes back
+        }
         auto result = state_->result;
         auto eptr = std::move(state_->eptr);
+        // A recovery log fires whenever THIS entry had stalled - whether the crossing
+        // was just detected above (log_new_stall) or on an earlier call (the same-entry
+        // timeout path) - exactly once, since the next launch() resets stall_logged for
+        // whatever entry takes this slot next.
+        const bool log_recovery = state_->stall_logged;
         state_->in_flight = false;
         state_->done = false;
         state_->eptr = nullptr;
-        if (eptr) {
-            lk.unlock(); // never rethrow while holding a lock a catch handler cannot see
-            std::rethrow_exception(eptr);
-        }
+        lk.unlock();
+        if (log_new_stall)
+            log_send_stall(entry.event_id);
+        if (log_recovery)
+            log_send_recovery(entry.event_id);
+        if (eptr)
+            std::rethrow_exception(eptr); // never rethrow while holding a lock a catch handler cannot see
         return result;
     }
 
@@ -325,6 +399,36 @@ private:
         return true;
     }
 
+    /// Called with NO lock held. All three logging helpers are firewalled: an
+    /// observability failure (e.g. spdlog itself throwing) must never escape offer(),
+    /// be miscounted as a send exception, or delay delivery - matches the established
+    /// pattern at guardian_outbox_drain_worker.cpp's `firewalled` lambda.
+    static void log_send_stall(const std::string& event_id) {
+        try {
+            spdlog::warn("Guardian outbox send stalled past its threshold (event_id {}); "
+                         "drain continues, the send stays running detached.",
+                         event_id);
+        } catch (...) {
+        }
+    }
+    static void log_send_recovery(const std::string& event_id) {
+        try {
+            spdlog::info("Guardian outbox send (event_id {}) completed after having "
+                         "stalled past its threshold.",
+                         event_id);
+        } catch (...) {
+        }
+    }
+    static void log_orphan_exception_discarded() {
+        try {
+            spdlog::warn("Guardian outbox send: a reclaimed orphan's result was a thrown "
+                         "exception, discarded (it belongs to a superseded entry with "
+                         "nowhere correct to attribute it). Further occurrences counted "
+                         "only.");
+        } catch (...) {
+        }
+    }
+
     /// RAII orphan-exit marker, mirroring guardian_io_executor.hpp's TicketCore split
     /// (guardian_io_executor.hpp:474-513): the worker's OWN captured copy is the one
     /// that decrements worker_count, and it is destroyed by the detached-thread
@@ -428,6 +532,11 @@ private:
                                                               // in_flight still false
                 state_->in_flight = true;
                 state_->done = false;
+                // #3953 items 1+2: reset for the NEW entry this admission is for -
+                // launched_at/stall_logged apply to whichever entry currently holds
+                // the slot.
+                state_->launched_at = std::chrono::steady_clock::now();
+                state_->stall_logged = false;
                 // Armed LAST, in this SAME locked block (#3966) - see AliveTicket::arm().
                 ticket->arm();
             }
@@ -461,6 +570,7 @@ private:
                     std::lock_guard<std::mutex> lk{st->mu};
                     st->result = r;
                     st->eptr = eptr;
+                    st->completed_at = std::chrono::steady_clock::now(); // #3953 item 2
                     st->done = true;
                 }
                 st->cv.notify_all();
