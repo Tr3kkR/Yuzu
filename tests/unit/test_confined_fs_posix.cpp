@@ -941,7 +941,6 @@ TEST_CASE("a MatchFn that throws on its first invocation stops before any deleti
     CHECK(fs::exists(root_dir / "c.tmp"));
 }
 
-#endif // !_WIN32
 
 // ── POSIX end-to-end: the real enumerator's timestamp ───────────────────────
 //
@@ -1005,3 +1004,5 @@ TEST_CASE("POSIX enumeration supplies a real file's mtime and age can select on 
     CHECK_FALSE(fs::exists(root_dir / "old.tmp"));
     CHECK(fs::exists(root_dir / "new.tmp"));
 }
+
+#endif // !_WIN32

@@ -615,13 +615,14 @@ TEST_CASE("Windows enumeration supplies LastWriteTime and age can select on it",
         FILETIME ft;
         ft.dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFULL);
         ft.dwHighDateTime = static_cast<DWORD>(static_cast<std::uint64_t>(ticks) >> 32);
-        HANDLE h = ::CreateFileW(p.wstring().c_str(), FILE_WRITE_ATTRIBUTES,
-                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                                 FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-        REQUIRE(h != INVALID_HANDLE_VALUE);
-        const BOOL ok = ::SetFileTime(h, nullptr, nullptr, &ft);
-        ::CloseHandle(h);
-        REQUIRE(ok);
+        // Adopted immediately into the file's own RAII owner rather than
+        // closed by hand: a REQUIRE between acquisition and CloseHandle would
+        // unwind past the manual close and leak the HANDLE.
+        WinHandle owned{::CreateFileW(p.wstring().c_str(), FILE_WRITE_ATTRIBUTES,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
+        REQUIRE(owned.get() != INVALID_HANDLE_VALUE);
+        REQUIRE(::SetFileTime(owned.get(), nullptr, nullptr, &ft));
     };
     set_mtime(tmp.path / "old.tmp", kOldSeconds);
     set_mtime(tmp.path / "new.tmp", kNewSeconds);
@@ -632,7 +633,7 @@ TEST_CASE("Windows enumeration supplies LastWriteTime and age can select on it",
     // 1. The enumerator reports the real values.
     const EnumBudget budget{1000, std::chrono::steady_clock::now() + std::chrono::seconds{60}};
     EnumerateResult enumerated =
-        enumerate_at(opened.root->handle_.get(), opened.root->identity(), budget);
+        enumerate_at(opened.root->h_.get(), opened.root->identity(), budget);
     REQUIRE(enumerated.reason == Reason::None);
     std::map<std::string, std::optional<std::int64_t>> by_name;
     for (const auto& e : enumerated.entries) by_name[e.name] = e.meta.mtime;

@@ -115,7 +115,6 @@ enum class Action : std::uint8_t {
     StopWalk,
 };
 
-/// Sentinel for "this entry's modification time could not be determined".
 /// Convert a Windows FILETIME (100-nanosecond ticks since 1601-01-01 UTC) to
 /// seconds since the Unix epoch, or nullopt when the value is not a timestamp.
 ///
