@@ -1696,10 +1696,10 @@ void RestApiV1::register_routes(
                                   const std::unordered_map<std::string, std::string>& params,
                                   const std::string& correlation_id,
                                   const yuzu::server::DispatchCaller& caller)
-                -> std::pair<std::string, int> {
+                -> yuzu::server::ConfinedDispatchOutcome {
                 for (const auto& id : agent_ids) {
                     if (!yuzu::server::authz::in_scope(caller.exec_visible, id))
-                        return {correlation_id, 0};
+                        return yuzu::server::ConfinedDispatchOutcome{.command_id = correlation_id};
                 }
                 return command_dispatch_fn(plugin, action, agent_ids, scope, params,
                                            correlation_id, caller);
@@ -1948,9 +1948,11 @@ void RestApiV1::register_routes(
                 bump("denied");
                 return;
             }
-            const auto [command_id, sent] =
+            const auto dispatch_outcome =
                 command_dispatch_fn("tar", "purge_source", {device_id}, "", {{"source", source}},
                                     /*execution_id=*/"", *caller);
+            const auto& command_id = dispatch_outcome.command_id;
+            const auto sent = dispatch_outcome.sent;
             if (sent == 0) {
                 // NOTE: a confinement drop also lands here and is reported as
                 // "offline" + counted as agent_not_connected. The RESPONSE
@@ -7763,8 +7765,10 @@ void RestApiV1::register_routes(
                 // pre-filtered here on purpose: the candidate set for both arms
                 // lives in the server's AgentRegistry, and a second copy of the
                 // intersection is the drift that seam exists to prevent.
-                std::tie(command_id, sent) = command_dispatch_fn(plugin, action, {}, dispatch_scope,
-                                                                 params, exec_id, caller);
+                const auto dispatch_outcome = command_dispatch_fn(plugin, action, {}, dispatch_scope,
+                                                                  params, exec_id, caller);
+                command_id = dispatch_outcome.command_id;
+                sent = dispatch_outcome.sent;
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 if (!execution_tracker->mark_cancelled(exec_id, owner)) {
@@ -10426,8 +10430,10 @@ void RestApiV1::register_routes(
                              audit_action, cid, agent_id);
                 return;
             }
-            const auto [command_id, sent] = command_dispatch_fn(plugin, action, {agent_id}, "", {},
-                                                                /*execution_id=*/"", *caller);
+            const auto dispatch_outcome = command_dispatch_fn(plugin, action, {agent_id}, "", {},
+                                                              /*execution_id=*/"", *caller);
+            const auto& command_id = dispatch_outcome.command_id;
+            const auto sent = dispatch_outcome.sent;
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(

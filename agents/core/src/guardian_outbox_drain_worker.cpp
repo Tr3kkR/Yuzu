@@ -102,6 +102,27 @@ void GuardianOutboxDrainWorker::start() {
         }
         sig->cv.notify_all();
     });
+    // No completion-waker is wired here: a completed send whose result arrives AFTER
+    // wrapped_send()'s own bounded per-attempt wait (kGuardianSendOfferWait, 200ms)
+    // already gave up is only noticed on the next enqueue wake or the periodic
+    // backstop (periodic_bound_ms_, kDefaultPeriodicBoundMs = 5000ms in production) -
+    // a real cadence regression versus pre-fix behavior (governance Gate 6 sre
+    // finding). A WakeFn callback was built and wired once (stored in
+    // GuardianOutboxSendExecutor::State, called right after that class's own
+    // state_->cv.notify_all() in launch()'s worker lambda, under the same lock that
+    // publishes done=true) and made EVERY completed send bump sig_->gen and wake loop()
+    // immediately. That broke "R4: a refill re-arm does not wait out the periodic bound"
+    // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
+    // loop re-arms a forced page from ITS OWN internal refill logic with NO external
+    // wake. Disabling the callback made the test pass again 4/4; the exact mechanism by
+    // which the extra per-send wakes broke it was not diagnosed. Reverted for the same
+    // reason offer()'s wake-on-stopping was reverted in
+    // guardian_outbox_send_executor.hpp's offer()/wait_until comment: the regression's
+    // cost is judged smaller than the risk of redesigning another load-bearing
+    // pre-existing timing test in this file under this PR's own time budget. The
+    // callback and its wiring were fully removed (not merely disabled) - left as a note
+    // for whoever revisits this trade-off, since re-adding it means also auditing every
+    // existing test that assumes loop() wakes ONLY on enqueue/notify()/periodic-bound.
     thread_ = std::thread([this] {
         // TOP-LEVEL firewall. The inner passes are each firewalled, but the loop's own tail -
         // the lifecycle_headroom() call (std::mutex::lock can throw system_error) and the
@@ -144,6 +165,13 @@ void GuardianOutboxDrainWorker::stop() {
         // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
         // already taken by an in-flight enqueue stays safe (still-alive Signal).
         rt_.set_outbox_enqueue_waker({});
+        // Stop admitting new detached sends on BOTH lanes (#2233 item 4); does not
+        // cancel one already in flight - that worker is covered by the orphan-exit
+        // contract (active_send_workers(), summed into GuardianEngine::active_io_workers()),
+        // not by this join. Before the join below, not after: the loop's own next
+        // wrapped_send() call must see stopping if it races this.
+        lifecycle_send_exec_.stop();
+        compliance_send_exec_.stop();
         sig_->cv.notify_all();
     }
     // The join is OUTSIDE the first_stop guard and keyed on joinable(), not on the
@@ -189,12 +217,15 @@ GuardianSparkRuntime::DrainOutcome GuardianOutboxDrainWorker::drain_bounded() {
     GuardianSparkRuntime::DrainLimits limits;
     limits.max_entries = maint_.drain_budget;
     limits.max_wall = maint_.drain_max_wall;
-    // Checked before EVERY send, not once per pass: a bounded pass is still a count bound,
-    // and one slow-but-succeeding send makes it arbitrarily long while GuardianEngine::stop()
-    // holds mtx_ waiting on our join (#2298 Sol review). The in-flight send cannot be
-    // interrupted; no further one starts.
+    // Checked before EVERY send, not once per pass: a bounded pass is still a count bound.
     limits.should_stop = [this] { return stop_requested(); };
-    return rt_.drain_bounded(send_, limits);
+    // Routed through wrapped_send(), not send_ directly (#2233 item 4): a stalled sink no
+    // longer makes this pass - or GuardianEngine::stop()'s join waiting on it (#2298 Sol
+    // review) - arbitrarily long. wrapped_send() bounds its own wait to
+    // kGuardianSendOfferWait and retains the head if the real send hasn't finished by then;
+    // the send itself keeps running detached (guardian_outbox_send_executor.hpp), covered by
+    // the orphan-exit contract rather than by this pass's own limits.
+    return rt_.drain_bounded([this](const OutboxEntry& e) { return wrapped_send(e); }, limits);
 }
 
 GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMaintenanceOps ops) {

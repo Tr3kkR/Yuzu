@@ -130,6 +130,7 @@
 #include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
+#include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
@@ -1350,6 +1351,15 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonQuarantined)}});
 
+        // #3511: same three routes, same discipline, for the plugin-presence
+        // filter — an unseeded series reads as "no dispatch has ever been
+        // withheld for a missing plugin" when the truth may be "the filter
+        // never ran".
+        for (const char* route : {"dispatch_closure", "command", "legacy"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}});
+
         // The containment gate's own outcome series, seeded across its whole
         // closed label set for the same reason. Without this, `absent()` on
         // `outcome="fail_closed"` cannot tell "the gate has never had to fail
@@ -1642,14 +1652,6 @@ public:
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
                                   "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
             metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
-        metrics_.describe("yuzu_server_rbac_backfill_total",
-                          "One-time legacy rbac.db -> rbac_store PostgreSQL backfill outcome on "
-                          "first PG boot, by result (fresh = no legacy DB, marked complete; "
-                          "completed = migrated + reconciled; failed = fail-closed, boot refused, "
-                          "next start retries).",
-                          "counter");
-        for (const auto result : {"fresh", "completed", "failed"})
-            metrics_.counter("yuzu_server_rbac_backfill_total", {{"result", result}});
         // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
         // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
         // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
@@ -1712,13 +1714,6 @@ public:
                           "counter");
         for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
             metrics_.counter("yuzu_server_mgmt_group_read_degrade_total", {{"reason", reason}});
-        metrics_.describe("yuzu_server_mgmt_group_backfill_total",
-                          "Management-group legacy-SQLite backfill outcomes by result "
-                          "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
-                          "failed = fail-closed refusal). One-time at boot (ADR-0042)",
-                          "counter");
-        for (const auto result : {"completed", "fresh", "failed"})
-            metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
         // DiscoveryStore observability (ADR-0044). The read-degrade counter is
         // the fail-closed signal: a non-zero rate means list_devices could not
         // answer (store_not_open/pool_acquire_timeout/query_error) — /readyz
@@ -1959,14 +1954,6 @@ public:
                           "Delivery-log INSERTs (webhook_deliveries) that failed against an open "
                           "store - the delivery itself still ran; only its record did not persist",
                           "counter");
-        metrics_.describe("yuzu_server_webhook_backfill_total",
-                          "One-time legacy webhooks.db -> webhook_store PostgreSQL backfill "
-                          "outcome on every boot, by result (success = fresh install, "
-                          "already-migrated skip, or a completed migration; failed = fail-closed, "
-                          "boot refused, next start retries). ADR-0057.",
-                          "counter");
-        for (const auto result : {"success", "failed"})
-            metrics_.counter("yuzu_server_webhook_backfill_total", {{"result", result}});
         metrics_.describe("yuzu_server_offload_delivery_success_total",
                           "Offload-target deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_offload_delivery_failed_total",
@@ -4581,9 +4568,12 @@ public:
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
             // versions. The CA root key itself is a 0600 file via default_certs, never in this
-            // DB. Born-on-PG like the other migrated stores: fail-closed on open, then a
-            // MANDATORY backfill of the legacy ca.db (issued-cert + CRL history is compliance
-            // evidence, ADR-0053 — refuse boot rather than serve a knowingly-incomplete trail).
+            // DB. Born-on-PG like the other migrated stores: fail-closed on open. NO backfill
+            // (ADR-0009's 2026-08-25 fresh-start-by-default amendment): the legacy ca.db is
+            // never copied; the detect-and-warn obligation still applies (issued-cert/CRL
+            // history is compliance evidence, not expendable telemetry), so
+            // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file read-only and
+            // warns (with a row count) only if it actually holds rows.
             if (pg_pool_ && !startup_failed_) {
                 ca_store_ = std::make_unique<CaStore>(*pg_pool_);
                 if (!ca_store_->is_open()) {
@@ -4592,17 +4582,9 @@ public:
                                   "created/opened)");
                     startup_failed_ = true;
                 } else {
-                    auto ca_db = cfg_.db_dir() / "ca.db";
-                    if (!ca_store_->migrate_from_sqlite(ca_db)) {
-                        spdlog::error("[PG] Refusing to start: ca store backfill from legacy {} "
-                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
-                                      "log lines). The issued-cert/CRL evidence chain must be "
-                                      "complete before serving; the next boot retries. Operator "
-                                      "remediation: repair the file, or quarantine it aside if it "
-                                      "is unrecoverable.",
-                                      ca_db.string());
-                        startup_failed_ = true;
-                    }
+                    legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "ca.db", "CaStore",
+                                                             {"ca_root", "ca_issued",
+                                                              "ca_crl_versions"});
                 }
             }
             // PR 10 hardening — wire AuditStore into FleetTopologyStore
@@ -5585,10 +5567,14 @@ public:
         // Initialize Phase 3: Security & RBAC stores (PostgreSQL, ADR-0041).
         // The authorization substrate — construction fail-closed (ADR-0007): a
         // failed open/migration refuses boot rather than serve with authz off.
-        // `migrate_from_sqlite` runs the MANDATORY one-time legacy-`rbac.db`
-        // backfill (ADR-0009/0041) — a failure there is ALSO fatal (never serve
-        // on top of a partially-migrated authorization config; losing a grant or
-        // the enabled flag is a fleet-wide authorization change nobody authored).
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment):
+        // the legacy rbac.db is never copied; the detect-and-warn obligation
+        // still applies (RBAC grants and the enabled flag are irreducible
+        // operator intent, not expendable telemetry), so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds
+        // rows — including `rbac_config`, the table holding the enabled flag,
+        // the row that matters most here.
         if (pg_pool_ && !startup_failed_) {
             rbac_store_ = std::make_unique<RbacStore>(*pg_pool_);
             if (!rbac_store_->is_open()) {
@@ -5597,19 +5583,11 @@ public:
                 startup_failed_ = true;
             } else {
                 rbac_store_->set_metrics(&metrics_);
-                auto rbac_db = cfg_.db_dir() / "rbac.db";
-                if (!rbac_store_->migrate_from_sqlite(rbac_db)) {
-                    spdlog::error("[PG] Refusing to start: RbacStore legacy-SQLite backfill from {} "
-                                  "failed (see prior log lines) — the authorization substrate is "
-                                  "authoritative and must not serve partially-migrated grants or a "
-                                  "lost rbac_enabled flag (mandatory backfill, ADR-0009/0041)",
-                                  rbac_db.string());
-                    startup_failed_ = true;
-                } else {
-                    spdlog::info("RbacStore initialized (schema rbac_store; legacy backfill source "
-                                 "{})",
-                                 rbac_db.string());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "rbac.db", "RbacStore",
+                    {"rbac_config", "securable_types", "operations", "roles", "role_permissions",
+                     "principal_roles", "groups", "group_members"});
+                spdlog::info("RbacStore initialized (schema rbac_store)");
             }
         }
 
@@ -5692,10 +5670,13 @@ public:
         // (ADR-0006/ADR-0042, schema `management_group_store`) — construction
         // fail-CLOSED per ADR-0012 §1: a reachable database whose schema can't
         // migrate/open is a fatal startup error, never a serve-degraded
-        // confinement substrate. `migrate_from_sqlite` runs the one-time,
-        // idempotent legacy-`management-groups.db` backfill (ADR-0009) —
-        // AUTHORITATIVE confinement scope means a backfill failure is ALSO fatal
-        // (never serve on top of partially-migrated confinement config).
+        // confinement substrate. NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment): the legacy management-groups.db is
+        // never copied; the detect-and-warn obligation still applies
+        // (confinement groups are irreducible operator intent, not expendable
+        // telemetry), so legacy_sqlite_probe::warn_if_legacy_rows() opens the
+        // legacy file read-only and warns (with a row count) only if it
+        // actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             mgmt_group_store_ = std::make_unique<ManagementGroupStore>(*pg_pool_);
             if (!mgmt_group_store_->is_open()) {
@@ -5705,17 +5686,9 @@ public:
                 startup_failed_ = true;
             } else {
                 mgmt_group_store_->set_metrics(&metrics_);
-                auto mgmt_db = cfg_.db_dir() / "management-groups.db";
-                if (!mgmt_group_store_->migrate_from_sqlite(mgmt_db)) {
-                    spdlog::error("[PG] Refusing to start: management-group legacy-SQLite backfill "
-                                  "failed (see prior log lines) — management_group_store is the "
-                                  "AUTHORITATIVE confinement substrate and must not serve "
-                                  "partially-migrated data. Operator remediation: repair {} or move "
-                                  "it aside to skip the backfill (confinement groups in it will NOT "
-                                  "carry over)",
-                                  mgmt_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(
+                    cfg_.db_dir() / "management-groups.db", "ManagementGroupStore",
+                    {"management_groups", "management_group_members", "management_group_roles"});
             }
         }
         if (mgmt_group_store_ && mgmt_group_store_->is_open() && !startup_failed_) {
@@ -5756,11 +5729,17 @@ public:
         // Postgres store (ADR-0006/ADR-0047, schema `quarantine_store`) —
         // construction fail-CLOSED per ADR-0012 §1: a reachable database
         // whose schema can't migrate/open is a fatal startup error, never a
-        // serve-degraded state. `migrate_from_sqlite` runs the one-time,
-        // idempotent legacy-`quarantine.db` backfill (ADR-0009) — an active
-        // quarantine record is live security containment state, so backfill
-        // is MANDATORY and a failure is ALSO fatal (never serve on top of
-        // partially-migrated quarantine data).
+        // serve-degraded state. NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment): the legacy quarantine.db is
+        // never copied; the detect-and-warn obligation still applies (an
+        // active quarantine record is live security containment state, not
+        // expendable telemetry), so legacy_sqlite_probe::warn_if_legacy_rows()
+        // opens the legacy file read-only and warns (with a row count) only
+        // if it actually holds rows. A real legacy quarantine record found
+        // this way means the server's view no longer reflects it — the
+        // device is NOT re-quarantined in Postgres, though agent-side
+        // firewall enforcement (§11.7, out of scope for this store) may
+        // still be in effect independently.
         if (pg_pool_ && !startup_failed_) {
             quarantine_store_ = std::make_unique<QuarantineStore>(*pg_pool_);
             if (!quarantine_store_->is_open()) {
@@ -5770,24 +5749,9 @@ public:
                 startup_failed_ = true;
             } else {
                 quarantine_store_->set_metrics(&metrics_);
-                auto quar_db = cfg_.db_dir() / "quarantine.db";
-                if (!quarantine_store_->migrate_from_sqlite(quar_db)) {
-                    spdlog::error(
-                        "[PG] Refusing to start: quarantine legacy-SQLite backfill failed — "
-                        "quarantine_store is AUTHORITATIVE and must not serve partially-"
-                        "migrated data. Operator remediation depends on the SPECIFIC reason "
-                        "logged above, not on this line alone: if it names a corrupt/truncated/"
-                        "unreadable {} or a fingerprint refusal BEFORE any insert happened, "
-                        "nothing has been migrated yet and moving it aside safely skips the "
-                        "backfill (its quarantine history, including any ACTIVE record, will "
-                        "NOT carry over — verify no device should currently be quarantined "
-                        "before doing this). If it instead names a row-insert or completion-"
-                        "marker problem, this replica's rows may ALREADY be durably inserted "
-                        "in Postgres — do NOT move the file aside without first checking "
-                        "quarantine_store.quarantine_records for the affected agent_id(s).",
-                        quar_db.string());
-                    startup_failed_ = true;
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "quarantine.db",
+                                                         "QuarantineStore",
+                                                         {"quarantine_records"});
             }
         }
         // Scope-walking result sets (capability §30). Migrated Postgres store
@@ -6286,14 +6250,16 @@ public:
         // auth_key_provider_ rather than minting a second KeyProvider over
         // the same install-wide KEK): SecretCodec (ctor only) -> WebhookStore
         // (this ctor registers `secret` as the secret column) ->
-        // SecretCodec::init() -> migrate_from_sqlite (MANDATORY backfill,
-        // ADR-0009 — webhook configs+secrets are unconditionally mandatory,
-        // and ADR-0057 also treats the delivery log as mandatory: it is
-        // not TTL'd, so ResponseStore's "ages out" skip-justification does
-        // not hold, and one transaction already covers both tables at this
-        // scale). auth_key_provider_ is guaranteed non-null whenever this
-        // guard is reached — same reasoning as the plugin_config_store_
-        // block above.
+        // SecretCodec::init(). NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment, OffloadTargetStore/ResponseStore
+        // precedent): no production fleet has ever run a pre-Postgres build
+        // of this store, so there is no legacy webhooks.db content to
+        // protect — legacy_sqlite_probe::harden_legacy_file_0600 (this
+        // store's legacy file may hold a plaintext signing secret, ADR-0010
+        // §Consequences (a)) then warn_if_legacy_rows run instead, right
+        // after set_metrics() so the read-degrade counters are already live.
+        // auth_key_provider_ is guaranteed non-null whenever this guard is
+        // reached — same reasoning as the plugin_config_store_ block above.
         if (pg_pool_ && !startup_failed_) {
             webhook_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
             webhook_store_ = std::make_unique<WebhookStore>(*pg_pool_, *webhook_secret_codec_);
@@ -6320,67 +6286,51 @@ public:
                             init_res.error().message);
                         startup_failed_ = true;
                     } else {
-                        // set_metrics() BEFORE migrate_from_sqlite() — gov
-                        // Gate 3 sre: the old ordering left
-                        // yuzu_server_webhook_backfill_total{result} dead on
-                        // every production boot (metrics_ was still null at
-                        // the sole call site inside migrate_from_sqlite).
-                        // NotificationStore's equivalent block (above) is
-                        // the reference ordering this now matches.
                         webhook_store_->set_metrics(&metrics_);
-                        auto webhook_db = cfg_.db_dir() / "webhooks.db";
-                        if (!webhook_store_->migrate_from_sqlite(webhook_db)) {
-                            spdlog::error(
-                                "[PG] Refusing to start: webhook legacy-SQLite backfill failed "
-                                "(see prior log lines) — webhook_store is authoritative and must "
-                                "not serve partially-migrated secret-bearing data. Operator "
-                                "remediation: repair {} or move it aside to skip the backfill "
-                                "(existing webhooks/signing secrets in it will NOT carry over)",
-                                webhook_db.string());
-                            startup_failed_ = true;
-                        } else {
-                            spdlog::info("WebhookStore initialized (schema webhook_store; legacy "
-                                         "backfill source {})",
-                                         webhook_db.string());
-                            // #3261/#3294 lesson 10: wire the consumer only
-                            // inside the full-success branch — a top-of-ctor
-                            // wiring block that ran before this store
-                            // existed silently never fired.
-                            agent_service_.set_webhook_store(webhook_store_.get());
-                            // ADR-0010 §Decision 3 evidence surface (gov Gate
-                            // 6 compliance-officer, contract floor — the
-                            // decrypt-failure metric alone does not satisfy
-                            // ADR-0010's "emit an audit event + metric" rule).
-                            // Mirrors auth_secret_codec_'s hook exactly
-                            // (server.cpp:4176) — audit_store_ already exists
-                            // by this point (constructed above at :4093), so
-                            // no deferred-wiring step is needed here the way
-                            // AuthDB's block needed one. Lifetime: the lambda
-                            // captures `this` and reads `audit_store_` at
-                            // call time, never the pointer, so a later reset
-                            // store cannot dangle; stop() clears the hook
-                            // before destroying the codec (below).
-                            webhook_secret_codec_->set_audit_hook(
-                                [this](std::string_view verb, const std::string& detail_json) {
-                                    if (!audit_store_ || !audit_store_->is_open())
-                                        return;
-                                    const bool failure = (verb == "secret.decrypt_failure");
-                                    (void)audit_store_->log(
-                                        {.timestamp = std::time(nullptr),
-                                         .principal = "system:secret-codec",
-                                         .principal_role = "system",
-                                         .action = std::string(verb),
-                                         .target_type = "Secret",
-                                         .target_id = "webhook_store",
-                                         // detail_json carries AAD
-                                         // coordinates, kek_version and the
-                                         // failure class ONLY — never
-                                         // ciphertext, plaintext, DEK or key
-                                         // bytes (secret_codec.hpp).
-                                         .detail = detail_json,
-                                         .result = failure ? "failure" : "success"});
-                                });
-                        }
+                        legacy_sqlite_probe::harden_legacy_file_0600(
+                            cfg_.db_dir() / "webhooks.db", "WebhookStore");
+                        legacy_sqlite_probe::warn_if_legacy_rows(
+                            cfg_.db_dir() / "webhooks.db", "WebhookStore",
+                            {"webhooks", "webhook_deliveries"});
+                        spdlog::info("WebhookStore initialized (schema webhook_store)");
+                        // #3261/#3294 lesson 10: wire the consumer only
+                        // inside the full-success branch — a top-of-ctor
+                        // wiring block that ran before this store
+                        // existed silently never fired.
+                        agent_service_.set_webhook_store(webhook_store_.get());
+                        // ADR-0010 §Decision 3 evidence surface (gov Gate
+                        // 6 compliance-officer, contract floor — the
+                        // decrypt-failure metric alone does not satisfy
+                        // ADR-0010's "emit an audit event + metric" rule).
+                        // Mirrors auth_secret_codec_'s hook exactly
+                        // (server.cpp:4176) — audit_store_ already exists
+                        // by this point (constructed above at :4093), so
+                        // no deferred-wiring step is needed here the way
+                        // AuthDB's block needed one. Lifetime: the lambda
+                        // captures `this` and reads `audit_store_` at
+                        // call time, never the pointer, so a later reset
+                        // store cannot dangle; stop() clears the hook
+                        // before destroying the codec (below).
+                        webhook_secret_codec_->set_audit_hook(
+                            [this](std::string_view verb, const std::string& detail_json) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                const bool failure = (verb == "secret.decrypt_failure");
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:secret-codec",
+                                     .principal_role = "system",
+                                     .action = std::string(verb),
+                                     .target_type = "Secret",
+                                     .target_id = "webhook_store",
+                                     // detail_json carries AAD
+                                     // coordinates, kek_version and the
+                                     // failure class ONLY — never
+                                     // ciphertext, plaintext, DEK or key
+                                     // bytes (secret_codec.hpp).
+                                     .detail = detail_json,
+                                     .result = failure ? "failure" : "success"});
+                            });
                     }
                 }
             }
@@ -6470,7 +6420,13 @@ public:
         // migrated to Postgres (ADR-0006/0008/0009/0037, schema `inventory_store`).
         // Coexists with the typed SoftwareInventoryStore below (that store's own
         // migration, not this one). Fails closed like every PG store: a reachable
-        // database whose schema/backfill cannot complete must not serve degraded.
+        // database whose schema cannot be created/opened must not serve degraded.
+        // NO backfill (ADR-0009's 2026-08-25 fresh-start-by-default amendment):
+        // the legacy inventory.db is never copied, and `delete_agent` no longer
+        // erases anything from it either — a leftover legacy file is inert. The
+        // detect-and-warn obligation still applies, so
+        // legacy_sqlite_probe::warn_if_legacy_rows() opens the legacy file
+        // read-only and warns (with a row count) only if it actually holds rows.
         if (pg_pool_ && !startup_failed_) {
             inventory_store_ = std::make_unique<InventoryStore>(*pg_pool_);
             if (!inventory_store_->is_open()) {
@@ -6479,26 +6435,19 @@ public:
                               "not be created/opened)");
                 startup_failed_ = true;
             } else {
-                auto inv_db = cfg_.db_dir() / "inventory.db";
-                if (!inventory_store_->migrate_from_sqlite(inv_db)) {
-                    spdlog::error("[PG] Refusing to start: generic inventory store backfill from "
-                                  "legacy {} failed (ADR-0009 fail-closed; see prior log lines). "
-                                  "Operator remediation: repair the file or quarantine it as an "
-                                  "operator-managed backup per ADR-0037 to skip "
-                                  "the backfill — gateway-connected live agents re-push generic "
-                                  "blobs on a changed/full report (weekly full floor); direct-"
-                                  "connected, offline, and decommissioned agents' "
-                                  "generic blobs need manual re-import (ADR-0037)",
-                                  inv_db.string());
-                    startup_failed_ = true;
-                } else {
-                    // Set-once before serving (race-free): wires the shared
-                    // read-degrade counter + the new ingest-drop/query-truncation
-                    // counters (governance IS3).
-                    inventory_store_->set_metrics(&metrics_);
-                    if (gateway_service_)
-                        gateway_service_->set_inventory_store(inventory_store_.get());
-                }
+                legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "inventory.db",
+                                                         "InventoryStore", {"inventory_data"});
+                // probe-then-set_metrics is this site's pre-existing order (unlike the other 5
+                // retired stores' set_metrics-then-probe) -- deliberately unchanged by #3623,
+                // functionally inert either way since the probe takes no metrics handle
+                // (governance consistency-auditor, 2026-09-03).
+                //
+                // Set-once before serving (race-free): wires the shared
+                // read-degrade counter + the new ingest-drop/query-truncation
+                // counters (governance IS3).
+                inventory_store_->set_metrics(&metrics_);
+                if (gateway_service_)
+                    gateway_service_->set_inventory_store(inventory_store_.get());
             }
         }
 
@@ -11112,7 +11061,7 @@ private:
     /// reverted, judging the blast radius (18+ fake DispatchFn lambdas plus
     /// the BundleOrchestrator coupling above) disproportionate for an
     /// audit-completeness LOW both external reviewers graded non-blocking.
-    std::pair<std::string, int> dispatch_confined(
+    yuzu::server::ConfinedDispatchOutcome dispatch_confined(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
@@ -11171,7 +11120,7 @@ private:
                                      /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
                                      std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return {command_id, 0};
+            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
 
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
@@ -11246,6 +11195,8 @@ private:
                                                    caller.principal_role, command_id,
                                                    std::move(outcome.denied_quarantined));
         }
+        audit_unknown_plugin_dispatch("dispatch_closure", caller.principal, caller.principal_role,
+                                      command_id, plugin, outcome.unknown_plugin_count);
 
         forward_gateway_pending();
         if (outcome.sent > 0)
@@ -11269,7 +11220,7 @@ private:
                          "necessarily a routine zero-reach dispatch",
                          plugin, norm_action, command_id);
         }
-        return {command_id, outcome.sent};
+        return outcome;
     }
 
     /// #1634: the SINGLE per-agent Response-scope predicate — every Response:Read
@@ -11806,6 +11757,52 @@ private:
             spdlog::error("audit write failed: quarantine.dispatch_denied (command={} "
                           "fail_closed, agents={})",
                           command_id, denied_count);
+    }
+
+    // #3511: the plugin-presence sibling of the quarantine emitters above.
+    // CORRECTED (PR #3939 review): this used to be metric+log only, on the
+    // claimed grounds that plugin absence is an INVENTORY fact rather than a
+    // POLICY decision, so there was "nothing for an auditor to review." That
+    // reasoning does not survive contact with `docs/observability-conventions.md`'s
+    // MUST clause ("Denied operations MUST emit an audit event — spdlog::warn
+    // alone breaks the SOC 2 CC7.2 evidence chain") — a command an operator or
+    // agentic caller asked for was NOT delivered, which is exactly what that
+    // clause exists to make durable, independent of whether a human "decided"
+    // it. Mirrors `audit_quarantine_dispatch_fail_closed`'s shape exactly: ONE
+    // aggregate row per dispatch (`target_id="*"`), not one per withheld id —
+    // this is a single withholding decision applied to a batch, the same
+    // shape as a fail-closed gate denial, not a per-device fact worth its own
+    // row the way a specific quarantine denial is.
+    void audit_unknown_plugin_dispatch(std::string_view route, const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& plugin,
+                                       std::size_t count) {
+        if (count == 0)
+            return;
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}})
+            .increment(static_cast<double>(count));
+        spdlog::warn(
+            "dispatch withheld: route={} command={} plugin={} reason=unknown_plugin agents={}",
+            route, command_id, plugin, count);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "command.dispatch_withheld";
+        ev.target_type = "Command";
+        ev.target_id = "*";
+        ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
+                    " reason=plugin_not_found agents=" + std::to_string(count);
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
+                          "agents={})",
+                          command_id, plugin, count);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a
@@ -15218,6 +15215,17 @@ private:
             // also cost a Postgres round trip. Still shared by all four arm
             // branches below.
             const auto containment_gate = make_containment_gate(plugin, action);
+            // #3424/#3511: same lifecycle as containment_gate — one registry
+            // read for the whole request, shared by every arm branch below.
+            // BR-009: `classified->wire().plugin()`, NOT the raw `plugin`
+            // local — `classify()` is case-insensitive (command_capability.hpp)
+            // and `finalize_classified_command` builds the wire command from
+            // the catalogue-resolved spelling, so a caller who dispatches with
+            // valid-but-non-canonical casing (e.g. "TAR") must be checked
+            // against the SAME spelling every agent's self-reported inventory
+            // uses, or every agent that genuinely has the plugin is spuriously
+            // flagged absent (governance Gate 2 finding, self-review round).
+            const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
 
             int sent = 0;
             // #881: filled by whichever arm branch below actually ran, then
@@ -15230,6 +15238,9 @@ private:
             // dispatch thread, per refused dispatch), so .size() is not the
             // denial count. See ArmDispatchResult.
             std::size_t denied_quarantined_count = 0;
+            // #3511: mirrors denied_quarantined_count for the plugin-presence
+            // filter — see ArmDispatchResult::unknown_plugin_count.
+            std::size_t unknown_plugin_count = 0;
             // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
             // the MCP execute_instruction schema, docs/scope-walking-design.md), and
             // it is handled here as "no scope expression" so the ordering matches the
@@ -15249,7 +15260,7 @@ private:
             const auto dispatch_broadcast = [&]() -> yuzu::server::ArmDispatchResult {
                 return yuzu::server::dispatch_confined_arms(
                     yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-                    /*broadcast_on_none=*/true, containment_gate, confined_sink);
+                    /*broadcast_on_none=*/true, containment_gate, confined_sink, plugin_missing);
             };
 
             if (arm == yuzu::server::DispatchArm::Group) {
@@ -15265,10 +15276,11 @@ private:
                 t.group_members = &members;
                 const auto result = yuzu::server::dispatch_confined_arms(
                     arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
-                    confined_sink);
+                    confined_sink, plugin_missing);
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                unknown_plugin_count = result.unknown_plugin_count;
             } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
@@ -15323,10 +15335,11 @@ private:
                     t.scope_matched = &*ladder.matched;
                     const auto result = yuzu::server::dispatch_confined_arms(
                         arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
-                        confined_sink);
+                        confined_sink, plugin_missing);
                     sent = result.sent;
                     denied_quarantined = result.denied_quarantined;
                     denied_quarantined_count = result.denied_quarantined_count;
+                    unknown_plugin_count = result.unknown_plugin_count;
                 }
                 // else: the ladder already audited the abort (db_degraded /
                 // owner_check_failed / principal_unresolved) — sent stays 0.
@@ -15342,10 +15355,11 @@ private:
                 t.agent_ids = &agent_ids;
                 const auto result = yuzu::server::dispatch_confined_arms(
                     arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
-                    confined_sink);
+                    confined_sink, plugin_missing);
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                unknown_plugin_count = result.unknown_plugin_count;
             } else if (arm == yuzu::server::DispatchArm::Broadcast) {
                 // Explicitly asked for the fleet by its published name — #1788
                 // still narrows delivery to the operator's visible set; the
@@ -15355,6 +15369,7 @@ private:
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                unknown_plugin_count = result.unknown_plugin_count;
             } else {
                 // Broadcast ONLY when the caller named no target at all (#2500).
                 // A target that was SUPPLIED but resolved to nothing must never
@@ -15418,6 +15433,13 @@ private:
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                // #3511: this arm (the omitted-target -> whole-fleet default,
+                // #2500) was missing this copy while every other arm branch
+                // above has it — a plugin-absence withholding on THIS arm
+                // silently fell through to the generic "failed to send
+                // command to any agent" 503 instead of the specific
+                // `plugin_not_found` one below.
+                unknown_plugin_count = result.unknown_plugin_count;
             }
 
             // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -15433,12 +15455,14 @@ private:
                                                        caller.principal_role, command_id,
                                                        std::move(denied_quarantined));
             }
+            audit_unknown_plugin_dispatch("command", caller.principal, caller.principal_role,
+                                          command_id, plugin, unknown_plugin_count);
 
             // Forward commands queued for gateway agents
             forward_gateway_pending();
 
             if (sent == 0) {
-                // #881: say WHICH kind of nothing. All three of these answered
+                // #881/#3511: say WHICH kind of nothing. All four of these answered
                 // "failed to send command to any agent", which reads as an
                 // agent-connectivity outage — so a fail-closed containment
                 // gate, which denies EVERY agent on EVERY dispatch fleet-wide,
@@ -15455,6 +15479,13 @@ private:
                 } else if (denied_quarantined_count > 0) {
                     res.set_content(
                         R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else if (unknown_plugin_count > 0) {
+                    // #3511: the dispatched plugin is absent from every target's
+                    // reported inventory — a command guaranteed to fail, withheld
+                    // before dispatch rather than reported as a false success.
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                         "application/json");
                 } else {
                     res.set_content(
@@ -15475,15 +15506,24 @@ private:
                         {"action", action},
                         {"command_id", command_id},
                         {"scope", scope_expr}});
-            res.set_header(
-                "HX-Trigger",
-                "{\"showToast\":{\"message\":\"Command sent to " + std::to_string(sent) +
-                    " agent(s)" +
-                    (denied_quarantined_count == 0
-                         ? std::string{}
-                         : "; " + std::to_string(denied_quarantined_count) +
-                               " withheld (quarantined)") +
-                    "\",\"level\":\"success\"}}");
+            // #3424/#3511 (governance Gate 4 finding, independently raised by
+            // consistency-auditor and unhappy-path): a MIXED partial dispatch
+            // -- some reached, some withheld for plugin absence -- must be as
+            // visible as a mixed quarantine withholding already is, or the
+            // "a mixed cause is never invisible" property the zero-reach
+            // cascade goes out of its way to guarantee silently doesn't hold
+            // once sent > 0.
+            std::string toast_suffix;
+            if (denied_quarantined_count > 0)
+                toast_suffix +=
+                    "; " + std::to_string(denied_quarantined_count) + " withheld (quarantined)";
+            if (unknown_plugin_count > 0)
+                toast_suffix += "; " + std::to_string(unknown_plugin_count) +
+                                " withheld (plugin not found)";
+            res.set_header("HX-Trigger",
+                           "{\"showToast\":{\"message\":\"Command sent to " +
+                               std::to_string(sent) + " agent(s)" + toast_suffix +
+                               "\",\"level\":\"success\"}}");
             // #881: a PARTIAL dispatch must say so. Without this an operator
             // targeting a 100-device group with 3 contained devices reads
             // "Command sent to 97 agent(s)" and has no signal that 3 were
@@ -15496,6 +15536,7 @@ private:
                                 {"command_id", command_id},
                                 {"agents_reached", sent},
                                 {"withheld_quarantined", denied_quarantined_count},
+                                {"withheld_unknown_plugin", unknown_plugin_count},
                                 {"thead_html", agent_service_.thead_for_plugin(plugin)}})
                     .dump(),
                 "application/json");
@@ -19274,7 +19315,7 @@ private:
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id) -> std::pair<std::string, int> {
+                   const std::string& execution_id) -> yuzu::server::ConfinedDispatchOutcome {
             // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
             // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
             // that must confine call command_dispatch_caller_fn / the caller-typed
@@ -19305,7 +19346,8 @@ private:
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id,
-                   const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                   const yuzu::server::DispatchCaller& caller)
+                -> yuzu::server::ConfinedDispatchOutcome {
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
                                      execution_id, caller, /*broadcast_on_none=*/false);
         };
@@ -19319,8 +19361,8 @@ private:
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
-                   const std::string& definition_id,
-                   const std::string& concurrency_mode) -> std::pair<std::string, int> {
+                   const std::string& definition_id, const std::string& concurrency_mode)
+                -> yuzu::server::ConfinedDispatchOutcome {
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
                                      execution_id, caller, /*broadcast_on_none=*/false,
                                      definition_id, concurrency_mode);
@@ -20375,7 +20417,7 @@ private:
                                   const std::vector<std::string>& agent_ids,
                                   const std::string& scope_expr,
                                   const std::unordered_map<std::string, std::string>& parameters)
-                -> std::pair<std::string, int> {
+                -> yuzu::server::ConfinedDispatchOutcome {
                 return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
                                            /*execution_id=*/"");
             },
@@ -20601,7 +20643,7 @@ private:
                                   const std::vector<std::string>& agent_ids,
                                   const std::string& scope_expr,
                                   const std::unordered_map<std::string, std::string>& parameters)
-                -> std::pair<std::string, int> {
+                -> yuzu::server::ConfinedDispatchOutcome {
                 return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
                                            /*execution_id=*/"");
             },
@@ -20997,7 +21039,8 @@ private:
                 const std::string& plugin, const std::string& action,
                 const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                 const std::unordered_map<std::string, std::string>& parameters,
-                const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller& caller)
+                -> yuzu::server::ConfinedDispatchOutcome {
                 return command_dispatch_caller_fn(plugin, action, agent_ids, scope_expr,
                                                   parameters, /*execution_id=*/"", caller);
             },
@@ -21077,12 +21120,12 @@ private:
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const yuzu::server::DispatchCaller& caller)
-                -> std::pair<std::string, int> {
-                auto [command_id, sent] = dispatch_confined(plugin, action, agent_ids, scope_expr,
-                                                            parameters, /*execution_id=*/std::string{},
-                                                            caller, /*broadcast_on_none=*/true);
+                -> yuzu::server::ConfinedDispatchOutcome {
+                auto outcome = dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                                 /*execution_id=*/std::string{}, caller,
+                                                 /*broadcast_on_none=*/true);
 
-                if (sent > 0) {
+                if (outcome.sent > 0) {
                     // Publish RUNNING status + clear results via SSE.
                     // This MUST happen via SSE (not in the POST response)
                     // because the POST response races with SSE output
@@ -21106,7 +21149,7 @@ private:
                     event_bus_.publish("output",
                                        "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>");
                 }
-                return {command_id, sent};
+                return outcome;
             },
             // CallerFn — CDX-R7-02 / PLAN-006: resolve the caller's identity +
             // Execution:Execute visible set from the request. The dashboard
@@ -22600,7 +22643,7 @@ private:
                        const std::unordered_map<std::string, std::string>& parameters,
                        const std::string& execution_id,
                        const yuzu::server::DispatchCaller& caller)
-                    -> std::pair<std::string, int> {
+                    -> yuzu::server::ConfinedDispatchOutcome {
                     // MCP normalises an omitted target to kBroadcastScope upstream
                     // (mcp_server.cpp), so broadcast_on_none=true states its
                     // deliberate broadcast-on-empty contract. Same seam as the
@@ -22609,7 +22652,7 @@ private:
                                                execution_id, caller,
                                                /*broadcast_on_none=*/true);
                     spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
-                                 r.second);
+                                 r.sent);
                     return r;
                 },
                 // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
@@ -22913,9 +22956,13 @@ private:
         // the gate, that unfiltered path bypasses containment with no per-id
         // check at all.
         const auto containment_gate = make_containment_gate(plugin, action);
+        // #3424/#3511: same lifecycle as containment_gate — one registry read
+        // for this dispatch. BR-009: `classified->wire().plugin()`, not the
+        // raw `plugin` local — see the /api/command sibling site's comment.
+        const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
         auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-            /*broadcast_on_none=*/false, containment_gate, sink);
+            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing);
         int sent = result.sent;
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -22931,9 +22978,11 @@ private:
                                                    caller.principal_role, command_id,
                                                    std::move(result.denied_quarantined));
         }
+        audit_unknown_plugin_dispatch("legacy", caller.principal, caller.principal_role,
+                                      command_id, plugin, result.unknown_plugin_count);
 
         if (sent == 0) {
-            // Same three-way split as /api/command above — see the comment
+            // Same four-way split as /api/command above — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
             // operator to the wrong subsystem.
@@ -22945,6 +22994,10 @@ private:
             } else if (result.denied_quarantined_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.unknown_plugin_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(
@@ -23074,6 +23127,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_c(),
         yuzu::server::capdecls::plugin_action_catalogue_d(),
         yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
+        yuzu::server::capdecls::plugin_action_catalogue_disk_actions(),
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/

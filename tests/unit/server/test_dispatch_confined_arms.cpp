@@ -322,6 +322,31 @@ TEST_CASE("resolve_and_dispatch_confined: Ids arm is classified and intersected 
     CHECK(std::find(sink.reached.begin(), sink.reached.end(), "dev-A") == sink.reached.end());
 }
 
+TEST_CASE("resolve_and_dispatch_confined: a fail-closed containment gate sets "
+          "containment_unreadable through the REAL derivation, not a hand-built struct "
+          "(CH-3, Gate 5)",
+          "[server][dispatch][scope][security][3424]") {
+    // `outcome.containment_unreadable = gate.enforced && gate.fail_closed` lives in
+    // resolve_and_dispatch_confined (dispatch_scope_ladder.hpp), NOT in
+    // dispatch_confined_arms — the inner function the sibling fail-closed test above
+    // calls directly. Every other `containment_unreadable` test in this codebase (MCP,
+    // REST, dashboard) constructs a `ConfinedDispatchOutcome` by hand and sets the field
+    // itself, so none of them exercises this line. This test calls the same
+    // classify-then-dispatch entry point `ServerImpl::dispatch_confined` delegates to,
+    // with the same (agent_ids, scope_expr) shape a real caller supplies — a regression
+    // that stopped deriving the field here (e.g. reverted to always-false, or read the
+    // wrong gate field) fails this test while every fake-struct test stays green.
+    RecordingSink sink;
+    const std::vector<std::string> ids{"dev-A", "dev-B"};
+    const auto gate = ContainmentGate::enforcing(/*fail_closed=*/true, {});
+    const auto outcome = resolve_and_dispatch_confined(
+        ids, /*scope_expr=*/"", unfiltered(), /*broadcast_on_none=*/false, gate,
+        no_group_no_scope_resolvers(), sink.make());
+    CHECK(outcome.containment_unreadable);
+    CHECK(outcome.sent == 0);
+    CHECK(sink.reached.empty());
+}
+
 TEST_CASE("resolve_and_dispatch_confined: Group arm resolves via the injected group store, "
           "then intersects",
           "[server][dispatch][scope][security]") {

@@ -345,7 +345,7 @@ struct RestGsHarness {
                    const std::vector<std::string>& ids, const std::string&,
                    const std::unordered_map<std::string, std::string>&, const std::string&,
                    const yuzu::server::DispatchCaller& caller)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             last_live_plugin = plugin;
             last_live_action = action;
             last_live_exec_visible = caller.exec_visible;
@@ -358,7 +358,7 @@ struct RestGsHarness {
                 std::all_of(ids.begin(), ids.end(), [&](const std::string& id) {
                     return yuzu::server::authz::in_scope(caller.exec_visible, id);
                 });
-            return {plugin + "-live", admitted ? live_sent : 0};
+            return {.sent = admitted ? live_sent : 0, .command_id = plugin + "-live"};
         };
         // When wire_live_deps is off, leave the dispatch closure empty so the /live
         // handler hits its "substrate unavailable → 503" branch.

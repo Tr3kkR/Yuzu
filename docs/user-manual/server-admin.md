@@ -1724,15 +1724,16 @@ systemctl start yuzu-server
 
 `WebhookStore` moves from SQLite (`webhooks.db`) to the PostgreSQL substrate, and the webhook
 HMAC signing secret is now envelope-encrypted at rest (`SecretCodec`, ADR-0010) instead of a
-plaintext column. A **mandatory, automatic backfill** re-encrypts every existing webhook's
-secret and carries over the delivery log on first boot; a failed backfill refuses to start the
-server (the boot log names the exact remediation). `POST /api/webhooks` now returns `400`
+plaintext column. No production fleet ever ran a pre-Postgres build of this store, so there was
+no real legacy data to migrate — the mandatory backfill this originally shipped with was
+retired shortly after (#3623, ADR-0057's Update); a legacy `webhooks.db` file is never read
+into Postgres, only hardened to 0600 and counted for a diagnostic warning at boot. `POST /api/webhooks` now returns `400`
 for an invalid URL, distinct from a `503` for a genuine store/database error; both `POST` and
 `DELETE` return `503` (rather than a silently-empty/silently-failed result) on that latter
-case, previously ambiguous. The legacy `webhooks.db` is retained one release as a rollback
-reference (never deleted) and still holds every pre-cutover secret in plaintext during that
-window, restricted to the file owner where the platform supports it (POSIX only, see the ADR)
-— see [`rest-api.md`](rest-api.md#post-apiwebhooks) for the rotation guidance. Full
+case, previously ambiguous. A legacy `webhooks.db` file left on disk still holds every
+pre-cutover secret in plaintext and is restricted to the file owner where the platform supports
+it (POSIX only, see the ADR) — see [`rest-api.md`](rest-api.md#post-apiwebhooks) for guidance
+on disposing of it securely. Full
 detail: `docs/adr/0057-webhook-store-postgres-migration.md` and the
 `## ⚠️ Behaviour change: webhook store moves to Postgres (ADR-0057)` section in
 `docs/user-manual/upgrading.md`.
