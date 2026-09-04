@@ -1825,6 +1825,129 @@ TEST_CASE("MCP confirm_engine_rotation: token_id pin round-trip via tools/call",
     CHECK(audit_bound);
 }
 
+// #3937: the engine-principal MUTATION twins fail closed (JSON-RPC 503 error, NOT
+// a success result) when their audit row cannot persist — parity with the REST
+// twins (#2466) and the in-MCP plugin-config precedent. mint/rotate additionally
+// WITHHOLD the one-time secret. create/revoke/transfer share the byte-identical
+// `if(!audit_ok){ mcp_audit("error"); a4_error(503,...); return; }` block.
+TEST_CASE("MCP #3937: mint_engine_credential fails CLOSED and withholds the secret on a "
+          "dropped audit",
+          "[mcp][pg][engine_principal][audit_failclose]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-mint-failclose";
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.audit_succeeds_ = false; // the mint audit row cannot persist
+    ts.start();
+
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-failclose","ttl_days":90}}})");
+    REQUIRE(r->status == 200);
+    auto body = nlohmann::json::parse(r->body);
+    // Fail closed: a JSON-RPC ERROR, not a success result.
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(body["error"]["message"].get<std::string>().find("could not be persisted") !=
+          std::string::npos);
+    CHECK(r->body.find("\"audit_persisted\":false") != std::string::npos);
+    // The one-time secret is WITHHELD — the raw_token key never appears.
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    // Attribution: the credential DID commit (mutation happened) though audit dropped.
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+}
+
+TEST_CASE("MCP #3937: rotate_engine_credential fails CLOSED and withholds the secret on a "
+          "dropped reveal audit",
+          "[mcp][pg][engine_principal][audit_failclose]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-rotate-failclose";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.audit_succeeds_ = false; // the reveal audit row cannot persist
+    ts.start();
+
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-rotate-failclose"}}})");
+    REQUIRE(r->status == 200);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("\"audit_persisted\":false") != std::string::npos);
+    CHECK(r->body.find("raw_token") == std::string::npos);
+    // Attribution: the successor was minted (overlap pair live) though the reveal audit dropped.
+    CHECK(store.list_active_for_principal(principal).size() == 2);
+}
+
+TEST_CASE("MCP #3937: confirm_engine_rotation fails CLOSED on a dropped audit (rotation still "
+          "committed)",
+          "[mcp][pg][engine_principal][audit_failclose]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-confirm-failclose";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start(); // audit ON for the rotate setup
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"rotate_engine_credential","arguments":{"principal_id":"engine:mcp-confirm-failclose"}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_payload = nlohmann::json::parse(
+        nlohmann::json::parse(rot->body)["result"]["content"][0]["text"].get<std::string>());
+    const auto tid = rot_payload["token_id"].get<std::string>();
+    const auto secret = rot_payload["raw_token"].get<std::string>();
+
+    ts.audit_succeeds_ = false; // now the confirm audit row cannot persist
+    auto r = ts.call(nlohmann::json{{"jsonrpc", "2.0"},
+                                    {"method", "tools/call"},
+                                    {"id", 2},
+                                    {"params",
+                                     {{"name", "confirm_engine_rotation"},
+                                      {"arguments",
+                                       {{"principal_id", principal},
+                                        {"token_id", tid},
+                                        {"secret", secret}}}}}}
+                         .dump());
+    REQUIRE(r->status == 200);
+    auto body = nlohmann::json::parse(r->body);
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(body["error"]["message"].get<std::string>().find("do NOT re-confirm") != std::string::npos);
+    CHECK(r->body.find("\"audit_persisted\":false") != std::string::npos);
+    // Attribution: the confirm committed — predecessor retired, successor sole active.
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 1);
+    CHECK(active[0].token_id == tid);
+}
+
 TEST_CASE("MCP confirm_engine_rotation: a WRONG secret is kPermissionDenied, distinct "
           "from token_id-mismatch's kInvalidParams (#3015)",
           "[mcp][pg][engine_principal][confirm][pop]") {

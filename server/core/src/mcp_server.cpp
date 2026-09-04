@@ -12099,10 +12099,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 bool audit_ok = audit_fn(req, "engine_principal.role.assigned", "success",
                                          "EnginePrincipal", principal_id, role_name);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The grant committed but its audit row did not
+                    // persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the role was assigned but its audit record could not be "
+                                 "persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json payload = {
                     {"assigned", true}, {"principal_id", principal_id}, {"role", role_name}};
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -12155,10 +12167,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 bool audit_ok = audit_fn(req, "engine_principal.role.unassigned", "success",
                                          "EnginePrincipal", principal_id, role_name);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The grant was removed but its audit row did not
+                    // persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the role was unassigned but its audit record could not be "
+                                 "persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 nlohmann::json payload = {
                     {"unassigned", true}, {"principal_id", principal_id}, {"role", role_name}};
-                if (!audit_ok)
-                    payload["audit_persisted"] = false;
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -12326,6 +12350,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok =
                     audit_fn(req, "engine_principal.create", "success", "EnginePrincipal",
                             principal_id, "owner=" + owner_username);
+                if (!audit_ok) {
+                    // #3937: fail closed — parity with the REST twin (#2466) and the
+                    // in-MCP plugin-config precedent. The mutation committed but its
+                    // audit row did not persist, so do not report success; the caller
+                    // must treat it as unconfirmed and reconcile via a read.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the engine principal was created but its audit record could not "
+                                 "be persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("principal_id", created->principal_id)
                     .add("display_name", created->display_name)
@@ -12333,8 +12372,6 @@ McpServer::HandlerFn McpServer::build_handler(
                     .add("classification", created->classification)
                     .add("lifecycle_state", created->lifecycle_state)
                     .add("created_at", created->created_at);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12560,12 +12597,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const bool audit_ok = audit_fn(req, "engine_principal.revoke", "success",
                                                "EnginePrincipal", principal_id, reason);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The principal + its credentials were revoked but the
+                    // audit row did not persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the engine principal was revoked but its audit record could not "
+                                 "be persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("revoked", true)
                     .add("principal_id", principal_id)
                     .add("credentials_revoked", static_cast<int64_t>(credentials_revoked));
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12660,13 +12709,29 @@ McpServer::HandlerFn McpServer::build_handler(
                                                "EnginePrincipal",
                                                found_newest ? newest.token_id : principal_id,
                                                "principal=" + principal_id);
+                if (!audit_ok) {
+                    // #3937: fail closed — the credential was minted but its audit row
+                    // did not persist, so the one-time secret is WITHHELD (never built
+                    // into the response below). Parity with the REST twin (#2466) +
+                    // the plugin-config MCP precedent; the credential exists but is
+                    // unusable — list it and rotate it to obtain an audited secret.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the credential was minted but its audit record could not be "
+                                 "persisted; the one-time secret was withheld. The credential "
+                                 "exists but is unusable: list it and rotate it to obtain an "
+                                 "audited secret",
+                                 "list the credential and rotate it; do not retry the mint",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("token_id", found_newest ? newest.token_id : "")
                     .add("raw_token", *minted)
                     .add("principal_id", principal_id)
                     .add("expires_at", expires_at);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12776,13 +12841,30 @@ McpServer::HandlerFn McpServer::build_handler(
                     req, "engine_principal.credential.reveal", "success", "EnginePrincipal",
                     found_successor ? successor.token_id : principal_id,
                     "principal=" + principal_id + " action=rotate");
+                if (!reveal_audit_ok) {
+                    // #3937: fail closed — the reveal IS this route's success audit, so
+                    // a dropped reveal-audit would let the raw secret leave the server
+                    // with no audit-chain row. The one-time secret is WITHHELD (never
+                    // built into the response below). Parity with the REST twin (#2466)
+                    // + the plugin-config MCP precedent; within the overlap window a
+                    // re-rotate re-serves the same successor once the audit persists.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the credential was rotated but its reveal audit record could not "
+                                 "be persisted; the one-time secret was withheld. Rotate again "
+                                 "within the overlap window to re-serve the same audited successor "
+                                 "secret",
+                                 "rotate again within the overlap window; do not retry immediately",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("token_id", found_successor ? successor.token_id : "")
                     .add("raw_token", *rotated)
                     .add("principal_id", principal_id)
                     .add("overlap_expires_at", found_successor ? successor.overlap_expires_at : 0);
-                if (!reveal_audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -12875,10 +12957,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok = audit_fn(req, "engine_principal.credential.confirm", "success",
                                                "EnginePrincipal", principal_id,
                                                "token_id=" + confirm_token_id);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). The rotation was confirmed (predecessor retired) but
+                    // its audit row did not persist — verify via a read and do NOT
+                    // re-confirm (the rotation is already resolved).
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "the rotation was confirmed but its audit record could not be "
+                                 "persisted; verify state via a read and reconcile the audit gap "
+                                 "out-of-band -- do NOT re-confirm (the rotation is already "
+                                 "resolved)",
+                                 "verify via a read; do not re-confirm",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("confirmed", true).add("principal_id", principal_id);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -13318,12 +13415,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok = audit_fn(req, "engine_principal.transfer_owner", "success",
                                                "EnginePrincipal", principal_id,
                                                "new_owner=" + new_owner);
+                if (!audit_ok) {
+                    // #3937: fail closed (parity with REST #2466 + plugin-config MCP
+                    // precedent). Ownership transferred but the audit row did not
+                    // persist — reconcile via a read, do not retry.
+                    mcp_audit("error", "audit_persist_failed");
+                    res.set_content(
+                        a4_error(503,
+                                 "ownership was transferred but its audit record could not be "
+                                 "persisted; treat as unconfirmed and reconcile via a read",
+                                 "verify via a read; do not retry the mutation",
+                                 /*retry_after_ms=*/-1, /*cid_override=*/{}, /*audit_ok=*/false),
+                        "application/json");
+                    return;
+                }
                 JObj payload;
                 payload.add("transferred", true)
                     .add("principal_id", principal_id)
                     .add("new_owner", new_owner);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
