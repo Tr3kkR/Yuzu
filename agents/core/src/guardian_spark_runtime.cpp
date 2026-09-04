@@ -1342,7 +1342,9 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
     // UP-3). Both logs now drain every pass; failure isolation beats strict ordering.
     // Residual (documented NICE): a reconnect flap between the two phases, or a concurrent
     // arm during the compliance phase, can still send a drift a pass ahead of its "armed".
-    // The watertight fix (merge-drain by global sequence) is a tracked follow-up.
+    // THIS residual is sequential/next-pass in shape (phase N+1 relative to phase N) - a
+    // DIFFERENT, same-pass residual exists too, see drain_bounded()'s own note below;
+    // #3972 tracks the watertight fix (merge-drain by global sequence) for both.
     DrainLimits unbounded;
     return drain_bounded(send, unbounded).sent;
 }
@@ -1350,6 +1352,15 @@ std::size_t GuardianSparkRuntime::drain(const std::function<SendResult(const Out
 GuardianSparkRuntime::DrainOutcome
 GuardianSparkRuntime::drain_bounded(const std::function<SendResult(const OutboxEntry&)>& send,
                                     const DrainLimits& limits) {
+    // Production caller: GuardianOutboxDrainWorker::drain_bounded() (#3847/#3961), which
+    // routes `send` through TWO INDEPENDENTLY SCHEDULED GuardianOutboxSendExecutor
+    // instances (one per lane), each on its own bounded per-attempt wait and its own
+    // detached worker thread. This makes a SAME-PASS cross-lane wire reordering reachable
+    // that the prior single shared executor structurally prevented: a compliance/health
+    // event can land on the wire between two lifecycle entries within this one call, if
+    // the lifecycle lane's send is still detached past its own bounded wait while the
+    // compliance/health lane's completes. Distinct from drain()'s own disclosed residual
+    // above, which is sequential/next-pass, not same-pass - #3972 tracks the fix for both.
     std::lock_guard<std::mutex> dg{drain_mu_};
     DrainOutcome out;
 

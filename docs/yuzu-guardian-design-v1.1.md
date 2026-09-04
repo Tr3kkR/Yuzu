@@ -2463,16 +2463,28 @@ Guardian ladder must check these.
   `stop()` holds `mtx_` across its whole body AND joins BOTH the
   `ConvergenceScheduler` lanes and the outbox drain worker inside it, so an
   `mtx_` acquisition on any of those threads is a lock-vs-join deadlock — a hung
-  agent shutdown, fleet-wide. Everything those threads run is in scope: the
-  journal's prune/page maintenance, the convergence sweeps, and the INJECTED
-  `send`, which is an arbitrary `std::function` supplied from `agent.cpp` and is
-  the easiest place to reintroduce it. Collaborators are handed to the workers as
-  pre-resolved handles at construction, never re-read off the engine under its
-  lock. `mtx_` is a `WorkerHostileMutex` that ABORTS on violation in
-  debug/sanitizer builds, keyed on the thread-local marker in
-  `guardian_joined_thread_role.hpp` — but the abort is a backstop, not a licence
-  to reason loosely, and it compiles out of a plain release build. (C0, #2298
-  gate 1 + Gate 4.)
+  agent shutdown, fleet-wide. In scope: the journal's prune/page maintenance and
+  the convergence sweeps, both of which run directly on a joined thread.
+  Collaborators are handed to the workers as pre-resolved handles at
+  construction, never re-read off the engine under its lock. `mtx_` is a
+  `WorkerHostileMutex` that ABORTS on violation in debug/sanitizer builds, keyed
+  on the thread-local marker in `guardian_joined_thread_role.hpp` — but the abort
+  is a backstop, not a licence to reason loosely, and it compiles out of a plain
+  release build. (C0, #2298 gate 1 + Gate 4.)
+  **NOT in scope since #3961**: the drain worker's INJECTED `send` (an arbitrary
+  `std::function` supplied from `agent.cpp`) no longer runs on the joined thread
+  — `GuardianOutboxDrainWorker::wrapped_send()` bounces every send through a
+  per-lane `GuardianOutboxSendExecutor`, which runs it on its own DETACHED
+  worker instead. That detached worker is covered by a separate invariant, the
+  ORPHAN-EXIT CONTRACT (`guardian_outbox_send_executor.hpp`'s header comment):
+  a worker wedged in a blocking syscall cannot be joined or force-cancelled, so
+  `active_send_workers()` — summed into `GuardianEngine::active_io_workers()`
+  (`guardian_engine.cpp`) alongside the state-reader and arm/disarm executors —
+  is what keeps `main.cpp`/`service_win.cpp` from tearing down the state `send`
+  captures while a detached send is still running, `hard_exit()`ing instead
+  after a bounded grace. A source left out of that sum would silently reinstate
+  the use-after-free the joined-thread rule used to prevent by a different
+  mechanism.
 - **Journal maintenance is paced by TIME, never by wake count.** The drain
   worker wakes on every outbox enqueue, and a paging pass is a full
   `list_entries` + parse + `validate_record` sweep of the journal.

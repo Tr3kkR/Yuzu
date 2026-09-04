@@ -263,8 +263,12 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
 
 void GuardianOutboxDrainWorker::loop() {
     // GuardianEngine::stop() joins this thread while holding mtx_, so mtx_ must never be
-    // taken here - including from the INJECTED send. The marker is what makes that abort
-    // instead of deadlock; the scheduler's lanes carry it for the same reason.
+    // taken here - the journal's prune/page maintenance runs directly on this thread.
+    // NOT the injected `send` (#3966 fold-in, stale since #3961): send() no longer runs
+    // on this thread at all - it runs on GuardianOutboxSendExecutor's own detached
+    // worker, covered by the orphan-exit contract instead. The marker below is what
+    // makes a violation abort instead of deadlock; the scheduler's lanes carry it for
+    // the same reason.
     const GuardianJoinedThreadRole role_marker;
     // The cadence timers are LOCALS, not members: nothing outside this thread can read
     // or write them, so the public maintenance_once() seam carries no timer state and

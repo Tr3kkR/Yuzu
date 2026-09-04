@@ -438,7 +438,9 @@ private:
     /// in flight at once - that is the SAME pre-existing, already-disclaimed
     /// contention this whole class's header names ("NOT a fix for stream_write_mu_
     /// contention"), now on two detached threads instead of one; it never touches the
-    /// worker's own thread.
+    /// worker's own thread. The same two-executor split also makes a same-pass
+    /// cross-lane WIRE ORDERING residual reachable (#3953 item 5 / #3972) - see
+    /// GuardianSparkRuntime::drain_bounded()'s own note for the mechanism.
     [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
         // Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value
         // added without updating this routing is a compiler warning here, not a
