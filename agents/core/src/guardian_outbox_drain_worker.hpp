@@ -453,8 +453,13 @@ private:
     /// GuardianSparkRuntime::drain_bounded()'s own note for the mechanism.
     [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
         // Enumerator-exhaustive, no `default` (#3953 item 4): a new OutboxDomain value
-        // added without updating this routing is a compiler warning here, not a
-        // silent fall-through into whichever branch happens to be the fallback.
+        // added without updating this routing is at least a silent fall-through into
+        // `compliance_send_exec_` (the pre-switch default), never something crash-safe
+        // to ignore. On GCC/Clang this also warns via -Wswitch (part of warning_level=3,
+        // meson.build) - but this repo builds with werror=false project-wide, so that
+        // warning does not fail CI, and MSVC's equivalent (C4062) is off at this
+        // project's current warning level (no /w14062 or /Wall set anywhere) - governance
+        // Gate 3 cpp-expert finding: do not assume uniform compiler protection here.
         GuardianOutboxSendExecutor* exec = &compliance_send_exec_;
         switch (entry.domain) {
         case OutboxDomain::Lifecycle:

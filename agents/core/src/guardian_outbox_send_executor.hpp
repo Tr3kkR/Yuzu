@@ -178,8 +178,16 @@ public:
                         ++state_->orphan_exceptions_discarded;
                         log_orphan_exception = (state_->orphan_exceptions_discarded == 1);
                     }
-                    // #3953 item 2: an orphan that had stalled gets its recovery logged
-                    // here too - it never reaches the normal consumption path below.
+                    // #3953 item 2 follow-up: check_stall_locked() FIRST, before reading
+                    // stall_logged - an orphan that crosses stall_threshold_ only in its
+                    // final stretch (never observed "still running" past threshold by
+                    // the branch above) would otherwise reach here with stall_logged
+                    // still false, silently undercounting a real stall (governance Gate
+                    // 6 sre finding). done==true here, so this correctly uses
+                    // completed_at, not now(). Recovery then logs whenever THIS orphan
+                    // had stalled - whether just detected here or on an earlier "still
+                    // running" poll - it never reaches the normal consumption path below.
+                    check_stall_locked();
                     log_orphan_recovery = state_->stall_logged;
                     state_->in_flight = false;
                     state_->done = false;
@@ -374,9 +382,12 @@ private:
         std::string in_flight_event_id;
         SendResult result{SendResult::Retain};
         std::exception_ptr eptr; ///< set instead of `result` if `send` itself threw
-        // #3953 items 1+2 - observability. Reset in launch()'s locked admission block
-        // (the same block that arms the AliveTicket), so they apply to the CURRENT
-        // in-flight send only.
+        // #3953 items 1+2 - observability. orphan_exceptions_discarded/stalls are
+        // CUMULATIVE for the life of this executor (see the accessor doc comments) -
+        // launch()'s locked admission block resets only launched_at/stall_logged
+        // below, which apply to the CURRENT in-flight send only (governance Gate 2/3
+        // truth finding: an earlier revision of this comment wrongly claimed both
+        // counters reset there too).
         std::uint64_t orphan_exceptions_discarded{0}; ///< a reclaimed orphan's throw, discarded (item 1)
         std::uint64_t stalls{0};                      ///< sends that crossed stall_threshold_ (item 2)
         std::chrono::steady_clock::time_point launched_at{};  ///< set by launch(), under the lock
