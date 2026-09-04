@@ -70,6 +70,16 @@ void ExecutionEventBus::publish(const std::string& execution_id, const std::stri
 
     {
         std::lock_guard<std::mutex> g(ch->mu);
+        // HA WS-2a-2 (Option A, self-adversarial K1): the bus id is the
+        // per-channel counter, assigned HERE under the channel mutex in PUBLISH
+        // order — so buffer order == id order and a `Last-Event-ID` reconnect
+        // (`ev.id > since_id`) can never skip an undelivered event. The durable
+        // global event_outbox.event_id is NOT used as the live bus id: assigning
+        // it at INSERT and publishing post-commit would let two concurrent
+        // same-execution transitions invert id vs publish order, stranding a
+        // committed event from a cursor-based subscriber on a SINGLE replica. The
+        // durable id lives in the outbox for the slice-2 durable failover replay
+        // (ORDER BY event_id), where cross-replica cursor stability belongs.
         ev.id = ch->next_id++;
         ch->buffer.push_back(ev);
         while (ch->buffer.size() > kBufferCap) {

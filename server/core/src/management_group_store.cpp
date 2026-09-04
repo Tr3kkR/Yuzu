@@ -5,14 +5,12 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "rbac_store.hpp" // RbacStore::validate_assignment — shared engine-principal assignment guard
-#include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <array>
@@ -37,10 +35,8 @@ constexpr const char* kStoreName = "management_group_store";
 
 // Bounded acquires (ADR-0012 §2(a)). Confinement reads are on the interactive
 // REST/dashboard/MCP list-gate path; writes get a slightly wider budget.
-// Backfill runs single-threaded at construction before serving.
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
-constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
 // Hierarchy traversal bound (ADR-0042 / ADR-0017 INV-7). A corrupt parent
 // cycle must TERMINATE, not spin; the ancestor-ward and descendant-ward walks
@@ -156,31 +152,20 @@ const std::vector<pg::PgMigration>& migrations() {
             CREATE INDEX idx_mgmt_roles_principal
                 ON management_group_roles(principal_type, principal_id);
 
-            -- Durable one-time backfill marker (ADR-0042).
+            -- Durable one-time backfill marker (ADR-0042). Marker-only; the sole
+            -- writer (migrate_from_sqlite) was retired (#3623, ADR-0042 Update).
             CREATE TABLE mgmt_group_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
         )"},
+        // migrate_from_sqlite() retired (#3623, ADR-0042 Update) — mgmt_group_meta was its
+        // sole idempotency marker. Appended at the next free slot, never renumbering v1
+        // (PgMigrationRunner applies only version > current — renumbering an already-shipped
+        // version re-applies it against a database that already ran it).
+        {2, "DROP TABLE IF EXISTS mgmt_group_meta;"},
     };
     return kMigrations;
-}
-
-// ── Legacy (SQLite) introspection for the backfill ───────────────────────────
-bool legacy_has_table(sqlite3* db, const char* table) {
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
-                           s.addr(), nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_STATIC);
-    return sqlite3_step(s.get()) == SQLITE_ROW;
-}
-
-std::string sqlite_text(sqlite3_stmt* s, int col) {
-    const auto* v = sqlite3_column_text(s, col);
-    return v ? std::string(reinterpret_cast<const char*>(v),
-                           static_cast<std::size_t>(sqlite3_column_bytes(s, col)))
-             : std::string{};
 }
 
 ManagementGroup read_group(PGresult* res, int row) {
@@ -956,411 +941,6 @@ size_t ManagementGroupStore::count_members(const std::string& group_id) const {
     if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) == 0)
         return 0;
     return static_cast<size_t>(to_i64(PQgetvalue(r.get(), 0, 0)));
-}
-
-// ── MANDATORY backfill (ADR-0009/0042) ────────────────────────────────────────
-
-bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
-    if (!open_)
-        return false;
-
-    const auto backfill_metric = [this](const char* result) {
-        if (metrics_)
-            metrics_->counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}})
-                .increment();
-    };
-
-    const auto stamp_complete = [&]() -> bool {
-        return pool_.with_txn_for(kBackfillTxnTimeout, [](PGconn* c) -> bool {
-            pg::PgResult mk = pg::exec_params(
-                c,
-                "INSERT INTO management_group_store.mgmt_group_meta (key, value) "
-                "VALUES ('backfill_complete', $1) ON CONFLICT (key) DO NOTHING",
-                std::vector<std::string>{std::to_string(now_secs())});
-            if (mk.status() != PGRES_COMMAND_OK) {
-                spdlog::error("ManagementGroupStore: backfill: marker stamp failed: {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-            return true;
-        });
-    };
-
-    // 1. Idempotency marker.
-    {
-        auto lease = pool_.acquire();
-        if (!lease) {
-            spdlog::error("ManagementGroupStore: backfill: no database connection ({})",
-                          pool_.last_error());
-            backfill_metric("failed");
-            return false;
-        }
-        pg::PgResult mk = pg::exec_params(
-            lease.get(),
-            "SELECT 1 FROM management_group_store.mgmt_group_meta WHERE key='backfill_complete'",
-            std::vector<std::string>{});
-        if (mk.status() != PGRES_TUPLES_OK) {
-            spdlog::error("ManagementGroupStore: backfill: marker lookup failed: {}",
-                          PQerrorMessage(lease.get()));
-            backfill_metric("failed");
-            return false;
-        }
-        if (PQntuples(mk.get()) > 0) {
-            spdlog::debug("ManagementGroupStore: backfill already completed, skipping");
-            return true;
-        }
-    }
-
-    // 2. Legacy present?
-    std::error_code ec;
-    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
-    if (ec) {
-        spdlog::error("ManagementGroupStore: backfill: cannot stat legacy path {}: {}",
-                      legacy_db_path.string(), ec.message());
-        backfill_metric("failed");
-        return false;
-    }
-    if (!legacy_exists) {
-        if (!stamp_complete()) {
-            backfill_metric("failed");
-            return false;
-        }
-        spdlog::info("ManagementGroupStore: backfill: no legacy db at {}; marking complete (fresh "
-                     "install)",
-                     legacy_db_path.string());
-        backfill_metric("fresh");
-        return true;
-    }
-
-    // 3. Open legacy read-only.
-    SqliteDb legacy;
-    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
-                        nullptr) != SQLITE_OK) {
-        spdlog::error("ManagementGroupStore: backfill: failed to open legacy db {}: {}",
-                      legacy_db_path.string(),
-                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
-        backfill_metric("failed");
-        return false;
-    }
-    sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-
-    // A deferred transaction fixes ONE consistent snapshot for the corruption
-    // probe, the table-existence probe, and all three reads below (PR #3174's
-    // software_deployment_store.cpp fix is the precedent for this exact
-    // hazard, itself following custom_properties_store.cpp's
-    // read_legacy_snapshot): without it, this connection's default autocommit
-    // mode makes each probe/read its own independent transaction, so a legacy
-    // file still being written by another process mid-backfill can interleave
-    // a write between them, producing a torn cross-table read. The blast
-    // radius depends on WHICH write tears across the read: a group being
-    // deleted/renamed leaves a member/role row referencing a group_id the
-    // groups-read never captured -- the non-deferrable Postgres FK on
-    // management_group_members.group_id / management_group_roles.group_id
-    // catches that at INSERT time and aborts the whole backfill (fail-closed,
-    // but NONDETERMINISTICALLY without this transaction -- an operator
-    // hitting the race sees a spurious boot failure and must retry). A
-    // member moved between two groups that BOTH continue to exist is the
-    // more dangerous case: every FK stays satisfied (both group_ids remain
-    // valid references) yet the migrated snapshot never corresponds to any
-    // single moment the legacy file was actually in -- a silent, FK-invisible
-    // inconsistency, not merely a spurious refusal. This transaction closes
-    // both classes by construction, not just the FK-visible one. `BEGIN`
-    // (not `BEGIN IMMEDIATE`) is sufficient: this connection is
-    // SQLITE_OPEN_READONLY, so there is nothing for it to write that a
-    // reserved lock would need to protect. (#3210)
-    if (sqlite3_exec(legacy.get(), "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        spdlog::error("ManagementGroupStore: backfill: failed to start a snapshot transaction on "
-                      "legacy {}: {}",
-                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
-        backfill_metric("failed");
-        return false;
-    }
-    SqliteTxn legacy_txn(legacy.get());
-
-    // Corruption probe: an unreadable legacy DB must NOT be silently skipped
-    // (that would drop every operator's confinement scope → fail-open).
-    {
-        SqliteStmt probe;
-        if (sqlite3_prepare_v2(legacy.get(), "SELECT count(*) FROM sqlite_master", -1, probe.addr(),
-                               nullptr) != SQLITE_OK ||
-            sqlite3_step(probe.get()) != SQLITE_ROW) {
-            spdlog::error("ManagementGroupStore: backfill: legacy db {} is unreadable/corrupt ({}); "
-                          "refusing backfill (fail-closed — never silently drop confinement config)",
-                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
-            backfill_metric("failed");
-            return false;
-        }
-    }
-    if (!legacy_has_table(legacy.get(), "management_groups")) {
-        if (!stamp_complete()) {
-            backfill_metric("failed");
-            return false;
-        }
-        spdlog::warn("ManagementGroupStore: backfill: legacy db {} has no management_groups table; "
-                     "marking complete",
-                     legacy_db_path.string());
-        backfill_metric("fresh");
-        return true;
-    }
-
-    // 4. Read every legacy row into memory (config sets are small) BEFORE the PG
-    // txn, so no two leases are held at once. Dynamic membership is
-    // re-derivable by the scope engine (ADR-0042), but preserving it across the
-    // cutover is harmless and avoids a visibility gap until the next refresh, so
-    // ALL member rows are backfilled with their original source.
-    struct LGroup {
-        std::string id, name, description, membership_type, created_by;
-        std::optional<std::string> parent_id, scope_expression;
-        std::int64_t created_at{0}, updated_at{0};
-    };
-    struct LMember {
-        std::string group_id, agent_id, source;
-        std::int64_t added_at{0};
-    };
-    struct LRole {
-        std::string group_id, principal_type, principal_id, role_name;
-    };
-    std::vector<LGroup> groups;
-    std::vector<LMember> members;
-    std::vector<LRole> roles;
-
-    const auto read_all = [&](const char* sql, const std::function<void(sqlite3_stmt*)>& row)
-        -> bool {
-        SqliteStmt s;
-        if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK)
-            return false;
-        int rc;
-        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW)
-            row(s.get());
-        return rc == SQLITE_DONE;
-    };
-
-    bool read_ok = true;
-    read_ok &= read_all(
-        "SELECT id, name, description, parent_id, membership_type, scope_expression, created_by, "
-        "created_at, updated_at FROM management_groups",
-        [&](sqlite3_stmt* s) {
-            LGroup g;
-            g.id = sqlite_text(s, 0);
-            g.name = sqlite_text(s, 1);
-            g.description = sqlite_text(s, 2);
-            if (sqlite3_column_type(s, 3) != SQLITE_NULL)
-                g.parent_id = sqlite_text(s, 3);
-            g.membership_type = sqlite_text(s, 4);
-            if (sqlite3_column_type(s, 5) != SQLITE_NULL)
-                g.scope_expression = sqlite_text(s, 5);
-            g.created_by = sqlite_text(s, 6);
-            g.created_at = sqlite3_column_int64(s, 7);
-            g.updated_at = sqlite3_column_int64(s, 8);
-            groups.push_back(std::move(g));
-        });
-    if (legacy_has_table(legacy.get(), "management_group_members"))
-        read_ok &= read_all(
-            "SELECT group_id, agent_id, source, added_at FROM management_group_members",
-            [&](sqlite3_stmt* s) {
-                members.push_back({sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2),
-                                   sqlite3_column_int64(s, 3)});
-            });
-    if (legacy_has_table(legacy.get(), "management_group_roles"))
-        read_ok &= read_all(
-            "SELECT group_id, principal_type, principal_id, role_name FROM management_group_roles",
-            [&](sqlite3_stmt* s) {
-                roles.push_back({sqlite_text(s, 0), sqlite_text(s, 1), sqlite_text(s, 2),
-                                 sqlite_text(s, 3)});
-            });
-    if (!read_ok) {
-        spdlog::error("ManagementGroupStore: backfill: legacy read failed: {}",
-                      sqlite3_errmsg(legacy.get()));
-        backfill_metric("failed");
-        return false;
-    }
-    // Every prior early return in this scope leaves legacy_txn uncommitted, so
-    // its destructor ROLLBACKs (harmless — SQLITE_OPEN_READONLY, nothing
-    // written). Reaching here means the probes + reads all shared one
-    // consistent snapshot; commit closes it cleanly before `legacy` itself
-    // closes at end of scope.
-    if (legacy_txn.commit() != SQLITE_OK) {
-        spdlog::error("ManagementGroupStore: backfill: failed to close the snapshot transaction "
-                      "on legacy {}: {}",
-                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
-        backfill_metric("failed");
-        return false;
-    }
-    const std::int64_t legacy_groups = static_cast<std::int64_t>(groups.size());
-    const std::int64_t legacy_members = static_cast<std::int64_t>(members.size());
-    const std::int64_t legacy_roles = static_cast<std::int64_t>(roles.size());
-
-    // Depth/cycle validation of the legacy tree (Gate 4 architect / unhappy R1).
-    // The confinement reads bound hierarchy traversal at kMaxHierarchyDepth; a
-    // legacy tree deeper than that (or cyclic) would be silently truncated at
-    // read time → mis-confinement (the deny-ward direction is a fail-OPEN). This
-    // is the ONLY reachable path to an over-deep tree (create_group caps depth
-    // at 5), so validate over the distinct-node parent chain — explicit cycle
-    // detection, no cycle-inflation false positive — and refuse the backfill
-    // (fail-closed boot) rather than migrate into a mis-confining state.
-    {
-        std::unordered_map<std::string, std::optional<std::string>> parent_of;
-        parent_of.reserve(groups.size());
-        for (const auto& g : groups)
-            parent_of[g.id] = g.parent_id;
-        for (const auto& g : groups) {
-            std::unordered_set<std::string> seen;
-            std::optional<std::string> cur = g.parent_id;
-            int depth = 0;
-            while (cur && !cur->empty()) {
-                if (!seen.insert(*cur).second) {
-                    spdlog::error("ManagementGroupStore: backfill: parent cycle reachable from "
-                                  "group {} — refusing (fail-closed)",
-                                  g.id);
-                    backfill_metric("failed");
-                    return false;
-                }
-                if (++depth > kMaxHierarchyDepth) {
-                    spdlog::error("ManagementGroupStore: backfill: group {} exceeds the max "
-                                  "hierarchy depth {} — refusing (fail-closed); the confinement "
-                                  "reads would truncate a deeper tree and mis-confine",
-                                  g.id, kMaxHierarchyDepth);
-                    backfill_metric("failed");
-                    return false;
-                }
-                auto it = parent_of.find(*cur);
-                cur = (it != parent_of.end()) ? it->second : std::nullopt;
-            }
-        }
-    }
-
-    // 5. Insert in one transaction. The self-referential parent_id FK is
-    // DEFERRABLE INITIALLY DEFERRED, so groups may be inserted in arbitrary
-    // order (a child before its parent) and integrity is verified at COMMIT.
-    // ON CONFLICT DO NOTHING → idempotent + crash-resumable by re-run.
-    const bool insert_ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
-        for (const auto& g : groups) {
-            pg::PgResult r = pg::exec_params(
-                c,
-                "INSERT INTO management_group_store.management_groups "
-                "(id, name, description, parent_id, membership_type, scope_expression, "
-                "created_by, created_at, updated_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8::bigint, $9::bigint) "
-                "ON CONFLICT (id) DO NOTHING",
-                std::vector<std::optional<std::string>>{
-                    sanitize_pg_text(g.id), sanitize_pg_text(g.name), sanitize_pg_text(g.description),
-                    g.parent_id ? std::optional<std::string>(sanitize_pg_text(*g.parent_id))
-                                : std::nullopt,
-                    sanitize_pg_text(g.membership_type),
-                    g.scope_expression
-                        ? std::optional<std::string>(sanitize_pg_text(*g.scope_expression))
-                        : std::nullopt,
-                    sanitize_pg_text(g.created_by), std::to_string(g.created_at),
-                    std::to_string(g.updated_at)});
-            if (r.status() != PGRES_COMMAND_OK) {
-                spdlog::error("ManagementGroupStore: backfill: group insert failed: {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-        }
-        for (const auto& m : members) {
-            pg::PgResult r = pg::exec_params(
-                c,
-                "INSERT INTO management_group_store.management_group_members "
-                "(group_id, agent_id, source, added_at) VALUES ($1, $2, $3, $4::bigint) "
-                "ON CONFLICT (group_id, agent_id) DO NOTHING",
-                std::vector<std::string>{sanitize_pg_text(m.group_id), sanitize_pg_text(m.agent_id),
-                                         sanitize_pg_text(m.source), std::to_string(m.added_at)});
-            if (r.status() != PGRES_COMMAND_OK) {
-                spdlog::error("ManagementGroupStore: backfill: member insert failed: {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-        }
-        for (const auto& a : roles) {
-            pg::PgResult r = pg::exec_params(
-                c,
-                "INSERT INTO management_group_store.management_group_roles "
-                "(group_id, principal_type, principal_id, role_name) VALUES ($1, $2, $3, $4) "
-                "ON CONFLICT (group_id, principal_type, principal_id, role_name) DO NOTHING",
-                std::vector<std::string>{
-                    sanitize_pg_text(a.group_id), sanitize_pg_text(a.principal_type),
-                    sanitize_pg_text(a.principal_id), sanitize_pg_text(a.role_name)});
-            if (r.status() != PGRES_COMMAND_OK) {
-                spdlog::error("ManagementGroupStore: backfill: role insert failed: {}",
-                              PQerrorMessage(c));
-                return false;
-            }
-        }
-        return true;
-    });
-    if (!insert_ok) {
-        backfill_metric("failed");
-        return false;
-    }
-
-    // 6. Row-count reconciliation — PG must hold at least the legacy counts
-    // (DO NOTHING never drops a legacy row).
-    {
-        auto lease = pool_.acquire();
-        if (!lease) {
-            backfill_metric("failed");
-            return false;
-        }
-        const auto pg_count = [&](const char* table) -> std::int64_t {
-            pg::PgResult r = pg::exec_params(
-                lease.get(),
-                (std::string("SELECT COUNT(*) FROM management_group_store.") + table).c_str(),
-                std::vector<std::string>{});
-            if (r.status() != PGRES_TUPLES_OK)
-                return -1;
-            return to_i64(PQgetvalue(r.get(), 0, 0));
-        };
-        const std::int64_t pg_groups = pg_count("management_groups"),
-                           pg_members = pg_count("management_group_members"),
-                           pg_roles = pg_count("management_group_roles");
-        if (pg_groups < 0 || pg_members < 0 || pg_roles < 0) {
-            spdlog::error("ManagementGroupStore: backfill: reconciliation count failed");
-            backfill_metric("failed");
-            return false;
-        }
-        if (pg_groups < legacy_groups || pg_members < legacy_members || pg_roles < legacy_roles) {
-            spdlog::error("ManagementGroupStore: backfill: reconciliation FAILED — legacy "
-                          "(groups={},members={},roles={}) vs PG (groups={},members={},roles={}); "
-                          "refusing marker",
-                          legacy_groups, legacy_members, legacy_roles, pg_groups, pg_members,
-                          pg_roles);
-            backfill_metric("failed");
-            return false;
-        }
-        spdlog::info("ManagementGroupStore: backfill reconciled — legacy "
-                     "(groups={},members={},roles={}), PG (groups={},members={},roles={})",
-                     legacy_groups, legacy_members, legacy_roles, pg_groups, pg_members, pg_roles);
-    }
-
-    // 7. Stamp the one-time marker.
-    if (!stamp_complete()) {
-        backfill_metric("failed");
-        return false;
-    }
-
-    // 8. Move the verified legacy file aside (non-fatal on failure).
-    // Close the legacy read-only handle FIRST: Windows refuses to rename a file
-    // that still has an open handle (ERROR_SHARING_VIOLATION), so leaving
-    // `legacy` open here silently defeated the move-aside on Windows (POSIX
-    // allows rename-with-open-handle, so it worked on Linux/macOS — a
-    // cross-platform gotcha that only surfaced on the Wee Tam MSVC leg). All
-    // legacy reads are already materialised in memory above, so closing now is
-    // safe.
-    legacy.close();
-    std::error_code mv_ec;
-    auto aside = legacy_db_path;
-    aside += ".migrated-" + std::to_string(now_secs());
-    std::filesystem::rename(legacy_db_path, aside, mv_ec);
-    if (mv_ec)
-        spdlog::warn("ManagementGroupStore: backfill complete but could not move legacy {} aside "
-                     "({}); it is safe to archive/remove manually",
-                     legacy_db_path.string(), mv_ec.message());
-    else
-        spdlog::info("ManagementGroupStore: moved legacy management-groups db to {}", aside.string());
-
-    backfill_metric("completed");
-    return true;
 }
 
 } // namespace yuzu::server

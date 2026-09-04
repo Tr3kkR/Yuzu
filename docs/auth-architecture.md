@@ -2972,6 +2972,18 @@ walkthrough.
   grant, or a full securable × operation wildcard grant). Fails closed
   (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
   reference data can't be resolved.
+- **Audit-persist posture (#2466/#2406, ADR-1005 "mutations fail closed on
+  audit failure"):** every *mutating* engine-principal REST route fails closed
+  — `503` + `Sec-Audit-Failed: true` — if its audit row cannot persist, so a
+  privileged mutation never reports success on an unrecorded action (mint/rotate
+  additionally withhold the one-time secret); the MCP twins signal the same
+  non-fatally via `audit_persisted:false`. The *reads* instead set the header
+  and proceed: they commit no state and disclose only authorization **topology
+  metadata** (principal ids, owners, role grants), not per-person behavioural
+  PII — so the fail-closed-on-read posture that governs the device/network PII
+  reads (which exists to keep individual-identifying data off an unaudited
+  response) does not apply. Full contract: `docs/user-manual/rest-api.md`
+  "Engine Principals" → *Audit-persist failure*.
 - **Owner-delete interlock (two-mode enforcement):** a user who owns an
   active engine principal must not be silently removed, or the principal's
   audit trail loses its named responsible human. Enforcement mode is chosen
@@ -3761,91 +3773,33 @@ schema-level `CHECK` constraint on `rbac_meta.value` for this key rejects a
 non-canonical write outright as defense in depth; the application-level
 strict parse is what refuses to boot if a bad value ever lands regardless.
 
-**Mandatory backfill (ADR-0009/0041).** Unlike the AuthDB fresh-start cutover,
-RBAC state is irreducible operator-authored config that **cannot be
-re-derived** — custom roles, every principal→role grant, groups, and
-membership — so the migration performs a one-time, single-shot, idempotent
-(retried from scratch on interruption — not a cursor-resumed stream, unlike
-AuditStore's larger dataset), reconciled, **fail-CLOSED** backfill from the
-legacy `rbac.db` (seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
-operator edits to seeded permissions are preserved via `DO UPDATE`). A
-built-in default permission the operator explicitly revoked (`remove_permission`)
-before upgrading is **deleted** — matching legacy exactly, a plain absent row
-— scoped to (role, securable_type, operation) triples legacy's own catalogue
-actually knew about, so a securable a later `seed_defaults()` adds (e.g.
-`EnginePrincipal`, #2376) or an operation added to an existing role+type pair
-(e.g. `ApiToken:Rotate` — fjarvis #2703 re-review, C1) is untouched (fjarvis
-#2703 F1). The revocation is
-recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
-`revoked_seed_defaults` table — consulted ONLY by `seed_defaults()`'s grant
-helper, never by any authorization-decision code path — so `seed_defaults()`'s
-unconditional every-boot reseed cannot silently resurrect the revoked default
-without ever making it a real authorization fact again. This mirrors
-`remove_permission()`'s own permanent mechanism for the identical hazard
-beyond the one-time cutover. THREE earlier versions of this fix each
-reintroduced a hazard, all caught by governance before merge (none ever
-pushed to `origin`): a plain `DELETE` with no marker resurrects on the very
-next restart (verified empirically — a second `RbacStore` construction
-against the same database brought the revoked permission back); an
-`effect='deny'` tombstone avoids that but is a REAL authorization fact —
-`check_permission()` / `check_scoped_permission()` / `authorize_list_read()`
-all apply "deny overrides everything, across ALL of a principal's held
-roles" (pre-existing, identical in the legacy store), so the tombstone
-silently changed the authorization OUTCOME for any principal holding a
-second role that independently grants the same permission — on both the
-global and the management-group-scoped read paths (verified empirically
-both ways); the DELETE+marker design that fixes both has its own
-concurrency hazard (**CHAOS-1**) — `seed_defaults()`'s `grant()` fixes its
-READ COMMITTED snapshot at statement start, so if a concurrent revoke's
-marker-insert commits WHILE `grant()` is blocked on the `ON CONFLICT`
-arbiter waiting for that same revoke's uncommitted `DELETE`, Postgres only
-re-checks the conflict target after unblocking — never the `WHERE NOT
-EXISTS` subquery — and `grant()`'s already-computed row lands anyway,
-resurrecting the permission with the marker present but ineffective. Most
-likely during a fleet-wide rolling restart (many replicas' `seed_defaults()`
-calls racing another replica's one-time backfill). Closed with a
-`pg_advisory_xact_lock`, acquired in its own statement strictly BEFORE the
-check-and-mutate statement, in an explicit transaction, in all three writers
-(`grant()`, `remove_permission()`, the backfill's own revoke step) —
-verified empirically with two real Postgres connections, and safe for any
-replica boot ordering. Reconciliation counts roles + grants + groups +
-members and refuses the completion marker on any shortfall (fail-closed →
-refuse boot, retry next start). **The `rbac_enabled` flag is migrated first
-and read-back-verified** before the store is considered open (losing it is
-the single most dangerous outcome); a flag-backfill failure fails the whole
-backfill closed. The legacy `rbac.db` is moved aside only after a verified
-backfill.
-
-**Cross-replica marker fingerprinting (governance re-review, #2703).** The
-shared Postgres `backfill_complete` marker alone cannot distinguish
-"genuinely no legacy data anywhere" from "a fileless replica happened to
-check first" — stamping it from local absence alone let a fileless replica
-permanently foreclose migration for a sibling genuinely holding the real
-`rbac.db` (matches the anti-pattern `docs/postgres-store-playbook.md`
-documents for `AuditStore`, #2697). The fix: a SHA-256 content fingerprint
-of the legacy file (length-prefixed, injective encoding over every migrated
-row — not a delimiter join, which cannot safely disambiguate unconstrained
-operator free-text) is stamped alongside the marker, in the same
-transaction, derived from the exact rows actually migrated (no second file
-read — the trust anchor and the migrated data come from one shared
-in-memory snapshot). Any later replica that still holds a local legacy file
-re-derives its own fingerprint and verifies it against the stored value
-before trusting an existing marker: a genuine match skips (safe); anything
-else fails closed, with a distinct diagnostic for each of a stored
-`"sourceless"` value (no real migration has happened yet, but this later
-boot cannot bound what live post-cutover mutations — e.g. IdP group
-reconciliation — a fresh auto-migration might clobber), a genuinely
-different real fingerprint, and an absent fingerprint from a marker that
-predates this mechanism. None of the fail-closed cases auto-retry; a
-genuine prior migration under live operator changes since cannot be told
-apart from a different replica's completion this file was never part of.
-Promotion of a stored `"sourceless"` value to a real fingerprint happens
-only at STAMP TIME, inside a replica's own migration (a monotonic upsert in
-`stamp_complete`) — by then that replica's writes are already durably
-committed, so correcting the trust anchor cannot clobber anything; a later
-boot's mismatch is a materially different, unbounded situation and always
-refuses. Operator-facing failure modes and recovery:
-`docs/ops-runbooks/rbac-store-backfill-recovery.md`.
+**`migrate_from_sqlite()` retired (2026-09-03, #3623, ADR-0041 Update).** No production Yuzu
+fleet has ever run a pre-Postgres build of this store (ADR-0009's 2026-08-25
+fresh-start-by-default amendment), so the mandatory, single-shot, fingerprint-verified backfill
+this section previously described in full — seed-then-backfill via `ON CONFLICT DO NOTHING`,
+the `rbac_enabled`-flag-first read-back-verified transfer, the `revoked_seed_defaults`
+suppression table (still live and unaffected by this retirement — `seed_defaults()`'s reseed
+still consults it), the CHAOS-1 concurrency fix (`pg_advisory_xact_lock`, still live —
+`seed_defaults()` and
+`remove_permission()` both still take it, only the backfill's third writer is gone), and the
+SHA-256 cross-replica marker fingerprinting — is gone. `RbacStore::migrate_from_sqlite()` and
+its backfill-only helpers are removed; the two backfill-only rows in `rbac_meta`
+(`backfill_complete`/`backfill_source_fingerprint`) are POISONED, not dropped, via a
+version-bumped migration — `backfill_source_fingerprint` is forced to the retired code's own
+`kSourcelessFingerprint` sentinel (`"sourceless"`), never deleted; `rbac_meta` itself stays,
+still holding `rbac_enabled`/`write_generation`. This is the one store in the retirement batch
+whose marker is ROWS rather than a whole table, and a bare `DELETE` (the first version of this
+migration, caught by governance unhappy-path before merge) would have let a pre-#3623 binary
+rolling back read the resulting absence as "never migrated" and fall straight through its own
+fingerprint-verification safety net into an unconditional overwrite of the live `rbac_enabled`
+flag from a local legacy file — see ADR-0041's Update for the full trace. `server.cpp`'s boot
+path now runs `legacy_sqlite_probe::warn_if_legacy_rows` over `rbac_config` (the legacy table
+that held the enabled flag), `securable_types`, `operations`, `roles`, `role_permissions`,
+`principal_roles`, `groups`, and `group_members` instead — WARN-only, never refuse-boot, a
+posture reopened and explicitly reconfirmed for this store given the enabled-flag stakes rather
+than defaulted by uniformity with the rest of this retirement batch (see ADR-0041's Update for
+the full reasoning). `docs/ops-runbooks/rbac-store-backfill-recovery.md`, which documented this
+mechanism's failure modes, is deleted along with it.
 
 **Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` — three
 DENYING reasons (`pool_acquire_timeout` / `query_error` /
@@ -3856,10 +3810,9 @@ Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
 still proceeds — and are deliberately excluded from that alert:
 `rbac_enabled_non_canonical` (a periodic refresh saw a non-canonical value;
 the cached enabled-state is left unchanged rather than coerced) and
-`stale_beyond_accepted_bound` (see the cross-replica coherence paragraph
-above). Also `yuzu_server_rbac_backfill_total{result}` (result ∈ `fresh` /
-`completed` / `failed`). See `docs/user-manual/metrics.md` and the
-`YuzuRbacReadDegraded` alert in `docs/prometheus/yuzu-alerts.yml`.
+`stale_beyond_accepted_bound` (the bounded-stale-serve paragraph above). See
+`docs/user-manual/metrics.md` and the `YuzuRbacReadDegraded` alert in
+`docs/prometheus/yuzu-alerts.yml`.
 
 **Read split for reviewers.** The plain `bool` authz checks fail closed
 (deny-on-error) so no chokepoint can regress to fail-open; the tri-state

@@ -1,0 +1,244 @@
+## Filesystem Posture Definitions
+## Reports mounted-volume inventory, volume-level disk quota state, and
+## filesystem snapshot inventory.
+## Plugin: filesystem_posture | Actions: mounts, quotas, snapshots
+##
+## Sources by platform:
+##   Windows: FindFirstVolumeW + GetVolumeInformationW + GetDriveTypeW +
+##            GetDiskFreeSpaceExW (mounts); IDiskQuotaControl GetQuotaState /
+##            GetDefaultQuotaLimit / GetDefaultQuotaThreshold, initialized
+##            bReadWrite=FALSE
+##            (quotas), IVssBackupComponents::Query — VSS shadow-copy
+##            enumeration (snapshots; requires administrative rights)
+##   Linux:   /proc/self/mountinfo (mounts), quotactl(Q_GETFMT) per
+##            mounted filesystem (quotas), Btrfs/LVM snapshot metadata
+##            (snapshots — capability, not inventory)
+##   macOS:   getmntinfo (mounts), APFS per-volume quota state has no
+##            per-user/group equivalent (quotas), `fs_snapshot_list(2)`/APFS snapshot
+##            enumeration (snapshots)
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.storage.mounts
+  displayName: Mounted Volumes
+  version: 1.0.0
+  description: >
+    Lists mounted volumes with device, filesystem type, mount options, and
+    capacity. On Windows enumerates volumes via FindFirstVolumeW, reads labels and flags with GetVolumeInformationW and GetDriveTypeW, capacity with GetDiskFreeSpaceExW. On
+    Linux parses /proc/self/mountinfo; a network-filesystem source (nfs,
+    cifs, smbfs) reports its capacity columns as "-" rather than a
+    misleading zero or stale figure, and a device-mapper source
+    (/dev/dm-*) may be dm-crypt or multipath rather than a volume manager
+    — the source string is reported as-is, not resolved to an underlying
+    physical device. On macOS reads getmntinfo; an APFS snapshot shared by
+    two mount points of the same volume lineage (e.g. a container's data
+    and preboot volumes) is reported once per mount point, not
+    deduplicated to one row. The flags column reports a fixed vocabulary:
+    ro, rw, nosuid, nodev, noexec, noatime, relatime, removable, remote,
+    cdrom — a mount option outside this set is not surfaced.
+  tags: [storage, filesystem, inventory, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem_posture
+    action: mounts
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # The plugin emits one pipe row per mount point:
+    # `mount|<mount_point>|<device>|<fstype>|<options>|<total_bytes>|
+    # <free_bytes>|<available_bytes>|<flags>` — field 0 is the literal
+    # `mount` discriminator and the columns below map to fields 1-8.
+    columns:
+      - name: mount_point
+        type: string
+      - name: device
+        type: string
+      - name: fstype
+        type: string
+      - name: options
+        type: string
+      - name: total_bytes
+        type: int64
+      - name: free_bytes
+        type: int64
+      - name: available_bytes
+        type: int64
+      - name: flags
+        type: string
+    aggregation:
+      groupBy:
+        - fstype
+      operations:
+        - count
+
+  readablePayload: "List mounted volumes"
+
+  gather:
+    ttlSeconds: 60
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [filesystem_posture]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.storage.quotas
+  displayName: Disk Quotas
+  version: 1.0.0
+  description: >
+    Reports volume-level disk quota state. This is volume-level quota only
+    everywhere — no per-user or per-group breakdown is reported on any
+    platform. On Windows reads IDiskQuotaControl (GetQuotaState /
+    GetDefaultQuotaLimit / GetDefaultQuotaThreshold), initialized
+    read-only (bReadWrite=FALSE); it is
+    compiled and linked on Windows but has not been asserted against a
+    host with quotas configured. On Linux reads quotactl(Q_GETFMT) per mounted
+    filesystem. On macOS the volume-level quota IS probed on APFS and HFS+ via
+    getattrlist and reports none/configured (state=unsupported_fs is emitted only
+    for a non-APFS/HFS mount): APFS has no per-user
+    or per-group quota mechanism at all, so there is no gap to report
+    beyond the volume-level scope shared by every platform.
+  tags: [storage, filesystem, quota, compliance]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem_posture
+    action: quotas
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # The plugin emits one pipe row per volume:
+    # `quota|<mount_point>|<scope>|<state>|<limit_bytes>|<reserved_bytes>|
+    # <detail>` — field 0 is the literal `quota` discriminator and the
+    # columns below map to fields 1-6.
+    columns:
+      - name: mount_point
+        type: string
+      - name: scope
+        type: string
+      - name: state
+        type: string
+      - name: limit_bytes
+        type: int64
+      - name: reserved_bytes
+        type: int64
+      - name: detail
+        type: string
+    aggregation:
+      groupBy:
+        - state
+      operations:
+        - count
+
+  readablePayload: "Report disk quota state"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [filesystem_posture]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.storage.snapshots
+  displayName: Filesystem Snapshots
+  version: 1.0.0
+  description: >
+    Enumerates filesystem snapshots. On Windows enumerates VSS shadow
+    copies via IVssBackupComponents::Query, one row per snapshot, whose
+    name column is the snapshot GUID and detail column the shadow-copy
+    device path. That leg REQUIRES ADMINISTRATIVE RIGHTS: the agent runs
+    as LocalSystem today so it succeeds; under an unprivileged service
+    account it reports permission_denied rather than an empty set. On
+    Linux reports Btrfs/LVM snapshot
+    CAPABILITY, not an inventory of existing snapshots: the columns
+    describe what the mechanism supports on this host, not a live
+    snapshot list. On macOS enumerates APFS snapshots; a snapshot shared
+    by two mount points of the same volume lineage is reported once per
+    mount point, matching the mounts action's same caveat.
+  tags: [storage, filesystem, snapshot, backup]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: filesystem_posture
+    action: snapshots
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # The plugin emits one pipe row per snapshot (or capability record on
+    # Linux): `snapshot|<mount_point>|<name>|<kind>|<detail>` — field 0 is
+    # the literal `snapshot` discriminator and the columns below map to
+    # fields 1-4.
+    columns:
+      - name: mount_point
+        type: string
+      - name: name
+        type: string
+      - name: kind
+        type: string
+      - name: detail
+        type: string
+    aggregation:
+      groupBy:
+        - kind
+      operations:
+        - count
+
+  readablePayload: "List filesystem snapshots"
+
+  gather:
+    ttlSeconds: 300
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [filesystem_posture]
+
+status:
+  phase: active
