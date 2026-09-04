@@ -32,6 +32,7 @@
 #if defined(__APPLE__)
 
 #include "disk_actions_legs.hpp"
+#include "disk_actions_parsers.hpp" // the shared degradation-precedence decision
 
 #include <yuzu/agent/scoped_cfref.hpp>
 #include <yuzu/agent/scoped_ioobject.hpp>
@@ -303,6 +304,8 @@ int emit_smart(yuzu::CommandContext& ctx) {
                             "at least one block storage device resolved no BSD name and is "
                             "reported with \"-\" as its device");
 
+    // LAST: an empty walk outranks both marks above it and must not be demoted
+    // to `partial` by the always-true health constraint.
     if (!any_row) {
         // `unsupported`, not `unknown`, so the placeholder is not schema-
         // identical to a real device row; and an empty walk reaches the seam
@@ -393,6 +396,49 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         any_row = true;
     }
 
+    // PRECEDENCE comes from the pure layer, NOT from the order of these blocks.
+    // This leg had inverted its own ordering -- it reported a skipped media
+    // object (a short listing) first and an unread mount table last, so under
+    // last-writer-wins the WEAKEST cause won. Driving the shared decision makes
+    // that class of drift impossible rather than merely fixed once.
+    DegradationFlags flags;
+    flags.list_truncated = any_media_skipped;
+    flags.item_detail_unread = any_physical_unresolved;
+    flags.mounts_unread = !mounts_ok;
+
+    if (const auto cause = summarise_degradation(flags)) {
+        switch (*cause) {
+        case DegradationKind::ListTruncated:
+            mark_result_partial(ctx, "macos:iomedia:no_bsd_name",
+                                "at least one IOMedia object reported no BSD name and is absent "
+                                "from this listing");
+            break;
+        case DegradationKind::ItemDetailUnread:
+            mark_result_partial(ctx, "macos:provider_walk",
+                                "the backing physical disk could not be resolved for at least one "
+                                "volume; those rows show \"-\" without meaning none exists");
+            break;
+        case DegradationKind::MountsUnread:
+            // The token names the API the code CALLS. getmntinfo(3) was
+            // replaced by getmntinfo_r_np for the static-buffer race documented
+            // above, and a provenance token naming the removed call is exactly
+            // the drift that invites someone to "restore consistency" by
+            // putting it back.
+            mark_result_partial(ctx, "macos:getmntinfo_r_np",
+                                "getmntinfo_r_np returned no entries; volumes are listed without "
+                                "their mount points");
+            break;
+        case DegradationKind::Denied:
+        case DegradationKind::EnumerationIncomplete:
+        case DegradationKind::ListUnread:
+        case DegradationKind::IdentityUnread:
+        case DegradationKind::FstypeUnread:
+            break; // not produced by this leg
+        }
+    }
+
+    // LAST: an empty result is the strongest statement this leg can make, and
+    // must not be demoted to `partial` by a co-occurring degradation.
     if (!any_row) {
         // Word this for what actually happened. IOMedia objects may well have
         // been FOUND and then dropped by the join filter above (a host whose
@@ -404,23 +450,6 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         mark_result_unavailable(ctx, "macos:iomedia",
                                 "no volume mapping could be produced on this host");
     }
-    // Least-material first: set_result_status assigns, so the LAST call wins.
-    if (any_media_skipped)
-        mark_result_partial(ctx, "macos:iomedia:no_bsd_name",
-                            "at least one IOMedia object reported no BSD name and is absent from "
-                            "this listing");
-    if (any_physical_unresolved)
-        mark_result_partial(ctx, "macos:provider_walk",
-                            "the backing physical disk could not be resolved for at least one "
-                            "volume; those rows show \"-\" without meaning none exists");
-    if (!mounts_ok)
-        // The token names the API the code CALLS. getmntinfo(3) was replaced by
-        // getmntinfo_r_np for the static-buffer race documented above, and a
-        // provenance token naming the removed call is exactly the drift that
-        // invites someone to "restore consistency" by putting it back.
-        mark_result_partial(ctx, "macos:getmntinfo_r_np",
-                            "getmntinfo_r_np returned no entries; volumes are listed without their "
-                            "mount points");
     return 0;
 }
 

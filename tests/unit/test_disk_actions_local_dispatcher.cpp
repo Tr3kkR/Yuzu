@@ -180,12 +180,25 @@ TEST_CASE("disk_actions plugin: smart action row shape", "[disk_actions][actions
     // exact shape of the dead FSCTL leg this plugin's sibling had to be rescued
     // from — which is why the sibling carries the same assertion
     // (test_filesystem_posture_local_dispatcher.cpp:378).
+    //
+    // It must not pass VACUOUSLY. On a driveless or unprivileged Windows runner
+    // every row is the `unsupported` placeholder, none of which carries the
+    // string, so the loop alone would be green on a build that genuinely lacks
+    // the header. Require a real drive row first, and say plainly why if there
+    // is none: a runner that cannot open a single PhysicalDriveN cannot answer
+    // the question this assertion asks.
 #ifdef _WIN32
+    bool saw_real_drive = false;
     for (const auto& r : rows) {
         const auto f = split_fields_escape_aware(r);
+        if (f[5] == "unsupported") continue; // the empty-walk placeholder
+        saw_real_drive = true;
         INFO("smart row: " << r);
         CHECK(f[8].find("built without") == std::string::npos);
     }
+    if (!saw_real_drive)
+        WARN("no physical drive was readable on this runner, so the NVMe "
+             "build-completeness assertion could not be evaluated");
 #endif
 }
 
@@ -601,6 +614,49 @@ TEST_CASE("disk_actions: a short listing outranks a missing column",
     CHECK_FALSE(is_denial(*k));
 }
 
+// EXHAUSTIVE pairwise precedence. Sampling a few combinations is not enough:
+// an earlier revision of these tests set each flag alone plus a couple of
+// hand-picked pairs, and a mutation swapping two ADJACENT kinds in the pure
+// function passed every one of them. Every ordered pair is checked here, so any
+// reordering of the precedence chain fails at least one case.
+TEST_CASE("disk_actions: the degradation precedence holds for every pair",
+          "[disk_actions][status]") {
+    using namespace yuzu::disk_actions;
+    using Setter = void (*)(DegradationFlags&);
+    struct Entry { Setter set; DegradationKind kind; };
+    // Listed weakest-first; the list order IS the asserted contract.
+    const Entry ordered[] = {
+        {[](DegradationFlags& f) { f.fstype_unread = true; },           DegradationKind::FstypeUnread},
+        {[](DegradationFlags& f) { f.mounts_unread = true; },           DegradationKind::MountsUnread},
+        {[](DegradationFlags& f) { f.item_detail_unread = true; },      DegradationKind::ItemDetailUnread},
+        {[](DegradationFlags& f) { f.identity_unread = true; },         DegradationKind::IdentityUnread},
+        {[](DegradationFlags& f) { f.list_truncated = true; },          DegradationKind::ListTruncated},
+        {[](DegradationFlags& f) { f.list_unread = true; },             DegradationKind::ListUnread},
+        {[](DegradationFlags& f) { f.enumeration_incomplete = true; },  DegradationKind::EnumerationIncomplete},
+        {[](DegradationFlags& f) { f.denied = true; },                  DegradationKind::Denied},
+    };
+    constexpr std::size_t n = std::size(ordered);
+
+    for (std::size_t weak = 0; weak < n; ++weak) {
+        for (std::size_t strong = weak + 1; strong < n; ++strong) {
+            DegradationFlags f{};
+            ordered[weak].set(f);
+            ordered[strong].set(f);
+            const auto got = summarise_degradation(f);
+            REQUIRE(got.has_value());
+            INFO("weaker index " << weak << " vs stronger index " << strong);
+            // The STRONGER of the two must win, whichever order they were set.
+            CHECK(*got == ordered[strong].kind);
+            CHECK(degradation_rank(*got) > degradation_rank(ordered[weak].kind));
+        }
+    }
+
+    // And the ranks must be strictly increasing across the whole chain, so the
+    // enum order and the decision order cannot drift apart.
+    for (std::size_t i = 1; i < n; ++i)
+        CHECK(degradation_rank(ordered[i].kind) > degradation_rank(ordered[i - 1].kind));
+}
+
 TEST_CASE("disk_actions: every degradation flag maps to its own cause",
           "[disk_actions][status]") {
     using namespace yuzu::disk_actions;
@@ -611,7 +667,8 @@ TEST_CASE("disk_actions: every degradation flag maps to its own cause",
     const Case cases[] = {
         {[](DegradationFlags& f) { f.fstype_unread = true; },          DegradationKind::FstypeUnread},
         {[](DegradationFlags& f) { f.mounts_unread = true; },          DegradationKind::MountsUnread},
-        {[](DegradationFlags& f) { f.detail_unread = true; },          DegradationKind::DetailUnread},
+        {[](DegradationFlags& f) { f.item_detail_unread = true; },     DegradationKind::ItemDetailUnread},
+        {[](DegradationFlags& f) { f.identity_unread = true; },        DegradationKind::IdentityUnread},
         {[](DegradationFlags& f) { f.list_truncated = true; },         DegradationKind::ListTruncated},
         {[](DegradationFlags& f) { f.list_unread = true; },            DegradationKind::ListUnread},
         {[](DegradationFlags& f) { f.enumeration_incomplete = true; }, DegradationKind::EnumerationIncomplete},

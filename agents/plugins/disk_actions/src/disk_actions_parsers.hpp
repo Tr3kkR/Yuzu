@@ -107,54 +107,74 @@ enum class NvmeVerdict { Ok, Warning, Failing };
 // independently prescribed the same remedy: make the DECISION pure and leave
 // only flag-setting in the shell.
 //
-// The legs now fill a `DegradationFlags` and call `summarise_degradation`; the
-// precedence lives here, where every platform's suite can exercise it.
+// The legs fill a `DegradationFlags` and call `summarise_degradation`, then map
+// the single winning kind to their own provenance token. The precedence lives
+// here, where every platform's suite can exercise it — and NOWHERE ELSE. An
+// earlier revision shipped this header alongside legs that still hand-ordered
+// their own `if` chains: the tests passed, the precedence was untested in
+// production, and the two orderings had already drifted apart (the macOS
+// volumes leg had inverted its own, so its weakest cause won). Three governance
+// agents caught it independently. If you add a cause, add it HERE.
 
-/// Which degradations a leg observed. Ordered weakest to strongest, and the
-/// order of the FIELDS is not meaningful — `summarise_degradation` owns that.
+/// Which degradations a leg observed. The order of the FIELDS is not
+/// meaningful — `summarise_degradation` owns precedence, and it is the only
+/// place that does.
 struct DegradationFlags {
     bool fstype_unread{false};       ///< a filesystem-type query was refused
     bool mounts_unread{false};       ///< mount-point enumeration failed
-    bool detail_unread{false};       ///< a per-item detail read failed
+    bool item_detail_unread{false};  ///< a per-item attribute could not be read
+    bool identity_unread{false};     ///< an item could not be identified at all
     bool list_truncated{false};      ///< a reply carried fewer items than claimed
     bool list_unread{false};         ///< an item list could not be read at all
     bool enumeration_incomplete{false}; ///< the walk itself stopped early
     bool denied{false};              ///< something refused us on privilege grounds
 };
 
-/// What a leg should report, or nullopt when the read was clean.
+/// What a leg must report, or nullopt when the read was clean.
 ///
-/// `denied` outranks everything: it is the one cause with a different
-/// remediation (grant the agent account a right), so it must survive
-/// last-writer-wins. Below it, strength runs from an incomplete ENUMERATION
-/// (the listing itself is short — the most material) down to a single missing
-/// column.
+/// Ordered WEAKEST to STRONGEST, and that order is the contract:
+///   * `Denied` outranks everything — it is the one cause with a different
+///     remediation (grant the agent account a right), so it must never be
+///     masked by a co-occurring degradation.
+///   * Below it, "we are missing whole ROWS" outranks "we are missing a FIELD
+///     of one row", because the first makes the answer incomplete and the
+///     second only makes it thinner.
 enum class DegradationKind {
     FstypeUnread,
     MountsUnread,
-    DetailUnread,
+    ItemDetailUnread,
+    IdentityUnread,
     ListTruncated,
     ListUnread,
     EnumerationIncomplete,
     Denied,
 };
 
+/// Rank, exposed so a test can assert the ORDER rather than restate it.
+[[nodiscard]] inline constexpr int degradation_rank(DegradationKind k) noexcept {
+    return static_cast<int>(k);
+}
+
 [[nodiscard]] inline constexpr std::optional<DegradationKind>
 summarise_degradation(const DegradationFlags& f) noexcept {
-    // Strongest first: this returns the cause that must WIN, which is the one
-    // the leg reports LAST.
+    // Strongest first: this returns the cause that must WIN. Because
+    // set_result_status ASSIGNS, a leg emits exactly ONE status call — this
+    // one — rather than a sequence whose earlier members are overwritten and
+    // therefore invisible.
     if (f.denied) return DegradationKind::Denied;
     if (f.enumeration_incomplete) return DegradationKind::EnumerationIncomplete;
     if (f.list_unread) return DegradationKind::ListUnread;
     if (f.list_truncated) return DegradationKind::ListTruncated;
-    if (f.detail_unread) return DegradationKind::DetailUnread;
+    if (f.identity_unread) return DegradationKind::IdentityUnread;
+    if (f.item_detail_unread) return DegradationKind::ItemDetailUnread;
     if (f.mounts_unread) return DegradationKind::MountsUnread;
     if (f.fstype_unread) return DegradationKind::FstypeUnread;
     return std::nullopt;
 }
 
-/// True when this cause is a privilege denial rather than a degradation, i.e.
-/// the leg must call mark_result_denied rather than mark_result_partial.
+/// True when the leg must call mark_result_denied rather than
+/// mark_result_partial: a privilege refusal is a different fact with a
+/// different fix, and a status-keyed consumer has to tell them apart.
 [[nodiscard]] inline constexpr bool is_denial(DegradationKind k) noexcept {
     return k == DegradationKind::Denied;
 }

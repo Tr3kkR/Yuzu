@@ -17,6 +17,15 @@
  * `health`, `bus` and `media` are FIXED vocabularies emitted verbatim (they are
  * derived from enums, never from parsed text); every other field is untrusted
  * OS-supplied text and goes through yuzu::util::safe_output_field.
+ *
+ * THE EMPTY-RESULT PLACEHOLDER, and how a consumer tells it from a real row.
+ * When a leg finds nothing it still emits one row rather than silence, so a
+ * consumer never reads zero rows and infers "this host has no disks". A smart
+ * placeholder is typed: `health` is `unsupported`, a value no real drive row
+ * carries. A volume placeholder has NO such column, so it is identified by its
+ * `volume` field being "-": a real volume always has a name, and "-" in that
+ * position is reserved for the placeholder. Both are accompanied by an
+ * UNAVAILABLE result status, which is the authoritative signal.
  */
 #pragma once
 
