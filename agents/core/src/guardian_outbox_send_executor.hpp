@@ -58,6 +58,7 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -72,6 +73,13 @@ namespace yuzu::agent {
 class YUZU_EXPORT GuardianOutboxSendExecutor {
 public:
     using SendFn = std::function<SendResult(const OutboxEntry&)>;
+
+    /// Test-only fault injection for launch()'s admission path (#3966 fold-in - no
+    /// regression coverage existed for either failure mode). `SpawnRefused` mirrors
+    /// `io_detail::spawn_detached` returning false (the OS refused to create the
+    /// thread); `Throw` mirrors a `std::bad_alloc` from anywhere in launch()'s guarded
+    /// region. Both take the SAME rollback path (see launch()).
+    enum class LaunchFaultForTest { None, SpawnRefused, Throw };
 
     GuardianOutboxSendExecutor() : state_(std::make_shared<State>()) {}
     GuardianOutboxSendExecutor(const GuardianOutboxSendExecutor&) = delete;
@@ -97,9 +105,8 @@ public:
         // there is no concurrent-submitter race to guard against here - only
         // against the detached worker thread, which the lock below still covers.
         // The launch-decision read and the launch() call itself are deliberately
-        // NOT done under one held lock: launch() constructs an AliveTicket, whose
-        // ctor/dtor take state_->mu themselves (see below), and that mutex is not
-        // recursive.
+        // NOT done under one held lock: launch() itself re-locks state_->mu for its
+        // own bookkeeping (see below), and that mutex is not recursive.
         bool need_launch = false;
         {
             std::lock_guard<std::mutex> lk{state_->mu};
@@ -240,6 +247,12 @@ public:
         post_admission_race_hook_for_test_ = std::move(hook);
     }
 
+    /// Test-only fault injection - see LaunchFaultForTest. Production callers never
+    /// set this (defaults to None, a no-op).
+    void set_launch_fault_for_test(LaunchFaultForTest fault) {
+        launch_fault_for_test_.store(fault, std::memory_order_relaxed);
+    }
+
 private:
     struct State {
         std::mutex mu;
@@ -253,34 +266,51 @@ private:
         std::exception_ptr eptr; ///< set instead of `result` if `send` itself threw
     };
 
-    /// RAII orphan-exit marker, mirroring guardian_io_executor.hpp's TicketCore
-    /// split: the worker's OWN captured copy is the one that decrements
-    /// worker_count, and it is destroyed by the detached-thread trampoline AFTER
-    /// the worker lambda body has fully returned (notify_all included) - the
-    /// latest point observable before the OS thread itself exits. A copy that
-    /// never reaches a launched thread (the launch-failed path) decrements
-    /// immediately instead, since no thread was ever created to outlive it.
+    /// RAII orphan-exit marker, mirroring guardian_io_executor.hpp's TicketCore split
+    /// (guardian_io_executor.hpp:474-513): the worker's OWN captured copy is the one
+    /// that decrements worker_count, and it is destroyed by the detached-thread
+    /// trampoline AFTER the worker lambda body has fully returned (notify_all
+    /// included) - the latest point observable before the OS thread itself exits.
+    ///
+    /// UNARMED BY DEFAULT (#3966): the ctor is lock-free/noexcept, and `arm()` - the
+    /// nothrow ++worker_count - is called by launch() as the LAST statement of the
+    /// SAME locked block that commits in_flight/done, under the SAME state_->mu stop()
+    /// takes to set `stopping`. The prior shape armed via a SECOND, independent
+    /// self-locking ctor, called after that locked block had already released the
+    /// lock - so a stop() landing in the gap between the two could return with
+    /// stopping=true while worker_count still read 0, even though admission was
+    /// already committed (the falsified-zero window #3966 reports; falsifier:
+    /// tests/unit/test_guardian_outbox_send_executor.cpp). Mirrors
+    /// GuardianIoExecutor::run()'s own "armed under the lock" pattern
+    /// (guardian_io_executor.hpp:291-317), which this class had deviated from at
+    /// exactly this point. A ticket destroyed before/without `arm()` (the rollback /
+    /// launch-failed path) is a no-op, since no count was ever incremented for it.
     struct AliveTicket {
-        explicit AliveTicket(std::shared_ptr<State> s) : state(std::move(s)) {
-            std::lock_guard<std::mutex> lk{state->mu};
-            ++state->worker_count;
-        }
+        explicit AliveTicket(std::shared_ptr<State> s) noexcept : state(std::move(s)) {}
         ~AliveTicket() {
+            if (!armed)
+                return;
             std::lock_guard<std::mutex> lk{state->mu};
             if (state->worker_count > 0)
                 --state->worker_count;
         }
+        /// CALLER MUST HOLD state->mu.
+        void arm() noexcept {
+            ++state->worker_count;
+            armed = true;
+        }
         AliveTicket(const AliveTicket&) = delete;
         AliveTicket& operator=(const AliveTicket&) = delete;
         std::shared_ptr<State> state;
+        bool armed{false};
     };
 
-    /// Called from offer() with state_->mu NOT held (AliveTicket's own ctor/dtor take
-    /// it, and it is not recursive). Spawns a detached worker that calls send(entry)
-    /// and publishes the result. Returns false for either of two reasons: the OS
-    /// refused to create the thread (mirrors guardian_io_executor.hpp's LaunchFailed
-    /// path), or a concurrent stop() won the race against offer()'s decision to call
-    /// this function (see the re-check just inside the try block below).
+    /// Called from offer() with state_->mu NOT held. Spawns a detached worker that
+    /// calls send(entry) and publishes the result. Returns false for either of two
+    /// reasons: the OS refused to create the thread (mirrors
+    /// guardian_io_executor.hpp's LaunchFailed path), or a concurrent stop() won the
+    /// race against offer()'s decision to call this function (see the re-check just
+    /// inside the try block below).
     bool launch(const OutboxEntry& entry, const SendFn& send) {
         // Bookkeeping FIRST, under its own lock, BEFORE the worker is spawned - not
         // after. A fast `send` can complete, lock state_->mu, and publish done=true
@@ -294,15 +324,15 @@ private:
         // from offer(), which has exactly one caller thread), so writing them before
         // the worker can possibly touch `done` is race-free by construction.
         //
-        // Everything from here through spawn_detached() can throw std::bad_alloc:
-        // the in_flight_event_id string copy just below (governance Gate 8 cpp-safety
-        // finding - an earlier draft placed this bookkeeping BEFORE the try, so a
-        // thrown bad_alloc on the copy itself left in_flight=true uncaught, the same
-        // wedge class one statement earlier than the guarded region started),
-        // make_shared<AliveTicket>, copying `entry`/`send` into the worker lambda's
-        // captures, and spawn_detached's own payload allocation (guardian_io_executor.hpp's
-        // own doc). ALL of it is inside one try, and any failure - a thrown bad_alloc
-        // OR spawn_detached returning false for an OS-level refusal - takes the SAME
+        // Everything from here through spawn_detached() can throw std::bad_alloc: the
+        // AliveTicket allocation, the in_flight_event_id string copy (governance Gate 8
+        // cpp-safety finding - an earlier draft placed this bookkeeping BEFORE the try,
+        // so a thrown bad_alloc on the copy itself left in_flight=true uncaught, the
+        // same wedge class one statement earlier than the guarded region started),
+        // copying `entry`/`send` into the worker lambda's captures, and
+        // spawn_detached's own payload allocation (guardian_io_executor.hpp's own
+        // doc). ALL of it is inside one try, and any failure - a thrown bad_alloc OR
+        // spawn_detached returning false for an OS-level refusal - takes the SAME
         // rollback path below. An uncaught throw here would unwind with in_flight left
         // true and no worker ever created to set done=true, wedging this entry exactly
         // like the ordering bug this function's rewrite fixed (verified in review) -
@@ -313,6 +343,11 @@ private:
         // drain_log_unlocked's catch and be miscounted as a send_exceptions_ hit.
         bool launched = false;
         try {
+            // Constructed UNARMED, before any lock (its ctor is lock-free/noexcept -
+            // #3966) - a shared_ptr so a launch failure's synchronous destruction and a
+            // launched worker's eventual thread-exit destruction both go through the
+            // same self-locking decrement path.
+            auto ticket = std::make_shared<AliveTicket>(state_);
             {
                 std::lock_guard<std::mutex> lk{state_->mu};
                 // Re-check stopping here, under the SAME lock stop() sets it under and
@@ -322,29 +357,26 @@ private:
                 // can run (adversarial review finding, #3847 item 4 hardening: no
                 // internal governance round caught this, both external reviewers did,
                 // independently). This return precedes every State mutation below -
-                // in_flight is still false, no AliveTicket/worker exists yet - so it
-                // reaches neither the catch(...) block (nothing thrown) nor the
-                // post-try `if (!launched)` rollback further down (nothing was set that
-                // needs unsetting); it is exactly as if offer() had seen stopping=true
-                // itself, one step earlier.
+                // in_flight is still false, the ticket is still unarmed - so it reaches
+                // neither the catch(...) block (nothing thrown) nor the post-try
+                // `if (!launched)` rollback further down (nothing was set that needs
+                // unsetting); it is exactly as if offer() had seen stopping=true itself,
+                // one step earlier.
                 if (state_->stopping)
                     return false;
+                state_->in_flight_event_id = entry.event_id; // the ONE throwing step,
+                                                              // FIRST - strong guarantee,
+                                                              // in_flight still false
                 state_->in_flight = true;
-                state_->in_flight_event_id = entry.event_id;
                 state_->done = false;
+                // Armed LAST, in this SAME locked block (#3966) - see AliveTicket::arm().
+                ticket->arm();
             }
-            // Test seam: fires in the gap between the bookkeeping lock above closing and
-            // AliveTicket's own self-locking ctor below - the exact window #3966 reports
-            // (a concurrent stop() can land here, observe stopping=true and
-            // active_worker_count()==0, while admission is already committed). Production
-            // callers never set this.
+            // Test seam: fires with NO lock held, after admission is committed AND
+            // counted (the SAME locked block above) - production callers never set
+            // this.
             if (post_admission_race_hook_for_test_)
                 post_admission_race_hook_for_test_();
-            // Constructed (and counted, via its self-locking ctor) BEFORE the launch
-            // attempt, inside a shared_ptr so a launch failure's synchronous destruction
-            // and a launched worker's eventual thread-exit destruction both go through
-            // the same self-locking decrement path.
-            auto ticket = std::make_shared<AliveTicket>(state_);
             auto st = state_;
             auto worker = [st, ticket, entry, send]() mutable noexcept {
                 SendResult r = SendResult::Retain;
@@ -377,14 +409,26 @@ private:
                 // observable point before this OS thread actually exits. Its dtor
                 // self-locks, so this runs safely with no lock held on this thread.
             };
-            launched = io_detail::spawn_detached(std::move(worker));
+            // Fault injection (#3966 fold-in): SpawnRefused mirrors an OS-level
+            // thread-creation refusal without depending on real resource exhaustion;
+            // Throw mirrors a bad_alloc anywhere in this guarded region - both take the
+            // SAME rollback path below via the surrounding try/catch and `if
+            // (!launched)`. Production always takes the plain spawn_detached() branch
+            // (LaunchFaultForTest::None).
+            const auto fault = launch_fault_for_test_.load(std::memory_order_relaxed);
+            if (fault == LaunchFaultForTest::Throw)
+                throw std::bad_alloc{};
+            launched = (fault == LaunchFaultForTest::SpawnRefused)
+                           ? false
+                           : io_detail::spawn_detached(std::move(worker));
         } catch (...) {
             launched = false;
         }
         if (!launched) {
             // Any partially-constructed ticket's local copy has already dropped by now
             // (try/catch unwound it, or the false-return path never released it) ->
-            // worker_count is back to 0 either way.
+            // worker_count is back to 0 either way (the ticket was never armed, or its
+            // armed destructor already ran and decremented).
             std::lock_guard<std::mutex> lk{state_->mu};
             state_->in_flight = false;
             return false;
@@ -395,6 +439,7 @@ private:
     std::shared_ptr<State> state_;
     std::function<void()> pre_launch_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::function<void()> post_admission_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::atomic<LaunchFaultForTest> launch_fault_for_test_{LaunchFaultForTest::None}; ///< test seam
 };
 
 } // namespace yuzu::agent

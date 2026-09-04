@@ -235,6 +235,64 @@ TEST_CASE("#3966: admission (in_flight) and the AliveTicket count are one atomic
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 
+TEST_CASE("#3966 fold-in: a refused thread spawn rolls admission back and frees the slot",
+          "[spark][guardian][send_executor][chaos]") {
+    GuardianOutboxSendExecutor exec;
+    exec.set_launch_fault_for_test(GuardianOutboxSendExecutor::LaunchFaultForTest::SpawnRefused);
+    auto entry = lifecycle_entry("e1");
+    std::atomic<int> invocations{0};
+    auto instant = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+
+    auto result = exec.offer(entry, instant, 200ms);
+    REQUIRE(result.has_value());
+    CHECK(*result == SendResult::Retain);
+    CHECK(invocations.load() == 0);
+    // Nothing was ever launched on this path - no spin needed.
+    CHECK(exec.active_worker_count() == 0);
+
+    // The slot was freed by the rollback: the SAME event_id can now launch for real.
+    exec.set_launch_fault_for_test(GuardianOutboxSendExecutor::LaunchFaultForTest::None);
+    std::optional<SendResult> retried;
+    REQUIRE(spin_until([&] {
+        retried = exec.offer(entry, instant, 200ms);
+        return retried.has_value();
+    }));
+    CHECK(*retried == SendResult::Sent);
+    CHECK(invocations.load() == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("#3966 fold-in: a thrown bad_alloc during admission rolls back and frees the slot",
+          "[spark][guardian][send_executor][chaos]") {
+    GuardianOutboxSendExecutor exec;
+    exec.set_launch_fault_for_test(GuardianOutboxSendExecutor::LaunchFaultForTest::Throw);
+    auto entry = lifecycle_entry("e1");
+    std::atomic<int> invocations{0};
+    auto instant = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+
+    auto result = exec.offer(entry, instant, 200ms);
+    REQUIRE(result.has_value());
+    CHECK(*result == SendResult::Retain);
+    CHECK(invocations.load() == 0);
+    CHECK(exec.active_worker_count() == 0);
+
+    exec.set_launch_fault_for_test(GuardianOutboxSendExecutor::LaunchFaultForTest::None);
+    std::optional<SendResult> retried;
+    REQUIRE(spin_until([&] {
+        retried = exec.offer(entry, instant, 200ms);
+        return retried.has_value();
+    }));
+    CHECK(*retried == SendResult::Sent);
+    CHECK(invocations.load() == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
 TEST_CASE("stop() prevents a new launch but does not disturb one already in flight",
           "[spark][guardian][send_executor]") {
     GuardianOutboxSendExecutor exec;
