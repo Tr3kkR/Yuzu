@@ -1859,8 +1859,41 @@ TEST_CASE("MCP #3937: mint_engine_credential fails CLOSED and withholds the secr
           std::string::npos);
     CHECK(r->body.find("\"audit_persisted\":false") != std::string::npos);
     // The one-time secret is WITHHELD — the raw_token key never appears.
-    CHECK(r->body.find("raw_token") == std::string::npos);
+    CHECK(r->body.find("\"raw_token\"") == std::string::npos);
     // Attribution: the credential DID commit (mutation happened) though audit dropped.
+    CHECK(store.list_active_for_principal(principal).size() == 1);
+}
+
+// #3937 adversarial-review CDX-001/K6: a THROWING audit sink (bad_alloc-class) must
+// fail closed identically to a false-returning one — the domain audit now routes
+// through try_persist_audit, so the throw is caught -> false -> the 503 fires and
+// the secret is withheld (before this fix the throw escaped the 503/A4 envelope).
+TEST_CASE("MCP #3937: mint fails CLOSED and withholds the secret when the audit sink THROWS",
+          "[mcp][pg][engine_principal][audit_failclose]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+    const std::string principal = "engine:mcp-mint-throw";
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.audit_throws_ = true; // the audit pipeline throws (bad_alloc-class)
+    ts.start();
+
+    auto r = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:mcp-mint-throw","ttl_days":90}}})");
+    REQUIRE(r->status == 200);
+    auto body = nlohmann::json::parse(r->body);
+    // A throw is caught by try_persist_audit -> the SAME fail-closed 503, not an escape.
+    REQUIRE(body.contains("error"));
+    REQUIRE_FALSE(body.contains("result"));
+    CHECK(r->body.find("\"audit_persisted\":false") != std::string::npos);
+    CHECK(r->body.find("\"raw_token\"") == std::string::npos); // secret withheld on the throw path too
     CHECK(store.list_active_for_principal(principal).size() == 1);
 }
 

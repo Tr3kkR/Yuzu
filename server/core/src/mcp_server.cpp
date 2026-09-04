@@ -11493,8 +11493,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // lose one that did.
                 //
                 // Scope: the FIVE plugin-config/secret/kill-switch mutations
-                // this PR introduces. The ~20 pre-existing MCP write tools keep
-                // their mutate-then-disclose posture; changing those is a
+                // this PR introduces. (#3937 has since converted the eight
+                // engine-principal mutation twins to fail-closed too — via the
+                // audit-AFTER-commit + 503 shape their REST siblings use, not this
+                // audit-BEFORE-mutate one.) The other pre-existing MCP write tools
+                // keep their mutate-then-disclose posture; changing those is a
                 // separate, separately-reviewed decision.
                 if (!audit_fn(req, "plugin_config.set", "attempted", "PluginConfig",
                               plugin + "." + key, "len=" + std::to_string(value.size()))) {
@@ -12097,8 +12100,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                bool audit_ok = audit_fn(req, "engine_principal.role.assigned", "success",
-                                         "EnginePrincipal", principal_id, role_name);
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.role.assigned", "success", "EnginePrincipal",
+                    principal_id, role_name);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The grant committed but its audit row did not
@@ -12165,8 +12169,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                bool audit_ok = audit_fn(req, "engine_principal.role.unassigned", "success",
-                                         "EnginePrincipal", principal_id, role_name);
+                bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.role.unassigned", "success", "EnginePrincipal",
+                    principal_id, role_name);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The grant was removed but its audit row did not
@@ -12347,9 +12352,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const bool audit_ok =
-                    audit_fn(req, "engine_principal.create", "success", "EnginePrincipal",
-                            principal_id, "owner=" + owner_username);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.create", "success", "EnginePrincipal",
+                    principal_id, "owner=" + owner_username);
                 if (!audit_ok) {
                     // #3937: fail closed — parity with the REST twin (#2466) and the
                     // in-MCP plugin-config precedent. The mutation committed but its
@@ -12595,8 +12600,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "engine_principal.revoke", "success",
-                                               "EnginePrincipal", principal_id, reason);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.revoke", "success", "EnginePrincipal",
+                    principal_id, reason);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The principal + its credentials were revoked but the
@@ -12705,10 +12711,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         found_newest = true;
                     }
                 }
-                const bool audit_ok = audit_fn(req, "engine_principal.credential.mint", "success",
-                                               "EnginePrincipal",
-                                               found_newest ? newest.token_id : principal_id,
-                                               "principal=" + principal_id);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.credential.mint", "success", "EnginePrincipal",
+                    found_newest ? newest.token_id : principal_id, "principal=" + principal_id);
                 if (!audit_ok) {
                     // #3937: fail closed — the credential was minted but its audit row
                     // did not persist, so the one-time secret is WITHHELD (never built
@@ -12837,9 +12842,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (never folded into one "rotation succeeded" row), so a replay is
                 // never invisible in the audit trail. This handler runs fresh on
                 // every JSON-RPC call, so a replay naturally produces its own row.
-                const bool reveal_audit_ok = audit_fn(
-                    req, "engine_principal.credential.reveal", "success", "EnginePrincipal",
-                    found_successor ? successor.token_id : principal_id,
+                const bool reveal_audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.credential.reveal", "success",
+                    "EnginePrincipal", found_successor ? successor.token_id : principal_id,
                     "principal=" + principal_id + " action=rotate");
                 if (!reveal_audit_ok) {
                     // #3937: fail closed — the reveal IS this route's success audit, so
@@ -12954,9 +12959,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // store validated confirm_token_id equals the pending
                 // successor's token_id, so this is server-verified (not a
                 // caller-supplied echo) and it is not the raw secret.
-                const bool audit_ok = audit_fn(req, "engine_principal.credential.confirm", "success",
-                                               "EnginePrincipal", principal_id,
-                                               "token_id=" + confirm_token_id);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.credential.confirm", "success",
+                    "EnginePrincipal", principal_id, "token_id=" + confirm_token_id);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). The rotation was confirmed (predecessor retired) but
@@ -13412,9 +13417,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                const bool audit_ok = audit_fn(req, "engine_principal.transfer_owner", "success",
-                                               "EnginePrincipal", principal_id,
-                                               "new_owner=" + new_owner);
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "engine_principal.transfer_owner", "success", "EnginePrincipal",
+                    principal_id, "new_owner=" + new_owner);
                 if (!audit_ok) {
                     // #3937: fail closed (parity with REST #2466 + plugin-config MCP
                     // precedent). Ownership transferred but the audit row did not
