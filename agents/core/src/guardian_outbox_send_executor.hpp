@@ -235,6 +235,18 @@ public:
         return static_cast<std::size_t>(state_->worker_count);
     }
 
+    /// True whenever ANY send is admitted and not yet consumed - the same-entry
+    /// timeout case AND the mismatched-orphan-still-running case both set
+    /// in_flight, so this reads true in either (#3953 item 3: the caller cannot
+    /// tell them apart from offer()'s return value alone, since wrapped_send()'s
+    /// `.value_or(SendResult::Retain)` collapses both to the same value). Used by
+    /// the drain worker's loop() to re-check sooner than the full periodic bound
+    /// while something is genuinely in flight on this lane.
+    [[nodiscard]] bool has_in_flight_send() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        return state_->in_flight;
+    }
+
     /// Test-only synchronization seam - see the call site in offer() for what race it
     /// exists to make deterministic. Production callers never set this.
     void set_pre_launch_race_hook_for_test(std::function<void()> hook) {

@@ -293,6 +293,44 @@ TEST_CASE("#3966 fold-in: a thrown bad_alloc during admission rolls back and fre
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 
+TEST_CASE("#3953 item 3: has_in_flight_send() reads true for a mismatched orphan too, "
+          "not only the same-entry timeout case",
+          "[spark][guardian][send_executor][chaos]") {
+    // wrapped_send()'s `.value_or(SendResult::Retain)` collapses the same-entry-timeout
+    // case (offer() returns nullopt) and the mismatched-orphan-still-running case
+    // (offer() returns a POPULATED Retain) to the identical value - the caller cannot
+    // tell them apart from the return alone. has_in_flight_send() must read true in
+    // BOTH, since in_flight is set for whichever entry currently owns the slot.
+    GuardianOutboxSendExecutor exec;
+    StallingSend send_a;
+    auto entry_a = lifecycle_entry("event-a");
+    auto entry_b = lifecycle_entry("event-b");
+
+    auto first = exec.offer(entry_a, std::ref(send_a), 20ms);
+    CHECK_FALSE(first.has_value());
+    REQUIRE(spin_until([&] { return send_a.invocations.load() >= 1; }));
+    CHECK(exec.has_in_flight_send()); // same-entry timeout case
+
+    // The head changed to B while A is still in flight - the mismatch/orphan branch.
+    auto while_stalled = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+    REQUIRE(while_stalled.has_value());
+    CHECK(*while_stalled == SendResult::Retain);
+    CHECK(exec.has_in_flight_send()); // mismatched-orphan-still-running case, too
+
+    send_a.release();
+    REQUIRE(spin_until([&] { return !exec.has_in_flight_send() || send_a.invocations.load() >= 1; }));
+    // Drain the reclaim + a fresh launch for B to completion so the test frame doesn't
+    // outlive a detached worker.
+    std::optional<SendResult> b_result;
+    REQUIRE(spin_until(
+        [&] {
+            b_result = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+            return b_result.has_value() && *b_result == SendResult::Sent;
+        },
+        3s));
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
 TEST_CASE("stop() prevents a new launch but does not disturb one already in flight",
           "[spark][guardian][send_executor]") {
     GuardianOutboxSendExecutor exec;

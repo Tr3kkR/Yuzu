@@ -1615,6 +1615,35 @@ TEST_CASE("item 4: a stalled send is single-flight, never resubmitted while in f
     worker.stop();
 }
 
+TEST_CASE("#3953 item 3: an internal re-check bounds detection latency for a send that "
+          "finishes between the per-attempt offer wait and the periodic backstop",
+          "[spark][guardian][drain][chaos]") {
+    // A 1-hour periodic bound - matching R4's own config - so only the internal
+    // re-check (kGuardianSendRecheckInterval) can make progress inside this test's
+    // window; without it, the second entry sits behind loop()'s full 1-hour sleep and
+    // this test times out. Default GuardianMaintenanceConfig (journal=nullptr) means no
+    // maintenance pass runs regardless of interval, so this exercises send cadence only.
+    JournalRig rig;
+    std::atomic<int> sent_count{0};
+    auto sink = [&](const OutboxEntry&) -> SendResult {
+        // Only the FIRST send stalls - long enough to exceed kGuardianSendOfferWait
+        // (200ms) several times over, so the margin against scheduling jitter is wide
+        // (Fable's review: a tighter stall left too little slack against two 200ms
+        // offer waits).
+        if (sent_count.fetch_add(1) == 0)
+            std::this_thread::sleep_for(1s);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rig.rt, sink, /*periodic_bound_ms=*/3'600'000);
+    worker.start();
+
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
+
+    CHECK(spin_until([&] { return sent_count.load() >= 2; }, 5s));
+    worker.stop();
+}
+
 TEST_CASE("item 4 regression: a stalled lifecycle send does not starve compliance delivery",
           "[spark][guardian][drain][chaos]") {
     // #3847/#2233 item 4, governance Gate 4 unhappy-path finding UP-1 (BLOCKING, found in

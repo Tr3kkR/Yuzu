@@ -152,6 +152,17 @@ inline constexpr std::chrono::milliseconds kGuardianDrainMaxWall{2'000};
 /// stops waiting on it.
 inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 
+/// Internal re-check bound (#3953 item 3): when a send is known in flight on either
+/// lane (GuardianOutboxSendExecutor::has_in_flight_send()), loop()'s own wait is
+/// clamped to at most this, instead of riding out the full periodic bound. Closes the
+/// throughput cliff a send finishing between kGuardianSendOfferWait and the periodic
+/// bound used to hit: detection latency after completion is now bounded by roughly
+/// kGuardianSendOfferWait + this, not by kDefaultPeriodicBoundMs (5s in production).
+/// Deliberately NOT a wake source (no sig_->gen bump, no notify_all) - it only shortens
+/// how long the loop's OWN wait blocks, so it cannot perturb any test whose timing
+/// depends on nothing else waking the loop (see the R4 test's own comment).
+inline constexpr std::chrono::milliseconds kGuardianSendRecheckInterval{200};
+
 /// Journal-maintenance knobs for GuardianOutboxDrainWorker. A struct rather than more
 /// positional parameters so the two same-typed intervals cannot be transposed at a call
 /// site, and so a test can name only what it overrides:
