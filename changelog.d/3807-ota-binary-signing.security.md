@@ -29,7 +29,18 @@
   anchor; on macOS and Windows it runs as root and LocalSystem and can, so there
   the permissions keep unprivileged local users out rather than the agent itself
   — inherent, since a process able to replace the system binary can rewrite the
-  file authorising the replacement. Refusals are counted per agent and
+  file authorising the replacement. On Windows the installer takes ownership of
+  that directory and rebuilds its permissions outright rather than adding to
+  them, because `%ProgramData%` lets an unprivileged user create `agent-certs`
+  first: breaking inheritance alone would leave both the entry they had set for
+  themselves and their ownership of it, and an owner can restore its own access
+  at will. A post-install check then verifies the resulting owner and entry set
+  exactly — not merely that inheritance is off — and stops the installation if
+  anything other than Administrators and SYSTEM can write there, or if it cannot
+  get a definitive answer. Deleting an OTA package writes an
+  `ota.package.deleted` audit row naming what actually happened to the binary and
+  its signature sidecar, including `result=partial` when the registry row was
+  removed but a file could not be. Refusals are counted per agent and
   surfaced fleet-wide as `yuzu_fleet_ota_signature_refusing_agents`, since the
   update path has no status-report RPC and the agent has no metrics endpoint —
   without that gauge a fleet-wide refusal would only be visible in per-endpoint

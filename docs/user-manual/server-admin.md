@@ -1570,15 +1570,32 @@ route, neither the directory nor its ACL hardening exists after upgrading. Creat
 it before you enable signing, or `--update-trust-bundle` points at nothing:
 
 ```powershell
-# Windows, elevated. The inheritance break is the point: without it, $env:ProgramData's
-# inherited rights let an unprivileged local user plant the anchor file before you do.
-# Keep icacls on ONE line -- a broken continuation runs the mkdir and silently skips
-# the hardening, which is the exact state this block exists to avoid.
+# Windows, elevated. All three commands matter, and in this order. Keep each on ONE
+# line -- a broken continuation runs the earlier steps and silently skips the rest,
+# which is the exact state this block exists to avoid.
 mkdir "C:\ProgramData\Yuzu\agent-certs"
-icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
 
-# Verify: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each (OI)(CI)(F).
+# 1. Take ownership. If the directory ALREADY EXISTS, whoever created it owns it and
+#    holds WRITE_DAC permanently -- stripping their access without taking ownership
+#    lets them put it straight back. takeown also enables the privilege needed to
+#    recover a directory whose permissions grant Administrators nothing at all.
+takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
+
+# 2. Drop every explicit entry. This is the step that removes a pre-existing grant.
+#    Step 3 cannot: /grant:r replaces grants only for the accounts it NAMES, so an
+#    entry held by anyone else survives it untouched.
+icacls "C:\ProgramData\Yuzu\agent-certs" /reset /T /C /Q
+
+# 3. Break inheritance and grant exactly Administrators and SYSTEM. Without the
+#    inheritance break, %ProgramData%'s inherited rights let an unprivileged local
+#    user plant the anchor file before you do.
+icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /T /C /Q
+
+# Verify: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each (OI)(CI)(F),
+# and nothing marked (I). Check the OWNER too -- an unexpected owner can restore its own
+# access at any time, so "the list looks right" is not on its own sufficient.
 icacls "C:\ProgramData\Yuzu\agent-certs"
+(Get-Acl "C:\ProgramData\Yuzu\agent-certs").Owner
 ```
 
 ```bash
@@ -2239,7 +2256,7 @@ both:
 |---|---|---|
 | Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
 | macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
-| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM. The installer breaks ACL inheritance (`icacls /inheritance:r`) — without that, `%ProgramData%`'s inherited rights would let an unprivileged local user create the anchor file before you do. |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. A post-install check verifies the resulting owner and entry set exactly and aborts the install if anything else can write there. |
 
 **How much protection that directory gives you depends on the platform, and it is
 worth being precise about it.** On Linux the agent runs as the unprivileged

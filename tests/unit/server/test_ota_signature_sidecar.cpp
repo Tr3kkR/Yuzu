@@ -37,6 +37,8 @@ using yuzu::server::read_signature_sidecar;
 using yuzu::server::replace_signature_sidecar;
 using yuzu::server::SidecarOutcome;
 using yuzu::server::signature_sidecar_path;
+using yuzu::server::describe_package_delete;
+using yuzu::server::PackageDeleteOutcome;
 
 namespace fs = std::filesystem;
 
@@ -397,4 +399,105 @@ TEST_CASE("package filenames that escape the update directory are refused (#3863
     CHECK_FALSE(is_safe_package_filename("sub/dir/agent"));
 
     CHECK_FALSE(is_safe_package_filename(""));
+}
+
+TEST_CASE("describe_package_delete: a failed unlink is never audited as a removal",
+          "[sidecar][ota][audit]") {
+    // The branch this exists for. audit-log.md documents `ota.package.deleted` as
+    // meaning the binary AND its sidecar were removed; an unlink that failed must
+    // not be able to produce that claim. The registry row is gone either way, so
+    // the package stops being served — but the leftover file is still on disk and
+    // this row is the only record saying so.
+    SECTION("binary delete failed") {
+        PackageDeleteOutcome o;
+        o.matched = true;
+        o.signature_removed = true;
+        o.binary_error = "Permission denied";
+        const auto a = describe_package_delete(o);
+        CHECK(a.result == "partial");
+        CHECK(a.detail == "registry row removed; binary delete failed: Permission denied");
+        CHECK(a.detail.find("removed,") == std::string::npos);
+    }
+
+    SECTION("sidecar delete failed") {
+        PackageDeleteOutcome o;
+        o.matched = true;
+        o.binary_removed = true;
+        o.signature_error = "Device or resource busy";
+        const auto a = describe_package_delete(o);
+        CHECK(a.result == "partial");
+        CHECK(a.detail ==
+              "registry row removed; signature sidecar delete failed: Device or resource busy");
+    }
+
+    SECTION("both failed — both causes are named, neither is dropped") {
+        PackageDeleteOutcome o;
+        o.matched = true;
+        o.binary_error = "Permission denied";
+        o.signature_error = "Read-only file system";
+        const auto a = describe_package_delete(o);
+        CHECK(a.result == "partial");
+        CHECK(a.detail.find("binary delete failed: Permission denied") != std::string::npos);
+        CHECK(a.detail.find("signature sidecar delete failed: Read-only file system") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("describe_package_delete: 'deleted it' and 'it was not there' stay distinct",
+          "[sidecar][ota][audit]") {
+    // Collapsing these would hide an out-of-band removal: a package whose binary
+    // someone else already deleted is a different fact from one this call deleted,
+    // and only the audit row can carry that difference.
+    PackageDeleteOutcome o;
+    o.matched = true;
+
+    SECTION("both really removed") {
+        o.binary_removed = true;
+        o.signature_removed = true;
+        const auto a = describe_package_delete(o);
+        CHECK(a.result == "success");
+        CHECK(a.detail == "binary removed, signature sidecar removed");
+    }
+
+    SECTION("unsigned package — no sidecar existed") {
+        o.binary_removed = true;
+        o.signature_removed = false;
+        const auto a = describe_package_delete(o);
+        CHECK(a.result == "success");
+        CHECK(a.detail == "binary removed, signature sidecar already absent");
+    }
+
+    SECTION("binary already gone out of band") {
+        o.binary_removed = false;
+        o.signature_removed = true;
+        const auto a = describe_package_delete(o);
+        CHECK(a.result == "success");
+        CHECK(a.detail == "binary already absent, signature sidecar removed");
+    }
+
+    SECTION("row with neither file on disk") {
+        const auto a = describe_package_delete(o);
+        CHECK(a.result == "success");
+        CHECK(a.detail == "binary already absent, signature sidecar already absent");
+    }
+}
+
+TEST_CASE("describe_package_delete: an unmatched package is denied, not successful",
+          "[sidecar][ota][audit]") {
+    // `denied` rather than a bespoke `not_found` token, because audit-log.md's
+    // probe-detection recipe tells operators to filter on result == "denied" — a
+    // fourth token would be invisible to exactly the rule this row feeds.
+    PackageDeleteOutcome o;
+    o.matched = false;
+    const auto a = describe_package_delete(o);
+    CHECK(a.result == "denied");
+    CHECK(a.detail == "not_found");
+
+    // An unmatched delete removed nothing, so it must never claim otherwise even
+    // if the removal flags are somehow set.
+    o.binary_removed = true;
+    o.signature_removed = true;
+    const auto b = describe_package_delete(o);
+    CHECK(b.result == "denied");
+    CHECK(b.detail == "not_found");
 }

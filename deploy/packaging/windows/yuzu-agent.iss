@@ -130,11 +130,11 @@ Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 ; incompatible with an agent-readable anchor. Plugin code signing is unaffected
 ; and still uses <cert-dir>\plugin-trust-bundle.pem.
 ;
-; This Permissions entry ADDS ACEs and cannot disable inheritance, so on its own
-; it does NOT keep unprivileged users out: ProgramData grants Users inheritable
-; create rights, which would let a local user plant update-trust-bundle.pem here
-; before an operator provisions it. The icacls entry in the Run section breaks
-; inheritance and is what actually enforces this.
+; This Permissions entry ADDS ACEs and cannot disable inheritance, and it cannot
+; remove anything, so on its own it does NOT keep unprivileged users out:
+; ProgramData grants Users inheritable create rights, which would let a local
+; user plant update-trust-bundle.pem here before an operator provisions it. The
+; Run section rebuilds the DACL outright and is what actually enforces this.
 ;
 ; The agent service runs as LocalSystem, so it is covered by system-full and CAN
 ; write here - this keeps unprivileged local users out, not the agent itself.
@@ -144,12 +144,39 @@ Name: "{commonappdata}\Yuzu"; Permissions: admins-full system-full
 Name: "{commonappdata}\Yuzu\agent-certs"; Permissions: admins-full system-full
 
 [Run]
-; Break ACL inheritance on the trust-anchor directory (#416/#3807). Without
-; this, ProgramData's inherited rights let an unprivileged local user create
-; the anchor file before the operator does, defeating the verification it
-; anchors. Runs before the service starts, so the directory is already
-; locked down the first time the agent reads it.
-Filename: "{sys}\icacls.exe"; Parameters: """{commonappdata}\Yuzu\agent-certs"" /inheritance:r /grant:r ""*S-1-5-32-544:(OI)(CI)F"" ""*S-1-5-18:(OI)(CI)F"""; Flags: runhidden waituntilterminated; StatusMsg: "Securing the update trust-anchor directory..."
+; Rebuild the DACL on the trust-anchor directory (#416/#3807). Without this,
+; ProgramData's inherited rights let an unprivileged local user create the
+; anchor file before the operator does, defeating the verification it anchors.
+; Runs before the service starts, so the directory is already locked down the
+; first time the agent reads it.
+;
+; THREE commands, and all three are load-bearing. An earlier form ran only the
+; third, and it left a pre-existing attacker grant in place while the installer
+; reported the directory secured:
+;
+;   1. takeown -- the attacker CREATED this directory in the ordinary case, so
+;      they OWN it, and an owner holds WRITE_DAC permanently: stripping their
+;      ACE without taking ownership lets them put it straight back. takeown
+;      also enables SeTakeOwnershipPrivilege, which is what recovers a
+;      directory whose DACL grants Administrators nothing at all -- there,
+;      Set-Acl and icacls alone both fail with access denied.
+;   2. /reset -- drops every EXPLICIT ACE. This is the one that removes the
+;      attacker's grant. Step 3 cannot: `/grant:r` replaces grants only for the
+;      SIDs it NAMES (icacls's own documented semantics), so an explicit ACE
+;      held by any third SID survives it untouched.
+;   3. /inheritance:r /grant:r -- removes the INHERITED ACEs that step 2 just
+;      restored, and grants exactly Administrators and SYSTEM.
+;
+; /T applies each step to content already in the directory: a child file the
+; attacker planted carries its own ACL and its own owner, and locking the
+; directory while leaving that file writable protects nothing.
+;
+; These are best-effort ([Run] failures are dismissible by design in Inno).
+; The fail-closed gate is the post-install verifier in [Code], which checks the
+; resulting owner and ACE set exactly rather than trusting these to have run.
+Filename: "{sys}\takeown.exe"; Parameters: "/F ""{commonappdata}\Yuzu\agent-certs"" /A /R /D Y"; Flags: runhidden waituntilterminated; StatusMsg: "Securing the update trust-anchor directory..."
+Filename: "{sys}\icacls.exe"; Parameters: """{commonappdata}\Yuzu\agent-certs"" /reset /T /C /Q"; Flags: runhidden waituntilterminated; StatusMsg: "Securing the update trust-anchor directory..."
+Filename: "{sys}\icacls.exe"; Parameters: """{commonappdata}\Yuzu\agent-certs"" /inheritance:r /grant:r ""*S-1-5-32-544:(OI)(CI)F"" ""*S-1-5-18:(OI)(CI)F"" /T /C /Q"; Flags: runhidden waituntilterminated; StatusMsg: "Securing the update trust-anchor directory..."
 
 ; Register and start the service after install
 Filename: "{app}\bin\yuzu-agent.exe"; Parameters: "--install-service"; StatusMsg: "Registering Yuzu Agent service..."; Flags: runhidden waituntilterminated
@@ -401,16 +428,48 @@ begin
   end;
 end;
 
+{ Embed S as a PowerShell single-quoted literal. Inside single quotes PowerShell
+  expands nothing -- no $variable, no subexpression -- so the quote itself is the
+  only character needing care, and it is escaped by doubling. }
+function PsLit(const S: string): string;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(S) do
+    if S[I] = '''' then
+      Result := Result + ''''''
+    else
+      Result := Result + S[I];
+  Result := '''' + Result + '''';
+end;
+
 { Verify the trust-anchor ACL actually took.
 
-  The [Run] icacls entry is what locks C:\ProgramData\Yuzu\agent-certs down, but
-  Inno's default response to a failed [Run] step is a DISMISSIBLE error. On a host
-  where icacls is blocked (AV/EDR, or a hardened policy) an operator can click
-  through and finish the install with the directory still inheriting ProgramData's
-  ACEs -- which is exactly the "an unprivileged local user pre-plants the anchor
-  file" state that step exists to prevent, reached silently.
+  The [Run] entries are what lock C:\ProgramData\Yuzu\agent-certs down, but
+  Inno's default response to a failed [Run] step is a DISMISSIBLE error. On a
+  host where they are blocked (AV/EDR, or a hardened policy) an operator can
+  click through and finish the install with the directory still writable by an
+  unprivileged local user -- exactly the state those steps exist to prevent,
+  reached silently. So the result is re-checked here, and anything short of the
+  intended end state stops the install.
 
-  This re-checks the result and aborts the install if any inherited ACE remains.
+  IT MUST CHECK THE EXACT OWNER AND ACE SET, not a marker within the ACL text.
+  An earlier form tested only `Pos('(I)', AclText) > 0` -- the INHERITED-ACE
+  marker -- and it passed a directory an attacker could still write to. An
+  explicit (non-inherited) ACE carries no "(I)", so a grant the attacker had
+  set on the directory before the installer ran was invisible to the check,
+  and `icacls /grant:r` had not removed it either: /grant:r replaces grants
+  only for the SIDs it NAMES. Verified on Windows 11 26100: the install
+  completed, reported the directory secured, and the attacker retained
+  (OI)(CI)(F) on it plus ownership. "No inherited ACEs" is a far weaker
+  statement than "only Administrators and SYSTEM can write here", and only the
+  latter is what this directory needs -- so that is what is asserted, against
+  the directory AND everything already inside it.
+
+  Identities are compared as SIDs, never as names: icacls prints localised
+  account names ("VORDEFINIERT\Administratoren" on a German host), so matching
+  on "BUILTIN\Administrators" would silently fail open off an English build.
 
   IT MUST NOT PIPE icacls INTO find. An earlier form did:
 
@@ -424,56 +483,86 @@ end;
   for a genuinely secured directory, and the script reported SUCCESS. The
   install then completed "verified" having checked nothing.
 
-  So: no pipe. icacls writes to a file and ResultCode is icacls's OWN exit
-  code, which separates "the command ran and told us the answer" from "the
-  answer was clean". Every way of NOT getting an answer -- cmd would not
-  launch, icacls exited non-zero, the output could not be read back -- FAILS
-  CLOSED and stops the install, because an unverifiable ACL on this directory
-  is indistinguishable from a bad one, and a wrong "secured" is worse than a
-  refusal. }
+  So: no pipe, and no inference from absence of output. The check writes its
+  verdict to a file and exits 0 ONLY on a clean result; the install proceeds
+  only when the exit code is 0 AND the file says PASS. Every way of NOT getting
+  an answer -- PowerShell would not launch, it exited non-zero, the ACL could
+  not be read, the verdict could not be read back -- FAILS CLOSED and stops the
+  install, because an unverifiable ACL on this directory is indistinguishable
+  from a bad one, and a wrong "secured" is worse than a refusal.
+
+  The script is passed with -Command, not -File: execution policy governs
+  script FILES, so an AllSigned policy pushed by GPO would block a .ps1 here
+  but does not affect -Command. }
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
-  CertDir: string;
-  AclDump: string;
-  AclText: AnsiString;
+  CertDir, ReasonFile, PsExe, Script, Reason: string;
+  ReasonText: AnsiString;
 begin
   if CurStep <> ssPostInstall then
     Exit;
 
   CertDir := ExpandConstant('{commonappdata}\Yuzu\agent-certs');
-  AclDump := ExpandConstant('{tmp}\yuzu-agent-certs-acl.txt');
+  ReasonFile := ExpandConstant('{tmp}\yuzu-agent-certs-acl.txt');
+  PsExe := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
 
-  if not Exec(ExpandConstant('{cmd}'),
-              '/C icacls "' + CertDir + '" > "' + AclDump + '" 2>&1',
+  { Built from plain literals so the braces stay literal -- Inno expands {...}
+    as a constant only inside ExpandConstant, which is applied to the paths
+    separately above. }
+  Script :=
+    '$ErrorActionPreference=''Stop'';' +
+    '$d=' + PsLit(CertDir) + ';' +
+    '$out=' + PsLit(ReasonFile) + ';' +
+    '$ok=@(''S-1-5-32-544'',''S-1-5-18'');' +
+    'function Fail($m){Set-Content -LiteralPath $out -Value $m -Encoding ASCII;exit 3};' +
+    'try{$a=Get-Acl -LiteralPath $d}catch{Fail (''the permissions could not be read: '' + $_.Exception.Message)};' +
+    'if(-not $a.AreAccessRulesProtected){Fail ''it still inherits permissions from ProgramData''};' +
+    '$t=@($d);' +
+    'try{$t+=@(Get-ChildItem -LiteralPath $d -Recurse -Force|ForEach-Object{$_.FullName})}catch{Fail ''its contents could not be listed''};' +
+    'foreach($p in $t){' +
+      'try{$x=Get-Acl -LiteralPath $p}catch{Fail (''the permissions could not be read on '' + $p)};' +
+      '$o=$x.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;' +
+      'if($ok -notcontains $o){Fail (''it is owned by '' + $o + '': '' + $p)};' +
+      'foreach($r in $x.Access){' +
+        'try{$s=$r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value}' +
+        'catch{Fail (''an account on its permission list could not be resolved: '' + $p)};' +
+        'if($ok -notcontains $s){Fail (''access is granted to '' + $s + '': '' + $p)}' +
+      '}' +
+    '};' +
+    'Set-Content -LiteralPath $out -Value ''PASS'' -Encoding ASCII;' +
+    'exit 0';
+
+  if not Exec(PsExe,
+              '-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "' + Script + '"',
               '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
     RaiseException('Could not run the permission check on:' + #13#10 + CertDir + #13#10#13#10 +
                    'The update trust-anchor directory could not be verified, so the ' +
                    'installation has been stopped rather than report it secured without ' +
-                   'having checked. Confirm manually that it does not inherit permissions ' +
-                   '(icacls /inheritance:r), then re-run the installer.');
+                   'having checked. Confirm manually that only Administrators and SYSTEM ' +
+                   'have access to it, then re-run the installer.');
 
-  if ResultCode <> 0 then
-    RaiseException('The permission check on the update trust-anchor directory failed:' + #13#10 +
-                   CertDir + #13#10#13#10 +
-                   'icacls could not read the ACL (exit code ' + IntToStr(ResultCode) + ') -- ' +
-                   'security software may have blocked it. The directory has NOT been ' +
-                   'verified, so the installation has been stopped.');
+  if LoadStringFromFile(ReasonFile, ReasonText) then
+    Reason := Trim(String(ReasonText))
+  else
+    Reason := '';
 
-  if not LoadStringFromFile(AclDump, AclText) then
-    RaiseException('Could not read back the permission check for:' + #13#10 + CertDir +
-                   #13#10#13#10 + 'The directory has NOT been verified, so the installation ' +
-                   'has been stopped.');
+  DeleteFile(ReasonFile);
 
-  DeleteFile(AclDump);
-
-  if Pos('(I)', AclText) > 0 then
-    RaiseException('The update trust-anchor directory still inherits permissions:' + #13#10 +
-                   CertDir + #13#10#13#10 +
-                   'Unprivileged local users may be able to create the trust bundle there ' +
-                   'before you do, which would let them authorise their own agent updates. ' +
-                   'Securing it (icacls /inheritance:r) did not take effect -- security ' +
-                   'software may have blocked it. The installation has been stopped.');
+  { Both conditions are required. A non-zero exit means the check ran and
+    rejected the directory; a zero exit without the PASS verdict means it did
+    not get far enough to reach one, which is not evidence of anything. }
+  if (ResultCode <> 0) or (Reason <> 'PASS') then
+  begin
+    if Reason = '' then
+      Reason := 'the check did not produce a result (exit code ' + IntToStr(ResultCode) + ')';
+    RaiseException('The update trust-anchor directory is not secured:' + #13#10 +
+                   CertDir + #13#10#13#10 + Reason + #13#10#13#10 +
+                   'Only Administrators and SYSTEM may have access to it. While anyone ' +
+                   'else can write there, they can install their own trust bundle and ' +
+                   'authorise their own agent updates. Securing it did not take effect -- ' +
+                   'security software may have blocked it. The installation has been stopped.');
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

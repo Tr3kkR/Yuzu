@@ -5644,21 +5644,33 @@ void SettingsRoutes::register_routes(
                     auto arch = req.matches[2].str();
                     auto version = req.matches[3].str();
 
-                    bool matched = false;
+                    PackageDeleteOutcome outcome;
+                    // Each remove gets its OWN error_code. Sharing one lets the
+                    // second call's result overwrite the first, so a failed
+                    // binary delete followed by a clean sidecar delete reads as
+                    // wholly successful.
+                    std::error_code bin_ec;
+                    std::error_code sig_ec;
                     auto packages = update_registry_->list_packages();
                     for (const auto& pkg : packages) {
                         if (pkg.platform == platform && pkg.arch == arch &&
                             pkg.version == version) {
-                            matched = true;
+                            outcome.matched = true;
                             auto bin_path = update_registry_->binary_path(pkg);
-                            std::error_code ec;
-                            std::filesystem::remove(bin_path, ec);
+                            outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
                             // Remove the signature sidecar with it. Leaving it
                             // behind would let a later upload of a same-named
                             // package inherit a signature made over DIFFERENT
                             // bytes — which the agent would then reject as
                             // tampered, with no obvious cause.
-                            std::filesystem::remove(update_registry_->signature_path(pkg), ec);
+                            outcome.signature_removed = std::filesystem::remove(
+                                update_registry_->signature_path(pkg), sig_ec);
+                            if (bin_ec) {
+                                outcome.binary_error = bin_ec.message();
+                            }
+                            if (sig_ec) {
+                                outcome.signature_error = sig_ec.message();
+                            }
                             break;
                         }
                     }
@@ -5672,16 +5684,15 @@ void SettingsRoutes::register_routes(
                     // successful removal puts a fictional event in the evidence
                     // store — and hides probing of the endpoint from a SIEM rule.
                     //
-                    // The rejection token is `denied` with the reason in `detail`,
-                    // not a bespoke `not_found` result: this file's own rejection
-                    // branches use that shape (`user.delete` -> "denied" /
-                    // "invalid_username"), and audit-log.md's probe-detection
-                    // recipe tells operators to filter on `result == "denied"` —
-                    // so a fourth token would be invisible to exactly the rule
-                    // this row exists to feed.
-                    audit_fn_(req, "ota.package.deleted", matched ? "success" : "denied",
-                              "UpdatePackage", platform + "/" + arch + "/" + version,
-                              matched ? "binary and signature sidecar removed" : "not_found");
+                    // The result/detail derivation is a pure function in
+                    // ota_signature_sidecar.hpp — including why a failed unlink is
+                    // never audited as a removal, and why the rejection token is
+                    // `denied` rather than a bespoke `not_found`. It lives there
+                    // because the failed-unlink branch cannot be reached from a
+                    // unit test of this route.
+                    const auto audit = describe_package_delete(outcome);
+                    audit_fn_(req, "ota.package.deleted", audit.result, "UpdatePackage",
+                              platform + "/" + arch + "/" + version, audit.detail);
                     res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
                 });
 

@@ -148,4 +148,37 @@ enum class SidecarOutcome {
 [[nodiscard]] bool replace_signature_sidecar(const std::filesystem::path& sidecar,
                                              const std::string& signature_pem);
 
+/// What a package delete actually did to the two files on disk.
+///
+/// `*_failed` carries the filesystem error; `*_removed` says a file was really
+/// unlinked. Both false with no error means the file was not there to begin with,
+/// which is a THIRD outcome and not a synonym for either of the others.
+struct PackageDeleteOutcome {
+    bool matched = false;            ///< a registry row matched the requested package
+    bool binary_removed = false;
+    bool signature_removed = false;
+    std::string binary_error;        ///< empty unless the binary unlink failed
+    std::string signature_error;     ///< empty unless the sidecar unlink failed
+};
+
+/// The audit `result` token and `detail` string for a package delete.
+///
+/// PURE so it can be tested, because the branch that matters cannot be reached
+/// from a unit test of the route: it needs a filesystem `remove` to FAIL, which
+/// means a read-only parent on POSIX and an open handle on Windows — a test that
+/// would be platform-guarded on both legs, and a platform-guarded test is how a
+/// dead leg hides. The route keeps only the two `remove` calls.
+///
+/// A FAILED unlink is never reported as a successful removal. The registry row is
+/// gone either way, so this is not an OTA-serving bypass — but audit-log.md
+/// documents this verb as meaning both files were removed, and an audit chain that
+/// asserts a removal which did not happen is worth less than one that admits it.
+/// `partial` is the token this codebase already uses for "the durable part landed,
+/// a dependent step did not" (cf. `session.revoke_all`).
+struct PackageDeleteAudit {
+    std::string result;
+    std::string detail;
+};
+[[nodiscard]] PackageDeleteAudit describe_package_delete(const PackageDeleteOutcome& outcome);
+
 } // namespace yuzu::server

@@ -280,4 +280,35 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
     return true;
 }
 
+PackageDeleteAudit describe_package_delete(const PackageDeleteOutcome& outcome) {
+    if (!outcome.matched) {
+        // `denied` with the reason in `detail`, not a bespoke `not_found` result:
+        // audit-log.md's probe-detection recipe tells operators to filter on
+        // `result == "denied"`, so a fourth token would be invisible to exactly
+        // the rule this row exists to feed.
+        return {"denied", "not_found"};
+    }
+
+    const bool binary_failed = !outcome.binary_error.empty();
+    const bool signature_failed = !outcome.signature_error.empty();
+    if (binary_failed || signature_failed) {
+        std::string detail = "registry row removed";
+        if (binary_failed) {
+            detail += "; binary delete failed: " + outcome.binary_error;
+        }
+        if (signature_failed) {
+            detail += "; signature sidecar delete failed: " + outcome.signature_error;
+        }
+        return {"partial", detail};
+    }
+
+    // Distinguish "deleted it" from "it was not there": a package whose binary had
+    // already been removed out of band is a different fact from one this call
+    // deleted, and collapsing them hides the out-of-band removal.
+    std::string detail = outcome.binary_removed ? "binary removed" : "binary already absent";
+    detail += outcome.signature_removed ? ", signature sidecar removed"
+                                        : ", signature sidecar already absent";
+    return {"success", detail};
+}
+
 } // namespace yuzu::server
