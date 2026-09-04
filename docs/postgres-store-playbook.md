@@ -185,7 +185,7 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    the caller has no retry of its own and an operator needs to know (`UpdateRegistry`'s admin-driven
    writes). State the choice's rationale in the store's own file, since the two shapes read
    identically from the log line alone. **Judge per METHOD, not per store** — `UpdateRegistry` itself
-   keeps all four methods at `error` uniformly (a coarser split than ideal: `latest_for` feeds the
+   keeps all five methods at `error` uniformly (a coarser split than ideal: `latest_for` feeds the
    agent-driven, heartbeat-retried `CheckForUpdate`/`DownloadUpdate` path and could plausibly justify
    `debug` by this same rationale, while `list_packages` is genuinely admin-driven like the writes) —
    don't cite `UpdateRegistry` as a worked example of the per-method split, only of the store-vs-store

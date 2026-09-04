@@ -389,6 +389,7 @@ yuzu_server_core_lib = static_library(
     'src/cpe_identity_resolver.cpp',
     'src/nvd_client.cpp',
     'src/nvd_sync.cpp',
+    'src/ota_signature_sidecar.cpp',
     'src/update_registry.cpp',
     'src/response_store.cpp',
     'src/bundle_service.cpp',

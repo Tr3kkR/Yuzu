@@ -99,7 +99,7 @@ TEST_CASE("UpdateRegistry: upsert_package + list_packages returns it",
     REQUIRE(reg.is_open());
 
     auto pkg = make_pkg();
-    reg.upsert_package(pkg);
+    REQUIRE(reg.upsert_package(pkg));
 
     auto packages = reg.list_packages();
     REQUIRE(packages.size() == 1);
@@ -119,7 +119,7 @@ TEST_CASE("UpdateRegistry: latest_for returns package for matching platform/arch
     UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 
-    reg.upsert_package(make_pkg("linux", "x86_64", "0.1.0", "yuzu-agent-0.1.0-linux"));
+    REQUIRE(reg.upsert_package(make_pkg("linux", "x86_64", "0.1.0", "yuzu-agent-0.1.0-linux")));
 
     auto result = reg.latest_for("linux", "x86_64");
     REQUIRE(result.has_value());
@@ -135,7 +135,7 @@ TEST_CASE("UpdateRegistry: latest_for returns nullopt for unknown platform",
     UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 
-    reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0"));
+    REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0")));
 
     auto result = reg.latest_for("freebsd", "x86_64");
     REQUIRE_FALSE(result.has_value());
@@ -149,8 +149,8 @@ TEST_CASE("UpdateRegistry: latest_for returns newest version when multiple exist
     UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 
-    reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-0.1.0.exe"));
-    reg.upsert_package(make_pkg("windows", "x86_64", "0.2.0", "agent-0.2.0.exe"));
+    REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-0.1.0.exe")));
+    REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.2.0", "agent-0.2.0.exe")));
 
     auto result = reg.latest_for("windows", "x86_64");
     REQUIRE(result.has_value());
@@ -165,8 +165,8 @@ TEST_CASE("UpdateRegistry: latest_for handles numeric version comparison (0.10.0
     UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 
-    reg.upsert_package(make_pkg("linux", "aarch64", "0.9.0", "agent-0.9.0"));
-    reg.upsert_package(make_pkg("linux", "aarch64", "0.10.0", "agent-0.10.0"));
+    REQUIRE(reg.upsert_package(make_pkg("linux", "aarch64", "0.9.0", "agent-0.9.0")));
+    REQUIRE(reg.upsert_package(make_pkg("linux", "aarch64", "0.10.0", "agent-0.10.0")));
 
     auto result = reg.latest_for("linux", "aarch64");
     REQUIRE(result.has_value());
@@ -183,7 +183,7 @@ TEST_CASE("UpdateRegistry: remove_package makes latest_for return nullopt",
     UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 
-    reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0"));
+    REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0")));
     reg.remove_package("windows", "x86_64", "0.1.0");
 
     auto result = reg.latest_for("windows", "x86_64");
@@ -259,6 +259,35 @@ TEST_CASE("UpdateRegistry: binary_path returns update_dir / filename", "[update_
     REQUIRE(path == tmp.path() / "yuzu-agent.exe");
 }
 
+// A STORED filename is revalidated at READ time, not only at upload (#3863).
+// The upload guard protects new rows; these paths are derived from whatever the
+// row already holds, so a row written BEFORE that guard landed, or written
+// straight to the database, would otherwise be resolved here and then read from
+// (CheckForUpdate serves the sidecar beside it) or unlinked (the delete route)
+// outside update_dir_.
+//
+// The assertion is `.empty()`, not "some path inside update_dir_": joining an
+// unsafe name yields update_dir_ ITSELF, and handing that to a remove() is
+// worse than handing it nothing. Without this case the read-time guard could be
+// deleted and every other test here would stay green.
+TEST_CASE("UpdateRegistry: an unsafe stored filename resolves to no path at all",
+          "[update_registry][pg][path]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
+    TempUpdateDir tmp;
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
+
+    for (const char* unsafe : {"../escape.exe", "sub/dir.exe", "/abs/path.exe", ""}) {
+        INFO("stored filename = '" << unsafe << "'");
+        auto pkg = make_pkg("windows", "x86_64", "0.1.0", unsafe);
+        CHECK(reg.binary_path(pkg).empty());
+        // The sidecar is derived from the binary path, so it must not fall back
+        // to a bare ".sig" resolved against the process working directory.
+        CHECK(reg.signature_path(pkg).empty());
+    }
+}
+
 // ── list_packages ───────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: list_packages returns all upserted packages",
@@ -269,9 +298,9 @@ TEST_CASE("UpdateRegistry: list_packages returns all upserted packages",
     UpdateRegistry reg(pool, tmp.path());
     REQUIRE(reg.is_open());
 
-    reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-win-0.1.0.exe"));
-    reg.upsert_package(make_pkg("linux", "x86_64", "0.1.0", "agent-linux-0.1.0"));
-    reg.upsert_package(make_pkg("darwin", "aarch64", "0.1.0", "agent-darwin-0.1.0"));
+    REQUIRE(reg.upsert_package(make_pkg("windows", "x86_64", "0.1.0", "agent-win-0.1.0.exe")));
+    REQUIRE(reg.upsert_package(make_pkg("linux", "x86_64", "0.1.0", "agent-linux-0.1.0")));
+    REQUIRE(reg.upsert_package(make_pkg("darwin", "aarch64", "0.1.0", "agent-darwin-0.1.0")));
 
     auto packages = reg.list_packages();
     REQUIRE(packages.size() == 3);
@@ -289,13 +318,13 @@ TEST_CASE("UpdateRegistry: upsert same platform/arch/version replaces existing",
 
     auto pkg = make_pkg("windows", "x86_64", "0.1.0", "agent-v1.exe");
     pkg.sha256 = "original_hash";
-    reg.upsert_package(pkg);
+    REQUIRE(reg.upsert_package(pkg));
 
     // Upsert with same primary key but different fields
     pkg.sha256 = "updated_hash";
     pkg.filename = "agent-v1-rebuilt.exe";
     pkg.file_size = 2048;
-    reg.upsert_package(pkg);
+    REQUIRE(reg.upsert_package(pkg));
 
     auto packages = reg.list_packages();
     REQUIRE(packages.size() == 1);
@@ -321,8 +350,10 @@ TEST_CASE("UpdateRegistry: a store that fails to open degrades every method to a
 
     CHECK(reg.list_packages().empty());
     CHECK_FALSE(reg.latest_for("windows", "x86_64").has_value());
-    // Neither call should throw or crash against a never-opened store.
-    reg.upsert_package(make_pkg());
+    // Neither call should throw or crash against a never-opened store, and the
+    // write must REPORT that it did not commit — the degrade is the behaviour
+    // under test, so asserting the false is stronger than discarding it.
+    CHECK_FALSE(reg.upsert_package(make_pkg()));
     reg.remove_package("windows", "x86_64", "0.1.0");
     CHECK(reg.list_packages().empty());
 }
@@ -352,7 +383,7 @@ TEST_CASE("UpdateRegistry: read and write degrade counters increment on a store 
                           {{"reason", "store_not_open"}})
               .value() == 1.0);
 
-    reg.upsert_package(make_pkg());
+    CHECK_FALSE(reg.upsert_package(make_pkg()));
     CHECK(metrics.counter("yuzu_server_update_registry_write_degrade_total",
                           {{"reason", "store_not_open"}})
               .value() == 1.0);

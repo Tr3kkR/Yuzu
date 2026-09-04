@@ -9,6 +9,7 @@ __declspec(allocate(".CRT$XCB"))
     [[maybe_unused]] static void(__cdecl* p_dll_diag)() = diag_dll_static_init;
 #endif
 
+#include <yuzu/agent/detached_signature.hpp>
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/agent_csr.hpp>
 #include <yuzu/agent/cert_discovery.hpp>
@@ -1938,7 +1939,12 @@ public:
                 // Publish the fresh Updater, then work through the LOCAL copy — the slot can
                 // be re-read by Agent::stop() on another thread at any moment.
                 auto updater = std::make_shared<Updater>(
-                    UpdateConfig{cfg_.auto_update, cfg_.update_check_interval}, cfg_.agent_id,
+                    UpdateConfig{.enabled = cfg_.auto_update,
+                                 .check_interval = cfg_.update_check_interval,
+                                 .signature_trust_bundle = cfg_.update_trust_bundle,
+                                 .require_signature = cfg_.update_require_signature,
+                                 .metrics = &metrics_},
+                    cfg_.agent_id,
                     std::string{yuzu::kFullVersionString}, kAgentOs, kAgentArch,
                     current_executable_path());
                 set_updater(updater);
@@ -2308,6 +2314,30 @@ public:
                                 metrics_.counter("yuzu_agent_dedup_record_errors_total").value()));
                             tags["yuzu.dedup_release_errors"] = std::to_string(static_cast<int64_t>(
                                 metrics_.counter("yuzu_agent_dedup_release_errors_total").value()));
+                            // OTA signature refusals (#416/#3807). Carried on the
+                            // heartbeat for the same reason as the dedup counters
+                            // above: the agent has no /metrics endpoint, so this
+                            // is the ONLY channel by which an operator learns that
+                            // an endpoint is refusing updates. Without it a
+                            // fleet-wide refusal is discovered when machines stop
+                            // patching, which is exactly the failure the signing
+                            // work exists to make visible.
+                            {
+                                // Summed over the SHARED reason list, not a
+                                // hardcoded copy: a reason added in updater.cpp
+                                // and forgotten here would be counted by neither
+                                // this tag nor the fleet gauge derived from it.
+                                double refused = 0.0;
+                                for (const auto reason :
+                                     yuzu::agent::kSignatureRefusalReasons) {
+                                    refused += metrics_
+                                                   .counter("yuzu_agent_ota_signature_refused_total",
+                                                            {{"reason", std::string(reason)}})
+                                                   .value();
+                                }
+                                tags["yuzu.ota_signature_refused"] =
+                                    std::to_string(static_cast<int64_t>(refused));
+                            }
                             tags["yuzu.os"] = kAgentOs;
                             tags["yuzu.arch"] = kAgentArch;
                             tags["yuzu.agent_version"] = std::string{yuzu::kFullVersionString};
