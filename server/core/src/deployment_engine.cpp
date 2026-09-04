@@ -143,7 +143,7 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
         if (accounted_ids.insert(aid).second)
             skipped.push_back({.agent_id = aid,
                                .from_step = claimed_step,
-                               .to_step = "skipped",
+                               .to_step = step_token(Step::kSkipped),
                                .error = "out of scope at dispatch"});
     }
 
