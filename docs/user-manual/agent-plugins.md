@@ -564,6 +564,21 @@ Plugins for file and directory operations.
 | `get_version_info` | Extract version information from an executable or app bundle. On Windows, reads the PE version resource (FileVersion, ProductVersion, CompanyName, FileDescription, etc.). On macOS, reads CFBundleShortVersionString and CFBundleVersion from the bundle's Info.plist via `plutil` (handles both binary and XML plists); `path` may be a `.app` directory or an `Info.plist` file directly, and a target with no Info.plist or version keys returns `version_status|not_available` rather than an error. On Linux, returns platform-unsupported. Parameters: `path` (required). |
 | `find_by_hash` | Search a directory tree for files matching a SHA-256 hash. Useful for threat hunting and file integrity verification. Parameters: `hash` (required, SHA-256 hex string), `path` (required, directory to search). |
 
+### disk_actions
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | W M |
+| **Description** | Physical drive health, and the mapping between physical drives and the logical volumes they back. Both actions are read-only — every device and volume handle is opened with no access rights at all on Windows, and no leg issues a mutating control. |
+
+| Action | Description |
+|---|---|
+| `smart` | Report per-physical-drive health: model, transport and media type, plus wear, available-spare and critical-warning figures where the OS exposes them. On Windows uses `IOCTL_STORAGE_QUERY_PROPERTY` — `StorageDeviceProperty` for identity, `StorageDeviceSeekPenaltyProperty` for SSD-vs-HDD, and `StorageDeviceProtocolSpecificProperty` with NVMe log page 0x02 for the health figures. **Health is NVMe-only:** the wear figures come from the NVMe health log, so a SATA or USB drive reports identity and media type with health `unknown` rather than a guess. `IOCTL_STORAGE_PREDICT_FAILURE` is deliberately not used as a fallback — it fails with `ERROR_INVALID_FUNCTION` on NVMe hardware. On macOS reports identity and whether the device advertises NVMe SMART, but **not** the health attributes: those are reachable only through a private, undocumented Apple interface, so health reads `unknown` on every macOS device. **Not implemented on Linux** in this release — no mechanism could be bound against real hardware, and the leg says so rather than reporting an empty result. |
+| `volumes` | Report which physical drive backs which logical volume and mount point. This is deliberately **not** a general volume inventory: `hardware.disks` already lists physical devices and `filesystem_posture.mounts` lists mounts; this action carries the join between them, so a failing drive can be named in terms of the drive letters or mount points it serves. On Windows a volume spanning several drives reports every drive it touches, and a volume with no drive letter or mount point reports `-` for mount points rather than being omitted. On macOS the physical drive is resolved by walking the IOKit provider chain, so a volume on a synthesized APFS container correctly reports the underlying physical disk rather than the container. **Not implemented on Linux** in this release; it ships with the `smart` leg it exists to support. |
+
+---
+
 ### disk_space
 
 | | |

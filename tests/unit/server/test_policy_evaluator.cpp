@@ -136,7 +136,7 @@ struct Harness {
         d.dispatch_fn = [this](const std::string& plugin, const std::string&,
                                const std::vector<std::string>& agents, const std::string&,
                                const std::unordered_map<std::string, std::string>&,
-                               const std::string& execid) -> std::pair<std::string, int> {
+                               const std::string& execid) -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatch_calls;
             dispatched_plugins.push_back(plugin);
             int sent = 0;
@@ -155,7 +155,7 @@ struct Harness {
                 rs.store(r);
                 ++sent;
             }
-            return {"cmd-" + execid, sent};
+            return {.sent = sent, .command_id = "cmd-" + execid};
         };
         return d;
     }
