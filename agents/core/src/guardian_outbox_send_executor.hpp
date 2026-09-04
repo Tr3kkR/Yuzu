@@ -81,7 +81,16 @@ public:
     /// region. Both take the SAME rollback path (see launch()).
     enum class LaunchFaultForTest { None, SpawnRefused, Throw };
 
-    GuardianOutboxSendExecutor() : state_(std::make_shared<State>()) {}
+    /// #3953 item 2: a send still in flight this long (measured from admission to
+    /// completion, or to "still running" if not yet complete) is counted and logged
+    /// once as a stall - matches the production periodic backstop, so this fires only
+    /// once a send has already missed every ordinary re-check. Tests pass a short
+    /// threshold to exercise the path without a real multi-second wait.
+    static constexpr std::chrono::milliseconds kGuardianSendStallThreshold{5'000};
+
+    explicit GuardianOutboxSendExecutor(
+        std::chrono::milliseconds stall_threshold = kGuardianSendStallThreshold)
+        : state_(std::make_shared<State>()), stall_threshold_(stall_threshold) {}
     GuardianOutboxSendExecutor(const GuardianOutboxSendExecutor&) = delete;
     GuardianOutboxSendExecutor& operator=(const GuardianOutboxSendExecutor&) = delete;
 
@@ -243,6 +252,21 @@ public:
         return state_->in_flight;
     }
 
+    /// #3953 item 1: an orphan's thrown exception, discarded because it belongs to a
+    /// superseded entry with nowhere correct to attribute it - see the reclaim branch
+    /// in offer(). Diagnostic-signal only; the discard itself is correct behavior.
+    [[nodiscard]] std::uint64_t orphan_exception_count() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        return state_->orphan_exceptions_discarded;
+    }
+
+    /// #3953 item 2: cumulative count of sends (same-entry or mismatched-orphan) that
+    /// crossed kGuardianSendStallThreshold before completing or being reclaimed.
+    [[nodiscard]] std::uint64_t send_stall_count() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        return state_->stalls;
+    }
+
     /// Test-only synchronization seam - see the call site in offer() for what race it
     /// exists to make deterministic. Production callers never set this.
     void set_pre_launch_race_hook_for_test(std::function<void()> hook) {
@@ -272,7 +296,34 @@ private:
         std::string in_flight_event_id;
         SendResult result{SendResult::Retain};
         std::exception_ptr eptr; ///< set instead of `result` if `send` itself threw
+        // #3953 items 1+2 - observability. Reset in launch()'s locked admission block
+        // (the same block that arms the AliveTicket), so they apply to the CURRENT
+        // in-flight send only.
+        std::uint64_t orphan_exceptions_discarded{0}; ///< a reclaimed orphan's throw, discarded (item 1)
+        std::uint64_t stalls{0};                      ///< sends that crossed stall_threshold_ (item 2)
+        std::chrono::steady_clock::time_point launched_at{};  ///< set by launch(), under the lock
+        std::chrono::steady_clock::time_point completed_at{}; ///< set by the worker, under the publish lock
+        bool stall_logged{false}; ///< this in-flight send already counted/logged as stalled
     };
+
+    /// Called with state_->mu HELD. Returns true iff THIS call is the one that newly
+    /// crosses stall_threshold_ (so the caller logs exactly once, outside the lock).
+    /// Compares against completed_at once the send is done, `now()` only while it is
+    /// still genuinely running (#3953 item 2, Fable's review) - comparing against
+    /// `now()` unconditionally would overstate elapsed time for a send that actually
+    /// finished earlier but whose caller was scheduled late to notice, which can flake
+    /// a short test threshold and conflates "how long did this take" with "how long has
+    /// the caller been checking".
+    bool check_stall_locked() {
+        if (!state_->in_flight || state_->stall_logged)
+            return false;
+        const auto reference = state_->done ? state_->completed_at : std::chrono::steady_clock::now();
+        if (reference - state_->launched_at < stall_threshold_)
+            return false;
+        ++state_->stalls;
+        state_->stall_logged = true;
+        return true;
+    }
 
     /// RAII orphan-exit marker, mirroring guardian_io_executor.hpp's TicketCore split
     /// (guardian_io_executor.hpp:474-513): the worker's OWN captured copy is the one
@@ -445,6 +496,7 @@ private:
     }
 
     std::shared_ptr<State> state_;
+    std::chrono::milliseconds stall_threshold_;
     std::function<void()> pre_launch_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::function<void()> post_admission_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::atomic<LaunchFaultForTest> launch_fault_for_test_{LaunchFaultForTest::None}; ///< test seam

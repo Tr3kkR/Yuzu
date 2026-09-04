@@ -15,6 +15,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 using namespace yuzu::agent;
 using namespace std::chrono_literals;
@@ -321,6 +322,141 @@ TEST_CASE("#3953 item 3: has_in_flight_send() reads true for a mismatched orphan
     REQUIRE(spin_until([&] { return !exec.has_in_flight_send() || send_a.invocations.load() >= 1; }));
     // Drain the reclaim + a fresh launch for B to completion so the test frame doesn't
     // outlive a detached worker.
+    std::optional<SendResult> b_result;
+    REQUIRE(spin_until(
+        [&] {
+            b_result = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+            return b_result.has_value() && *b_result == SendResult::Sent;
+        },
+        3s));
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("#3953 item 1: a reclaimed orphan's thrown exception is counted, not just "
+          "silently discarded",
+          "[spark][guardian][send_executor][chaos]") {
+    GuardianOutboxSendExecutor exec;
+    StallingSend send_a;
+    send_a.result = SendResult::Sent; // unused: A throws instead, see below
+    auto entry_a = lifecycle_entry("event-a");
+    auto entry_b = lifecycle_entry("event-b");
+
+    // A's send throws once released, instead of returning a SendResult.
+    std::atomic<bool> a_release{false};
+    std::mutex a_mu;
+    std::condition_variable a_cv;
+    auto throwing_a = [&](const OutboxEntry&) -> SendResult {
+        std::unique_lock<std::mutex> lk{a_mu};
+        a_cv.wait(lk, [&] { return a_release.load(); });
+        throw std::runtime_error("orphan boom");
+    };
+
+    auto first = exec.offer(entry_a, throwing_a, 20ms);
+    CHECK_FALSE(first.has_value());
+
+    // Head changes to B while A is still running - the mismatch/orphan branch.
+    auto while_stalled = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+    REQUIRE(while_stalled.has_value());
+    CHECK(*while_stalled == SendResult::Retain);
+    CHECK(exec.orphan_exception_count() == 0); // not yet reclaimed
+
+    {
+        std::lock_guard<std::mutex> lk{a_mu};
+        a_release = true;
+    }
+    a_cv.notify_all();
+
+    // Once A's orphaned worker finishes (with a throw this time), reclaiming it must
+    // count the discard - the throw is real evidence of a problem, and silently losing
+    // it entirely (as pre-#3953) is a diagnostic-signal narrowing versus pre-item-4
+    // behavior (drain_log_unlocked's own catch used to count every such throw).
+    std::optional<SendResult> b_result;
+    REQUIRE(spin_until(
+        [&] {
+            b_result = exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+            return b_result.has_value() && *b_result == SendResult::Sent;
+        },
+        3s));
+    CHECK(exec.orphan_exception_count() == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("#3953 item 2: a same-entry send stalled past the threshold is counted once, "
+          "and a recovery log fires on eventual completion",
+          "[spark][guardian][send_executor][chaos]") {
+    GuardianOutboxSendExecutor exec{50ms}; // short threshold - no real multi-second wait
+    StallingSend send;
+    auto entry = lifecycle_entry("e1");
+
+    auto first = exec.offer(entry, std::ref(send), 20ms);
+    CHECK_FALSE(first.has_value());
+    CHECK(exec.send_stall_count() == 0); // not stalled yet - under the 50ms threshold
+
+    // Repeated 20ms offers on the SAME entry until the 50ms threshold is crossed.
+    // NON-fatal (CHECK, not REQUIRE): send.release() below MUST run regardless, or the
+    // detached worker - still blocked in send.cv.wait() - outlives this stack frame's
+    // synchronization primitives once the test function returns.
+    CHECK(spin_until([&] {
+        exec.offer(entry, std::ref(send), 20ms);
+        return exec.send_stall_count() == 1;
+    }));
+    // Stays 1 across further nullopts - counted once, not once per re-check.
+    exec.offer(entry, std::ref(send), 20ms);
+    CHECK(exec.send_stall_count() == 1);
+
+    send.release();
+    std::optional<SendResult> result;
+    CHECK(spin_until([&] {
+        result = exec.offer(entry, std::ref(send), 20ms);
+        return result.has_value();
+    }));
+    if (result.has_value())
+        CHECK(*result == SendResult::Sent);
+    CHECK(exec.send_stall_count() == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("#3953 item 2: a send crossing the threshold DURING one bounded wait is still "
+          "counted, not only the timeout-gated case",
+          "[spark][guardian][send_executor][chaos]") {
+    // Proves the unconditional check (right after wait_until, before the done branch),
+    // not merely the timeout-gated one: this send finishes just PAST the threshold
+    // inside a single offer() call, so `done` is already true by the time offer() would
+    // otherwise decide whether to count a stall.
+    GuardianOutboxSendExecutor exec{50ms};
+    auto entry = lifecycle_entry("e1");
+    auto slow_but_completes = [](const OutboxEntry&) -> SendResult {
+        std::this_thread::sleep_for(80ms); // > the 50ms threshold, < the 200ms wait below
+        return SendResult::Sent;
+    };
+
+    auto result = exec.offer(entry, slow_but_completes, 200ms);
+    REQUIRE(result.has_value());
+    CHECK(*result == SendResult::Sent);
+    CHECK(exec.send_stall_count() == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
+TEST_CASE("#3953 item 2: a mismatched orphan stalled past the threshold is counted too",
+          "[spark][guardian][send_executor][chaos]") {
+    GuardianOutboxSendExecutor exec{50ms};
+    StallingSend send_a;
+    auto entry_a = lifecycle_entry("event-a");
+    auto entry_b = lifecycle_entry("event-b");
+
+    auto first = exec.offer(entry_a, std::ref(send_a), 20ms);
+    CHECK_FALSE(first.has_value());
+
+    // Poll the mismatch branch (offering B) until A - still running, past the
+    // threshold - gets counted as stalled BEFORE it is ever released. NON-fatal: A's
+    // detached worker is still blocked in send_a.cv.wait() until the release below,
+    // which must run regardless of whether the count reaches 1.
+    CHECK(spin_until([&] {
+        exec.offer(entry_b, [](const OutboxEntry&) { return SendResult::Sent; }, 20ms);
+        return exec.send_stall_count() == 1;
+    }));
+
+    send_a.release();
     std::optional<SendResult> b_result;
     REQUIRE(spin_until(
         [&] {
