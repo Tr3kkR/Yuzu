@@ -169,9 +169,15 @@ void GuardianOutboxDrainWorker::stop() {
     // std::function is only "valid but unspecified" per the standard, not guaranteed empty;
     // operator=(nullptr_t) has a specified empty postcondition, which is what makes this
     // fire-once for real rather than for every stdlib we happen to test against.
+    // Guarded by an empty-check first (governance Gate 8 happy-path finding) so the common,
+    // hook-never-set production path stays a plain read of a non-atomic member rather than
+    // an unconditional write - both are currently equivalent (every real stop() caller is
+    // serialized under GuardianEngine::mtx_), but there is no reason to prefer the write.
     // Production callers never set this.
-    if (auto hook = std::exchange(between_lane_stops_hook_for_test_, nullptr)) {
-        hook();
+    if (between_lane_stops_hook_for_test_) {
+        if (auto hook = std::exchange(between_lane_stops_hook_for_test_, nullptr)) {
+            hook();
+        }
     }
     compliance_send_exec_.stop();
     bool first_stop = false;

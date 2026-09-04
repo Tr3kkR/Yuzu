@@ -507,6 +507,13 @@ TEST_CASE("#3953 item 2: a mismatched orphan stalled past the threshold is count
             return b_result.has_value() && *b_result == SendResult::Sent;
         },
         3s));
+    // A's orphan is reclaimed somewhere in the polling loop above (state_->done becomes
+    // true once send_a.release() lets it finish), which now also runs check_stall_locked()
+    // (governance Gate 8 unhappy-path finding, this fix round). That reclaim-branch call
+    // must be a no-op here - A was already counted by the "still running" poll earlier -
+    // so this pins the stall_logged double-count guard actually holds across the two call
+    // sites, not just at each one in isolation.
+    CHECK(exec.send_stall_count() == 1);
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 
