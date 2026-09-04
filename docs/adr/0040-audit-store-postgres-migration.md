@@ -363,41 +363,45 @@ across three governance rounds (Gate 3 architect A-2/A-4, Gate 4 unhappy-path UP
 (`git show 8992b5274:server/core/src/audit_store.cpp`, the `origin/dev` HEAD this PR branched
 from) rather than assumed from precedent:
 
-- **Marker absent, no local legacy file, `audit_events` still genuinely empty**: re-stamps
-  sourcelessly. Silent, safe — but this window is narrower than it sounds: `complete_without_source`
-  (the function both the no-legacy-file and empty/tableless-legacy-file exits route through)
-  checks `pg_rows_before > 0` — the LIVE row count already in `audit_store.audit_events` — BEFORE
-  it ever considers stamping (pre-retirement file, `complete_without_source` at line ~964,
-  checked first at line 965). It does not distinguish "no legacy file" from "a legacy file with
-  nothing in it"; both routes converge on the same guard.
-- **Marker absent, no local legacy file, `audit_events` NON-empty — the realistic rollback
-  case on any host that has served real traffic since upgrading, essentially always true within
-  moments of a normal boot**: the same `pg_rows_before > 0` guard REFUSES outright — "another
-  replica may still be streaming the legacy trail... refusing to mark the backfill complete"
-  (pre-retirement file, lines ~965-976) — regardless of whether a legacy file exists at all. This
-  is the common case, not the exception: a rollback essentially never lands in the empty-table
-  window above once the server has been live even briefly.
-- **Marker absent, a real local legacy file with an `audit_events` table**: re-runs the streamed
-  backfill instead of `complete_without_source` (this path never consults `pg_rows_before`). Row
-  inserts are `ON CONFLICT (id) DO NOTHING` (idempotent — a re-run of already-migrated content is
-  a no-op, never a duplicate or a corruption), and completion is gated on an exact whole-file
-  fingerprint match before the marker is ever re-stamped (lines ~1439-1558 of the pre-retirement
-  file). A genuine mismatch refuses to mark complete and retries on the next boot rather than
-  reporting a false success.
-- **Marker present (re-stamped by an old binary, or never actually deleted on some replica),
-  legacy file still present, fingerprint mismatched**: refuses to serve outright (lines ~904-921)
-  — "some other process declared this deployment's evidence migration complete without ever
-  reading this host's trail... boot refuses until this is resolved by an operator." Loud, not
-  silent.
+**Gate 4 unhappy-path UP-1 (round 4) found that the DELETE alone does not actually reach this
+guarantee.** An earlier draft of this Update reasoned through the sub-cases individually — marker
+absent with an empty table, marker absent with a non-empty table, marker absent with a real
+legacy file, marker already present — and concluded each one refuses loudly except a narrow
+empty-table window where an old binary re-stamps `backfill_complete='sourceless'` via its own
+`complete_without_source`/`Sourceless::StampIfEmpty` default (pre-retirement file, line ~964).
+That per-case reasoning was accurate as far as it went, but it missed the composition:
+`audit_retention_meta` is never wiped again once v2 has run, so a stamp made during that one
+narrow window is **permanent** — no later v2 re-run ever revisits it. Every subsequent old-binary
+boot on that database, at any later time, however much data `audit_events` holds by then, now
+takes the marker-**present** branch instead, which — when no legacy file remains at the
+configured path, the ordinary case — returns success with **zero row-count check at all**
+(pre-retirement file, lines ~928-940). One lost race permanently and silently disarms the refusal
+for that database. UP-2 compounds this: the break-glass one-shot CLI (`--mfa-reset`/
+`--break-glass-arm`) constructs a full `AuditStore` unconditionally on every invocation, so
+running it from a freshly-built image against a fleet whose daemons haven't yet upgraded can
+manufacture the empty-table window directly, on a live fleet, outside any planned rollout.
 
-No sub-case reaches an unconditional, unverified overwrite the way `RbacStore`'s did — and unlike
-the framing an earlier draft of this Update gave, the safe SILENT case (bullet 1) is the NARROW
-one, not the common one: `complete_without_source`'s own pre-existing `pg_rows_before` guard means
-an old binary rolling back against a `DELETE`d marker refuses to boot in the realistic case
-(bullet 2) just as reliably as the `DROP TABLE` group's `42P01`/`undefined_table` failure does for
-the other 17 retired stores — without disturbing the clock guard's live rows in a table that
-cannot itself be dropped. Loud failure, not silent data loss, is the expected outcome of rolling
-back a live AuditStore either way.
+**The fix is a CHECK constraint added in the same v2 migration**, closing the race rather than
+narrowing it:
+
+```sql
+ALTER TABLE audit_retention_meta ADD CONSTRAINT audit_retention_meta_no_retired_backfill_markers
+    CHECK (key NOT IN ('backfill_complete', 'backfill_source_fingerprint'));
+```
+
+Same shape as `RbacStore`'s own v4 constraint (`rbac_meta_enabled_canonical`) on the same
+key/value-meta table pattern — but where RbacStore's constraint narrows the *values* a key may
+hold, this one forbids the *keys* outright. With it in place, `stamp_complete`'s `INSERT` fails
+(`23514 check_violation`) on every sub-case above — marker absent or present, table empty or not,
+legacy file present or not — because all four routes converge on the same `INSERT INTO
+audit_retention_meta (key, value) VALUES ('backfill_complete', ...)` (or the fingerprint
+counterpart). `migrate_from_sqlite` then returns `false` and `server.cpp` sets
+`startup_failed_`, deterministically, not merely in the realistic case. This is the same class of
+guarantee the `DROP TABLE` group gets from `42P01`/`undefined_table` — a schema-level rejection,
+not a live-row-count race — while still leaving `audit_retention_meta` itself in place for the
+clock guard's permanent rows. Nothing in the current codebase writes either key any more
+(`migrate_from_sqlite` and its helpers are fully deleted), so the constraint can never reject
+legitimate current-binary activity.
 
 `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows(audit.db, "AuditStore",
 {"audit_events"})` at construction instead — WARN-only, log-only, never blocking, the same

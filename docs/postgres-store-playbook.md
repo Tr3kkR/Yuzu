@@ -8,7 +8,7 @@ It is the *how*; the *why* lives in the ADRs — **read these first**:
 | [0006](adr/0006-server-postgresql-substrate.md) | Postgres is the server substrate; **every** server store migrates (2026-06-22 Update) — none stays SQLite. Agent stays SQLite. |
 | [0007](adr/0007-server-single-backend-no-sqlite-fallback.md) | Single backend, **fail closed** — no SQLite fallback. |
 | [0008](adr/0008-postgres-substrate-architecture.md) | libpq + in-house RAII, one shared `PgPool`, schema-per-store, `PgMigrationRunner`; **schema naming**, non-transactional-migration rule, thin helper (2026-06-22 Update). |
-| [0009](adr/0009-per-store-first-boot-backfill-cutover.md) | How a store cuts over from legacy SQLite — **fresh-start-by-default since the 2026-08-25 amendment** (no `migrate_from_sqlite()` unless a store has a specific, documented reason); the original one-time/idempotent/fail-closed backfill mechanism is now the exception path, and stays in place for already-migrated stores. |
+| [0009](adr/0009-per-store-first-boot-backfill-cutover.md) | How a store cuts over from legacy SQLite — **fresh-start-by-default since the 2026-08-25 amendment**, and hard-cutover since the 2026-09-04 Update: `migrate_from_sqlite()` is retired for all 19 stores that ever had one (#3623 PR A/B/AuditStore), none remaining. |
 | [0010](adr/0010-secrets-at-rest-envelope-encryption.md) | Secret-bearing stores use `SecretCodec`, never plain columns. |
 | [0012](adr/0012-server-postgres-store-contract.md) | The author-facing **contract**: failure posture, lease discipline, cross-store seam. |
 

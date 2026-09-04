@@ -982,13 +982,15 @@ only when a legacy `inventory.db` happens to be present. This is a deliberate fa
 startup error, never silent data loss), not a bug, but it means "just roll back the binary" is
 not a supported recovery path once this migration has run. The same is true for
 CaStore/ManagementGroupStore/QuarantineStore/WebhookStore below, each for its own dropped marker
-table. RbacStore is the one genuine exception (see its own section): the marker rows are removed,
-not the table, so an old binary's own lookup succeeds (0 rows, not a SQL error) and it boots
-normally UNLESS a real, unmigrated legacy file is also present on that specific host. AuditStore
-also removes marker rows rather than dropping a table, but do NOT assume it behaves the same way
-— its own section explains why an old binary's boot fails just as reliably as the DROP-TABLE
-group's, via a different mechanism (a live-row-count guard the retired code already had, not a
-SQL error).
+table. RbacStore is the one genuine exception (see its own section): its retirement migration
+**poisons** the marker rows to a sentinel value rather than deleting them, so an old binary's own
+lookup finds them present (not 0 rows) and — reading a value it understands as "no verified
+source, but not a failure" — boots normally UNLESS a real, unmigrated legacy file is also present
+on that specific host. This is RbacStore's own deliberate choice to tolerate rollback, not an
+artifact of a row count. AuditStore also removes marker rows rather than dropping a table, but do
+NOT assume it behaves the same way as either group — its own section explains why an old binary's
+boot fails just as reliably as the DROP-TABLE group's, via a CHECK constraint rather than a SQL
+error on a missing table.
 
 ## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
 
@@ -1768,35 +1770,40 @@ conflate them:
 - A reachable Postgres database whose schema can't migrate or open **is**
   still a fatal startup error (fail-closed), unchanged from before.
 - A legacy `audit.db` file with real content **does NOT** fail startup and its
-  content is **never imported** — the server opens it read-only, purely to
-  count rows in `audit_events` for a diagnostic warning, then boots regardless
-  of what it finds. Fresh installs are unaffected — no legacy file, nothing to
-  warn about.
+  content is **never imported**. Its permissions are forced to owner-only
+  (`0600`, plus its `-wal`/`-shm`/`-journal` sidecars) if they aren't already —
+  this file may hold plaintext secret material from a since-fixed historical
+  bug, same obligation as every other legacy-file-hardening store on this page
+  — then the server opens it read-only, purely to count rows in `audit_events`
+  for a diagnostic warning, then boots regardless of what it finds. Beyond that
+  row count, its content is never read, and it is never renamed, moved, or
+  written to. Fresh installs are unaffected — no legacy file, nothing to warn
+  about.
 
 **If you see the legacy-row-count warning and the environment genuinely has
 real audit history to keep, there is no automated recovery path**: the
-pre-cutover trail stays exactly where it is, in the untouched `audit.db` file
-at its configured path — nothing reads or modifies it — and is your
-operator-managed record going forward (export it, archive it, keep it under
-your own retention policy; Yuzu will never import it).
+pre-cutover trail stays exactly where it is, at its configured path (0600
+now enforced, content otherwise untouched) — and is your operator-managed
+record going forward (export it, archive it, keep it under your own
+retention policy; Yuzu will never import it). The generic "reapply manually"
+phrasing in the boot warning fits config-shaped stores below (a webhook
+subscription, a notification preference) where reapplying means re-creating
+the row through the API; it does not apply here in that sense — an audit
+trail is historical evidence, not something you recreate, so "reapply" for
+AuditStore means export-and-archive, never re-import.
 
 **Rollback caution.** Do not roll back to a build older than this release.
 Unlike RbacStore above, this is not just a caution about a leftover legacy
 file — an older binary's own (now-removed-from-current-code) backfill logic
-refuses to boot in the ordinary case too, **with or without** a legacy
-`audit.db` present: seeing this database already past this migration (the
-marker rows are gone, but `audit_retention_meta` itself is not — see
-ADR-0040's Update), it checks the live row count in `audit_store.audit_events`
-before doing anything else, and refuses ("another replica may still be
-streaming the legacy trail...") the moment that count is non-zero — true
-almost immediately after any normal boot, legacy file or not. The one case
-where it succeeds silently is a rollback attempted before a single audit
-event has ever been written post-upgrade — a window narrow enough not to
-rely on. If a legacy `audit.db` with real content also sits at its configured
-path, the older binary instead re-streams it: idempotently, if the count IS
-still zero (`ON CONFLICT DO NOTHING` skips already-present rows), or refusing
-outright on a genuine content mismatch. Either way this is a clear startup
-refusal, never silent corruption — but "just roll back the binary" is not a
+refuses to boot **unconditionally**, with or without a legacy `audit.db`
+present: seeing this database already past this migration (the marker rows
+are gone, but `audit_retention_meta` itself is not — see ADR-0040's Update),
+its own idempotency-marker write hits a CHECK constraint this migration also
+adds (`audit_retention_meta_no_retired_backfill_markers`) and fails with a
+Postgres `23514 check_violation`, on every path — table empty or not, legacy
+file present or not. This is the same class of guarantee the DROP-TABLE-group
+stores above get from their `undefined_table` error: a schema-level
+rejection, not a live-row-count race. "Just roll back the binary" is not a
 supported recovery path once this migration has run, the same as every
 DROP-TABLE-group store above.
 

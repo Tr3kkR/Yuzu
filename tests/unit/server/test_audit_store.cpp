@@ -156,8 +156,8 @@ std::int64_t row_count(const std::string& dsn) {
 
 // ── Migration ────────────────────────────────────────────────────────────────
 
-TEST_CASE("AuditStore migration v2 deletes only the backfill marker rows, leaving the "
-          "clock-guard's durable state untouched (#3623)",
+TEST_CASE("AuditStore migration v2 deletes the backfill marker rows and forbids their "
+          "re-insertion, leaving the clock-guard's durable state untouched (#3623)",
           "[pg][audit_store][migration]") {
     YUZU_REQUIRE_PG_DB(db);
     {
@@ -245,6 +245,39 @@ TEST_CASE("AuditStore migration v2 deletes only the backfill marker rows, leavin
     CHECK(std::string(PQgetvalue(surviving.get(), 0, 1)) == "-----");
     CHECK(std::string(PQgetvalue(surviving.get(), 1, 0)) == "last_pass_now");
     CHECK(std::string(PQgetvalue(surviving.get(), 1, 1)) == "1700000500");
+
+    // Gate 4 unhappy-path UP-1 (round 4): a plain DELETE alone leaves a window where an old
+    // binary can re-stamp `backfill_complete` while `audit_events` is still empty, after which
+    // nothing ever deletes it again. v2 also adds a CHECK constraint forbidding either marker
+    // key outright, so this must survive independent of table content: re-inserting EITHER
+    // key, even into an otherwise-empty table, is rejected at the constraint (23514
+    // check_violation), never silently accepted.
+    PgResult constraint{PQexec(
+        conn.get(),
+        "SELECT 1 FROM pg_constraint WHERE conname = "
+        "'audit_retention_meta_no_retired_backfill_markers' AND connamespace = "
+        "'audit_store'::regnamespace")};
+    REQUIRE(constraint.ok());
+    CHECK(PQntuples(constraint.get()) == 1);
+
+    for (const char* key : {"backfill_complete", "backfill_source_fingerprint"}) {
+        const std::string sql = std::string("INSERT INTO audit_store.audit_retention_meta "
+                                             "(key, value) VALUES ('") +
+                                 key + "', 'x')";
+        PgResult rejected{PQexec(conn.get(), sql.c_str())};
+        CHECK_FALSE(rejected.ok());
+        const char* sqlstate =
+            rejected ? PQresultErrorField(rejected.get(), PG_DIAG_SQLSTATE) : nullptr;
+        REQUIRE(sqlstate != nullptr);
+        CHECK(std::string(sqlstate) == "23514"); // check_violation
+    }
+
+    // The constraint is scoped to these two keys only — an ordinary key/value row is
+    // unaffected, matching the clock guard's own untouched rows above.
+    PgResult ordinary{
+        PQexec(conn.get(), "INSERT INTO audit_store.audit_retention_meta (key, value) "
+                            "VALUES ('some_other_key', 'ok')")};
+    CHECK(ordinary.ok());
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────

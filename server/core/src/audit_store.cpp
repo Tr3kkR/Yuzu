@@ -210,7 +210,8 @@ const std::vector<pg::PgMigration>& migrations() {
         // the last of 19 stores to lose it (#3623 PR A/B did the other 18). `audit_retention_meta`
         // stays -- it holds the clock-guard's PERMANENT durable state (`last_pass_now`,
         // `last_anomaly_facts`, `bootstrap_settled`), so this is a plain DELETE of the two
-        // marker rows, never a DROP TABLE.
+        // marker rows, never a DROP TABLE, plus a CHECK constraint (below) closing a race the
+        // DELETE alone leaves open.
         //
         // DELETE, not poison, unlike RbacStore's v4 (same PR family, `rbac_meta`): the two
         // stores' old-binary-rollback failure modes differ. RbacStore's retired code fell
@@ -224,12 +225,35 @@ const std::vector<pg::PgMigration>& migrations() {
         // stamping complete -- a real legacy file), and its marker-present-but-mismatched-
         // fingerprint path REFUSES to serve rather than trust unproven content (`git show
         // 8992b5274:server/core/src/audit_store.cpp` lines ~906-921, the pre-retirement HEAD
-        // on `origin/dev`). An old binary rolling
-        // back against a DELETEd marker either no-ops or refuses loudly -- never a silent
-        // wrong overwrite -- so DELETE meets the same safety bar DROP TABLE gives the other
-        // 17 stores, without disturbing the clock-guard's live rows.
+        // on `origin/dev`).
+        //
+        // Gate 4 unhappy-path UP-1 (round 4): a plain DELETE alone is NOT DROP TABLE's safety
+        // bar. An old binary that boots while `audit_events` is still empty (the near-guaranteed
+        // window immediately after this migration, before any native write) takes the
+        // marker-ABSENT branch, finds `pg_rows_before == 0`, and re-stamps
+        // `backfill_complete='sourceless'` via its own `Sourceless::StampIfEmpty` default. That
+        // stamp is never deleted again -- v2 has already run -- so it is now PERMANENT. Every
+        // later old-binary boot, on any replica, at any later time (however much data
+        // `audit_events` has by then), takes the marker-PRESENT branch instead, which -- when no
+        // legacy file remains at the configured path, the ordinary case -- returns success with
+        // ZERO row-count check (same pre-retirement source, lines ~928-940). One lost race
+        // permanently disarms the refusal for that database, silently.
+        //
+        // The CHECK constraint closes this deterministically rather than merely narrowing the
+        // window: it rejects an INSERT of either marker key outright (23514 check_violation), so
+        // an old binary's `stamp_complete` -- on EVERY branch, marker-absent or marker-present,
+        // empty table or not, legacy file or not -- fails at the write, `migrate_from_sqlite`
+        // returns false, and `server.cpp` sets `startup_failed_`. Same shape as RbacStore's own
+        // v4 constraint (`rbac_meta_enabled_canonical`, `rbac_store.cpp`) on the same
+        // key/value-meta table pattern. Nothing in the current codebase writes either key any
+        // more (`migrate_from_sqlite` and its helpers are fully deleted, grep-verified) so the
+        // constraint can never reject legitimate current-binary activity -- only an old binary's
+        // retired write path.
         {2, "DELETE FROM audit_retention_meta WHERE key IN "
-            "('backfill_complete', 'backfill_source_fingerprint');"},
+            "('backfill_complete', 'backfill_source_fingerprint');"
+            "ALTER TABLE audit_retention_meta ADD CONSTRAINT "
+            "audit_retention_meta_no_retired_backfill_markers "
+            "CHECK (key NOT IN ('backfill_complete', 'backfill_source_fingerprint'));"},
     };
     return kMigrations;
 }
