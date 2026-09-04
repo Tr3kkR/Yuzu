@@ -592,8 +592,17 @@ int do_set_power_plan(yuzu::CommandContext& ctx, yuzu::Params params) {
         ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "read_prior_failed", "", ""));
         return 1;
     case Outcome::SetFailed:
+        // Deliberately does NOT claim "no mutation applied". SetFailed folds an
+        // ordinary API failure together with a TIMEOUT (see SetPowerPlanOutcome's
+        // comment), and a timed-out PowerSetActiveScheme may still have landed —
+        // the plugin cannot tell. Claiming no mutation is the one wording that
+        // would stop an operator going to check, on the exact path where the
+        // final state is unknown. previous_guid is reported so they can revert.
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                               "PowerSetActiveScheme failed or timed out; no mutation applied");
+                               "PowerSetActiveScheme failed or timed out; the mutation was NOT "
+                               "confirmed and, on a timeout, may still have been applied — final "
+                               "state is unknown; previous_guid is reported for manual "
+                               "verification/revert");
         ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "set_failed", fmt_or_dash(result.previous_guid), ""));
         return 1;
     case Outcome::ReadbackFailed:
