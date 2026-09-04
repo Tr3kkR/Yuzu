@@ -289,19 +289,45 @@ Needs its own fix + timeline, tracked separately. Only #2797's spark-branch half
 is **boot-time, restart-required** - accepted with that limitation. **Scope note**: this
 procedure is a UAT-drill spec, written against zero production fleet. It is single-agent
 (one restart at a time) with no fleet-wide orchestration story - flipping this on N agents
-during a real incident is N individual restarts, not covered here. It also has no persistence
-mechanism wired into the shipped `yuzu-agent.service` unit today (tracked as #3851). Treat
-this as the drill procedure for evidence collection, not yet a production incident runbook.
+during a real incident is N individual restarts, not covered here. Persistence across restarts
+is the unit's `EnvironmentFile=-/etc/yuzu/yuzu-agent.env` (#3851) - Linux/systemd packages;
+Windows and macOS service configuration is outside this issue. Treat this as the drill
+procedure for evidence collection, not yet a production incident runbook.
 
 1. Confirm current state: agent running with `prefer_spark` active, spark armed on at least one
    rule, drift/heartbeat evidence flowing (criterion 5's UAT smoke precondition).
-2. Flip the flag: set `--spark-disable` (or the equivalent config/env toggle feeding
-   `cfg_.spark_disable`) and restart the agent process. The boot-time branch at
-   `agent.cpp:1195–1197` short-circuits `SparkEngine` instantiation entirely when this is set -
-   `spark_engine_` stays null, and the boot log records the literal string (note: an em dash,
-   not a hyphen, at `agent.cpp:1196` - a plain-hyphen grep will not match it)
-   `"SparkEngine: disabled by --spark-disable — not instantiated; Guardian detection path =
-   legacy IGuard (enforcing)"`.
+2. Flip the flag - persist it, then restart. On a systemd-managed agent (the production
+   form):
+   ```bash
+   sudo mkdir -p -m 0750 /etc/yuzu
+   sudo touch /etc/yuzu/yuzu-agent.env
+   sudo chown root:root /etc/yuzu/yuzu-agent.env
+   sudo chmod 0600 /etc/yuzu/yuzu-agent.env
+   sudoedit /etc/yuzu/yuzu-agent.env   # ensure exactly one line: YUZU_AGENT_SPARK_DISABLE=1
+   sudo systemctl restart yuzu-agent
+   ```
+   Exactly one `YUZU_AGENT_SPARK_DISABLE=1` line - no `export`, no shell syntax, no trailing
+   inline comment (systemd's `EnvironmentFile=` parser does NOT strip a trailing `# ...` the
+   way a shell would; the whole rest of the line becomes part of the value, which then fails
+   CLI11 parsing at boot). A foreground UAT agent (Rig B, §8) exports the same variable on its
+   own command line instead: `YUZU_AGENT_SPARK_DISABLE=1 ./yuzu-agent ...`. Drop-in
+   alternative: `sudo systemctl edit yuzu-agent` with `[Service]`
+   `Environment=YUZU_AGENT_SPARK_DISABLE=1` (`EnvironmentFile=` overrides `Environment=` when
+   both exist; an `ExecStart` override is unaffected, since the variable binds via
+   `->envname`, and a CLI flag always wins over the environment). Roll-forward: remove the
+   assignment and restart - not `=0` (works today, per CLI11's source, but the runbook
+   shouldn't couple to that implementation detail). Evidence it took - run the redirection
+   inside the privileged shell, not the calling one:
+   ```bash
+   pid="$(systemctl show -p MainPID --value yuzu-agent)"
+   sudo sh -c 'tr "\0" "\n" < "/proc/$1/environ" | grep -Fx "YUZU_AGENT_SPARK_DISABLE=1"' sh "$pid"
+   ```
+   (`systemctl show -p Environment` does not list `EnvironmentFile=`-sourced vars.) The
+   boot-time branch at `agent.cpp:1195–1197` short-circuits `SparkEngine` instantiation
+   entirely when this is set - `spark_engine_` stays null, and the boot log records the
+   literal string (note: an em dash, not a hyphen, at `agent.cpp:1196` - a plain-hyphen grep
+   will not match it) `"SparkEngine: disabled by --spark-disable — not instantiated; Guardian
+   detection path = legacy IGuard (enforcing)"`.
 3. Confirm legacy enforcement resumed: the same-boot `wire_spark_engine()` call
    (`agent.cpp:1254`) records `SparkAvailability::SparkDisabled`, and the `SparkDisabled` case
    of the backend-derivation log switch (`:1269–1272`) reports `detection backend = legacy`

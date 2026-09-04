@@ -18,6 +18,16 @@ StartLimitBurst=5
 Type=simple
 User=yuzu-agent
 Group=yuzu-agent
+# Optional environment file (leading '-' = no error when absent). Not shipped by the
+# .deb/.rpm - create it by hand, root:root 0600 (protects at rest and stops the
+# yuzu-agent account altering its own boot posture; not a secrets channel - the agent
+# still inherits every value it sets). Persists deploy-time YUZU_* settings across
+# restarts and upgrades, chiefly YUZU_AGENT_SPARK_DISABLE=1, the prefer_spark rollback
+# lever (#3851; see docs/user-manual/guaranteed-state.md "SparkEngine"). A missing or
+# unreadable file is silently skipped - rollback then silently does NOT apply, verify
+# via /proc, don't trust file-presence alone. A present file with a malformed VALUE
+# makes the agent fail to start instead. Re-enable = remove the assignment.
+EnvironmentFile=-/etc/yuzu/yuzu-agent.env
 ExecStart=/usr/local/bin/yuzu-agent \
     --server %H:50051 \
     --plugin-dir /usr/lib/yuzu/plugins \
