@@ -1127,7 +1127,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      // already surfaces, so the operator reading THIS console
                      // isn't pointed at the wrong remediation.
                      const char* message = "No agents connected. Cannot dispatch command.";
-                     if (dispatch_outcome.containment_unreadable) {
+                     if (dispatch_outcome.scope_parse_error) {
+                         // #3424/#3511 PR review fix round: this console
+                         // accepts a scope expression (scope_expr, above)
+                         // and reaches the same ConfinedDispatchOutcome
+                         // scope_parse_error field mcp_server.cpp's
+                         // execute_instruction reads -- checked first, same
+                         // as there, since a malformed expression is a
+                         // caller error, not a fleet-state fact.
+                         message = "Invalid scope expression -- dispatch was not attempted. "
+                                    "Fix the expression and resubmit; retrying unchanged will "
+                                    "not help.";
+                     } else if (dispatch_outcome.containment_unreadable) {
                          message = "Containment state is unreadable — dispatch is failing "
                                     "closed and reaching no agent; check the quarantine store.";
                      } else if (dispatch_outcome.denied_quarantined_count > 0) {

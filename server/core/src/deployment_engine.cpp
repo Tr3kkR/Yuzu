@@ -89,23 +89,46 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
                                   "this device's reported inventory"});
     }
 
-    // Existing (pre-fix) behaviour, preserved exactly: when NOTHING in the
-    // batch was sent and nothing was named-withheld either (a plain
-    // zero-reach cause — offline devices, or a residual approval-required
-    // race — `ConfinedDispatchOutcome` carries no per-id identification for
-    // this class), fail the remainder of the batch too, matching what this
-    // function always did for the `sent == 0` case. When `sent > 0` and a
-    // remainder beyond the named-permanent ids was not reached, this is the
-    // SAME pre-existing limitation (no way to tell which of the remainder
-    // failed) — those rows are left claimed, exactly as every OTHER
-    // dispatch surface in this codebase already leaves an in-flight row
-    // for the next response poll to resolve.
-    if (outcome.sent == 0 && claimed.size() > permanent_ids.size()) {
+    // PR #3939 review round, security-guardian finding: `outcome.not_sent`
+    // names ids that survived containment/plugin-presence but whose actual
+    // send failed (AgentRegistry::send_to returned false, the ordinary case
+    // of a device that went offline between claim and dispatch) --
+    // `dispatch_confined_arms`'s Ids-arm walk populates this unconditionally
+    // on any delivery failure, not only under an ADR-1007 concurrency claim
+    // (this function's dispatch_fn never applies one). Unlike
+    // denied_quarantined/unknown_plugin this is NOT a permanent fact: an
+    // offline device may reconnect, matching every zero-reach RESPONSE
+    // cascade's own "an offline device may reconnect" wording -- so these
+    // ids REVERT for retry, same as containment_unreadable, but individually
+    // rather than as a whole-batch revert, since the rest of the batch may
+    // have been reached or permanently withheld.
+    std::unordered_set<std::string> accounted_ids = permanent_ids;
+    std::vector<DeviceTransition> reverted;
+    for (const auto& aid : outcome.not_sent) {
+        if (accounted_ids.insert(aid).second)
+            reverted.push_back({.agent_id = aid,
+                                .from_step = claimed_step,
+                                .to_step = revert_step,
+                                .error = ""});
+    }
+
+    // Residual catch-all: `outcome.sent == 0` with NEITHER a named-permanent
+    // id NOR a not_sent id accounts for the batch means dispatch never
+    // reached the per-id arm walk at all -- a chokepoint denial
+    // (`dispatch_confined`'s `if (!classified) return {command_id, 0};`,
+    // e.g. the caller lost the classified permission for
+    // content_dist.stage/execute_staged between claim and dispatch) or an
+    // authorization-scope drop before the walk. `ConfinedDispatchOutcome`
+    // carries no per-id identification for this class, so — unlike
+    // not_sent — there is no way to tell which of the remainder is
+    // responsible; fail the whole unaccounted remainder, matching this
+    // function's original (pre-review) behaviour for exactly this case.
+    if (outcome.sent == 0 && claimed.size() > accounted_ids.size()) {
         const std::string reason = phase +
                                    " dispatch refused or reached no agents (command " +
                                    outcome.command_id + ", 0 sent)";
         for (const auto& aid : claimed) {
-            if (permanent_ids.count(aid))
+            if (accounted_ids.count(aid))
                 continue;
             failed.push_back(
                 {.agent_id = aid, .from_step = claimed_step, .to_step = failed_step, .error = reason});
@@ -114,6 +137,8 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
 
     if (!failed.empty())
         deps.store->apply_results(deployment_id, failed);
+    if (!reverted.empty())
+        deps.store->apply_results(deployment_id, reverted);
 }
 
 int response_score(const StoredResponse& r) {

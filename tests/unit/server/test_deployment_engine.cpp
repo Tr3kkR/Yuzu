@@ -83,15 +83,31 @@ struct Harness {
             // engine must settle the claim on ANY zero-sent outcome.
             if (gate_unreadable)
                 return {.sent = 0, .command_id = "cmd", .containment_unreadable = true};
+            std::vector<std::string> quarantined;
             std::vector<std::string> withheld;
-            for (const auto& a : agents)
-                if (unknown_plugin_agents.count(a))
+            std::vector<std::string> offline;
+            for (const auto& a : agents) {
+                // Mirrors dispatch_confined_arms.hpp's own priority: a
+                // quarantined-and-plugin-absent agent reports quarantined,
+                // the stronger fact -- checked first here too, so a test
+                // can put one agent id in BOTH sets to exercise that.
+                if (denied_quarantined_agents.count(a))
+                    quarantined.push_back(a);
+                else if (unknown_plugin_agents.count(a))
                     withheld.push_back(a);
-            const int reached =
-                deny_dispatch ? 0
-                              : static_cast<int>(agents.size()) - static_cast<int>(withheld.size());
+                else if (offline_agents.count(a))
+                    offline.push_back(a);
+            }
+            const int reached = deny_dispatch ? 0
+                                              : static_cast<int>(agents.size()) -
+                                                    static_cast<int>(quarantined.size()) -
+                                                    static_cast<int>(withheld.size()) -
+                                                    static_cast<int>(offline.size());
             return {.sent = reached,
+                   .denied_quarantined = quarantined,
+                   .denied_quarantined_count = quarantined.size(),
                    .command_id = "cmd",
+                   .not_sent = offline,
                    .unknown_plugin = withheld,
                    .unknown_plugin_count = withheld.size()};
         };
@@ -101,6 +117,8 @@ struct Harness {
     bool deny_dispatch{false};
     bool gate_unreadable{false};
     std::unordered_set<std::string> unknown_plugin_agents;
+    std::unordered_set<std::string> offline_agents;
+    std::unordered_set<std::string> denied_quarantined_agents;
 
     int dispatch_count(const std::string& action, const std::string& agent) const {
         int n = 0;
@@ -294,6 +312,33 @@ TEST_CASE("deployment engine retries after a transient containment-gate failure 
     CHECK(step_of(store, id, "a1") == "staging");
 }
 
+TEST_CASE("deployment engine fails a quarantined device in a mixed batch the same way it "
+          "fails a plugin-absent one (quality-engineer, Gate 3: settle_claimed_batch's "
+          "denied_quarantined branch had no test at this layer)",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-mixed-quarantined";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1"), tgt("a2")}));
+
+    Harness h{store};
+    h.denied_quarantined_agents = {"a2"};
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1", "a2"};
+
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(step_of(store, id, "a1") == "staging");
+    CHECK(step_of(store, id, "a2") == "failed");
+    for (const auto& d : store.get_devices(id))
+        if (d.agent_id == "a2")
+            CHECK(d.error.find("quarantined") != std::string::npos);
+}
+
 TEST_CASE("deployment engine fails only the plugin-absent device in a mixed batch, leaving "
           "the reached device in flight (PR #3939 review, finding 2b — was an unconditional "
           "hang: sent>0 skipped rollback entirely, so the withheld row never left 'staging')",
@@ -331,9 +376,58 @@ TEST_CASE("deployment engine fails only the plugin-absent device in a mixed batc
     // fabricating a resolution for the genuinely in-flight one.
     advance(deps, id, cfg, authorized, test_caller());
     CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(step_of(store, id, "a2") == "failed");  // still terminal, not re-touched
+    for (const auto& d : store.get_devices(id))
+        if (d.agent_id == "a2")
+            CHECK(d.error.find("plugin not found") != std::string::npos);  // unchanged
     auto dep = store.get_deployment(id);
     REQUIRE(dep);
     CHECK(dep->status == "running");
+}
+
+TEST_CASE("deployment engine reverts (not fails) a device whose send simply failed, leaving "
+          "reached/withheld siblings unaffected (PR #3939 review, security-guardian finding: "
+          "outcome.not_sent -- an ordinary offline device -- was silently unaccounted for, "
+          "so it stayed claimed forever exactly like the finding-2b wedge)",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-not-sent-offline";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1"), tgt("a2"), tgt("a3")}));
+
+    Harness h{store};
+    h.offline_agents = {"a2"};           // survives containment/plugin checks, send fails
+    h.unknown_plugin_agents = {"a3"};    // named-withheld, permanent
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1", "a2", "a3"};
+
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(step_of(store, id, "a1") == "staging");   // reached — in flight, unchanged
+    CHECK(step_of(store, id, "a3") == "failed");    // named-permanent — unchanged
+    // a2: NOT stuck in 'staging' forever (the confirmed gap), NOT permanently
+    // failed either (an offline device may reconnect) — reverted to 'pending'
+    // so the next tick's own candidate scan reclaims it.
+    CHECK(step_of(store, id, "a2") == "pending");
+    for (const auto& d : store.get_devices(id))
+        if (d.agent_id == "a2")
+            CHECK(d.error.empty());  // not a failure -- no error attached to a revert
+
+    // Tick 2: a2 comes back online — reclaimed (a SECOND stage dispatch,
+    // since the first was never delivered) and reaches this time. a1/a3 are
+    // untouched (source-step-guarded: a1 is 'staging' not 'pending', a3 is
+    // terminal).
+    h.offline_agents.clear();
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);   // still exactly once
+    CHECK(h.dispatch_count("stage", "a2") == 2);   // reclaimed and redispatched
+    CHECK(step_of(store, id, "a2") == "staging");
+    CHECK(step_of(store, id, "a3") == "failed");   // still untouched
 }
 
 TEST_CASE("deployment engine records a non-zero installer exit as failed",

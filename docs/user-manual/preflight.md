@@ -144,8 +144,12 @@ Deploy** (the cohort is frozen then). On those devices it:
 The progress view is **aggregate-first**: a count strip (targeted / succeeded /
 executing / in-flight / failed / skipped) and a progress bar are the headline, with
 the per-device list below, problem-first. A device is **Succeeded** on exit 0,
-**Failed** on a stage error or a non-zero exit, and **Skipped** if you no longer
-have scope to it when the step is dispatched — it is never run.
+**Failed** on a stage error, a non-zero exit, being quarantined, or the dispatched
+plugin being absent from its reported inventory (the last two are permanent — a
+retry will not help), and **Skipped** if you no longer have scope to it when the
+step is dispatched — it is never run. A device is **not** shown as Failed for a
+device that was offline or unreachable at dispatch time, or for a transient
+containment-gate degradation — see below.
 
 Two safety properties matter because executing an installer changes the endpoint:
 
@@ -180,9 +184,14 @@ after roughly ten minutes — **pauses** the deployment: its state is durably sa
 but it does not advance while no page is polling it. To **resume**, re-open the
 deploy panel for the same pre-flight run and click **Deploy go-cohort** again — the
 server detects the in-flight deployment and re-attaches to it rather than starting
-a second one. A device that is offline when its stage or execute step is dispatched
-is not retried in this slice; delete the deployment and re-deploy once it is back.
-The same engine is designed to be driven headless by an automation worker later.
+a second one. A device that is offline (or a fail-closed containment-gate read) when
+its stage or execute step is dispatched is retried automatically on a later tick,
+while the page keeps polling — no need to delete and re-deploy; the device stays
+claimed and shows as still in-flight, not Failed, until it either reaches the agent
+or you close the page. A device that is quarantined or is missing the `content_dist`
+plugin is a permanent condition and fails immediately instead — those need an
+operator action (release the quarantine, install the plugin) before a re-deploy will
+help. The same engine is designed to be driven headless by an automation worker later.
 
 ## Permissions
 

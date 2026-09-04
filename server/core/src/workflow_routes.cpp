@@ -23,6 +23,7 @@
 #include <expected>
 #include <format>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -2147,6 +2148,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         bool containment_unreadable = false;
         std::size_t denied_quarantined_count = 0;
         std::size_t unknown_plugin_count = 0;
+        std::optional<std::string> scope_parse_error;
         try {
             // #2500: NAME the broadcast rather than expressing it as "both
             // fields happen to be empty". The shape check above guarantees that
@@ -2178,6 +2180,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             containment_unreadable = dispatch_outcome.containment_unreadable;
             denied_quarantined_count = dispatch_outcome.denied_quarantined_count;
             unknown_plugin_count = dispatch_outcome.unknown_plugin_count;
+            scope_parse_error = dispatch_outcome.scope_parse_error;
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created
@@ -2215,6 +2218,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // excluded by an already-open concurrency claim rather than being
             // unreachable at all — check yuzu_server_dispatch_concurrency_skipped_total
             // too, same as before, folded into the generic catch-all below.
+            if (scope_parse_error) {
+                // #3424/#3511 PR review fix round: this route accepts a
+                // scope expression (dispatch_scope, above) and reaches the
+                // same ConfinedDispatchOutcome::scope_parse_error field
+                // mcp_server.cpp's execute_instruction reads -- checked
+                // first, same priority as there, since a malformed
+                // expression is a caller error, not a fleet-state fact,
+                // and 400 (not 503) since this is a client mistake, not a
+                // server-side condition.
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json({{"error", "invalid scope: " + *scope_parse_error}}).dump(),
+                    "application/json");
+                return;
+            }
             res.status = 503;
             if (containment_unreadable) {
                 res.set_content(

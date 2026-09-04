@@ -134,6 +134,9 @@ struct ExecHarness {
     bool dispatch_containment_unreadable_override{false};
     std::size_t dispatch_denied_quarantined_count_override{0};
     std::size_t dispatch_unknown_plugin_count_override{0};
+    /// PR #3939 review fix round: exercises the new scope_parse_error ->
+    /// invalid_scope branch this route gained.
+    std::optional<std::string> dispatch_scope_parse_error_override;
     /// PR 4 audit-coverage regression net: captures every audit_fn call
     /// the routes layer makes so tests can assert the SSE handler's
     /// audit-on-success / audit-absence-on-denied policy (qe-S4).
@@ -317,6 +320,7 @@ struct ExecHarness {
             last_dispatch_exec_visible = caller.exec_visible;
             last_dispatch_caller = caller;
             return {.sent = dispatch_sent_override,
+                   .scope_parse_error = dispatch_scope_parse_error_override,
                    .denied_quarantined_count = dispatch_denied_quarantined_count_override,
                    .command_id = dispatch_cmd_override,
                    .containment_unreadable = dispatch_containment_unreadable_override,
@@ -1386,6 +1390,24 @@ TEST_CASE("PR2 hardening — failed dispatch does NOT orphan a phantom 'running'
 // discrimination /api/command and MCP execute_instruction already had tests
 // for — this route's contract was documented in rest-api.md this same fix
 // round with no test coverage to back it.
+TEST_CASE("instruction execute: a malformed scope expression reports reason=invalid_scope, "
+          "400 (not 503), non-retryable (PR #3939 review, architect finding: this route "
+          "reaches ConfinedDispatchOutcome::scope_parse_error via a caller scope expression "
+          "but never read it, silently falling into the generic no_agents_reached catch-all)",
+          "[pg][workflow][executions][execute][3424][3511]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-IS", "IS");
+    h.dispatch_scope_parse_error_override = "unexpected token at offset 4";
+    auto res = h.sink.Post("/api/instructions/def-IS/execute", R"({"scope":"tag:(("})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"].get<std::string>().find("unexpected token at offset 4") !=
+          std::string::npos);
+}
+
 TEST_CASE("instruction execute: a fail-closed containment gate reports "
           "reason=containment_unreadable, retryable after 5000ms",
           "[pg][workflow][executions][execute][3424][3511]") {
