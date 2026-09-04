@@ -9,6 +9,7 @@
 #include <chrono>
 #include <random>
 #include <stdexcept>
+#include <utility>
 
 namespace yuzu::agent {
 
@@ -161,12 +162,15 @@ void GuardianOutboxDrainWorker::stop() {
     // Test seam: fires with NO lock held, in the real gap between the two lane
     // executors' own stop() calls (governance Gate 4 unhappy-path UP-4) - at this
     // instant lifecycle's lane already refuses admission, compliance's does not yet.
-    // Fire-once via move-and-clear: both stop() calls above/below are unconditional,
-    // not gated on first_stop, so a second/idempotent GuardianOutboxDrainWorker::stop()
-    // call must not re-fire this against an already-stopped compliance lane.
+    // Fire-once via std::exchange, not move-then-check: both stop() calls above/below
+    // are unconditional, not gated on first_stop, so a second/idempotent
+    // GuardianOutboxDrainWorker::stop() call (including the one ~GuardianOutboxDrainWorker
+    // makes) must not re-fire this against an already-stopped compliance lane. A moved-from
+    // std::function is only "valid but unspecified" per the standard, not guaranteed empty;
+    // operator=(nullptr_t) has a specified empty postcondition, which is what makes this
+    // fire-once for real rather than for every stdlib we happen to test against.
     // Production callers never set this.
-    if (between_lane_stops_hook_for_test_) {
-        auto hook = std::move(between_lane_stops_hook_for_test_);
+    if (auto hook = std::exchange(between_lane_stops_hook_for_test_, nullptr)) {
         hook();
     }
     compliance_send_exec_.stop();
