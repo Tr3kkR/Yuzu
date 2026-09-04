@@ -253,25 +253,32 @@ tracked separately below)
   `yuzu.spark_disarm_unwatch_failures` during a shutdown is NOT evidence that nothing was
   orphaned.** Pinned in PR-2c and disclosed on both counters and on
   `emit_spark_heartbeat_tags` itself.
-- **#2839 - CONFIRMED and FIXED in PR-2c; Windows evidence still OWED.** `push_retiring`
-  took the owning `unique_ptr` by value and pushed before allocating, so a `bad_alloc`
-  destroyed a `DirWatch` whose `ReadDirectoryChangesW` was still outstanding. Review found
-  three further gaps beyond the original reorder: the gauge-crossing log runs after the
-  transfer and can itself throw, `release_ancestor` is a second call site with the
-  identical pattern, and all THREE `stop()` cancel loops dereferenced their `unique_ptr`
-  unguarded. All four fixed, with a `set_file_retire_fault_hook_for_test` seam to aim the
-  allocation failure. **NOT YET VERIFIED ON WINDOWS**: the mechanism is Windows-only, so
-  the fix body and its test are uncompiled - no red run, no green run, no MSVC compile. A
-  Wee Tam / DGRHP pass is required before this bullet may be treated as closed, and it must
-  also settle whether MSVC `/fsanitize=address` links against the static-CRT grpc override
-  at all (never tested on this repo). If it does not, the evidence downgrades to
-  "injected-throw pin plus `stats().retiring`/`quarantined_total`" - a valid pin, NOT ASan
-  proof - and must be described that way.
+- **#2839 - CONFIRMED and FIXED in PR-2c; Windows evidence CAPTURED (corrected
+  2026-09-04).** `push_retiring` took the owning `unique_ptr` by value and pushed before
+  allocating, so a `bad_alloc` destroyed a `DirWatch` whose `ReadDirectoryChangesW` was
+  still outstanding. Review found three further gaps beyond the original reorder: the
+  gauge-crossing log runs after the transfer and can itself throw, `release_ancestor` is a
+  second call site with the identical pattern, and all THREE `stop()` cancel loops
+  dereferenced their `unique_ptr` unguarded. All four fixed, with a
+  `set_file_retire_fault_hook_for_test` seam to aim the allocation failure. **Verified on
+  real Windows hardware (DGRHP, commit `95ca9f8e2`)**: the committed test's own
+  discriminating power was checked on real MSVC-compiled code first - an earlier version
+  had zero discriminating power (its "still not wedged" follow-up watch collided with the
+  first watch's directory key and silently repaired the pre-fix corruption before `stop()`'s
+  cancel loop ever ran, so it passed identically whether the fix was present or reverted) -
+  then corrected (a genuine sibling directory) and re-verified: a real SIGSEGV
+  (`0xC0000005 STATUS_ACCESS_VIOLATION`, in `mech->stop()`) pre-fix, a real clean pass
+  post-fix, 4/4 stable. **MSVC `/fsanitize=address` was separately confirmed INFEASIBLE**
+  under this repo's current toolchain (a real, general finding, not specific to this PR): an
+  ASan-instrumented build compiles clean but fails to LINK, 1266 `LNK2038` mismatches,
+  because vcpkg's binary-cache grpc/protobuf/abseil aren't ASan-instrumented and no triplet
+  rebuilds them with matching instrumentation - a substantial, separate, not-yet-scoped
+  prerequisite if Windows ASan is ever wanted. So the evidence above is real MSVC-compiled,
+  real-kernel-I/O red/green verification, genuinely NOT ASan proof, described honestly as
+  such.
 - Owner: not assigned in source material.
-- Milestone: PR-2c DONE for #2815 / #2833 / #2839 (Windows leg outstanding); **PR-2d owed
-  for #2818 before PR-5**.
-- Revisit trigger: fired. #2818 escalated per the rule; #2839 re-opens if the Windows pass
-  contradicts the Linux-side reasoning.
+- Milestone: PR-2c DONE for #2815 / #2833 / #2839; **PR-2d owed for #2818 before PR-5**.
+- Revisit trigger: fired. #2818 escalated per the rule.
 
 **#2012 + #2011 + #3840** (+#2014, confirm at execution)
 - Detection signal: **none today**, named explicitly in the source ruling - a stuck

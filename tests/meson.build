@@ -585,11 +585,14 @@ agent_test_exe = executable(
                 windows_updates_plugin_lib,
                 ],
 )
-# Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
-# threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
-# ballooned under Big Tam filesystem contention (four CI jobs sharing one host's /tmp), where
-# one stalled ~8 minutes and timed the whole agent suite out (#2345). In a PLAIN build they
-# detect nothing (no instrumentation), so that cost buys no signal there - skip them. A
+# Three agent tests are [tsan-heavy] (#3848 added the third, a concurrency soak against a
+# BLOCKING Spark backend/send callback - not a SQLite spin-loop, but genuinely contention-
+# dominated in the same way, ~4-15s under TSan): concurrency STRESS checkpoints that spin
+# four to five threads with no throttle, two of them on real SQLite I/O. Their wall time is
+# contention-dominated - it ballooned under Big Tam filesystem contention (four CI jobs
+# sharing one host's /tmp), where one stalled ~8 minutes and timed the whole agent suite out
+# (#2345). In a PLAIN build they detect nothing (no instrumentation), so that cost buys no
+# signal there - skip them. A
 # sanitizer build runs everything (ASan for use-after-free in the concurrent teardown, TSan
 # for the races they exist for), where the ~10x-larger job budget absorbs their cost as it did
 # before this change. The OTHER four [tsan] tests are cheap and bounded (no real SQLite, or a
@@ -635,7 +638,7 @@ test(
   agent_test_exe,
   args: agent_test_args,
   suite: 'agent',
-  timeout: 240, # restored after moving the two [tsan-heavy] spin-loop tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
+  timeout: 240, # restored after moving the (now three, #3848) [tsan-heavy] tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
 )
 
