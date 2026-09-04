@@ -69,6 +69,20 @@ All Yuzu metrics follow a consistent naming scheme.
 | `yuzu_server_default_certs_active` | gauge | `1` when the server is running with built-in per-install **default** certificates, `0` otherwise. Alert on `== 1` for any production deployment — defaults are convenience certs and should be replaced (see `security-hardening.md`). |
 | `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` | gauge | Unix timestamp (seconds) at which the default cert set expires (the leaves are sized to the CA's `notAfter`, so `cert="default-ca"` is the binding expiry). Default certs are 10-year with **no auto-renewal**; the `yuzu-tls` alert rules (`YuzuCertificateExpiringSoon` warn @7d, `YuzuCertificateExpiryCritical` crit @1d in `docs/prometheus/yuzu-alerts.yml`) fire on `value - time() < window`. |
 
+## Executions event-outbox metrics (HA WS-2a)
+
+The durable `event_outbox` (ADR-2002 §5) shadows the execution-history SSE events and,
+on a multi-replica deployment, is drained cross-replica so a subscriber on one server
+replica sees live execution progress driven from any replica. See
+`docs/executions-history-ladder.md`.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_exec_outbox_poll_published_total` | counter | Durable `event_outbox` rows re-published onto **this** replica's in-memory SSE bus by the ~2s cross-replica delivery poll — i.e. events that ORIGINATED on another replica and were fanned out to this replica's live subscribers. **Zero on a single-replica deployment** (the poll finds nothing foreign to deliver). Flat while idle *or* while stalled behind a long-running transaction that pins the substrate's `pg_snapshot_xmin` — the two are not distinguished today (delivery-lag observability is tracked for WS-11). |
+| `yuzu_exec_outbox_reap_total` | counter | Aged-out `event_outbox` rows deleted by the clock-guarded 24h retention sweep. |
+| `yuzu_exec_outbox_reap_clock_anomaly_total` | counter | Retention sweep passes DECLINED because the substrate `now()` reading was implausible (forward- or backward-skewed vs the persisted anchor) — the clock-guard refusing to delete under a mistrusted clock. A non-zero/rising value means investigate host/DB clock integrity, not retention. |
+| `yuzu_exec_outbox_store_degrade_total` | counter | `event_outbox` **reap OR cross-replica poll** passes that failed outright (pool-acquire timeout / query error), distinct from a clock-anomaly decline. The two sources share one series today (a `stage` label to separate reap from poll is a follow-up); correlate with `yuzu_pg_acquire_timeout_total` / Postgres health. |
+
 ## SSO login metrics
 
 Every SAML and OIDC login attempt — success or failure — increments its provider's login counter. Both counters carry a uniform `{result, role}` label set on every series (including error paths), so a dashboard can group by either label without hitting an unlabelled/labelled split.

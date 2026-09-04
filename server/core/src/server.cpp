@@ -121,14 +121,16 @@
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
-// PR1.9c: the six capability spans build_classified_command's registry composes over — declared
-// by other packages (p1/p7/p10-p13), included (never authored) here at the composition site.
+// PR1.9c: the seven capability spans build_classified_command's registry composes over —
+// declared by other packages (p1/p7/p10-p13), included (never authored) here at the composition
+// site.
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "capability_decls/plugin_action_catalogue_a.hpp"
 #include "capability_decls/plugin_action_catalogue_b.hpp"
 #include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
+#include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -2679,10 +2681,19 @@ public:
                           "counter");
         metrics_.counter("yuzu_exec_outbox_reap_clock_anomaly_total");
         metrics_.describe("yuzu_exec_outbox_store_degrade_total",
-                          "event_outbox reap passes that failed outright (pool/query degradation), "
-                          "distinct from a clock-anomaly decline",
+                          "event_outbox reap OR cross-replica poll passes that failed outright "
+                          "(pool/query degradation), distinct from a clock-anomaly decline",
                           "counter");
         metrics_.counter("yuzu_exec_outbox_store_degrade_total");
+        // HA WS-2a-2 (ADR-2002 §5): events re-published onto this replica's
+        // in-memory bus by the cross-replica delivery poll — i.e. events that
+        // ORIGINATED on another replica and were fanned out to this replica's
+        // live SSE subscribers. Zero on a single-replica deployment.
+        metrics_.describe("yuzu_exec_outbox_poll_published_total",
+                          "Durable event_outbox rows re-published cross-replica onto this "
+                          "replica's in-memory SSE bus by the WS-2a-2 delivery poll",
+                          "counter");
+        metrics_.counter("yuzu_exec_outbox_poll_published_total");
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
@@ -19909,6 +19920,28 @@ private:
                             }
                         }
 
+                        // 2h) HA WS-2a-2 (ADR-2002 §5): cross-replica event
+                        // delivery. Runs EVERY tick (~2s) — NOT on the reap's
+                        // 60s cadence — so a live SSE subscriber on this replica
+                        // sees events that originated on OTHER replicas with
+                        // ~tick latency. (A LISTEN/NOTIFY hint to cut that to
+                        // near-zero is a deferred optimization; the durable
+                        // outbox + horizon poll is the correctness substrate.) A
+                        // degrade does NOT advance the in-memory horizon, so the
+                        // window is re-read next tick (a duplicate, never a gap).
+                        if (execution_tracker_ && execution_tracker_->is_open()) {
+                            if (auto published = execution_tracker_->poll_event_outbox_once()) {
+                                if (*published > 0)
+                                    metrics_.counter("yuzu_exec_outbox_poll_published_total")
+                                        .increment(static_cast<double>(*published));
+                            } else {
+                                spdlog::warn("event_outbox cross-replica poll failed: {}",
+                                             published.error());
+                                metrics_.counter("yuzu_exec_outbox_store_degrade_total")
+                                    .increment();
+                            }
+                        }
+
                         // 3) Refresh alive gauges.
                         if (rs_ok) {
                             auto c = result_set_store_->counts();
@@ -22966,7 +22999,7 @@ private:
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
     /// PR1.9c: the composed classification ruleset `build_classified_command`
-    /// consults on every dispatch — core (this package) plus the five
+    /// consults on every dispatch — core (this package) plus the six
     /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
     /// once: composing it is not itself a cached DECISION (ADR-0012 §4) —
     /// `classify_and_authorize_dispatch` still re-classifies and re-authorizes
@@ -22980,6 +23013,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_c(),
         yuzu::server::capdecls::plugin_action_catalogue_d(),
         yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
+        yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
