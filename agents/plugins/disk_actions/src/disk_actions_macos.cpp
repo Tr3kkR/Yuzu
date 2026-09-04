@@ -204,8 +204,19 @@ int emit_smart(yuzu::CommandContext& ctx) {
             dict ? trim_right(cf_string(CFDictionaryGetValue(dict, CFSTR(kIOPropertyProductNameKey))))
                  : std::string{};
 
-        ScopedCFRef<CFTypeRef> bsd{IORegistryEntryCreateCFProperty(
-            obj.get(), CFSTR(kIOBSDNameKey), kCFAllocatorDefault, kIORegistryIterateRecursively)};
+        // IORegistryEntrySearchCFProperty, NOT IORegistryEntryCreateCFProperty.
+        // The BSD name lives on the CHILD IOMedia, not on the
+        // IOBlockStorageDevice itself, so the lookup has to search the plane.
+        // Create's fourth parameter is `IOOptionBits options`, documented as
+        // having no options defined -- passing kIORegistryIterateRecursively
+        // there is silently ignored, and the earlier revision of this line did
+        // exactly that. Measured on this Mac: every smart row's device column
+        // came back "-". Caught by the standards reviewer reading the API
+        // contract; the runtime dump that would have shown it had only been
+        // taken for the volumes action.
+        ScopedCFRef<CFTypeRef> bsd{IORegistryEntrySearchCFProperty(
+            obj.get(), kIOServicePlane, CFSTR(kIOBSDNameKey), kCFAllocatorDefault,
+            kIORegistryIterateRecursively)};
         const std::string device = cf_string(bsd.get());
 
         ScopedCFRef<CFTypeRef> nvme_smart{IORegistryEntryCreateCFProperty(

@@ -44,7 +44,9 @@ namespace {
 /// mistaken for "this host has no drives".
 void emit_unsupported(yuzu::CommandContext& ctx, std::string_view provenance,
                       std::string_view detail) {
-    mark_result_partial(ctx, provenance, detail);
+    // UNAVAILABLE, not CONSTRAINED: this leg produces no data at all, and
+    // "partial data" would be a false description of that (spec-axis F5).
+    mark_result_unavailable(ctx, provenance, detail);
 }
 
 } // namespace

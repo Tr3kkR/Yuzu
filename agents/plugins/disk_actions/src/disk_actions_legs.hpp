@@ -200,6 +200,23 @@ inline void mark_result_partial(yuzu::CommandContext& ctx, std::string_view prov
 /// status-keyed consumer can tell "not allowed to read that" from every other
 /// kind of degradation. Precedent: event_logs_plugin.cpp's access-denied
 /// mapping, and filesystem_posture's mark_result_denied.
+/// Report a capability that is ABSENT on this platform, as distinct from a
+/// read that partially degraded. Spec-axis review (F5) caught the Linux legs
+/// reporting CONSTRAINED/PARTIAL — "partial data" — for actions that are not
+/// implemented at all and produce no data whatsoever. The repo precedent for
+/// "capability absent entirely" is UNAVAILABLE (antivirus_plugin.cpp:92,
+/// network_config_plugin.cpp:1170), and a status-keyed consumer must be able
+/// to tell "some of it failed" from "this platform cannot do this".
+inline void mark_result_unavailable(yuzu::CommandContext& ctx, std::string_view provenance,
+                                    std::string_view reason = {}) {
+    if (reason.empty())
+        spdlog::warn("disk_actions: capability unavailable ({})", provenance);
+    else
+        spdlog::warn("disk_actions: capability unavailable ({}): {}", provenance, reason);
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          provenance);
+}
+
 inline void mark_result_denied(yuzu::CommandContext& ctx, std::string_view provenance,
                                std::string_view reason = {}) {
     if (reason.empty())

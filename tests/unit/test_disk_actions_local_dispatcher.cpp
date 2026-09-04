@@ -14,8 +14,10 @@
  * SEMANTICS are platform-specific rather than excluding a whole platform.
  *
  * Note what a row-shape assertion can and cannot catch: a leg that is compiled
- * out can still emit a perfectly well-formed row. The BUILD-COMPLETENESS
- * assertions below are the ones that fail on a leg whose own guard excluded it.
+ * out can still emit a perfectly well-formed row. That is why the
+ * build-completeness assertion below exists — it fails when a leg reports that
+ * its OWN SDK guard excluded its implementation, which shape and vocabulary
+ * checks cannot see.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,11 +28,13 @@
 #include "local_dispatcher.hpp"
 
 #include "disk_actions_legs.hpp"
+#include "disk_actions_parsers.hpp"
 
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -184,6 +188,120 @@ TEST_CASE("disk_actions plugin: volumes action row shape", "[disk_actions][actio
     }
 }
 
+// K2 / FV-3 (both external reviewers, independently): nothing asserted
+// result_status, so every mark_result_* call could be deleted and the suite
+// would stay green. LocalDispatcher::Result exposes the seam precisely so a
+// test can prove it fires.
+TEST_CASE("disk_actions: a degraded read reports through the typed status seam",
+          "[disk_actions][status]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+
+#if defined(__APPLE__)
+    // The macOS smart leg is CONSTRAINED by construction: it reads identity and
+    // capability but never health, and says so unconditionally after the walk.
+    // If this ever reports clean, the leg has started claiming to know
+    // something it does not.
+    auto smart = dispatcher.run(plugin->descriptor, "smart");
+    CHECK(smart.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(smart.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(smart.result_provenance == "macos:iokit");
+#elif defined(__linux__)
+    // K5 + spec F5: the Linux legs are not implemented, which is UNAVAILABLE
+    // ("this platform cannot do this"), never CONSTRAINED ("partial data") --
+    // there is no data at all.
+    auto smart = dispatcher.run(plugin->descriptor, "smart");
+    CHECK(smart.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(smart.result_provenance == "linux:smart");
+    auto vols = dispatcher.run(plugin->descriptor, "volumes");
+    CHECK(vols.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(vols.result_provenance == "linux:volumes");
+#else
+    // Windows: a healthy admin host reads every drive, so no degradation is
+    // guaranteed. What IS guaranteed is that the status is never a value the
+    // plugin cannot produce -- and that a degraded run always names a
+    // provenance rather than degrading anonymously.
+    auto smart = dispatcher.run(plugin->descriptor, "smart");
+    const bool declared = smart.result_status == YUZU_RESULT_STATUS_UNDECLARED;
+    const bool degraded = smart.result_status == YUZU_RESULT_STATUS_CONSTRAINED ||
+                          smart.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED;
+    CHECK((declared || degraded));
+    if (degraded) CHECK_FALSE(smart.result_provenance.empty());
+#endif
+}
+
+// K6: the macOS leg must never GUESS health. The fixed-vocabulary check alone
+// permits `ok`, so a regression to a guessed value -- the exact dishonesty the
+// spike ruling rejected -- would pass it.
+#if defined(__APPLE__)
+TEST_CASE("disk_actions: macOS never reports a health value it did not read",
+          "[disk_actions][actions]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "smart");
+    const auto rows = captured_rows(result.captured);
+    REQUIRE_FALSE(rows.empty());
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        REQUIRE(f.size() == 9);
+        INFO("row: " << r);
+        // Health attributes need a private Apple interface this plugin does
+        // not use, so `unknown` is the only honest answer on this platform.
+        CHECK(f[5] == "unknown");
+    }
+}
+
+// K1 / FV-2 (both reviewers, independently): the APFS physical-store
+// resolution is the anchor behaviour of this action and was shipped WRONG in
+// an earlier revision of this very change -- `/` resolved to disk3, a
+// synthesized AppleAPFSMedia container that is not hardware. Nothing asserted
+// it, so the defect could return silently.
+TEST_CASE("disk_actions: macOS resolves volumes to a real physical disk, not an APFS container",
+          "[disk_actions][actions]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    // The set of whole physical disks, taken from the OTHER action rather than
+    // hardcoded: smart enumerates IOBlockStorageDevice, which is by definition
+    // physical hardware. A synthesized APFS container never appears there.
+    std::set<std::string> physical;
+    for (const auto& r : captured_rows(dispatcher.run(plugin->descriptor, "smart").captured)) {
+        const auto f = split_fields_escape_aware(r);
+        if (f.size() == 9 && f[1] != "-") physical.insert(f[1]);
+    }
+    REQUIRE_FALSE(physical.empty());
+
+    const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "volumes").captured);
+    REQUIRE_FALSE(rows.empty());
+    bool checked_any = false;
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        REQUIRE(f.size() == 7);
+        if (f[3] == "-") continue; // no backing device resolved; not this test's subject
+        INFO("row: " << r);
+        // THE assertion: the device column names a disk the physical
+        // enumeration knows about. A synthesized container (diskN with no
+        // IOBlockStorageDevice behind it) fails here, which is exactly the
+        // pre-fix behaviour.
+        CHECK(physical.count(f[3]) == 1);
+        checked_any = true;
+    }
+    CHECK(checked_any);
+}
+#endif // __APPLE__
+
 TEST_CASE("disk_actions plugin: an unknown action is refused, not silently ignored",
           "[disk_actions][actions]") {
     auto plugin = load_disk_actions_plugin();
@@ -244,4 +362,114 @@ TEST_CASE("disk_actions: the volume row carries the physical-to-logical join",
     const auto r = format_volume_row("disk0s2", "/,/System/Volumes/Data", "disk0", "apfs",
                                      std::optional<std::uint64_t>{494384795648}, "-");
     CHECK(r == "volume|disk0s2|/,/System/Volumes/Data|disk0|apfs|494384795648|-");
+}
+
+// ── pure NVMe decision tests (K4 / FV-1) ────────────────────────────────
+//
+// These exist because the decision a failing-drive alert keys on used to live
+// in an anonymous namespace inside a _WIN32-only TU, where no test on any
+// platform could reach it. Both external reviewers reported that a wrong
+// bitmask or a shifted byte offset would ship green. The logic now lives in
+// disk_actions_parsers.hpp and these run everywhere.
+
+TEST_CASE("disk_actions: NVMe critical-warning bits map to the right verdict",
+          "[disk_actions][nvme]") {
+    using namespace yuzu::disk_actions;
+    CHECK(nvme_verdict(0x00) == NvmeVerdict::Ok);
+    // Bit 0 (spare below threshold) and bit 2 (reliability degraded) are the
+    // two an operator must act on.
+    CHECK(nvme_verdict(kNvmeWarnSpareBelowThreshold) == NvmeVerdict::Failing);
+    CHECK(nvme_verdict(kNvmeWarnReliabilityDegraded) == NvmeVerdict::Failing);
+    // Other defined warnings are real, but not "replace this drive now".
+    CHECK(nvme_verdict(kNvmeWarnTemperature) == NvmeVerdict::Warning);
+    CHECK(nvme_verdict(kNvmeWarnReadOnly) == NvmeVerdict::Warning);
+    CHECK(nvme_verdict(kNvmeWarnVolatileMemoryBackupFailed) == NvmeVerdict::Warning);
+    // A bit this code does not recognise is still a warning -- never Ok.
+    // Treating an unknown warning as healthy is what makes a fleet view lie.
+    CHECK(nvme_verdict(0x80) == NvmeVerdict::Warning);
+    // Failing dominates when both classes are set.
+    CHECK(nvme_verdict(kNvmeWarnSpareBelowThreshold | kNvmeWarnTemperature) ==
+          NvmeVerdict::Failing);
+}
+
+TEST_CASE("disk_actions: the NVMe log-page offsets are pinned to their meaning",
+          "[disk_actions][nvme]") {
+    using namespace yuzu::disk_actions;
+    std::array<std::byte, 512> page{};
+    page[kNvmeCriticalWarningOffset] = std::byte{0x04}; // reliability degraded
+    page[kNvmeAvailableSpareOffset] = std::byte{77};
+    page[kNvmePercentageUsedOffset] = std::byte{42};
+
+    const auto h = decode_nvme_health(page);
+    REQUIRE(h.has_value());
+    CHECK(h->critical_warning == 0x04);
+    CHECK(h->available_spare == 77);
+    CHECK(h->percentage_used == 42);
+    CHECK(nvme_verdict(h->critical_warning) == NvmeVerdict::Failing);
+}
+
+TEST_CASE("disk_actions: a short NVMe reply is a failure to report, not a healthy zero",
+          "[disk_actions][nvme]") {
+    using namespace yuzu::disk_actions;
+    // A device that answered with less than it promised must not decode to an
+    // all-zero (i.e. perfectly healthy) reading.
+    std::array<std::byte, kNvmeHealthMinBytes - 1> truncated{};
+    CHECK_FALSE(decode_nvme_health(truncated).has_value());
+    std::array<std::byte, kNvmeHealthMinBytes> exact{};
+    CHECK(decode_nvme_health(exact).has_value());
+}
+
+TEST_CASE("disk_actions: the name-derived whole disk is WRONG for APFS, deliberately",
+          "[disk_actions][nvme]") {
+    using namespace yuzu::disk_actions;
+    // Pins the distinction that the macOS leg exists to honour. For an
+    // ordinary partition the string shortcut is right...
+    CHECK(name_derived_whole_disk("disk0s2") == "disk0");
+    CHECK(name_derived_whole_disk("disk0") == "disk0");
+    // ...but for an APFS volume on a synthesized container it yields the
+    // CONTAINER (disk3), which is not hardware. That is why the leg walks the
+    // IOKit provider chain instead of trimming the name, and why a future
+    // "simplification" back to string handling would reintroduce the defect.
+    CHECK(name_derived_whole_disk("disk3s1s1") == "disk3");
+}
+
+// ── FV-4: escaping is a contract over EVERY untrusted field ─────────────
+//
+// The original test proved it for one field (`model`). A bare separator could
+// regress in any other text column without failing anything.
+
+TEST_CASE("disk_actions: every untrusted text field survives separator injection",
+          "[disk_actions][format]") {
+    using namespace yuzu::disk_actions;
+    const std::string evil = "a|b";
+
+    // smart: device (1), model (2), detail (8) are the untrusted text columns;
+    // bus/media/health are fixed vocabularies and must NOT be escapable at all.
+    {
+        const auto f = split_fields_escape_aware(
+            format_smart_row(evil, "m", Bus::Nvme, Media::Ssd, Health::Ok, std::nullopt,
+                             std::nullopt, "d"));
+        REQUIRE(f.size() == 9);
+        CHECK(f[1] == evil);
+    }
+    {
+        const auto f = split_fields_escape_aware(
+            format_smart_row("dev", "m", Bus::Nvme, Media::Ssd, Health::Ok, std::nullopt,
+                             std::nullopt, evil));
+        REQUIRE(f.size() == 9);
+        CHECK(f[8] == evil);
+    }
+    // volume: volume (1), mount_points (2), device (3), fstype (4), detail (6).
+    for (int field = 1; field <= 6; ++field) {
+        if (field == 5) continue; // total_bytes is numeric, not text
+        const std::string v = field == 1 ? evil : "vol";
+        const std::string m = field == 2 ? evil : "-";
+        const std::string d = field == 3 ? evil : "-";
+        const std::string t = field == 4 ? evil : "-";
+        const std::string det = field == 6 ? evil : "-";
+        const auto f = split_fields_escape_aware(format_volume_row(v, m, d, t, std::nullopt, det));
+        INFO("injected into volume field " << field);
+        REQUIRE(f.size() == 7);
+        CHECK(f[field] == evil);
+    }
 }

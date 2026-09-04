@@ -71,6 +71,7 @@
 #include <win_str.hpp>
 
 #include "disk_actions_legs.hpp"
+#include "disk_actions_parsers.hpp"
 
 #include <array>
 #include <cstddef>
@@ -223,12 +224,6 @@ std::optional<DriveIdentity> query_identity(HANDLE h) {
     return id;
 }
 
-struct NvmeHealth {
-    std::uint8_t critical_warning{0};
-    std::uint8_t available_spare{0};
-    std::uint8_t percentage_used{0};
-};
-
 #if defined(YUZU_DISKACTIONS_HAVE_NVME)
 /// NVMe SMART / Health Information log page 0x02. Byte offsets are from the
 /// NVMe specification: [0] critical warning, [3] available spare %,
@@ -265,21 +260,24 @@ std::optional<NvmeHealth> query_nvme_health(HANDLE h) {
     const std::size_t len = pd->ProtocolSpecificData.ProtocolDataLength;
     if (len < 6 || base > returned || base + len > returned) return std::nullopt;
 
-    const BYTE* lp = out.data() + base;
-    return NvmeHealth{lp[0], lp[3], lp[5]};
+    // The field extraction and its bounds check are pure and shared, so a
+    // change to the NVMe offsets fails a unit test rather than silently
+    // reading the wrong byte on a live drive.
+    return decode_nvme_health(
+        std::span<const std::byte>(reinterpret_cast<const std::byte*>(out.data() + base), len));
 }
 #endif // YUZU_DISKACTIONS_HAVE_NVME
 
-/// Health from the NVMe critical-warning bitmask. Bit 0 is "available spare
-/// below threshold" and bit 2 is "reliability degraded" -- the two an operator
-/// must act on. Any other set bit still degrades to `warning` rather than being
-/// ignored, because an unrecognised warning is not the same as no warning.
-Health health_from_nvme(const NvmeHealth& h) {
-    constexpr std::uint8_t kSpareBelowThreshold = 0x01;
-    constexpr std::uint8_t kReliabilityDegraded = 0x04;
-    if (h.critical_warning & (kSpareBelowThreshold | kReliabilityDegraded)) return Health::Failing;
-    if (h.critical_warning != 0) return Health::Warning;
-    return Health::Ok;
+/// Adapt the pure verdict (disk_actions_parsers.hpp) to the row-layer token
+/// enum. The DECISION lives in the parsers header so every platform's unit
+/// suite can exercise it against fixtures; this is only the mapping.
+Health health_from_verdict(NvmeVerdict v) {
+    switch (v) {
+    case NvmeVerdict::Ok:      return Health::Ok;
+    case NvmeVerdict::Warning: return Health::Warning;
+    case NvmeVerdict::Failing: return Health::Failing;
+    }
+    return Health::Unknown;
 }
 
 } // namespace
@@ -290,6 +288,7 @@ int emit_smart(yuzu::CommandContext& ctx) {
     bool any_row = false;
     bool any_denied = false;
     bool any_open_failure = false;
+    bool any_health_unread = false;
     DWORD first_open_err = 0;
 
     // Windows exposes no enumeration of PhysicalDriveN, so probe a bounded
@@ -327,10 +326,15 @@ int emit_smart(yuzu::CommandContext& ctx) {
 #if defined(YUZU_DISKACTIONS_HAVE_NVME)
         if (id->bus == Bus::Nvme) {
             if (const auto nh = query_nvme_health(h.get())) {
-                health = health_from_nvme(*nh);
+                health = health_from_verdict(nvme_verdict(nh->critical_warning));
                 pct_used = nh->percentage_used;
                 spare = nh->available_spare;
             } else {
+                // F2: recording the cause only in the row's detail left the
+                // command reporting a clean OK. An NVMe drive whose health we
+                // could not read is a DEGRADED read, and must say so through
+                // the typed seam a status-keyed consumer reads.
+                any_health_unread = true;
                 detail = "NVMe SMART log page 0x02 was not returned by this device";
             }
         } else {
@@ -342,6 +346,12 @@ int emit_smart(yuzu::CommandContext& ctx) {
                      "not NVMe, so its health is not reported";
         }
 #else
+        // F1: this build has no NVMe header, so NO drive can report health on
+        // it. The descriptor advertises SUPPORTED with wear figures, so a
+        // silent OK here would be the sibling plugin's exact failure mode --
+        // a leg whose real path was compiled out while its descriptor claimed
+        // otherwise. Degrade explicitly and let the row say why.
+        any_health_unread = true;
         detail = "built without the NVMe SDK header; health is not read";
 #endif
 
@@ -356,6 +366,9 @@ int emit_smart(yuzu::CommandContext& ctx) {
 
     // Reported after the walk, least-material first, so the most actionable
     // cause is the one that survives set_result_status's last-writer-wins.
+    if (any_health_unread)
+        mark_result_partial(ctx, "windows:nvme_health",
+                            "health could not be read for at least one drive; see the row detail");
     if (any_open_failure)
         mark_result_partial(ctx, "windows:physicaldrive",
                             std::format("at least one drive could not be opened: {}",
