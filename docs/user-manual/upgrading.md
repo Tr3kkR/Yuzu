@@ -1077,9 +1077,9 @@ The webhook HMAC signing secret is now envelope-encrypted at rest
   migrate or open is still a fatal startup error (fail-closed); a legacy
   `webhooks.db` file with real content does NOT fail startup and its content
   is never imported — the server hardens it to 0600 (main file and any
-  `-wal`/`-shm` sidecars, since it may still hold a pre-cutover signing
-  secret in plaintext — POSIX only, a no-op on Windows, #3593) and counts
-  rows in `webhooks`/`webhook_deliveries` for a diagnostic warning, then
+  `-wal`/`-shm`/`-journal` sidecars, since it may still hold a pre-cutover
+  signing secret in plaintext — POSIX only, a no-op on Windows, #3593) and
+  counts rows in `webhooks`/`webhook_deliveries` for a diagnostic warning, then
   boots regardless of what it finds. There is no move-aside: the legacy
   file stays at its original path.
 - **New fail-closed-at-boot behaviour.** A Postgres/`SecretCodec` error at any

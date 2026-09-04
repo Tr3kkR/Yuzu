@@ -180,11 +180,13 @@ inline void warn_if_legacy_rows(const std::filesystem::path& legacy_db_path,
     }
 }
 
-/// Force POSIX 0600 (owner read/write only) on a legacy SQLite file AND its `-wal`/`-shm`
-/// sidecars, for a caller whose legacy file may hold plaintext secret material (ADR-0010
-/// §Consequences (a)) — generalizes `WebhookStore::migrate_from_sqlite_impl`'s own inline
-/// 0600+sidecar block (PR #3563) per this header's "extend, never fork" instruction above.
-/// Call this BEFORE `warn_if_legacy_rows` for a secret-bearing store.
+/// Force POSIX 0600 (owner read/write only) on a legacy SQLite file AND its `-wal`/`-shm`/
+/// `-journal` sidecars (WAL-mode and rollback-journal-mode, respectively — whichever the file
+/// was last closed in), for a caller whose legacy file may hold plaintext secret material
+/// (ADR-0010 §Consequences (a)) — generalizes `WebhookStore::migrate_from_sqlite_impl`'s own
+/// inline 0600+sidecar block (PR #3563) per this header's "extend, never fork" instruction
+/// above. Call this BEFORE `warn_if_legacy_rows` for a secret-bearing store, passing the SAME
+/// `store_name` (used only in log lines, exactly like `warn_if_legacy_rows`'s own parameter).
 ///
 /// POSIX-only, internally guarded (`#ifndef _WIN32`) so the call site itself stays
 /// platform-agnostic — a Windows build compiles this as a no-op (no compensating Windows ACL
@@ -218,7 +220,8 @@ inline void warn_if_legacy_rows(const std::filesystem::path& legacy_db_path,
 /// a dedicated non-root account (`USER yuzu`, `deploy/docker/Dockerfile.server*`), not root, so
 /// this ownership gate holds in the deployed configuration. (`docs/agent-privilege-model.md`
 /// covers the separate agent-daemon account, not the server's — do not cite it here.)
-inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path) {
+inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path,
+                                    std::string_view store_name) {
 #ifndef _WIN32
     // RAII, not `agents/core/include/yuzu/agent/scoped_fd.hpp`'s `ScopedFd` -- that header is
     // agent-only (yuzu::agent, a separate build target) and importing it into server code would
@@ -239,41 +242,44 @@ inline void harden_legacy_file_0600(const std::filesystem::path& legacy_db_path)
         OwnedFd& operator=(OwnedFd&&) = delete;
     };
 
-    const auto chmod_owner_only = [](const std::filesystem::path& path, const char* what) {
+    const auto chmod_owner_only = [store_name](const std::filesystem::path& path,
+                                               const char* what) {
         OwnedFd owned{::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_NOCTTY)};
         if (owned.fd < 0) {
             const int open_errno = errno; // capture before any other call can touch it
             if (open_errno != ENOENT)
-                spdlog::warn("legacy_sqlite_probe: could not open {} {} to harden its "
-                            "permissions ({})",
-                            what, path.string(), std::strerror(open_errno));
+                spdlog::warn("{}: could not open {} {} to harden its permissions -- it may "
+                            "still hold a plaintext secret at its current mode ({})",
+                            store_name, what, path.string(), std::strerror(open_errno));
             return; // absent (ordinary case), or unreadable -- nothing to harden
         }
         struct stat st{};
         if (::fstat(owned.fd, &st) != 0) {
             const int fstat_errno = errno;
-            spdlog::warn("legacy_sqlite_probe: could not stat {} {} to harden its permissions "
-                        "({})",
-                        what, path.string(), std::strerror(fstat_errno));
+            spdlog::warn("{}: could not stat {} {} to harden its permissions -- it may still "
+                        "hold a plaintext secret at its current mode ({})",
+                        store_name, what, path.string(), std::strerror(fstat_errno));
             return;
         }
         if (!S_ISREG(st.st_mode))
             return; // not a regular file (dir/device/FIFO/socket) -- nothing to harden
         if (::fchmod(owned.fd, S_IRUSR | S_IWUSR) != 0) {
             const int fchmod_errno = errno;
-            spdlog::warn("legacy_sqlite_probe: could not set 0600 on {} {}: {}", what,
-                        path.string(), std::strerror(fchmod_errno));
+            spdlog::warn("{}: could not set 0600 on {} {} -- it may still hold a plaintext "
+                        "secret at its current, wider mode: {}",
+                        store_name, what, path.string(), std::strerror(fchmod_errno));
         }
     };
 
     chmod_owner_only(legacy_db_path, "legacy file");
-    for (const char* suffix : {"-wal", "-shm"}) {
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
         auto side = legacy_db_path;
         side += suffix;
         chmod_owner_only(side, "legacy sidecar");
     }
 #else
     (void)legacy_db_path;
+    (void)store_name;
 #endif
 }
 

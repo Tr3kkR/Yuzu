@@ -6266,8 +6266,8 @@ public:
                         startup_failed_ = true;
                     } else {
                         webhook_store_->set_metrics(&metrics_);
-                        legacy_sqlite_probe::harden_legacy_file_0600(cfg_.db_dir() /
-                                                                     "webhooks.db");
+                        legacy_sqlite_probe::harden_legacy_file_0600(
+                            cfg_.db_dir() / "webhooks.db", "WebhookStore");
                         legacy_sqlite_probe::warn_if_legacy_rows(
                             cfg_.db_dir() / "webhooks.db", "WebhookStore",
                             {"webhooks", "webhook_deliveries"});

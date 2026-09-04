@@ -3984,7 +3984,7 @@ is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database back
 recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
 recreate it. No production fleet ever ran a pre-Postgres build of this store (#3623), so a
 legacy SQLite `webhooks.db` genuinely holding real data should not exist — but if one is
-somehow found on disk at boot (hardened to 0600, main file and any `-wal`/`-shm` sidecars, and
+somehow found on disk at boot (hardened to 0600, main file and any `-wal`/`-shm`/`-journal` sidecars, and
 warned about in the log), it still holds any signing secrets in **plaintext** and is never
 automatically deleted or rotated. If you find one and don't need it, delete it yourself; if any
 webhook it names might still be relying on that secret, rotate (delete-and-recreate) the

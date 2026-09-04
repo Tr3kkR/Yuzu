@@ -256,13 +256,17 @@ TEST_CASE("legacy_sqlite_probe: warns (does not silently skip) when the legacy p
 // ── harden_legacy_file_0600 (#3623, generalized from WebhookStore's own inline
 // 0600+sidecar block, PR #3563) ──────────────────────────────────────────────
 
-TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 restricts the main file and both "
+TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 restricts the main file and all three "
           "sidecars to owner-only",
           "[legacy_sqlite_probe]") {
+    // Covers `-wal`/`-shm` (WAL mode) AND `-journal` (rollback-journal mode) -- a secret-bearing
+    // store's legacy SQLite file could be left in either journal mode depending on how it was
+    // last closed, and only WAL-mode sidecars were covered before this test (external PR review,
+    // 2026-09-04).
     auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_legacyprobe_harden_") += ".db";
     std::ofstream(legacy_path) << "dummy-content";
     std::vector<std::filesystem::path> sidecars;
-    for (const char* suffix : {"-wal", "-shm"}) {
+    for (const char* suffix : {"-wal", "-shm", "-journal"}) {
         auto side = legacy_path;
         side += suffix;
         std::ofstream(side) << "dummy-sidecar-content";
@@ -275,20 +279,20 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 restricts the main file 
             for (const auto& p : paths)
                 std::filesystem::remove(p, ec);
         }
-    } cleanup{{legacy_path, sidecars[0], sidecars[1]}};
+    } cleanup{{legacy_path, sidecars[0], sidecars[1], sidecars[2]}};
 
     // Group/world-readable to start, matching the unclean-shutdown-leftover
     // shape the real code path defends against.
     const auto wide_open = std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
                            std::filesystem::perms::group_read | std::filesystem::perms::others_read;
-    for (const auto& p : {legacy_path, sidecars[0], sidecars[1]})
+    for (const auto& p : {legacy_path, sidecars[0], sidecars[1], sidecars[2]})
         std::filesystem::permissions(p, wide_open, std::filesystem::perm_options::replace);
 
-    harden_legacy_file_0600(legacy_path);
+    harden_legacy_file_0600(legacy_path, "TestStore");
 
     const auto owner_only =
         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
-    for (const auto& p : {legacy_path, sidecars[0], sidecars[1]}) {
+    for (const auto& p : {legacy_path, sidecars[0], sidecars[1], sidecars[2]}) {
         std::error_code st_ec;
         const auto perms = std::filesystem::status(p, st_ec).permissions();
         REQUIRE_FALSE(st_ec);
@@ -303,9 +307,12 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 is a silent no-op when t
     REQUIRE_FALSE(std::filesystem::exists(path));
 
     yuzu::test::LogCapture cap;
-    harden_legacy_file_0600(path); // must not throw
+    harden_legacy_file_0600(path, "TestStore"); // must not throw
     cap.stop();
-    CHECK(cap.text().find("legacy_sqlite_probe") == std::string::npos);
+    // Genuinely silent -- not just missing a since-removed literal prefix (this function's log
+    // lines are now store_name-prefixed, like warn_if_legacy_rows', so a stale substring check
+    // here would vacuously pass even if a warning HAD fired).
+    CHECK(cap.text().empty());
 }
 
 TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 hardens the resolved target when the "
@@ -333,7 +340,7 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 hardens the resolved tar
                            std::filesystem::perms::group_read | std::filesystem::perms::others_read;
     std::filesystem::permissions(target, wide_open, std::filesystem::perm_options::replace);
 
-    harden_legacy_file_0600(link);
+    harden_legacy_file_0600(link, "TestStore");
 
     const auto owner_only =
         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
@@ -389,7 +396,7 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 cannot widen or redirect
         } cleanup{link};
 
         yuzu::test::LogCapture cap;
-        harden_legacy_file_0600(link); // must not throw, must not touch /etc/passwd's mode
+        harden_legacy_file_0600(link, "TestStore"); // must not throw, must not touch /etc/passwd's mode
         cap.stop();
 
         std::error_code after_ec;
@@ -420,7 +427,8 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 leaves a non-regular pat
         }
     } cleanup{fifo_path};
 
-    auto fut = std::async(std::launch::async, [&] { harden_legacy_file_0600(fifo_path); });
+    auto fut =
+        std::async(std::launch::async, [&] { harden_legacy_file_0600(fifo_path, "TestStore"); });
     const auto status = fut.wait_for(std::chrono::seconds(3));
     REQUIRE(status == std::future_status::ready); // else: regressed off O_NONBLOCK, hung on open()
 }
