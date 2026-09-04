@@ -25,21 +25,37 @@
  * relationship ConvergenceScheduler already has to the runtime.
  *
  * `send` MAY capture GuardianEngine/AgentImpl state (e.g. `this`) directly -
- * unlike the SparkEngine-queued-consumer handler (which can be DETACHED past
- * the shutdown budget and must therefore be fully self-contained), this
- * worker's thread is ALWAYS synchronously joined by stop() before the owner
- * tears down further, so a capture here does not need that level of
- * self-containment. Document this distinction at the call site if it becomes
- * non-obvious.
+ * BUT (#2233 item 4, revised) the actual call to `send` no longer necessarily
+ * runs ON this worker's thread, and is no longer necessarily joined by stop():
+ * drain_bounded() routes it through GuardianOutboxSendExecutor
+ * (guardian_outbox_send_executor.hpp), which detaches the call so a stalled
+ * sink cannot wedge this worker's own maintenance/cadence. A detached send can
+ * therefore outlive stop()'s join, exactly like the SparkEngine-queued-consumer
+ * handler this paragraph used to contrast against - `send`'s capture is safe
+ * ONLY because active_send_workers() (below) is summed into
+ * GuardianEngine::active_io_workers(), the orphan-exit contract's sole source
+ * of truth: main.cpp/service_win.cpp refuse normal C++ teardown of the very
+ * object `send` captures while that count is nonzero, hard_exit()ing instead
+ * after a bounded grace. A source left out of that sum would silently
+ * reinstate the use-after-free this paragraph used to rule out by construction.
  *
- * WITH ONE ABSOLUTE EXCEPTION: whatever `send` captures, it must never take
- * GuardianEngine::mtx_ - see the central constraint below. That applies to
- * EVERY path on this thread, the injected send included; `send` is in fact the
- * easiest place to reintroduce the deadlock, because it is an arbitrary
- * std::function supplied from agent.cpp. GuardianEngine aborts on this in
+ * WITH ONE ABSOLUTE EXCEPTION: whatever runs ON THIS WORKER'S OWN THREAD - the
+ * loop() body and journal maintenance, see the central constraint below - must
+ * never take GuardianEngine::mtx_. `send` (the injected std::function from
+ * agent.cpp) is deliberately EXCLUDED from that set as of #2233 item 4: it now
+ * runs on GuardianOutboxSendExecutor's detached worker (guardian_outbox_send_
+ * executor.hpp), never on this thread, so it can no longer produce the
+ * lock-vs-join deadlock this exception used to warn about - that is precisely
+ * the property tests/unit/test_guardian_outbox_drain_worker.cpp's role-marker
+ * test now checks (on_guardian_joined_thread() reads FALSE inside `send`).
+ * `send` taking mtx_ is still pointless (nothing on that thread needs it) and
+ * still worth avoiding, but it is no longer the CATASTROPHIC exposure this
+ * paragraph originally named - see guardian_outbox_send_executor.hpp for what
+ * IS still load-bearing about `send`'s capture (the orphan-exit contract).
+ * GuardianEngine aborts on an mtx_ acquisition on the WORKER thread itself in
  * debug/sanitizer builds via the thread-local marker in
- * guardian_joined_thread_role.hpp, so a violation crashes loudly rather than
- * hanging a fleet.
+ * guardian_joined_thread_role.hpp, so a violation there crashes loudly rather
+ * than hanging a fleet.
  *
  * JOURNAL MAINTENANCE (C0, #2298 gate 1): this worker also runs the durable
  * lifecycle journal's retention prune + replay paging, which used to run inline
@@ -61,8 +77,9 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
-#include "guardian_outbox.hpp"        // OutboxEntry, SendResult
-#include "guardian_spark_runtime.hpp" // GuardianSparkRuntime
+#include "guardian_outbox.hpp"              // OutboxEntry, SendResult
+#include "guardian_outbox_send_executor.hpp" // GuardianOutboxSendExecutor
+#include "guardian_spark_runtime.hpp"        // GuardianSparkRuntime
 
 #include <atomic>
 #include <chrono>
@@ -126,6 +143,14 @@ guardian_jitter_offset(std::mt19937& rng, std::chrono::milliseconds upper);
 /// TIME: at a pathological seconds-per-send it is still minutes, and the worker may be
 /// holding up GuardianEngine::stop()'s join for all of it.
 inline constexpr std::chrono::milliseconds kGuardianDrainMaxWall{2'000};
+
+/// Per-attempt bound on how long the worker thread waits for a detached send to finish
+/// before treating it as still-in-flight and retaining the head (#2233 item 4,
+/// guardian_outbox_send_executor.hpp). Small relative to kGuardianDrainMaxWall so a
+/// stalled sink costs the worker at most this much per tick, not the send's actual
+/// duration - the detached worker keeps running past this deadline; only the CALLER
+/// stops waiting on it.
+inline constexpr std::chrono::milliseconds kGuardianSendOfferWait{200};
 
 /// Journal-maintenance knobs for GuardianOutboxDrainWorker. A struct rather than more
 /// positional parameters so the two same-typed intervals cannot be transposed at a call
@@ -348,8 +373,43 @@ public:
         return started_;
     }
 
+    /// For GuardianEngine::active_io_workers() (#2233 item 4) - the orphan-exit
+    /// contract's sole source of truth (hard_exit.hpp). MUST be summed in there
+    /// alongside the state-reader and arm/disarm executors; see
+    /// guardian_outbox_send_executor.hpp's header comment.
+    [[nodiscard]] std::size_t active_send_workers() const {
+        return lifecycle_send_exec_.active_worker_count() + compliance_send_exec_.active_worker_count();
+    }
+
 private:
     void loop();
+    /// The SendFn actually threaded through rt_.drain_bounded(): bounces each send
+    /// through a per-LANE GuardianOutboxSendExecutor so the worker thread never blocks
+    /// on the real, injected `send_` for longer than kGuardianSendOfferWait (#2233
+    /// item 4). TWO executors, not one: drain_bounded() calls this once for
+    /// lifecycle_log_ and once for outbox_ (compliance+health) per pass
+    /// (guardian_spark_runtime.cpp), and a SHARED single-flight slot across both lanes
+    /// would let a slow-but-succeeding lifecycle send silently starve compliance
+    /// delivery every pass - the compliance send would never even be INVOKED, hitting
+    /// the mismatch-orphan branch instead (governance Gate 4 unhappy-path finding
+    /// UP-1, derived BLOCKING: I5(b) unavailability on a path shared with an audit/
+    /// detection operation). This reintroduces the fairness the existing
+    /// guaranteed_attempts/compliance-reserve machinery in drain_bounded() already
+    /// protects, WITHOUT that machinery ever seeing it happen, since Retain here never
+    /// reaches drain_log_unlocked's own "did we actually try" accounting. Routed by
+    /// OutboxEntry::domain: Lifecycle is the only domain in lifecycle_log_
+    /// (guardian_outbox.hpp); Compliance/Health share outbox_ and therefore share the
+    /// second lane, matching drain_bounded()'s own two-call structure exactly. The two
+    /// lanes' detached sends CAN contend on agent.cpp's stream_write_mu_ if both are
+    /// in flight at once - that is the SAME pre-existing, already-disclaimed
+    /// contention this whole class's header names ("NOT a fix for stream_write_mu_
+    /// contention"), now on two detached threads instead of one; it never touches the
+    /// worker's own thread.
+    [[nodiscard]] SendResult wrapped_send(const OutboxEntry& entry) {
+        auto& exec = entry.domain == OutboxDomain::Lifecycle ? lifecycle_send_exec_
+                                                              : compliance_send_exec_;
+        return exec.offer(entry, send_, kGuardianSendOfferWait).value_or(SendResult::Retain);
+    }
     /// True once stop() has been requested. Lock-free and noexcept BY DESIGN: this is
     /// the one check loop() makes outside a try, and taking a mutex here would let
     /// std::system_error escape the bare worker thread and terminate the agent (the
@@ -375,6 +435,12 @@ private:
 
     GuardianSparkRuntime& rt_;
     SendFn send_;
+    /// Detaches the actual send call from this worker's own thread (#2233 item 4).
+    /// TWO instances, one per drain lane - see wrapped_send()'s doc comment for why a
+    /// single shared slot silently starves one lane behind the other. See
+    /// guardian_outbox_send_executor.hpp for the per-instance contract.
+    GuardianOutboxSendExecutor lifecycle_send_exec_;
+    GuardianOutboxSendExecutor compliance_send_exec_;
     std::uint64_t periodic_bound_ms_;
     GuardianMaintenanceConfig maint_;
     std::shared_ptr<Signal> sig_;

@@ -216,9 +216,9 @@ TEST_CASE("preflight routes: /fragments/auto/run denies a service-scoped "
     auto dispatch = [&dispatched](const std::string&, const std::string&,
                                   const std::vector<std::string>&, const std::string&,
                                   const std::unordered_map<std::string, std::string>&,
-                                  const std::string&) -> std::pair<std::string, int> {
+                                  const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
-        return {"cmd-1", 1};
+        return {.sent = 1, .command_id = "cmd-1"};
     };
     std::vector<std::string> audit_log;
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
@@ -279,9 +279,9 @@ TEST_CASE("preflight routes: /fragments/auto/run reaches resolve_targets + "
     auto dispatch = [&dispatched](const std::string&, const std::string&,
                                   const std::vector<std::string>&, const std::string&,
                                   const std::unordered_map<std::string, std::string>&,
-                                  const std::string&) -> std::pair<std::string, int> {
+                                  const std::string&) -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
-        return {"cmd-1", 1};
+        return {.sent = 1, .command_id = "cmd-1"};
     };
     std::vector<std::string> audit_log;
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,

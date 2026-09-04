@@ -150,9 +150,9 @@ TEST_CASE("deployment routes: config/result/delete deny a service-scoped "
                                   const std::vector<std::string>&, const std::string&,
                                   const std::unordered_map<std::string, std::string>&,
                                   const std::string&,
-                                  const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+                                  const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
-        return {"cmd-1", 1};
+        return {.sent = 1, .command_id = "cmd-1"};
     };
     auto poll = [](const std::string&) { return std::unordered_map<std::string, deployment::AgentResponse>{}; };
     std::vector<std::string> audit_log;
@@ -250,8 +250,8 @@ TEST_CASE("deployment routes: ordinary session reaches config/result/delete, "
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
                        const std::string&,
-                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
-        return {"cmd-1", 1};
+                       const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-1"};
     };
     auto poll = [](const std::string&) { return std::unordered_map<std::string, deployment::AgentResponse>{}; };
     std::vector<std::string> audit_log;

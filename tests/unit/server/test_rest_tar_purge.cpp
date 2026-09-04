@@ -105,7 +105,7 @@ struct PurgeHarness {
                    const std::vector<std::string>& ids, const std::string&,
                    const std::unordered_map<std::string, std::string>& params, const std::string&,
                    const yuzu::server::DispatchCaller& caller)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             last_exec_visible = caller.exec_visible;
             last_caller = caller;
             calls.push_back({plugin, action, ids, params});
@@ -120,7 +120,7 @@ struct PurgeHarness {
                 std::all_of(ids.begin(), ids.end(), [&](const std::string& id) {
                     return yuzu::server::authz::in_scope(caller.exec_visible, id);
                 });
-            return {"cmd-" + std::to_string(calls.size()), admitted ? dispatch_sent : 0};
+            return {.sent = admitted ? dispatch_sent : 0, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
         api.register_routes(

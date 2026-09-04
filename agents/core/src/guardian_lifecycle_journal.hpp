@@ -12,16 +12,24 @@
  *
  * C2 delivers persist() only; paging + retention (C4/C5) layer on later.
  *
- * CONCURRENCY (updated #2303): NOT a general thread-safe object, but it does run
- * under a specific, bounded concurrency in production - persist() executes on the
- * engine mtx_ (heartbeat retry / apply_rules flush / stop-flush) while prune() and
- * page_into_window() run OFF mtx_, serialised against each other by paging_mutex_.
- * That safe overlap rests on: the size gauges being atomic RMW running counters
- * (no lost update across persist-vs-prune), KvStore serialising its single
- * connection, batch_seq_ being written only by the single persist caller
- * (boot_nonce_ is fixed in the ctor, immutable thereafter), and the seed's
- * absolute store running once in the ctor before publication. Do NOT add a
- * second persist caller or a non-RMW gauge write.
+ * CONCURRENCY (updated #2303, #2233 item 4): NOT a general thread-safe object, but
+ * it does run under a specific, bounded concurrency in production - persist()
+ * executes on the engine mtx_ (heartbeat retry / apply_rules flush / stop-flush)
+ * while prune() and page_into_window() run OFF mtx_ on the drain worker's own
+ * thread, serialised against each other by paging_mutex_. mark_batch_sent() is a
+ * THIRD, independent caller into kv_: it runs wherever the production `send` wrap
+ * happens to execute, which since #2233 item 4 is GuardianOutboxSendExecutor's
+ * detached worker (guardian_outbox_send_executor.hpp), NOT the drain worker's own
+ * thread - so it can now run genuinely concurrently with prune()/page_into_window(),
+ * not merely interleaved on one thread as before. That safe overlap rests on: the
+ * size gauges being atomic RMW running counters (no lost update across
+ * persist-vs-prune-vs-mark_batch_sent), KvStore serialising its single connection,
+ * batch_seq_ being written only by the single persist caller (boot_nonce_ is fixed
+ * in the ctor, immutable thereafter), and the seed's absolute store running once in
+ * the ctor before publication. mark_batch_sent()'s label is explicitly best-effort
+ * (see its own doc comment) - a redundant re-page from a stale-observed label is the
+ * worst case, not a correctness break. Do NOT add a second persist caller or a
+ * non-RMW gauge write.
  */
 
 #include "guardian_journal_format.hpp"

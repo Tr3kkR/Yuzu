@@ -387,13 +387,15 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
                     s.name, s.id, s.definition_id);
             }
         }
-        std::tie(command_id, sent) =
+        const auto dispatch_outcome =
             d_.dispatch_fn_concurrency
                 ? d_.dispatch_fn_concurrency(plugin, action, /*agent_ids=*/{}, dispatch_scope,
                                             parameters, exec_id, caller, s.definition_id,
                                             concurrency_mode)
                 : d_.dispatch_fn(plugin, action, /*agent_ids=*/{}, dispatch_scope, parameters,
                                  exec_id, caller);
+        command_id = dispatch_outcome.command_id;
+        sent = dispatch_outcome.sent;
     } catch (const std::exception& e) {
         count("yuzu_schedule_fire_failures_total");
         spdlog::error("schedule_runner: dispatch failed for schedule '{}' (id={}): {}", s.name,
