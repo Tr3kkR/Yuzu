@@ -664,15 +664,23 @@ private:
     /// early locked block has flipped both flags a later caller resolves nothing and
     /// arms nothing. The lease counts exactly the callers in flight at that instant.
     ///
-    /// A PLAIN ATOMIC, POLLED — deliberately, not for want of a condition_variable.
-    /// The lease is released from an RAII DESTRUCTOR on the door caller's thread, and
-    /// a destructor that locked a mutex would std::terminate on the std::system_error
-    /// std::mutex::lock is permitted to raise, in a subsystem whose whole design
-    /// premise is that an observe-only component may never take the agent down (see
-    /// stop()'s noexcept rationale). fetch_sub cannot throw, so the count is always
-    /// correct; the waiters absorb the cost as a 1 ms sleep-poll, which is paid only
-    /// at shutdown and only while a caller is genuinely in flight. Ordering: the
-    /// releasing fetch_sub and the waiters' acquiring load give the waiter
+    /// A PLAIN ATOMIC, POLLED — a simplicity choice, not a forced one (governance
+    /// Gate 3 cpp-expert review: worth recording precisely, since the original
+    /// wording here overclaimed that a condition_variable was ruled out entirely).
+    /// The lease is released from an RAII DESTRUCTOR on the door caller's thread. A
+    /// destructor that itself LOCKED a mutex would std::terminate on the
+    /// std::system_error std::mutex::lock is permitted to raise, in a subsystem whose
+    /// whole design premise is that an observe-only component may never take the
+    /// agent down (see stop()'s noexcept rationale) — that part is a real, load-
+    /// bearing constraint. But `condition_variable::notify_all()` itself takes no
+    /// lock and is noexcept, so a hybrid (atomic fetch_sub, then a lock-free
+    /// notify_all, with this same poll retained only as a much-longer-interval
+    /// lost-wakeup backstop) was a real option that was not implemented, not one
+    /// that couldn't be. fetch_sub cannot throw, so the count is always correct
+    /// either way; the waiters absorb the cost as a 1 ms sleep-poll, which is paid
+    /// only at shutdown and only while a caller is genuinely in flight — judged not
+    /// worth the added complexity for a dormant subsystem's teardown path. Ordering:
+    /// the releasing fetch_sub and the waiters' acquiring load give the waiter
     /// happens-before over everything the door caller did.
     std::atomic<std::uint64_t> inflight_teardowns_{0};
 

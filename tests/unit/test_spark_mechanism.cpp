@@ -236,6 +236,31 @@ struct ParkGate {
     }
 };
 
+/// RAII safety net for the #2815/#2833/#2818 door tests below (cpp-safety Gate 3
+/// finding): each spawns a std::thread, then runs a REQUIRE(gate.wait_entered())
+/// BEFORE that thread is joined. If wait_entered() times out (real CI/shared-box
+/// contention, not hypothetical), the REQUIRE throws and unwinds past a still-
+/// joinable std::thread -> ~thread() -> std::terminate(), aborting the WHOLE test
+/// binary, not just this one case. Declare one of these right after each thread is
+/// spawned (track() it immediately, before any assertion that can throw) so the
+/// destructor releases the gate and joins every tracked thread on ANY unwind path.
+/// On the ordinary happy path the test's own explicit gate.release()+.join() calls
+/// still run first, making the destructor's release()/join() calls harmless no-ops
+/// (release() is idempotent; joinable() is false on an already-joined thread) — this
+/// is purely a backstop, not a replacement for the explicit teardown sequence.
+struct ThreadJoinGuard {
+    ParkGate* gate;
+    std::vector<std::thread*> threads;
+    void track(std::thread& t) { threads.push_back(&t); }
+    ~ThreadJoinGuard() {
+        if (gate)
+            gate->release();
+        for (auto* t : threads)
+            if (t->joinable())
+                t->join();
+    }
+};
+
 /// Poll `flag` for `window`, reporting whether it ever became true. Used by the #2815
 /// cases to assert a NEGATIVE ("stop() has NOT returned yet") without a fixed sleep and
 /// without spraying one Catch2 assertion per poll.
@@ -1642,6 +1667,8 @@ TEST_CASE("#2815 door 1/4 — stop() waits for an in-flight disarm() teardown",
     });
 
     std::thread disarmer([&] { engine.disarm(*sub); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(disarmer);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
@@ -1649,6 +1676,7 @@ TEST_CASE("#2815 door 1/4 — stop() waits for an in-flight disarm() teardown",
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
+    guard.track(stopper);
 
     // PRE-FIX this is TRUE within a millisecond or two: stop() takes lifecycle_mu_,
     // flips the flags, joins the wheel and tears the mechanisms down without ever
@@ -1688,6 +1716,8 @@ TEST_CASE("#2815 door 2/4 — stop() waits for an in-flight consumer-race teardo
     });
 
     std::thread armer([&] { (void)engine.arm(*c, file_spec("/etc/hosts")); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(armer);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
@@ -1695,6 +1725,7 @@ TEST_CASE("#2815 door 2/4 — stop() waits for an in-flight consumer-race teardo
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
+    guard.track(stopper);
     CHECK_FALSE(became_true_within(stop_returned, 300ms));
 
     gate.release();
@@ -1721,6 +1752,8 @@ TEST_CASE("#2815 door 3/4 — stop() waits for an in-flight unregister_consumer(
     });
 
     std::thread dropper([&] { engine.unregister_consumer(*c); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(dropper);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
@@ -1728,6 +1761,7 @@ TEST_CASE("#2815 door 3/4 — stop() waits for an in-flight unregister_consumer(
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
+    guard.track(stopper);
     CHECK_FALSE(became_true_within(stop_returned, 300ms));
 
     gate.release();
@@ -1763,6 +1797,8 @@ TEST_CASE("#2815 door 4/4 — stop() waits for an in-flight arm_impl() watch cal
 
     std::expected<SparkEngine::SubscriptionId, std::string> armed;
     std::thread armer([&] { armed = engine.arm(*c, file_spec("/etc/hosts")); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(armer);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
@@ -1770,6 +1806,7 @@ TEST_CASE("#2815 door 4/4 — stop() waits for an in-flight arm_impl() watch cal
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
+    guard.track(stopper);
     CHECK_FALSE(became_true_within(stop_returned, 300ms));
 
     gate.release();
@@ -1822,6 +1859,8 @@ TEST_CASE("#2815 — a DEDUP arm (mech stays null) is still leased before its M1
     std::expected<SparkEngine::SubscriptionId, std::string> deduped;
     SparkEngine* raw = engine.get();
     std::thread armer([&] { deduped = raw->arm(*c2, file_spec("/etc/hosts")); }); // DEDUP: mech stays null
+    ThreadJoinGuard guard{&gate};
+    guard.track(armer);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> destroyed{false};
@@ -1830,6 +1869,7 @@ TEST_CASE("#2815 — a DEDUP arm (mech stays null) is still leased before its M1
         engine.reset(); // ~SparkEngine — must NOT free consumers_mu_/consumers_ while `armer` is parked
         destroyed.store(true, std::memory_order_release);
     });
+    guard.track(killer);
 
     CHECK_FALSE(became_true_within(destroyed, 300ms));
 
@@ -1871,6 +1911,8 @@ TEST_CASE("#2815 — ~SparkEngine waits UNBOUNDED for an in-flight teardown befo
 
     SparkEngine* raw = engine.get();
     std::thread disarmer([raw, sub_id] { raw->disarm(sub_id); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(disarmer);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> destroyed{false};
@@ -1879,6 +1921,7 @@ TEST_CASE("#2815 — ~SparkEngine waits UNBOUNDED for an in-flight teardown befo
         engine.reset(); // ~SparkEngine — must NOT free while `disarmer` is parked
         destroyed.store(true, std::memory_order_release);
     });
+    guard.track(killer);
 
     CHECK_FALSE(became_true_within(destroyed, 300ms));
 
@@ -1913,6 +1956,8 @@ TEST_CASE("#2815 — stop()'s teardown wait is BOUNDED and counts its own expiry
         local->park();
     });
     std::thread disarmer([&] { engine.disarm(*sub); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(disarmer);
     REQUIRE(gate.wait_entered());
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -1960,9 +2005,12 @@ TEST_CASE("#2833 — a shutdown-window unwatch failure is counted but has NO hea
         local->park();
     });
     std::thread disarmer([&] { engine.disarm(*sub); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(disarmer);
     REQUIRE(gate.wait_entered());
 
     std::thread stopper([&] { engine.stop(); });
+    guard.track(stopper);
     gate.release();
     disarmer.join();
     stopper.join();
@@ -2057,6 +2105,8 @@ TEST_CASE("#2818 PIN — a deduped sibling is erased by another consumer's faile
 
     std::expected<SparkEngine::SubscriptionId, std::string> a_sub;
     std::thread armer_a([&] { a_sub = engine.arm(*a, spec); });
+    ThreadJoinGuard guard{&gate};
+    guard.track(armer_a);
     REQUIRE(gate.wait_entered());
 
     // B arms the SAME spec while A's watch is in flight. It dedups onto A's committed
@@ -2981,26 +3031,84 @@ TEST_CASE("File spark (real mechanism): a zombie left by a throwing unwatch is d
     // awaiting reclaim — watch() reports success, but nothing will ever fire for that key.
     // This is exactly the hazard unwatch_locked's own "Free dirkey for reuse NOW" comment
     // describes, reopened on the throw path #2839 itself introduced.
+    //
+    // Quality-engineer Gate 3 finding: the cancelled I/O's aborted completion is already
+    // queued on the IOCP the instant CancelIoEx runs (inside the forced-throw unwatch,
+    // before this test ever gets control back), and the worker thread races to drain it
+    // via its OWN drop_watch() path independent of anything this test does next. If the
+    // worker wins that race before the watch("kB", ...) call below, the zombie is gone
+    // from dirs_ by the time this test's own drain-check runs — `stats().retiring` would
+    // read 0 whether the production fix is present or reverted, a non-deterministic
+    // result either way, not a test of the fix at all. Wedge the worker (the same
+    // determinism trick as the #1979/#1982 flood test above: a blocking emit_ callback,
+    // called with mu_ RELEASED, so watch()/unwatch() stay fully operable) BEFORE arming
+    // kA at all, so it cannot process ANY completion — including kA's aborted one — until
+    // this test explicitly releases it, well after the discriminating assertion.
     namespace fs = std::filesystem;
     const auto pid = std::to_string(::GetCurrentProcessId());
     const fs::path dir = fs::temp_directory_path() / ("yuzu_test_spark_2839z_" + pid);
+    const fs::path trigger_dir = fs::temp_directory_path() / ("yuzu_test_spark_2839z_trig_" + pid);
     std::error_code ec;
     fs::remove_all(dir, ec);
+    fs::remove_all(trigger_dir, ec);
     fs::create_directories(dir);
+    fs::create_directories(trigger_dir);
     const fs::path target = dir / "t.txt";
+    const fs::path trigger_file = trigger_dir / "t.txt";
     { std::ofstream(target) << "seed"; }
+    { std::ofstream(trigger_file) << "seed"; }
 
     struct DirCleanup {
         const fs::path& d;
+        const fs::path& d2;
         ~DirCleanup() {
             std::error_code e;
             fs::remove_all(d, e);
+            fs::remove_all(d2, e);
         }
-    } dir_cleanup{dir}; // declared BEFORE mech, so it runs AFTER ~mech has closed handles
+    } dir_cleanup{dir, trigger_dir}; // declared BEFORE mech, so it runs AFTER ~mech has closed handles
+
+    struct Gate {
+        std::mutex m;
+        std::condition_variable cv;
+        bool release{false};
+        std::atomic<int> emit_calls{0};
+        void wait() {
+            emit_calls.fetch_add(1);
+            std::unique_lock lk(m);
+            cv.wait(lk, [&] { return release; });
+        }
+        void open() {
+            {
+                std::lock_guard lk(m);
+                release = true;
+            }
+            cv.notify_all();
+        }
+    };
+    auto gate = std::make_shared<Gate>();
 
     auto mech = make_file_mechanism();
     REQUIRE(mech);
-    mech->start([](const std::string&, SparkData) {}, [](const std::string&, bool, std::string_view) {});
+    // If any assertion below fails, this guard's destructor (declared AFTER mech, so it
+    // runs BEFORE mech's own destructor, reverse-declaration-order) opens the gate
+    // unconditionally first — without it, a failed assertion here leaves the worker
+    // wedged in emit() forever, and ~WindowsFileMechanism's stop()/worker_.join() hangs
+    // the WHOLE test binary (same rationale as the #1979/#1982 test above).
+    struct GateOpener {
+        std::shared_ptr<Gate> g;
+        ~GateOpener() { g->open(); }
+    } gate_opener{gate};
+
+    mech->start([gate](const std::string&, SparkData) { gate->wait(); },
+                [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch("trigger", FileSparkParams{trigger_file.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the trigger's read arm
+    { std::ofstream(trigger_file, std::ios::app) << "change"; } // fires → worker blocks in emit()
+    CHECK(eventually([&] { return gate->emit_calls.load() >= 1; }));
+    // The worker is now wedged for the rest of this test — it cannot process kA's
+    // aborted completion no matter how fast CancelIoEx's kernel-side abort is.
 
     REQUIRE(mech->watch("kA", FileSparkParams{target.string()}).has_value());
     std::this_thread::sleep_for(150ms); // let the read arm, matching the #2839 test above
@@ -3009,7 +3117,8 @@ TEST_CASE("File spark (real mechanism): a zombie left by a throwing unwatch is d
     REQUIRE(set_file_retire_fault_hook_for_test(*mech, [] { throw std::bad_alloc{}; }));
     CHECK_THROWS_AS(mech->unwatch("kA"), std::bad_alloc);
     // The zombie is retained in dirs_ (removing=true) but NOT yet in retiring_ — matches
-    // the #2839 test's own documented pre-fix-of-the-fix contract above.
+    // the #2839 test's own documented pre-fix-of-the-fix contract above. The worker
+    // cannot have raced this: it's still blocked in emit_ for the trigger fire.
     CHECK(mech->stats().retiring == 0);
 
     // A second key in the SAME directory. Pre-fix: silently attaches to the zombie,
@@ -3017,10 +3126,142 @@ TEST_CASE("File spark (real mechanism): a zombie left by a throwing unwatch is d
     // watch() call drains the zombie into retiring_ FIRST (the fault hook was single-shot
     // and is already consumed, so this drain succeeds), then arms a genuinely fresh watch
     // for kB — the deterministic, in-process signal that no silent reattachment occurred.
+    // Deterministic either way: the worker is still wedged, so this can only be the
+    // production code's own doing, never a race outcome.
     const fs::path second = dir / "u.txt";
     { std::ofstream(second) << "seed"; }
     CHECK(mech->watch("kB", FileSparkParams{second.string()}).has_value());
     CHECK(mech->stats().retiring == 1);
+
+    // Release the worker now — it catches up on the backlog (the trigger's emit_ call
+    // returns, then it drains kA's long-queued aborted completion via the ordinary
+    // drop_watch() path) before stop() below.
+    gate->open();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_NOTHROW(mech->stop());
+    CHECK(std::chrono::steady_clock::now() - t0 < 5000ms);
+    CHECK(mech->stats().quarantined_total == 0);
+}
+
+TEST_CASE("File spark (real mechanism): a zombie ancestor watch is drained, not silently "
+          "reattached, and a throwing release_ancestor() never crashes (#2839 follow-up)",
+          "[spark][mechanism][windows][resilience]") {
+    // Covers the OTHER half of the zombie-drain fix above: ancestors_ (arm_ancestor()),
+    // exercised via watches on directories that do not exist (arm_dir fails, so the
+    // mechanism falls back to watching the nearest existing ancestor for the parent's
+    // eventual (re)creation — release_ancestor()/arm_ancestor(), not watch()/dirs_
+    // directly). Also proves release_ancestor()'s own push_retiring call is safely
+    // contained: it is reachable from the worker thread's run() loop with NO exception
+    // frame above it there (unlike watch(), always wrapped by watch_guarded()), so an
+    // uncaught throw would std::terminate the process rather than just fail one release.
+    //
+    // Same quality-engineer Gate 3 race as the dirs_ version of this test above: the
+    // ancestor's cancelled I/O is already queued on the IOCP the instant CancelIoEx runs
+    // inside release_ancestor(), and the worker races to drain it via its own
+    // drop_watch() path independent of this test's next watch() call. Wedge the worker
+    // (same blocking-emit_ idiom) before touching any of the absent-directory watches, so
+    // it cannot process the ancestor's aborted completion until explicitly released.
+    namespace fs = std::filesystem;
+    const auto pid = std::to_string(::GetCurrentProcessId());
+    const fs::path base = fs::temp_directory_path() / ("yuzu_test_spark_2839a_" + pid);
+    const fs::path trigger_dir = fs::temp_directory_path() / ("yuzu_test_spark_2839a_trig_" + pid);
+    std::error_code ec;
+    fs::remove_all(base, ec);
+    fs::remove_all(trigger_dir, ec);
+    fs::create_directories(base);
+    fs::create_directories(trigger_dir);
+    // Two DIFFERENT absent immediate parents that both resolve to the same existing
+    // ancestor (`base`) once walked up — the shared ancestor is what gives it a
+    // refcount, so releasing the FIRST dependent alone does not tear it down (refcount
+    // 2->1), only the second does (1->0), which is when release_ancestor() actually
+    // calls push_retiring.
+    const fs::path absent1 = base / "gone1" / "t1.txt";
+    const fs::path absent2 = base / "gone2" / "t2.txt";
+    const fs::path trigger_file = trigger_dir / "t.txt";
+    { std::ofstream(trigger_file) << "seed"; }
+
+    struct DirCleanup {
+        const fs::path& d;
+        const fs::path& d2;
+        ~DirCleanup() {
+            std::error_code e;
+            fs::remove_all(d, e);
+            fs::remove_all(d2, e);
+        }
+    } dir_cleanup{base, trigger_dir}; // declared BEFORE mech, so it runs AFTER ~mech has closed handles
+
+    struct Gate {
+        std::mutex m;
+        std::condition_variable cv;
+        bool release{false};
+        std::atomic<int> emit_calls{0};
+        void wait() {
+            emit_calls.fetch_add(1);
+            std::unique_lock lk(m);
+            cv.wait(lk, [&] { return release; });
+        }
+        void open() {
+            {
+                std::lock_guard lk(m);
+                release = true;
+            }
+            cv.notify_all();
+        }
+    };
+    auto gate = std::make_shared<Gate>();
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    // Same unconditional-open-on-unwind rationale as the #1979/#1982 and dirs_-zombie
+    // tests above — without it, a failed assertion here wedges the worker forever and
+    // hangs the whole test binary in ~mech's stop()/worker_.join().
+    struct GateOpener {
+        std::shared_ptr<Gate> g;
+        ~GateOpener() { g->open(); }
+    } gate_opener{gate};
+
+    mech->start([gate](const std::string&, SparkData) { gate->wait(); },
+                [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch("trigger", FileSparkParams{trigger_file.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the trigger's read arm
+    { std::ofstream(trigger_file, std::ios::app) << "change"; } // fires → worker blocks in emit()
+    CHECK(eventually([&] { return gate->emit_calls.load() >= 1; }));
+    // The worker is now wedged for the rest of this test.
+
+    REQUIRE(mech->watch("k1", FileSparkParams{absent1.string()}).has_value());
+    REQUIRE(mech->watch("k2", FileSparkParams{absent2.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the ancestor's own read genuinely arm
+
+    // Drop the first dependent: refcount 2->1, release_ancestor() returns early (another
+    // dependent still needs it) — no push_retiring call yet, so no fault to inject here.
+    REQUIRE(set_file_retire_fault_hook_for_test(*mech, [] { throw std::bad_alloc{}; }));
+    CHECK_NOTHROW(mech->unwatch("k1")); // no throw expected: release_ancestor didn't reach push_retiring
+    REQUIRE(mech->stats().retiring == 0);
+
+    // Drop the SECOND (last) dependent: refcount 1->0, release_ancestor() now reaches
+    // push_retiring on the ancestor watch and hits the still-armed fault hook. unwatch()
+    // itself must NOT throw and must NOT crash the worker thread — release_ancestor()'s
+    // own try/catch contains it, leaving the ancestor watch whole in ancestors_ (removing,
+    // cancelled) rather than propagating into the (for THIS call, still-contained-by-
+    // watch_guarded) caller OR — the real risk this test pins — into the worker thread on
+    // some other trigger. The hook is single-shot and is now consumed either way. The
+    // worker is still wedged, so it cannot have raced this either.
+    CHECK_NOTHROW(mech->unwatch("k2"));
+    CHECK(mech->stats().retiring == 0); // release_ancestor caught the throw; nothing moved yet
+
+    // A THIRD absent path resolving to the SAME ancestor. Pre-fix: arm_ancestor() would
+    // silently attach to the zombie ancestor slot (already cancelled, awaiting reclaim) —
+    // watch() reports success, but the fallback ancestor watch backing k3's eventual fire
+    // is dead. Post-fix: arm_ancestor() drains the zombie into retiring_ FIRST (the
+    // deterministic, in-process signal), then arms a genuinely fresh ancestor watch.
+    // Deterministic either way: the worker is still wedged.
+    const fs::path absent3 = base / "gone3" / "t3.txt";
+    CHECK(mech->watch("k3", FileSparkParams{absent3.string()}).has_value());
+    CHECK(mech->stats().retiring == 1);
+
+    gate->open(); // let the worker catch up (the trigger's emit_ return, then the drains)
 
     const auto t0 = std::chrono::steady_clock::now();
     CHECK_NOTHROW(mech->stop());

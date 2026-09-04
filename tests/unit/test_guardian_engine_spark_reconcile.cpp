@@ -379,6 +379,21 @@ TEST_CASE("#2818 PIN — Guardian's subscription is erased by a sibling's failed
     f.mechanism->set_throw_next_watch(); // …and fail once released
     std::expected<SparkEngine::SubscriptionId, std::string> raw_sub;
     std::thread armer([&] { raw_sub = f.spark_engine.arm(*raw, spec); });
+    // cpp-safety Gate 3 finding (same class as the "hung watch()/unwatch() wedges
+    // stop()" tests above): a REQUIRE between a thread spawn and its join can throw
+    // and unwind past a still-joinable std::thread -> std::terminate() on the WHOLE
+    // binary. Guard releases the hang and joins `armer` on any unwind path; harmless
+    // no-op on the happy path below (release_hang() only matters once, join() on an
+    // already-joined thread is a no-op via the joinable() check).
+    struct ArmerGuard {
+        FakeServiceMechanism* mech;
+        std::thread* t;
+        ~ArmerGuard() {
+            mech->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } armer_guard{f.mechanism, &armer};
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds{5}));
 
     // Guardian now applies its rule. It derives the same spark key, dedups onto the raw

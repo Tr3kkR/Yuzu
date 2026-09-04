@@ -638,7 +638,34 @@ private:
             // the original fix named only unwatch_locked's. Same contract: erase only
             // after the transfer completed; a throw leaves the entry whole in ancestors_
             // for drop_watch() to reclaim.
-            push_retiring(it->second);
+            //
+            // Governance Gate 3 (cpp-expert) finding: release_ancestor() is reachable
+            // from run() with NO exception containment above it — directly (via
+            // reresolve_absent(), called from run()'s is_ancestor branch) and via
+            // arm_ancestor()'s own three unguarded calls to this function before its
+            // own zombie-drain code (which IS wrapped, below). An uncaught throw here
+            // would std::terminate the worker thread's process, not just fail one arm
+            // — the exact hazard the zombie-drain fix elsewhere in this file was
+            // written to avoid, missed here because this call predates that fix.
+            // Contained the same way: on failure the entry simply stays in ancestors_
+            // (already `removing`, cancelled) for drop_watch() to reclaim when the
+            // aborted completion drains — no different from the ordinary "leave it
+            // whole" contract push_retiring already documents for a throw, just
+            // caught here instead of propagating into un-owned territory.
+            //
+            // MUST return, not fall through, on a caught throw: push_retiring leaves
+            // `it->second` UNTOUCHED (its own contract — the caller keeps ownership),
+            // so falling through to ancestors_.erase(it) below would destroy a live
+            // DirWatch this call never actually transferred out — freeing memory a
+            // cancelled-but-undrained kernel I/O may still reference. That is exactly
+            // the use-after-free class #2839 exists to prevent, reintroduced here if
+            // the erase runs unconditionally after a caught (rather than propagated)
+            // throw.
+            try {
+                push_retiring(it->second);
+            } catch (...) {
+                return;
+            }
         }
         ancestors_.erase(it);
     }
