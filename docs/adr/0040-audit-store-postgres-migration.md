@@ -352,7 +352,7 @@ backfill-only rows (`backfill_complete`, `backfill_source_fingerprint`) are remo
 version-bumped v2 migration appended after the already-shipped v1, never edited in place: this
 store is constructed in production, so v1 has run against real dev/UAT databases.
 
-**DELETE, not poison — the opposite choice from `RbacStore`'s v4 (ADR-0041's own Update,
+**DELETE, not poison — the opposite choice from `RbacStore`'s v2 (ADR-0041's own Update,
 same PR family), and deliberately so.** `RbacStore`'s retired code fell through marker-absence
 into an unconditional overwrite of a live security flag (`rbac_enabled`) sourced from whatever a
 local legacy file held — silent and dangerous, so that migration POISONS the marker to force an
@@ -381,17 +381,31 @@ for that database. UP-2 compounds this: the break-glass one-shot CLI (`--mfa-res
 running it from a freshly-built image against a fleet whose daemons haven't yet upgraded can
 manufacture the empty-table window directly, on a live fleet, outside any planned rollout.
 
-**The fix is a CHECK constraint added in the same v2 migration**, closing the race rather than
-narrowing it:
+**The fix is a CHECK constraint added in the SAME v2 migration as the DELETE, DELETE ordered
+first, one transaction** — closing the race rather than narrowing it:
 
 ```sql
--- v3, a separate migration from v2's DELETE (not folded into it, even though this branch has
--- never shipped and editing v2 in place would violate no convention): a rig that already
--- migrated to v2 alone before this fix existed picks v3 up on its next boot, same as any other
--- upgrade, rather than depending on checking every local/dev Postgres instance for drift.
+DELETE FROM audit_retention_meta WHERE key IN ('backfill_complete', 'backfill_source_fingerprint');
 ALTER TABLE audit_retention_meta ADD CONSTRAINT audit_retention_meta_no_retired_backfill_markers
     CHECK (key NOT IN ('backfill_complete', 'backfill_source_fingerprint'));
 ```
+
+**Must stay one migration — an interim commit on this branch briefly split it and Gate 5
+chaos-injector (round 1) found why that was worse.** The split moved the DELETE into v2 and the
+ADD CONSTRAINT into a new v3, to avoid depending on checking every local/dev Postgres instance for
+drift from an even earlier commit's DELETE-only v2 (see the drift-check record below — that
+concern turned out to already be closed). But a crash between v2's COMMIT and v3's BEGIN is a real
+durable state: `audit_retention_meta` has no marker rows and no constraint yet, and an old
+binary — which does not take `PgMigrationRunner`'s advisory lock, by its own explicit design — can
+land a marker `INSERT` into exactly that gap. v3's `ALTER TABLE ADD CONSTRAINT` then fails
+validating the row it finds, so the **current** binary's own `AuditStore` refuses to open too, not
+merely an old one — a wedge until an operator manually deletes the row, worse than the silent
+UP-1 disarm this fix exists to close. Folded into one transaction, DELETE and ADD CONSTRAINT
+commit together or roll back together, so no durable state exists where the marker could be
+absent but the constraint not yet in force. The DELETE ordered first is also what makes a retry
+**self-healing**, not merely atomic: if an old binary's insert lands and this transaction's own
+`ALTER` blocks on it and then fails, the *next* attempt's `DELETE` clears that very row before its
+`ALTER` validates — a split migration has no `DELETE` in its second step to do this.
 
 Same shape as `RbacStore`'s own v2 constraint (`rbac_meta_enabled_canonical`) on the same
 key/value-meta table pattern — but where RbacStore's constraint narrows the *values* a key may
@@ -399,8 +413,8 @@ hold, this one forbids the *keys* outright. With it in place, `stamp_complete`'s
 (`23514 check_violation`, independent of `ON CONFLICT` arbitration — Postgres validates CHECK
 constraints before conflict resolution) on two of the four sub-cases above: marker-absent with an
 empty table (the UP-1 window itself) and a real local legacy file. The other two never reach an
-`INSERT` at all post-v3: a non-empty `audit_events` was already refused by the pre-existing
-`pg_rows_before` guard, unrelated to this fix, and marker-present is now structurally unreachable,
+`INSERT` at all: a non-empty `audit_events` was already refused by the pre-existing
+`pg_rows_before` guard, unrelated to this fix, and marker-present is structurally unreachable,
 since the marker can never be (re-)inserted. `migrate_from_sqlite` returns `false` on every one of
 the four, and `server.cpp` sets `startup_failed_`, deterministically, not merely in the realistic
 case. The refusal itself is the same class of guarantee the `DROP TABLE` group gets from
@@ -414,9 +428,19 @@ error on first touch is. Nothing in the current codebase writes either backfill 
 (`migrate_from_sqlite` and its helpers are fully deleted), so the constraint can never reject
 legitimate current-binary activity.
 
-`server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows(audit.db, "AuditStore",
-{"audit_events"})` at construction instead — WARN-only, log-only, never blocking, the same
-treatment every other retired store gets. This is a deliberate, explicit choice: "no migration
+**Drift-check record (Gate 6 security-guardian, round 1) — the concern the brief split tried to
+address, resolved the safer way instead.** This SQL has been identical since its first commit on
+this branch; `git merge-base --is-ancestor <that commit> origin/main` and `origin/dev` both return
+false (this branch has never shipped), and a direct `schema_meta` query against the two Postgres
+instances reachable from this box showed both still at v1 — no rig anywhere has run a build with a
+different v2 to drift from.
+
+`server.cpp` now runs `legacy_sqlite_probe::harden_legacy_file_0600(audit.db, "AuditStore")` (POSIX
+only — a documented no-op on Windows, #3593 — `audit_events.detail` may hold plaintext secret
+material from a since-fixed historical bug) followed by
+`legacy_sqlite_probe::warn_if_legacy_rows(audit.db, "AuditStore", {"audit_events"})` at
+construction instead — WARN-only, log-only, never blocking, the same treatment every other
+retired store gets. This is a deliberate, explicit choice: "no migration
 paths held open" governs the DATA path (nothing imports a legacy file's rows any more), not the
 detect-and-warn smoke detector every other retired store keeps — an operator finding a real,
 row-holding `audit.db` still gets a loud boot-time signal that the "no production fleet"

@@ -210,7 +210,8 @@ const std::vector<pg::PgMigration>& migrations() {
         // the last of 19 stores to lose it (#3623 PR A/B did the other 18). `audit_retention_meta`
         // stays -- it holds the clock-guard's PERMANENT durable state (`last_pass_now`,
         // `last_anomaly_facts`, `bootstrap_settled`), so this is a plain DELETE of the two
-        // marker rows, never a DROP TABLE. v3 below closes a race this DELETE alone leaves open.
+        // marker rows, never a DROP TABLE, plus a CHECK constraint closing a race the DELETE
+        // alone leaves open (Gate 4 unhappy-path UP-1, round 4, below).
         //
         // DELETE, not poison, unlike RbacStore's v2 (same PR family, `rbac_meta`): the two
         // stores' old-binary-rollback failure modes differ. RbacStore's retired code fell
@@ -225,47 +226,64 @@ const std::vector<pg::PgMigration>& migrations() {
         // fingerprint path REFUSES to serve rather than trust unproven content (`git show
         // 8992b5274:server/core/src/audit_store.cpp` lines ~906-921, the pre-retirement HEAD
         // on `origin/dev`).
-        {2, "DELETE FROM audit_retention_meta WHERE key IN "
-            "('backfill_complete', 'backfill_source_fingerprint');"},
-        // Gate 4 unhappy-path UP-1 (round 4): v2 alone is NOT DROP TABLE's safety bar. An old
-        // binary that boots while `audit_events` is still empty (the near-guaranteed window
-        // immediately after v2 runs, before any native write) takes the marker-ABSENT branch,
-        // finds `pg_rows_before == 0`, and re-stamps `backfill_complete='sourceless'` via its own
-        // `Sourceless::StampIfEmpty` default. That stamp is never deleted again -- v2 has already
-        // run -- so it is now PERMANENT. Every later old-binary boot, on any replica, at any
-        // later time (however much data `audit_events` has by then), takes the marker-PRESENT
-        // branch instead, which -- when no legacy file remains at the configured path, the
-        // ordinary case -- returns success with ZERO row-count check (same pre-retirement
-        // source, lines ~928-940). One lost race permanently disarms the refusal for that
-        // database, silently. UP-2: the break-glass CLI (`--mfa-reset`/`--break-glass-arm`)
-        // constructs a full `AuditStore` unconditionally, so it can manufacture this window
-        // directly against a live, not-yet-upgraded fleet.
         //
-        // This CHECK constraint closes the race deterministically rather than narrowing it: it
-        // rejects an INSERT of either marker key outright (23514 check_violation) independent of
-        // `ON CONFLICT` arbitration (Postgres validates CHECK constraints before conflict
-        // resolution, so `stamp_complete`'s `ON CONFLICT (id) DO NOTHING` shape does not bypass
-        // it). Old-binary `stamp_complete` reaches this INSERT from exactly two of its four
-        // branches -- marker-absent-empty-table (the UP-1 window) and a real local legacy file --
-        // and both now fail at the write; the other two branches never reach an INSERT at all: a
-        // non-empty `audit_events` was already refused by the pre-existing `pg_rows_before` guard
-        // (unrelated to this fix), and marker-PRESENT is now structurally unreachable, since the
-        // marker can never be (re-)inserted post-v3. `migrate_from_sqlite` returns false on every
-        // one of the four, and `server.cpp` sets `startup_failed_` -- deterministically, not
-        // merely in the realistic case. Same shape as RbacStore's own v2 constraint
+        // Gate 4 unhappy-path UP-1 (round 4): a plain DELETE alone is NOT DROP TABLE's safety
+        // bar. An old binary that boots while `audit_events` is still empty (the near-guaranteed
+        // window immediately after this migration, before any native write) takes the
+        // marker-ABSENT branch, finds `pg_rows_before == 0`, and re-stamps
+        // `backfill_complete='sourceless'` via its own `Sourceless::StampIfEmpty` default. If
+        // nothing else acted, that stamp would be permanent -- no later run of this migration
+        // ever revisits it -- so every LATER old-binary boot, on any replica, at any later time,
+        // would take the marker-PRESENT branch instead, which returns success with ZERO
+        // row-count check (same pre-retirement source, lines ~928-940): one lost race
+        // permanently disarms the refusal, silently. UP-2: the break-glass CLI
+        // (`--mfa-reset`/`--break-glass-arm`) constructs a full `AuditStore` unconditionally, so
+        // it can manufacture this window directly against a live, not-yet-upgraded fleet.
+        //
+        // The CHECK constraint closes this deterministically: it rejects an INSERT of either
+        // marker key outright (23514 check_violation) independent of `ON CONFLICT` arbitration
+        // (Postgres validates CHECK constraints before conflict resolution, so
+        // `stamp_complete`'s `ON CONFLICT (id) DO NOTHING` shape does not bypass it). Old-binary
+        // `stamp_complete` reaches this INSERT from exactly two of its four branches --
+        // marker-absent-empty-table (the UP-1 window) and a real local legacy file -- and both
+        // now fail at the write; the other two never reach an INSERT at all: a non-empty
+        // `audit_events` was already refused by the pre-existing `pg_rows_before` guard,
+        // unrelated to this fix, and marker-PRESENT is structurally unreachable once the marker
+        // can never be (re-)inserted. `migrate_from_sqlite` returns false on every one of the
+        // four, and `server.cpp` sets `startup_failed_` -- deterministically, not merely in the
+        // realistic case. Same shape as RbacStore's own v2 constraint
         // (`rbac_meta_enabled_canonical`, `rbac_store.cpp`) on the same key/value-meta table
         // pattern. Nothing in the current codebase writes either key any more
         // (`migrate_from_sqlite` and its helpers are fully deleted, grep-verified) so the
         // constraint can never reject legitimate current-binary activity -- only an old binary's
         // retired write path.
         //
-        // A separate migration from v2 (not folded into it), even though this branch has never
-        // shipped to `origin/dev`/`origin/main` and editing v2 in place would therefore violate
-        // no convention: it removes any dependence on checking every local/dev Postgres instance
-        // that might already have run a build from before this constraint existed (verified clean
-        // on the two reachable here, Gate 4 security-guardian round 2) -- a rig at v2 alone picks
-        // up v3 on its next boot, same as any other upgrade.
-        {3, "ALTER TABLE audit_retention_meta ADD CONSTRAINT "
+        // DELETE and ADD CONSTRAINT MUST stay ONE migration, DELETE first, never split into two
+        // separately-numbered migrations -- Gate 5 chaos-injector (round 1) found the reason: an
+        // interim commit on this branch briefly split them into v2 (DELETE) + v3 (ADD
+        // CONSTRAINT) to sidestep having to verify every local/dev rig for drift from an even
+        // earlier commit's DELETE-only v2 (a real but purely theoretical concern -- verified
+        // clean on the two Postgres instances reachable from this box, recorded below). That
+        // split reopened a WORSE, real race: crash a boot between v2's COMMIT and v3's BEGIN,
+        // and an old binary -- which does not take `PgMigrationRunner`'s advisory lock, by its
+        // own design -- can land a marker INSERT into the v2-but-not-yet-v3 gap. v3's `ALTER
+        // TABLE ADD CONSTRAINT` then fails validating that row, so the CURRENT binary's own
+        // `AuditStore` refuses to open too -- not a rollback inconvenience but a wedge, until an
+        // operator manually deletes the row. Folded into one transaction, this can't happen: DELETE
+        // and ADD CONSTRAINT commit together or roll back together, so there is no durable state
+        // where the marker could be absent but the constraint not yet in force. The DELETE
+        // ordered FIRST is what makes a retry self-healing rather than merely atomic: if an old
+        // binary's insert lands and this transaction's own ALTER blocks on it and then fails, the
+        // NEXT attempt's DELETE clears that very row before its ALTER validates -- a split
+        // migration has no DELETE in the second step to do this. Drift-check record instead of
+        // the split: this SQL (identical since `bec24602e`) was verified via
+        // `git merge-base --is-ancestor <ancestor> origin/main`/`origin/dev` (neither is an
+        // ancestor -- this branch has never shipped) plus a direct `schema_meta` query against
+        // the two Postgres instances reachable from this box, both still at v1 (Gate 6
+        // security-guardian, round 1) -- no rig anywhere has run a build with a different v2.
+        {2, "DELETE FROM audit_retention_meta WHERE key IN "
+            "('backfill_complete', 'backfill_source_fingerprint');"
+            "ALTER TABLE audit_retention_meta ADD CONSTRAINT "
             "audit_retention_meta_no_retired_backfill_markers "
             "CHECK (key NOT IN ('backfill_complete', 'backfill_source_fingerprint'));"},
     };

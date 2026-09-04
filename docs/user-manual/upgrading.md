@@ -1758,10 +1758,10 @@ unreachable — there is no SQLite fallback.
 **No legacy-SQLite migration path.** This release retires `AuditStore`'s
 one-time, mandatory, streamed backfill from a legacy `audit.db` (`#3623`,
 `chore/retire-migrate-from-sqlite-auditstore`, ADR-0009's hard-cutover Update)
-— no production Yuzu fleet has ever run a pre-Postgres build, and the operator
-directed a hard cutover with no migration path held open for any store,
-including this one, accepting permanent audit-trail loss as the failure mode
-if that premise is ever wrong for a specific host. `AuditStore` had been the
+— no production Yuzu fleet has ever run a pre-Postgres build, and this is a
+hard cutover with no migration path held open for any store, including this
+one, accepting permanent audit-trail loss as the failure mode if that premise
+is ever wrong for a specific host. `AuditStore` had been the
 one deliberate, permanent exception to ADR-0009's fresh-start default — audit
 evidence cannot be regenerated the way config or cache state can — until this
 release withdrew it. These are two SEPARATE behaviors, not one — do not
@@ -1774,11 +1774,11 @@ conflate them:
   (`0600`, plus its `-wal`/`-shm`/`-journal` sidecars) if they aren't already —
   this file may hold plaintext secret material from a since-fixed historical
   bug, same obligation as every other legacy-file-hardening store on this page
-  — then the server opens it read-only, purely to count rows in `audit_events`
-  for a diagnostic warning, then boots regardless of what it finds. Beyond that
-  row count, its content is never read, and it is never renamed, moved, or
-  written to. Fresh installs are unaffected — no legacy file, nothing to warn
-  about.
+  — POSIX only, a no-op on Windows, #3593 — then the server opens it
+  read-only, purely to count rows in `audit_events` for a diagnostic warning,
+  then boots regardless of what it finds. Beyond that row count, its content
+  is never read, and it is never renamed, moved, or written to. Fresh installs
+  are unaffected — no legacy file, nothing to warn about.
 
 **If you see the legacy-row-count warning and the environment genuinely has
 real audit history to keep, there is no automated recovery path**: the
@@ -1798,18 +1798,29 @@ file — an older binary's own (now-removed-from-current-code) backfill logic
 refuses to boot **unconditionally**, with or without a legacy `audit.db`
 present: seeing this database already past this migration (the marker rows
 are gone, but `audit_retention_meta` itself is not — see ADR-0040's Update),
-its own idempotency-marker write hits a CHECK constraint a following
-migration adds (`audit_retention_meta_no_retired_backfill_markers`) and
-fails with a Postgres `23514 check_violation`, table empty or not, legacy
-file present or not. This is the same class of guarantee the DROP-TABLE-group
-stores above get from their `undefined_table` error — a schema-level
-rejection, not a live-row-count race — with one caveat: if a legacy
-`audit.db` is present, the old binary's row inserts into `audit_events` still
-run and commit before this final write fails, so the refusal is loud and
-deterministic but not zero-data-movement the way a first-touch
-`undefined_table` error is. "Just roll back the binary" is not a
-supported recovery path once this migration has run, the same as every
-DROP-TABLE-group store above.
+its own idempotency-marker write hits the SAME migration's CHECK constraint
+(`audit_retention_meta_no_retired_backfill_markers`) and fails with a
+Postgres `23514 check_violation`, table empty or not, legacy file present or
+not. This is the same class of guarantee the DROP-TABLE-group stores above
+get from their `undefined_table` error — a schema-level rejection, not a
+live-row-count race — with one caveat: if a legacy `audit.db` is present,
+the old binary's row inserts into `audit_events` still run and commit before
+this final write fails, so the refusal is loud and deterministic but not
+zero-data-movement the way a first-touch `undefined_table` error is. "Just
+roll back the binary" is not a supported recovery path once this migration
+has run, the same as every DROP-TABLE-group store above. **If AuditStore
+runs as more than one replica, upgrade every replica and any
+`--mfa-reset`/`--break-glass-arm` CLI image together** during a staged
+rollout — a replica or one-shot CLI still on the old binary that boots after
+this migration has run on the shared database will refuse to start, same as
+any other rollback attempt.
+
+**What to do:** the `YuzuAuditBackfillFailing` alert is removed with this
+release. If you copied it into your own alerting config instead of
+re-importing `docs/prometheus/yuzu-alerts.yml`, remove it or it fires
+permanently via `absent_over_time` on a stale local copy — a CRITICAL page
+that never clears, pointing at boot-log remediation steps that no longer
+exist.
 
 **Reads deny-on-degrade.** An audit-store or connection-pool failure makes
 `GET /api/v1/audit*` return `503` rather than an empty `200`, so an

@@ -602,12 +602,13 @@ problem, treat it as a capacity incident (see below) rather than an audit one.
 
 This is distinct from a legacy **`audit.db` SQLite file**, if one still exists
 (see `docs/user-manual/upgrading.md`): its permissions are forced to
-owner-only at boot and it is opened read-only purely to count rows for a
-diagnostic warning, but its content is never imported or otherwise read, and
-it is never renamed, moved, or written to. It stays at its configured path
-and is your own operator-managed record going forward. The prohibition above
-is about the *live* `audit_store` schema in PostgreSQL — there is no live
-SQLite file to move, and nothing ever moves this one either.
+owner-only at boot (POSIX only, a no-op on Windows, #3593) and it is opened
+read-only purely to count rows for a diagnostic warning, but its content is
+never imported or otherwise read, and it is never renamed, moved, or written
+to. It stays at its configured path and is your own operator-managed record
+going forward. The prohibition above is about the *live* `audit_store` schema
+in PostgreSQL — there is no live SQLite file to move, and nothing ever moves
+this one either.
 
 Safe for *evidence*, which is not the same as safe for *privacy*: audit rows
 carry `principal`, `source_ip` and `user_agent`. If you are under a retention

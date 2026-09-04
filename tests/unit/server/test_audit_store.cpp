@@ -156,7 +156,7 @@ std::int64_t row_count(const std::string& dsn) {
 
 // ── Migration ────────────────────────────────────────────────────────────────
 
-TEST_CASE("AuditStore migrations v2/v3 delete the backfill marker rows and forbid their "
+TEST_CASE("AuditStore migration v2 deletes the backfill marker rows and forbids their "
           "re-insertion, leaving the clock-guard's durable state untouched (#3623)",
           "[pg][audit_store][migration]") {
     YUZU_REQUIRE_PG_DB(db);
@@ -227,7 +227,7 @@ TEST_CASE("AuditStore migrations v2/v3 delete the backfill marker rows and forbi
                                     "'audit_store'")};
     REQUIRE(ver.ok());
     REQUIRE(PQntuples(ver.get()) == 1);
-    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "3");
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
 
     // The two backfill-only markers are GONE.
     PgResult markers{PQexec(conn.get(),
