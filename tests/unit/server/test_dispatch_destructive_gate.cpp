@@ -42,6 +42,7 @@
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -498,4 +499,91 @@ TEST_CASE("#3685 composition: /api/command's require_permission call is present 
     // a future rename that made them collide would have to touch this
     // assertion, not silently pass it.)
     CHECK(std::string("require_permission") != std::string("has_permission"));
+}
+
+// ─────────────────────────────────────── Wave 6 W1B (power_health) — P-009 ──
+
+namespace {
+
+// A locally-constructed Destructive+Reversible row (power_health's real
+// set_power_plan row is Destructive/Reversible/PowerManagement/Write/
+// AdminOrApproval — see plugin_action_catalogue_power_health.hpp; not
+// included here, this fixture is deliberately independent of the real
+// catalogue, same as kFixture above).
+inline constexpr std::array<CommandCapability, 1> kReversibleDestructiveFixture{{
+    {
+        .plugin = "power_health",
+        .action = "set_power_plan",
+        .dispatch_class = DispatchClass::Destructive,
+        .mutability = Mutability::Reversible,
+        .securable = "PowerManagement",
+        .operation = yuzu::server::authz::Operation::Write,
+        .risk_tier = yuzu::server::authz::RiskTier::Medium,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+}};
+
+} // namespace
+
+TEST_CASE("Destructive+Reversible row gates identically to Destructive+Irreversible: the gate is "
+          "class-driven, mutability-independent (P-009)",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kReversibleDestructiveFixture)};
+    auto classified = registry.classify("power_health", "set_power_plan");
+    REQUIRE(classified.has_value());
+    REQUIRE(classified->mutability == Mutability::Reversible);
+
+    // Same targeting-shape matrix kFixture's Irreversible tar.purge_source
+    // row exercises above: Targeted, RefuseUntargeted (no ids), and
+    // RefuseUntargeted (ids + scope both present) — the verdict must match
+    // in every case, because evaluate_destructive_targeting keys off
+    // DispatchClass::Destructive alone, never Mutability.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::Targeted);
+        REQUIRE(gate.capability.has_value());
+        CHECK(gate.capability->mutability == Mutability::Reversible);
+        CHECK_FALSE(gate.miss.has_value());
+    }
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/false,
+                                                          /*scope_key_present=*/false);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK_FALSE(gate.miss.has_value());
+    }
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/true);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK_FALSE(gate.miss.has_value());
+    }
+}
+
+TEST_CASE("power_health.set_power_plan: the REAL catalogue row (not the independent P-009 "
+          "fixture above) is security-classified as Destructive/Reversible/PowerManagement/Write/"
+          "AdminOrApproval and gates identically to a targeted Destructive dispatch — guards "
+          "against the shipped row silently becoming permissive (e.g. downgraded to ReadOnly or "
+          "ExecuteGate::None) while kReversibleDestructiveFixture's independent, class-driven "
+          "assertions above continue to pass on their own (PH-006)",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{yuzu::server::capdecls::plugin_action_catalogue_power_health()};
+    auto classified = registry.classify("power_health", "set_power_plan");
+    REQUIRE(classified.has_value());
+
+    CHECK(classified->dispatch_class == DispatchClass::Destructive);
+    CHECK(classified->mutability == Mutability::Reversible);
+    CHECK(classified->securable == "PowerManagement");
+    CHECK(classified->operation == yuzu::server::authz::Operation::Write);
+    CHECK(classified->risk_tier == yuzu::server::authz::RiskTier::Medium);
+    CHECK(classified->execute_gate == ExecuteGate::AdminOrApproval);
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/false,
+                                                      /*scope_key_present=*/false);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
 }
