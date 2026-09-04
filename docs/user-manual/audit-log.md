@@ -600,12 +600,12 @@ longer than configured because this is an evidence store. Rows older than the
 configured window are the guard working, not a fault. If disk is the immediate
 problem, treat it as a capacity incident (see below) rather than an audit one.
 
-This is distinct from the one-time **legacy `audit.db` SQLite file** the Postgres
-migration moves aside after a verified backfill (see
-`docs/user-manual/upgrading.md`): that file is a completed, operator-managed
-backup of the pre-cutover trail, so relocating or archiving it is expected, not
-forbidden. The prohibition above is about the *live* `audit_store` schema in
-PostgreSQL — there is no live SQLite file to move.
+This is distinct from a legacy **`audit.db` SQLite file**, if one still exists
+(see `docs/user-manual/upgrading.md`): Yuzu never reads or modifies it — it
+stays exactly where it is, untouched, at its configured path, and is your own
+operator-managed record going forward. The prohibition above is about the
+*live* `audit_store` schema in PostgreSQL — there is no live SQLite file to
+move, and nothing ever moves this one either.
 
 Safe for *evidence*, which is not the same as safe for *privacy*: audit rows
 carry `principal`, `source_ip` and `user_agent`. If you are under a retention
@@ -693,7 +693,7 @@ rather than alerted on directly. Do not collapse the first two:
 | `yuzu_server_audit_retention_bootstrap_declines_total` | A pass declined because it had NO stored clock reading while rows were already expired (#2579); nothing was deleted. Counted apart from the clock-anomaly series on purpose - it claims only that nothing can yet rule out a wrong clock, not that the clock moved, so it must not fire an alert that says otherwise. Expect 0 or 1 per database; a climbing value means the anchor is not surviving, so read it with `..._retention_persist_failed_total`. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
 | `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other six counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
-| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if no pass has ever run on this **database** (seeded from the durable `audit_retention_meta` anchor at startup and after the legacy backfill, #2854 - survives a restart, including the first PostgreSQL boot). A pass refused for an implausible `now` counts as a pass but does not stamp this gauge. A value of `-9223372036854775808` (`INT64_MIN`) means the durable anchor could not be read or trusted as a plausible integer - a distinct anomaly, not a genuine timestamp; it self-corrects at the next pass whose own clock reading is plausible - even if that pass then declines or fails for an unrelated reason - consistent with the "refused for an implausible `now`" case above, which is the one pass that does NOT self-correct it. |
+| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if no pass has ever run on this **database** (seeded from the durable `audit_retention_meta` anchor at startup, #2854 - survives a restart, including the first PostgreSQL boot). A pass refused for an implausible `now` counts as a pass but does not stamp this gauge. A value of `-9223372036854775808` (`INT64_MIN`) means the durable anchor could not be read or trusted as a plausible integer - a distinct anomaly, not a genuine timestamp; it self-corrects at the next pass whose own clock reading is plausible - even if that pass then declines or fails for an unrelated reason - consistent with the "refused for an implausible `now`" case above, which is the one pass that does NOT self-correct it. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
 looks identical either way --- only the pair distinguishes "the guard is

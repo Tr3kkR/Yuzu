@@ -154,6 +154,99 @@ std::int64_t row_count(const std::string& dsn) {
 
 } // namespace
 
+// ── Migration ────────────────────────────────────────────────────────────────
+
+TEST_CASE("AuditStore migration v2 deletes only the backfill marker rows, leaving the "
+          "clock-guard's durable state untouched (#3623)",
+          "[pg][audit_store][migration]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA audit_store")};
+        REQUIRE(schema.ok());
+
+        // v1 DDL, copied from migrations() in audit_store.cpp — schema-qualified, unlike the
+        // source (a raw PQexec connection has no search_path set the way PgMigrationRunner's
+        // migration transaction does; mirrors the QuarantineStore v1→v2 test precedent).
+        PgResult v1{PQexec(conn.get(),
+                           "CREATE TABLE audit_store.audit_events ("
+                           "  id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+                           "  timestamp       BIGINT  NOT NULL,"
+                           "  principal       TEXT    NOT NULL,"
+                           "  principal_role  TEXT    NOT NULL,"
+                           "  action          TEXT    NOT NULL,"
+                           "  target_type     TEXT    NOT NULL DEFAULT '',"
+                           "  target_id       TEXT    NOT NULL DEFAULT '',"
+                           "  detail          TEXT    NOT NULL DEFAULT '',"
+                           "  source_ip       TEXT    NOT NULL DEFAULT '',"
+                           "  user_agent      TEXT    NOT NULL DEFAULT '',"
+                           "  session_id      TEXT    NOT NULL DEFAULT '',"
+                           "  result          TEXT    NOT NULL,"
+                           "  ttl_expires_at  BIGINT  NOT NULL DEFAULT 0,"
+                           "  principal_class TEXT    NOT NULL DEFAULT '');"
+                           "CREATE TABLE audit_store.audit_retention_meta ("
+                           "  key   TEXT PRIMARY KEY,"
+                           "  value TEXT NOT NULL"
+                           ")")};
+        REQUIRE(v1.ok());
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('audit_store', 1, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+
+        // All four keys genuinely present BEFORE v2's DELETE runs — the two retired backfill
+        // markers, and the two the clock guard depends on surviving this migration.
+        PgResult seed{PQexec(
+            conn.get(),
+            "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+            "('backfill_complete', '1700000000'), "
+            "('backfill_source_fingerprint', '5:15:5000:1000:1004'), "
+            "('last_pass_now', '1700000500'), "
+            "('last_anomaly_facts', '-----')")};
+        REQUIRE(seed.ok());
+    }
+
+    // The real construction path: PgMigrationRunner::run reads version 1 from schema_meta and
+    // applies v2's DELETE against the meta table seeded above.
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AuditStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult ver{PQexec(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                    "'audit_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+
+    // The two backfill-only markers are GONE.
+    PgResult markers{PQexec(conn.get(),
+                            "SELECT key FROM audit_store.audit_retention_meta WHERE key IN "
+                            "('backfill_complete', 'backfill_source_fingerprint')")};
+    REQUIRE(markers.ok());
+    CHECK(PQntuples(markers.get()) == 0);
+
+    // The clock guard's own durable rows are BYTE-IDENTICAL, not merely present.
+    PgResult surviving{PQexec(
+        conn.get(), "SELECT key, value FROM audit_store.audit_retention_meta ORDER BY key")};
+    REQUIRE(surviving.ok());
+    REQUIRE(PQntuples(surviving.get()) == 2);
+    CHECK(std::string(PQgetvalue(surviving.get(), 0, 0)) == "last_anomaly_facts");
+    CHECK(std::string(PQgetvalue(surviving.get(), 0, 1)) == "-----");
+    CHECK(std::string(PQgetvalue(surviving.get(), 1, 0)) == "last_pass_now");
+    CHECK(std::string(PQgetvalue(surviving.get(), 1, 1)) == "1700000500");
+}
+
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
 TEST_CASE("AuditStore: open against a fresh template clone", "[pg][audit_store][db]") {
@@ -491,14 +584,9 @@ TEST_CASE("AuditStore #2854: an ordinary restart seeds the liveness gauge from t
     CHECK(store.last_pass_unixtime() == 1700000000);
 }
 
-// Adversarial review (Kimi H1 / Codex C-P2-1), and the reason the A-3 alert is
-// keyed the way it is. `YuzuAuditBackfillFailing` fires on the ABSENCE of a
-// success outcome, so the family has to exist on a healthy server — and the
-// ordinary restart of an already-migrated server reaches NO outcome at all: it
-// returns at the marker check. Without the pre-seed in `set_metrics`, that
-// healthy restart exports nothing and the critical alert pages every time.
-// Both halves are asserted here: the seed exists, and the marker-present restart
-// leaves it at 0 rather than incrementing something untrue.
+// Per docs/observability-conventions.md: a bounded-label counter is
+// pre-seeded to 0 at boot so an `absent()`-based alert stays meaningful on a
+// healthy server before any degrade has ever fired.
 TEST_CASE("AuditStore: wiring metrics pre-seeds the read-degrade label set",
           "[pg][audit_store][metrics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);

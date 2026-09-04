@@ -17,8 +17,6 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
-#include <cstring>
-#include <format>
 #include <limits>
 #include <optional>
 #include <random>
@@ -263,12 +261,12 @@ AuditStore::AuditStore(pg::PgPool& pool, int retention_days, int cleanup_interva
     open_ = true;
     // Restores the liveness gauge across a restart on an ALREADY-migrated
     // database — the anchor from a previous `cleanup_once` pass already
-    // exists. It does NOT cover the first-ever Postgres boot: on that boot
-    // the anchor is only copied by `migrate_from_sqlite`'s legacy-meta step,
-    // which runs after this constructor returns — that function re-seeds
-    // itself, immediately before its own return, once that copy has
-    // actually happened (#2854). Deliberately NOT re-seeded from inside
-    // `backfill_ok` — see the comment at that call site for why.
+    // exists. On the first-ever Postgres boot no anchor row exists yet
+    // either, so this is a no-op (`0`, "never ran") — the legacy-SQLite
+    // continuity path that used to backdate this seed on a mid-cutover
+    // upgrade is retired (ADR-0009 hard-cutover Update, 2026-09-04); no
+    // production fleet ever had a pre-Postgres reading to carry forward
+    // (#2854).
     seed_last_pass_from_anchor();
     spdlog::info("AuditStore initialized (schema {}, retention={}d, liveness anchor {})",
                  kStoreName, retention_days_, last_pass_unixtime_.load(std::memory_order_relaxed));
@@ -283,10 +281,10 @@ void AuditStore::seed_last_pass_from_anchor() {
     // already persisted. #2854.
     //
     // NEVER FATAL, deliberately asymmetric with this store's OTHER
-    // construction-time checks (lease-acquire, schema migration, and
-    // `migrate_from_sqlite`'s mandatory backfill all fail closed). Those fail
-    // closed because failure there means audit events genuinely cannot be
-    // written or read correctly — the SOC 2-critical path. A failed or
+    // construction-time checks (lease-acquire and schema migration both fail
+    // closed). Those fail closed because failure there means audit events
+    // genuinely cannot be written or read correctly — the SOC 2-critical
+    // path. A failed or
     // unreadable read HERE does not touch that: audit ingestion is
     // unaffected either way, and the anomaly sentinel below already makes
     // both the liveness alert and the never-ran alert behave safely without
@@ -384,9 +382,8 @@ bool AuditStore::log(const AuditEvent& event) {
 
     // Sanitize EVERY text column, including `result` and `principal_class`.
     // They were bound verbatim on the claim that they are enum-controlled. All
-    // the assignment sites in the tree today do use literals — but the backfill
-    // path (below) sanitizes both, with a comment explaining precisely why, and
-    // the failure modes are not symmetric with the free-text ones: MEASURED on
+    // the assignment sites in the tree today do use literals — but the
+    // failure modes are not symmetric with the free-text ones: MEASURED on
     // PG 18, `result="\xff\xfe"` fails the INSERT and LOSES the event on a
     // fail-hard write path, and `result="suc\0cess"` stores `"suc"` — a
     // SILENTLY TRUNCATED audit result. A convention enforced only by every

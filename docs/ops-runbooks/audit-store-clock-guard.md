@@ -2,10 +2,11 @@
 
 Covers the `YuzuAuditRetention*` alert family and `YuzuAuditPersistFailures`
 (`docs/prometheus/yuzu-alerts.yml`) - i.e. `audit_store` health (PostgreSQL,
-ADR-0040), both the write path and the retention path. `YuzuAuditBackfillFailing`
-and `YuzuAuditReadDegraded` are the other two alerts in this family; each has
-its own `runbook_url` (`upgrading.md`, `audit-log.md#storage`) and is
-deliberately not duplicated here.
+ADR-0040), both the write path and the retention path. `YuzuAuditReadDegraded`
+is the other alert in this family; it has its own `runbook_url`
+(`audit-log.md#storage`) and is deliberately not duplicated here.
+(`YuzuAuditBackfillFailing` was retired alongside `migrate_from_sqlite()`
+itself, #3623, ADR-0009 hard-cutover Update, 2026-09-04.)
 Background: `docs/user-manual/audit-log.md`, ADR-0040, issue #2360.
 
 > **Read this first.** These rules are NOT active unless you wired them up.

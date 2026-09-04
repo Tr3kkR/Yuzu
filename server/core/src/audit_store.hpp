@@ -263,8 +263,9 @@ public:
     /// lock-free atomic accessors, scraped as gauges by the server maintenance
     /// loop independently of this registry.
     ///
-    /// Wiring a registry PRE-SEEDS both closed label sets to 0 — load-bearing for
-    /// the absence-keyed backfill alert; see the definition.
+    /// Wiring a registry PRE-SEEDS the closed label set to 0, per
+    /// docs/observability-conventions.md, so `absent()`-based alerting stays
+    /// meaningful on a healthy server before any degrade has ever fired.
     void set_metrics(yuzu::MetricsRegistry* m);
 
     /// Persist an audit event. FAIL-HARD: returns true iff the row was written.

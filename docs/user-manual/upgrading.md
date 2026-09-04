@@ -982,10 +982,13 @@ only when a legacy `inventory.db` happens to be present. This is a deliberate fa
 startup error, never silent data loss), not a bug, but it means "just roll back the binary" is
 not a supported recovery path once this migration has run. The same is true for
 CaStore/ManagementGroupStore/QuarantineStore/WebhookStore below, each for its own dropped marker
-table; RbacStore and AuditStore are the two exceptions (see their own sections), where rollback
-does NOT fail unconditionally — the marker rows are removed, not the table, so an old binary's
-own lookup succeeds (0 rows, not a SQL error) and it boots normally UNLESS a real, unmigrated
-legacy file is also present on that specific host.
+table. RbacStore is the one genuine exception (see its own section): the marker rows are removed,
+not the table, so an old binary's own lookup succeeds (0 rows, not a SQL error) and it boots
+normally UNLESS a real, unmigrated legacy file is also present on that specific host. AuditStore
+also removes marker rows rather than dropping a table, but do NOT assume it behaves the same way
+— its own section explains why an old binary's boot fails just as reliably as the DROP-TABLE
+group's, via a different mechanism (a live-row-count guard the retired code already had, not a
+SQL error).
 
 ## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
 
@@ -1777,16 +1780,25 @@ at its configured path — nothing reads or modifies it — and is your
 operator-managed record going forward (export it, archive it, keep it under
 your own retention policy; Yuzu will never import it).
 
-**Rollback caution.** Do not roll back to a build older than this release
-while a legacy `audit.db` file with real content still sits at its configured
-path on any replica. An older binary's own (now-removed-from-current-code)
-backfill logic still runs on that replica and, seeing this database already
-past this migration (the marker rows are gone, but `audit_retention_meta`
-itself is not — see ADR-0040's Update), re-streams that file: it either
-completes idempotently (already-present rows are skipped via `ON CONFLICT DO
-NOTHING`) or refuses to boot on a genuine content mismatch — a clear startup
-refusal, not silent corruption, but it IS a startup refusal. Move the legacy
-file aside first if a rollback is genuinely needed.
+**Rollback caution.** Do not roll back to a build older than this release.
+Unlike RbacStore above, this is not just a caution about a leftover legacy
+file — an older binary's own (now-removed-from-current-code) backfill logic
+refuses to boot in the ordinary case too, **with or without** a legacy
+`audit.db` present: seeing this database already past this migration (the
+marker rows are gone, but `audit_retention_meta` itself is not — see
+ADR-0040's Update), it checks the live row count in `audit_store.audit_events`
+before doing anything else, and refuses ("another replica may still be
+streaming the legacy trail...") the moment that count is non-zero — true
+almost immediately after any normal boot, legacy file or not. The one case
+where it succeeds silently is a rollback attempted before a single audit
+event has ever been written post-upgrade — a window narrow enough not to
+rely on. If a legacy `audit.db` with real content also sits at its configured
+path, the older binary instead re-streams it: idempotently, if the count IS
+still zero (`ON CONFLICT DO NOTHING` skips already-present rows), or refusing
+outright on a genuine content mismatch. Either way this is a clear startup
+refusal, never silent corruption — but "just roll back the binary" is not a
+supported recovery path once this migration has run, the same as every
+DROP-TABLE-group store above.
 
 **Reads deny-on-degrade.** An audit-store or connection-pool failure makes
 `GET /api/v1/audit*` return `503` rather than an empty `200`, so an
@@ -3088,10 +3100,10 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT store, version, to_timestamp(upgraded_at) FROM public.schema_meta ORDER BY upgraded_at;"
 ```
 
-For `audit_store` specifically, the legacy `audit.db` also **stops existing at its old path**
-after the one-time backfill: it is renamed to `audit.db.migrated-<epoch>` (with any
-`-wal`/`-shm` sidecars). A `sqlite3 /var/lib/yuzu/audit.db` command therefore fails with
-`unable to open database file` on a migrated server, and that is expected, not a fault.
+For `audit_store` specifically, a legacy `audit.db` — if one still exists — is never renamed,
+moved, or modified: Yuzu only opens it read-only, at boot, to warn if it holds rows (see the
+Audit trail section above). `sqlite3 /var/lib/yuzu/audit.db` still opens it normally on a
+migrated server; there is nothing to restore or account for here.
 
 If a migration fails:
 

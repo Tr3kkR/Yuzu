@@ -4539,8 +4539,11 @@ public:
         // fresh-start-by-default amendment, extended to AuditStore by the 2026-09-04 hard-cutover
         // Update — no migration path is held open, incl. for evidence): the legacy audit.db is
         // never copied; the detect-and-warn obligation still applies (audit history is compliance
-        // evidence, not expendable telemetry), so legacy_sqlite_probe::warn_if_legacy_rows() opens
-        // the legacy file read-only and warns (with a row count) only if it actually holds rows.
+        // evidence, not expendable telemetry), so legacy_sqlite_probe::harden_legacy_file_0600()
+        // (this file's `detail` column may hold a pre-fix plaintext secret — `sanitized_detail`'s
+        // own doc comment, ADR-0010 §Consequences (a) — the now-retired backfill never rewrote
+        // the legacy file to redact it, WebhookStore precedent) then warn_if_legacy_rows() open
+        // the legacy file read-only and warn (with a row count) only if it actually holds rows.
         {
             if (pg_pool_ && !startup_failed_) {
                 audit_store_ =
@@ -4552,6 +4555,8 @@ public:
                     startup_failed_ = true;
                 } else {
                     audit_store_->set_metrics(&metrics_);
+                    legacy_sqlite_probe::harden_legacy_file_0600(cfg_.db_dir() / "audit.db",
+                                                                 "AuditStore");
                     legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "audit.db",
                                                              "AuditStore", {"audit_events"});
                     audit_store_->start_cleanup();
