@@ -18,7 +18,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <set>
@@ -87,6 +89,14 @@ public:
     void unwatch(const std::string& key) override {
         std::lock_guard lk(mu_);
         ++unwatch_calls_;
+        // #2815: did this unwatch arrive AFTER the engine had already torn this
+        // mechanism down? That is the exact fact the teardown lease exists to make
+        // false. It is the BENIGN half of the window — every real mechanism fails an
+        // unwatch closed once stopped — whose MALIGN half is the same parked caller
+        // touching a FREED engine (Scenario B below). This counter is the observable
+        // for the benign half, which is the half a cross-platform test can pin.
+        if (stop_calls_ > 0)
+            ++unwatch_calls_after_stop_;
         watched_.erase(key);
         // The real mechanisms allocate inside unwatch() (spark_service queues a Cmd
         // holding a key copy; spark_file grows retiring_), so bad_alloc out of here
@@ -131,6 +141,11 @@ public:
     int unwatch_calls() {
         std::lock_guard lk(mu_);
         return unwatch_calls_;
+    }
+    /// #2815: unwatch() calls that arrived after this mechanism's own stop().
+    int unwatch_calls_after_stop() {
+        std::lock_guard lk(mu_);
+        return unwatch_calls_after_stop_;
     }
     int stop_calls() {
         std::lock_guard lk(mu_);
@@ -181,9 +196,56 @@ private:
     std::string fail_watch_msg_{"forced watch failure"};
     int watch_calls_{0};
     int unwatch_calls_{0};
+    int unwatch_calls_after_stop_{0};
     int stop_calls_{0};
     int start_calls_{0};
 };
+
+/// A one-shot park for the #2815 teardown-barrier cases: an engine test hook enters,
+/// announces it, and blocks until the test releases it.
+///
+/// DELIBERATELY NOT OWNED BY THE ENGINE. Scenario B destroys the engine while a caller
+/// is parked in here, so the gate must outlive it — it lives on the TEST's stack and the
+/// hook captures a bare pointer to it. The hook lambda's own closure storage belongs to
+/// the engine's std::function member and dies with the engine, so the capture is read
+/// ONCE at hook entry (into a stack local) and never again after the park begins;
+/// otherwise ASan reports the closure rather than the engine member the case is about.
+struct ParkGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool entered{false};
+    bool released{false};
+    void park() {
+        std::unique_lock lk(mu);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [this] { return released; });
+    }
+    [[nodiscard]] bool wait_entered(std::chrono::milliseconds timeout = 5000ms) {
+        std::unique_lock lk(mu);
+        return cv.wait_for(lk, timeout, [this] { return entered; });
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            released = true;
+        }
+        cv.notify_all();
+    }
+};
+
+/// Poll `flag` for `window`, reporting whether it ever became true. Used by the #2815
+/// cases to assert a NEGATIVE ("stop() has NOT returned yet") without a fixed sleep and
+/// without spraying one Catch2 assertion per poll.
+bool became_true_within(const std::atomic<bool>& flag, std::chrono::milliseconds window) {
+    const auto until = std::chrono::steady_clock::now() + window;
+    while (std::chrono::steady_clock::now() < until) {
+        if (flag.load(std::memory_order_acquire))
+            return true;
+        std::this_thread::sleep_for(2ms);
+    }
+    return flag.load(std::memory_order_acquire);
+}
 
 /// A mechanism whose stop() blocks until released — for #1934 UP-1/F4, a
 /// regression test that stop()'s mechanism-teardown step runs with no engine
@@ -1529,6 +1591,281 @@ TEST_CASE("SparkEngine: a queued handler re-entering the engine while stop() is 
         CHECK(sync->reentry_done);
     }
     CHECK(sync->reentrant_arm_rejected.load()); // failed cleanly, never hung
+}
+
+// ── #2815: the teardown barrier ───────────────────────────────────────────────
+//
+// SparkEngine has FOUR call sites that resolve a raw `ISparkMechanism*` (and this
+// engine's `mech_ops_mu_by_type_` entry) under mu_, then RELEASE mu_ and call into the
+// mechanism: disarm(), teardown_arm_race(), unregister_consumer() and the live arm path
+// in arm_impl(). Before this fix, stop() waited on NONE of them — it flipped
+// running_/stopped_, joined the wheel, and went straight on to tear the mechanisms down
+// while a caller could still be parked inside that window.
+//
+// Two consequences, one benign and one not:
+//   * BENIGN, and cross-platform observable: the parked caller's unwatch() lands on a
+//     mechanism the engine has already stopped (FakeMechanism::unwatch_calls_after_stop).
+//   * MALIGN, and the actual defect: nothing else ever waits either, so ~SparkEngine can
+//     free the engine out from under that same parked caller, which then dereferences
+//     mech_ops_mu_by_type_ on freed memory (Scenario B, under ASan).
+//
+// The fix is an engine-local lease: each of the four doors arms a function-scoped lease
+// as the last statement of the SAME mu_ block that resolves `mech`, and holds it for the
+// whole rest of the function. stop() waits on the lease BOUNDED (a determinism nicety —
+// it proceeds on expiry and counts teardown_join_timeouts_total); ~SparkEngine waits
+// UNBOUNDED, which is what actually closes the use-after-free.
+//
+// Why a lease is sufficient — i.e. why no NEW caller can slip in behind stop(): all four
+// doors gate their own entry on running_/stopped_ under mu_ BEFORE they resolve `mech`,
+// so once stop()'s early locked block has flipped both flags, a later caller resolves no
+// mechanism and arms no lease. The lease therefore counts exactly the callers already in
+// flight at that instant.
+
+TEST_CASE("#2815 door 1/4 — stop() waits for an in-flight disarm() teardown",
+          "[spark][mechanism][teardown][tsan]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(sub.has_value());
+
+    ParkGate gate;
+    // The disarm race hook fires with NO locks held, after mu_ is released and before
+    // the mech-ops lock — exactly inside the window this case is about.
+    engine.set_disarm_race_hook_for_test([g = &gate] {
+        ParkGate* local = g; // read the capture ONCE, before parking (see ParkGate's doc)
+        local->park();
+    });
+
+    std::thread disarmer([&] { engine.disarm(*sub); });
+    REQUIRE(gate.wait_entered());
+
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper([&] {
+        engine.stop();
+        stop_returned.store(true, std::memory_order_release);
+    });
+
+    // PRE-FIX this is TRUE within a millisecond or two: stop() takes lifecycle_mu_,
+    // flips the flags, joins the wheel and tears the mechanisms down without ever
+    // looking at the parked caller. POST-FIX the lease holds it here.
+    // 300 ms is well inside stop()'s bounded wait (the default 2 s budget), so a
+    // post-fix PASS here means "still waiting", never "already timed out".
+    CHECK_FALSE(became_true_within(stop_returned, 300ms));
+
+    gate.release();
+    disarmer.join();
+    stopper.join();
+    CHECK(stop_returned.load());
+
+    // The barrier's point: the unwatch reaches a mechanism that is still LIVE.
+    CHECK(fake->unwatch_calls() == 1);
+    CHECK(fake->unwatch_calls_after_stop() == 0);
+    CHECK(engine.stats().teardown_join_timeouts_total == 0); // released inside the budget
+}
+
+TEST_CASE("#2815 door 2/4 — stop() waits for an in-flight consumer-race teardown",
+          "[spark][mechanism][teardown][tsan]") {
+    // teardown_arm_race(): arm_impl loses the M1 consumer race and unwinds its own
+    // subscription, taking the same post-mu_ mechanism call as disarm(). Driven the way
+    // the existing #2270 cases drive it — unregister from the arm PRE-CHECK hook, so the
+    // teardown's real-work branch (including the OS unwatch) is the one that runs.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    ParkGate gate;
+    engine.set_arm_precheck_race_hook_for_test([&] { engine.unregister_consumer(*c); });
+    engine.set_disarm_race_hook_for_test([g = &gate] {
+        ParkGate* local = g;
+        local->park();
+    });
+
+    std::thread armer([&] { (void)engine.arm(*c, file_spec("/etc/hosts")); });
+    REQUIRE(gate.wait_entered());
+
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper([&] {
+        engine.stop();
+        stop_returned.store(true, std::memory_order_release);
+    });
+    CHECK_FALSE(became_true_within(stop_returned, 300ms));
+
+    gate.release();
+    armer.join();
+    stopper.join();
+    CHECK(stop_returned.load());
+    CHECK(fake->unwatch_calls() == 1);
+    CHECK(fake->unwatch_calls_after_stop() == 0);
+}
+
+TEST_CASE("#2815 door 3/4 — stop() waits for an in-flight unregister_consumer() teardown",
+          "[spark][mechanism][teardown][tsan]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    REQUIRE(engine.arm(*c, file_spec("/etc/hosts")).has_value());
+
+    ParkGate gate;
+    engine.set_disarm_race_hook_for_test([g = &gate] {
+        ParkGate* local = g;
+        local->park();
+    });
+
+    std::thread dropper([&] { engine.unregister_consumer(*c); });
+    REQUIRE(gate.wait_entered());
+
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper([&] {
+        engine.stop();
+        stop_returned.store(true, std::memory_order_release);
+    });
+    CHECK_FALSE(became_true_within(stop_returned, 300ms));
+
+    gate.release();
+    dropper.join();
+    stopper.join();
+    CHECK(stop_returned.load());
+    CHECK(fake->unwatch_calls() == 1);
+    CHECK(fake->unwatch_calls_after_stop() == 0);
+}
+
+TEST_CASE("#2815 door 4/4 — stop() waits for an in-flight arm_impl() watch call",
+          "[spark][mechanism][teardown][tsan]") {
+    // The door the original design missed. arm_impl resolves `mech` under mu_, releases
+    // mu_, takes this type's mech-ops lock and calls watch_guarded() — retaining the raw
+    // mechanism pointer across exactly the same window the three teardown doors do.
+    // Parked here via the watch-error fault phase, which fires inside watch_guarded's
+    // catch with the mech-ops lock held and mu_ NOT held (so stop()'s wait, which takes
+    // neither, cannot deadlock against it).
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    ParkGate gate;
+    fake->set_throw_watch(true);
+    engine.set_arm_fault_hook_for_test([g = &gate](int phase) {
+        if (phase != SparkEngine::kArmFaultPhaseWatchErrorBuild)
+            return;
+        ParkGate* local = g;
+        local->park();
+    });
+
+    std::expected<SparkEngine::SubscriptionId, std::string> armed;
+    std::thread armer([&] { armed = engine.arm(*c, file_spec("/etc/hosts")); });
+    REQUIRE(gate.wait_entered());
+
+    std::atomic<bool> stop_returned{false};
+    std::thread stopper([&] {
+        engine.stop();
+        stop_returned.store(true, std::memory_order_release);
+    });
+    CHECK_FALSE(became_true_within(stop_returned, 300ms));
+
+    gate.release();
+    armer.join();
+    stopper.join();
+    CHECK(stop_returned.load());
+    CHECK(fake->watch_calls() == 1);
+    CHECK_FALSE(armed.has_value()); // the throwing watch still fails cleanly
+    CHECK(engine.stats().armed_sparks == 0);
+}
+
+TEST_CASE("#2815 — ~SparkEngine waits UNBOUNDED for an in-flight teardown before freeing "
+          "the members that caller still holds",
+          "[spark][mechanism][teardown]") {
+    // Scenario B: the actual use-after-free, and the reason stop()'s BOUNDED wait is a
+    // nicety rather than the fix. Pre-fix, the parked disarm() resumes into
+    // `mech_ops_mu_by_type_.at(type)` on an engine that has already been destroyed —
+    // ASan reports heap-use-after-free on the engine allocation. Post-fix the destructor
+    // blocks until the lease drains, so the resumed caller finds every member alive.
+    //
+    // The budget is squeezed to 50 ms deliberately: stop()'s bounded wait then EXPIRES
+    // while the caller is still parked, which is exactly the state in which only the
+    // destructor's unbounded wait can prevent the free. If this case passes with a short
+    // budget, the destructor — not stop() — is what is holding the line.
+    auto engine = std::make_unique<SparkEngine>();
+    wire_fake(*engine, SparkType::File);
+    engine->set_consumer_join_budget_for_test(50);
+    auto c = engine->register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine->start();
+    auto sub = engine->arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(sub.has_value());
+    const auto sub_id = *sub;
+
+    ParkGate gate;
+    engine->set_disarm_race_hook_for_test([g = &gate] {
+        ParkGate* local = g;
+        local->park();
+    });
+
+    SparkEngine* raw = engine.get();
+    std::thread disarmer([raw, sub_id] { raw->disarm(sub_id); });
+    REQUIRE(gate.wait_entered());
+
+    std::atomic<bool> destroyed{false};
+    std::thread killer([&] {
+        engine->stop();
+        engine.reset(); // ~SparkEngine — must NOT free while `disarmer` is parked
+        destroyed.store(true, std::memory_order_release);
+    });
+
+    CHECK_FALSE(became_true_within(destroyed, 300ms));
+
+    gate.release();
+    disarmer.join();
+    killer.join();
+    CHECK(destroyed.load());
+}
+
+TEST_CASE("#2815 — stop()'s teardown wait is BOUNDED and counts its own expiry",
+          "[spark][mechanism][teardown]") {
+    // NOT A RED-FIRST CASE, and it is not offered as one: teardown_join_timeouts_total
+    // is introduced BY this fix, so there is no pre-fix meaning to fail. It pins the
+    // deliberate second half of the design — stop() must never become a place an agent
+    // shutdown can hang, so it gives up after the budget, counts, and proceeds.
+    //
+    // It also pins the honest cost of proceeding: past the expiry the benign half of the
+    // window is genuinely reopened, and the late unwatch DOES land on a stopped
+    // mechanism. Only the destructor's unbounded wait closes the malign half.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    engine.set_consumer_join_budget_for_test(50);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(sub.has_value());
+
+    ParkGate gate;
+    engine.set_disarm_race_hook_for_test([g = &gate] {
+        ParkGate* local = g;
+        local->park();
+    });
+    std::thread disarmer([&] { engine.disarm(*sub); });
+    REQUIRE(gate.wait_entered());
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop(); // returns despite the parked caller — bounded, never a hang
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(elapsed < 5000ms);
+    CHECK(engine.stats().teardown_join_timeouts_total == 1);
+
+    gate.release();
+    disarmer.join();
+    // Proceeding past the expiry is not free: the late unwatch reached a stopped
+    // mechanism. Recorded, not lamented — the alternative is hanging shutdown.
+    CHECK(fake->unwatch_calls_after_stop() == 1);
+    // ~SparkEngine still runs its UNBOUNDED wait here; the lease is already drained.
 }
 
 TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][mechanism]") {

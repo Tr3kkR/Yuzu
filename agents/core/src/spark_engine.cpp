@@ -153,6 +153,75 @@ watch_guarded(ISparkMechanism* mech, const std::string& key, const SparkParams& 
     }
 }
 
+/// #2815: RAII lease over one pass through a post-mu_ mechanism-call window.
+///
+/// ARM IT AS THE LAST STATEMENT OF THE mu_ BLOCK THAT RESOLVES THE MECHANISM, and let
+/// it live to the end of the enclosing FUNCTION - not merely until unwatch() returns.
+/// Both halves are load-bearing:
+///   * "last statement under mu_" - arming earlier is harmless, but anything after it
+///     inside the lock that could throw would run this destructor while mu_ is still
+///     held. The destructor takes no lock, so that is not a deadlock today; keeping the
+///     arm last means it never becomes one.
+///   * "to the end of the function" - the window does not close when the mechanism call
+///     does. disarm()'s own catch touches disarm_unwatch_failures_ AFTER unwatch()
+///     throws, and unregister_consumer() runs on into quiesce_consumer(), which reads
+///     consumer_join_budget_ms_ and consumer_threads_detached_. Releasing at the
+///     mechanism call would leave both of those outside the barrier.
+///
+/// Everything here is noexcept: this is destroyed on the door caller's thread during
+/// ordinary return AND during exception unwind, and an observe-only subsystem must
+/// never be the reason the agent terminates.
+class TeardownLease {
+public:
+    explicit TeardownLease(std::atomic<std::uint64_t>& count) noexcept : count_(&count) {}
+    ~TeardownLease() { release(); }
+    TeardownLease(const TeardownLease&) = delete;
+    TeardownLease& operator=(const TeardownLease&) = delete;
+
+    /// Caller holds mu_.
+    void arm_locked() noexcept {
+        count_->fetch_add(1, std::memory_order_relaxed);
+        armed_ = true;
+    }
+
+private:
+    void release() noexcept {
+        if (!armed_)
+            return;
+        armed_ = false;
+        // RELEASE ordering: a waiter that observes zero via an ACQUIRE load has
+        // happens-before over every engine access this caller made in the window.
+        count_->fetch_sub(1, std::memory_order_acq_rel);
+    }
+    std::atomic<std::uint64_t>* count_;
+    bool armed_{false};
+};
+
+/// Wait until no caller is inside a teardown window, or `budget` elapses.
+/// Returns true if the lease drained, false on expiry. See the member's doc in
+/// spark_engine.hpp for why this polls rather than waiting on a condition_variable.
+bool wait_teardown_leases(const std::atomic<std::uint64_t>& count,
+                          std::chrono::milliseconds budget) noexcept {
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    for (;;) {
+        if (count.load(std::memory_order_acquire) == 0)
+            return true;
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+/// The UNBOUNDED counterpart, for ~SparkEngine only. A caller that never returns turns
+/// what used to be a silent use-after-free into a visible hang, which is the trade this
+/// fix deliberately makes. Dormant in the shipped agent: main.cpp's OrphanExitGuard
+/// hard_exit()s while any Guardian I/O worker is still live, long before ~Agent - so a
+/// wedged worker terminates the process there, not here.
+void wait_teardown_leases_forever(const std::atomic<std::uint64_t>& count) noexcept {
+    while (count.load(std::memory_order_acquire) != 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
 } // namespace
 
 bool SparkEngine::is_event_driven(SparkType type) noexcept {
@@ -164,6 +233,12 @@ SparkEngine::SparkEngine() = default;
 
 SparkEngine::~SparkEngine() {
     stop();
+    // #2815: THE fix. stop()'s own wait is bounded and may have given up; nothing else
+    // in this destructor may run until every caller has left a teardown window, because
+    // the very next thing that happens is the destruction of the members those callers
+    // still hold (mech_ops_mu_by_type_, mechanisms_, consumers_). Last statement of the
+    // body on purpose - member destructors run only once this returns.
+    wait_teardown_leases_forever(inflight_teardowns_);
 }
 
 // ── Mechanisms ────────────────────────────────────────────────────────────────
@@ -320,6 +395,12 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
         SparkType type; // picks this type's mech-ops lock at consumption
     };
     std::vector<PendingUnwatch> to_unwatch;
+    // #2815 door 3/4. Armed UNCONDITIONALLY below (not only when to_unwatch is
+    // non-empty): this function continues past its mechanism calls into
+    // quiesce_consumer(), which reads consumer_join_budget_ms_ and writes
+    // consumer_threads_detached_ - engine members, so the window this lease covers is
+    // the whole function tail either way.
+    TeardownLease lease(inflight_teardowns_);
     {
         std::lock_guard lk(mu_);
         for (auto it = armed_.begin(); it != armed_.end();) {
@@ -344,6 +425,11 @@ void SparkEngine::unregister_consumer(ConsumerId id) {
                 ++it;
             }
         }
+        // #2815: LAST statement under mu_, and after the collection loop has finished -
+        // one lease per door-call, never a token per queued item. The loop can itself
+        // throw part-way (std::erase_if, the to_unwatch push_back); arming after it
+        // means a partial collection unwinds with nothing to balance.
+        lease.arm_locked();
     }
     // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
     // takes mu_) — mirrors disarm(). Serialized via this type's
@@ -622,6 +708,13 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
     ISparkMechanism* mech = nullptr;
     SparkParams watch_params;
     SubscriptionId id = 0;
+    // #2815 door 4/4 - the one the original design missed. This is not a TEARDOWN, but
+    // it is the same window: `mech` and mech_ops_mu_by_type_.at(spec.type) are resolved
+    // under mu_ and then used with mu_ RELEASED, so ~SparkEngine freeing those members
+    // mid-watch is the same use-after-free. The lease also covers the M1 consumer
+    // re-check and teardown_arm_race() call in this function's tail, which read
+    // consumers_mu_/consumers_.
+    TeardownLease lease(inflight_teardowns_);
 
     // ── pre-built returns (#2270 layer 2) ─────────────────────────────────────────
     // Built here, where a throw unwinds a still-untouched engine, and only MOVED
@@ -754,6 +847,8 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
             } catch (...) {
             }
         }
+        if (mech)
+            lease.arm_locked(); // #2815: last statement under mu_
     }
 
     // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
@@ -872,6 +967,7 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
     // that deduped onto this key keeps its subscription AND its watcher — deleting
     // those is precisely the defect that failed review twice.
     ISparkMechanism* mech = nullptr;
+    TeardownLease lease(inflight_teardowns_); // #2815 door 2/4
     {
         std::lock_guard lk(mu_);
         auto ki = sub_keys_.find(id);
@@ -920,6 +1016,8 @@ void SparkEngine::teardown_arm_race(SubscriptionId id, const std::string& key, S
         }
         sub_keys_.erase(ki);
         wheel_cv_.notify_all();
+        if (mech)
+            lease.arm_locked(); // #2815: last statement under mu_
     }
     if (mech) {
         // Hook BEFORE the mech-ops lock, never while held — a test hook that re-arms
@@ -984,6 +1082,7 @@ void SparkEngine::disarm(SubscriptionId id) {
     ISparkMechanism* mech = nullptr;
     std::string unwatch_key;
     SparkType unwatch_type{}; // carried forward to pick this type's mech-ops lock
+    TeardownLease lease(inflight_teardowns_); // #2815 door 1/4
     {
         std::lock_guard lk(mu_);
         auto ki = sub_keys_.find(id);
@@ -1033,6 +1132,8 @@ void SparkEngine::disarm(SubscriptionId id) {
         }
         sub_keys_.erase(ki);
         wheel_cv_.notify_all();
+        if (mech)
+            lease.arm_locked(); // #2815: last statement under mu_
     }
     // Stop watching with mu_ RELEASED (unwatch may block; a racing inline emit
     // takes mu_). Serialized via this type's mech_ops_mu_by_type_ entry with a
@@ -1250,6 +1351,38 @@ void SparkEngine::stop() noexcept try {
     // occur. joinable() guards the never-started and already-torn-down cases only.
     if (wheel_thread_.joinable())
         wheel_thread_.join();
+
+    // 1b) #2815: wait — BOUNDED — for every caller already inside a post-mu_ mechanism
+    // window (disarm / teardown_arm_race / unregister_consumer / arm_impl's watch) to
+    // leave it, before step 2 starts tearing those same mechanisms down. The locked
+    // block above has already flipped running_ AND stopped_, and all four doors gate
+    // their own entry on those under mu_ BEFORE resolving a mechanism, so no NEW caller
+    // can arm a lease from here on: this waits on a set that only shrinks.
+    //
+    // BOUNDED, AND IT PROCEEDS ON EXPIRY. stop() is called from Agent::stop() and from
+    // the Windows SCM control thread; it may never become a place a shutdown can hang,
+    // which is the same rule that makes the consumer join bounded (UP-1 / #1311). This
+    // wait is therefore a determinism/API-contract nicety - "stop() returned" should
+    // normally mean "nothing is still inside the engine" - and NOT the safety mechanism.
+    // The safety mechanism is ~SparkEngine's UNBOUNDED wait, which is what actually
+    // prevents the members from being freed under a parked caller.
+    //
+    // Budget: consumer_join_budget_ms_, reusing the existing shutdown budget (and its
+    // test seam) rather than inventing a second one.
+    if (!wait_teardown_leases(inflight_teardowns_,
+                              std::chrono::milliseconds(
+                                  consumer_join_budget_ms_.load(std::memory_order_relaxed)))) {
+        teardown_join_timeouts_.fetch_add(1, std::memory_order_relaxed);
+        // Contained: spdlog allocates, and this is inside a noexcept teardown whose
+        // remaining steps (mechanism stop, consumer join) must still run.
+        try {
+            spdlog::warn("SparkEngine::stop(): a mechanism teardown was still in flight after "
+                         "the shutdown budget — proceeding; a late unwatch() may now reach an "
+                         "already-stopped mechanism (~SparkEngine still waits for it before "
+                         "freeing anything)");
+        } catch (...) {
+        }
+    }
 
     // 2) Stop event-driven mechanisms (producers, like the wheel) BEFORE the
     // consumer threads they feed — a mechanism must quiesce before its downstream
@@ -1558,6 +1691,7 @@ SparkEngineStats SparkEngine::stats() const {
     s.arm_race_unwatch_failures_total =
         arm_race_unwatch_failures_.load(std::memory_order_relaxed);
     s.disarm_unwatch_failures_total = disarm_unwatch_failures_.load(std::memory_order_relaxed);
+    s.teardown_join_timeouts_total = teardown_join_timeouts_.load(std::memory_order_relaxed);
     s.consumer_threads_detached = consumer_threads_detached_.load(std::memory_order_relaxed);
     s.events_total = events_total_.load(std::memory_order_relaxed);
     s.queued_delivered_total = delivery_->delivered.load(std::memory_order_relaxed);

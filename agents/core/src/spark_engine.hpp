@@ -120,6 +120,23 @@ struct SparkEngineStats {
     /// reclamation bound as its counterpart.
     std::uint64_t disarm_unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
+    /// stop() calls whose BOUNDED wait for the in-flight mechanism-teardown lease
+    /// expired, so stop() proceeded to tear the mechanisms down with a caller still
+    /// inside the post-mu_ window (#2815). Monotonic.
+    ///
+    /// JOURNAL-ONLY BY CONSTRUCTION, and deliberately absent from
+    /// emit_spark_heartbeat_tags(): this counter can only ever increment INSIDE stop(),
+    /// which runs after running_ = false, and the heartbeat gate at agent.cpp:2552 emits
+    /// nothing once shutdown has been requested. A heartbeat tag for it would be
+    /// unreachable on every path that can set it — the same shape as the two
+    /// unwatch-failure counters' shutdown-window increments (#2833). Its egress is the
+    /// spdlog::warn at the expiry site, plus this field for tests.
+    ///
+    /// Non-zero does NOT mean a use-after-free happened: ~SparkEngine's wait is
+    /// UNBOUNDED and is what actually closes that. It means the late unwatch may have
+    /// reached an already-stopped mechanism (benign — every real mechanism fails a
+    /// post-stop unwatch closed) and that some caller outstayed the budget.
+    std::uint64_t teardown_join_timeouts_total{0};
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
     std::uint64_t queued_dropped_total{0}; ///< bounded-queue overflow + shutdown drops
@@ -609,6 +626,37 @@ private:
     std::atomic<std::uint64_t> watch_faults_{0}; ///< monotonic mechanism fault-report count
     std::atomic<std::uint64_t> arm_race_unwatch_failures_{0}; ///< monotonic; teardown_arm_race ONLY (#2270)
     std::atomic<std::uint64_t> disarm_unwatch_failures_{0};   ///< monotonic; disarm() ONLY (#2270)
+    std::atomic<std::uint64_t> teardown_join_timeouts_{0};    ///< monotonic; stop()'s lease wait expired (#2815)
+
+    /// #2815 TEARDOWN LEASE. Callers currently inside one of the FOUR windows that
+    /// resolve a raw `ISparkMechanism*` (and this engine's mech_ops_mu_by_type_ entry)
+    /// under mu_, RELEASE mu_, and then call into the mechanism: disarm(),
+    /// teardown_arm_race(), unregister_consumer(), and the live arm path in arm_impl().
+    /// Armed as the last statement of the SAME mu_ block that resolves the mechanism,
+    /// released when the enclosing function returns (an RAII lease in spark_engine.cpp).
+    ///
+    /// stop() waits on it BOUNDED before stopping the mechanisms; ~SparkEngine waits on
+    /// it UNBOUNDED before any member is destroyed. The unbounded one is the actual
+    /// safety mechanism: without it, ~SparkEngine frees mech_ops_mu_by_type_ out from
+    /// under a caller parked in that window (use-after-free). The bounded one is an
+    /// API-contract nicety, and stop() must never become a place shutdown can hang.
+    ///
+    /// NO NEW CALLER CAN SLIP IN BEHIND stop(): all four doors gate their own entry on
+    /// running_/stopped_ under mu_ BEFORE they resolve a mechanism, so once stop()'s
+    /// early locked block has flipped both flags a later caller resolves nothing and
+    /// arms nothing. The lease counts exactly the callers in flight at that instant.
+    ///
+    /// A PLAIN ATOMIC, POLLED — deliberately, not for want of a condition_variable.
+    /// The lease is released from an RAII DESTRUCTOR on the door caller's thread, and
+    /// a destructor that locked a mutex would std::terminate on the std::system_error
+    /// std::mutex::lock is permitted to raise, in a subsystem whose whole design
+    /// premise is that an observe-only component may never take the agent down (see
+    /// stop()'s noexcept rationale). fetch_sub cannot throw, so the count is always
+    /// correct; the waiters absorb the cost as a 1 ms sleep-poll, which is paid only
+    /// at shutdown and only while a caller is genuinely in flight. Ordering: the
+    /// releasing fetch_sub and the waiters' acquiring load give the waiter
+    /// happens-before over everything the door caller did.
+    std::atomic<std::uint64_t> inflight_teardowns_{0};
 
     // Counters updated outside mu_ (delivery paths) — atomics.
     std::atomic<std::uint64_t> events_total_{0};
