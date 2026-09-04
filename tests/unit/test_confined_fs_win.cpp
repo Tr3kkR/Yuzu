@@ -25,6 +25,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <limits>
+#include <map>
 
 #include <algorithm>
 #include <chrono>
@@ -580,6 +581,74 @@ TEST_CASE("Unsupported fail-closed path via the ntdll injection seam deletes not
     CHECK(result.entries[0].status == EntryStatus::Failed);
     CHECK(result.entries[0].reason == Reason::Unsupported);
     CHECK(std::filesystem::exists(root_dir.path / "a.txt"));
+}
+
+
+// ── Windows end-to-end: the real enumerator's LastWriteTime ─────────────────
+//
+// Gate 1 (Codex FV-3, Kimi F3): the pure FILETIME conversion is exhaustively
+// tested, but nothing observed the value the ACTUAL enumerator supplies.
+// Reverting the assignment in confined_fs_win.cpp to drop the timestamp left
+// every Windows assertion green — and that TU does not compile on the macOS
+// dev host at all, so this case is also the only thing that will exercise the
+// wiring before it reaches production.
+//
+// This runs on the CI Windows leg. It sets an exact whole-second FILETIME with
+// SetFileTime, reads it back through the held root handle, and then lets an age
+// policy decide what is unlinked.
+TEST_CASE("Windows enumeration supplies LastWriteTime and age can select on it",
+          "[confined_fs][mtime]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_mtime_"};
+    std::filesystem::create_directories(tmp.path);
+    write_file(tmp.path / "old.tmp", "old");
+    write_file(tmp.path / "new.tmp", "new");
+
+    // Whole-second Unix instants, converted to FILETIME ticks with the inverse
+    // of the arithmetic under test — written out longhand here deliberately, so
+    // this case cannot pass by sharing a bug with filetime_to_unix_seconds.
+    constexpr std::int64_t kTicksPerSecond = 10'000'000;
+    constexpr std::int64_t kEpochDeltaSeconds = 11'644'473'600;
+    constexpr std::int64_t kOldSeconds = 946'684'800;   // 2000-01-01T00:00:00Z
+    constexpr std::int64_t kNewSeconds = 1'893'456'000; // 2030-01-01T00:00:00Z
+    auto set_mtime = [](const std::filesystem::path& p, std::int64_t unix_seconds) {
+        const std::int64_t ticks = (unix_seconds + kEpochDeltaSeconds) * kTicksPerSecond;
+        FILETIME ft;
+        ft.dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFULL);
+        ft.dwHighDateTime = static_cast<DWORD>(static_cast<std::uint64_t>(ticks) >> 32);
+        HANDLE h = ::CreateFileW(p.wstring().c_str(), FILE_WRITE_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                 FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        REQUIRE(h != INVALID_HANDLE_VALUE);
+        const BOOL ok = ::SetFileTime(h, nullptr, nullptr, &ft);
+        ::CloseHandle(h);
+        REQUIRE(ok);
+    };
+    set_mtime(tmp.path / "old.tmp", kOldSeconds);
+    set_mtime(tmp.path / "new.tmp", kNewSeconds);
+
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+
+    // 1. The enumerator reports the real values.
+    const EnumBudget budget{1000, std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    EnumerateResult enumerated =
+        enumerate_at(opened.root->handle_.get(), opened.root->identity(), budget);
+    REQUIRE(enumerated.reason == Reason::None);
+    std::map<std::string, std::optional<std::int64_t>> by_name;
+    for (const auto& e : enumerated.entries) by_name[e.name] = e.meta.mtime;
+    CHECK(by_name["old.tmp"] == std::optional<std::int64_t>{kOldSeconds});
+    CHECK(by_name["new.tmp"] == std::optional<std::int64_t>{kNewSeconds});
+
+    // 2. And an age policy over them selects correctly end-to-end.
+    constexpr std::int64_t kCutoff = 1'500'000'000;
+    MatchFn older_than_cutoff = [](std::string_view, const EntryMeta& meta) {
+        if (!meta.mtime) return false;
+        return *meta.mtime < kCutoff;
+    };
+    DeleteResult result = delete_matching(*opened.root, older_than_cutoff, open_limits());
+    REQUIRE(result.stop_reason == Reason::None);
+    CHECK_FALSE(std::filesystem::exists(tmp.path / "old.tmp"));
+    CHECK(std::filesystem::exists(tmp.path / "new.tmp"));
 }
 
 #endif // _WIN32

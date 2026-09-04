@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <iterator>
+#include <map>
 #include <limits>
 #include <system_error>
 
@@ -941,3 +942,66 @@ TEST_CASE("a MatchFn that throws on its first invocation stops before any deleti
 }
 
 #endif // !_WIN32
+
+// ── POSIX end-to-end: the real enumerator's timestamp ───────────────────────
+//
+// Gate 1 (Codex FV-2, Kimi F2, Spec F3): the pure conversion was tested
+// exhaustively and the POPULATE step not at all. Reverting the assignment in
+// confined_fs_posix.cpp to omit the timestamp left every POSIX assertion green,
+// because no test observed `meta.mtime` from a real file.
+//
+// This exercises the whole path a consumer depends on: a real file with a real
+// mtime, read through the held root fd by the same fstatat the walk already
+// performs, delivered to a MatchFn, and controlling what is actually unlinked.
+TEST_CASE("POSIX enumeration supplies a real file's mtime and age can select on it",
+          "[confined_fs][mtime]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_posix_mtime_"};
+    const fs::path root_dir = tmp.path / "root";
+    fs::create_directories(root_dir);
+    write_file(root_dir / "old.tmp");
+    write_file(root_dir / "new.tmp");
+
+    // Whole-second, far from "now", so the assertion cannot pass by accident
+    // and does not depend on the clock during the test.
+    constexpr std::int64_t kOldSeconds = 946'684'800;  // 2000-01-01T00:00:00Z
+    constexpr std::int64_t kNewSeconds = 1'893'456'000; // 2030-01-01T00:00:00Z
+    auto set_mtime = [&](const fs::path& p, std::int64_t secs) {
+        struct timespec times[2];
+        times[0].tv_sec = static_cast<time_t>(secs); times[0].tv_nsec = 0; // atime
+        times[1].tv_sec = static_cast<time_t>(secs); times[1].tv_nsec = 0; // mtime
+        REQUIRE(::utimensat(AT_FDCWD, p.c_str(), times, AT_SYMLINK_NOFOLLOW) == 0);
+    };
+    set_mtime(root_dir / "old.tmp", kOldSeconds);
+    set_mtime(root_dir / "new.tmp", kNewSeconds);
+
+    OpenRootResult opened = open_root(root_dir);
+    REQUIRE(opened.root.has_value());
+
+    // 1. The enumerator itself reports the real values.
+    const EnumBudget budget{1000, std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    EnumerateResult enumerated =
+        enumerate_at(opened.root->fd_.get(), opened.root->identity(), budget);
+    REQUIRE(enumerated.entries.size() == 2);
+    std::map<std::string, std::optional<std::int64_t>> by_name;
+    for (const auto& e : enumerated.entries) by_name[e.name] = e.meta.mtime;
+    CHECK(by_name["old.tmp"] == std::optional<std::int64_t>{kOldSeconds});
+    CHECK(by_name["new.tmp"] == std::optional<std::int64_t>{kNewSeconds});
+
+    // 2. And an age policy over those values selects correctly end-to-end.
+    constexpr std::int64_t kCutoff = 1'500'000'000; // between the two
+    MatchFn older_than_cutoff = [](std::string_view, const EntryMeta& meta) {
+        if (!meta.mtime) return false;
+        return *meta.mtime < kCutoff;
+    };
+    DeleteLimits limits{};
+    limits.max_entries = 100;
+    limits.max_bytes = 1'000'000;
+    limits.max_wall = std::chrono::milliseconds{60'000};
+    limits.max_depth = 4;
+    limits.max_open_dirs = 4;
+
+    DeleteResult result = delete_matching(*opened.root, older_than_cutoff, limits);
+    REQUIRE(result.stop_reason == Reason::None);
+    CHECK_FALSE(fs::exists(root_dir / "old.tmp"));
+    CHECK(fs::exists(root_dir / "new.tmp"));
+}

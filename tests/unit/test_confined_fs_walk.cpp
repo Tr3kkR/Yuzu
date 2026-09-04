@@ -652,3 +652,89 @@ TEST_CASE("walk_delete: bytes_deleted grows only on successful deletes", "[confi
 
     REQUIRE(result.tally.bytes_deleted == 30);
 }
+
+// ── The metadata contract between walker and predicate ──────────────────────
+//
+// Gate 1 (all four reviewers, independently): the change's whole purpose is
+// that an entry's real modification time reaches a caller's MatchFn, and that
+// was asserted NOWHERE. Every existing predicate discards its EntryMeta
+// argument, so — as Kimi put it — reverting the one-line pass-through in
+// walk_delete left the entire suite green. Compilation proved the two-argument
+// SHAPE; nothing proved WHICH metadata was forwarded, or that age could
+// actually control deletion.
+TEST_CASE("walk_delete forwards the entry's own metadata to MatchFn",
+          "[confined_fs][mtime]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+
+    DirEntry old_file = file_entry("old.tmp");
+    old_file.meta.mtime = 1'000;
+    old_file.meta.size_bytes = 11;
+    DirEntry new_file = file_entry("new.tmp");
+    new_file.meta.mtime = 2'000;
+    new_file.meta.size_bytes = 22;
+    DirEntry undated = file_entry("undated.tmp");
+    undated.meta.mtime = std::nullopt;
+    undated.meta.size_bytes = 33;
+    ops.dir(root).entries = {old_file, new_file, undated};
+
+    // Record exactly what the predicate is handed, keyed by the path it is
+    // handed alongside — so a forwarding bug that supplies the WRONG entry's
+    // metadata fails, not just one that supplies none.
+    std::map<std::string, std::optional<std::int64_t>> seen_mtime;
+    std::map<std::string, std::uint64_t> seen_size;
+    MatchFn observe = [&](std::string_view rel_path, const EntryMeta& meta) {
+        seen_mtime[std::string{rel_path}] = meta.mtime;
+        seen_size[std::string{rel_path}] = meta.size_bytes;
+        return false; // delete nothing; this case is about delivery only
+    };
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, observe, kOpenLimits);
+    REQUIRE(result.stop_reason == Reason::None);
+
+    REQUIRE(seen_mtime.size() == 3);
+    CHECK(seen_mtime["old.tmp"] == std::optional<std::int64_t>{1'000});
+    CHECK(seen_mtime["new.tmp"] == std::optional<std::int64_t>{2'000});
+    CHECK_FALSE(seen_mtime["undated.tmp"].has_value());
+    // The size travels through the same struct, so pinning it here catches a
+    // forwarding bug that hands over a DEFAULT-constructed meta rather than
+    // the entry's own.
+    CHECK(seen_size["old.tmp"] == 11);
+    CHECK(seen_size["new.tmp"] == 22);
+    CHECK(seen_size["undated.tmp"] == 33);
+}
+
+TEST_CASE("walk_delete: a MatchFn can select by age, and an undated entry is refused",
+          "[confined_fs][mtime]") {
+    FakeOps ops{std::chrono::steady_clock::now()};
+    int root = ops.add_dir();
+
+    DirEntry old_file = file_entry("old.tmp");
+    old_file.meta.mtime = 1'000;
+    DirEntry new_file = file_entry("new.tmp");
+    new_file.meta.mtime = 2'000;
+    DirEntry undated = file_entry("undated.tmp");
+    undated.meta.mtime = std::nullopt;
+    ops.dir(root).entries = {old_file, new_file, undated};
+
+    // The shape a real consumer writes: absence is handled BEFORE any
+    // arithmetic, which is the whole reason mtime is an optional rather than a
+    // sentinel. An undated entry is refused rather than treated as ancient.
+    constexpr std::int64_t kCutoff = 1'500;
+    MatchFn older_than_cutoff = [&](std::string_view, const EntryMeta& meta) {
+        if (!meta.mtime) return false; // unknown age -> do not act
+        return *meta.mtime < kCutoff;
+    };
+
+    DeleteResult result = walk_delete<FakeOps>(root, ops, older_than_cutoff, kOpenLimits);
+    REQUIRE(result.stop_reason == Reason::None);
+
+    // Exactly one entry deleted, and it is the old one by NAME -- not merely a
+    // count, which a wrong-entry bug would satisfy.
+    std::vector<std::string> deleted;
+    for (const auto& e : result.entries)
+        if (e.status == EntryStatus::Deleted) deleted.push_back(e.rel_path);
+    REQUIRE(deleted.size() == 1);
+    CHECK(deleted[0] == "old.tmp");
+    CHECK(ops.unlink_calls_ == 1);
+}

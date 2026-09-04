@@ -195,19 +195,19 @@ TEST_CASE("filetime_to_unix_seconds converts the Unix epoch exactly",
           "[confined_fs][mtime]") {
     // 1970-01-01T00:00:00Z expressed in 100ns ticks since 1601-01-01.
     constexpr std::int64_t kUnixEpochInFiletimeTicks = 116'444'736'000'000'000;
-    CHECK(filetime_to_unix_seconds(kUnixEpochInFiletimeTicks) == 0);
+    CHECK(filetime_to_unix_seconds(kUnixEpochInFiletimeTicks) == std::optional<std::int64_t>{0});
 }
 
 TEST_CASE("filetime_to_unix_seconds converts a known post-epoch instant",
           "[confined_fs][mtime]") {
     // Exactly one day after the Unix epoch: 86400 seconds.
     constexpr std::int64_t kOneDayTicks = 116'444'736'000'000'000 + 86'400LL * 10'000'000LL;
-    CHECK(filetime_to_unix_seconds(kOneDayTicks) == 86'400);
+    CHECK(filetime_to_unix_seconds(kOneDayTicks) == std::optional<std::int64_t>{86'400});
 
     // A whole non-leap year later.
     constexpr std::int64_t kOneYearTicks =
         116'444'736'000'000'000 + 365LL * 86'400LL * 10'000'000LL;
-    CHECK(filetime_to_unix_seconds(kOneYearTicks) == 365LL * 86'400LL);
+    CHECK(filetime_to_unix_seconds(kOneYearTicks) == std::optional<std::int64_t>{365LL * 86'400LL});
 }
 
 TEST_CASE("filetime_to_unix_seconds reports unset timestamps as unknown, not 1601",
@@ -216,8 +216,8 @@ TEST_CASE("filetime_to_unix_seconds reports unset timestamps as unknown, not 160
     // -11644473600 (the year 1601), which an age filter reads as impossibly
     // old and therefore SAFE TO DELETE. That is the wrong direction for a
     // destructive action, so it must be indistinguishable from "unknown".
-    CHECK(filetime_to_unix_seconds(0) == kMtimeUnknown);
-    CHECK(filetime_to_unix_seconds(-1) == kMtimeUnknown);
+    CHECK_FALSE(filetime_to_unix_seconds(0).has_value());
+    CHECK_FALSE(filetime_to_unix_seconds(-1).has_value());
 }
 
 TEST_CASE("filetime_to_unix_seconds handles pre-epoch timestamps as negative",
@@ -227,21 +227,21 @@ TEST_CASE("filetime_to_unix_seconds handles pre-epoch timestamps as negative",
     // so an age comparison still sees it as old.
     constexpr std::int64_t kOneDayBeforeEpoch =
         116'444'736'000'000'000 - 86'400LL * 10'000'000LL;
-    CHECK(filetime_to_unix_seconds(kOneDayBeforeEpoch) == -86'400);
+    CHECK(filetime_to_unix_seconds(kOneDayBeforeEpoch) == std::optional<std::int64_t>{-86'400});
 }
 
-TEST_CASE("an unpopulated EntryMeta is unknown-aged, never epoch-aged",
+TEST_CASE("an unpopulated EntryMeta has NO timestamp, never a misleading one",
           "[confined_fs][mtime]") {
     // The default matters: a consumer filtering on age must not be handed a
     // meta that claims 1970 and therefore reads as infinitely old.
     const EntryMeta fresh{};
-    CHECK(fresh.mtime_unix == kMtimeUnknown);
+    CHECK_FALSE(fresh.mtime.has_value());
 
     // Three-element aggregate initialisation (the pre-change form, still used
     // throughout the existing tests) must also default the timestamp safely
     // rather than to 0.
     const EntryMeta legacy_shape{EntryType::RegularFile, 42, true};
-    CHECK(legacy_shape.mtime_unix == kMtimeUnknown);
+    CHECK_FALSE(legacy_shape.mtime.has_value());
 }
 
 TEST_CASE("decide_entry is UNCHANGED by the presence of a timestamp",
@@ -253,9 +253,9 @@ TEST_CASE("decide_entry is UNCHANGED by the presence of a timestamp",
                               .max_depth = 4, .max_open_dirs = 4};
     const WalkTally tally{};
     EntryMeta ancient{EntryType::RegularFile, 10, true};
-    ancient.mtime_unix = 0;
+    ancient.mtime = 0;
     EntryMeta brand_new{EntryType::RegularFile, 10, true};
-    brand_new.mtime_unix = 4'000'000'000;
+    brand_new.mtime = 4'000'000'000;
     EntryMeta unknown_age{EntryType::RegularFile, 10, true};
 
     const Decision a = decide_entry(ancient, limits, tally, false, false, true);
