@@ -2833,19 +2833,31 @@ TEST_CASE("File spark (real mechanism): a failed retire keeps the DirWatch alive
     namespace fs = std::filesystem;
     const auto pid = std::to_string(::GetCurrentProcessId());
     const fs::path dir = fs::temp_directory_path() / ("yuzu_test_spark_2839_" + pid);
+    // A SIBLING directory, not a second file in `dir` — spark_file.cpp's watch() keys
+    // dirs_ by the PARENT DIRECTORY (dirkey), so a second watch under `dir` would
+    // resurrect the exact dangling dirs_[dirkey] slot the throw below leaves behind,
+    // silently repairing the state this test exists to check and making every
+    // assertion below pass identically whether the fix is present or not (found via
+    // real Windows red/green verification, #2839 follow-up — the test as first
+    // written had zero discriminating power).
+    const fs::path other_dir = fs::temp_directory_path() / ("yuzu_test_spark_2839_" + pid + "_sibling");
     std::error_code ec;
     fs::remove_all(dir, ec);
+    fs::remove_all(other_dir, ec);
     fs::create_directories(dir);
+    fs::create_directories(other_dir);
     const fs::path target = dir / "t.txt";
     { std::ofstream(target) << "seed"; }
 
     struct DirCleanup {
         const fs::path& d;
+        const fs::path& d2;
         ~DirCleanup() {
             std::error_code e;
             fs::remove_all(d, e);
+            fs::remove_all(d2, e);
         }
-    } dir_cleanup{dir}; // declared BEFORE mech, so it runs AFTER ~mech has closed handles
+    } dir_cleanup{dir, other_dir}; // declared BEFORE mech, so it runs AFTER ~mech has closed handles
 
     auto mech = make_file_mechanism();
     REQUIRE(mech);
@@ -2871,8 +2883,9 @@ TEST_CASE("File spark (real mechanism): a failed retire keeps the DirWatch alive
     // "fully quarantined".
     CHECK(mech->stats().retiring == 0);
 
-    // The mechanism is not wedged: a fresh watch on a different key still arms.
-    const fs::path other = dir / "u.txt";
+    // The mechanism is not wedged: a fresh watch on a DIFFERENT DIRECTORY still arms
+    // (see other_dir's declaration above for why it must not be `dir`).
+    const fs::path other = other_dir / "u.txt";
     { std::ofstream(other) << "seed"; }
     CHECK(mech->watch("k2839b", FileSparkParams{other.string()}).has_value());
 
