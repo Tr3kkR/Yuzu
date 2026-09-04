@@ -100,9 +100,14 @@ struct FakeBackend : ISparkBackend {
         if (throw_arm.load()) throw std::runtime_error("arm boom");
         if (fail_arm.load()) return std::unexpected(std::string{"no mechanism"});
         arms.fetch_add(1);
-        return next.fetch_add(1);
+        const std::uint64_t id = next.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk{ids_mu_};
+            armed_ids_.push_back(id);
+        }
+        return id;
     }
-    void disarm(std::uint64_t) override {
+    void disarm(std::uint64_t sub) override {
         if (hang_next_disarm.exchange(false)) {
             std::unique_lock<std::mutex> lk{disarm_gate_mu_};
             disarm_entered_hang_ = true;
@@ -110,7 +115,23 @@ struct FakeBackend : ISparkBackend {
             disarm_gate_cv_.wait(lk, [this] { return disarm_released_; });
         }
         disarms.fetch_add(1);
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        disarmed_ids_.push_back(sub);
     }
+    /// #3816: exact-id recording, not just balanced counts - a wrong-handle disarm
+    /// (the right COUNT, the wrong SUBSCRIPTION) would pass a count-only check.
+    std::vector<std::uint64_t> armed_ids() const {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        return armed_ids_;
+    }
+    std::vector<std::uint64_t> disarmed_ids() const {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        return disarmed_ids_;
+    }
+    mutable std::mutex ids_mu_;
+    std::vector<std::uint64_t> armed_ids_;
+    std::vector<std::uint64_t> disarmed_ids_;
+
     /// Blocks until a hung arm() has actually entered its wait (avoids a racy
     /// sleep-based poll for "is the worker parked yet").
     bool wait_entered_hang(std::chrono::seconds timeout) {
@@ -2062,12 +2083,49 @@ TEST_CASE("#2233 item 3: begin_stop() wakes a parked arm before its deadline ela
                        // wakes the WAITER, not the underlying OS call - see begin_stop's doc)
 }
 
+TEST_CASE("#3816: begin_stop() followed by a late successful arm disarms the exact "
+          "subscription id, once",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    std::atomic<int> outcome_ok{-1};
+    std::thread a_thread{[&] {
+        auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        outcome_ok.store(gen.has_value() ? 1 : 0, std::memory_order_release);
+    }};
+    struct Cleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~Cleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } cleanup{b.get(), &a_thread};
+
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->begin_stop(); // wakes the parked caller with Stopped, well before the arm resolves
+    a_thread.join();
+    CHECK(outcome_ok.load(std::memory_order_acquire) == 0); // rejected (stopping)
+
+    b->release_hang(); // let the parked arm() finally succeed, well after the stop
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->arms.load() == 1);
+    CHECK(b->disarms.load() == 1);
+    CHECK(b->armed_ids() == b->disarmed_ids()); // the exact id, not merely a count
+    CHECK(rt->backend_op_late_arms() == 1);
+}
+
 // ── Adversarial-review fix round: C1/c1 (late-success subscription leak) and
 // C2/c2 (rollback disarm still under registry_mu_), both reviewers independently
 // HIGH, plus C5/k3 (untested detach-during-in-flight-arm withdrawal path). ──
 
-TEST_CASE("#2233 item 3 (C1/c1): a timeout followed by a LATE successful arm "
-          "self-disarms instead of leaking the subscription",
+TEST_CASE("#3816 (was C1/c1): a timeout followed by a LATE successful arm "
+          "is disarmed by GuardianIoExecutor's own on_abandoned, not leaked",
           "[spark][runtime][liveness]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -2088,22 +2146,24 @@ TEST_CASE("#2233 item 3 (C1/c1): a timeout followed by a LATE successful arm "
     REQUIRE_FALSE(gen);
     CHECK(gen.error() == "arm timed out");
     // The worker is STILL parked at this point (only release_hang() unblocks it) -
-    // attach_rule's post-wait commit has already run and erased arming_keys_[key],
-    // which is exactly the signal the worker's own self-disarm check relies on.
+    // attach_rule has already returned Timeout to its own caller.
     CHECK(rt->armed_key_count() == 0);
     CHECK(b->arms.load() == 0);
     CHECK(b->disarms.load() == 0);
+    CHECK(rt->backend_op_late_arms() == 0);
 
     b->release_hang(); // let the parked arm() finally return - successfully, LATE
-    REQUIRE(yuzu::test::spin_until([&] { return b->arms.load() == 1; },
-                                   std::chrono::seconds(10)));
-    // The worker's own self-disarm check (registry_mu_-serialised against
-    // arming_keys_'s erase, see attach_rule's comment) must fire: the arm
-    // succeeded, but nobody was still waiting for it.
+    // #3816: GuardianIoExecutor itself decides this arm arrived after its own
+    // caller gave up and routes it to attach_rule's on_abandoned callback, which
+    // disarms it - not a self-check racing arming_keys_'s erase any more.
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
     CHECK(b->arms.load() == 1);
     CHECK(b->disarms.load() == 1);
+    // Exact-id check, not just balanced counts (#3816): the id disarmed must be
+    // the SAME id this arm() call minted, never merely "some id".
+    CHECK(b->armed_ids() == b->disarmed_ids());
+    CHECK(rt->backend_op_late_arms() == 1);
     // No trace of a live watcher anywhere in the runtime's own bookkeeping - the
     // subscription was real (arms==1) but is now fully reclaimed (disarms==1),
     // not silently untracked.
@@ -2115,6 +2175,35 @@ TEST_CASE("#2233 item 3 (C1/c1): a timeout followed by a LATE successful arm "
     REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
     CHECK(rt->armed_key_count() == 1);
     CHECK(b->arms.load() == 2);
+}
+
+TEST_CASE("#3816: a timeout followed by a LATE FAILED arm is not counted as a late "
+          "success and attempts no disarm",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    REQUIRE_FALSE(gen);
+    CHECK(gen.error() == "arm timed out");
+
+    b->fail_arm.store(true); // the parked call, once released, fails rather than succeeds
+    b->release_hang();
+    // No counter this failure path touches ever increments, so there is nothing to
+    // spin_until on to prove the worker resumed - give it ample bounded time (same
+    // idiom test_guardian_io_executor.cpp uses to prove an erroneous action never
+    // happened) before asserting the negative.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(b->arms.load() == 0);      // arm() itself failed - no subscription ever minted
+    CHECK(b->disarms.load() == 0);   // nothing to disarm
+    CHECK(rt->backend_op_late_arms() == 0); // a late FAILURE is not a late SUCCESS
 }
 
 TEST_CASE("#2233 item 3 (security-guardian F2 / cpp-safety HIGH): a same-rule_id "
