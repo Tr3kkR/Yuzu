@@ -225,6 +225,7 @@ int emit_smart(yuzu::CommandContext& ctx) {
     ScopedIOObject it{raw_it};
 
     bool any_row = false;
+    bool any_device_unresolved = false;
     for (io_object_t raw_obj; (raw_obj = IOIteratorNext(it.get()));) {
         ScopedIOObject obj{raw_obj};
 
@@ -272,21 +273,45 @@ int emit_smart(yuzu::CommandContext& ctx) {
                   "Apple's private IONVMeSMARTUserClient interface)"
                 : "device does not advertise SMART capability";
 
+        // An IOBlockStorageDevice with no IOMedia child (an empty card reader or
+        // optical bay) resolves no BSD name. That is a device we could not
+        // identify, not a device named "-", and it needs the seam like any
+        // other unresolved read.
+        if (device.empty()) any_device_unresolved = true;
+
         write_smart_row(ctx, device.empty() ? "-" : device, model.empty() ? "-" : model,
                         bus_from_class(cls), media_from_characteristics(dict), Health::Unknown,
                         std::nullopt, std::nullopt, detail);
         any_row = true;
     }
 
-    if (!any_row) {
-        write_smart_row(ctx, "-", "-", Bus::Unknown, Media::Unknown, Health::Unknown, std::nullopt,
-                        std::nullopt, "no block storage devices found");
-    }
-    // Reported once, after the walk, so it cannot be overwritten by a later
-    // per-device mark. The whole leg is constrained by construction: it reads
-    // identity and capability but never health.
-    mark_result_partial(ctx, "macos:iokit",
+    // ORDERING IS THE CONTRACT HERE. set_result_status ASSIGNS, so the LAST
+    // call wins, and the constraint below is TRUE ON EVERY RUN. Reporting it
+    // last -- as an earlier revision did -- overwrote every more-material
+    // cause with a constant, so no real macOS degradation could ever reach a
+    // status-keyed consumer. Least-material (always true) FIRST.
+    //
+    // The token is `macos:iokit:health_unread`, not bare `macos:iokit`: sharing
+    // the token with the hard IOServiceGetMatchingServices failure gave that
+    // alert key a 100% firing rate on healthy hosts, which makes it useless for
+    // detecting a genuinely broken IOKit.
+    mark_result_partial(ctx, "macos:iokit:health_unread",
                         "health attributes are not read on macOS; identity and capability only");
+
+    if (any_device_unresolved)
+        mark_result_partial(ctx, "macos:iokit:no_bsd_name",
+                            "at least one block storage device resolved no BSD name and is "
+                            "reported with \"-\" as its device");
+
+    if (!any_row) {
+        // `unsupported`, not `unknown`, so the placeholder is not schema-
+        // identical to a real device row; and an empty walk reaches the seam
+        // rather than returning a clean, complete inventory of nothing.
+        write_smart_row(ctx, "-", "-", Bus::Unknown, Media::Unknown, Health::Unsupported,
+                        std::nullopt, std::nullopt, "no block storage devices found");
+        mark_result_unavailable(ctx, "macos:iokit",
+                                "no IOBlockStorageDevice was found on this host");
+    }
     return 0;
 }
 
@@ -368,11 +393,20 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         any_row = true;
     }
 
-    if (!any_row)
-        write_volume_row(ctx, "-", "-", "-", "-", std::nullopt, "no IOMedia objects found");
+    if (!any_row) {
+        // Word this for what actually happened. IOMedia objects may well have
+        // been FOUND and then dropped by the join filter above (a host whose
+        // every media object is a whole disk serving no mount point), so
+        // "no IOMedia objects found" would be a falsehood in exactly the case
+        // that produces it most often.
+        write_volume_row(ctx, "-", "-", "-", "-", std::nullopt,
+                         "no IOMedia object carried a physical-to-logical mapping to report");
+        mark_result_unavailable(ctx, "macos:iomedia",
+                                "no volume mapping could be produced on this host");
+    }
     // Least-material first: set_result_status assigns, so the LAST call wins.
     if (any_media_skipped)
-        mark_result_partial(ctx, "macos:iomedia",
+        mark_result_partial(ctx, "macos:iomedia:no_bsd_name",
                             "at least one IOMedia object reported no BSD name and is absent from "
                             "this listing");
     if (any_physical_unresolved)
@@ -380,7 +414,11 @@ int emit_volumes(yuzu::CommandContext& ctx) {
                             "the backing physical disk could not be resolved for at least one "
                             "volume; those rows show \"-\" without meaning none exists");
     if (!mounts_ok)
-        mark_result_partial(ctx, "macos:getmntinfo",
+        // The token names the API the code CALLS. getmntinfo(3) was replaced by
+        // getmntinfo_r_np for the static-buffer race documented above, and a
+        // provenance token naming the removed call is exactly the drift that
+        // invites someone to "restore consistency" by putting it back.
+        mark_result_partial(ctx, "macos:getmntinfo_r_np",
                             "getmntinfo_r_np returned no entries; volumes are listed without their "
                             "mount points");
     return 0;

@@ -148,11 +148,22 @@ constexpr int kMaxPhysicalDrives = 64; // bounds the probe walk; see emit_smart
 /// Open \\.\PhysicalDriveN with ZERO access rights. See negative (1) in the
 /// file banner: this is what an unprivileged service account may do, and it is
 /// sufficient for every IOCTL this file issues.
-ScopedFileHandle open_physical_drive(int index) {
+///
+/// `err` receives the failing GetLastError() and is meaningful only when the
+/// returned handle is invalid. It is captured HERE, immediately after
+/// CreateFileW, because this function destroys a heap-allocated std::wstring
+/// on the way out; that free can overwrite the thread's last error before the
+/// caller ever reads it. The caller's classification depends on the exact code
+/// -- ERROR_FILE_NOT_FOUND is the normal terminator on roughly 62 of 64
+/// iterations, so a clobbered value would misclassify a HEALTHY host as a
+/// degraded one.
+ScopedFileHandle open_physical_drive(int index, DWORD& err) {
+    err = 0;
     const std::wstring path = L"\\\\.\\PhysicalDrive" + std::to_wstring(index);
-    return ScopedFileHandle{::CreateFileW(path.c_str(), 0,
-                                          FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                          OPEN_EXISTING, 0, nullptr)};
+    ScopedFileHandle h{::CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     nullptr, OPEN_EXISTING, 0, nullptr)};
+    if (!h.valid()) err = ::GetLastError();
+    return h;
 }
 
 Bus bus_from_storage_type(STORAGE_BUS_TYPE t) {
@@ -244,26 +255,54 @@ std::optional<DriveIdentity> query_identity(HANDLE h, DWORD& err) {
 /// NVMe specification: [0] critical warning, [3] available spare %,
 /// [5] percentage used.
 std::optional<NvmeHealth> query_nvme_health(HANDLE h) {
+    // LAYOUT PROOF, and a deliberate absence of named members.
+    //
+    // The Windows protocol query is a single flat buffer: a STORAGE_PROPERTY_QUERY
+    // whose trailing `AdditionalParameters` (declared `BYTE[1]`) is where a
+    // STORAGE_PROTOCOL_SPECIFIC_DATA actually begins, with the payload after it.
+    // Writing through that member is the documented wire contract, not a hack.
+    //
+    // An earlier revision declared `STORAGE_PROTOCOL_SPECIFIC_DATA protocol;` and
+    // `BYTE data[512];` as named members here. They were a TRAP: the cast below
+    // establishes the real object at offsetof(AdditionalParameters) == 8, while
+    // the named `protocol` sat at 12 and `data` at 52 — so neither named member
+    // was ever the object the driver reads. Setting `req.protocol.ProtocolType`
+    // (the obvious maintenance edit) would have configured nothing, the driver
+    // would have seen ProtocolTypeUnknown, and NVMe health would have gone
+    // silently unread on every drive. The members are gone so that edit cannot
+    // be written; the buffer is a flat array sized and aligned for the query.
+    // The NVMe SMART / Health Information log page is 512 bytes. Named once so
+    // the request size, the declared ProtocolDataLength and the reply buffer
+    // cannot drift apart.
+    static constexpr std::size_t kNvmeLogPageBytes = 512;
+    static constexpr std::size_t kProtoQueryBytes =
+        offsetof(STORAGE_PROPERTY_QUERY, AdditionalParameters) +
+        sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA) + kNvmeLogPageBytes;
     struct Request {
-        STORAGE_PROPERTY_QUERY query;
-        STORAGE_PROTOCOL_SPECIFIC_DATA protocol;
-        BYTE data[512];
+        alignas(STORAGE_PROPERTY_QUERY) BYTE bytes[kProtoQueryBytes];
     } req{};
-    req.query.PropertyId = StorageDeviceProtocolSpecificProperty;
-    req.query.QueryType = PropertyStandardQuery;
+    static_assert(sizeof(Request) >= kProtoQueryBytes,
+                  "the flat request buffer must hold the query header, the protocol descriptor "
+                  "and the full 512-byte log page");
+    static_assert(offsetof(STORAGE_PROPERTY_QUERY, AdditionalParameters) <= kProtoQueryBytes,
+                  "AdditionalParameters must lie inside the request buffer");
 
-    auto* psd = reinterpret_cast<STORAGE_PROTOCOL_SPECIFIC_DATA*>(req.query.AdditionalParameters);
+    auto* q = reinterpret_cast<STORAGE_PROPERTY_QUERY*>(req.bytes);
+    q->PropertyId = StorageDeviceProtocolSpecificProperty;
+    q->QueryType = PropertyStandardQuery;
+
+    auto* psd = reinterpret_cast<STORAGE_PROTOCOL_SPECIFIC_DATA*>(q->AdditionalParameters);
     psd->ProtocolType = ProtocolTypeNvme;
     psd->DataType = NVMeDataTypeLogPage;
     psd->ProtocolDataRequestValue = 2; // SMART / Health Information
     psd->ProtocolDataRequestSubValue = 0;
     psd->ProtocolDataOffset = sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA);
-    psd->ProtocolDataLength = sizeof(req.data);
+    psd->ProtocolDataLength = kNvmeLogPageBytes;
 
     // alignas: same reason as query_identity's buffer -- this is read back
     // through a STORAGE_PROTOCOL_DATA_DESCRIPTOR*.
     alignas(STORAGE_PROTOCOL_DATA_DESCRIPTOR)
-        std::array<BYTE, sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR) + 512> out{};
+        std::array<BYTE, sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR) + kNvmeLogPageBytes> out{};
     DWORD returned = 0;
     if (!::DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &req, sizeof req, out.data(),
                            static_cast<DWORD>(out.size()), &returned, nullptr))
@@ -337,24 +376,31 @@ int emit_smart(yuzu::CommandContext& ctx) {
     // Windows exposes no enumeration of PhysicalDriveN, so probe a bounded
     // range. ERROR_FILE_NOT_FOUND simply means that index does not exist and is
     // the normal terminator; ACCESS_DENIED is a different fact and is reported.
+    // Truncation detection: the probe is a bounded walk over a SPARSE namespace.
+    // PhysicalDriveN numbering has holes after a hot-remove, so "index 63 was
+    // open" is NOT the condition -- a host with more than 64 drives and nothing
+    // at 63 would truncate silently. What proves the range was exhausted is a
+    // clean not-found TAIL: a run of absent indices at the end of the walk. Any
+    // other exit means the cap may have cut the list short.
+    int trailing_absent = 0;
     for (int i = 0; i < kMaxPhysicalDrives; ++i) {
-        auto h = open_physical_drive(i);
+        DWORD open_err = 0;
+        auto h = open_physical_drive(i, open_err);
         if (!h.valid()) {
-            const DWORD err = ::GetLastError();
-            if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) continue;
-            if (err == ERROR_ACCESS_DENIED) {
+            if (open_err == ERROR_FILE_NOT_FOUND || open_err == ERROR_PATH_NOT_FOUND) {
+                ++trailing_absent;
+                continue;
+            }
+            trailing_absent = 0;
+            if (open_err == ERROR_ACCESS_DENIED) {
                 any_denied = true;
             } else {
                 any_open_failure = true;
-                if (first_open_err == 0) first_open_err = err;
+                if (first_open_err == 0) first_open_err = open_err;
             }
             continue;
         }
-
-        // Reaching the last probe index with an OPEN drive means the range may
-        // have truncated a real device, which is a different fact from simply
-        // running out of indices.
-        if (i == kMaxPhysicalDrives - 1) probe_cap_reached = true;
+        trailing_absent = 0;
 
         const std::string device = "PhysicalDrive" + std::to_string(i);
         DWORD identity_err = 0;
@@ -414,9 +460,22 @@ int emit_smart(yuzu::CommandContext& ctx) {
         any_row = true;
     }
 
-    if (!any_row)
-        write_smart_row(ctx, "-", "-", Bus::Unknown, Media::Unknown, Health::Unknown, std::nullopt,
-                        std::nullopt, "no physical drives could be opened");
+    // The walk ended without a clean not-found tail, so index 63 was either a
+    // real drive or an error -- either way the 64-index cap may have cut the
+    // list short and this inventory cannot claim to be complete.
+    if (trailing_absent == 0) probe_cap_reached = true;
+
+    if (!any_row) {
+        // `unsupported`, not `unknown`: this placeholder must not be schema-
+        // identical to a real drive row, or a positional consumer counts a
+        // phantom device named "-". And an empty walk is a fact the status seam
+        // must carry too -- returning 0 with UNDECLARED here would report a
+        // clean, complete inventory of nothing.
+        write_smart_row(ctx, "-", "-", Bus::Unknown, Media::Unknown, Health::Unsupported,
+                        std::nullopt, std::nullopt, "no physical drives could be opened");
+        mark_result_unavailable(ctx, "windows:physicaldrive",
+                                "no physical drive could be opened on this host");
+    }
 
     // Reported after the walk, least-material first, so the most actionable
     // cause is the one that survives set_result_status's last-writer-wins.
@@ -449,19 +508,42 @@ int emit_volumes(yuzu::CommandContext& ctx) {
     wchar_t volume[MAX_PATH] = {};
     const ScopedVolumeFindHandle find{::FindFirstVolumeW(volume, MAX_PATH)};
     if (!find.valid()) {
+        // ONE read, used twice. Reading GetLastError() a second time after
+        // write_volume_row has run std::format, safe_output_field, several
+        // allocations and a cross-ABI write_output returns whatever THOSE left
+        // behind -- the row and the status would then disagree, both claiming
+        // to name the cause.
+        const DWORD err = ::GetLastError();
         write_volume_row(ctx, "-", "-", "-", "-", std::nullopt,
-                         std::format("FindFirstVolumeW failed: {}", ::GetLastError()));
-        mark_result_partial(ctx, "windows:volume_enum",
-                            std::format("FindFirstVolumeW failed: {}", ::GetLastError()));
+                         std::format("FindFirstVolumeW failed: {}", err));
+        if (err == ERROR_ACCESS_DENIED)
+            mark_result_denied(ctx, "windows:volume_enum",
+                               "volume enumeration was refused; this agent account cannot "
+                               "enumerate volumes");
+        else
+            mark_result_partial(ctx, "windows:volume_enum",
+                                std::format("FindFirstVolumeW failed: {}", err));
         return 0;
     }
 
     bool any_extent_failure = false;
     bool any_extent_truncated = false;
     bool any_mounts_failure = false;
+    bool any_fstype_failure = false;
+    bool any_denied = false;
+    bool any_enum_failure = false;
+    DWORD first_enum_err = 0;
     for (;;) {
         std::wstring vol = volume;
         const std::string vol_utf8 = yuzu::win::from_wide(vol.c_str());
+
+        // PER-ROW causes. The typed seam transmits only the short provenance
+        // token -- the `reason` text goes to spdlog on the endpoint and never
+        // reaches the server -- so an aggregate mark tells a consumer that
+        // SOMETHING degraded but never WHICH row's "-" is a failure rather than
+        // a genuine "none". On the mount-points column that is the join this
+        // action exists for, so the cause travels in the row as well.
+        std::vector<std::string> row_causes;
 
         // Mount points served by this volume. A volume with no letter and no
         // mount point is reported with "-" rather than omitted -- it still
@@ -493,11 +575,16 @@ int emit_volumes(yuzu::CommandContext& ctx) {
                 if (!joined.empty()) mounts = joined;
             } else {
                 any_mounts_failure = true;
+                const DWORD e = ::GetLastError();
+                if (e == ERROR_ACCESS_DENIED) any_denied = true;
+                row_causes.push_back(std::format("mount-point enumeration failed: {}", e));
             }
         } else if (!sized && size_err != ERROR_MORE_DATA) {
             // A FAILED sizing call, as distinct from a successful one reporting
             // an empty mount list.
             any_mounts_failure = true;
+            if (size_err == ERROR_ACCESS_DENIED) any_denied = true;
+            row_causes.push_back(std::format("mount-point enumeration failed: {}", size_err));
         }
 
         // THE JOIN: which physical drives back this volume. CreateFileW wants
@@ -509,10 +596,20 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         std::string fstype = "-";
         {
             wchar_t fs_name[MAX_PATH] = {};
+            ::SetLastError(ERROR_SUCCESS);
             if (::GetVolumeInformationW(vol.c_str(), nullptr, 0, nullptr, nullptr, nullptr,
-                                        fs_name, MAX_PATH) &&
-                fs_name[0] != L'\0')
-                fstype = yuzu::win::from_wide(fs_name);
+                                        fs_name, MAX_PATH)) {
+                if (fs_name[0] != L'\0') fstype = yuzu::win::from_wide(fs_name);
+            } else {
+                // A REFUSED query, not a volume without a filesystem. Both
+                // produce "-", so without this the two are indistinguishable and
+                // a host where every volume is BitLocker-locked or not-ready
+                // still reports a clean, complete run.
+                const DWORD e = ::GetLastError();
+                any_fstype_failure = true;
+                if (e == ERROR_ACCESS_DENIED) any_denied = true;
+                row_causes.push_back(std::format("filesystem type query failed: {}", e));
+            }
         }
 
         std::string devices = "-";
@@ -554,38 +651,85 @@ int emit_volumes(yuzu::CommandContext& ctx) {
                     devices = joined;
                     total = bytes;
                 }
+                if (n > max_fit)
+                    row_causes.push_back(std::format(
+                        "the device reported {} extents but only {} fit the reply; this drive "
+                        "list is incomplete",
+                        n, max_fit));
             } else {
+                const DWORD e = ::GetLastError();
                 any_extent_failure = true;
+                if (e == ERROR_ACCESS_DENIED) any_denied = true;
+                row_causes.push_back(std::format("disk-extent query failed: {}", e));
             }
         } else {
+            // U1: a REFUSED volume handle is a privilege fact, not a device
+            // fact. The file banner's zero-access-rights measurement covered
+            // \\.\PhysicalDriveN only -- the VOLUME handle was never measured
+            // under an unprivileged account, so if #1442 moves the agent off
+            // LocalSystem this is the arm that fires, and it must not be
+            // reported as "the device did not answer".
+            const DWORD e = ::GetLastError();
             any_extent_failure = true;
+            if (e == ERROR_ACCESS_DENIED) any_denied = true;
+            row_causes.push_back(std::format("volume handle could not be opened: {}", e));
         }
 
-        write_volume_row(ctx, vol_utf8, mounts, devices, fstype, total, "-");
+        std::string detail = "-";
+        for (const auto& c : row_causes) {
+            if (detail == "-") detail.clear(); else detail += "; ";
+            detail += c;
+        }
+        write_volume_row(ctx, vol_utf8, mounts, devices, fstype, total, detail);
 
         if (!::FindNextVolumeW(find.get(), volume, MAX_PATH)) {
             const DWORD err = ::GetLastError();
-            if (err != ERROR_NO_MORE_FILES)
-                mark_result_partial(ctx, "windows:volume_enum",
-                                    std::format("FindNextVolumeW failed: {}", err));
+            if (err != ERROR_NO_MORE_FILES) {
+                // Recorded, NOT marked here. set_result_status assigns, so a
+                // mark emitted inside the loop is unconditionally overwritten by
+                // the summary block below -- and a truncated enumeration is the
+                // MOST material cause (the listing is incomplete), so it must be
+                // reported last, not first.
+                any_enum_failure = true;
+                first_enum_err = err;
+                if (err == ERROR_ACCESS_DENIED) any_denied = true;
+            }
             break;
         }
     }
 
-    // Least-material first: set_result_status assigns, so the LAST call wins and
-    // the most actionable cause must be reported last.
+    // Least-material FIRST: set_result_status assigns, so the LAST call wins.
+    // The ordering below is the priority order, weakest cause to strongest:
+    // a missing filesystem label < missing mount points < an incomplete drive
+    // list < an unreadable drive list < a truncated enumeration < a privilege
+    // denial. Each provenance token names exactly one cause, so an operator can
+    // alert on the distinction.
+    if (any_fstype_failure)
+        mark_result_partial(ctx, "windows:volume_information",
+                            "at least one volume refused its filesystem-type query; those rows "
+                            "show \"-\" for fstype without meaning the volume has no filesystem");
     if (any_mounts_failure)
         mark_result_partial(ctx, "windows:volume_mount_paths",
                             "at least one volume's mount-point enumeration failed; those rows show "
                             "\"-\" for mount points without meaning the volume has none");
     if (any_extent_truncated)
-        mark_result_partial(ctx, "windows:volume_extents",
+        mark_result_partial(ctx, "windows:volume_extents:truncated",
                             "at least one volume reported more disk extents than its reply could "
                             "carry; those rows name only some of the drives backing them");
     if (any_extent_failure)
-        mark_result_partial(ctx, "windows:volume_extents",
+        mark_result_partial(ctx, "windows:volume_extents:unread",
                             "at least one volume did not report its disk extents; those rows name "
                             "no backing drive");
+    if (any_enum_failure)
+        mark_result_partial(ctx, "windows:volume_enum",
+                            std::format("volume enumeration stopped early ({}); this listing is "
+                                        "incomplete", first_enum_err));
+    // Strongest cause last: a privilege denial is a different remediation from
+    // every degradation above it, and must survive last-writer-wins.
+    if (any_denied)
+        mark_result_denied(ctx, "windows:volume_enum",
+                           "at least one volume refused a zero-access open or query; this agent "
+                           "account cannot fully enumerate volumes");
     return 0;
 }
 

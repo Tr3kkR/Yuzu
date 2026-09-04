@@ -165,6 +165,28 @@ TEST_CASE("disk_actions plugin: smart action row shape", "[disk_actions][actions
         CHECK(one_of(f[4], kMedia, std::size(kMedia)));
         CHECK(one_of(f[5], kHealth, std::size(kHealth)));
     }
+
+    // THE BUILD-COMPLETENESS ASSERTION. This file's banner has claimed one
+    // exists since the first revision; it did not, and governance caught the
+    // false claim.
+    //
+    // Why a shape assertion cannot replace it: a leg whose implementation was
+    // compiled out still emits perfectly well-formed rows with a legal health
+    // token, so every CHECK above passes. On Windows, an SDK without <nvme.h>
+    // compiles out the entire NVMe health path (`__has_include` in
+    // disk_actions_win.cpp) and no drive reports health at all — while the
+    // descriptor continues to advertise SUPPORTED, rung 1, log page 0x02 with
+    // wear figures. That is a BUILD defect, not a host condition, and it is the
+    // exact shape of the dead FSCTL leg this plugin's sibling had to be rescued
+    // from — which is why the sibling carries the same assertion
+    // (test_filesystem_posture_local_dispatcher.cpp:378).
+#ifdef _WIN32
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        INFO("smart row: " << r);
+        CHECK(f[8].find("built without") == std::string::npos);
+    }
+#endif
 }
 
 TEST_CASE("disk_actions plugin: volumes action row shape", "[disk_actions][actions]") {
@@ -209,7 +231,11 @@ TEST_CASE("disk_actions: a degraded read reports through the typed status seam",
     auto smart = dispatcher.run(plugin->descriptor, "smart");
     CHECK(smart.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(smart.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-    CHECK(smart.result_provenance == "macos:iokit");
+    // The token is qualified, NOT the bare `macos:iokit`. The bare token is
+    // reserved for an IOKit enumeration FAILURE; this always-true structural
+    // constraint has its own key, so an operator alerting on a broken IOKit is
+    // not drowned by a signal that fires on every healthy macOS host.
+    CHECK(smart.result_provenance == "macos:iokit:health_unread");
 #elif defined(__linux__)
     // K5 + spec F5: the Linux legs are not implemented, which is UNAVAILABLE
     // ("this platform cannot do this"), never CONSTRAINED ("partial data") --
@@ -299,6 +325,26 @@ TEST_CASE("disk_actions: macOS resolves volumes to a real physical disk, not an 
         checked_any = true;
     }
     CHECK(checked_any);
+
+    // A SELF-CONTAINED assertion, because everything above derives its oracle
+    // from the sibling `smart` action. If emit_smart's matching class were
+    // changed (kIOBlockStorageDeviceClass -> kIOMediaClass), the `physical` set
+    // would silently widen to include synthesized containers, the check above
+    // would stop discriminating, and the original defect would return green.
+    //
+    // This proves the provider walk produced an answer the string shortcut
+    // CANNOT: on an APFS root, disk3s1s1's name-derived whole disk is disk3 (a
+    // synthesized container), while the walk resolves the real disk0.
+    bool walk_beat_the_string_shortcut = false;
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        if (f[3] == "-") continue;
+        if (yuzu::disk_actions::name_derived_whole_disk(f[1]) != f[3]) {
+            INFO("row where the provider walk disagrees with the name: " << r);
+            walk_beat_the_string_shortcut = true;
+        }
+    }
+    CHECK(walk_beat_the_string_shortcut);
 }
 
 // Adversarial review (2026-09-04, KMI-1/CDX-006): the macOS leg used bare
@@ -446,13 +492,38 @@ TEST_CASE("disk_actions: NVMe critical-warning bits map to the right verdict",
           NvmeVerdict::Failing);
 }
 
+// The offsets and bitmask ARE the contract with the device, so they are pinned
+// against the NVMe specification directly — as LITERALS.
+//
+// The previous revision of this test wrote `page[kNvmePercentageUsedOffset]`
+// and then asserted the decoded value came back, i.e. it read and wrote through
+// the SAME constant. Changing that constant from 5 to 6 left it green, which
+// made it worthless as closure for the two external reviewers' finding that a
+// shifted offset would ship silently. `kNvmeHealthMinBytes` is derived from the
+// same constant, so the short-reply test below inherited the same blind spot.
+static_assert(yuzu::disk_actions::kNvmeCriticalWarningOffset == 0,
+              "NVMe log page 0x02: Critical Warning is byte 0 (NVM Express Base Specification)");
+static_assert(yuzu::disk_actions::kNvmeAvailableSpareOffset == 3,
+              "NVMe log page 0x02: Available Spare is byte 3");
+static_assert(yuzu::disk_actions::kNvmePercentageUsedOffset == 5,
+              "NVMe log page 0x02: Percentage Used is byte 5");
+static_assert(yuzu::disk_actions::kNvmeWarnSpareBelowThreshold == 0x01,
+              "NVMe critical-warning bit 0: available spare below threshold");
+static_assert(yuzu::disk_actions::kNvmeWarnTemperature == 0x02,
+              "NVMe critical-warning bit 1: temperature threshold exceeded");
+static_assert(yuzu::disk_actions::kNvmeWarnReliabilityDegraded == 0x04,
+              "NVMe critical-warning bit 2: reliability degraded");
+
 TEST_CASE("disk_actions: the NVMe log-page offsets are pinned to their meaning",
           "[disk_actions][nvme]") {
     using namespace yuzu::disk_actions;
+    // Indexed by LITERAL byte position, never by the constant under test, so a
+    // shifted constant moves the decode away from the byte the spec names and
+    // this fails.
     std::array<std::byte, 512> page{};
-    page[kNvmeCriticalWarningOffset] = std::byte{0x04}; // reliability degraded
-    page[kNvmeAvailableSpareOffset] = std::byte{77};
-    page[kNvmePercentageUsedOffset] = std::byte{42};
+    page[0] = std::byte{0x04}; // critical warning: reliability degraded
+    page[3] = std::byte{77};   // available spare, percent
+    page[5] = std::byte{42};   // percentage used, percent of rated endurance
 
     const auto h = decode_nvme_health(page);
     REQUIRE(h.has_value());
@@ -460,6 +531,20 @@ TEST_CASE("disk_actions: the NVMe log-page offsets are pinned to their meaning",
     CHECK(h->available_spare == 77);
     CHECK(h->percentage_used == 42);
     CHECK(nvme_verdict(h->critical_warning) == NvmeVerdict::Failing);
+
+    // Neighbouring bytes must NOT bleed into the decoded fields: a decode that
+    // read byte 4 instead of 5 would still pass the assertions above if only
+    // one byte were ever set.
+    std::array<std::byte, 512> neighbours{};
+    neighbours[1] = std::byte{0xFF};
+    neighbours[2] = std::byte{0xFF};
+    neighbours[4] = std::byte{0xFF};
+    neighbours[6] = std::byte{0xFF};
+    const auto n = decode_nvme_health(neighbours);
+    REQUIRE(n.has_value());
+    CHECK(n->critical_warning == 0);
+    CHECK(n->available_spare == 0);
+    CHECK(n->percentage_used == 0);
 }
 
 TEST_CASE("disk_actions: a short NVMe reply is a failure to report, not a healthy zero",
