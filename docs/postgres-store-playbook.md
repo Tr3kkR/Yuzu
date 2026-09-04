@@ -329,16 +329,19 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   legacy dataset rather than `AuditStore`'s larger resumable-streaming one — but `RbacStore`'s
   own `migrate_from_sqlite()` has since been retired (#3623), so that implementation is no
   longer live code; find it via `git log`/the PR history if you need the worked example, but do
-  not expect to find it in `rbac_store.cpp` today. **Trap a future port hits if it works from
-  this paragraph's prose instead of the actual code:** `AuditStore::stamp_complete` (the sole
-  remaining live reference implementation — see ADR-0009's Update for why `AuditStore` is the
-  one store that keeps its backfill permanently) has two exemptions this description doesn't
-  spell out, and `RbacStore`'s own first port missed both when it was live — (1) a
-  **sourceless** writer losing the trust-anchor race is NOT an error (it has no evidence worth
-  protecting, so whichever writer's `"sourceless"` value won is fine); (2) a **real** writer's
-  content that fingerprints as having nothing to protect (an empty/schema-less local file)
-  should trust the marker rather than refuse. Port the REFERENCE CODE (`audit_store.cpp`'s
-  `stamp_complete`) and diff your port against it line by line — not this summary.
+  not expect to find it in `rbac_store.cpp` today. `AuditStore::stamp_complete` — the last
+  backfill-marker implementation on this ladder, retired 2026-09-04 (#3623, ADR-0009's
+  hard-cutover Update withdrew the permanent exception AuditStore held) — is no longer live
+  code either; no store on this ladder has a `migrate_from_sqlite()` today. **Trap a future
+  port hits if it works from this paragraph's prose instead of the actual code:**
+  `stamp_complete` had two exemptions this description doesn't spell out, and `RbacStore`'s own
+  first port missed both when it was live — (1) a **sourceless** writer losing the trust-anchor
+  race is NOT an error (it has no evidence worth protecting, so whichever writer's `"sourceless"`
+  value won is fine); (2) a **real** writer's content that fingerprints as having nothing to
+  protect (an empty/schema-less local file) should trust the marker rather than refuse. Find the
+  reference code via `git log`/the PR history (`git show 8992b5274:server/core/src/audit_store.cpp`
+  is the pre-retirement `origin/dev` HEAD) and diff your port against it line by line — not this
+  summary — if a future store ever needs this shape again.
 - **Long-lived migration branches accumulate test-file drift against the pre-migration API —
   budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
   store via its old constructor fails to compile once the branch merges current `origin/dev` —

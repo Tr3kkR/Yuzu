@@ -327,3 +327,69 @@ winner sweeps). The in-process cleanup thread's join-before-store-teardown contr
   recipe, and name **EXISTS, never a counting aggregate**, as the probe form (Gate 3
   performance measured the difference on this store; `result_set_store.cpp` still carries the
   counting form and should be converted before the remaining #2508 stores copy it).
+
+## Update (2026-09-04) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) named `AuditStore` as the sole
+**permanent** exception: "audit evidence cannot be regenerated the way config or cache state
+can." This ADR's "Skippable backfill: rejected" line above (Considered and rejected) recorded
+the same reasoning for the mandatory backfill this document originally designed. Both are
+superseded here, at the operator's explicit direction: a hard cutover with no migration path
+held open, for any store, accepting permanent audit-trail loss as the failure mode if the "no
+production fleet" premise is ever wrong for this store specifically. #3623 (batches A and B,
+merged 2026-09-03) had already retired the other 18 stores' `migrate_from_sqlite()`;
+`chore/retire-migrate-from-sqlite-auditstore` retires the 19th and last.
+
+`AuditStore::migrate_from_sqlite()` and its private helpers (`legacy_has_column`,
+`LegacyTableStatus`, `legacy_has_table`, `LegacyFingerprint`, `legacy_fingerprint`,
+`parse_fingerprint`, `stamp_complete`, `move_legacy_aside`, `kBackfillTxnTimeout`,
+`kBackfillBatchRows`, the `Sourceless` enum) are removed, along with the now-permanently-false
+`backfill_pending_` write gate on `log()` (nothing sets it once the only caller is gone) and the
+`yuzu_server_audit_backfill_total{result}` counter + its `YuzuAuditBackfillFailing` alert.
+`audit_retention_meta` is NOT dropped — it also holds the clock guard's permanent durable state
+(`last_pass_now`, `last_anomaly_facts`, `bootstrap_settled`, #2360/#2579) — and its two
+backfill-only rows (`backfill_complete`, `backfill_source_fingerprint`) are removed via a
+version-bumped v2 migration appended after the already-shipped v1, never edited in place: this
+store is constructed in production, so v1 has run against real dev/UAT databases.
+
+**DELETE, not poison — the opposite choice from `RbacStore`'s v4 (ADR-0041's own Update,
+same PR family), and deliberately so.** `RbacStore`'s retired code fell through marker-absence
+into an unconditional overwrite of a live security flag (`rbac_enabled`) sourced from whatever a
+local legacy file held — silent and dangerous, so that migration POISONS the marker to force an
+old binary rolling back down its own pre-existing safe branches instead of a bare `DELETE`.
+`AuditStore::migrate_from_sqlite()` was already engineered against exactly this failure shape,
+across three governance rounds (Gate 3 architect A-2/A-4, Gate 4 unhappy-path UP-1/UP-10 round
+3, Gate 8 architect round 3; #2661/#2854) — verified by reading the pre-retirement code directly
+(`git show 8992b5274:server/core/src/audit_store.cpp`, the `origin/dev` HEAD this PR branched
+from) rather than assumed from precedent:
+
+- **Marker absent, no local legacy file** (the ordinary rollback case): re-stamps sourcelessly.
+  Silent, safe — matches every other retired store.
+- **Marker absent, a real local legacy file**: re-runs the streamed backfill. Row inserts are
+  `ON CONFLICT (id) DO NOTHING` (idempotent — a re-run of already-migrated content is a no-op,
+  never a duplicate or a corruption), and completion is gated on an exact whole-file fingerprint
+  match before the marker is ever re-stamped (lines ~1439-1558 of the pre-retirement file). A
+  genuine mismatch refuses to mark complete and retries on the next boot rather than reporting a
+  false success.
+- **Marker present (re-stamped by an old binary, or never actually deleted on some replica),
+  legacy file still present, fingerprint mismatched**: refuses to serve outright (lines ~904-921)
+  — "some other process declared this deployment's evidence migration complete without ever
+  reading this host's trail... boot refuses until this is resolved by an operator." Loud, not
+  silent.
+
+No sub-case reaches an unconditional, unverified overwrite the way `RbacStore`'s did. An old
+binary rolling back against a `DELETE`d marker either no-ops or refuses loudly — the same safety
+bar `DROP TABLE` gives the other 17 retired stores (an old binary's marker `SELECT` fails
+`42P01`/`undefined_table` and refuses to boot) — without disturbing the clock guard's live rows
+in a table that cannot itself be dropped.
+
+`server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows(audit.db, "AuditStore",
+{"audit_events"})` at construction instead — WARN-only, log-only, never blocking, the same
+treatment every other retired store gets. This is a deliberate, explicit choice: "no migration
+paths held open" governs the DATA path (nothing imports a legacy file's rows any more), not the
+detect-and-warn smoke detector every other retired store keeps — an operator finding a real,
+row-holding `audit.db` still gets a loud boot-time signal that the "no production fleet"
+premise may be locally wrong, even though nothing will act on it. `open_one_shot_audit()`
+(`main.cpp`, the `--mfa-reset`/`--break-glass-arm` break-glass CLI paths) drops its
+`legacy_audit_db` parameter and `Sourceless::Refuse` call entirely — it now just constructs
+`AuditStore` and checks `is_open()`, matching every other one-shot audit writer.

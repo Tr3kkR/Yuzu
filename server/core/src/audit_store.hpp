@@ -3,10 +3,14 @@
 /// @file audit_store.hpp
 /// SOC 2 evidence chain — operator actions, agent enrolment, fleet-topology
 /// events, background schedule execution, and every behavioural-PII access.
-/// Born on SQLite (`audit.db`), migrated to PostgreSQL (ADR-0006/0008/0009/
-/// 0040, schema `audit_store`). Highest-stakes store on the ladder: a lost or
-/// silently-truncated audit trail is a compliance failure (CC6.6/CC7.2), not
-/// degraded telemetry.
+/// Born on PostgreSQL (ADR-0006/0008/0009/0040, schema `audit_store`).
+/// Highest-stakes store on the ladder: a lost or silently-truncated audit
+/// trail is a compliance failure (CC6.6/CC7.2), not degraded telemetry.
+///
+/// Retired 2026-09-04 (ADR-0009 hard-cutover Update): the legacy-SQLite
+/// backfill (`migrate_from_sqlite`) is gone — no production fleet ever ran a
+/// pre-Postgres build, and a leftover `audit.db` gets a boot-time WARN via
+/// `legacy_sqlite_probe::warn_if_legacy_rows`, never an import.
 ///
 /// Substrate contract (ADR-0008/0012): holds a `pg::PgPool&`, migrates at
 /// construction on a pinned lease, schema-qualifies every runtime statement
@@ -33,17 +37,16 @@
 ///    #2360 guard ported to a single-sweeper advisory lease with durable dedup
 ///    (see the .cpp). Fail-hard within its advisory-lease-held transaction; a
 ///    probe/delete failure declines the pass (never a blind delete).
-///  - **Backfill: MANDATORY (ADR-0009 mandatory class).** 365-day SOC 2
-///    retention makes pre-cutover rows mandatory evidence; `migrate_from_sqlite`
-///    streams the legacy `audit.db` in bounded, id-resumable batches and boot
-///    FAILS CLOSED on backfill failure.
+///  - **Backfill: RETIRED (ADR-0009 hard-cutover Update, 2026-09-04).** No
+///    production fleet ever ran a pre-Postgres build; a leftover `audit.db`
+///    is never read or imported, only WARNed on at boot if it still holds
+///    rows (`legacy_sqlite_probe::warn_if_legacy_rows`).
 
 #include <yuzu/audit_retention_rules.hpp>
 
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -253,8 +256,7 @@ public:
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
     /// Wire a metrics registry for `yuzu_server_audit_read_degrade_total{reason}`
-    /// (degrade-distinguishable reads) and `yuzu_server_audit_backfill_total{result}`
-    /// (the one-time backfill outcome). Set ONCE during single-threaded startup,
+    /// (degrade-distinguishable reads). Set ONCE during single-threaded startup,
     /// before serving — read without synchronisation on serving threads. A null
     /// registry (default, e.g. unit tests) disables emission; every emit site is
     /// null-guarded. The eight retention/write counters below are ALSO exposed as
@@ -264,38 +266,6 @@ public:
     /// Wiring a registry PRE-SEEDS both closed label sets to 0 — load-bearing for
     /// the absence-keyed backfill alert; see the definition.
     void set_metrics(yuzu::MetricsRegistry* m);
-
-    /// MANDATORY backfill (ADR-0009 mandatory class / ADR-0040). On first boot
-    /// against an empty `audit_store.audit_events` with a legacy `audit.db`
-    /// present, streams every row (ALL columns incl. `principal_class` and
-    /// `ttl_expires_at`, so the retention horizon is preserved exactly) into PG
-    /// in bounded, id-resumable batches (`ON CONFLICT (id) DO NOTHING`, resume
-    /// from `MAX(id)` in PG), copies `audit_retention_meta`, reconciles row
-    /// counts, then stamps a one-time `backfill_complete` marker and advances the
-    /// identity sequence past the migrated ids. Returns TRUE on success or when
-    /// already complete; FALSE on any failure — the caller MUST refuse boot
-    /// (fail-closed: never serve with a knowingly-incomplete evidence chain, retry
-    /// next start). The verified-migrated legacy file is moved aside, not deleted.
-    ///
-    /// A FAILED call ARMS the write gate: `log()` declines until a later call
-    /// succeeds. That is not belt-and-braces — `ServerImpl`'s constructor sets
-    /// `startup_failed_` and then KEEPS CONSTRUCTING, and several of its own
-    /// audit-emitting hooks are guarded only on `is_open()`, so without this a
-    /// boot that refuses to serve still writes native rows ahead of the marker
-    /// and wedges every later boot on the prefix proof (Gate 3 cpp-safety).
-    ///
-    /// `sourceless` decides what happens when there is nothing to migrate — no
-    /// legacy file, or a legacy file with no `audit_events` table:
-    ///   * `StampIfEmpty` (boot): stamp the completion marker, but ONLY over an
-    ///     empty table, re-checked inside the stamping transaction.
-    ///   * `Refuse`: do not stamp under any circumstance. One-shot CLI paths pass
-    ///     this — a CLI invocation must never be what declares the fleet's
-    ///     evidence migration complete, because a host that simply does not hold
-    ///     `audit.db` would otherwise foreclose the real migration on the host
-    ///     that does (Gate 3 architect A-4).
-    enum class Sourceless { StampIfEmpty, Refuse };
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path,
-                                           Sourceless sourceless = Sourceless::StampIfEmpty);
 
     /// Persist an audit event. FAIL-HARD: returns true iff the row was written.
     /// The bool is part of the SOC 2 CC6.6/CC7.2 evidence-integrity chain —
@@ -440,20 +410,17 @@ public:
     /// WAS USABLE.
     ///
     /// TWO CLOCKS FEED THIS GAUGE, and the difference is deliberate (#2854).
-    ///   * AT CONSTRUCTION, and again after a successful `migrate_from_sqlite`,
-    ///     it is SEEDED from the durable `audit_retention_meta` anchor
-    ///     (`last_pass_now`), which — once at least one `cleanup_once` pass
-    ///     has run on Postgres — holds POSTGRESQL's clock, the one authority
-    ///     every replica serialises through (see the long note at
-    ///     `cleanup_once`'s advisory-lock transaction). ONE EXCEPTION: on the
-    ///     very first Postgres boot, before any `cleanup_once` pass has run,
-    ///     the anchor is a value copied verbatim from the retired SQLite
-    ///     predecessor's own `last_pass_now` — stamped by ITS `cleanup_once`
-    ///     from whatever caller clock that single-process store used, not
-    ///     Postgres's. Still a real epoch-seconds reading, just not from the
-    ///     authority the rest of this comment describes. That is what makes
-    ///     it survive a restart, including the FIRST Postgres boot, where
-    ///     the anchor is only copied by the legacy backfill.
+    ///   * AT CONSTRUCTION it is SEEDED from the durable `audit_retention_meta`
+    ///     anchor (`last_pass_now`), which — once at least one `cleanup_once`
+    ///     pass has run on Postgres — holds POSTGRESQL's clock, the one
+    ///     authority every replica serialises through (see the long note at
+    ///     `cleanup_once`'s advisory-lock transaction). On the very first
+    ///     Postgres boot, before any `cleanup_once` pass has ever run, no
+    ///     anchor row exists yet and the seed is a no-op (`0`, "never ran") —
+    ///     the legacy-SQLite continuity path that used to backdate this seed
+    ///     on a mid-cutover upgrade is retired (ADR-0009 hard-cutover Update,
+    ///     2026-09-04); no production fleet ever had a pre-Postgres reading to
+    ///     carry forward.
     ///   * ON EVERY SUBSEQUENT PASS it is overwritten with the CALLER's
     ///     process clock (`cleanup_once`), which is a liveness signal only and
     ///     drives no decision.
@@ -550,20 +517,9 @@ private:
     int cleanup_interval_min_;
     yuzu::MetricsRegistry* metrics_{nullptr};
 
-    /// Set when `migrate_from_sqlite` starts, cleared only when it SUCCEEDS.
-    /// While set, `log()` declines: a store whose mandatory backfill did not
-    /// complete must not put native rows ahead of the marker, because the prefix
-    /// proof then rejects the legacy trail on every later boot. A store that was
-    /// never asked to migrate (unit tests, and any future caller) is unaffected —
-    /// the gate arms on the attempt, not on construction, so it cannot silently
-    /// disable audit for a caller that has no legacy trail to worry about.
-    /// Atomic because serving threads read it while boot writes it.
-    std::atomic<bool> backfill_pending_{false};
-
     /// Restores `last_pass_unixtime_` from the durable `audit_retention_meta`
-    /// anchor. Called at construction and again after a successful
-    /// `migrate_from_sqlite` (#2854) — see `last_pass_unixtime()`'s doc for
-    /// the two-clock / three-sentinel contract this maintains.
+    /// anchor. Called once, at construction (#2854) — see `last_pass_unixtime()`'s
+    /// doc for the two-clock / three-sentinel contract this maintains.
     void seed_last_pass_from_anchor();
 
     // Cumulative event write counters bucketed by `result`. Lock-free.
