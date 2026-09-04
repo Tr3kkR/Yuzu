@@ -13,4 +13,12 @@
   as a failure and never as absence. That distinction matters because these reads
   fail soft: without it a database blip during a legitimate rollout would both
   raise enumeration alerts and assert, in the evidence record, that a package
-  which exists did not.
+  which exists did not. The recorded prior value is the one the write actually
+  replaced: the package row is read under a lock and updated in the same database
+  transaction, so a second rollout change to the same package arriving at the same
+  moment cannot slip between the read and the write and leave the row naming a
+  value it did not replace — which matters precisely because the admin whose
+  tracks this evidence exists to preserve is also the one who could issue both
+  requests. The rollout write also now touches only the rollout percentage
+  instead of rewriting the whole package row, so it can no longer silently revert
+  a concurrent change to another field such as the mandatory flag.

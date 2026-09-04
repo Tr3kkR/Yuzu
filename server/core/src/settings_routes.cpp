@@ -5445,7 +5445,7 @@ void SettingsRoutes::register_routes(
                   // distinguish that from a package that was never rolled out.
                   // "from=100% to=0%" does. `mandatory` is carried for the same
                   // reason: it is what makes the de-prioritisation consequential.
-                  // find_package_checked, NOT list_packages: the ordinary reads on
+                  // A CHECKED read, NOT list_packages: the ordinary reads on
                   // this store fail SOFT, returning an empty vector on a closed
                   // store, a pool-acquire timeout or a query error. That carve-out
                   // (ADR-0061) was granted because no downstream branch treated an
@@ -5454,24 +5454,32 @@ void SettingsRoutes::register_routes(
                   // a legitimate admin rollout both manufacture key-enumeration
                   // alerts (audit-log.md names `denied` as that filter) and assert,
                   // in the evidence record, that a package which exists did not.
-                  auto lookup = update_registry_->find_package_checked(platform, arch, version);
-                  bool committed = false;
-                  if (lookup.status == UpdateRegistry::PackageLookup::kFound) {
-                      auto pkg = lookup.package;
-                      pkg.rollout_pct = pct;
-                      committed = update_registry_->upsert_package(pkg);
-                      if (committed)
-                          spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
-                                       version, pct);
-                      else
-                          spdlog::error("OTA rollout NOT applied for {}/{} v{}: the registry "
-                                        "write did not commit",
-                                        platform, arch, version);
-                  } else if (lookup.status == UpdateRegistry::PackageLookup::kUnavailable) {
+                  // ONE store call, not a find-then-upsert pair. Read and write
+                  // are the same row-locked transaction, so the `from=` this row
+                  // reports is provably the value the commit replaced. As two
+                  // autocommit statements a concurrent write to the same key
+                  // could land between them — and it does not take two admins:
+                  // one session firing two near-simultaneous requests is enough,
+                  // which is exactly the compromised-admin case #3692 exists to
+                  // catch. Same shape as `AuditStore::stamp_complete` (ADR-0040,
+                  // #2697); see update_registry.hpp.
+                  auto change =
+                      update_registry_->update_rollout_checked(platform, arch, version, pct);
+                  // NOT `status == kFound`: the row can be found inside the
+                  // transaction and the write still fail to commit, which is a
+                  // distinct outcome the audit row reports differently.
+                  const bool committed = change.committed;
+                  if (committed)
+                      spdlog::info("OTA rollout updated: {}/{} v{} {}% -> {}%", platform, arch,
+                                   version, change.prior_rollout_pct, pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kFound)
+                      spdlog::error("OTA rollout NOT applied for {}/{} v{}: the package exists "
+                                    "at {}% but the registry write did not commit",
+                                    platform, arch, version, change.prior_rollout_pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kUnavailable)
                       spdlog::error("OTA rollout for {}/{} v{}: the registry could not be read; "
                                     "the package's existence is UNKNOWN, not absent",
                                     platform, arch, version);
-                  }
 
                   // Audited AFTER the write, and reporting what actually happened.
                   // A rollout change alters which endpoints receive a given binary,
@@ -5506,13 +5514,16 @@ void SettingsRoutes::register_routes(
                   // detail records what was ATTEMPTED, which asserts nothing false.
                   const char* result = "failure";
                   std::string detail;
-                  switch (lookup.status) {
+                  switch (change.status) {
                   case UpdateRegistry::PackageLookup::kFound:
                       result = committed ? "success" : "failure";
+                      // `from=` is now provably the value this write replaced —
+                      // it was read under a row lock in the same transaction, so
+                      // no concurrent writer can have changed it in between.
                       detail = (committed ? "from=" : "attempted_from=") +
-                               std::to_string(lookup.package.rollout_pct) +
+                               std::to_string(change.prior_rollout_pct) +
                                (committed ? "% to=" : "% attempted_to=") + std::to_string(pct) +
-                               "% mandatory=" + (lookup.package.mandatory ? "true" : "false") +
+                               "% mandatory=" + (change.prior_mandatory ? "true" : "false") +
                                (committed ? "" : " outcome=write_not_committed");
                       break;
                   case UpdateRegistry::PackageLookup::kAbsent:

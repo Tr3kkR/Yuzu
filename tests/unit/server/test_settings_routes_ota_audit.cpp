@@ -41,6 +41,7 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <thread>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -304,4 +305,99 @@ TEST_CASE("a rollout against a DEGRADED registry is audited as failure, never as
     CHECK(row.detail.find("not_found") == std::string::npos);
     CHECK(row.detail.find("store_unavailable") != std::string::npos);
     CHECK(row.detail.find("existence_unknown=true") != std::string::npos);
+}
+
+TEST_CASE("the audited from= is the value the commit replaced, not a stale snapshot",
+          "[ota][audit][settings_routes][pg]") {
+    // The falsifier for the round-1 blocker. The route used to read the prior
+    // percentage on one autocommit statement and write on another, so a
+    // concurrent write to the same key could land between them — and the row
+    // then asserted `from=<a value this write did not replace>` under a
+    // `result=success` that audit-log.md calls "the point of this row".
+    //
+    // NO TIMING ASSUMPTION. A competing transaction takes the row and changes it
+    // BEFORE the route is ever called, and holds the lock open across the call.
+    // The route's own `SELECT ... FOR UPDATE` therefore cannot read until that
+    // transaction commits, so the ordering is forced by the lock, not by a sleep.
+    //
+    // Without the lock this fails rather than flakes: a plain SELECT does not
+    // block on an uncommitted UPDATE — MVCC hands it the OLD row version — so
+    // the pre-fix code reports from=100 while the value actually replaced was 55.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/100, /*mandatory=*/true);
+
+    pg::PgConn other{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(other.get()) == CONNECTION_OK);
+    {
+        pg::PgResult begin{PQexec(other.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        pg::PgResult upd{PQexec(other.get(),
+                                "UPDATE update_registry.update_packages SET rollout_pct = 55 "
+                                "WHERE platform = 'linux' AND arch = 'x86_64' "
+                                "AND version = '1.2.3'")};
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+
+    // The route runs while that row is locked and uncommitted at 55.
+    std::unique_ptr<httplib::Response> res;
+    std::thread worker([&] { res = h.post_rollout("1.2.3", "7"); });
+
+    pg::PgResult commit{PQexec(other.get(), "COMMIT")};
+    REQUIRE(commit.status() == PGRES_COMMAND_OK);
+    worker.join(); // happens-before for everything the worker wrote
+
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.audited.size() == 1);
+    const auto& row = h.audited.front();
+    CHECK(row.result == "success");
+
+    // 55, not 100: the value the committed write actually replaced.
+    CHECK(row.detail.find("from=55%") != std::string::npos);
+    CHECK(row.detail.find("from=100%") == std::string::npos);
+    CHECK(row.detail.find("to=7%") != std::string::npos);
+
+    auto pkgs = h.registry->list_packages();
+    REQUIRE(pkgs.size() == 1);
+    CHECK(pkgs.front().rollout_pct == 7);
+}
+
+TEST_CASE("a rollout write does not clobber a concurrent change to another column",
+          "[ota][audit][settings_routes][pg]") {
+    // The other half of the same defect. The old path wrote the WHOLE snapshot
+    // back via upsert_package, so a rollout edit silently reverted any other
+    // column a concurrent writer had changed — `mandatory` above all, which is
+    // what makes a de-prioritisation consequential in the first place.
+    // update_rollout_checked writes rollout_pct and nothing else.
+    YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
+    OtaAuditHarness h{db.dsn()};
+    h.seed(/*rollout_pct=*/100, /*mandatory=*/false);
+
+    pg::PgConn other{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(other.get()) == CONNECTION_OK);
+    {
+        pg::PgResult begin{PQexec(other.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        pg::PgResult upd{PQexec(other.get(),
+                                "UPDATE update_registry.update_packages SET mandatory = true "
+                                "WHERE platform = 'linux' AND arch = 'x86_64' "
+                                "AND version = '1.2.3'")};
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+
+    std::unique_ptr<httplib::Response> res;
+    std::thread worker([&] { res = h.post_rollout("1.2.3", "10"); });
+    pg::PgResult commit{PQexec(other.get(), "COMMIT")};
+    REQUIRE(commit.status() == PGRES_COMMAND_OK);
+    worker.join();
+
+    REQUIRE(res);
+    auto pkgs = h.registry->list_packages();
+    REQUIRE(pkgs.size() == 1);
+    CHECK(pkgs.front().rollout_pct == 10);
+    // The concurrent writer's change survives, and the audit row saw it.
+    CHECK(pkgs.front().mandatory == true);
+    REQUIRE(h.audited.size() == 1);
+    CHECK(h.audited.front().detail.find("mandatory=true") != std::string::npos);
 }

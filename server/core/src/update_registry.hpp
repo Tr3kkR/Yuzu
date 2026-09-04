@@ -119,19 +119,8 @@ public:
     /// manufacture key-enumeration alerts AND assert, in the evidence record,
     /// that a package which exists did not. This lookup exists so that branch can
     /// tell the two apart, without widening the fail-soft reads the rest of the
-    /// server depends on.
+    /// server depends on. `update_rollout_checked` below is its one consumer.
     enum class PackageLookup { kFound, kAbsent, kUnavailable };
-
-    struct PackageLookupResult {
-        PackageLookup status{PackageLookup::kUnavailable};
-        UpdatePackage package{};
-    };
-
-    /// Find one package by its `(platform, arch, version)` key, reporting a
-    /// degraded store as `kUnavailable` rather than as absence.
-    [[nodiscard]] PackageLookupResult find_package_checked(const std::string& platform,
-                                                          const std::string& arch,
-                                                          const std::string& version) const;
 
     /// Insert or update a package row. Returns false when the write did NOT
     /// commit — a closed store, a pool-acquire timeout, or a query error.
@@ -144,6 +133,59 @@ public:
     /// supposed to be able to trust. Callers that do not audit may still ignore
     /// the result; the log line is unchanged.
     [[nodiscard]] bool upsert_package(const UpdatePackage& pkg);
+
+    /// Outcome of an atomic rollout change: what the row held BEFORE the write,
+    /// and whether that write committed.
+    ///
+    /// `status` and `committed` are SEPARATE questions and the caller needs both.
+    ///  - `kFound` + `committed`      — applied; the priors are the values this
+    ///                                  transaction replaced.
+    ///  - `kFound` + `!committed`     — the row was read inside the transaction,
+    ///                                  so it exists and the priors are what was
+    ///                                  observed, but the write did not land.
+    ///  - `kAbsent`                   — the store reported no such row.
+    ///  - `kUnavailable`              — nothing is known; priors are unset.
+    ///
+    /// The middle case is why `committed` is not folded into `status`: collapsing
+    /// it onto `kUnavailable` would throw away a prior value that WAS read and an
+    /// existence that IS known, and the audit row would then say
+    /// `existence_unknown=true` about a package the store had just returned.
+    struct RolloutChange {
+        PackageLookup status{PackageLookup::kUnavailable};
+        bool committed{false};
+        int prior_rollout_pct{0};
+        bool prior_mandatory{false};
+    };
+
+    /// Set one package's rollout percentage, returning the percentage it
+    /// replaced — read and written in a SINGLE transaction under a row lock.
+    ///
+    /// IT MUST STAY ONE TRANSACTION, and that is the whole reason this method
+    /// exists rather than a separate lookup + `upsert_package` pair at the call
+    /// site. Those are two separate pooled leases in autocommit, so a
+    /// concurrent write to the same key can land between them — and
+    /// `upsert_package` writes the ENTIRE snapshot back, not just
+    /// `rollout_pct`, so the other writer's change is silently discarded. The
+    /// audit row is what makes that fatal rather than merely lossy:
+    /// audit-log.md states "the `from=` value is the point of this row", and a
+    /// `result=success` row whose `from=` names a value the commit did not
+    /// actually replace is evidence disagreeing with state, in the one record an
+    /// incident responder is meant to be able to trust. It does not need two
+    /// colliding admins: one session firing two near-simultaneous requests is
+    /// enough, which is exactly the compromised-admin case #3692 exists to catch.
+    ///
+    /// Same shape as `AuditStore::stamp_complete` (ADR-0040, #2697), where
+    /// checking only statement status let a writer that LOST this race report
+    /// success while another writer's value sat at the trust anchor. See
+    /// docs/postgres-store-playbook.md.
+    ///
+    /// A degraded store reports `kUnavailable`, never absence — see the
+    /// `PackageLookup` comment above for why that distinction is load-bearing
+    /// for the audit branch.
+    [[nodiscard]] RolloutChange update_rollout_checked(const std::string& platform,
+                                                       const std::string& arch,
+                                                       const std::string& version, int rollout_pct);
+
     void remove_package(const std::string& platform, const std::string& arch,
                         const std::string& version);
     std::vector<UpdatePackage> list_packages() const;
