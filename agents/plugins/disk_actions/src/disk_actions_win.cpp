@@ -123,6 +123,19 @@ private:
 };
 
 /// RAII owner for a device/volume HANDLE.
+///
+/// MOVABLE, not copyable, and the move operations are DECLARED rather than
+/// defaulted for a reason: declaring the copy constructor (even as deleted)
+/// suppresses the implicit move constructor, so a factory returning one of
+/// these by value fails to compile with "attempting to reference a deleted
+/// function". That is exactly what happened -- `open_physical_drive` was
+/// changed to return by value and the whole TU is `#if defined(_WIN32)`, so no
+/// macOS build compiled a line of it and only the Windows CI leg caught it.
+///
+/// A HANDLE is a VALUE, not a refcount: the moved-from object must be left
+/// holding INVALID_HANDLE_VALUE so exactly one owner ever closes it. This is
+/// the same reasoning that makes ScopedFd's same-identity early return correct
+/// while ScopedCFRef's would be a leak -- do not "harmonise" them.
 class ScopedFileHandle {
 public:
     explicit ScopedFileHandle(HANDLE h) noexcept : h_(h) {}
@@ -131,6 +144,17 @@ public:
     }
     ScopedFileHandle(const ScopedFileHandle&) = delete;
     ScopedFileHandle& operator=(const ScopedFileHandle&) = delete;
+    ScopedFileHandle(ScopedFileHandle&& other) noexcept : h_(other.h_) {
+        other.h_ = INVALID_HANDLE_VALUE; // sole ownership transfers
+    }
+    ScopedFileHandle& operator=(ScopedFileHandle&& other) noexcept {
+        if (this != &other) {
+            if (valid()) ::CloseHandle(h_);
+            h_ = other.h_;
+            other.h_ = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
     [[nodiscard]] HANDLE get() const noexcept { return h_; }
     [[nodiscard]] bool valid() const noexcept {
         return h_ != nullptr && h_ != INVALID_HANDLE_VALUE;
