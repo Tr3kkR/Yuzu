@@ -35,6 +35,9 @@ tar_sources = files(
   'src/tar_cursor_sources.cpp',
 )
 
+# Wave 6 PR6.2-b: the power cursor source
+tar_sources += files('src/tar_power_collector.cpp')
+
 if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('advapi32')
   tar_deps += cxx.find_library('iphlpapi')
