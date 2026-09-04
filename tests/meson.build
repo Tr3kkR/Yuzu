@@ -2073,6 +2073,33 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 60,
   )
+
+  # meson's cpp cmd_array()[0] is the LAUNCHER when one is configured (ccache,
+  # sccache), not the compiler -- passing it yields "ccache: invalid option -- t".
+  # Step past a launcher to the real compiler.
+  _guard_cxx_arr = meson.get_compiler('cpp').cmd_array()
+  _guard_check_cxx = _guard_cxx_arr[0]
+  if _guard_cxx_arr.length() > 1 and (_guard_check_cxx.endswith('ccache') or _guard_check_cxx.endswith('sccache'))
+    _guard_check_cxx = _guard_cxx_arr[1]
+  endif
+
+  # Platform-guard placement (PR6.0c). A test appended after a TU's closing
+  # `#endif` is invisible to the local build -- the POSIX file compiles fine on
+  # macOS either way, and the Windows file is never compiled there at all. This
+  # change produced two such defects, each caught only by external review, so
+  # the check is wired in rather than left to memory.
+  #
+  # CXX comes from meson's OWN configured compiler: the script fails loudly when
+  # it cannot find one, which is correct for a developer running it by hand but
+  # would be a spurious failure here on a host whose compiler is not at the
+  # script's default path.
+  test('platform guard placement',
+    _bash_test,
+    args: [files('../scripts/dev/check-platform-guards.sh')],
+    env: {'CXX': _guard_check_cxx},
+    suite: 'docs',
+    timeout: 60,
+  )
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1

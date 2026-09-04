@@ -129,6 +129,12 @@ enum class Action : std::uint8_t {
 ///
 /// 11644473600 is the number of seconds between 1601-01-01 and 1970-01-01.
 ///
+/// Truncation is toward zero, i.e. FLOOR for every value this guard admits, so a
+/// Windows entry can read up to one second OLDER than reality while POSIX's
+/// st_mtime is already whole seconds. Against the minute-or-hour thresholds an
+/// age filter uses that is immaterial; it is recorded because it errs marginally
+/// toward deletion rather than away from it.
+///
 /// A zero or negative tick count is Windows' "not set", NOT a timestamp of
 /// 1601: returning the literal conversion would read to an age filter as
 /// impossibly old and therefore safe to delete.
@@ -381,6 +387,11 @@ struct DeleteResult {
 /// `EntryMeta::mtime` for why that matters here specifically. `meta` is
 /// the same value `decide_entry` was given, so a `MatchFn` and the primitive
 /// always reason about identical facts.
+///
+/// BORROWED FOR THE CALL ONLY. `rel_path` views a string the walker owns and
+/// `meta` references an entry in the enumeration buffer; both are valid for the
+/// duration of the invocation and no longer. A predicate needing either beyond
+/// that must copy it.
 ///
 /// May throw; `walk_delete` firewalls that into `Reason::MatchError`.
 using MatchFn = std::function<bool(std::string_view rel_path, const EntryMeta& meta)>;

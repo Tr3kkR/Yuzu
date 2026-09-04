@@ -30,6 +30,16 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$repo_root" || exit 1
 CXX=${CXX:-/usr/bin/clang++}
 
+# A missing or broken compiler produces NO OUTPUT, which the emptiness test below
+# would otherwise read as "correctly guarded" and report as a pass. That is this
+# script's own declared failure class, and it shipped anyway -- the sibling
+# check-windows-tu-syntax.sh guards this correctly and this one did not.
+if ! command -v "$CXX" >/dev/null 2>&1; then
+    echo "check-platform-guards: compiler '$CXX' not found." >&2
+    echo "  Set CXX to a C++ compiler, e.g. CXX=clang++ or CXX=g++." >&2
+    exit 2
+fi
+
 # file:macro-that-should-make-it-empty
 checks=(
   "tests/unit/test_confined_fs_posix.cpp:-D_WIN32"
@@ -47,13 +57,22 @@ for spec in "${checks[@]}"; do
         continue
     fi
     # -E -P: preprocess only, no linemarkers. Anything surviving is real code.
-    leaked=$("$CXX" -std=c++23 "$flag" -E -P "$f" 2>/dev/null | tr -d '[:space:]')
+    #
+    # The compiler's STATUS is captured separately from its OUTPUT: a preprocess
+    # that fails also emits nothing, and conflating the two is how "broken" reads
+    # as "clean".
+    if ! out=$("$CXX" -std=c++23 "$flag" -E -P "$f" 2>&1); then
+        echo "  FAIL  $f: $CXX could not preprocess it under $flag"
+        printf '%s\n' "$out" | head -5 | sed 's/^/        /'
+        rc=1
+        continue
+    fi
+    leaked=$(printf '%s' "$out" | tr -d '[:space:]')
     if [ -z "$leaked" ]; then
         echo "  ok    $f preprocesses to nothing under $flag"
     else
         echo "  FAIL  $f leaves code OUTSIDE its platform guard (under $flag)"
-        "$CXX" -std=c++23 "$flag" -E -P "$f" 2>/dev/null | grep -vE '^\s*$' | head -5 \
-            | sed 's/^/        /'
+        printf '%s\n' "$out" | grep -vE '^[[:space:]]*$' | head -5 | sed 's/^/        /'
         rc=1
     fi
 done
