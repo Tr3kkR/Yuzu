@@ -154,7 +154,17 @@ bool LeaderElector::try_acquire() {
         pg::exec_params(conn_.get(), lock_key_.try_lock_sql().c_str(), std::vector<std::string>{});
     if (lock_res.status() != PGRES_TUPLES_OK || PQntuples(lock_res.get()) != 1 ||
         PQgetisnull(lock_res.get(), 0, 0)) {
-        spdlog::warn("leader_elector: try-lock query failed");
+        // A failed try-lock QUERY (a transport error, as opposed to a 't'/'f'
+        // result) means the dedicated connection is unhealthy. Reconnect so a
+        // later try_acquire() can heal, mirroring the already-leader liveness
+        // branch above. Without this a FOLLOWER (epoch_ == nullopt, so the
+        // liveness branch is skipped) whose connection blipped would be
+        // permanently, silently excluded from failover: open_ stays true, so
+        // the reconnect at the top of try_acquire is never re-entered, and every
+        // subsequent call retries the same dead PGconn. [self-adversarial F1]
+        spdlog::warn("leader_elector: try-lock query failed; reconnecting");
+        drop_leadership_locked();
+        connect_locked(); // best-effort; on failure open_ becomes false
         return false;
     }
     if (PQgetvalue(lock_res.get(), 0, 0)[0] != 't')
@@ -221,19 +231,16 @@ void LeaderElector::resign() {
     drop_leadership_locked();
 }
 
-bool LeaderElector::epoch_is_current(PGconn* claim_conn, const std::string& lock_name,
-                                     std::int64_t expected_epoch) {
-    if (claim_conn == nullptr)
-        return false;
-    pg::PgResult res = pg::exec_params(
-        claim_conn,
-        "SELECT current_leader_epoch FROM leader_elector.leader_state WHERE lock_key = $1",
-        std::vector<std::string>{lock_name});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1 ||
-        PQgetisnull(res.get(), 0, 0))
-        return false; // fail closed: no leader row, or a degraded read
-    auto cur = parse_i64(PQgetvalue(res.get(), 0, 0));
-    return cur.has_value() && *cur == expected_epoch;
+std::string LeaderElector::epoch_fence_sql(const std::string& lock_name, std::int64_t epoch) {
+    // Fail closed: an invalid lock name fences everything out rather than
+    // producing SQL that could admit a claim. is_valid_lock_name constrains
+    // lock_name to [a-z][a-z0-9_]{0,47}, so the value below cannot break out of
+    // the single-quoted literal; epoch is rendered from an integer.
+    if (!is_valid_lock_name(lock_name))
+        return "(1=0)";
+    return "((SELECT current_leader_epoch FROM leader_elector.leader_state "
+           "WHERE lock_key = '" +
+           lock_name + "') = " + std::to_string(epoch) + ")";
 }
 
 } // namespace yuzu::server

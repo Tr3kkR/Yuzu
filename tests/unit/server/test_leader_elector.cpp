@@ -5,8 +5,9 @@
 //   2. a single acquirer becomes leader and mints an epoch;
 //   3. a second elector is REFUSED while the first holds (mutual exclusion via
 //      the session advisory lock);
-//   4. the epoch is strictly monotonic across a handover, and
-//      `epoch_is_current()` fences a stale ex-leader's epoch (fail-closed).
+//   4. the epoch is strictly monotonic across a handover, and the
+//      `epoch_fence_sql()` predicate, embedded in a claim's WRITE statement,
+//      fences a stale ex-leader's epoch atomically (fail-closed).
 // The primitive is not wired into any loop yet (slice 3.2), so nothing here
 // exercises runtime dispatch — this binds the coordination primitive alone.
 
@@ -20,11 +21,15 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
+#include <cstdlib>
 #include <string>
+#include <thread>
 
 using yuzu::server::LeaderElector;
 using yuzu::server::kServerBackgroundLeaderLock;
 using yuzu::server::pg::PgConn;
+using yuzu::server::pg::PgResult;
 
 namespace {
 
@@ -36,6 +41,24 @@ PgConn connect(const std::string& dsn) {
 
 LeaderElector::Config cfg(const std::string& dsn, std::string holder) {
     return LeaderElector::Config{.dsn = dsn, .holder_id = std::move(holder)};
+}
+
+// Evaluate an SQL boolean expression; true iff it evaluates to 't' (a NULL,
+// e.g. a fence over a missing leader row, reads as false — fail-closed).
+bool eval_bool(PGconn* conn, const std::string& expr) {
+    PgResult r{PQexec(conn, ("SELECT " + expr).c_str())};
+    REQUIRE(r.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(r.get()) == 1);
+    return PQgetisnull(r.get(), 0, 0) == 0 && PQgetvalue(r.get(), 0, 0)[0] == 't';
+}
+
+// Run a claim-shaped guarded INSERT (INSERT ... SELECT ... WHERE <fence>) into a
+// per-session temp table; returns the number of rows the fence admitted. This
+// is the atomic same-statement fence the predicate exists for.
+int guarded_insert(PGconn* conn, const std::string& fence) {
+    PgResult r{PQexec(conn, ("INSERT INTO claim_probe(n) SELECT 1 WHERE " + fence).c_str())};
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+    return std::atoi(PQcmdTuples(r.get()));
 }
 
 } // namespace
@@ -101,11 +124,11 @@ TEST_CASE("LeaderElector epoch is strictly monotonic across handover",
     CHECK(*a.epoch() > e2);
 }
 
-TEST_CASE("epoch_is_current fences a stale ex-leader epoch (fail-closed)",
+TEST_CASE("epoch_fence_sql predicate fences a stale ex-leader epoch (fail-closed)",
           "[pg][store][leader-elector]") {
     YUZU_REQUIRE_PG_DB(db);
     const std::string lock_name = kServerBackgroundLeaderLock;
-    auto observer = connect(db.dsn()); // an ordinary (non-owning) connection, like a claim conn
+    auto claim = connect(db.dsn()); // an ordinary (non-owning) connection, like a claim conn
 
     LeaderElector a(cfg(db.dsn(), "holder-a"));
     LeaderElector b(cfg(db.dsn(), "holder-b"));
@@ -113,8 +136,8 @@ TEST_CASE("epoch_is_current fences a stale ex-leader epoch (fail-closed)",
     const auto e_a = *a.epoch();
 
     // The current leader's epoch passes; a lower (stale) epoch fails.
-    CHECK(LeaderElector::epoch_is_current(observer.get(), lock_name, e_a));
-    CHECK_FALSE(LeaderElector::epoch_is_current(observer.get(), lock_name, e_a - 1));
+    CHECK(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_a)));
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_a - 1)));
 
     // Handover: a resigns, b takes over with a higher epoch. a's old epoch is
     // now stale and must be rejected — the paused-ex-leader guarantee.
@@ -122,20 +145,103 @@ TEST_CASE("epoch_is_current fences a stale ex-leader epoch (fail-closed)",
     REQUIRE(b.try_acquire());
     const auto e_b = *b.epoch();
     REQUIRE(e_b > e_a);
-    CHECK_FALSE(LeaderElector::epoch_is_current(observer.get(), lock_name, e_a));
-    CHECK(LeaderElector::epoch_is_current(observer.get(), lock_name, e_b));
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_a)));
+    CHECK(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_b)));
 }
 
-TEST_CASE("epoch_is_current fails closed when no leader row exists",
+TEST_CASE("epoch_fence_sql guards a claim WRITE atomically",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB(db);
+    const std::string lock_name = kServerBackgroundLeaderLock;
+    auto claim = connect(db.dsn());
+    PgResult tmp{PQexec(claim.get(), "CREATE TEMP TABLE claim_probe(n int)")};
+    REQUIRE(tmp.status() == PGRES_COMMAND_OK);
+
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    REQUIRE(a.try_acquire());
+    const auto e_a = *a.epoch();
+
+    // A guarded INSERT commits only when the epoch matches — the fence is part
+    // of the write, so a stale epoch admits zero rows.
+    CHECK(guarded_insert(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_a)) == 1);
+    CHECK(guarded_insert(claim.get(), LeaderElector::epoch_fence_sql(lock_name, e_a - 1)) == 0);
+}
+
+TEST_CASE("epoch_fence_sql fails closed with no leader row and on an invalid name",
           "[pg][store][leader-elector]") {
     YUZU_REQUIRE_PG_DB(db);
     // Construct an elector only to run the migration (creates leader_state), but
     // never acquire — so the table exists with no row.
     LeaderElector e(cfg(db.dsn(), "holder-a"));
     REQUIRE(e.is_open());
-    auto observer = connect(db.dsn());
-    CHECK_FALSE(
-        LeaderElector::epoch_is_current(observer.get(), kServerBackgroundLeaderLock, 1));
+    auto claim = connect(db.dsn());
+    // No row → inner SELECT is NULL → predicate is NULL → false.
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql(kServerBackgroundLeaderLock, 1)));
+    // Invalid name → constant-false predicate, never admits a claim.
+    CHECK(LeaderElector::epoch_fence_sql("Bad Name!", 1) == "(1=0)");
+    CHECK_FALSE(eval_bool(claim.get(), LeaderElector::epoch_fence_sql("Bad Name!", 1)));
+}
+
+TEST_CASE("LeaderElector follower recovers after its backend is terminated (F1)",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB(db);
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    LeaderElector b(cfg(db.dsn(), "holder-b"));
+    REQUIRE(a.is_open());
+    REQUIRE(b.is_open());
+    // b leads; a is an OPEN FOLLOWER (epoch_ == nullopt) — the exact F1 case.
+    // The already-leader liveness branch is SKIPPED for a, so a's recovery can
+    // only come from the try-lock-query-failure reconnect the F1 fix added.
+    // (The earlier version of this test made `a` the leader and thus exercised
+    // the already-healing leader path — it would have passed without the fix.)
+    REQUIRE(b.try_acquire());
+    REQUIRE_FALSE(a.try_acquire()); // a is a live follower, refused by b's lock
+
+    // Kill every backend on this per-case ephemeral database except the killer's
+    // — drops a's and b's dedicated connections and frees b's advisory lock.
+    auto killer = connect(db.dsn());
+    PgResult k{PQexec(killer.get(),
+                      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                      "WHERE datname = current_database() AND pid <> pg_backend_pid()")};
+    REQUIRE(k.status() == PGRES_TUPLES_OK);
+
+    // a, a follower on a now-dead connection, must heal: the F1 fix reconnects on
+    // the failed try-lock query so a later call can lead once b's lock is freed.
+    // Pre-fix this looped forever returning false on the dead PGconn.
+    bool led = false;
+    for (int i = 0; i < 20 && !led; ++i) {
+        led = a.try_acquire();
+        if (!led)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    CHECK(led);
+    CHECK(a.is_leader());
+    CHECK(a.epoch().has_value());
+}
+
+TEST_CASE("LeaderElector heartbeat tracks leadership", "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB(db);
+    LeaderElector a(cfg(db.dsn(), "holder-a"));
+    CHECK_FALSE(a.heartbeat()); // not leader yet
+    REQUIRE(a.try_acquire());
+    CHECK(a.heartbeat()); // leader, connection live
+    a.resign();
+    CHECK_FALSE(a.heartbeat()); // resigned
+}
+
+TEST_CASE("LeaderElector distinct lock names hold independent locks",
+          "[pg][store][leader-elector]") {
+    YUZU_REQUIRE_PG_DB(db);
+    LeaderElector alpha(LeaderElector::Config{.dsn = db.dsn(), .holder_id = "h", .lock_name = "alpha"});
+    LeaderElector beta(LeaderElector::Config{.dsn = db.dsn(), .holder_id = "h", .lock_name = "beta"});
+    REQUIRE(alpha.is_open());
+    REQUIRE(beta.is_open());
+    // Different names derive different advisory keys, so both lead at once —
+    // proving make_lock_key does not collapse names to one lock.
+    CHECK(alpha.try_acquire());
+    CHECK(beta.try_acquire());
+    CHECK(alpha.is_leader());
+    CHECK(beta.is_leader());
 }
 
 // Fail-closed construction — invalid config never opens and never leads. These

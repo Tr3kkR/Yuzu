@@ -20,16 +20,20 @@
 ///     connection, so mutual exclusion guarantees only the true holder writes
 ///     it, and each new leader's epoch is strictly greater than any prior one.
 ///   * Every SIDE-EFFECTING claim (slices 3.3/3.4, on an ORDINARY pooled
-///     connection, inside the claim's own transaction) checks
-///     `expected_epoch == leader_state.current_leader_epoch` via
-///     `epoch_is_current()`. A stale ex-leader's cached epoch is < the current
-///     one, so its claim fails the predicate even in the window before it
-///     notices its lock dropped. THIS is the correctness guarantee.
+///     connection) embeds the `epoch_fence_sql()` predicate
+///     (`current_leader_epoch == expected_epoch`) INTO its claim's WRITE
+///     statement, so the epoch is verified ATOMICALLY with the side effect. A
+///     stale ex-leader's cached epoch is < the current one, so the guarded write
+///     admits zero rows even in the window before it notices its lock dropped.
+///     THIS is the correctness guarantee. There is deliberately NO standalone
+///     boolean fence read: a check-then-act read (`if (current) { claim(); }`)
+///     races a handover between the read and the claim commit.
 ///
-/// `is_leader()` gates only WHETHER TO ATTEMPT work; `epoch_is_current()` in
-/// the claim txn is what makes a stale leader's write fail. A boolean
-/// "I am leader" cached and trusted OUTSIDE the lock connection is PROHIBITED
-/// (ADR-2002 §6) — it is exactly the paused-ex-leader hazard the epoch closes.
+/// `is_leader()` gates only WHETHER TO ATTEMPT work; the `epoch_fence_sql()`
+/// predicate embedded in the claim's write is what makes a stale leader's write
+/// fail. A boolean "I am leader" cached and trusted OUTSIDE the lock connection
+/// is PROHIBITED (ADR-2002 §6) — it is exactly the paused-ex-leader hazard the
+/// epoch closes.
 ///
 /// TWO DISPATCH PLANES (ADR-2002 Decision 1, plan §1a). The epoch fence gates
 /// LEADER-DRIVEN BACKGROUND dispatch ONLY. Operator-triggered SYNCHRONOUS
@@ -37,7 +41,7 @@
 /// runs on whichever active-active replica received the request — frequently a
 /// non-leader — and MUST NOT be epoch-fenced or it regresses the active-active
 /// operator plane. Those paths are arbitrated by their own per-occurrence
-/// durable CAS, never by this epoch. Do not add `epoch_is_current()` to an
+/// durable CAS, never by this epoch. Do not embed `epoch_fence_sql()` on an
 /// operator-synchronous path.
 ///
 /// CONNECTION OWNERSHIP (ADR-2002 §10). The elector owns ONE dedicated,
@@ -45,8 +49,9 @@
 /// checkout-per-op lease (a recycled connection would drop the session lock).
 /// A transaction-mode pooler must not front it (it breaks backend affinity for
 /// session advisory locks). HAProxy-to-primary (WS-7) preserves affinity and is
-/// compatible. `epoch_is_current()` is the one method that runs on a CALLER's
-/// pooled connection, because it is a read inside the caller's claim txn.
+/// compatible. `epoch_fence_sql()` is a pure string builder (no connection); the
+/// SQL it returns is the one part of the fence that executes on a CALLER's
+/// pooled connection, inside the caller's own claim statement.
 
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_raii.hpp"
@@ -112,27 +117,50 @@ public:
     /// call when not leader. Leaves the connection open.
     void resign();
 
-    /// FENCE CHECK for a side-effecting claim, run on a CALLER-SUPPLIED pooled
-    /// connection inside the caller's transaction: true iff
-    /// `leader_state.current_leader_epoch` for `lock_name` equals
-    /// `expected_epoch`. Fail-CLOSED — returns false on a missing row, a query
-    /// error, or any parse failure. Static so a claim site can fence without a
-    /// reference to the live elector. See the two-dispatch-planes note above:
-    /// use this ONLY on leader-driven background claims, never on an
-    /// operator-synchronous path.
+    /// THE FENCE, as an SQL boolean expression to EMBED in a side-effecting
+    /// claim's WRITE statement (its `WHERE`/guard). Returns SQL of the form:
+    ///   ((SELECT current_leader_epoch FROM leader_elector.leader_state
+    ///       WHERE lock_key = '<lock_name>') = <epoch>)
     ///
-    /// ISOLATION CONTRACT (the claim-side wiring, slice 3.3, MUST honour this).
-    /// This read must observe the LATEST COMMITTED epoch. Run it in a
-    /// READ COMMITTED transaction, or as the FIRST statement of the claim
+    /// WHY A PREDICATE, NOT A BOOLEAN READ. ADR-2002 §3 requires the epoch check
+    /// to run "in the SAME TRANSACTION as the claim" — and, more strongly, it
+    /// must be indivisible from the claim's WRITE. A standalone boolean read
+    /// (`if (is_current) { claim(); }`) is a check-then-act race: a successor can
+    /// advance the epoch in the window between the read returning true and the
+    /// claim committing, so a stale ex-leader commits anyway. This primitive
+    /// therefore deliberately ships NO standalone boolean fence. The claim site
+    /// (slice 3.3) MUST compose this fragment into the writing statement, e.g.
+    ///   UPDATE claims SET ... WHERE claim_id = $1 AND <epoch_fence_sql(...)>
+    /// so the epoch is verified atomically with the write; a row count of zero
+    /// then means "fenced out", and a paused ex-leader cannot commit.
+    ///
+    /// Use ONLY on leader-driven background claims, never on an operator-
+    /// synchronous path (see the two-dispatch-planes note above).
+    ///
+    /// ISOLATION CONTRACT (the claim-side wiring, slice 3.3, MUST honour this —
+    /// embedding the predicate is necessary but NOT sufficient on its own). The
+    /// predicate is a scalar subquery over `leader_state`, so it reads under the
+    /// claim statement's TRANSACTION SNAPSHOT. Run the guarded write in a
+    /// READ COMMITTED transaction, or as the FIRST data statement of its
     /// transaction — never after an earlier statement in a REPEATABLE READ /
     /// SERIALIZABLE transaction, whose snapshot was taken before a concurrent
-    /// handover committed. A snapshot predating the handover would return the
-    /// pre-handover epoch and ADMIT a stale ex-leader's claim, silently
-    /// defeating the fence. The primitive cannot enforce the caller's isolation
-    /// level, so the claim site owns satisfying this.
-    [[nodiscard]] static bool epoch_is_current(PGconn* claim_conn,
-                                               const std::string& lock_name,
-                                               std::int64_t expected_epoch);
+    /// handover committed. A snapshot predating the handover reads the
+    /// pre-handover epoch and would ADMIT a stale ex-leader's claim even though
+    /// the check is in the same statement as the write. The primitive cannot
+    /// enforce the caller's isolation level, so the claim site owns this. (A
+    /// residual in-flight window — the handover committing after this statement's
+    /// snapshot is taken — is narrow and is bounded by §6 effectively-once; if a
+    /// claim requires strict exclusion it must add `FOR KEY SHARE` on the fence
+    /// row or stamp the epoch into the claim row under a constraint.)
+    ///
+    /// SAFE TO INLINE: `lock_name` is validated to `[a-z][a-z0-9_]{0,47}` and
+    /// `epoch` is an integer, so both are rendered as SQL literals — this lets
+    /// the caller splice the fragment into a larger statement without colliding
+    /// with its own `$N` placeholders. FAIL-CLOSED: an invalid `lock_name`
+    /// returns the constant-false predicate `(1=0)`, which fences everything out
+    /// rather than admitting a claim.
+    [[nodiscard]] static std::string epoch_fence_sql(const std::string& lock_name,
+                                                     std::int64_t epoch);
 
     /// The schema migrations for this store (version 1: `leader_epoch_seq` +
     /// `leader_state`). Exposed for tests and for the migration ladder.
