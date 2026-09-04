@@ -102,27 +102,23 @@ void GuardianOutboxDrainWorker::start() {
         }
         sig->cv.notify_all();
     });
-    // No completion-waker is wired here: a completed send whose result arrives AFTER
-    // wrapped_send()'s own bounded per-attempt wait (kGuardianSendOfferWait, 200ms)
-    // already gave up is only noticed on the next enqueue wake or the periodic
-    // backstop (periodic_bound_ms_, kDefaultPeriodicBoundMs = 5000ms in production) -
-    // a real cadence regression versus pre-fix behavior (governance Gate 6 sre
-    // finding). A WakeFn callback was built and wired once (stored in
-    // GuardianOutboxSendExecutor::State, called right after that class's own
-    // state_->cv.notify_all() in launch()'s worker lambda, under the same lock that
-    // publishes done=true) and made EVERY completed send bump sig_->gen and wake loop()
-    // immediately. That broke "R4: a refill re-arm does not wait out the periodic bound"
+    // No completion-waker callback is wired here (#3953 item 3, revised): a WakeFn
+    // stored in GuardianOutboxSendExecutor::State, called right after that class's own
+    // state_->cv.notify_all() and bumping sig_->gen to wake loop() immediately, was
+    // built and wired once - but it made EVERY completed send a wake SOURCE, which broke
+    // "R4: a refill re-arm does not wait out the periodic bound"
     // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
     // loop re-arms a forced page from ITS OWN internal refill logic with NO external
-    // wake. Disabling the callback made the test pass again 4/4; the exact mechanism by
-    // which the extra per-send wakes broke it was not diagnosed. Reverted for the same
-    // reason offer()'s wake-on-stopping was reverted in
-    // guardian_outbox_send_executor.hpp's offer()/wait_until comment: the regression's
-    // cost is judged smaller than the risk of redesigning another load-bearing
-    // pre-existing timing test in this file under this PR's own time budget. The
-    // callback and its wiring were fully removed (not merely disabled) - left as a note
-    // for whoever revisits this trade-off, since re-adding it means also auditing every
-    // existing test that assumes loop() wakes ONLY on enqueue/notify()/periodic-bound.
+    // wake, and an unrelated wake source let it pass for the wrong reason. Fixed
+    // instead with a WAIT clamp, not a wake: loop() polls
+    // GuardianOutboxSendExecutor::has_in_flight_send() on both lanes after every drain
+    // pass and clamps its OWN wait to kGuardianSendRecheckInterval (200ms) while
+    // anything is in flight - see loop()'s wait computation. This closes the same
+    // cadence cliff (detection latency after completion now bounded by roughly
+    // kGuardianSendOfferWait + kGuardianSendRecheckInterval, not by
+    // periodic_bound_ms_) without adding a wake source, so R4 - whose sink is fully
+    // synchronous and therefore never leaves a send in flight across a cycle boundary -
+    // is untouched.
     thread_ = std::thread([this] {
         // TOP-LEVEL firewall. The inner passes are each firewalled, but the loop's own tail -
         // the lifecycle_headroom() call (std::mutex::lock can throw system_error) and the
@@ -292,6 +288,12 @@ void GuardianOutboxDrainWorker::loop() {
     // it. Nothing here takes the engine mtx_, so running concurrently with the remainder of
     // wire_spark_engine is safe.
     bool skip_wait = true;
+    // #3953 item 3: a LOCAL, not a member (same convention as the timers above) - set
+    // after each drain pass, consumed by the wait computation below. Lets loop() poll a
+    // stalled-past-kGuardianSendOfferWait send sooner than the full periodic bound,
+    // without becoming a wake SOURCE itself (no sig_->gen bump, no notify_all) - see the
+    // wait computation's own comment for why that distinction is what keeps R4 sound.
+    bool send_in_flight_pending = false;
     // Concurrent arm/disarm traffic can refill the window between the end-of-cycle headroom
     // check and the next page pass, so the immediate re-arm could chain indefinitely - each
     // link a full journal scan. The token bucket does NOT bound that: take() is charged only
@@ -352,6 +354,21 @@ void GuardianOutboxDrainWorker::loop() {
                     // the preprocessor expands on the identifier plus '('.
                     wait_ms = (std::max)(remaining, std::chrono::milliseconds{0});
             }
+            // #3953 item 3: a send known in flight on either lane at the end of the last
+            // pass is re-checked sooner than the full periodic bound - closes the
+            // throughput cliff a send finishing between kGuardianSendOfferWait (200ms)
+            // and the periodic backstop used to hit. Deliberately just a WAIT clamp, not
+            // a wake (no gen bump, no notify_all): R4 ("a refill re-arm does not wait out
+            // the periodic bound") discriminates entirely on nothing but its own re-arm
+            // being able to produce a page inside its spin_until window - an added wake
+            // SOURCE would let an unrelated event satisfy that assertion for the wrong
+            // reason, which is exactly the "hollow test" failure R4's own comment warns
+            // against. A shortened WAIT cannot do that: it only changes how long THIS
+            // loop's own cv.wait_for blocks before re-evaluating its own predicate, so R4
+            // (whose sink is fully synchronous - offer() never returns nullopt there, so
+            // send_in_flight_pending is always false in that test) is untouched.
+            if (send_in_flight_pending)
+                wait_ms = (std::min)(wait_ms, kGuardianSendRecheckInterval);
             sig_->cv.wait_for(lk, wait_ms, [this, seen] {
                 return sig_->stopping.load(std::memory_order_acquire) || sig_->gen != seen;
             });
@@ -479,6 +496,17 @@ void GuardianOutboxDrainWorker::loop() {
         if (stop_requested())
             break;
         const auto drained = firewalled_drain();
+
+        // #3953 item 3: firewalled like every other read in this bare-thread tail (the
+        // item-13 seam below models exactly this class of exposure) - a std::system_error
+        // from either executor's mutex lock must not escape and kill the one-shot worker.
+        // Fails toward the existing periodic-bound cadence (false), never toward a crash.
+        try {
+            send_in_flight_pending =
+                lifecycle_send_exec_.has_in_flight_send() || compliance_send_exec_.has_in_flight_send();
+        } catch (...) {
+            send_in_flight_pending = false;
+        }
 
         // TEST-ONLY item-13 seam: model a throw from the loop's OWN tail (the refill re-arm's
         // rt_.lifecycle_headroom() - std::mutex::lock can throw - and the cadence arithmetic),

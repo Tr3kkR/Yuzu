@@ -203,25 +203,21 @@ public:
         state_->stopping = true;
     }
 
-    // NOT PROVIDED: a callback fired after every completed send, so the caller's own
-    // wake mechanism (e.g. the drain worker's Signal cv/gen) could learn promptly that
-    // a result is available even past offer()'s own bounded wait having given up. Its
-    // absence is a real cadence regression versus pre-fix behavior, not just a missed
-    // optimization: a send that runs longer than the caller's own bounded wait but
-    // still succeeds isn't re-checked until the caller's next enqueue or periodic
-    // backstop, where pre-fix (a blocking inline call) the next tick started as soon
-    // as the send returned (governance Gate 6 sre finding).
-    // Built and wired once (a WakeFn callback stored in State, called right after this
-    // class's own state_->cv.notify_all() in launch()'s worker lambda, under the same
-    // lock that publishes done=true); reverted after it empirically broke a
-    // load-bearing pre-existing timing test, "R4: a refill re-arm does not wait out
-    // the periodic bound" (test_guardian_outbox_drain_worker.cpp), whose whole point
-    // is proving loop() re-arms a forced page from its OWN internal logic with NO
-    // external wake. Disabling the callback made the test pass again 4/4; the exact
-    // mechanism by which the extra per-send wakes broke it was not diagnosed. The
-    // regression's cost is judged smaller than the risk of redesigning ANOTHER
-    // load-bearing pre-existing test under this PR's own time budget - left here as a
-    // note for whoever revisits this trade-off.
+    // NOT PROVIDED: a callback fired after every completed send (#3953 item 3, revised).
+    // Built and wired once (a WakeFn stored in State, called right after this class's
+    // own state_->cv.notify_all() in launch()'s worker lambda) - but it made every
+    // completed send bump the drain worker's sig_->gen and wake loop() immediately,
+    // which broke "R4: a refill re-arm does not wait out the periodic bound"
+    // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
+    // loop re-arms a forced page from its OWN internal logic with NO external wake, and
+    // an unrelated wake source let it pass for the wrong reason. Fixed instead with
+    // has_in_flight_send() (below) plus a WAIT clamp on the drain worker's own side
+    // (guardian_outbox_drain_worker.cpp's loop()) - the drain worker polls it after
+    // every pass and shortens its OWN wait while anything is in flight, rather than this
+    // class waking the drain worker itself. Closes the same cadence cliff (a send
+    // finishing between offer()'s bounded wait and the drain worker's periodic bound
+    // used to wait out the whole bound before being noticed) without adding a wake
+    // source, so R4 is untouched.
 
     /// For GuardianEngine::active_io_workers() (the orphan-exit contract's sole
     /// source of truth) - normally 0 or 1 (this executor is single-flight in the
