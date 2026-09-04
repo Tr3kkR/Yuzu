@@ -150,6 +150,19 @@ void GuardianOutboxDrainWorker::start() {
 }
 
 void GuardianOutboxDrainWorker::stop() {
+    // Stop admitting new detached sends on BOTH lanes FIRST, before sig_->stopping is
+    // published below (#3953 item 6). Unconditional (not gated on first_stop) and
+    // idempotent (GuardianOutboxSendExecutor::stop() just sets its own `stopping` under
+    // its own lock) - cheap to call on every GuardianOutboxDrainWorker::stop() call,
+    // including a second/concurrent one, and this ordering is what closes the window: a
+    // drain loop that reads should_stop()==false an instant before sig_->stopping flips
+    // still finds BOTH lane executors already refusing admission when it reaches
+    // wrapped_send(), so it cannot slip a new send in behind this call. Does not cancel a
+    // send already in flight - that worker is covered by the orphan-exit contract
+    // (active_send_workers(), summed into GuardianEngine::active_io_workers()), not by
+    // this join.
+    lifecycle_send_exec_.stop();
+    compliance_send_exec_.stop();
     bool first_stop = false;
     {
         // Stored UNDER the mutex even though the flag is atomic: a waiter evaluating the
@@ -162,23 +175,14 @@ void GuardianOutboxDrainWorker::stop() {
         }
     }
     if (first_stop) {
-        // Test seam: fires in the gap between sig_->stopping being published above and
-        // the two lane executors' own stop() calls below - the exact window #3953 item
-        // 6 reports (the drain loop can observe should_stop()==false, queried before
-        // this publish, and enter wrapped_send() for a lane whose own executor hasn't
-        // been told to stop yet). Production callers never set this.
+        // Test seam: fires with NO lock held, after BOTH lane executors already refuse
+        // admission (the calls above) and sig_->stopping is already published (#3953
+        // item 6). Production callers never set this.
         if (stop_race_hook_for_test_)
             stop_race_hook_for_test_();
         // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
         // already taken by an in-flight enqueue stays safe (still-alive Signal).
         rt_.set_outbox_enqueue_waker({});
-        // Stop admitting new detached sends on BOTH lanes (#2233 item 4); does not
-        // cancel one already in flight - that worker is covered by the orphan-exit
-        // contract (active_send_workers(), summed into GuardianEngine::active_io_workers()),
-        // not by this join. Before the join below, not after: the loop's own next
-        // wrapped_send() call must see stopping if it races this.
-        lifecycle_send_exec_.stop();
-        compliance_send_exec_.stop();
         sig_->cv.notify_all();
     }
     // The join is OUTSIDE the first_stop guard and keyed on joinable(), not on the
