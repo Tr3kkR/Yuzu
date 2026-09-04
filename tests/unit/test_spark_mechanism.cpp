@@ -1781,6 +1781,65 @@ TEST_CASE("#2815 door 4/4 — stop() waits for an in-flight arm_impl() watch cal
     CHECK(engine.stats().armed_sparks == 0);
 }
 
+TEST_CASE("#2815 — a DEDUP arm (mech stays null) is still leased before its M1 tail reads "
+          "consumers_mu_/consumers_",
+          "[spark][mechanism][teardown]") {
+    // Adversarial-review finding (K1/kimi, C2-1/codex, both independently confirmed and
+    // cross-examined BLOCK): door 4/4's own test above only exercises the NEWLY-INSERTED,
+    // mech-resolved shape. A DEDUP arm — a second Queued-tier consumer sharing an
+    // already-armed key — never sets `mech`, so pre-fix `if (mech) lease.arm_locked();`
+    // left this call's tail (the M1 consumer-race re-check, which locks consumers_mu_ and
+    // reads consumers_) with no lease at all. `~SparkEngine`'s unbounded wait keys solely
+    // on the lease count, saw zero, and could free consumers_mu_/consumers_ while this
+    // caller was still about to touch them — the same UAF class as door 4, just without a
+    // blocking mechanism call in the window. Fixed by arming unconditionally (matching
+    // door 3's unregister_consumer, which has the identical "tail touches engine members
+    // regardless of mech" shape). `arm_race_hook_for_test_` is the right injection point:
+    // it fires after the (skipped, since mech is null) watch block and before the M1
+    // re-check, on every arm_impl call regardless of whether mech was resolved.
+    auto engine = std::make_unique<SparkEngine>();
+    // Default (2s) budget deliberately NOT squeezed: this test's point is that BOTH
+    // stop()'s bounded wait and ~SparkEngine's unbounded wait block on this call's lease,
+    // so consumers_ stays intact (no M1-race error) the whole time this thread is parked —
+    // a squeezed budget would let stop() proceed to its own consumer-swap step first and
+    // conflate that (benign, already-handled) race with the property under test here.
+    wire_fake(*engine, SparkType::File);
+    auto c1 = engine->register_consumer("c1", [](const SparkEvent&) {});
+    REQUIRE(c1.has_value());
+    engine->start();
+    auto first = engine->arm(*c1, file_spec("/etc/hosts")); // mech resolved, real watch armed
+    REQUIRE(first.has_value());
+
+    auto c2 = engine->register_consumer("c2", [](const SparkEvent&) {});
+    REQUIRE(c2.has_value());
+
+    ParkGate gate;
+    engine->set_arm_race_hook_for_test([g = &gate] {
+        ParkGate* local = g;
+        local->park();
+    });
+
+    std::expected<SparkEngine::SubscriptionId, std::string> deduped;
+    SparkEngine* raw = engine.get();
+    std::thread armer([&] { deduped = raw->arm(*c2, file_spec("/etc/hosts")); }); // DEDUP: mech stays null
+    REQUIRE(gate.wait_entered());
+
+    std::atomic<bool> destroyed{false};
+    std::thread killer([&] {
+        engine->stop();
+        engine.reset(); // ~SparkEngine — must NOT free consumers_mu_/consumers_ while `armer` is parked
+        destroyed.store(true, std::memory_order_release);
+    });
+
+    CHECK_FALSE(became_true_within(destroyed, 300ms));
+
+    gate.release();
+    armer.join();
+    killer.join();
+    CHECK(destroyed.load());
+    CHECK(deduped.has_value()); // the dedup itself still succeeds; only the tail was racing
+}
+
 TEST_CASE("#2815 — ~SparkEngine waits UNBOUNDED for an in-flight teardown before freeing "
           "the members that caller still holds",
           "[spark][mechanism][teardown]") {

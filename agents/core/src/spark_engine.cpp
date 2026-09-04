@@ -847,8 +847,17 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
             } catch (...) {
             }
         }
-        if (mech)
-            lease.arm_locked(); // #2815: last statement under mu_
+        // Unconditional — not `if (mech)`. Reviewer-found (adversarial review, K1/C2-1):
+        // the tail below (M1 re-check + teardown_arm_race()) reads consumers_mu_/
+        // consumers_ regardless of whether a mechanism was resolved, so the dedup,
+        // pre-start-event-driven, and non-event-driven arm shapes — all of which leave
+        // `mech` null — need the same lease coverage door 3 (unregister_consumer, which
+        // arms unconditionally for the identical reason) already has. Confirmed reachable
+        // in production shape by the #2818 Guardian pin, which performs exactly this
+        // dedup arm on a Queued-tier subscription. RED-FIRST CONFIRMED: reverting this to
+        // `if (mech)` reproduces a real SIGSEGV in this file's "#2815 — a DEDUP arm"
+        // TEST_CASE (destroyed becomes true within 300ms pre-fix, then crashes on resume).
+        lease.arm_locked(); // #2815: last statement under mu_
     }
 
     // Arm the OS watch with mu_ RELEASED — watch() may block on handle setup,
