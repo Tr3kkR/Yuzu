@@ -138,7 +138,7 @@ public:
             // Test seam: fires in the real race window between offer()'s decision
             // (need_launch=true, state_->mu already released above) and the launch()
             // call below - the exact gap a concurrent stop() can land in. Deterministic
-            // regression coverage for that race (governance's adversarial-review C1/F3
+            // regression coverage for that race (the adversarial-review pass's C1/F3
             // finding, #3847 item 4 hardening) sets this to call stop() synchronously,
             // on this same thread, right here, then asserts launch() below observes it
             // and bails - the hook is what makes the interleave deterministic via call
@@ -146,7 +146,10 @@ public:
             if (pre_launch_race_hook_for_test_)
                 pre_launch_race_hook_for_test_();
             if (!launch(entry, send))
-                return SendResult::Retain; // launch failed (thread exhaustion, or stop() won the race); retry next tick
+                // launch failed - thread exhaustion (retried next tick), or stop() won
+                // the race (no next tick follows; the entry stays durable in the log
+                // for replay on the next boot, same as any other Retain at shutdown).
+                return SendResult::Retain;
         }
 
         std::unique_lock<std::mutex> lk{state_->mu};
@@ -268,8 +271,10 @@ private:
 
     /// Called from offer() with state_->mu NOT held (AliveTicket's own ctor/dtor take
     /// it, and it is not recursive). Spawns a detached worker that calls send(entry)
-    /// and publishes the result; returns false only if the OS refused to create the
-    /// thread (mirrors guardian_io_executor.hpp's LaunchFailed path).
+    /// and publishes the result. Returns false for either of two reasons: the OS
+    /// refused to create the thread (mirrors guardian_io_executor.hpp's LaunchFailed
+    /// path), or a concurrent stop() won the race against offer()'s decision to call
+    /// this function (see the re-check just inside the try block below).
     bool launch(const OutboxEntry& entry, const SendFn& send) {
         // Bookkeeping FIRST, under its own lock, BEFORE the worker is spawned - not
         // after. A fast `send` can complete, lock state_->mu, and publish done=true
@@ -308,7 +313,7 @@ private:
                 // offer() already read it under (above, before releasing state_->mu to
                 // call this function) - offer()'s own check has a gap between deciding
                 // need_launch and reaching this point, during which a concurrent stop()
-                // can run (adversarial review finding, #3847 item 4 hardening: neither
+                // can run (adversarial review finding, #3847 item 4 hardening: no
                 // internal governance round caught this, both external reviewers did,
                 // independently). This return precedes every State mutation below -
                 // in_flight is still false, no AliveTicket/worker exists yet - so it
