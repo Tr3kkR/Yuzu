@@ -38,6 +38,8 @@
 #include <system_error>
 #include <vector>
 
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field — zone names are firmware-supplied
+
 namespace yuzu::power_health {
 
 // ─────────────────────────────────────────────────────────── battery ──────
@@ -317,7 +319,9 @@ struct ThermalReport {
             out += '\n';
         char buf[16];
         std::snprintf(buf, sizeof buf, "%.1f", celsius);
-        out += "thermal|ok|" + name + "|" + buf;
+        // Zone names come from firmware, so they are untrusted with respect to
+        // the pipe-delimited grammar: an embedded '|' would forge a column.
+        out += "thermal|ok|" + yuzu::util::safe_output_field(name) + "|" + buf;
     }
     return out;
 }
@@ -633,6 +637,30 @@ struct SetPowerPlanResult {
 /// bounded_call()/bounded_call_tracked()'s own `std::optional<T>` shape one
 /// level up, so the real leg's bindings are a direct pass-through with no
 /// translation layer.
+/// Render a set_power_plan result row.
+///
+/// EVERY branch emits exactly four fields after the `set_power_plan`
+/// discriminator, because content/definitions/power_health.yaml declares the
+/// result columns POSITIONALLY (status, reason, previous_guid, new_guid). A
+/// success row that omitted `reason` shifted previous_guid into reason and
+/// new_guid into previous_guid — corrupting the one value an operator needs in
+/// order to revert. `-` is the absent-field marker, never an empty field.
+[[nodiscard]] inline std::string format_set_power_plan_row(std::string_view status,
+                                                            std::string_view reason,
+                                                            std::string_view previous_guid,
+                                                            std::string_view new_guid) {
+    auto dash = [](std::string_view v) { return v.empty() ? std::string_view{"-"} : v; };
+    std::string out = "set_power_plan|";
+    out += status;
+    out += '|';
+    out += dash(reason);
+    out += '|';
+    out += dash(previous_guid);
+    out += '|';
+    out += dash(new_guid);
+    return out;
+}
+
 struct SetPowerPlanOps {
     std::function<std::optional<EnumerateResult>()> enumerate;
     std::function<std::optional<std::optional<GuidBytes>>()> read_active;

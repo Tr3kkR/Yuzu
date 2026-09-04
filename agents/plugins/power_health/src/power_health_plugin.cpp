@@ -67,6 +67,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-H1 precedent)
 
 #include <atomic>
 #include <chrono>
@@ -516,7 +517,7 @@ int do_power_plan(yuzu::CommandContext& ctx) {
         for (const auto& scheme : schemes_result->schemes) {
             ctx.write_output(std::format("power_plan|{}|{}|-|active_unknown",
                                           yuzu::power_health::format_guid(scheme.guid),
-                                          scheme.friendly_name));
+                                          yuzu::util::safe_output_field(scheme.friendly_name)));
         }
         return 0;
     }
@@ -524,8 +525,11 @@ int do_power_plan(yuzu::CommandContext& ctx) {
 
     for (const auto& scheme : schemes_result->schemes) {
         const bool is_active = yuzu::power_health::guids_equal(active, scheme.guid);
+        // Scheme friendly names are operator-settable (powercfg -changename),
+        // so they are untrusted input to the pipe-delimited grammar.
         ctx.write_output(std::format("power_plan|{}|{}|{}|ok", yuzu::power_health::format_guid(scheme.guid),
-                                      scheme.friendly_name, is_active ? 1 : 0));
+                                      yuzu::util::safe_output_field(scheme.friendly_name),
+                                      is_active ? 1 : 0));
     }
     return 0;
 }
@@ -558,39 +562,39 @@ int do_set_power_plan(yuzu::CommandContext& ctx, yuzu::Params params) {
     case Outcome::MissingParam:
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "missing required param 'scheme'");
-        ctx.write_output("set_power_plan|error|missing_param|-|-");
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "missing_param", "", ""));
         return 1;
     case Outcome::Timeout:
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "bounded_call timed out enumerating power schemes; no mutation attempted");
-        ctx.write_output("set_power_plan|error|timeout|-|-");
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "timeout", "", ""));
         return 1;
     case Outcome::EnumerationIncomplete:
         ctx.set_result_status(
             YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
             "PowerEnumerate ended on a non-terminal error; refusing to resolve a scheme name "
             "against an incomplete inventory; no mutation attempted");
-        ctx.write_output("set_power_plan|error|enumeration_incomplete|-|-");
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "enumeration_incomplete", "", ""));
         return 1;
     case Outcome::Ambiguous:
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "scheme name matched more than one scheme; no mutation attempted");
-        ctx.write_output("set_power_plan|error|ambiguous|-|-");
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "ambiguous", "", ""));
         return 1;
     case Outcome::NoMatch:
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "no scheme matched the given name/GUID; no mutation attempted");
-        ctx.write_output("set_power_plan|error|no_match|-|-");
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "no_match", "", ""));
         return 1;
     case Outcome::ReadPriorFailed:
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "failed to read the prior active scheme; no mutation attempted");
-        ctx.write_output("set_power_plan|error|read_prior_failed|-|-");
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "read_prior_failed", "", ""));
         return 1;
     case Outcome::SetFailed:
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "PowerSetActiveScheme failed or timed out; no mutation applied");
-        ctx.write_output(std::format("set_power_plan|error|set_failed|{}|-", fmt_or_dash(result.previous_guid)));
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "set_failed", fmt_or_dash(result.previous_guid), ""));
         return 1;
     case Outcome::ReadbackFailed:
         // The set call itself already reported success — final state is
@@ -600,19 +604,30 @@ int do_set_power_plan(yuzu::CommandContext& ctx, yuzu::Params params) {
             YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
             "post-set read-back failed; the mutation may already be applied and final state is "
             "unknown — previous_guid is reported for manual verification/revert");
-        ctx.write_output(
-            std::format("set_power_plan|error|readback_failed|{}|-", fmt_or_dash(result.previous_guid)));
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row(
+            "error", "readback_failed", fmt_or_dash(result.previous_guid), ""));
         return 1;
     case Outcome::ReadbackMismatch:
         ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "post-set read-back scheme does not match the target; final state is uncertain");
-        ctx.write_output(std::format("set_power_plan|error|readback_mismatch|{}|{}",
-                                      fmt_or_dash(result.new_guid), fmt_or_dash(result.target_guid)));
+        // previous_guid/new_guid keep their declared meaning here too: the
+        // scheme in force BEFORE the mutation, and what the read-back actually
+        // observed. The target that was asked for is named in the status text
+        // rather than overloading a declared column with a third meaning.
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row(
+            "error", "readback_mismatch", fmt_or_dash(result.previous_guid),
+            fmt_or_dash(result.new_guid)));
         return 1;
     case Outcome::Ok:
         ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
-        ctx.write_output(std::format("set_power_plan|ok|{}|{}", fmt_or_dash(result.previous_guid),
-                                      fmt_or_dash(result.new_guid)));
+        // Four fields after the discriminator on EVERY branch, success included.
+        // content/definitions/power_health.yaml declares the result columns
+        // positionally (status, reason, previous_guid, new_guid), so a success
+        // row that omitted `reason` shifted previous_guid into reason and
+        // new_guid into previous_guid — corrupting exactly the value an
+        // operator needs in order to revert.
+        ctx.write_output(yuzu::power_health::format_set_power_plan_row(
+            "ok", "", fmt_or_dash(result.previous_guid), fmt_or_dash(result.new_guid)));
         return 0;
     }
 
@@ -620,7 +635,7 @@ int do_set_power_plan(yuzu::CommandContext& ctx, yuzu::Params params) {
     // (-Wswitch would flag a future enumerator added without a case here).
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                            "unrecognised internal outcome");
-    ctx.write_output("set_power_plan|error|internal|-|-");
+    ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "internal", "", ""));
     return 1;
 }
 
@@ -643,11 +658,11 @@ int do_set_power_plan(yuzu::CommandContext& ctx, yuzu::Params /*params*/) {
 #ifdef __APPLE__
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                            "macOS has no named power schemes; no mutation attempted");
-    ctx.write_output("set_power_plan|error|unsupported_on_macos|-|-");
+    ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "unsupported_on_macos", "", ""));
 #else
     ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                            "power_plan mutation is PLANNED on Linux, not implemented; no mutation attempted");
-    ctx.write_output("set_power_plan|error|planned_not_implemented|-|-");
+    ctx.write_output(yuzu::power_health::format_set_power_plan_row("error", "planned_not_implemented", "", ""));
 #endif
     // Genuinely did not mutate — non-zero, same contract as the Windows
     // failure branches (exit code and typed status agree in every branch).
@@ -666,7 +681,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_CONSTRAINED, 1, "/sys/class/power_supply uevent parsing",
          "fixture-verified; no live Linux venue in this run"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList",
+         "IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is "
+         "present, matched and active even on a battery-less Mac mini and would report a "
+         "phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real "
+         "Mac battery hardware — the run host was a desktop"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState)",
          "no-system-battery path measured live on the-rig (BatteryFlag=128); the "

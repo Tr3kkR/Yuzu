@@ -448,10 +448,13 @@ agent_test_exe = executable(
                                                 # errno classification, fs_snapshot_list attrlist walk,
                                                 # and the legs.hpp pure row formatters
     'unit/test_filesystem_posture_local_dispatcher.cpp', # Wave 6 PR6.1-b: real filesystem_posture dylib
-    'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
-    'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via LocalDispatcher (read-only actions only; explicit no-battery SKIP)
                                                 # driven end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
+    'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
+                                                # LocalDispatcher. Deliberately NOT platform-guarded — it
+                                                # runs on every OS, and on a host with no battery it emits an
+                                                # explicit named SKIP rather than passing silently.
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

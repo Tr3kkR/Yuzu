@@ -109,8 +109,14 @@ TEST_CASE("classify_windows_battery: battery-PRESENT, discharging — RECONSTRUC
     const auto row = classify_windows_battery(kReconstructedPresentBattery);
     CHECK(row.present);
     CHECK(row.state == BatteryState::discharging);
-    CHECK(row.percent == 62);
-    CHECK(row.time_to_empty_min == 90);
+    // Derived invariants, not literals: the whole point of this seam is that a
+    // reviewer can paste a REAL laptop capture over kReconstructedPresentBattery
+    // without touching a single assertion. Pinning percent==62 would have forced
+    // exactly the edit the protocol says must not be needed.
+    CHECK(row.percent >= 0);
+    CHECK(row.percent <= 100);
+    CHECK(row.percent == kReconstructedPresentBattery.battery_life_percent);
+    CHECK(row.time_to_empty_min == kReconstructedPresentBattery.battery_life_time / 60);
 }
 
 TEST_CASE("classify_windows_battery: battery-PRESENT, charging — RECONSTRUCTION",
@@ -632,4 +638,42 @@ TEST_CASE("format_thermal_line: constrained line is the explicit success shape",
           "[power_health][thermal]") {
     const ThermalReport r{"constrained", "no_thermal_zones_exposed", {}};
     CHECK(format_thermal_line(r) == "thermal|constrained|no_thermal_zones_exposed");
+}
+
+TEST_CASE("set_power_plan row: every branch emits exactly four fields after the discriminator "
+          "so the positional result columns cannot shift",
+          "[power_health][set_power_plan][columns]") {
+    using yuzu::power_health::format_set_power_plan_row;
+
+    // content/definitions/power_health.yaml declares, positionally:
+    //   status, reason, previous_guid, new_guid
+    // The success row previously carried only three payload fields, so the
+    // server bound reason=<previous_guid> and previous_guid=<new_guid> and left
+    // new_guid empty — silently corrupting the value an operator reverts with.
+    auto field_count = [](const std::string& row) {
+        return static_cast<int>(std::count(row.begin(), row.end(), '|'));
+    };
+
+    const std::string ok = format_set_power_plan_row("ok", "", "{prev-guid}", "{new-guid}");
+    CHECK(ok == "set_power_plan|ok|-|{prev-guid}|{new-guid}");
+    CHECK(field_count(ok) == 4);
+
+    const std::string mismatch =
+        format_set_power_plan_row("error", "readback_mismatch", "{prev-guid}", "{observed-guid}");
+    CHECK(mismatch == "set_power_plan|error|readback_mismatch|{prev-guid}|{observed-guid}");
+    CHECK(field_count(mismatch) == 4);
+
+    // Sparse error branches still pad rather than shorten.
+    for (std::string_view reason : {"missing_param", "timeout", "enumeration_incomplete",
+                                     "ambiguous", "no_match", "read_prior_failed"}) {
+        const std::string row = format_set_power_plan_row("error", reason, "", "");
+        INFO("reason: " << reason);
+        CHECK(field_count(row) == 4);
+        CHECK(row.ends_with("|-|-"));
+    }
+
+    // A partially-known branch pads only the unknown tail field.
+    const std::string set_failed = format_set_power_plan_row("error", "set_failed", "{prev}", "");
+    CHECK(set_failed == "set_power_plan|error|set_failed|{prev}|-");
+    CHECK(field_count(set_failed) == 4);
 }

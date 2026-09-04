@@ -140,6 +140,23 @@ battery hardware** (only a desktop, which correctly reports
    run the tests on your laptop — its absence is the signal that the real
    battery-present leg executed and was asserted, not skipped.
 
-Until that capture lands, the battery-PRESENT path is **not** described as
+### Second check, if you have a MacBook
+
+The same gap exists on macOS and for the same reason: the run host was a Mac
+mini (`hw.model` = Mac16,10), which has no battery, so the macOS
+battery-PRESENT path is fixture-tested too. It is a separate ask from the
+Windows one above — neither covers the other.
+
+Run the same `battery` dispatch against a macOS agent on a MacBook and apply
+the identical pass criteria (`present=1`; `state` never `unknown`; `percent`
+in `0`-`100`, never `-1`; the no-battery `SKIP` absent from the suite run).
+
+Worth knowing while you check: this leg reads `IOPSCopyPowerSourcesInfo`
+rather than the `AppleSmartBattery` IORegistry node **on purpose**. That node
+is present, matched and active even on the battery-less Mac mini, so a leg
+built on it would have reported a phantom battery on every desktop Mac. If a
+future change "simplifies" this to an `ioreg` read, that is a regression.
+
+Until those captures land, the battery-PRESENT path is **not** described as
 verified anywhere in this plugin's docs, changelog, or capability
-declaration — only the no-battery desktop path is.
+declaration — on **either** platform. Only the no-battery desktop paths are.
