@@ -358,7 +358,6 @@ TEST_CASE("#3953 item 3: has_in_flight_send() reads true for a mismatched orphan
     CHECK(exec.has_in_flight_send()); // mismatched-orphan-still-running case, too
 
     send_a.release();
-    REQUIRE(spin_until([&] { return !exec.has_in_flight_send() || send_a.invocations.load() >= 1; }));
     // Drain the reclaim + a fresh launch for B to completion so the test frame doesn't
     // outlive a detached worker.
     std::optional<SendResult> b_result;
@@ -368,6 +367,11 @@ TEST_CASE("#3953 item 3: has_in_flight_send() reads true for a mismatched orphan
             return b_result.has_value() && *b_result == SendResult::Sent;
         },
         3s));
+    // The real property this test's earlier vacuous predicate meant to assert
+    // (quality-engineer review): once B's send has actually completed, the slot has
+    // cleared - has_in_flight_send() must read false, not merely "invocations >= 1"
+    // (which was already REQUIRE'd true above and never decreases).
+    CHECK_FALSE(exec.has_in_flight_send());
     CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
 }
 
