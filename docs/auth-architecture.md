@@ -2972,12 +2972,16 @@ walkthrough.
   grant, or a full securable × operation wildcard grant). Fails closed
   (`503`, "cannot verify") rather than reporting a false `ok:true` if RBAC
   reference data can't be resolved.
-- **Audit-persist posture (#2466/#2406, ADR-1005 "mutations fail closed on
-  audit failure"):** every *mutating* engine-principal REST route fails closed
+- **Audit-persist posture (#2466/#2406 + #3937, ADR-1005 "mutations fail closed
+  on audit failure"):** every *mutating* engine-principal REST route fails closed
   — `503` + `Sec-Audit-Failed: true` — if its audit row cannot persist, so a
   privileged mutation never reports success on an unrecorded action (mint/rotate
-  additionally withhold the one-time secret); the MCP twins signal the same
-  non-fatally via `audit_persisted:false`. The *reads* instead set the header
+  additionally withhold the one-time secret). **Since #3937 the MCP mutation twins
+  fail closed too** — a JSON-RPC `503` error (with `audit_persisted:false` in
+  `error.data`, not on a success result), matching the REST posture and the
+  in-MCP plugin-config precedent; mint/rotate withhold the secret there as well.
+  (The human-token twins + the ~20 other set-and-proceed MCP write tools are a
+  separate, tracked decision.) The *reads* instead set the header
   and proceed: they commit no state and disclose only authorization **topology
   metadata** (principal ids, owners, role grants), not per-person behavioural
   PII — so the fail-closed-on-read posture that governs the device/network PII

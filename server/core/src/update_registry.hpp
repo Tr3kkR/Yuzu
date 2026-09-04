@@ -50,9 +50,11 @@
 /// migration solves.
 
 #include <cstdint>
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -103,7 +105,89 @@ public:
     /// adversarial review 2026-08-28).
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
-    void upsert_package(const UpdatePackage& pkg);
+    /// Outcome of a single-package lookup that distinguishes "not there" from
+    /// "the store could not answer".
+    ///
+    /// The ordinary reads on this store fail SOFT — a degraded `list_packages`
+    /// returns an EMPTY VECTOR, which reads as "no packages configured" (see the
+    /// posture note at the top of this file, and ADR-0061). That carve-out was
+    /// granted on the explicit premise that "no downstream branch treats an empty
+    /// list as an authorization or enforcement signal".
+    ///
+    /// An AUDIT branch does. `ota.package.rollout_changed` records `denied` /
+    /// `not_found` when the package is absent, and audit-log.md tells operators
+    /// that `result == "denied"` is the filter for enumeration attempts — so a
+    /// pool timeout or a PG blip during a legitimate admin rollout would both
+    /// manufacture key-enumeration alerts AND assert, in the evidence record,
+    /// that a package which exists did not. This lookup exists so that branch can
+    /// tell the two apart, without widening the fail-soft reads the rest of the
+    /// server depends on. `update_rollout_checked` below is its one consumer.
+    enum class PackageLookup { kFound, kAbsent, kUnavailable };
+
+    /// Insert or update a package row. Returns false when the write did NOT
+    /// commit — a closed store, a pool-acquire timeout, or a query error.
+    ///
+    /// It returns a value rather than logging and moving on because a CALLER
+    /// AUDITS THIS. `ota.package.rollout_changed` reports a committed transition
+    /// ("from=100% to=0%"), and an audit row asserting a change that never
+    /// reached the database is worse than no row at all: it is evidence that
+    /// disagrees with the state, in the one record an incident responder is
+    /// supposed to be able to trust. Callers that do not audit may still ignore
+    /// the result; the log line is unchanged.
+    [[nodiscard]] bool upsert_package(const UpdatePackage& pkg);
+
+    /// Outcome of an atomic rollout change: what the row held BEFORE the write,
+    /// and whether that write committed.
+    ///
+    /// `status` and `committed` are SEPARATE questions and the caller needs both.
+    ///  - `kFound` + `committed`      — applied; the priors are the values this
+    ///                                  transaction replaced.
+    ///  - `kFound` + `!committed`     — the row was read inside the transaction,
+    ///                                  so it exists and the priors are what was
+    ///                                  observed, but the write did not land.
+    ///  - `kAbsent`                   — the store reported no such row.
+    ///  - `kUnavailable`              — nothing is known; priors are unset.
+    ///
+    /// The middle case is why `committed` is not folded into `status`: collapsing
+    /// it onto `kUnavailable` would throw away a prior value that WAS read and an
+    /// existence that IS known, and the audit row would then say
+    /// `existence_unknown=true` about a package the store had just returned.
+    struct RolloutChange {
+        PackageLookup status{PackageLookup::kUnavailable};
+        bool committed{false};
+        int prior_rollout_pct{0};
+        bool prior_mandatory{false};
+    };
+
+    /// Set one package's rollout percentage, returning the percentage it
+    /// replaced — read and written in a SINGLE transaction under a row lock.
+    ///
+    /// IT MUST STAY ONE TRANSACTION, and that is the whole reason this method
+    /// exists rather than a separate lookup + `upsert_package` pair at the call
+    /// site. Those are two separate pooled leases in autocommit, so a
+    /// concurrent write to the same key can land between them — and
+    /// `upsert_package` writes the ENTIRE snapshot back, not just
+    /// `rollout_pct`, so the other writer's change is silently discarded. The
+    /// audit row is what makes that fatal rather than merely lossy:
+    /// audit-log.md states "the `from=` value is the point of this row", and a
+    /// `result=success` row whose `from=` names a value the commit did not
+    /// actually replace is evidence disagreeing with state, in the one record an
+    /// incident responder is meant to be able to trust. It does not need two
+    /// colliding admins: one session firing two near-simultaneous requests is
+    /// enough, which is exactly the compromised-admin case #3692 exists to catch.
+    ///
+    /// Same shape as `AuditStore::stamp_complete` (ADR-0040, #2697), where
+    /// checking only statement status let a writer that LOST this race report
+    /// success while another writer's value sat at the trust anchor. See
+    /// docs/postgres-store-playbook.md.
+    ///
+    /// A degraded store reports `kUnavailable`, never absence — see the
+    /// `PackageLookup` comment above for why that distinction is load-bearing
+    /// for the audit branch.
+    [[nodiscard]] RolloutChange update_rollout_checked(const std::string& platform,
+                                                       const std::string& arch,
+                                                       const std::string& version, int rollout_pct);
+
     void remove_package(const std::string& platform, const std::string& arch,
                         const std::string& version);
     std::vector<UpdatePackage> list_packages() const;
@@ -116,11 +200,50 @@ public:
     /// Pure — no DB.
     std::filesystem::path binary_path(const UpdatePackage& pkg) const;
 
+    /// Path to the package's detached CMS signature, if the operator supplied
+    /// one at upload (#416/#3807). A SIDECAR beside the binary rather than a
+    /// column on the row, mirroring how plugin signatures are stored, so the
+    /// signature travels with the artifact and needs no schema migration.
+    ///
+    /// The server does not verify this and is deliberately not trusted to: the
+    /// agent checks it against a trust anchor placed on disk at install time,
+    /// out of band of this server entirely. Absent file means unsigned.
+    std::filesystem::path signature_path(const UpdatePackage& pkg) const;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
     std::filesystem::path update_dir_;
     yuzu::MetricsRegistry* metrics_{nullptr};
 };
+
+/// Is `name` safe to use as an OTA package filename? (#3863)
+///
+/// Every OTA artifact path is built as `update_dir_ / filename` — the binary, its
+/// `.sig` sidecar, and the `.upload.<n>.tmp` staging file. The filename arrives
+/// from an operator-supplied multipart part, so without this check a name of
+/// `../../../../etc/cron.d/x` escapes the update directory, and an ABSOLUTE name
+/// is worse still: `operator/` discards the left operand entirely when the right
+/// is absolute, so `/etc/cron.d/x` ignores `update_dir_` without needing any
+/// `..` at all. Either way the uploaded bytes land wherever the server account
+/// can write, which is arbitrary file write and, via cron or a unit file, code
+/// execution.
+///
+/// ALLOWLIST, NOT AN ESCAPE-SCAN. This accepts a bare filename and rejects
+/// everything else, rather than trying to strip or normalise a hostile one —
+/// normalising is where this class of bug comes back, because it invites
+/// "just one more" separator or encoding to be handled. Callers reject; nothing
+/// rewrites the operator's name behind their back.
+///
+/// Rejects: empty; `.` and `..`; anything containing `/`, `\\`, or `:`. The
+/// backslash and colon are rejected on every platform, not just Windows — the
+/// server may run on Windows, where both are path-significant (`:` also selects
+/// an NTFS alternate data stream), and a rule that varies by build host is a rule
+/// nobody can reason about.
+[[nodiscard]] inline bool is_safe_package_filename(std::string_view name) {
+    if (name.empty() || name == "." || name == "..")
+        return false;
+    return name.find_first_of("/\\:") == std::string_view::npos;
+}
 
 } // namespace yuzu::server
