@@ -213,7 +213,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // marker rows, never a DROP TABLE, plus a CHECK constraint closing a race the DELETE
         // alone leaves open (Gate 4 unhappy-path UP-1, round 4, below).
         //
-        // DELETE, not poison, unlike RbacStore's v2 (same PR family, `rbac_meta`): the two
+        // DELETE, not poison, unlike RbacStore's v4 (same PR family, `rbac_meta`): the two
         // stores' old-binary-rollback failure modes differ. RbacStore's retired code fell
         // through marker-absence into an UNCONDITIONAL overwrite of a live security flag --
         // silent and dangerous, so that migration POISONS the marker to force old code down
@@ -243,7 +243,7 @@ const std::vector<pg::PgMigration>& migrations() {
         // The CHECK constraint closes this deterministically: it rejects an INSERT of either
         // marker key outright (23514 check_violation) independent of `ON CONFLICT` arbitration
         // (Postgres validates CHECK constraints before conflict resolution, so
-        // `stamp_complete`'s `ON CONFLICT (id) DO NOTHING` shape does not bypass it). Old-binary
+        // `stamp_complete`'s `ON CONFLICT (key) DO NOTHING` shape does not bypass it). Old-binary
         // `stamp_complete` reaches this INSERT from exactly two of its four branches --
         // marker-absent-empty-table (the UP-1 window) and a real local legacy file -- and both
         // now fail at the write; the other two never reach an INSERT at all: a non-empty

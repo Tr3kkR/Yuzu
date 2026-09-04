@@ -352,7 +352,7 @@ backfill-only rows (`backfill_complete`, `backfill_source_fingerprint`) are remo
 version-bumped v2 migration appended after the already-shipped v1, never edited in place: this
 store is constructed in production, so v1 has run against real dev/UAT databases.
 
-**DELETE, not poison — the opposite choice from `RbacStore`'s v2 (ADR-0041's own Update,
+**DELETE, not poison — the opposite choice from `RbacStore`'s v4 (ADR-0041's own Update,
 same PR family), and deliberately so.** `RbacStore`'s retired code fell through marker-absence
 into an unconditional overwrite of a live security flag (`rbac_enabled`) sourced from whatever a
 local legacy file held — silent and dangerous, so that migration POISONS the marker to force an

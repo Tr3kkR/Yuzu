@@ -1783,7 +1783,7 @@ conflate them:
 **If you see the legacy-row-count warning and the environment genuinely has
 real audit history to keep, there is no automated recovery path**: the
 pre-cutover trail stays exactly where it is, at its configured path (0600
-now enforced, content otherwise untouched) — and is your operator-managed
+now enforced on POSIX, #3593; content otherwise untouched) — and is your operator-managed
 record going forward (export it, archive it, keep it under your own
 retention policy; Yuzu will never import it). The generic "reapply manually"
 phrasing in the boot warning fits config-shaped stores below (a webhook
