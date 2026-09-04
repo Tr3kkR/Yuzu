@@ -286,34 +286,52 @@ int emit_smart(yuzu::CommandContext& ctx) {
         any_row = true;
     }
 
-    // ORDERING IS THE CONTRACT HERE. set_result_status ASSIGNS, so the LAST
-    // call wins, and the constraint below is TRUE ON EVERY RUN. Reporting it
-    // last -- as an earlier revision did -- overwrote every more-material
-    // cause with a constant, so no real macOS degradation could ever reach a
-    // status-keyed consumer. Least-material (always true) FIRST.
-    //
-    // The token is `macos:iokit:health_unread`, not bare `macos:iokit`: sharing
-    // the token with the hard IOServiceGetMatchingServices failure gave that
-    // alert key a 100% firing rate on healthy hosts, which makes it useless for
-    // detecting a genuinely broken IOKit.
-    mark_result_partial(ctx, "macos:iokit:health_unread",
-                        "health attributes are not read on macOS; identity and capability only");
-
-    if (any_device_unresolved)
-        mark_result_partial(ctx, "macos:iokit:no_bsd_name",
-                            "at least one block storage device resolved no BSD name and is "
-                            "reported with \"-\" as its device");
-
-    // LAST: an empty walk outranks both marks above it and must not be demoted
-    // to `partial` by the always-true health constraint.
-    if (!any_row) {
+    if (!any_row)
         // `unsupported`, not `unknown`, so the placeholder is not schema-
-        // identical to a real device row; and an empty walk reaches the seam
-        // rather than returning a clean, complete inventory of nothing.
+        // identical to a real device row.
         write_smart_row(ctx, "-", "-", Bus::Unknown, Media::Unknown, Health::Unsupported,
                         std::nullopt, std::nullopt, "no block storage devices found");
-        mark_result_unavailable(ctx, "macos:iokit",
-                                "no IOBlockStorageDevice was found on this host");
+
+    // PRECEDENCE comes from the pure layer. This leg previously hand-ordered
+    // its marks, which contradicted the header's own "and NOWHERE ELSE" claim
+    // and left the last hand-ordered chain in the plugin -- exactly the drift
+    // that produced the earlier defect.
+    //
+    // The health constraint is TRUE ON EVERY RUN, so it is the weakest cause
+    // here: mapping it to ItemDetailUnread lets any real degradation outrank it
+    // rather than being overwritten by a constant.
+    DegradationFlags flags;
+    flags.item_detail_unread = true; // health is never read on this platform
+    flags.identity_unread = any_device_unresolved;
+    flags.empty_result = !any_row;
+
+    if (const auto cause = summarise_degradation(flags)) {
+        switch (*cause) {
+        case DegradationKind::EmptyResult:
+            mark_result_unavailable(ctx, "macos:iokit",
+                                    "no IOBlockStorageDevice was found on this host");
+            break;
+        case DegradationKind::IdentityUnread:
+            mark_result_partial(ctx, "macos:iokit:no_bsd_name",
+                                "at least one block storage device resolved no BSD name and is "
+                                "reported with \"-\" as its device");
+            break;
+        case DegradationKind::ItemDetailUnread:
+            // The token is qualified, not bare `macos:iokit`: sharing it with
+            // the hard IOServiceGetMatchingServices failure gave that alert key
+            // a 100% firing rate on healthy hosts.
+            mark_result_partial(ctx, "macos:iokit:health_unread",
+                                "health attributes are not read on macOS; identity and capability "
+                                "only");
+            break;
+        case DegradationKind::Denied:
+        case DegradationKind::EnumerationIncomplete:
+        case DegradationKind::ListUnread:
+        case DegradationKind::ListTruncated:
+        case DegradationKind::MountsUnread:
+        case DegradationKind::FstypeUnread:
+            break; // not produced by this leg
+        }
     }
     return 0;
 }
@@ -401,10 +419,19 @@ int emit_volumes(yuzu::CommandContext& ctx) {
     // object (a short listing) first and an unread mount table last, so under
     // last-writer-wins the WEAKEST cause won. Driving the shared decision makes
     // that class of drift impossible rather than merely fixed once.
+    if (!any_row)
+        // Word this for what actually happened. IOMedia objects may well have
+        // been FOUND and then dropped by the join filter above, so "no IOMedia
+        // objects found" would be a falsehood in exactly the case that produces
+        // it most often.
+        write_volume_row(ctx, "-", "-", "-", "-", std::nullopt,
+                         "no IOMedia object carried a physical-to-logical mapping to report");
+
     DegradationFlags flags;
     flags.list_truncated = any_media_skipped;
     flags.item_detail_unread = any_physical_unresolved;
     flags.mounts_unread = !mounts_ok;
+    flags.empty_result = !any_row;
 
     if (const auto cause = summarise_degradation(flags)) {
         switch (*cause) {
@@ -428,6 +455,10 @@ int emit_volumes(yuzu::CommandContext& ctx) {
                                 "getmntinfo_r_np returned no entries; volumes are listed without "
                                 "their mount points");
             break;
+        case DegradationKind::EmptyResult:
+            mark_result_unavailable(ctx, "macos:iomedia",
+                                    "no volume mapping could be produced on this host");
+            break;
         case DegradationKind::Denied:
         case DegradationKind::EnumerationIncomplete:
         case DegradationKind::ListUnread:
@@ -435,20 +466,6 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         case DegradationKind::FstypeUnread:
             break; // not produced by this leg
         }
-    }
-
-    // LAST: an empty result is the strongest statement this leg can make, and
-    // must not be demoted to `partial` by a co-occurring degradation.
-    if (!any_row) {
-        // Word this for what actually happened. IOMedia objects may well have
-        // been FOUND and then dropped by the join filter above (a host whose
-        // every media object is a whole disk serving no mount point), so
-        // "no IOMedia objects found" would be a falsehood in exactly the case
-        // that produces it most often.
-        write_volume_row(ctx, "-", "-", "-", "-", std::nullopt,
-                         "no IOMedia object carried a physical-to-logical mapping to report");
-        mark_result_unavailable(ctx, "macos:iomedia",
-                                "no volume mapping could be produced on this host");
     }
     return 0;
 }

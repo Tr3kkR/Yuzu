@@ -509,11 +509,21 @@ int emit_smart(yuzu::CommandContext& ctx) {
     if (trailing_absent < kExhaustionTailRun) probe_cap_reached = true;
 
     // PRECEDENCE comes from the pure layer; this switch only names the cause.
+    // The placeholder ROW is written before the status decision: a consumer
+    // must never read zero rows and infer "no drives". Its STATUS, though, goes
+    // through the shared precedence like every other cause -- emitting it after
+    // the switch overwrote a co-occurring denial, reporting a host that refused
+    // every device as one that simply has none.
+    if (!any_row)
+        write_smart_row(ctx, "-", "-", Bus::Unknown, Media::Unknown, Health::Unsupported,
+                        std::nullopt, std::nullopt, "no physical drives could be opened");
+
     DegradationFlags flags;
     flags.item_detail_unread = any_health_unread;
     flags.identity_unread = any_identity_failure;
     flags.list_truncated = probe_cap_reached;
     flags.list_unread = any_open_failure;
+    flags.empty_result = !any_row;
     flags.denied = any_denied;
 
     if (const auto cause = summarise_degradation(flags)) {
@@ -545,23 +555,15 @@ int emit_smart(yuzu::CommandContext& ctx) {
                                 "health could not be read for at least one drive; see the row "
                                 "detail");
             break;
+        case DegradationKind::EmptyResult:
+            mark_result_unavailable(ctx, "windows:physicaldrive",
+                                    "no physical drive could be opened on this host");
+            break;
         case DegradationKind::EnumerationIncomplete:
         case DegradationKind::MountsUnread:
         case DegradationKind::FstypeUnread:
             break; // not produced by this leg
         }
-    }
-
-    // LAST, deliberately. An empty walk is the strongest statement this leg can
-    // make -- there is nothing here at all -- and set_result_status assigns, so
-    // reporting it before the partial block would let a co-occurring partial
-    // demote it. `unsupported` rather than `unknown` keeps the placeholder from
-    // being schema-identical to a real drive row.
-    if (!any_row) {
-        write_smart_row(ctx, "-", "-", Bus::Unknown, Media::Unknown, Health::Unsupported,
-                        std::nullopt, std::nullopt, "no physical drives could be opened");
-        mark_result_unavailable(ctx, "windows:physicaldrive",
-                                "no physical drive could be opened on this host");
     }
     return 0;
 }
@@ -580,8 +582,11 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         const DWORD err = ::GetLastError();
         write_volume_row(ctx, "-", "-", "-", "-", std::nullopt,
                          std::format("FindFirstVolumeW failed: {}", err));
+        // Qualified tokens, matching the summary block: a consumer alerting on
+        // windows:volume_enum:denied must see the TOTAL refusal too, which is
+        // the most severe case of all.
         if (err == ERROR_ACCESS_DENIED)
-            mark_result_denied(ctx, "windows:volume_enum",
+            mark_result_denied(ctx, "windows:volume_enum:denied",
                                "volume enumeration was refused; this agent account cannot "
                                "enumerate volumes");
         else
@@ -828,6 +833,7 @@ int emit_volumes(yuzu::CommandContext& ctx) {
                                 "rows show \"-\" for fstype without meaning the volume has no "
                                 "filesystem");
             break;
+        case DegradationKind::EmptyResult:
         case DegradationKind::IdentityUnread:
         case DegradationKind::ItemDetailUnread:
             break; // not produced by this leg

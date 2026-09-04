@@ -127,6 +127,7 @@ struct DegradationFlags {
     bool list_truncated{false};      ///< a reply carried fewer items than claimed
     bool list_unread{false};         ///< an item list could not be read at all
     bool enumeration_incomplete{false}; ///< the walk itself stopped early
+    bool empty_result{false};        ///< the walk produced nothing at all
     bool denied{false};              ///< something refused us on privilege grounds
 };
 
@@ -147,6 +148,7 @@ enum class DegradationKind {
     ListTruncated,
     ListUnread,
     EnumerationIncomplete,
+    EmptyResult,
     Denied,
 };
 
@@ -162,6 +164,14 @@ summarise_degradation(const DegradationFlags& f) noexcept {
     // one — rather than a sequence whose earlier members are overwritten and
     // therefore invisible.
     if (f.denied) return DegradationKind::Denied;
+    // An empty result outranks every degradation EXCEPT a denial. A leg that
+    // produced nothing because it was refused everywhere must report the
+    // refusal: UNAVAILABLE says "this platform cannot do this", which is the
+    // wrong category and hides the one cause with a distinct remediation
+    // (grant the agent account a right). An earlier revision emitted the empty
+    // mark after the switch, so on a host that denied every device the denial
+    // was silently overwritten.
+    if (f.empty_result) return DegradationKind::EmptyResult;
     if (f.enumeration_incomplete) return DegradationKind::EnumerationIncomplete;
     if (f.list_unread) return DegradationKind::ListUnread;
     if (f.list_truncated) return DegradationKind::ListTruncated;
@@ -172,11 +182,25 @@ summarise_degradation(const DegradationFlags& f) noexcept {
     return std::nullopt;
 }
 
+/// Which of the three status seams a cause must be reported through. Kept as a
+/// pure classification so a leg cannot pick the wrong seam for a given cause:
+/// PERMISSION_DENIED, UNAVAILABLE and CONSTRAINED mean different things to a
+/// status-keyed consumer, and only the first is fixed by granting a right.
+enum class DegradationSeam { Partial, Denied, Unavailable };
+
+[[nodiscard]] inline constexpr DegradationSeam degradation_seam(DegradationKind k) noexcept {
+    switch (k) {
+    case DegradationKind::Denied:      return DegradationSeam::Denied;
+    case DegradationKind::EmptyResult: return DegradationSeam::Unavailable;
+    default:                           return DegradationSeam::Partial;
+    }
+}
+
 /// True when the leg must call mark_result_denied rather than
 /// mark_result_partial: a privilege refusal is a different fact with a
 /// different fix, and a status-keyed consumer has to tell them apart.
 [[nodiscard]] inline constexpr bool is_denial(DegradationKind k) noexcept {
-    return k == DegradationKind::Denied;
+    return degradation_seam(k) == DegradationSeam::Denied;
 }
 
 /// The whole-disk name for a partition, by string shape only.

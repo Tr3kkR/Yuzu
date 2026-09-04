@@ -30,6 +30,7 @@
 #include "disk_actions_legs.hpp"
 #include "disk_actions_parsers.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdlib>
 #include <filesystem>
@@ -244,11 +245,17 @@ TEST_CASE("disk_actions: a degraded read reports through the typed status seam",
     auto smart = dispatcher.run(plugin->descriptor, "smart");
     CHECK(smart.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(smart.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
-    // The token is qualified, NOT the bare `macos:iokit`. The bare token is
-    // reserved for an IOKit enumeration FAILURE; this always-true structural
-    // constraint has its own key, so an operator alerting on a broken IOKit is
-    // not drowned by a signal that fires on every healthy macOS host.
-    CHECK(smart.result_provenance == "macos:iokit:health_unread");
+    // The token is QUALIFIED, not the bare `macos:iokit` -- that one is reserved
+    // for an IOKit enumeration FAILURE, so an operator alerting on a broken
+    // IOKit is not drowned by a signal that fires on every healthy macOS host.
+    //
+    // Asserted as a prefix, not an equality: a Mac with a block-storage device
+    // that resolves no BSD name (an empty card reader or optical bay) reports
+    // the more material `macos:iokit:no_bsd_name` instead, and that is correct
+    // behaviour rather than a failure. Pinning the exact string made this test
+    // depend on the hardware of whoever ran it.
+    INFO("provenance: " << smart.result_provenance);
+    CHECK(smart.result_provenance.rfind("macos:iokit:", 0) == 0);
 #elif defined(__linux__)
     // K5 + spec F5: the Linux legs are not implemented, which is UNAVAILABLE
     // ("this platform cannot do this"), never CONSTRAINED ("partial data") --
@@ -633,6 +640,7 @@ TEST_CASE("disk_actions: the degradation precedence holds for every pair",
         {[](DegradationFlags& f) { f.list_truncated = true; },          DegradationKind::ListTruncated},
         {[](DegradationFlags& f) { f.list_unread = true; },             DegradationKind::ListUnread},
         {[](DegradationFlags& f) { f.enumeration_incomplete = true; },  DegradationKind::EnumerationIncomplete},
+        {[](DegradationFlags& f) { f.empty_result = true; },            DegradationKind::EmptyResult},
         {[](DegradationFlags& f) { f.denied = true; },                  DegradationKind::Denied},
     };
     constexpr std::size_t n = std::size(ordered);
@@ -672,6 +680,7 @@ TEST_CASE("disk_actions: every degradation flag maps to its own cause",
         {[](DegradationFlags& f) { f.list_truncated = true; },         DegradationKind::ListTruncated},
         {[](DegradationFlags& f) { f.list_unread = true; },            DegradationKind::ListUnread},
         {[](DegradationFlags& f) { f.enumeration_incomplete = true; }, DegradationKind::EnumerationIncomplete},
+        {[](DegradationFlags& f) { f.empty_result = true; },           DegradationKind::EmptyResult},
         {[](DegradationFlags& f) { f.denied = true; },                 DegradationKind::Denied},
     };
     std::set<DegradationKind> seen;
@@ -739,4 +748,40 @@ TEST_CASE("disk_actions: every untrusted text field survives separator injection
         REQUIRE(f.size() == 7);
         CHECK(f[field] == evil);
     }
+}
+
+// Gate 8b (cpp-safety G8b-1, HIGH): a host that refuses a zero-access open on
+// EVERY device sets both `denied` and `empty_result`. An earlier revision
+// emitted the empty-result status AFTER the precedence switch, so UNAVAILABLE
+// overwrote PERMISSION_DENIED and a total privilege refusal was reported as
+// "this platform cannot do this" — the wrong category, and the one cause whose
+// remediation (grant the account a right) the operator most needs to see.
+TEST_CASE("disk_actions: a denial outranks an empty result", "[disk_actions][status]") {
+    using namespace yuzu::disk_actions;
+    DegradationFlags f{};
+    f.denied = true;
+    f.empty_result = true;
+    const auto k = summarise_degradation(f);
+    REQUIRE(k.has_value());
+    CHECK(*k == DegradationKind::Denied);
+    CHECK(is_denial(*k));
+    CHECK(degradation_seam(*k) == DegradationSeam::Denied);
+
+    // ...and an empty result with no denial still reports UNAVAILABLE, so the
+    // fix does not simply suppress the empty case.
+    DegradationFlags e{};
+    e.empty_result = true;
+    const auto ek = summarise_degradation(e);
+    REQUIRE(ek.has_value());
+    CHECK(*ek == DegradationKind::EmptyResult);
+    CHECK(degradation_seam(*ek) == DegradationSeam::Unavailable);
+
+    // An empty result still outranks every ordinary degradation.
+    DegradationFlags m{};
+    m.empty_result = true;
+    m.enumeration_incomplete = true;
+    m.list_unread = true;
+    const auto mk = summarise_degradation(m);
+    REQUIRE(mk.has_value());
+    CHECK(*mk == DegradationKind::EmptyResult);
 }
