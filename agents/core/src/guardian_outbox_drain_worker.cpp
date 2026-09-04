@@ -162,6 +162,13 @@ void GuardianOutboxDrainWorker::stop() {
         }
     }
     if (first_stop) {
+        // Test seam: fires in the gap between sig_->stopping being published above and
+        // the two lane executors' own stop() calls below - the exact window #3953 item
+        // 6 reports (the drain loop can observe should_stop()==false, queried before
+        // this publish, and enter wrapped_send() for a lane whose own executor hasn't
+        // been told to stop yet). Production callers never set this.
+        if (stop_race_hook_for_test_)
+            stop_race_hook_for_test_();
         // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
         // already taken by an in-flight enqueue stays safe (still-alive Signal).
         rt_.set_outbox_enqueue_waker({});

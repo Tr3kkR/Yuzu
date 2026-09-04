@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -242,6 +243,40 @@ TEST_CASE("the periodic bound drains even without an explicit enqueue-wake",
 
     REQUIRE(spin_until([&] { return sink.count() >= 1; }, 2s)); // the backstop did
     worker.stop();
+}
+
+TEST_CASE("#3953 item 6: stop() closes both lane executors before publishing sig_->stopping "
+          "does not admit a send in the gap",
+          "[spark][guardian][drain][chaos]") {
+    // Never start()ed: offer()'s one-caller contract holds on THIS test thread, so
+    // calling wrapped_send_for_test() directly from inside the hook is deterministic -
+    // no real thread scheduling involved, matching the send_executor file's own
+    // pre_launch_race_hook_for_test_ pattern.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    std::atomic<int> invocations{0};
+    auto sink = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rt, sink);
+
+    auto entry = OutboxEntry::lifecycle("r1", 1, "e1", 1'700'000'000'000'000'000, "armed");
+    std::optional<SendResult> observed;
+    worker.set_stop_race_hook_for_test(
+        [&] { observed = worker.wrapped_send_for_test(entry); });
+
+    worker.stop();
+
+    REQUIRE(observed.has_value());
+    CHECK(*observed == SendResult::Retain);
+    CHECK(invocations.load() == 0);
+    // On TODAY's order this test's own admitted send launches a REAL detached thread
+    // (the executor hasn't been told to stop yet when the hook fires) - spin_until,
+    // don't assert active_send_workers()==0 synchronously: a real worker is in
+    // flight, only its eventual thread-exit decrement makes the count read 0.
+    CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
 }
 
 TEST_CASE("stop() is idempotent and joins cleanly with nothing pending",

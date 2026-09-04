@@ -381,6 +381,19 @@ public:
         return lifecycle_send_exec_.active_worker_count() + compliance_send_exec_.active_worker_count();
     }
 
+    /// Test-only forwarder to the private wrapped_send() (#3953 item 6) - lets a test
+    /// drive a single send attempt directly, on the test's own thread, without
+    /// start()ing the worker thread. No production caller.
+    [[nodiscard]] SendResult wrapped_send_for_test(const OutboxEntry& entry) {
+        return wrapped_send(entry);
+    }
+
+    /// Test-only synchronization seam - see the call site in stop() for what race it
+    /// exists to make deterministic (#3953 item 6). Production callers never set this.
+    void set_stop_race_hook_for_test(std::function<void()> hook) {
+        stop_race_hook_for_test_ = std::move(hook);
+    }
+
 private:
     void loop();
     /// The SendFn actually threaded through rt_.drain_bounded(): bounces each send
@@ -446,6 +459,7 @@ private:
     std::shared_ptr<Signal> sig_;
     bool started_{false};
     std::thread thread_;
+    std::function<void()> stop_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
     std::atomic<std::uint64_t> drain_exceptions_{0}; ///< firewalled drain-pass throws (item 4 hardening)
     std::atomic<std::uint64_t> journal_maint_exceptions_{0}; ///< firewalled maintenance-pass throws (C0)
     /// Success stamps for the staleness gauges (item 6). Seeded at start() (clamped >= 1 so
