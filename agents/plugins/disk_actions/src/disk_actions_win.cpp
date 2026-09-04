@@ -5,6 +5,15 @@
  * (the-rig, live Samsung SSD 970 EVO Plus over NVMe) before a line of this was
  * written. The full record is at ~/.claude/roadmaps/wave6-smart-spike.md.
  *
+ *   smart    IOCTL_STORAGE_QUERY_PROPERTY with StorageDeviceProperty (identity,
+ *            bus type), StorageDeviceSeekPenaltyProperty (SSD vs HDD) and
+ *            StorageDeviceProtocolSpecificProperty + ProtocolTypeNvme +
+ *            NVMeDataTypeLogPage page 0x02 (the SMART/Health log).
+ *   volumes  FindFirstVolumeW/FindNextVolumeW +
+ *            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS (which physical drives back
+ *            this volume) + GetVolumePathNamesForVolumeNameW (which mount
+ *            points it serves).
+ *
  * HOST-VERIFIED 2026-09-04 on that same host: this TU compiles under real MSVC
  * with zero errors, the agent suite passes there (76,268 assertions / 2,553
  * cases), and both actions were exercised against two live NVMe drives,
@@ -18,15 +27,6 @@
  * The last two lines are the join this plugin exists for: C: resolves to
  * PhysicalDrive0 and D: to PhysicalDrive1, so a failing drive can be named in
  * terms of the drive letters it serves.
- *
- *   smart    IOCTL_STORAGE_QUERY_PROPERTY with StorageDeviceProperty (identity,
- *            bus type), StorageDeviceSeekPenaltyProperty (SSD vs HDD) and
- *            StorageDeviceProtocolSpecificProperty + ProtocolTypeNvme +
- *            NVMeDataTypeLogPage page 0x02 (the SMART/Health log).
- *   volumes  FindFirstVolumeW/FindNextVolumeW +
- *            IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS (which physical drives back
- *            this volume) + GetVolumePathNamesForVolumeNameW (which mount
- *            points it serves).
  *
  * TWO SPIKE NEGATIVES, both load-bearing, both the kind of mistake that ships
  * a leg which silently never works:
