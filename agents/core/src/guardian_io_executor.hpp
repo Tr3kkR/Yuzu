@@ -49,6 +49,19 @@
  *    a precise bounded Unknown string (it lands in guard.unhealthy detail).
  *  - Absolute deadline captured at run() ENTRY (per-class deadline chosen by the
  *    reader), so allocation + launch time counts against the caller's budget.
+ *  - Exactly-once result delivery (#3816): every result fn() returns normally goes
+ *    to exactly one of run()'s return value (caller still waiting) or the optional
+ *    on_abandoned(T&&) callback (caller already timed out / the executor is
+ *    stopping). The wait-side lock is acquired ONCE, before spawn_detached, and
+ *    held across launch into cv.wait_until - so the caller's abandon decision and
+ *    the worker's publish decision always serialize on the SAME mutex acquisition
+ *    (a plain ResultCell::abandoned bool, no atomics needed) and there is no
+ *    window after a caller gives up where a late success has nowhere race-free to
+ *    go. A mutex-lock failure on this ONE acquisition can only happen before the
+ *    worker exists (folds into IoFailure::LaunchFailed, #saf3821-5's test seam is
+ *    set_throw_before_wait_lock_for_test); cv.wait_until's own internal re-lock on
+ *    wake is not a throwing failure mode (std::terminate per the standard if it
+ *    cannot reacquire), so there is no catchable post-launch failure to guard.
  *
  * ORPHAN PROCESS-EXIT CONTRACT (rung-5 scope: expose + document; ENFORCEMENT
  * LANDED rung 7, see below):
@@ -80,6 +93,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -126,7 +140,9 @@ enum class IoFailure {
     Stopped,           ///< the executor is stopping (shutdown); the submitter was woken / rejected
     CapacityExhausted, ///< the per-class or total inflight quota was full
     AlreadyRunning,    ///< a read for this exact (class, key) is already in flight (single-flight)
-    LaunchFailed,      ///< the OS refused to create the worker thread (or an allocation failed)
+    LaunchFailed,      ///< the OS refused to create the worker thread, an allocation failed, or
+                       ///< the pre-launch wait-lock acquisition failed (#3816 - folded here
+                       ///< rather than a new enumerator, since it is now provably pre-launch)
     WorkerThrew,       ///< the read body threw (should not happen; contained, never terminates)
 };
 
@@ -227,6 +243,17 @@ public:
         std::uint64_t rejected_key{0};
         std::uint64_t launch_failures{0};
         std::uint64_t worker_exceptions{0};
+        /// #3816: every result routed to on_abandoned (a late completion after the
+        /// caller gave up), success or failure of fn() alike - this class is
+        /// T-agnostic and cannot discriminate a "success" for an arbitrary T; a
+        /// caller wanting that distinction (e.g. GuardianSparkRuntime's late-arm
+        /// count) must derive it from within its own on_abandoned callback.
+        std::uint64_t abandoned{0};
+        /// on_abandoned itself threw; contained here (never propagated - the
+        /// worker lambda is noexcept). Counted IN ADDITION to `abandoned` above
+        /// (that delivery still happened; this counts that its cleanup failed),
+        /// not instead of it - the two are not mutually exclusive.
+        std::uint64_t abandonment_cleanup_failures{0};
     };
 
     /// A by-value snapshot (never a reference into State after the lock releases).
@@ -274,9 +301,24 @@ public:
     /// Forwarding callable (no std::function alloc); the worker captures a decayed
     /// OWNING copy of `fn`. No constraint on `T`'s own move-throwing-ness - the
     /// worker heap-boxes its result and publishes by a nothrow unique_ptr move
-    /// (see below).
+    /// (see below). 4-arg form: no abandonment callback (state reads - a late
+    /// result is pure wasted work, nothing escapes to clean up).
     template <class F>
     auto run(IoClass cls, std::string key, std::chrono::milliseconds deadline, F&& fn) {
+        using T = std::decay_t<std::invoke_result_t<F&>>;
+        return run(cls, std::move(key), deadline, std::forward<F>(fn), [](T&&) {});
+    }
+
+    /// 5-arg form (#3816): `on_abandoned` is invoked, on the worker thread, with
+    /// fn()'s result WHEN that result would otherwise have nowhere race-free to
+    /// go - the caller already decided Timeout/Stopped before the worker reached
+    /// its publish decision. It fires only when fn() returned normally (never for
+    /// WorkerThrew or an alloc-starved null box - there is no T to hand it in
+    /// either case). See the class INVARIANTS block for the exactly-once contract
+    /// and why a plain mutex-guarded bool is sufficient (no atomics).
+    template <class F, class OnAbandoned>
+    auto run(IoClass cls, std::string key, std::chrono::milliseconds deadline, F&& fn,
+             OnAbandoned&& on_abandoned) {
         using T = std::decay_t<std::invoke_result_t<F&>>;
         // The worker heap-boxes its result (unique_ptr<IoResult<T>>) and publishes
         // it into the cell by a pointer move, which is nothrow for ANY result type -
@@ -291,6 +333,10 @@ public:
         Ticket ticket;                          // function scope: armed under the lock; its RAII
                                                 // destructor rolls admission back on any unwind
         std::shared_ptr<ResultCell<T>> cell;
+        // Constructed inside the try, held across spawn_detached, reused for
+        // cv.wait_until - see INVARIANTS. owns_lock() tells the catch block
+        // whether the failure happened before or after this was acquired.
+        std::unique_lock<std::mutex> wait_lk;
         try {
             cell = std::make_shared<ResultCell<T>>();
             ticket = std::make_shared<TicketCore>(state_); // unarmed until admitted
@@ -316,8 +362,21 @@ public:
                 ticket->arm(ci, it);
             }
 
+            // #saf3821-5 test seam: simulate the wait-lock acquisition failing,
+            // without corrupting state_->mu for the rest of the process. Thrown
+            // BEFORE wait_lk exists, so owns_lock() is false in the catch below.
+            if (throw_before_wait_lock_for_test_.load(std::memory_order_relaxed))
+                throw std::runtime_error(
+                    "guardian_io_executor: injected wait-lock failure (test seam)");
+
+            // Acquired once, held across spawn_detached, reused for wait_until
+            // below - see INVARIANTS. This is the ONLY lock construction in the
+            // function that can outlive the admission block.
+            wait_lk = std::unique_lock<std::mutex>{state_->mu};
+
             auto st = state_;
             auto worker = [st, cell, ticket, ci,
+                           on_abandoned = std::decay_t<OnAbandoned>(std::forward<OnAbandoned>(on_abandoned)),
                            fn = std::decay_t<F>(std::forward<F>(fn))]() mutable noexcept {
                 // Construct the result on the heap OUTSIDE the publish lock; this is
                 // the only potentially-throwing step (fn() itself, or the boxing
@@ -336,55 +395,114 @@ public:
                         boxed.reset();
                     }
                 }
+                // Decide abandoned-vs-published under st->mu FIRST, before touching
+                // cell->result - deciding after would mean handing on_abandoned a
+                // `boxed` that publication had already moved from (#3816 design
+                // review caught this ordering bug). Both this decision and the
+                // caller's own Timeout/Stopped decision (guardian_io_executor.hpp's
+                // run()) serialize on this SAME mutex, so a plain bool is enough.
+                bool was_abandoned = false;
                 {
                     std::lock_guard<std::mutex> lk{st->mu};
                     if (threw)
                         ++st->counters[ci].worker_exceptions;
-                    cell->result = std::move(boxed); // nothrow: unique_ptr pointer move
-                    cell->done = true;
-                    ticket->release_key_locked(); // free the single-flight key now;
-                                                   // the inflight counters stay held
-                                                   // until this ticket's destructor
-                                                   // runs (worker's own copy, at true
-                                                   // OS-thread-exit time)
+                    was_abandoned = cell->abandoned;
+                    if (!was_abandoned) {
+                        cell->result = std::move(boxed); // nothrow: unique_ptr pointer move
+                        cell->done = true;
+                        ticket->release_key_locked(); // free the single-flight key now;
+                                                       // the inflight counters stay held
+                                                       // until this ticket's destructor
+                                                       // runs (worker's own copy, at true
+                                                       // OS-thread-exit time)
+                    } else if (boxed && boxed->has_value()) {
+                        ++st->counters[ci].abandoned;
+                    }
+                    // On the abandoned branch, deliberately do NOT call
+                    // release_key_locked() here - a second lock acquisition after
+                    // on_abandoned returns would be a new throwing call inside this
+                    // noexcept lambda. TicketCore's own destructor (already a single
+                    // unconditional acquisition, already runs at true worker-thread-
+                    // exit) frees the key together with the inflight counters
+                    // instead - no new lock acquisition on this, the ORDINARY
+                    // abandoned-publish path (the separate, rare cleanup-failure
+                    // sub-path below DOES take one more, to count the failure).
                 }
-                st->cv.notify_all(); // after releasing the lock
+                st->cv.notify_all(); // after releasing the lock (unconditional,
+                                     // matching the pre-existing idiom - harmless
+                                     // for any other waiter sharing this cv)
+                if (was_abandoned && boxed && boxed->has_value()) {
+                    try {
+                        on_abandoned(std::move(boxed->value()));
+                    } catch (...) {
+                        try {
+                            std::lock_guard<std::mutex> lk{st->mu};
+                            ++st->counters[ci].abandonment_cleanup_failures;
+                        } catch (...) {
+                        }
+                    }
+                }
                 // `ticket` copy destroyed at worker scope end -> releases the counters
+                // (and, on the abandoned branch, the key too - see above)
             };
 
             bool launched = false;
             if (!fail_launch_for_test_.load(std::memory_order_relaxed))
                 launched = io_detail::spawn_detached(std::move(worker));
             if (!launched) {
-                std::lock_guard<std::mutex> lk{state_->mu};
+                // wait_lk is already held - reuse it, do NOT take a fresh lock here
+                // (a second acquisition of the same non-recursive mutex by this
+                // thread would self-deadlock).
                 ++state_->counters[ci].launch_failures;
                 return IoResult<T>{std::unexpect, IoFailure::LaunchFailed}; // ticket rolls back
             }
         } catch (...) {
-            // bad_alloc from cell / ticket / worker allocation, or from set::insert. An
-            // armed ticket's function-scope destructor rolls admission back on return.
+            // bad_alloc from cell / ticket / worker allocation, from set::insert, or
+            // the injected test-seam throw above. wait_lk may or may not be held
+            // depending on where the throw happened - owns_lock() tells us which,
+            // so we never try to lock state_->mu twice on the same thread. An armed
+            // ticket's function-scope destructor rolls admission back on return
+            // (wait_lk, declared after ticket, destructs FIRST - unlocking before
+            // the ticket destructor's own acquisition, if wait_lk was held).
             try {
-                std::lock_guard<std::mutex> lk{state_->mu};
-                ++state_->counters[ci].launch_failures;
+                if (wait_lk.owns_lock()) {
+                    ++state_->counters[ci].launch_failures;
+                } else {
+                    std::lock_guard<std::mutex> lk{state_->mu};
+                    ++state_->counters[ci].launch_failures;
+                }
             } catch (...) {
             }
             return IoResult<T>{std::unexpect, IoFailure::LaunchFailed};
         }
 
         ticket.reset(); // success: drop the caller copy; the worker now owns the reservation
+        // Safe only because every worker code path first blocks on THIS SAME
+        // state_->mu (the caller's own wait_lk, held continuously from before this
+        // point) before it can reach a publish/abandon decision - no worker path
+        // bypasses that lock_guard to race TicketCore's destructor against the
+        // caller. A future worker early-return that skipped the lock would
+        // self-deadlock (or worse, race) here instead.
 
-        std::unique_lock<std::mutex> lk{state_->mu};
-        state_->cv.wait_until(lk, abs_deadline,
+        state_->cv.wait_until(wait_lk, abs_deadline,
                               [&] { return cell->done || state_->stopping; });
         if (cell->done) {
             if (cell->result)
                 return std::move(*cell->result); // real result wins over a concurrent stop
             return IoResult<T>{std::unexpect, IoFailure::WorkerThrew}; // null box: alloc-starved worker
         }
-        if (state_->stopping)
+        // Giving up: mark abandoned under the still-held wait_lk BEFORE returning -
+        // this is the caller-side half of the exactly-once decision (#3816). A
+        // worker that reaches its own publish decision after this either sees
+        // `abandoned` already true (routes to on_abandoned) or is still mid-fn()
+        // and will see it the moment it takes st->mu.
+        if (state_->stopping) {
+            cell->abandoned = true;
             return IoResult<T>{std::unexpect, IoFailure::Stopped};
+        }
         ++state_->counters[ci].timed_out;
-        return IoResult<T>{std::unexpect, IoFailure::Timeout}; // the late worker write is discarded
+        cell->abandoned = true;
+        return IoResult<T>{std::unexpect, IoFailure::Timeout};
     }
 
     /// Wake every waiting submitter and reject new submissions. Idempotent,
@@ -433,6 +551,16 @@ public:
     /// Test seam: force the next launch to fail, exercising the LaunchFailed
     /// rollback path without depending on real thread-resource exhaustion.
     void set_fail_launch_for_test(bool v) { fail_launch_for_test_.store(v); }
+
+    /// Test seam (#3816/#saf3821-5): force every run() to throw immediately
+    /// before its wait-lock acquisition, exercising the pre-launch LaunchFailed
+    /// rollback path this specific failure now folds into - without corrupting
+    /// state_->mu (a real std::mutex::lock() failure cannot be induced portably).
+    /// Sticky until reset (same semantics as set_fail_launch_for_test above) - a
+    /// test that sets this must reset it before any later run() on this instance.
+    void set_throw_before_wait_lock_for_test(bool v) {
+        throw_before_wait_lock_for_test_.store(v);
+    }
 
 private:
     /// Heap state shared (via shared_ptr) by the executor AND every worker + ticket,
@@ -519,14 +647,21 @@ private:
     /// result type whose own move is potentially-throwing, e.g. MSVC's
     /// std::unordered_map, would otherwise terminate the noexcept worker). A null
     /// pointer with done == true means the worker could not allocate its result box.
+    /// `abandoned` (#3816): set by the caller, under State::mu, when it decides
+    /// Timeout/Stopped instead of consuming a result; read by the worker, under the
+    /// SAME lock, to decide whether to publish or route to on_abandoned. A plain
+    /// bool is sufficient - both writers/readers always hold State::mu, there is no
+    /// lock-free path to this cell.
     template <class T>
     struct ResultCell {
         bool done{false};
+        bool abandoned{false};
         std::unique_ptr<IoResult<T>> result;
     };
 
     std::shared_ptr<State> state_;
     std::atomic<bool> fail_launch_for_test_{false};
+    std::atomic<bool> throw_before_wait_lock_for_test_{false};
 };
 
 // Tripwires (ADR-0021 rung 9a R3), at namespace scope so Config{}'s default member

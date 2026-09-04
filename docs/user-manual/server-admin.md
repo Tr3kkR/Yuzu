@@ -1561,6 +1561,97 @@ registered an interval trigger expecting the old no-op behaviour will now
 have that trigger fire — this is the fix, not a regression. Server-only
 upgrades are unaffected; the change is entirely agent-side.
 
+### vNEXT — OTA update binary signing (#416)
+
+**Endpoints that upgraded via OTA self-update have no trust-anchor directory.**
+The installers create it, but agent self-update replaces the binary in place and
+runs no installer — so on Windows and macOS, where OTA *is* the normal upgrade
+route, neither the directory nor its ACL hardening exists after upgrading. Create
+it before you enable signing, or `--update-trust-bundle` points at nothing:
+
+```powershell
+# Windows, elevated. All three commands matter, and in this order. Keep each on ONE
+# line -- a broken continuation runs the earlier steps and silently skips the rest,
+# which is the exact state this block exists to avoid.
+mkdir "C:\ProgramData\Yuzu\agent-certs"
+
+# 1. Take ownership. If the directory ALREADY EXISTS, whoever created it owns it and
+#    holds WRITE_DAC permanently -- stripping their access without taking ownership
+#    lets them put it straight back. takeown also enables the privilege needed to
+#    recover a directory whose permissions grant Administrators nothing at all.
+takeown /F "C:\ProgramData\Yuzu\agent-certs" /A /R /D Y
+
+# 2. Drop every explicit entry. This is the step that removes a pre-existing grant.
+#    Step 3 cannot: /grant:r replaces grants only for the accounts it NAMES, so an
+#    entry held by anyone else survives it untouched.
+icacls "C:\ProgramData\Yuzu\agent-certs" /reset /T /C /Q
+
+# 3. Break inheritance and grant exactly Administrators and SYSTEM. Without the
+#    inheritance break, %ProgramData%'s inherited rights let an unprivileged local
+#    user plant the anchor file before you do.
+icacls "C:\ProgramData\Yuzu\agent-certs" /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /T /C /Q
+
+# Verify: expect ONLY BUILTIN\Administrators and NT AUTHORITY\SYSTEM, each (OI)(CI)(F),
+# and nothing marked (I). Check the OWNER too -- an unexpected owner can restore its own
+# access at any time, so "the list looks right" is not on its own sufficient.
+icacls "C:\ProgramData\Yuzu\agent-certs"
+(Get-Acl "C:\ProgramData\Yuzu\agent-certs").Owner
+```
+
+```bash
+# macOS, as root.
+mkdir -p /etc/yuzu-agent/certs && chown root:wheel /etc/yuzu-agent/certs
+chmod 755 /etc/yuzu-agent/certs
+```
+
+Linux endpoints upgraded through `.deb`/`.rpm` need nothing here — Debian's
+post-install step re-runs on upgrade, and the RPM ships the directory in its
+payload. A Linux endpoint that upgraded by OTA self-update, however, is in the
+same position as Windows and macOS and needs `install -d -m 0755 -o root -g root
+/etc/yuzu-agent/certs`.
+
+**Default behaviour is unchanged.** Agents that pass no `--update-trust-bundle`
+behave exactly as before: the downloaded binary is checked against the
+server-supplied SHA-256 and applied. Signature verification is entirely opt-in.
+
+**What signing does and does not close — read this before relying on it.** With a
+trust bundle configured, a compromised or impersonated update server can no
+longer push a binary your signing key never signed. That is the substitution
+attack, and it is closed.
+
+It does NOT close ROLLBACK. The signature covers the binary's CONTENT only, while
+`latest_version` and the SHA-256 both come from the server. So a hostile server
+can still serve a genuinely signed OLD release — one you really did sign — while
+labelling it a newer version and quoting a hash computed over those same bytes.
+Every agent-side check passes and the endpoint installs a real but outdated,
+possibly known-vulnerable build, then reports itself up to date. Closing this
+needs the version bound into the signed material (a signed manifest, TUF-style),
+which is not in this release. Treat signing as confining an attacker to *binaries
+you have signed*, not to *the binary you meant to ship*, and keep retiring the
+signing key's authority over withdrawn releases accordingly.
+
+**New on-disk artifact — the trust anchor.** `/etc/yuzu-agent/certs/` on Linux
+and macOS, `C:\ProgramData\Yuzu\agent-certs\` on Windows, created by the
+installers. It is deliberately NOT the server's `/etc/yuzu/certs` — that path is
+the server's own CA directory, which the server owns and re-tightens on boot, so
+no single mode serves both. You place the PEM bundle there yourself; nothing is
+installed into it.
+
+**Second new artifact — the signature sidecar.** An uploaded signature is stored
+as `<binary>.sig` beside the package in the update directory. Like the package
+itself it is node-local and not covered by the database backup: it is recreated
+by re-uploading the package with its signature, so it needs no separate
+backup step.
+
+**Two new agent flags**, both off by default: `--update-trust-bundle`
+(`YUZU_UPDATE_TRUST_BUNDLE`) and `--update-require-signature`
+(`YUZU_UPDATE_REQUIRE_SIGNATURE`). Setting the second without the first refuses
+to start, rather than running with enforcement silently inert.
+
+**Nothing to do on upgrade** unless you want signing. If you do, read *Signing
+update binaries* — in particular the two-stage rollout, because a fleet that
+enforces before every package is signed stops updating.
+
 ### vNEXT — Plugin code signing (#80)
 
 Plugin signature verification ships in two parts: an agent-side CMS verifier and a server-side Settings UI for managing the trust bundle. **Default behaviour is unchanged** — agents that do not pass `--plugin-trust-bundle` and operators that do not upload a bundle through the new Settings card see identical behaviour to prior releases (allowlist-only, sha256 hash check).
@@ -1706,7 +1797,7 @@ The Settings page is organized into sections, each loaded as an HTMX fragment. C
 | Auto-Approval Policies | `/fragments/settings/auto-approve` | Define rules for automatically approving agents based on criteria (hostname pattern, IP range, etc.). |
 | API Tokens | `/fragments/settings/api-tokens` | Create and revoke bearer tokens for REST API automation. |
 | Plugin Code Signing | `/fragments/settings/plugin-signing` | Upload a PEM trust bundle for agent plugin CMS signature verification, toggle the require-signed-plugins flag, and remove the bundle. The trust bundle persists at `<cert-dir>/plugin-trust-bundle.pem`; the require flag persists in `runtime_config` under key `plugin_signing_required`. Distribution to agents is operator-driven today (curl into a local file referenced by `--plugin-trust-bundle`); automatic agent-side fetch is a forthcoming change. See the user-manual *Agent Plugins → Plugin Code Signing* section. |
-| OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. |
+| OTA Updates | `/fragments/settings/updates` | Upload agent binaries, view available versions, promote a version to production. The upload form also takes an optional detached CMS **Signature** (`.sig`, max 64 KB), stored as a sidecar beside the binary and served to agents on `CheckForUpdate` — see *Signing update binaries*. The server stores but never verifies it. |
 | Tag Compliance | `/fragments/settings/tag-compliance` | View compliance summary across the fleet based on tag-driven policies. |
 | RBAC Management | *(planned -- no fragment yet)* | Enable or disable RBAC enforcement, create and manage roles. RBAC is enforced via `RbacStore` and the `/api/v1/rbac/*` REST API, but has no Settings page fragment yet. |
 | OIDC SSO / Directory | `/fragments/settings/directory` | Configure OIDC single sign-on (issuer, client ID, secret, admin group). Editable form with "Test Connection" button. Changes are applied to the running server AND persisted to runtime config. **This is the only path that applies an OIDC change to the RUNNING server** (the swap is process-local - a restart reverts to the command-line/environment value, so a durable rotation must update that too; see [security hardening](security-hardening.md#oidc-hardening)) - a `PUT /api/config/oidc_*` persists the value but never reaches the live provider, on this boot or a later one (see [REST API -> Runtime Configuration](rest-api.md#when-a-change-takes-effect)). |
@@ -2049,8 +2140,16 @@ The server can distribute agent binary updates to enrolled endpoints.
 ### Uploading a New Version
 
 1. Navigate to **Settings > OTA Updates**.
-2. Click **Upload** and select the agent binary.
-3. The server stores the binary and assigns a version identifier.
+2. Click **Upload** and select the agent binary. Optionally select a detached
+   CMS signature in the **Signature** field — see *Signing update binaries*
+   below, and do supply one: without it the agent can verify integrity but not
+   authenticity.
+3. The server stores the binary (and the signature, if given) and assigns a
+   version identifier.
+
+**Package filenames may not end in `.sig`** (case-insensitive); the upload is
+rejected with a 400. That suffix is reserved for signature sidecars, named
+`<binary>.sig`, so a package called `x.sig` would occupy package `x`'s slot.
 
 ### Promoting to Production
 
@@ -2065,6 +2164,269 @@ The server can distribute agent binary updates to enrolled endpoints.
 - Only one version can be promoted (active) at a time.
 
 ---
+
+### Signing update binaries (#416)
+
+**The SHA-256 the agent checks is not an authenticity check.** The server supplies
+that hash over the same gRPC channel that delivers the binary, so anything able to
+substitute the binary substitutes the hash beside it. It detects corruption and a
+truncated download; it does not detect a malicious or impersonated server. Since
+the OTA path installs and runs code on every managed endpoint, sign your packages.
+
+A signature is a detached PEM CMS blob over the binary's bytes, produced by a
+certificate carrying the **codeSigning** EKU. Yuzu does not sign for you — the
+party that chooses the binary is the party that must sign it, and on this path
+that is you: packages reach the registry by admin upload.
+
+**The signing certificate's profile is load-bearing, and getting it wrong fails
+in a confusing way.** The agent builds its trust store with OpenSSL's codeSigning
+*purpose*, which imposes requirements beyond "chains to the bundle":
+
+- the leaf MUST carry `extendedKeyUsage = codeSigning`;
+- the leaf's `keyUsage` MUST be marked **critical** (`keyUsage = critical,
+  digitalSignature`). A non-critical keyUsage is rejected — this is the single
+  most common way to produce a certificate that looks correct and does not work;
+- the issuing CA should carry `keyUsage = critical, keyCertSign, cRLSign`. This one is
+  good practice rather than enforced — a CA with no `keyUsage` at all still
+  verifies — but set it, since a CA that declares its purpose is easier to audit.
+
+A minimal OpenSSL extension file for the leaf:
+
+```ini
+[ codesign ]
+basicConstraints       = critical,CA:FALSE
+keyUsage               = critical,digitalSignature
+extendedKeyUsage       = codeSigning
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+```
+
+Then sign the binary:
+
+```sh
+openssl cms -sign -binary -outform PEM \
+  -signer code-signing-cert.pem -inkey code-signing-key.pem \
+  -in yuzu-agent-0.14.0-x86_64-linux -out yuzu-agent-0.14.0-x86_64-linux.sig
+```
+
+**If your signing certificate chains through an intermediate**, add
+`-certfile intermediate.pem`. Without it the signature carries only the leaf, the
+agent cannot build the chain to your root. Note the agent does NOT log OpenSSL's
+familiar `unable to get local issuer certificate` — CMS reports it as `untrusted
+chain` with `error:17000064:CMS routines::certificate verify error`, so grepping
+for the X509 string finds nothing. Two-tier PKIs are the normal enterprise case,
+so this is easy to hit.
+
+**Diagnosing a rejection.** The agent logs either `untrusted chain` or
+`invalid signature`. Be aware that a certificate-*profile* problem — a
+non-critical keyUsage, a missing codeSigning EKU, a missing intermediate — is
+reported as `untrusted chain`, the same as a genuinely wrong CA. Check the
+profile above before concluding the trust bundle is wrong. Verify a certificate
+locally with:
+
+```sh
+openssl verify -purpose codesign -CAfile trust-bundle.pem code-signing-cert.pem
+```
+
+**Before you debug the certificate, check the server side.** A stored signature
+that cannot possibly cover the binary beside it produces the same `untrusted
+chain` string as a genuinely wrong CA, and no amount of `openssl verify` on your
+certificate will reveal it. The **Signed** column shows **signature mismatch**
+for exactly this case: the signature landed but the binary write that should
+have followed it did not, so the two artifacts are from different uploads. The
+fix is to re-upload the binary and its signature together; the certificate is
+not the problem. If the column says **unsigned** for a package you signed, the
+sidecar was rejected or is unreadable — the server log names which.
+
+Upload it alongside the binary: **Settings → OTA Updates** has an optional
+**Signature** file input beside the binary input. The server stores it as a
+sidecar next to the package and hands it to agents on `CheckForUpdate`; it does
+**not** verify it and is deliberately not trusted to. Signatures are capped at
+64 KB — a detached CMS signature is a few KB, so a rejection here usually means
+the binary was selected into the signature field by mistake.
+
+**Place the trust anchor out of band.** Agents verify against a PEM bundle you
+install on the endpoint — never fetched over the update channel, because a trust
+anchor delivered by the party being verified anchors nothing. The installers now create the directory for it. It is deliberately separate from
+`/etc/yuzu/certs`, which is the SERVER's CA directory — the server owns that path
+and re-tightens its mode on every boot, so an anchor placed there would be either
+unwritable by the server or unreadable by the agent, with no mode satisfying
+both:
+
+| Platform | Path | Ownership |
+|---|---|---|
+| Linux | `/etc/yuzu-agent/certs/` | `root:root`, mode 0755 |
+| macOS | `/etc/yuzu-agent/certs/` | `root:wheel`, mode 0755 |
+| Windows | `C:\ProgramData\Yuzu\agent-certs\` | Administrators + SYSTEM, and owned by Administrators. The installer takes ownership, resets the ACL outright, then breaks inheritance and re-grants those two (`takeown` → `icacls /reset` → `icacls /inheritance:r /grant:r`) — breaking inheritance alone is not enough, because it leaves any explicit entry a local user had already set, and leaves them owning the directory. A post-install check verifies the resulting owner and entry set exactly and aborts the install if anything else can write there. |
+
+**How much protection that directory gives you depends on the platform, and it is
+worth being precise about it.** On Linux the agent runs as the unprivileged
+`yuzu-agent` user and genuinely cannot write the anchor. On macOS and Windows the
+agent runs as `root` and `LocalSystem` respectively — it has to, in order to
+replace its own binary — so it *can* write the anchor there. On those platforms
+the directory permissions protect the anchor from unprivileged local users, not
+from the agent process itself.
+
+This is a real limit rather than an oversight: a process privileged enough to
+replace the system binary is privileged enough to rewrite the file that
+authorises the replacement. Signature verification on those platforms defends
+against a malicious or impersonated *server*, which is the threat it was built
+for; it is not a defence against an already-compromised root/SYSTEM process on
+the endpoint. If you need the stronger property, run the agent as a dedicated
+non-privileged service account and grant it only what it needs.
+
+Then point agents at it. On a packaged install the agent is started by the
+service manager, not by hand, so set these through the environment rather than by
+editing the unit:
+
+| Platform | How |
+|---|---|
+| Linux (systemd) | `systemctl edit yuzu-agent` and add `[Service]` / `Environment="YUZU_UPDATE_TRUST_BUNDLE=/etc/yuzu-agent/certs/update-trust-bundle.pem"`, then `systemctl restart yuzu-agent`. The shipped unit has a fixed `ExecStart`, so a drop-in is the supported route. |
+| macOS (launchd) | Add the variable to `EnvironmentVariables` in `/Library/LaunchDaemons/com.yuzu.agent.plist`, then `launchctl kickstart -k system/com.yuzu.agent`. |
+| Windows | Add the flag to the service's **binary path**. **`sc.exe config binPath=` REPLACES THE ENTIRE COMMAND LINE — it does not append.** Capture the current one first with `sc qc YuzuAgent`, then re-issue it in full with the flag added, keeping the escaped inner quotes exactly as shown under **Windows Service Installation → Agent: `--install-service`** below. Passing only the new flag drops `--server`, `--data-dir`, `--plugin-dir` and `--log-file`; the service then reaches RUNNING, fails closed on startup with no server or CA to pin, and the endpoint silently leaves the fleet while you believe you enabled signing. Prefer this over `setx /M`: services inherit their environment from `services.exe`, which caches it at boot, so a machine variable is typically NOT visible to a merely-restarted service — the bundle would stay unset and verification silently OFF while you believed it was on. If you do use `setx /M`, reboot. |
+
+Every flag below has the environment variable shown beside it:
+
+| Agent flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--update-trust-bundle` | `YUZU_UPDATE_TRUST_BUNDLE` | unset | PEM bundle of CAs permitted to sign update binaries. **Unset disables signature checking entirely.** |
+| `--update-require-signature` | `YUZU_UPDATE_REQUIRE_SIGNATURE` | off | Refuse packages that carry no signature. |
+
+Setting `--update-require-signature` **without** a trust bundle refuses to start,
+rather than running with enforcement silently inert.
+
+### The verifier's catastrophic invariants
+
+Four properties of `agents/core/src/detached_signature.cpp` are recorded as
+catastrophic-if-violated in `.claude/routed-concerns.md`. They are stated here in
+full because that table is character-budgeted and carries only a pointer. Anyone
+changing that file must preserve all four.
+
+1. **`CMS_verify` must never receive `CMS_NO_SIGNER_CERT_VERIFY` or
+   `CMS_NO_CONTENT_VERIFY`.** Each individually disables one half of the check —
+   the certificate-chain validation or the content digest — while still returning
+   success. The call passes exactly `CMS_BINARY | CMS_DETACHED`.
+2. **The `X509_STORE` must keep `X509_PURPOSE_CODE_SIGN`.** Without it, any leaf
+   chaining to a trusted root becomes a signing authority — the normal case for an
+   internal PKI issuing mTLS and S/MIME from one root, so the consequence is not
+   hypothetical.
+3. **An unreadable trust bundle must fail CLOSED.** "Cannot check" is never
+   "checked out fine". The store load is the first check performed.
+4. **OTA verification stays after the SHA-256 compare and before apply**, reading
+   the HELD descriptor rather than re-opening the path. Apply is the point of no
+   return — the execute bit on POSIX, the live-binary move on Windows. Reading the
+   held descriptor is mandatory rather than preferable on Windows: the staged file
+   is opened `dwShareMode=0` and cannot be opened twice.
+
+Two further properties are load-bearing without being catastrophic:
+`--update-require-signature` governs **only** whether an ABSENT signature is
+tolerated — a present-but-invalid one is refused in both modes given a bundle —
+and the trust-anchor directory must stay root-owned and non-world-writable.
+
+### Rolling signing out to a live fleet
+
+**Roll it out in two stages, and understand what the first stage does not give
+you.** Deploy the bundle with `--update-require-signature` OFF first: an unsigned
+package is then accepted with a loud warning, while a package whose signature is
+present and does not verify is refused — that rejection is unconditional and does
+not depend on this flag. Once every package you serve is signed, turn the flag on.
+
+The permissive stage is a genuine **downgrade oracle** for as long as it lasts.
+There is no capability handshake on this RPC, so an agent cannot tell "this server
+is too old to sign" from "the signature was stripped in transit"; both look like
+an absent signature and both are accepted. Keep the window short.
+
+### Withdrawing a signed release, or responding to a suspected key compromise
+
+**Deleting the package from the server does not withdraw it.** The signature
+covers the binary's content and carries no version or expiry, so any copy of a
+binary your key has ever signed stays acceptable to every anchored agent forever.
+An attacker who kept a copy can replay it (see the rollback limitation above).
+Removing it from Settings → OTA Updates only stops *you* serving it.
+
+The only true withdrawal lever is the trust anchor itself, and it is blunt:
+
+1. **Issue a new signing key and certificate**, and re-sign every release you
+   still want endpoints to accept.
+2. **Re-upload the re-signed packages** to the server. Do this BEFORE the new
+   bundle reaches any endpoint: an agent that gets the new anchor while the
+   server is still serving old-key signatures refuses everything.
+3. **Distribute a bundle containing only the new certificate** — not both.
+   Last, because this is the step that actually invalidates the withdrawn
+   release, and until it lands the withdrawal has not happened.
+
+For a *suspected key compromise*, do the same but do not wait to batch it, and
+invert the ordering caution from *Rotating the signing key* below: there the old
+certificate is removed **last** to avoid an outage; here leaving it in place is
+the risk you are trying to remove. Plan for a window in which updates stop rather
+than a window in which a compromised key is still trusted.
+
+### Rotating the signing key
+
+**If you are enabling signing for the first time, read *Rolling signing out to a
+live fleet* above first** — this section is about replacing a key you already
+use.
+
+The spec for this feature asked for custody and rotation guidance, and rotation
+is worth doing deliberately because the naive sequence strands a fleet.
+
+**The trap.** Agents verify against whatever is in the trust bundle at the moment
+they check. If you sign new packages with a new key and have not yet distributed
+the new anchor, every agent that has the old anchor refuses them — and refusal
+is unconditional for a signature that is present and does not verify, so the
+transitional mode does not help.
+
+**The safe order:**
+
+1. **Distribute the new anchor alongside the old one, and wait.** A PEM bundle
+   may hold several certificates; append the new one rather than replacing it, so
+   an agent trusts both keys at once. Do not sign anything with the new key yet.
+   Wait until you are confident every endpoint has the updated bundle — the fleet
+   gauge cannot tell you this, so use your configuration-management tooling.
+2. **Start signing with the new key.** Both old and new packages verify, because
+   every agent trusts both.
+3. **Re-sign anything you still serve.** A package uploaded under the old key
+   keeps its old signature; it stays valid only while the old anchor is trusted.
+4. **Remove the old certificate from the bundle**, last.
+
+**Re-signing an existing package.** Upload it again with the new `.sig`. Do NOT
+re-upload the binary without a signature intending to add one afterwards — the
+upload replaces the sidecar along with the binary, so the package would be served
+unsigned in between, and `--update-require-signature` agents would refuse it for
+as long as that window lasts. The **Signed** column in Settings → OTA Updates
+shows what agents are actually being served.
+
+**Custody.** The signing key never needs to touch a Yuzu server — the server
+stores and forwards the signature but never produces or verifies one. Keep it
+wherever you keep your other code-signing material.
+
+**Watch `yuzu_fleet_ota_signature_refusing_agents`.** The server derives this
+gauge from the agents' heartbeats: it counts how many endpoints have refused at
+least one update **since the agent process last started**. It counts AGENTS
+rather than refusals on purpose — one wedged endpoint retrying every six hours
+would otherwise dominate a refusal count and hide how much of the fleet is
+affected.
+
+**Read it as "has refused", not "is currently failing".** The underlying counter
+is cumulative and never resets, so an endpoint that refused once and has since
+updated cleanly keeps contributing until it restarts — and conversely, an agent
+restart zeroes one that is still failing. A rising number is a real signal and
+worth acting on; a flat non-zero number is not proof that those machines are
+still stuck. To confirm current state, check whether the affected endpoints'
+reported agent version is advancing.
+
+**A refusing agent still cannot tell you WHY.** There is no status-report RPC on
+the update path, so the reason appears only in that endpoint's own log — the
+gauge tells you how many are affected, not what to fix. The strings to grep for
+are `untrusted chain` and `invalid signature`; an unsigned package logs
+`update package is unsigned and --update-require-signature is set` (`missing` is
+the metric label for that case, not text that appears in the log). Verify on a pilot
+group before a fleet-wide flip.
+
+Signature verification runs after the hash check and before anything irreversible
+— before the execute bit is set on POSIX and before the live binary is moved
+aside on Windows — and reads the already-downloaded file through the descriptor
+that was hashed, so the bytes verified are the bytes that were checked.
 
 ## RBAC Management
 
@@ -3137,8 +3499,8 @@ All API routes require a valid session cookie (obtained via `POST /login`) or, w
 | Method | Route | Description |
 |---|---|---|
 | `GET` | `/fragments/settings/updates` | Render the OTA updates fragment (HTMX). |
-| `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart form). |
-| `DELETE` | `/api/settings/updates/{platform}/{arch}/{version}` | Delete an uploaded agent binary. |
+| `POST` | `/api/settings/updates/upload` | Upload an agent binary (multipart form). Parts: `file` (the binary, required), `signature` (an optional detached PEM CMS signature, ≤64 KB), `platform`, `arch`, `rollout_pct`, `mandatory`. Returns **400** if the signature is not a PEM CMS block, and **500** if the signature could not be stored, the binary could not be written, or the binary could not be published. **Treat any non-2xx as "retry", never as "uploaded".** How much changed depends on where it failed: a **400**, or a **500 storing the signature**, changes nothing at all. A **500 writing or publishing the binary** leaves the previous binary in place, and — on a *signed* upload — the *new* signature already stored beside it, so agents refuse that package until you retry successfully. The upload order guarantees only that a failure never leaves the served binary UNPROTECTED; it does not guarantee the pair is consistent. After a 500 on a **signed** upload, check the **Signed** column: **signature mismatch** is the expected state, and re-uploading clears it. An unsigned upload that fails on the binary changes nothing, so the column is unchanged. Omitting `signature` on a re-upload **removes** any existing signature for that package. |
+| `DELETE` | `/api/settings/updates/{platform}/{arch}/{version}` | Delete an uploaded agent binary **and its signature sidecar**. |
 | `POST` | `/api/settings/updates/{platform}/{arch}/{version}/rollout` | Promote a version to production rollout. |
 
 ### Tag Compliance
@@ -3421,6 +3783,14 @@ puts the unit into `failed` and stops retrying (the device goes dark rather than
 silently). Recover with `systemctl reset-failed yuzu-agent && systemctl start yuzu-agent`
 once the wedged target is resolved. Alert on the `failed` state; the old restart-forever
 behaviour hid a crash-looping agent.
+
+**Persisting deploy-time settings (systemd).** The `yuzu-agent` unit also loads an optional
+`EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env` (`-` = no error when absent, not shipped by
+the `.deb`/`.rpm` - operator-created), so `YUZU_AGENT_*` flags such as
+`YUZU_AGENT_SPARK_DISABLE` survive restarts and package upgrades instead of only a one-off
+command-line override. See [SparkEngine](guaranteed-state.md#sparkengine--the-next-generation-detection-engine-observe-only)
+for the specific rollback-lever case, and `docs/spark-flip-gate.md` §6 for the drill
+procedure and recovery from a malformed value (it shares the crash-loop backstop above).
 
 **Installation:**
 

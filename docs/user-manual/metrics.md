@@ -998,6 +998,23 @@ certificate nor a parseable peer address was available.
 load balancer the per-peer bounds they report are per-replica, not fleet-wide
 (see `docs/user-manual/server-admin.md`).
 
+### Agent-side signature refusals (#416/#3807)
+
+Emitted by the AGENT, not the server, and therefore not scrapeable directly —
+the agent has no `/metrics` endpoint. They reach an operator only by the route
+described below.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_agent_ota_signature_refused_total{reason}` | counter | An OTA package was refused for a signature reason. `reason` is a closed set: `missing` (no signature, with `--update-require-signature` set), `untrusted` (the signer does not chain to the configured trust bundle, or its leaf lacks the codeSigning EKU, or **the trust bundle itself could not be read** — an unreadable or missing bundle proves nothing, so it is counted as a trust failure rather than a pass, and is the most likely cause if this counter jumps on a host right after a config change), `invalid` (the signature is malformed, or does not cover these bytes). Cumulative for the life of the agent process. |
+
+**How it reaches you.** The total across all three reasons is carried on the
+agent heartbeat as the status tag `yuzu.ota_signature_refused`, and the server
+derives `yuzu_fleet_ota_signature_refusing_agents` from it. Nothing else reads
+the tag. If you need per-reason detail for a specific endpoint, it is in that
+endpoint's own log — the update path has no status-report RPC, so the reason
+does not travel to the server.
+
 ## Histogram buckets
 
 Most histogram metrics use the same default bucket boundaries (in seconds); a few carry a custom
@@ -1109,6 +1126,7 @@ out-of-range readings are rejected).
 
 | Metric | Type | Description |
 |---|---|---|
+| `yuzu_fleet_ota_signature_refusing_agents` | gauge | Endpoints that have refused at least one OTA update for a signature reason **since the agent process last started** (#416/#3807). Derived from the agents' heartbeat tag `yuzu.ota_signature_refused`, whose counter is cumulative and never resets — so read this as "has refused", not "is currently failing": an endpoint that refused once and has since updated cleanly still counts until it restarts, and a restart zeroes one that is still stuck. A RISING value is the actionable signal. This is the only server-side view of the state: the OTA path has no status-report RPC and the agent exposes no `/metrics` endpoint. Counts only endpoints currently reporting heartbeats — an agent that refused and then went offline drops out of the gauge. See [server-admin.md → Signing update binaries](server-admin.md#signing-update-binaries-416). |
 | `yuzu_fleet_perf_reporting` | gauge | Devices contributing at least one perf metric this sweep (the same any-of-three definition the `/dex` Performance tab's Reporting card uses) |
 | `yuzu_fleet_perf_cpu_pct{stat}` | gauge | Fleet CPU busy %, `stat` = `avg` / `p50` / `p90` / `max` |
 | `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |

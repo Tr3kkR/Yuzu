@@ -4,6 +4,9 @@
 
 #include "settings_routes.hpp"
 
+#include "ota_signature_sidecar.hpp"
+
+#include <atomic>
 #include <cstdio>
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
@@ -2170,11 +2173,12 @@ std::string SettingsRoutes::render_updates_fragment() {
 
     html += "<table class=\"user-table\">"
             "<thead><tr><th>Platform</th><th>Arch</th><th>Version</th>"
-            "<th>Size</th><th>Rollout</th><th>Mandatory</th><th></th></tr></thead>"
+            "<th>Size</th><th>Signed</th><th>Rollout</th><th>Mandatory</th><th></th>"
+            "</tr></thead>"
             "<tbody>";
 
     if (packages.empty()) {
-        html += "<tr><td colspan=\"7\" style=\"color:#484f58\">"
+        html += "<tr><td colspan=\"8\" style=\"color:#484f58\">"
                 "No update packages uploaded</td></tr>";
     } else {
         for (const auto& pkg : packages) {
@@ -2194,6 +2198,46 @@ std::string SettingsRoutes::render_updates_fragment() {
                     "</code></td>"
                     "<td style=\"font-size:0.75rem\">" +
                     size_str +
+                    "</td>"
+                    // Read from disk, not from a stored flag: the sidecar is the
+                    // artifact an agent is actually served, so this shows what the
+                    // fleet will see rather than what the upload intended. Without
+                    // it an operator has no way to tell a signed package from an
+                    // unsigned one short of reading server logs.
+                    "<td style=\"font-size:0.75rem\">" +
+                    // The SAME decision CheckForUpdate makes, not just exists():
+                    // an over-cap, unreadable or zero-byte sidecar is present on
+                    // disk but served as UNSIGNED, so exists() alone would tell
+                    // the operator "signed" while every agent is told otherwise —
+                    // the one thing this column exists to prevent.
+                    (update_registry_ &&
+                     signature_sidecar_outcome(update_registry_->signature_path(pkg)) ==
+                         SidecarOutcome::kServed
+                         // A served signature that CANNOT cover the binary beside
+                         // it gets its own state. Reporting it as "signed" is the
+                         // worst of the three: the docs nominate this column as
+                         // the confirmation check, so the operator reads success
+                         // while every anchored agent refuses the package.
+                         ? (signature_sidecar_covers_binary(
+                                update_registry_->binary_path(pkg),
+                                update_registry_->signature_path(pkg))
+                                ? std::string("<span title=\"A detached signature is stored "
+                                              "for this package\">signed</span>")
+                                : std::string(
+                                      "<span style=\"color:#d29922\" title=\"The stored "
+                                      "signature is NEWER than the binary beside it, so it "
+                                      "cannot be confirmed to cover it. Usually an upload that "
+                                      "did not complete; a restore that did not preserve "
+                                      "timestamps looks the same. Agents refuse a signature "
+                                      "that does not verify, in both modes. Re-upload the "
+                                      "binary and its signature together to clear "
+                                      "it.\">signature mismatch</span>"))
+                         : std::string("<span style=\"color:#8b949e\" title=\"No usable "
+                                       "signature is being served: either none is stored, or "
+                                       "the stored one is unreadable, empty or over the size "
+                                       "cap (see the server log). Agents running "
+                                       "--update-require-signature will refuse this "
+                                       "package.\">unsigned</span>")) +
                     "</td>"
                     "<td>"
                     "<form style=\"display:flex;align-items:center;gap:0.4rem\" "
@@ -2255,6 +2299,17 @@ std::string SettingsRoutes::render_updates_fragment() {
             "<div class=\"mini-field\">"
             "<label>Binary</label>"
             "<input type=\"file\" name=\"file\" required></div>"
+            // Optional detached CMS signature (#416/#3807). Without this input
+            // the documented signing workflow is unreachable from the UI and an
+            // operator would ship an unsigned package believing it signed.
+            // `mini-field`, matching every sibling in this inline row — `form-row`
+            // is the stacked full-width variant and breaks the row's layout.
+            "<div class=\"mini-field\">"
+            "<label>Signature <span class=\"muted\">(optional, .sig)</span></label>"
+            // No accept filter: ".sig" is only convention — ".p7s" and ".pem" are
+            // common names for the same detached CMS blob, and filtering the picker
+            // to one suffix hides the operator's actual file.
+            "<input type=\"file\" name=\"signature\"></div>"
             "<div class=\"mini-field\">"
             "<label>Rollout %</label>"
             "<input type=\"text\" name=\"rollout_pct\" value=\"100\" style=\"width:50px\"></div>"
@@ -5319,7 +5374,47 @@ void SettingsRoutes::register_routes(
                             "text/html; charset=utf-8");
             return;
         }
+        // Optional detached CMS signature (#416/#3807). Optional because a fleet
+        // that has not adopted signing yet must still be able to upload, and
+        // because the agent — not this server — decides whether an unsigned
+        // package is acceptable. Uploading one here does not make it trusted:
+        // the agent checks it against an anchor this server never supplies.
+        std::string signature_pem;
+        if (SETTINGS_REQ_HAS_FILE(req, "signature")) {
+            signature_pem = SETTINGS_REQ_GET_FILE(req, "signature").content;
+            if (signature_pem.size() > kMaxSignatureBytes) {
+                res.status = 400;
+                res.set_content("<span class=\"feedback-error\">Signature file is too large "
+                                "(max 64 KB). A detached CMS signature is a few KB — check you "
+                                "selected the .sig file and not the binary.</span>",
+                                "text/html; charset=utf-8");
+                return;
+            }
+        }
+
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
+        // Case-INSENSITIVE: the server may store packages on a case-insensitive
+        // filesystem (macOS, Windows), where "foo.SIG" and "foo.sig" are the
+        // same file, so a case-sensitive guard is bypassable there.
+        auto ends_with_sig = [](std::string n) {
+            if (n.size() < 4)
+                return false;
+            n = n.substr(n.size() - 4);
+            std::transform(n.begin(), n.end(), n.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return n == ".sig";
+        };
+        if (ends_with_sig(uploaded.filename)) {
+            // Signature sidecars are derived as "<binary>.sig", so a package
+            // literally named X.sig would occupy package X's sidecar slot. It
+            // fails closed (X's agents then see a signature over the wrong
+            // bytes and refuse), but the cause would be invisible.
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">Package filenames may not end in "
+                            "'.sig' — that suffix is reserved for signature sidecars.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
         if (uploaded.content.empty()) {
             res.status = 400;
             res.set_content("<span class=\"feedback-error\">Empty file.</span>",
@@ -5337,22 +5432,159 @@ void SettingsRoutes::register_routes(
         if (rollout_pct > 100)
             rollout_pct = 100;
 
+        // Shape-check the signature BEFORE the binary is written. A well-sized
+        // file of garbage would otherwise be stored, reported "signed" by the
+        // settings column, served by CheckForUpdate, and then refused by every
+        // anchored agent in BOTH enforcement modes — including permissive, where
+        // the documented contract is that unsigned packages are accepted with a
+        // warning. The operator's only signal would be a fleet gauge rising after
+        // the fact.
+        //
+        // Placed here, ahead of the write, so a rejection leaves the PREVIOUS
+        // package and its signature completely untouched: the operator retries an
+        // upload rather than recovering a half-replaced package.
+        if (!signature_pem.empty() && !looks_like_pem_cms(signature_pem)) {
+            spdlog::warn("OTA upload for {}/{}: rejected — the signature is not PEM-armoured CMS",
+                         platform, arch);
+            // 400, not the httplib default. Leaving the status unset answered 200
+            // for an upload that wrote nothing, so a scripted uploader recorded
+            // success and the fleet silently kept the old package. 400 rather than
+            // 500 because the input is malformed — the server is fine.
+            res.status = 400;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"That signature file is not a PEM CMS )"
+                           R"(signature (expected a -----BEGIN CMS----- block). Nothing was )"
+                           R"(changed.","level":"error"}})");
+            res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
+            return;
+        }
+
         auto orig_name =
             uploaded.filename.empty() ? "yuzu-agent-" + platform + "-" + arch : uploaded.filename;
+
+        // #3863: the name is operator-supplied and every artifact path is built
+        // from it — the binary, its .sig sidecar and the .upload staging file —
+        // so a traversal or absolute name writes all three outside update_dir_.
+        // Rejected BEFORE any path is derived from it.
+        if (!is_safe_package_filename(orig_name)) {
+            spdlog::warn("OTA upload for {}/{}: rejected unsafe package filename", platform, arch);
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">The package filename must be a plain "
+                            "filename \u2014 no directory separators, drive letters, or "
+                            "<code>..</code>.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
 
         auto out_path =
             update_registry_->binary_path(UpdatePackage{platform, arch, "", "", orig_name});
         std::error_code ec;
         std::filesystem::create_directories(out_path.parent_path(), ec);
+
+        // ORDERING RULE: THE STEP THAT WEAKENS THE SIGNATURE GOES LAST.
+        //
+        // Which step that is depends on the upload, so the order is not fixed:
+        //
+        //   signed upload   -> sidecar, then binary. Writing the binary first
+        //                      leaves new-binary + no-signature if we die in
+        //                      between, and on the FIRST signed upload of a
+        //                      filename there is no predecessor to fall back on,
+        //                      so that window spans the whole signing rollout.
+        //
+        //   unsigned upload -> binary, then remove the sidecar. Removing first
+        //                      leaves OLD-binary + no-signature if the binary
+        //                      write then fails, which strips protection from a
+        //                      package still being served. (This is the hole the
+        //                      first version of this reorder left: it removed
+        //                      unconditionally up front.)
+        //
+        // Both orders leave only fail-closed intermediates: a mismatched pair,
+        // which every anchored agent refuses. Never the unprotected pair.
+        //
+        // The sidecar path derives from the filename alone (UpdateRegistry::
+        // signature_path -> binary_path = update_dir_ / filename), so it is known
+        // here, before `pkg` exists.
+        const auto sidecar_path = signature_sidecar_path(out_path);
+        const bool signed_upload = !signature_pem.empty();
+
+        if (signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
+            // Nothing has been written yet: the previous binary and its signature
+            // are both untouched, so this is a clean refusal, not a partial state.
+            spdlog::error("OTA upload for {}/{}: the signature sidecar could not be written; "
+                          "the previous package is unchanged",
+                          platform, arch);
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Could not store the signature. "
+                            "Nothing was changed \u2014 retry the upload.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        // STAGE AND RENAME, for the same reason the sidecar does. Writing in place
+        // with ios::trunc means an ENOSPC part-way through leaves a TRUNCATED
+        // binary on the live path — and one whose mtime is NEWER than the sidecar,
+        // so the mtime consistency check sees a well-ordered pair and the column
+        // reports "signed" for a package whose signature covers nothing that is
+        // there. Staging keeps a partial write off the served path entirely.
+        //
+        // The staging name carries the request's own suffix: a fixed name lets two
+        // concurrent uploads of the same filename interleave into one file, and
+        // whichever rename loses publishes bytes that do not match its own row.
+        static std::atomic<unsigned long long> upload_seq{0};
+        auto bin_tmp = out_path;
+        bin_tmp += ".upload." + std::to_string(upload_seq.fetch_add(1)) + ".tmp";
+
+        const auto fail_binary = [&](const char* msg) {
+            std::error_code rm_ec;
+            std::filesystem::remove(bin_tmp, rm_ec);
+            res.status = 500;
+            res.set_content(std::string("<span class=\"feedback-error\">") + msg + "</span>",
+                            "text/html; charset=utf-8");
+        };
+
         {
-            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+            std::ofstream f(bin_tmp, std::ios::binary | std::ios::trunc);
             if (!f.is_open()) {
-                res.status = 500;
-                res.set_content("<span class=\"feedback-error\">Cannot write file.</span>",
-                                "text/html; charset=utf-8");
+                fail_binary("Cannot write file.");
                 return;
             }
             f.write(uploaded.content.data(), static_cast<std::streamsize>(uploaded.content.size()));
+            // Same reasoning as the sidecar's own close: testing before
+            // destruction misses whatever ~ofstream flushes, and a truncated
+            // agent binary that reports success is a fleet-wide apply failure.
+            f.close();
+            if (!f) {
+                fail_binary("Could not write the binary completely.");
+                return;
+            }
+        }
+        // Durable before publication, matching the sidecar. Without this a crash
+        // just after the rename can expose the live name pointing at unflushed
+        // (zero-length) bytes.
+        if (!fsync_file(bin_tmp)) {
+            fail_binary("Could not flush the uploaded binary to disk.");
+            return;
+        }
+        std::error_code bin_ren_ec;
+        std::filesystem::rename(bin_tmp, out_path, bin_ren_ec);
+        if (bin_ren_ec) {
+            fail_binary("Could not publish the uploaded binary.");
+            return;
+        }
+
+        // The binary is live. NOW drop the signature, if this upload is unsigned —
+        // last, per the ordering rule above, so no failure above this line could
+        // have left the served package unprotected.
+        if (!signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
+            spdlog::error("OTA upload for {}/{}: the stale signature could not be removed; "
+                          "the package is served with a signature that does not cover it",
+                          platform, arch);
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">The binary was published but its "
+                            "old signature could not be removed. Agents will refuse this "
+                            "package until you retry.</span>",
+                            "text/html; charset=utf-8");
+            return;
         }
 
         auto sha = auth::AuthManager::sha256_hex(uploaded.content);
@@ -5375,9 +5607,29 @@ void SettingsRoutes::register_routes(
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
-        update_registry_->upsert_package(pkg);
+        // Upload path: the row is best-effort here and the failure is already
+        // visible in the log; the rollout path is the one that audits a committed
+        // transition and therefore must not discard this.
+        (void)update_registry_->upsert_package(pkg);
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
+
+        if (!signature_pem.empty())
+            spdlog::info("OTA package {}: detached signature stored ({} bytes)", pkg.filename,
+                         signature_pem.size());
+
+        // AUDIT. This changes what code the fleet will execute, so it belongs in
+        // the evidence store, not only in the server log. `signed=` is the field
+        // that matters: an upload with the Signature field left empty silently
+        // downgrades the package from signed to unsigned for every endpoint, and
+        // without this row that transition has no actor, no timestamp and no
+        // outcome. The sibling plugin_signing.bundle.* handler in this same file
+        // has recorded exactly this for its own trust artifact all along.
+        audit_fn_(req, "ota.package.uploaded", "success", "UpdatePackage",
+                  platform + "/" + arch + "/" + version,
+                  "file=" + orig_name + " sha256=" + sha +
+                      " signed=" + (signature_pem.empty() ? "false" : "true") +
+                      " rollout=" + std::to_string(rollout_pct) + "%");
 
         res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
     });
@@ -5395,19 +5647,55 @@ void SettingsRoutes::register_routes(
                     auto arch = req.matches[2].str();
                     auto version = req.matches[3].str();
 
+                    PackageDeleteOutcome outcome;
+                    // Each remove gets its OWN error_code. Sharing one lets the
+                    // second call's result overwrite the first, so a failed
+                    // binary delete followed by a clean sidecar delete reads as
+                    // wholly successful.
+                    std::error_code bin_ec;
+                    std::error_code sig_ec;
                     auto packages = update_registry_->list_packages();
                     for (const auto& pkg : packages) {
                         if (pkg.platform == platform && pkg.arch == arch &&
                             pkg.version == version) {
+                            outcome.matched = true;
                             auto bin_path = update_registry_->binary_path(pkg);
-                            std::error_code ec;
-                            std::filesystem::remove(bin_path, ec);
+                            outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
+                            // Remove the signature sidecar with it. Leaving it
+                            // behind would let a later upload of a same-named
+                            // package inherit a signature made over DIFFERENT
+                            // bytes — which the agent would then reject as
+                            // tampered, with no obvious cause.
+                            outcome.signature_removed = std::filesystem::remove(
+                                update_registry_->signature_path(pkg), sig_ec);
+                            if (bin_ec) {
+                                outcome.binary_error = bin_ec.message();
+                            }
+                            if (sig_ec) {
+                                outcome.signature_error = sig_ec.message();
+                            }
                             break;
                         }
                     }
 
                     update_registry_->remove_package(platform, arch, version);
                     spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
+                    // Audited for the same reason as the upload: this removes a
+                    // binary AND its signature from the fleet's update surface.
+                    // Report what actually happened. A delete naming a package that
+                    // is not there removes nothing, and recording that as a
+                    // successful removal puts a fictional event in the evidence
+                    // store — and hides probing of the endpoint from a SIEM rule.
+                    //
+                    // The result/detail derivation is a pure function in
+                    // ota_signature_sidecar.hpp — including why a failed unlink is
+                    // never audited as a removal, and why the rejection token is
+                    // `denied` rather than a bespoke `not_found`. It lives there
+                    // because the failed-unlink branch cannot be reached from a
+                    // unit test of this route.
+                    const auto audit = describe_package_delete(outcome);
+                    audit_fn_(req, "ota.package.deleted", audit.result, "UpdatePackage",
+                              platform + "/" + arch + "/" + version, audit.detail);
                     res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
                 });
 
@@ -5435,16 +5723,106 @@ void SettingsRoutes::register_routes(
                   if (pct > 100)
                       pct = 100;
 
-                  auto packages = update_registry_->list_packages();
-                  for (auto pkg : packages) {
-                      if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
-                          pkg.rollout_pct = pct;
-                          update_registry_->upsert_package(pkg);
-                          spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
-                                       version, pct);
-                          break;
-                      }
+                  // Capture the PRIOR percentage before the write. It is the whole
+                  // evidentiary value of this row: #3692's scenario is an admin —
+                  // or a compromised admin session — silently de-prioritising a
+                  // mandatory security patch, and "rollout is 0%" does not
+                  // distinguish that from a package that was never rolled out.
+                  // "from=100% to=0%" does. `mandatory` is carried for the same
+                  // reason: it is what makes the de-prioritisation consequential.
+                  // A CHECKED read, NOT list_packages: the ordinary reads on
+                  // this store fail SOFT, returning an empty vector on a closed
+                  // store, a pool-acquire timeout or a query error. That carve-out
+                  // (ADR-0061) was granted because no downstream branch treated an
+                  // empty list as a signal — and an audit branch does. Deriving
+                  // "not_found" from a soft-failed read would let a PG blip during
+                  // a legitimate admin rollout both manufacture key-enumeration
+                  // alerts (audit-log.md names `denied` as that filter) and assert,
+                  // in the evidence record, that a package which exists did not.
+                  // ONE store call, not a find-then-upsert pair. Read and write
+                  // are the same row-locked transaction, so the `from=` this row
+                  // reports is provably the value the commit replaced. As two
+                  // autocommit statements a concurrent write to the same key
+                  // could land between them — and it does not take two admins:
+                  // one session firing two near-simultaneous requests is enough,
+                  // which is exactly the compromised-admin case #3692 exists to
+                  // catch. Same shape as `AuditStore::stamp_complete` (ADR-0040,
+                  // #2697); see update_registry.hpp.
+                  auto change =
+                      update_registry_->update_rollout_checked(platform, arch, version, pct);
+                  // NOT `status == kFound`: the row can be found inside the
+                  // transaction and the write still fail to commit, which is a
+                  // distinct outcome the audit row reports differently.
+                  const bool committed = change.committed;
+                  if (committed)
+                      spdlog::info("OTA rollout updated: {}/{} v{} {}% -> {}%", platform, arch,
+                                   version, change.prior_rollout_pct, pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kFound)
+                      spdlog::error("OTA rollout NOT applied for {}/{} v{}: the package exists "
+                                    "at {}% but the registry write did not commit",
+                                    platform, arch, version, change.prior_rollout_pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kUnavailable)
+                      spdlog::error("OTA rollout for {}/{} v{}: the registry could not be read; "
+                                    "the package's existence is UNKNOWN, not absent",
+                                    platform, arch, version);
+
+                  // Audited AFTER the write, and reporting what actually happened.
+                  // A rollout change alters which endpoints receive a given binary,
+                  // so it belongs in the same evidence chain as the upload and the
+                  // delete; `spdlog::info` is the application log, not the audit
+                  // log, and nothing else in the request path emits an audit row.
+                  //
+                  // A request naming a package that does not exist changes nothing,
+                  // so it must not record a fictional success. The token is
+                  // `denied` with the reason in `detail`, NOT a bespoke
+                  // `not_found` result: this file's own rejection branches use
+                  // that shape (`user.delete` -> "denied" / "invalid_username"),
+                  // and audit-log.md's probe-detection recipe tells operators to
+                  // filter on `result == "denied"` to surface enumeration — a
+                  // fourth token would be invisible to exactly the rule this row
+                  // exists to feed.
+                  // THE RESULT IS DERIVED FROM THE COMMIT, NOT FROM THE LOOKUP.
+                  // `upsert_package` degrades silently on a closed store, a
+                  // pool-acquire timeout or a query error, so deriving `success`
+                  // from "we found the package" would let this row assert a
+                  // "from=100% to=0%" transition that never reached the database —
+                  // evidence disagreeing with state, in the one record an incident
+                  // responder is meant to be able to trust. `failure` is the
+                  // documented token for a failure the handler audits itself.
+                  // THREE DISTINCT OUTCOMES, and the store-degraded one is NOT
+                  // absence. `denied` is reserved for a package the store actually
+                  // reported as absent, because audit-log.md tells operators to
+                  // filter on it to surface enumeration; a degraded read reports
+                  // `failure`, which is the documented token for a failure the
+                  // handler audits itself. Neither the degraded nor the
+                  // uncommitted branch may claim a `from=`/`to=` transition — the
+                  // detail records what was ATTEMPTED, which asserts nothing false.
+                  const char* result = "failure";
+                  std::string detail;
+                  switch (change.status) {
+                  case UpdateRegistry::PackageLookup::kFound:
+                      result = committed ? "success" : "failure";
+                      // `from=` is now provably the value this write replaced —
+                      // it was read under a row lock in the same transaction, so
+                      // no concurrent writer can have changed it in between.
+                      detail = (committed ? "from=" : "attempted_from=") +
+                               std::to_string(change.prior_rollout_pct) +
+                               (committed ? "% to=" : "% attempted_to=") + std::to_string(pct) +
+                               "% mandatory=" + (change.prior_mandatory ? "true" : "false") +
+                               (committed ? "" : " outcome=write_not_committed");
+                      break;
+                  case UpdateRegistry::PackageLookup::kAbsent:
+                      result = "denied";
+                      detail = "not_found";
+                      break;
+                  case UpdateRegistry::PackageLookup::kUnavailable:
+                      result = "failure";
+                      detail = "attempted_to=" + std::to_string(pct) +
+                               "% outcome=store_unavailable existence_unknown=true";
+                      break;
                   }
+                  audit_fn_(req, "ota.package.rollout_changed", result, "UpdatePackage",
+                            platform + "/" + arch + "/" + version, detail);
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
               });
