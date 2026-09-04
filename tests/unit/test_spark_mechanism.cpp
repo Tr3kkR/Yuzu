@@ -2969,6 +2969,65 @@ TEST_CASE("File spark (real mechanism): a failed retire keeps the DirWatch alive
     // filed as a follow-up.
 }
 
+TEST_CASE("File spark (real mechanism): a zombie left by a throwing unwatch is drained, "
+          "not silently reattached to a new key (#2839 follow-up)",
+          "[spark][mechanism][windows][resilience]") {
+    // Security-guardian Gate 2 finding on the #2839 reorder above: erasing dirs_[dirkey]
+    // only after push_retiring's transfer completes means a throw during unwatch() (or
+    // release_ancestor()) leaves the key pointing at a `removing` zombie instead of
+    // freeing it for reuse. Pre-fix, watch()'s `auto& slot = dirs_[dirkey]; if (!slot)`
+    // skips the fresh-DirWatch branch entirely when a zombie is already keyed there, so a
+    // second key in the SAME directory silently attaches to a watch that is cancelled and
+    // awaiting reclaim — watch() reports success, but nothing will ever fire for that key.
+    // This is exactly the hazard unwatch_locked's own "Free dirkey for reuse NOW" comment
+    // describes, reopened on the throw path #2839 itself introduced.
+    namespace fs = std::filesystem;
+    const auto pid = std::to_string(::GetCurrentProcessId());
+    const fs::path dir = fs::temp_directory_path() / ("yuzu_test_spark_2839z_" + pid);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    const fs::path target = dir / "t.txt";
+    { std::ofstream(target) << "seed"; }
+
+    struct DirCleanup {
+        const fs::path& d;
+        ~DirCleanup() {
+            std::error_code e;
+            fs::remove_all(d, e);
+        }
+    } dir_cleanup{dir}; // declared BEFORE mech, so it runs AFTER ~mech has closed handles
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    mech->start([](const std::string&, SparkData) {}, [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch("kA", FileSparkParams{target.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the read arm, matching the #2839 test above
+    REQUIRE(mech->stats().retiring == 0);
+
+    REQUIRE(set_file_retire_fault_hook_for_test(*mech, [] { throw std::bad_alloc{}; }));
+    CHECK_THROWS_AS(mech->unwatch("kA"), std::bad_alloc);
+    // The zombie is retained in dirs_ (removing=true) but NOT yet in retiring_ — matches
+    // the #2839 test's own documented pre-fix-of-the-fix contract above.
+    CHECK(mech->stats().retiring == 0);
+
+    // A second key in the SAME directory. Pre-fix: silently attaches to the zombie,
+    // returns success, retiring_ stays 0 (the zombie was never drained). Post-fix: the
+    // watch() call drains the zombie into retiring_ FIRST (the fault hook was single-shot
+    // and is already consumed, so this drain succeeds), then arms a genuinely fresh watch
+    // for kB — the deterministic, in-process signal that no silent reattachment occurred.
+    const fs::path second = dir / "u.txt";
+    { std::ofstream(second) << "seed"; }
+    CHECK(mech->watch("kB", FileSparkParams{second.string()}).has_value());
+    CHECK(mech->stats().retiring == 1);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_NOTHROW(mech->stop());
+    CHECK(std::chrono::steady_clock::now() - t0 < 5000ms);
+    CHECK(mech->stats().quarantined_total == 0);
+}
+
 TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
           "[spark][mechanism][windows][resilience]") {
     const std::string sub =

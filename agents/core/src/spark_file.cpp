@@ -185,6 +185,20 @@ public:
             unwatch_locked(key);
         }
         auto& slot = dirs_[dirkey];
+        // Security-guardian Gate 2 finding: #2839's reorder (push_retiring taking a
+        // reference, erasing dirs_[dirkey] only after the transfer completes) means a
+        // throw during a PRIOR unwatch()/release_ancestor() leaves this exact key
+        // pointing at a `removing` zombie instead of freeing it for reuse — the hazard
+        // the "Free dirkey for reuse NOW" comment in unwatch_locked() exists to close,
+        // reopened on the throw path. Left unguarded, a same-directory watch() lands
+        // here, `slot` is non-null so the `if (!slot)` branch below is skipped, and the
+        // NEW key gets silently attached to a watch already cancelled and awaiting
+        // reclaim — watch() reports success, but nothing will ever fire for it. Drain
+        // the zombie first: push_retiring leaves `slot` untouched on a throw (its own
+        // contract), so a failure here just propagates to watch_guarded()'s existing
+        // failure handling exactly like any other watch() failure — no new hazard.
+        if (slot && slot->removing)
+            push_retiring(slot);
         if (!slot) {
             slot = std::make_unique<DirWatch>();
             slot->dir = parent.wstring();
@@ -572,6 +586,23 @@ private:
             return true; // already depending on exactly this ancestor — no churn
         release_ancestor(dependent);
         auto& slot = ancestors_[akey];
+        // Same zombie-reattachment hazard as watch()'s dirs_ lookup above (security-
+        // guardian Gate 2 finding), but arm_ancestor() is ALSO called directly from
+        // run()'s worker-thread loop (the `!ok`/is_ancestor branches below), which has
+        // NO exception containment above it — unlike watch(), which watch_guarded()
+        // always wraps. Letting push_retiring's rare bad_alloc escape from here would
+        // std::terminate the process instead of just failing one arm. So contain it
+        // locally: a caller already treats a `false` return as an ordinary fault to
+        // retry on the next health-check pass, which is exactly the right response to
+        // "couldn't drain the zombie slot right now" — push_retiring leaves the zombie
+        // untouched on a throw, so nothing is lost by retrying later.
+        if (slot && slot->removing) {
+            try {
+                push_retiring(slot);
+            } catch (...) {
+                return false;
+            }
+        }
         if (!slot) {
             slot = std::make_unique<DirWatch>();
             slot->dir = anc.wstring();
