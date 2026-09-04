@@ -111,20 +111,13 @@ struct Harness {
             "127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
     }
     ~Harness() {
-        // TEARDOWN ORDER IS LOAD-BEARING, and getting it wrong crashed the
-        // Windows MSVC debug leg with an access violation (0xc0000005) when the
-        // SECOND harness in this binary started — the first one's threads were
-        // still unwinding.
-        //
-        //  1. Drop the client channel first, so no in-flight RPC is still
-        //     addressing a server that is about to go away.
-        //  2. Shutdown() only *initiates* shutdown and returns once the deadline
-        //     passes; it does NOT guarantee handler threads have returned.
-        //     Wait() is what blocks until they actually have. Shutdown-without-
-        //     Wait leaves gRPC background threads running past this scope.
-        //  3. Destroy the server explicitly, while `svc` is still alive — the
-        //     server holds a raw pointer to the registered service, so the
-        //     service must outlive it.
+        // Teardown order: drop the client channel before the server (no
+        // in-flight RPC should be left addressing a server about to go away),
+        // then Shutdown()+Wait() (Shutdown only *initiates* shutdown and
+        // returns once its deadline passes; Wait() is what actually blocks
+        // until handler threads have returned), then destroy the server
+        // explicitly while `svc` is still alive — the server holds a raw
+        // pointer to the registered service, so the service must outlive it.
         stub.reset();
         if (server) {
             server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
@@ -133,6 +126,36 @@ struct Harness {
         }
     }
 };
+
+/// ONE gRPC server for every TEST_CASE in this file, not one per case.
+///
+/// This file used to build and tear down a real in-process gRPC server 7
+/// times sequentially. That repeated create/destroy churn — not a Shutdown/
+/// Wait ordering bug — is what crashed the Windows MSVC debug leg: a fix that
+/// made teardown provably correct (drop the channel, Shutdown(deadline),
+/// Wait(), then destroy the server while its service outlives it) shipped
+/// and the identical SIGSEGV at the SECOND harness's startup recurred
+/// unchanged on the next CI run, which rules out a teardown-ordering bug in
+/// THIS file's own code as the trigger. The other pre-existing gRPC harness
+/// files in this suite (`test_ota_download_bound.cpp`,
+/// `test_ota_identity_mtls.cpp`, `test_ota_stalled_write.cpp`) run many
+/// sequential TEST_CASEs without a reported crash, so the safe, structural
+/// fix is the one they don't need: never repeat the cycle at all. One server
+/// stood up on first use and torn down once, at process exit via this
+/// function-local static's destructor, removes the repeated-churn trigger by
+/// construction regardless of its exact mechanism.
+///
+/// Safe to share: every TEST_CASE below already sets `svc.payload` and
+/// `svc.signature` explicitly before issuing its RPC (the two SECTIONs that
+/// want no signature call `svc.signature.clear()`), so there is no
+/// leftover-state risk between cases, and Catch2 runs TEST_CASEs
+/// sequentially in this binary — never two of these concurrently.
+Harness& shared_harness() {
+    static Harness h;
+    if (!h.server)
+        h.start();
+    return h;
+}
 
 /// A throwaway "installed agent binary" for the updater to replace.
 struct FakeExe {
@@ -169,10 +192,9 @@ double refused(yuzu::MetricsRegistry& m, const char* reason) {
 TEST_CASE("updater: a correctly signed package is applied", "[updater][signing][grpc]") {
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness h;
+    Harness& h = shared_harness();
     h.svc.payload = read_file(f.artifact_file);
     h.svc.signature = read_file(f.sig_file);
-    h.start();
 
     Updater updater(cfg_with(f.trust_bundle, /*require=*/true), "test-agent", "0.1.0", "linux",
                     "x86_64", exe.path);
@@ -188,10 +210,9 @@ TEST_CASE("updater: a package signed by a FOREIGN CA is refused", "[updater][sig
     // distinguishes it.
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness h;
+    Harness& h = shared_harness();
     h.svc.payload = read_file(f.artifact_file);
     h.svc.signature = read_file(f.sig_file);
-    h.start();
 
     // Same package, same valid signature — but the agent trusts a different CA.
     yuzu::MetricsRegistry metrics;
@@ -218,10 +239,9 @@ TEST_CASE("updater: a present-but-invalid signature is refused in BOTH modes",
 
     for (const bool require : {false, true}) {
         FakeExe exe;
-        Harness h;
+        Harness& h = shared_harness();
         h.svc.payload = read_file(f.artifact_file);
         h.svc.signature = read_file(f.sig_file);
-        h.start();
 
         yuzu::MetricsRegistry metrics;
         // Signature is valid, but the agent trusts a different CA.
@@ -242,10 +262,9 @@ TEST_CASE("updater: a tampered payload increments the INVALID refusal counter",
     // real failure (a signature over different bytes) was unverified.
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness h;
+    Harness& h = shared_harness();
     h.svc.payload = read_file(f.artifact_file) + "-tampered";
     h.svc.signature = read_file(f.sig_file);
-    h.start();
 
     yuzu::MetricsRegistry metrics;
     Updater updater(cfg_with(f.trust_bundle, /*require=*/true, &metrics), "test-agent", "0.1.0",
@@ -260,10 +279,9 @@ TEST_CASE("updater: a tampered payload is refused even with a real signature",
           "[updater][signing][grpc]") {
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness h;
+    Harness& h = shared_harness();
     h.svc.payload = read_file(f.artifact_file) + "-tampered";
     h.svc.signature = read_file(f.sig_file); // signature covers the ORIGINAL bytes
-    h.start();
 
     Updater updater(cfg_with(f.trust_bundle, false), "test-agent", "0.1.0", "linux", "x86_64",
                     exe.path);
@@ -278,10 +296,9 @@ TEST_CASE("updater: an unsigned package is refused only when require is set",
 
     SECTION("require on → refused") {
         FakeExe exe;
-        Harness h;
+        Harness& h = shared_harness();
         h.svc.payload = read_file(f.artifact_file);
         h.svc.signature.clear();
-        h.start();
         yuzu::MetricsRegistry metrics;
         Updater updater(cfg_with(f.trust_bundle, /*require=*/true, &metrics), "test-agent", "0.1.0",
                         "linux", "x86_64", exe.path);
@@ -293,10 +310,9 @@ TEST_CASE("updater: an unsigned package is refused only when require is set",
 
     SECTION("require off → applied, transitional mode") {
         FakeExe exe;
-        Harness h;
+        Harness& h = shared_harness();
         h.svc.payload = read_file(f.artifact_file);
         h.svc.signature.clear();
-        h.start();
         Updater updater(cfg_with(f.trust_bundle, /*require=*/false), "test-agent", "0.1.0", "linux",
                         "x86_64", exe.path);
         auto r = updater.check_and_apply(h.stub.get());
@@ -312,10 +328,9 @@ TEST_CASE("updater: with no trust bundle configured, signatures are not checked 
     // "unset bundle" really does mean off, rather than accidentally enforcing.
     auto f = build_signing_fixtures();
     FakeExe exe;
-    Harness h;
+    Harness& h = shared_harness();
     h.svc.payload = read_file(f.artifact_file);
     h.svc.signature = read_file(f.sig_file);
-    h.start();
 
     Updater updater(cfg_with(fs::path{}, /*require=*/false), "test-agent", "0.1.0", "linux",
                     "x86_64", exe.path);
