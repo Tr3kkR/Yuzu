@@ -250,7 +250,9 @@ public:
         /// count) must derive it from within its own on_abandoned callback.
         std::uint64_t abandoned{0};
         /// on_abandoned itself threw; contained here (never propagated - the
-        /// worker lambda is noexcept), never counted in `abandoned` above.
+        /// worker lambda is noexcept). Counted IN ADDITION to `abandoned` above
+        /// (that delivery still happened; this counts that its cleanup failed),
+        /// not instead of it - the two are not mutually exclusive.
         std::uint64_t abandonment_cleanup_failures{0};
     };
 
@@ -542,10 +544,12 @@ public:
     /// rollback path without depending on real thread-resource exhaustion.
     void set_fail_launch_for_test(bool v) { fail_launch_for_test_.store(v); }
 
-    /// Test seam (#3816/#saf3821-5): force the NEXT run() to throw immediately
+    /// Test seam (#3816/#saf3821-5): force every run() to throw immediately
     /// before its wait-lock acquisition, exercising the pre-launch LaunchFailed
     /// rollback path this specific failure now folds into - without corrupting
     /// state_->mu (a real std::mutex::lock() failure cannot be induced portably).
+    /// Sticky until reset (same semantics as set_fail_launch_for_test above) - a
+    /// test that sets this must reset it before any later run() on this instance.
     void set_throw_before_wait_lock_for_test(bool v) {
         throw_before_wait_lock_for_test_.store(v);
     }
