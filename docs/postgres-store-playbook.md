@@ -90,15 +90,23 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
      next to the existing entries, matching `webhook_secret_codec_`'s. `RuntimeConfigStore`'s
      initial migration missed this; only an external adversarial review caught it (PR #3632).
    - **If your store retains a legacy SQLite file post-migration (backfilled OR warn-only),
-     force it — and any `-wal`/`-shm` sidecar — to 0600 (POSIX-only) BEFORE the first open,
-     every time you touch it, not just once.** ADR-0010 §Consequences (a): a file you're about
-     to read that may hold a plaintext secret column needs this regardless of whether you then
-     backfill from it or only detect-and-warn over it. An unclean pre-migration shutdown under
-     `journal_mode=WAL` can leave the pre-checkpoint plaintext sitting in a sidecar the main
-     file's own hardening never touches. Copy `webhook_store.cpp`'s
-     `migrate_from_sqlite_impl` block (or, for a warn-only store, `runtime_config_store.cpp`'s
-     `warn_if_legacy_data_present`) verbatim in shape. `RuntimeConfigStore`'s initial migration
-     missed the warn-only variant of this; same PR #3632 catch.
+     force it — and any `-wal`/`-shm`/`-journal` sidecar — to 0600 (POSIX-only) BEFORE the
+     first open, every time you touch it, not just once.** ADR-0010 §Consequences (a): a file
+     you're about to read that may hold a plaintext secret column needs this regardless of
+     whether you then backfill from it or only detect-and-warn over it. An unclean pre-migration
+     shutdown can leave pre-checkpoint plaintext sitting in a sidecar the main file's own
+     hardening never touches — `-wal`/`-shm` under `journal_mode=WAL`, `-journal` under the
+     rollback-journal default. **Call `legacy_sqlite_probe::harden_legacy_file_0600` (this
+     header, above) — do not hand-roll this.** `webhook_store.cpp`'s own inline
+     `migrate_from_sqlite_impl` block this helper was originally extracted from (PR #3563) no
+     longer exists — it was retired along with the rest of that function (#3623) — so
+     `harden_legacy_file_0600` is the ONLY current reference implementation, not a copy target
+     alongside it. For a warn-only store with no secret material, `runtime_config_store.cpp`'s
+     `warn_if_legacy_data_present` remains a valid model for the detection half only; its own
+     0600-hardening block is NOT yet consolidated onto the shared helper (tracked: #3959) and
+     should not be copied for NEW code — call `harden_legacy_file_0600` instead.
+     `RuntimeConfigStore`'s initial migration missed the warn-only variant of this; same PR
+     #3632 catch.
    - **Never sanitize a secret value before encrypting it.** `sanitize_pg_text()` (or any
      TEXT-column sanitizer) exists to make free-text safe for a PostgreSQL TEXT column; your
      secret's ciphertext column is BYTEA, so there is no storage reason to touch the plaintext's
@@ -265,7 +273,7 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   (`server/core/src/legacy_sqlite_probe.hpp`, introduced by ADR-0061) over hand-rolling this
   check** — it generalizes `RuntimeConfigStore::warn_if_legacy_data_present`'s single-table logic
   to an arbitrary table list. **A secret-bearing store additionally calls the same header's
-  `harden_legacy_file_0600` FIRST** (0600 on the legacy file plus its `-wal`/`-shm` sidecars, via
+  `harden_legacy_file_0600` FIRST** (0600 on the legacy file plus its `-wal`/`-shm`/`-journal` sidecars, via
   a single `open()`+`fstat()`+`fchmod()` on one fd — no path re-resolution between check and
   chmod, closing a symlink-TOCTOU gap two adversarial-review rounds found in an earlier revision;
   #3623/WebhookStore is the first consumer). Do NOT model a new secret-bearing store's hardening

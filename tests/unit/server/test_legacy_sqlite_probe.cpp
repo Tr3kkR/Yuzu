@@ -405,6 +405,11 @@ TEST_CASE("legacy_sqlite_probe: harden_legacy_file_0600 cannot widen or redirect
         REQUIRE_FALSE(after_ec);
         CHECK(after_perms == before_perms); // unchanged -- the fchmod failed closed
         CHECK(cap.text().find("could not set 0600") != std::string::npos);
+        // Pins the store_name parameter's actual effect (not just that call sites compile with
+        // it) -- a future edit reordering or dropping the format argument on any of the three
+        // chmod_owner_only call sites would otherwise go undetected (governance Gate 3,
+        // quality-engineer, 2026-09-04).
+        CHECK(cap.text().find("TestStore") != std::string::npos);
     }
 }
 
