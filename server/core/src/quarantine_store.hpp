@@ -30,22 +30,19 @@
 /// never had to be. `release_device` is a single guarded `UPDATE ... WHERE
 /// status = 'active'` (the #3062 `cancel_job` pattern), not lock-then-check.
 ///
-/// Backfill (ADR-0009) is MANDATORY, not skippable: an active quarantine
-/// record is live security state whose loss silently un-quarantines a
-/// device in the server's view. Fingerprint-verified (ADR-0040 pattern,
-/// `RbacStore`/`DiscoveryStore` the reference implementations), but ported
-/// with a design difference from `DiscoveryStore` — see
-/// `docs/adr/0047-quarantine-store-postgres-migration.md` "no natural
-/// per-row key" for why the row inserts and the completion marker commit
-/// together in one advisory-locked transaction rather than relying on a
-/// per-row `ON CONFLICT` idiom.
-///
 /// Out of scope: the agent-side quarantine firewall enforcement (§11.7) is
 /// untouched — this store is only the server-side bookkeeping.
+///
+/// `migrate_from_sqlite()` retired (#3623, ADR-0047 Update): no production fleet ever ran a
+/// pre-Postgres build of this store, so the mandatory fingerprint-verified backfill it
+/// implemented (fingerprint-verified per the ADR-0040/RbacStore/DiscoveryStore reference shape,
+/// with a design difference from DiscoveryStore's — see ADR-0047 "no natural per-row key")
+/// never had real legacy data to protect. `server.cpp` now runs
+/// `legacy_sqlite_probe::warn_if_legacy_rows` over `quarantine_records` instead — silent
+/// unless real rows are found, never blocks boot.
 
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -114,11 +111,10 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for the backfill-result counter
-    /// (`yuzu_server_quarantine_backfill_total{result}`) and the read-degrade
-    /// counter (`yuzu_server_quarantine_read_degrade_total{reason}`). Set
-    /// ONCE during single-threaded startup, before serving; a null registry
-    /// (default, e.g. unit tests) disables emission.
+    /// Wire a metrics registry for the read-degrade counter
+    /// (`yuzu_server_quarantine_read_degrade_total{reason}`). Set ONCE during
+    /// single-threaded startup, before serving; a null registry (default,
+    /// e.g. unit tests) disables emission.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
 
     // ── Quarantine operations ────────────────────────────────────────────
@@ -189,18 +185,6 @@ public:
     /// genuinely history-less agent.
     [[nodiscard]] std::optional<std::vector<QuarantineRecord>>
     get_history(const std::string& agent_id);
-
-    /// MANDATORY one-time, idempotent backfill (ADR-0009) of a legacy
-    /// `quarantine.db` SQLite file into this Postgres schema,
-    /// fingerprint-verified per the RbacStore/DiscoveryStore reference shape
-    /// (ADR-0040/0044 pattern — see the header doc above and ADR-0047 for
-    /// why this store's design differs from DiscoveryStore's). Runs at
-    /// startup, before serving; the caller (server.cpp) fails closed on a
-    /// `false` return, matching every other MANDATORY-backfill store.
-    /// Returns true when already migrated (idempotent short-circuit), when a
-    /// fresh install has no legacy file, or when the migration completed and
-    /// reconciled successfully.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
 private:
     pg::PgPool& pool_;

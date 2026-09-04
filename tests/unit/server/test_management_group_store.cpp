@@ -10,8 +10,11 @@
  * (a construct-invalid pool), so it is deliberately NOT `[pg]`-tagged and runs
  * in every shard.
  *
- * migrate_from_sqlite backfill-contract coverage was retired 2026-08-25 (fresh-start-by-default,
- * ADR-0009 amendment) — no upgrade path exists for this store's legacy SQLite file.
+ * `ManagementGroupStore::migrate_from_sqlite()` itself was retired
+ * (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0042 Update, 2026-09-03) -- no
+ * production fleet has ever run a pre-Postgres build, so the mandatory backfill never had real
+ * legacy data to protect. `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows` over
+ * the three legacy tables instead.
  */
 
 #include "management_group_store.hpp"
@@ -62,6 +65,27 @@ void exec_sql(const std::string& dsn, const std::string& sql) {
 }
 
 } // namespace
+
+TEST_CASE("ManagementGroupStore migration lands at v2 and drops mgmt_group_meta (#3623)",
+          "[pg][management_group][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult ver{PQexec(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                    "'management_group_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+    PgResult tbl{PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.tables WHERE "
+                                    "table_schema = 'management_group_store' AND table_name = "
+                                    "'mgmt_group_meta'")};
+    REQUIRE(tbl.ok());
+    CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
+}
 
 TEST_CASE("ManagementGroupStore: create and retrieve group", "[pg][management_group][crud]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);

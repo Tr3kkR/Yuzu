@@ -2,17 +2,16 @@
 // Postgres migration. Covers the authoritative read contract (degrade vs
 // genuinely-absent vs found/empty), fail-soft ingest, delete_agent's
 // empty-id guard, and the Postgres schema-migration-runner upgrade path
-// (published v2 -> v4, repairing an incomplete v3 state).
+// (published v2 -> v5, repairing an incomplete v3 state, then dropping
+// backfill_state at v5).
 //
-// No legacy-SQLite backfill test coverage: the dedicated migrate_from_sqlite
-// TEST_CASE suite (2026-08-25) was removed as part of a fresh-start-by-default
-// policy change (ADR-0009 amendment) -- no production fleet has ever run a
-// pre-Postgres build. InventoryStore::migrate_from_sqlite() itself is
-// UNCHANGED and still present (its removal is a separate, later step) -- it
-// is still called by the "degrades on a broken pool" test below (a general
-// closed-store fail-closed sweep, not backfill correctness) and by the kept
-// schema-migration-runner test (which uses it only as a trigger to exercise
-// the schema-version-upgrade repair path, not to test backfill itself).
+// No legacy-SQLite backfill test coverage: `InventoryStore::migrate_from_sqlite()` itself was
+// retired (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0037 Update, 2026-09-03) -- no
+// production fleet has ever run a pre-Postgres build, so the one-time first-boot backfill never
+// had real legacy data to protect. `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows`
+// over `inventory_data` instead. `delete_agent` no longer erases anything from a legacy file
+// either; the kept schema-migration-runner test below now asserts `backfill_state`'s ABSENCE at
+// v5 instead of using migrate_from_sqlite as a stamp mechanism.
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -77,8 +76,7 @@ void inventory_reset() {
     REQUIRE(lease);
     auto trunc =
         pg::exec_params(lease.get(),
-                        "TRUNCATE inventory_store.inventory_data, inventory_store.backfill_state "
-                        "RESTART IDENTITY CASCADE",
+                        "TRUNCATE inventory_store.inventory_data RESTART IDENTITY CASCADE",
                         std::vector<std::string>{});
     REQUIRE(trunc.status() == PGRES_COMMAND_OK);
 }
@@ -127,7 +125,6 @@ TEST_CASE("InventoryStore degrades (not empty) on a broken pool", "[inventory]")
     CHECK(g.error() == yuzu::server::InventoryReadError::kDegraded);
     CHECK_FALSE(store.delete_agent("a")); // ingest/delete: fail-soft, false, no crash
     store.upsert("a", "p", "{}", 1);      // fail-soft: does not throw
-    CHECK_FALSE(store.migrate_from_sqlite("/nonexistent/path/inventory.db")); // !open_ -> false
 }
 
 TEST_CASE("InventoryStore upsert/get/query/list_tables/count round-trip", "[pg][inventory]") {
@@ -363,7 +360,8 @@ TEST_CASE("InventoryStore query: aggregate blob bytes are bounded before libpq m
     CHECK(rows->size() == 2);
 }
 
-TEST_CASE("InventoryStore migration upgrades published v2 and repairs the incomplete v3 state",
+TEST_CASE("InventoryStore migration upgrades published v2 and repairs the incomplete v3 state, "
+          "then drops backfill_state at v5",
           "[pg][inventory][migration]") {
     // Migration tests deliberately use one private database rather than the
     // pre-migrated shared fixture: both scenarios rewrite schema_meta and DDL.
@@ -410,31 +408,35 @@ TEST_CASE("InventoryStore migration upgrades published v2 and repairs the incomp
         REQUIRE(meta.status() == PGRES_COMMAND_OK);
     };
 
-    const auto require_upgrade_and_stamp = [&] {
+    // Construction alone now drives the full upgrade — migrate_from_sqlite (the previous
+    // mechanism used here purely to trigger PgMigrationRunner::run a second time) was
+    // retired (#3623); the migration ladder runs entirely inside the constructor.
+    const auto require_upgrade = [&] {
         InventoryStore store{pool};
         REQUIRE(store.is_open());
-        REQUIRE(store.migrate_from_sqlite("/nonexistent/path/inventory.db"));
 
         auto lease = pool.acquire();
         REQUIRE(lease);
-        auto state = pg::exec_params(
-            lease.get(),
-            "SELECT m.version, COUNT(*) FILTER (WHERE c.column_name = 'skipped_bad'), "
-            "(SELECT COUNT(*) FROM inventory_store.backfill_state WHERE id = 1) "
-            "FROM public.schema_meta m "
-            "JOIN information_schema.columns c ON c.table_schema = 'inventory_store' "
-            "AND c.table_name = 'backfill_state' "
-            "WHERE m.store = 'inventory_store' GROUP BY m.version",
+        auto ver = pg::exec_params(
+            lease.get(), "SELECT version FROM public.schema_meta WHERE store = 'inventory_store'",
             std::vector<std::string>{});
-        REQUIRE(state.status() == PGRES_TUPLES_OK);
-        REQUIRE(PQntuples(state.get()) == 1);
-        CHECK(std::string(PQgetvalue(state.get(), 0, 0)) == "4");
-        CHECK(std::string(PQgetvalue(state.get(), 0, 1)) == "1");
-        CHECK(std::string(PQgetvalue(state.get(), 0, 2)) == "1");
+        REQUIRE(ver.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(ver.get()) == 1);
+        CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "5");
+
+        // v5 drops backfill_state (its sole writer, migrate_from_sqlite, is gone) — assert
+        // absence rather than the pre-retirement id=1 row-presence check.
+        auto tbl = pg::exec_params(
+            lease.get(),
+            "SELECT COUNT(*) FROM information_schema.tables "
+            "WHERE table_schema = 'inventory_store' AND table_name = 'backfill_state'",
+            std::vector<std::string>{});
+        REQUIRE(tbl.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
     };
 
     seed_historical_schema(2);
-    require_upgrade_and_stamp();
+    require_upgrade();
 
     // Reuse the same ephemeral database for the second historical state. The
     // store and all leases above are already out of scope, so no session owns
@@ -452,5 +454,5 @@ TEST_CASE("InventoryStore migration upgrades published v2 and repairs the incomp
     }
 
     seed_historical_schema(3);
-    require_upgrade_and_stamp();
+    require_upgrade();
 }
