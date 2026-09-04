@@ -136,8 +136,8 @@ constexpr DeleteLimits kOpenLimits{
     /*max_open_dirs=*/64,
 };
 
-MatchFn always_match = [](std::string_view) { return true; };
-MatchFn never_match = [](std::string_view) { return false; };
+MatchFn always_match = [](std::string_view, const EntryMeta&) { return true; };
+MatchFn never_match = [](std::string_view, const EntryMeta&) { return false; };
 
 } // namespace
 
@@ -174,7 +174,7 @@ TEST_CASE("walk_delete lazy match: MatchFn never called for structurally-rejecte
     };
 
     int match_calls = 0;
-    MatchFn counting = [&](std::string_view) {
+    MatchFn counting = [&](std::string_view, const EntryMeta&) {
         ++match_calls;
         return true;
     };
@@ -200,7 +200,7 @@ TEST_CASE("walk_delete lazy match: MatchFn IS called for an otherwise-deletable 
     ops.dir(root).entries = {file_entry("a.txt")};
 
     int match_calls = 0;
-    MatchFn counting = [&](std::string_view) {
+    MatchFn counting = [&](std::string_view, const EntryMeta&) {
         ++match_calls;
         return true;
     };
@@ -218,7 +218,7 @@ TEST_CASE("walk_delete lazy match: MatchFn not called past the entry cap", "[con
     limits.max_entries = 0;
 
     int match_calls = 0;
-    MatchFn counting = [&](std::string_view) {
+    MatchFn counting = [&](std::string_view, const EntryMeta&) {
         ++match_calls;
         return true;
     };
@@ -458,7 +458,7 @@ TEST_CASE("walk_delete: MatchFn throwing stops the walk with MatchError and keep
     int root = ops.add_dir();
     ops.dir(root).entries = {file_entry("a.txt"), file_entry("throws.txt"), file_entry("c.txt")};
 
-    MatchFn throwing = [](std::string_view rel_path) -> bool {
+    MatchFn throwing = [](std::string_view rel_path, const EntryMeta&) -> bool {
         if (rel_path == "throws.txt")
             throw std::runtime_error("boom");
         return true;
@@ -496,7 +496,7 @@ TEST_CASE("walk_delete: a name_invalid entry is Skipped(InvalidName) and MatchFn
         DirEntry{"bad\x00name", EntryMeta{EntryType::RegularFile, 1, true}, 0, true}};
 
     int match_calls = 0;
-    MatchFn counting = [&](std::string_view) {
+    MatchFn counting = [&](std::string_view, const EntryMeta&) {
         ++match_calls;
         return true;
     };

@@ -57,11 +57,11 @@ std::vector<EntryOutcome> sorted_entries(std::vector<EntryOutcome> v) {
 }
 
 MatchFn match_all() {
-    return [](std::string_view) { return true; };
+    return [](std::string_view, const EntryMeta&) { return true; };
 }
 
 MatchFn suffix_match(std::string suffix) {
-    return [suffix](std::string_view rel_path) {
+    return [suffix](std::string_view rel_path, const EntryMeta&) {
         return rel_path.size() >= suffix.size() &&
                rel_path.compare(rel_path.size() - suffix.size(), suffix.size(), suffix) == 0;
     };
@@ -881,7 +881,7 @@ TEST_CASE("a throwing MatchFn stops the walk with MatchError, consistent with th
     OpenRootResult opened = open_root(root_dir);
     REQUIRE(opened.root.has_value());
 
-    MatchFn throwing = [](std::string_view rel_path) -> bool {
+    MatchFn throwing = [](std::string_view rel_path, const EntryMeta&) -> bool {
         if (rel_path == "z_throws.tmp")
             throw std::runtime_error("boom");
         return true;
@@ -923,7 +923,7 @@ TEST_CASE("a MatchFn that throws on its first invocation stops before any deleti
     REQUIRE(opened.root.has_value());
 
     bool first_call = true;
-    MatchFn throw_once_first = [&first_call](std::string_view) -> bool {
+    MatchFn throw_once_first = [&first_call](std::string_view, const EntryMeta&) -> bool {
         if (first_call) {
             first_call = false;
             throw std::runtime_error("boom");

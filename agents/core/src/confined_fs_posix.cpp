@@ -310,7 +310,10 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
                 const std::uint64_t size =
                     (type == EntryType::RegularFile) ? static_cast<std::uint64_t>(st.st_size) : 0;
                 entry.meta =
-                    EntryMeta{type, size, static_cast<std::uint64_t>(st.st_dev) == root_id.dev};
+                    EntryMeta{type, size, static_cast<std::uint64_t>(st.st_dev) == root_id.dev,
+                              // Already in hand from the fstatat above, which is
+                              // parent-handle-relative -- no extra syscall, no path open.
+                              static_cast<std::int64_t>(st.st_mtime)};
             }
             result.entries.push_back(std::move(entry));
         }

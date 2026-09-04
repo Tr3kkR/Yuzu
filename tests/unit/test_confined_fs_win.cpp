@@ -111,7 +111,7 @@ struct JunctionCleanup {
     ~JunctionCleanup() { RemoveDirectoryW(path.c_str()); }
 };
 
-MatchFn always_match = [](std::string_view) { return true; };
+MatchFn always_match = [](std::string_view, const EntryMeta&) { return true; };
 
 DeleteLimits open_limits() {
     return DeleteLimits{/*max_entries=*/1000, /*max_bytes=*/1'000'000,
@@ -292,7 +292,7 @@ TEST_CASE("delete_matching honours a non-default entry cap", "[confined_fs]") {
 
     DeleteLimits limits = open_limits();
     limits.max_entries = 3;
-    DeleteResult result = delete_matching(*opened.root, [](std::string_view) { return true; },
+    DeleteResult result = delete_matching(*opened.root, [](std::string_view, const EntryMeta&) { return true; },
                                           limits);
 
     CHECK(result.stop_reason == Reason::EntryCap);
@@ -311,7 +311,7 @@ TEST_CASE("delete_matching happy path deletes matched files with exact sorted ou
     OpenRootResult opened = open_root(root_dir.path);
     REQUIRE(opened.root.has_value());
 
-    MatchFn match_txt = [](std::string_view p) { return p.ends_with(".txt"); };
+    MatchFn match_txt = [](std::string_view p, const EntryMeta&) { return p.ends_with(".txt"); };
     DeleteResult result = delete_matching(*opened.root, match_txt, open_limits());
 
     REQUIRE(result.stop_reason == Reason::None);
@@ -449,14 +449,14 @@ TEST_CASE("delete_matching can run twice against the same ConfinedRoot (root reu
     OpenRootResult opened = open_root(root_dir.path);
     REQUIRE(opened.root.has_value());
 
-    MatchFn match_a = [](std::string_view p) { return p == "a.txt"; };
+    MatchFn match_a = [](std::string_view p, const EntryMeta&) { return p == "a.txt"; };
     DeleteResult first = delete_matching(*opened.root, match_a, open_limits());
     CHECK(first.stop_reason == Reason::None);
     REQUIRE(first.entries.size() == 1);
     CHECK(first.entries[0].status == EntryStatus::Deleted);
     CHECK_FALSE(std::filesystem::exists(root_dir.path / "a.txt"));
 
-    MatchFn match_b = [](std::string_view p) { return p == "b.txt"; };
+    MatchFn match_b = [](std::string_view p, const EntryMeta&) { return p == "b.txt"; };
     DeleteResult second = delete_matching(*opened.root, match_b, open_limits());
     CHECK(second.stop_reason == Reason::None);
     REQUIRE(second.entries.size() == 1);
