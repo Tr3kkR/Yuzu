@@ -2071,6 +2071,27 @@ TEST_CASE("#2818 PIN — a post-arm watch fault is counted but never reaches the
     engine.stop();
 }
 
+TEST_CASE("#2839 seam — set_file_retire_fault_hook_for_test refuses a non-file mechanism",
+          "[spark][mechanism]") {
+    // The seam's failure contract, pinned on EVERY platform (the injection case itself is
+    // Windows-only, below). It returns bool rather than void precisely so a caller cannot
+    // silently install a hook on the wrong mechanism and then conclude from a green run
+    // that the fault path was exercised — which, since the hook would never fire, is the
+    // false-green this assertion exists to prevent.
+    FakeMechanism fake;
+    CHECK_FALSE(set_file_retire_fault_hook_for_test(fake, [] {}));
+
+    // And on a platform with no file mechanism at all there is nothing to hook, so the
+    // Windows case below is correctly skipped rather than silently vacuous.
+    auto file = make_file_mechanism();
+#ifdef _WIN32
+    REQUIRE(file);
+    CHECK(set_file_retire_fault_hook_for_test(*file, nullptr)); // real mechanism, hook cleared
+#else
+    CHECK(file == nullptr);
+#endif
+}
+
 TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][mechanism]") {
 #ifdef _WIN32
     CHECK(make_file_mechanism() != nullptr);
@@ -2778,6 +2799,90 @@ TEST_CASE("File spark (real mechanism): retiring_ is capped and observable under
     CHECK(elapsed < 5000ms);
     CHECK(mech->stats().quarantined_total == 0); // the cap kept this reachable in the first place
     // trigger_dir + flood_dirs removed by DirCleanup on scope exit.
+}
+
+TEST_CASE("File spark (real mechanism): a failed retire keeps the DirWatch alive rather than "
+          "freeing it under a live kernel read (#2839)",
+          "[spark][mechanism][windows][resilience]") {
+    // THE DEFECT. push_retiring() used to take the owning unique_ptr BY VALUE and start
+    // with retiring_.push_back(std::move(w)). The ownership transfer therefore completed
+    // at the CALL, before the one statement that can allocate — so a std::bad_alloc out
+    // of push_back destroyed a DirWatch whose ReadDirectoryChangesW was still
+    // outstanding, and the kernel later wrote into that freed buffer and OVERLAPPED. The
+    // caller's dirs_.erase(di) was skipped too, leaving a moved-from (null) unique_ptr
+    // keyed in dirs_ that stop()'s cancel loop then dereferenced.
+    //
+    // A real bad_alloc cannot be aimed at one statement, so it is injected through the
+    // #2839 seam, which fires immediately before the allocating step — the same
+    // "fault phase" idiom as SparkEngine::set_arm_fault_hook_for_test.
+    //
+    // PRE-FIX this case crashes: the throw frees the live DirWatch and stop() then
+    // dereferences the null map entry. POST-FIX the throw lands BEFORE any ownership
+    // moves, so the watch stays whole in dirs_ — already `removing` and cancelled — and
+    // stop() reclaims it normally.
+    namespace fs = std::filesystem;
+    const auto pid = std::to_string(::GetCurrentProcessId());
+    const fs::path dir = fs::temp_directory_path() / ("yuzu_test_spark_2839_" + pid);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir);
+    const fs::path target = dir / "t.txt";
+    { std::ofstream(target) << "seed"; }
+
+    struct DirCleanup {
+        const fs::path& d;
+        ~DirCleanup() {
+            std::error_code e;
+            fs::remove_all(d, e);
+        }
+    } dir_cleanup{dir}; // declared BEFORE mech, so it runs AFTER ~mech has closed handles
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech);
+    mech->start([](const std::string&, SparkData) {}, [](const std::string&, bool, std::string_view) {});
+
+    REQUIRE(mech->watch("k2839", FileSparkParams{target.string()}).has_value());
+    std::this_thread::sleep_for(150ms); // let the read arm — io_pending must be TRUE, or
+                                        // unwatch takes the plain dirs_.erase branch and
+                                        // never reaches push_retiring at all
+    REQUIRE(mech->stats().retiring == 0);
+
+    // Aim a bad_alloc at the retire. The seam returns false off Windows and for any other
+    // mechanism type, so the REQUIRE is the guard against silently testing nothing.
+    REQUIRE(set_file_retire_fault_hook_for_test(*mech, [] { throw std::bad_alloc{}; }));
+
+    // unwatch() REPORTS the failure rather than swallowing it — ISparkMechanism::unwatch
+    // is not noexcept, and SparkEngine contains and counts a throwing unwatch at both of
+    // its teardown doors (#2270). What must NOT happen is the free.
+    CHECK_THROWS_AS(mech->unwatch("k2839"), std::bad_alloc);
+
+    // The watch was never handed over, so nothing landed in retiring_ and the gauge is
+    // untouched — "fully retained", the other half of the post-fix contract from
+    // "fully quarantined".
+    CHECK(mech->stats().retiring == 0);
+
+    // The mechanism is not wedged: a fresh watch on a different key still arms.
+    const fs::path other = dir / "u.txt";
+    { std::ofstream(other) << "seed"; }
+    CHECK(mech->watch("k2839b", FileSparkParams{other.string()}).has_value());
+
+    // And the retained watch is reclaimed by an ordinary stop(): it is cancelled and
+    // drained like any other, with no quarantine and no crash. PRE-FIX this line is where
+    // the null dirs_ entry was dereferenced.
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_NOTHROW(mech->stop());
+    CHECK(std::chrono::steady_clock::now() - t0 < 5000ms);
+    CHECK(mech->stats().quarantined_total == 0);
+
+    // KNOWN RESIDUAL, recorded rather than asserted away. unwatch_locked() erases the
+    // key_index_ entry at its top, BEFORE anything that can throw, so on this path the
+    // key registration is gone while the DirWatch itself is retained. The watch is still
+    // reclaimed correctly (by stop() above, or by the worker's drop_watch() when the
+    // aborted completion drains — it searches dirs_, ancestors_ and retiring_), but that
+    // one key can no longer be unwatched by name. A map entry stranded on a bad_alloc
+    // path, not a use-after-free: strictly smaller than what this fix removes, and out of
+    // scope for it. Moving the key_index_ erase after the transfer would close it and is
+    // filed as a follow-up.
 }
 
 TEST_CASE("Registry spark (real mechanism): survives key delete + recreate",
