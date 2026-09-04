@@ -842,10 +842,10 @@ TEST_CASE("procperf routes: own audit verb, Execute gate, result narrowing",
     DexRoutes::DispatchFn dispatch =
         [&](const std::string&, const std::string&, const std::vector<std::string>&,
             const std::string&, const std::unordered_map<std::string, std::string>& params)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         auto it = params.find("sql");
         dispatched_sql = it != params.end() ? it->second : "";
-        return {"tar-abc123", 1};
+        return {.sent = 1, .command_id = "tar-abc123"};
     };
     const std::string output =
         "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"

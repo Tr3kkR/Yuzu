@@ -156,55 +156,26 @@ struct DispatchResolvers {
 using ConcurrencyClaimFn =
     std::function<std::vector<std::string>(const std::vector<std::string>& candidates)>;
 
-/// Outcome of `resolve_and_dispatch_confined`: `sent` is the count actually
-/// dispatched; `scope_parse_error` is set only when the Scope arm's resolved
-/// expression failed to parse — the one distinction a caller with an HTTP
-/// response to shape might still act on differently than reaching nobody.
-///
-/// #881: `denied_quarantined` carries every reachable id the quarantine gate
-/// withheld OUT of this function, so the caller can audit it — without this
-/// field the majority of dispatch (MCP, workflows, schedules, REST v1, all
-/// of which route through `wire_and_dispatch_confined`) would enforce
-/// quarantine but audit nothing. `command_id` rides along for the same
-/// reason: once the return type stopped being a bare `std::pair<std::string,
-/// int>`, the caller needed a way to correlate `denied_quarantined` entries
-/// with the dispatch that produced them without re-deriving it.
-///
-/// `command_id` is populated ONLY by `wire_and_dispatch_confined` (it takes
-/// the id as a parameter and assigns it on return); `resolve_and_dispatch_confined`
-/// has no command id to give it and leaves the field default-constructed
-/// (empty). A caller of `resolve_and_dispatch_confined` directly — today only
-/// this file's own tests — must not read `command_id` off its result.
-struct ConfinedDispatchOutcome {
-    int sent = 0;
-    std::optional<std::string> scope_parse_error;
-    /// The ids withheld, for audit rows that name a device. **Empty on a
-    /// fail-closed denial** — the ids are deliberately not collected there.
-    std::vector<std::string> denied_quarantined;
-    /// How many were withheld, always. Report counts from THIS, never from
-    /// `denied_quarantined.size()`, which differs under fail-closed. See
-    /// `ArmDispatchResult` for why the two are separate.
-    std::size_t denied_quarantined_count = 0;
-    std::string command_id;
-    /// ADR-1007: ids whose claim (taken by `claim_fn` before the send) was
-    /// never actually delivered — mirrors `ArmDispatchResult::not_sent`, see
-    /// its doc comment for why the collection happens there and the release
-    /// happens at `wire_and_dispatch_confined` instead. Empty whenever no
-    /// concurrency claim was in effect for this dispatch.
-    std::vector<std::string> not_sent;
-};
+// `ConfinedDispatchOutcome` (the return type of `resolve_and_dispatch_confined`
+// below, and — #3424/#3511 — every `DispatchFn` typedef across the codebase)
+// lives in dispatch_confined_arms.hpp now, next to its inner analog
+// `ArmDispatchResult`: a header the 7 `DispatchFn`-declaring headers can
+// include without also pulling in this file's much heavier dependency list
+// (scope_engine, tag_store, result_set_store, management_group_store,
+// execution_tracker). See that header for the struct's own doc comment.
 
 /// The "middle link": classify the arm, resolve ITS targets via the injected
 /// resolvers, and route the actual send through `dispatch_confined_arms` —
 /// the ONE call every arm makes, so the classification + resolution that
 /// feeds it is exercised by the same tests that bind the intersection itself.
-inline ConfinedDispatchOutcome
-resolve_and_dispatch_confined(const std::vector<std::string>& agent_ids,
-                              const std::string& scope_expr, const authz::VisibleSet& exec_visible,
-                              bool broadcast_on_none, const ContainmentGate& gate,
-                              const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink,
-                              const ConcurrencyClaimFn& claim_fn = nullptr) {
+inline ConfinedDispatchOutcome resolve_and_dispatch_confined(
+    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+    const authz::VisibleSet& exec_visible, bool broadcast_on_none, const ContainmentGate& gate,
+    const DispatchResolvers& resolvers, const ConfinedDispatchSink& sink,
+    const ConcurrencyClaimFn& claim_fn = nullptr,
+    const std::unordered_set<std::string>& plugin_missing = {}) {
     ConfinedDispatchOutcome outcome;
+    outcome.containment_unreadable = gate.enforced && gate.fail_closed;
     const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
 
     // ADR-1007 correctness fix (Gate 2 security-guardian SHOULD): claim
@@ -229,11 +200,14 @@ resolve_and_dispatch_confined(const std::vector<std::string>& agent_ids,
             members = claim_fn(authz::filter_to_scope(members, exec_visible));
         ConfinedDispatchTargets t;
         t.group_members = &members;
-        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
+        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
+                                              plugin_missing);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
         outcome.not_sent = r.not_sent;
+        outcome.unknown_plugin = r.unknown_plugin;
+        outcome.unknown_plugin_count = r.unknown_plugin_count;
         return outcome;
     }
 
@@ -248,11 +222,14 @@ resolve_and_dispatch_confined(const std::vector<std::string>& agent_ids,
             *ladder.matched = claim_fn(authz::filter_to_scope(*ladder.matched, exec_visible));
         ConfinedDispatchTargets t;
         t.scope_matched = &*ladder.matched;
-        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
+        const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
+                                              plugin_missing);
         outcome.sent = r.sent;
         outcome.denied_quarantined = r.denied_quarantined;
         outcome.denied_quarantined_count = r.denied_quarantined_count;
         outcome.not_sent = r.not_sent;
+        outcome.unknown_plugin = r.unknown_plugin;
+        outcome.unknown_plugin_count = r.unknown_plugin_count;
         return outcome;
     }
 
@@ -266,11 +243,14 @@ resolve_and_dispatch_confined(const std::vector<std::string>& agent_ids,
             t.agent_ids = &agent_ids;
         }
     }
-    const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink);
+    const auto r = dispatch_confined_arms(arm, t, exec_visible, broadcast_on_none, gate, sink,
+                                          plugin_missing);
     outcome.sent = r.sent;
     outcome.denied_quarantined = r.denied_quarantined;
     outcome.denied_quarantined_count = r.denied_quarantined_count;
     outcome.not_sent = r.not_sent;
+    outcome.unknown_plugin = r.unknown_plugin;
+    outcome.unknown_plugin_count = r.unknown_plugin_count;
     return outcome;
 }
 
@@ -350,6 +330,20 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         [&registry, &cmd] { return registry.send_to_all(cmd); },
         [&registry] { return registry.all_ids(); }};
 
+    // #3424/#3511: one registry read per dispatch, same lifecycle as `gate`
+    // (built once by the caller before this function runs) -- never
+    // recomputed per arm.
+    //
+    // COST, ACCEPTED: `ids_missing_plugin` is one locked O(fleet) pass over
+    // `agents_` regardless of arm size, so a single-Ids dispatch to one
+    // device pays the same registry walk a fleet broadcast does. Same shape
+    // and same trade as `gate`'s own containment-store read immediately
+    // above -- see `make_containment_gate`'s comment for the equivalent
+    // "share the one read across arms rather than skip it for small
+    // dispatches" reasoning. Revisit if this shows up in profiling on a
+    // large fleet under a high single-target dispatch rate.
+    const auto plugin_missing = registry.ids_missing_plugin(cmd.wire().plugin());
+
     // ADR-1007: per-device concurrency claim. Only wired for
     // concurrency_mode == "per-device" with a definition_id supplied and a
     // live tracker. Two definition-aware callers DO reach this gated
@@ -398,8 +392,9 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
         };
     }
 
-    auto outcome = resolve_and_dispatch_confined(
-        agent_ids, scope_expr, exec_visible, broadcast_on_none, gate, resolvers, sink, claim_fn);
+    auto outcome =
+        resolve_and_dispatch_confined(agent_ids, scope_expr, exec_visible, broadcast_on_none, gate,
+                                      resolvers, sink, claim_fn, plugin_missing);
     outcome.command_id = command_id;
 
     // ADR-1007 claim-leak fix: `claim_fn` above ran BEFORE the send, so every
@@ -417,8 +412,16 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
     // cost that field's comment explains) — those claims are NOT released
     // here and instead age out via the stale-claim reconciler's own
     // `expires_at` bound, same as any other orphaned claim.
+    //
+    // #3424/#3511: `outcome.unknown_plugin` is the THIRD bucket in this same
+    // leak class — `plugin_absent` in `dispatch_confined_arms` runs the
+    // identical "claimed, then `continue` before send" shape `contained`
+    // does, so an id withheld for a missing plugin holds an open claim too.
+    // No fail-closed analogue here (plugin-presence has no degraded-read
+    // mode), so unlike `denied_quarantined` this list is never elided.
     if (claim_fn && execution_tracker) {
-        std::size_t leaked = outcome.not_sent.size() + outcome.denied_quarantined.size();
+        std::size_t leaked = outcome.not_sent.size() + outcome.denied_quarantined.size() +
+                             outcome.unknown_plugin.size();
         if (leaked > 0) {
             // One batched UPDATE (#881 discipline — matches `claim_fn`'s own
             // unnest-batched INSERT), not a per-id loop: a large not_sent set
@@ -429,6 +432,8 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
             to_release.insert(to_release.end(), outcome.not_sent.begin(), outcome.not_sent.end());
             to_release.insert(to_release.end(), outcome.denied_quarantined.begin(),
                               outcome.denied_quarantined.end());
+            to_release.insert(to_release.end(), outcome.unknown_plugin.begin(),
+                              outcome.unknown_plugin.end());
             // definition_id scoping (Gate 2 security-guardian finding, PR
             // #3784 fix round): execution_id alone is NOT a safe match key
             // here — every workflow-step dispatch (workflow_routes.cpp)
@@ -443,9 +448,9 @@ inline ConfinedDispatchOutcome wire_and_dispatch_confined(
                                                           to_release);
             spdlog::info("wire_and_dispatch_confined: released {} per-device concurrency "
                          "claim(s) for execution_id={} that were taken but never delivered "
-                         "(undelivered={}, quarantine-denied={})",
+                         "(undelivered={}, quarantine-denied={}, unknown-plugin={})",
                          leaked, execution_id, outcome.not_sent.size(),
-                         outcome.denied_quarantined.size());
+                         outcome.denied_quarantined.size(), outcome.unknown_plugin.size());
         }
     }
     return outcome;

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 #include "stream_budget.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -319,7 +321,7 @@ public:
     /// a healthy connected agent. The other three dispatch surfaces (MCP,
     /// dashboard, workflow) were widened by PR1.9b′; this one was deferred at
     /// the time, and that deferral WAS the defect rather than a boundary.
-    using CommandDispatchFn = std::function<std::pair<std::string, int>(
+    using CommandDispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

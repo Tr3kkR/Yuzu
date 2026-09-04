@@ -176,6 +176,17 @@ inline constexpr std::array<std::string_view, 6> kRouteRejectReasons{
 /// kind of refusal.
 inline constexpr std::string_view kReasonQuarantined{"quarantined"};
 
+/// #3511: mirrors `kReasonQuarantined` exactly — same series, same three
+/// routes (`dispatch_closure` / `command` / `legacy`), same rationale. Every
+/// withheld-for-quarantine dispatch already produced a counter row and a
+/// `spdlog::warn`; before this constant, a withheld-for-plugin-absence
+/// dispatch produced neither. A plugin-absence withholding is not a policy
+/// event (no audit row — see the call sites), but it is still an operational
+/// fact worth a metric and a log line: an agentic caller retrying against a
+/// misspelled or unregistered plugin name should be observable the same way
+/// a quarantine denial is.
+inline constexpr std::string_view kReasonUnknownPlugin{"unknown_plugin"};
+
 /// Reject a targeting argument that was SUPPLIED but names nothing.
 ///
 /// Both the type and the emptiness arms matter for the same reason: a handler
