@@ -77,7 +77,6 @@
 #include <cstddef>
 #include <cstring>
 #include <format>
-#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -189,16 +188,32 @@ struct DriveIdentity {
     Media media{Media::Unknown};
 };
 
-std::optional<DriveIdentity> query_identity(HANDLE h) {
+/// `err` receives the failing GetLastError() and is meaningful only when this
+/// returns nullopt. It is captured HERE, at the syscall, because by the time
+/// the caller formats its row the thread's last-error has already been
+/// overwritten by the intervening calls -- the row used to print a stale code.
+std::optional<DriveIdentity> query_identity(HANDLE h, DWORD& err) {
+    err = 0;
     STORAGE_PROPERTY_QUERY q{};
     q.PropertyId = StorageDeviceProperty;
     q.QueryType = PropertyStandardQuery;
-    std::array<BYTE, 1024> buf{};
+    // alignas: this byte array is read back through a STORAGE_DEVICE_DESCRIPTOR*
+    // below. std::array<BYTE,N> carries only BYTE alignment, so the cast would
+    // otherwise rest on incidental placement rather than a stated precondition
+    // (adversarial review 2026-09-04; a MinGW probe found the buffers aligned in
+    // practice, which is exactly the kind of accident that stops being true on
+    // another supported compiler).
+    alignas(STORAGE_DEVICE_DESCRIPTOR) std::array<BYTE, 1024> buf{};
     DWORD returned = 0;
     if (!::DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &q, sizeof q, buf.data(),
-                           static_cast<DWORD>(buf.size()), &returned, nullptr))
+                           static_cast<DWORD>(buf.size()), &returned, nullptr)) {
+        err = ::GetLastError();
         return std::nullopt;
-    if (returned < sizeof(STORAGE_DEVICE_DESCRIPTOR)) return std::nullopt;
+    }
+    if (returned < sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+        err = ERROR_INVALID_DATA; // answered, but with less than the descriptor
+        return std::nullopt;
+    }
 
     const auto* d = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(buf.data());
     DriveIdentity id;
@@ -245,7 +260,10 @@ std::optional<NvmeHealth> query_nvme_health(HANDLE h) {
     psd->ProtocolDataOffset = sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA);
     psd->ProtocolDataLength = sizeof(req.data);
 
-    std::array<BYTE, sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR) + 512> out{};
+    // alignas: same reason as query_identity's buffer -- this is read back
+    // through a STORAGE_PROTOCOL_DATA_DESCRIPTOR*.
+    alignas(STORAGE_PROTOCOL_DATA_DESCRIPTOR)
+        std::array<BYTE, sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR) + 512> out{};
     DWORD returned = 0;
     if (!::DeviceIoControl(h, IOCTL_STORAGE_QUERY_PROPERTY, &req, sizeof req, out.data(),
                            static_cast<DWORD>(out.size()), &returned, nullptr))
@@ -253,12 +271,34 @@ std::optional<NvmeHealth> query_nvme_health(HANDLE h) {
     if (returned < sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR)) return std::nullopt;
 
     const auto* pd = reinterpret_cast<const STORAGE_PROTOCOL_DATA_DESCRIPTOR*>(out.data());
+
+    // The descriptor HEADER is device-supplied too, and bounding the payload
+    // span is not enough on its own. Adversarial review (2026-09-04) found that
+    // a driver returning success with ProtocolDataOffset = 0 makes the span
+    // below start at the STORAGE_PROTOCOL_SPECIFIC_DATA header itself -- whose
+    // bytes would then be decoded as a SMART reading and reported as a health
+    // verdict and wear figures that never came from log page 0x02. Every check
+    // here is one Microsoft's own protocol-query sample performs:
+    //
+    //   * Version and Size must be exactly the descriptor's size. This fails
+    //     CLOSED (health `unknown`, and the caller marks the read degraded)
+    //     rather than trusting a header we do not recognise.
+    //   * ProtocolDataOffset must clear the STORAGE_PROTOCOL_SPECIFIC_DATA
+    //     header -- the same lower bound the REQUEST uses at the top of this
+    //     function, so an answer that violates it is self-inconsistent.
+    if (pd->Version != sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR) ||
+        pd->Size != sizeof(STORAGE_PROTOCOL_DATA_DESCRIPTOR))
+        return std::nullopt;
+    if (pd->ProtocolSpecificData.ProtocolDataOffset < sizeof(STORAGE_PROTOCOL_SPECIFIC_DATA))
+        return std::nullopt;
+
     // Both offset and length are device-supplied. Bound the whole span against
     // what was actually returned before touching a byte of it.
     const std::size_t base = offsetof(STORAGE_PROTOCOL_DATA_DESCRIPTOR, ProtocolSpecificData) +
                              pd->ProtocolSpecificData.ProtocolDataOffset;
     const std::size_t len = pd->ProtocolSpecificData.ProtocolDataLength;
-    if (len < 6 || base > returned || base + len > returned) return std::nullopt;
+    if (len < kNvmeHealthMinBytes || base > returned || base + len > returned)
+        return std::nullopt;
 
     // The field extraction and its bounds check are pure and shared, so a
     // change to the NVMe offsets fails a unit test rather than silently
@@ -289,7 +329,10 @@ int emit_smart(yuzu::CommandContext& ctx) {
     bool any_denied = false;
     bool any_open_failure = false;
     bool any_health_unread = false;
+    bool any_identity_failure = false;
+    bool probe_cap_reached = false;
     DWORD first_open_err = 0;
+    DWORD first_identity_err = 0;
 
     // Windows exposes no enumeration of PhysicalDriveN, so probe a bounded
     // range. ERROR_FILE_NOT_FOUND simply means that index does not exist and is
@@ -308,12 +351,23 @@ int emit_smart(yuzu::CommandContext& ctx) {
             continue;
         }
 
+        // Reaching the last probe index with an OPEN drive means the range may
+        // have truncated a real device, which is a different fact from simply
+        // running out of indices.
+        if (i == kMaxPhysicalDrives - 1) probe_cap_reached = true;
+
         const std::string device = "PhysicalDrive" + std::to_string(i);
-        const auto id = query_identity(h.get());
+        DWORD identity_err = 0;
+        const auto id = query_identity(h.get(), identity_err);
         if (!id) {
+            // The row alone is not enough: leaving the typed seam UNDECLARED
+            // here reports a clean OK while a drive's identity is missing --
+            // the same defect already fixed for the NVMe health path below.
+            any_identity_failure = true;
+            if (first_identity_err == 0) first_identity_err = identity_err;
             write_smart_row(ctx, device, "-", Bus::Unknown, Media::Unknown, Health::Unknown,
                             std::nullopt, std::nullopt,
-                            std::format("StorageDeviceProperty query failed: {}", ::GetLastError()));
+                            std::format("StorageDeviceProperty query failed: {}", identity_err));
             any_row = true;
             continue;
         }
@@ -366,9 +420,18 @@ int emit_smart(yuzu::CommandContext& ctx) {
 
     // Reported after the walk, least-material first, so the most actionable
     // cause is the one that survives set_result_status's last-writer-wins.
+    if (probe_cap_reached)
+        mark_result_partial(ctx, "windows:physicaldrive_cap",
+                            std::format("the drive probe stops at PhysicalDrive{}; a host with "
+                                        "more drives than that reports only the first {}",
+                                        kMaxPhysicalDrives - 1, kMaxPhysicalDrives));
     if (any_health_unread)
         mark_result_partial(ctx, "windows:nvme_health",
                             "health could not be read for at least one drive; see the row detail");
+    if (any_identity_failure)
+        mark_result_partial(ctx, "windows:storage_device_property",
+                            std::format("at least one drive did not answer the identity query: {}",
+                                        first_identity_err));
     if (any_open_failure)
         mark_result_partial(ctx, "windows:physicaldrive",
                             std::format("at least one drive could not be opened: {}",
@@ -394,6 +457,8 @@ int emit_volumes(yuzu::CommandContext& ctx) {
     }
 
     bool any_extent_failure = false;
+    bool any_extent_truncated = false;
+    bool any_mounts_failure = false;
     for (;;) {
         std::wstring vol = volume;
         const std::string vol_utf8 = yuzu::win::from_wide(vol.c_str());
@@ -401,9 +466,22 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         // Mount points served by this volume. A volume with no letter and no
         // mount point is reported with "-" rather than omitted -- it still
         // occupies a physical drive, which is what this action is about.
+        // Both failure arms below must reach the typed seam. "-" legitimately
+        // means "this volume serves no mount point", so a FAILED enumeration
+        // that silently produces the same "-" is indistinguishable from a
+        // genuinely unmounted volume -- and the mount-point column is the join
+        // this action exists for. The sibling filesystem_posture_win.cpp:275
+        // already draws exactly this distinction.
         std::string mounts = "-";
         DWORD needed = 0;
-        ::GetVolumePathNamesForVolumeNameW(vol.c_str(), nullptr, 0, &needed);
+        // Key the sizing outcome off the RETURN VALUE, not GetLastError: this
+        // call SUCCEEDS on a volume with no mount points (needed == 1, just the
+        // list terminator), and GetLastError is not set on success -- reading it
+        // there would surface a stale code from an earlier call and mark every
+        // healthy unmounted volume degraded.
+        ::SetLastError(ERROR_SUCCESS);
+        const BOOL sized = ::GetVolumePathNamesForVolumeNameW(vol.c_str(), nullptr, 0, &needed);
+        const DWORD size_err = sized ? ERROR_SUCCESS : ::GetLastError();
         if (needed > 1) {
             std::vector<wchar_t> buf(needed, L'\0');
             if (::GetVolumePathNamesForVolumeNameW(vol.c_str(), buf.data(), needed, &needed)) {
@@ -413,7 +491,13 @@ int emit_volumes(yuzu::CommandContext& ctx) {
                     joined += yuzu::win::from_wide(p);
                 }
                 if (!joined.empty()) mounts = joined;
+            } else {
+                any_mounts_failure = true;
             }
+        } else if (!sized && size_err != ERROR_MORE_DATA) {
+            // A FAILED sizing call, as distinct from a successful one reporting
+            // an empty mount list.
+            any_mounts_failure = true;
         }
 
         // THE JOIN: which physical drives back this volume. CreateFileW wants
@@ -454,6 +538,11 @@ int emit_volumes(yuzu::CommandContext& ctx) {
                 // was actually returned before indexing.
                 const std::size_t max_fit =
                     (returned - offsetof(VOLUME_DISK_EXTENTS, Extents)) / sizeof(DISK_EXTENT);
+                // The device claimed more extents than the reply could carry, so
+                // this volume's drive list is INCOMPLETE -- a spanned volume
+                // would name only some of the drives backing it, which is a
+                // wrong answer to this action's only question, not a slow one.
+                if (n > max_fit) any_extent_truncated = true;
                 std::string joined;
                 std::uint64_t bytes = 0;
                 for (DWORD e = 0; e < n && e < max_fit; ++e) {
@@ -483,6 +572,16 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         }
     }
 
+    // Least-material first: set_result_status assigns, so the LAST call wins and
+    // the most actionable cause must be reported last.
+    if (any_mounts_failure)
+        mark_result_partial(ctx, "windows:volume_mount_paths",
+                            "at least one volume's mount-point enumeration failed; those rows show "
+                            "\"-\" for mount points without meaning the volume has none");
+    if (any_extent_truncated)
+        mark_result_partial(ctx, "windows:volume_extents",
+                            "at least one volume reported more disk extents than its reply could "
+                            "carry; those rows name only some of the drives backing them");
     if (any_extent_failure)
         mark_result_partial(ctx, "windows:volume_extents",
                             "at least one volume did not report its disk extents; those rows name "

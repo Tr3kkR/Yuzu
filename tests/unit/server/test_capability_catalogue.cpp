@@ -185,7 +185,7 @@ TEST_CASE("capability catalogue: system_reserved is true only for core_dispatch_
     }
 }
 
-TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across all seven "
+TEST_CASE("capability catalogue: classify() resolves every declared plugin.action across all eight "
           "sources",
           "[server][dispatch][capability]") {
     auto registry = build_registry(all_labeled_sources());

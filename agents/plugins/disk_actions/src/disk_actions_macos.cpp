@@ -45,7 +45,9 @@
 
 #include <sys/mount.h>
 
+#include <cstdlib> // std::free — owns getmntinfo_r_np's caller-owned allocation
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -114,8 +116,33 @@ Bus bus_from_class(std::string_view cls) {
 
 /// Mount points reachable today, keyed by BSD device name (e.g. "disk0s2").
 /// MNT_NOWAIT for the same reason filesystem_posture uses it: a synchronous
-/// getmntinfo can block on an unreachable network mount, and this runs on a
+/// enumeration can block on an unreachable network mount, and this runs on a
 /// bounded dispatch-pool worker.
+///
+/// THIS USES getmntinfo_r_np, NOT getmntinfo, AND THE DIFFERENCE IS A BUG FIX.
+/// Adversarial review (2026-09-04, both external reviewers independently) found
+/// the original `getmntinfo` call here racing on a concurrent worker:
+///
+///   * `getmntinfo(3)` returns a PROCESS-OWNED STATIC buffer, and `man 3
+///     getmntinfo` states a later call may OVERWRITE OR FREE it. It is not
+///     thread-safe. This function held that pointer across its whole parse
+///     loop.
+///   * Plugin actions genuinely run concurrently: `execute()` is invoked from
+///     inside the dispatch-pool submit lambda (agent.cpp:3480) on a pool sized
+///     std::thread::hardware_concurrency() (agent.cpp:1139), and plugin_loader
+///     holds no execution mutex. So `disk_actions.volumes` can overlap
+///     `filesystem_posture.mounts` — another getmntinfo caller in ANOTHER dylib.
+///   * Consequence: torn statfs records corrupt the physical-to-logical join
+///     this action exists to produce, and a realloc between the two calls turns
+///     the loop below into a freed-heap read.
+///
+/// COPYING THE SIBLING'S MUTEX WOULD NOT HAVE FIXED IT. filesystem_posture
+/// guards its own calls with a function-local `static std::mutex`
+/// (filesystem_posture_macos.cpp:65-93), but that mutex is private to THAT
+/// dylib — a second copy here would serialize disk_actions against itself and
+/// still race filesystem_posture. `getmntinfo_r_np` (macOS 10.13+) sidesteps
+/// the shared buffer entirely by handing the CALLER its own allocation, so the
+/// race closes one-sidedly with no cross-dylib coordination to maintain.
 struct MountInfo {
     std::vector<std::string> mount_points;
     std::string fstype; ///< F6: a declared column that no leg used to fill
@@ -124,7 +151,10 @@ struct MountInfo {
 std::map<std::string, MountInfo> mount_points_by_bsd_name(bool& ok) {
     std::map<std::string, MountInfo> out;
     struct statfs* mnts = nullptr;
-    const int n = ::getmntinfo(&mnts, MNT_NOWAIT);
+    const int n = ::getmntinfo_r_np(&mnts, MNT_NOWAIT);
+    // The allocation is OURS. Adopt it before anything can return, so no exit
+    // path leaks it; free(nullptr) is a no-op, so the failure case is safe too.
+    const std::unique_ptr<struct statfs, decltype(&std::free)> owned{mnts, &std::free};
     ok = n > 0;
     if (!ok) return out;
     for (int i = 0; i < n; ++i) {
@@ -275,13 +305,20 @@ int emit_volumes(yuzu::CommandContext& ctx) {
     ScopedIOObject it{raw_it};
 
     bool any_row = false;
+    bool any_media_skipped = false;
+    bool any_physical_unresolved = false;
     for (io_object_t raw_obj; (raw_obj = IOIteratorNext(it.get()));) {
         ScopedIOObject obj{raw_obj};
 
         ScopedCFRef<CFTypeRef> bsd{
             IORegistryEntryCreateCFProperty(obj.get(), CFSTR(kIOBSDNameKey), kCFAllocatorDefault, 0)};
         const std::string name = cf_string(bsd.get());
-        if (name.empty()) continue;
+        if (name.empty()) {
+            // An IOMedia object we cannot key on is silently absent from the
+            // output; record it rather than let a short list read as complete.
+            any_media_skipped = true;
+            continue;
+        }
 
         ScopedCFRef<CFTypeRef> size{
             IORegistryEntryCreateCFProperty(obj.get(), CFSTR(kIOMediaSizeKey), kCFAllocatorDefault, 0)};
@@ -306,8 +343,15 @@ int emit_volumes(yuzu::CommandContext& ctx) {
             if (!found->second.fstype.empty()) fstype = found->second.fstype;
         }
 
+        // An empty answer means the provider walk failed or hit its depth cap,
+        // NOT that this media has no backing disk. Collapsing both to "-" left
+        // the command reporting a clean OK while the physical column -- the
+        // whole point of the action -- was unresolved.
         std::string physical = physical_whole_disk_of(obj.get());
-        if (physical.empty()) physical = "-";
+        if (physical.empty()) {
+            any_physical_unresolved = true;
+            physical = "-";
+        }
 
         // F3 (spec axis): this action is the physical-to-logical JOIN, not a
         // third media inventory -- `hardware.disks` already enumerates physical
@@ -326,9 +370,18 @@ int emit_volumes(yuzu::CommandContext& ctx) {
 
     if (!any_row)
         write_volume_row(ctx, "-", "-", "-", "-", std::nullopt, "no IOMedia objects found");
+    // Least-material first: set_result_status assigns, so the LAST call wins.
+    if (any_media_skipped)
+        mark_result_partial(ctx, "macos:iomedia",
+                            "at least one IOMedia object reported no BSD name and is absent from "
+                            "this listing");
+    if (any_physical_unresolved)
+        mark_result_partial(ctx, "macos:provider_walk",
+                            "the backing physical disk could not be resolved for at least one "
+                            "volume; those rows show \"-\" without meaning none exists");
     if (!mounts_ok)
         mark_result_partial(ctx, "macos:getmntinfo",
-                            "getmntinfo returned no entries; volumes are listed without their "
+                            "getmntinfo_r_np returned no entries; volumes are listed without their "
                             "mount points");
     return 0;
 }

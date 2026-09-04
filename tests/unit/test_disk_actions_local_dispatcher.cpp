@@ -300,6 +300,46 @@ TEST_CASE("disk_actions: macOS resolves volumes to a real physical disk, not an 
     }
     CHECK(checked_any);
 }
+
+// Adversarial review (2026-09-04, KMI-1/CDX-006): the macOS leg used bare
+// `getmntinfo(3)`, whose process-owned static buffer may be overwritten or
+// freed by a concurrent caller in another dylib. The fix moved it to
+// `getmntinfo_r_np`, which hands the caller its own allocation.
+//
+// That fix is silently reversible in the worst way: if the replacement ever
+// returns nothing, every row simply reports "-" for mount points, which is a
+// LEGITIMATE value meaning "this volume serves no mount point". The action
+// would keep passing every other test while the join it exists to produce
+// quietly disappeared. The APFS anchor test above does not cover this -- it
+// asserts the DEVICE column (the provider walk), not the mount-point column.
+//
+// So assert the mount side positively: a macOS host always mounts root.
+TEST_CASE("disk_actions: macOS reports real mount points, not an empty join",
+          "[disk_actions][actions]") {
+    auto plugin = load_disk_actions_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    const auto rows = captured_rows(dispatcher.run(plugin->descriptor, "volumes").captured);
+    REQUIRE_FALSE(rows.empty());
+
+    bool saw_root_mount = false;
+    for (const auto& r : rows) {
+        const auto f = split_fields_escape_aware(r);
+        REQUIRE(f.size() == 7);
+        if (f[2] == "-") continue; // genuinely serves no mount point
+        INFO("row: " << r);
+        // Comma-delimited; the sentinels make this an exact element match, so
+        // a mount point merely CONTAINING "/" cannot satisfy it.
+        if (("," + f[2] + ",").find(",/,") != std::string::npos) saw_root_mount = true;
+    }
+    // If this fails, getmntinfo_r_np returned no usable entries and the
+    // physical-to-logical join is empty on every row.
+    CHECK(saw_root_mount);
+}
 #endif // __APPLE__
 
 TEST_CASE("disk_actions plugin: an unknown action is refused, not silently ignored",
@@ -331,15 +371,29 @@ TEST_CASE("disk_actions: an absent percentage renders as '-', never as 0",
     CHECK(zero == "smart|d|m|nvme|ssd|ok|0|0|-");
 }
 
-TEST_CASE("disk_actions: an out-of-range percentage is clamped, not dropped",
+TEST_CASE("disk_actions: wear above 100% is reported as read, spare is clamped",
           "[disk_actions][format]") {
     using namespace yuzu::disk_actions;
-    // A device reporting 255% used is malformed, but discarding the row would
-    // hide a drive that is plausibly in trouble.
+    // The two percentage columns have DIFFERENT contracts and must not share a
+    // formatter. Per the NVMe Base Specification, `Percentage Used` is allowed
+    // to exceed 100 (a drive past its rated endurance) and saturates at 255,
+    // while `Available Spare` is genuinely 0..100.
+    //
+    // This test previously asserted BOTH columns rendered "100", which pinned a
+    // real defect: every drive between 101% and 255% wear was reported as
+    // exactly 100, so a fleet view could not tell a drive at its rated limit
+    // from one far beyond it, nor trend toward failure.
     const auto r = format_smart_row("d", "m", Bus::Nvme, Media::Ssd, Health::Warning,
                                     std::optional<std::uint8_t>{255},
                                     std::optional<std::uint8_t>{200}, "-");
-    CHECK(r == "smart|d|m|nvme|ssd|warning|100|100|-");
+    CHECK(r == "smart|d|m|nvme|ssd|warning|255|100|-");
+
+    // The ordinary in-range case is unchanged, and a wear value just past the
+    // rated limit survives intact rather than collapsing onto 100.
+    const auto worn = format_smart_row("d", "m", Bus::Nvme, Media::Ssd, Health::Warning,
+                                       std::optional<std::uint8_t>{101},
+                                       std::optional<std::uint8_t>{7}, "-");
+    CHECK(worn == "smart|d|m|nvme|ssd|warning|101|7|-");
 }
 
 TEST_CASE("disk_actions: untrusted fields cannot forge a column separator",

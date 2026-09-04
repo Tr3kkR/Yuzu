@@ -89,11 +89,29 @@ namespace detail {
 
 /// A std::nullopt percentage renders as "-", never as 0 -- "we did not read
 /// this" and "this is zero" are different facts and a consumer must be able to
-/// tell them apart. Values above 100 are clamped rather than dropped: a device
-/// reporting 255% used is malformed, but discarding the row would hide it.
+/// tell them apart.
+///
+/// This formatter is for fields whose contract really is 0..100 -- today that
+/// is NVMe `Available Spare` only. A value above 100 from such a field is
+/// malformed, and is clamped rather than dropped so the row still appears.
 inline std::string format_optional_pct(std::optional<std::uint8_t> pct) {
     if (!pct) return "-";
     return std::to_string(*pct > 100 ? 100 : *pct);
+}
+
+/// Wear (`Percentage Used`) is NOT a 0..100 field and must not be clamped like
+/// one. The NVMe Base Specification defines it as permitted to EXCEED 100 --
+/// a drive past its rated endurance reports 101..254 honestly, and 255 is the
+/// defined saturation value for anything beyond that.
+///
+/// The original revision fed this through format_optional_pct, so every drive
+/// from 101% to 255% wear reported exactly "100" and a fleet view could not
+/// distinguish a drive at its rated limit from one far past it, nor trend
+/// toward failure. Adversarial review (2026-09-04) caught it; the unit test
+/// that pinned 255 -> 100 was pinning the defect.
+inline std::string format_wear_pct(std::optional<std::uint8_t> pct) {
+    if (!pct) return "-";
+    return std::to_string(*pct); // full 0..255 range, reported as read
 }
 
 inline std::string format_optional_bytes(std::optional<std::uint64_t> bytes) {
@@ -127,9 +145,9 @@ inline std::string format_smart_row(std::string_view device, std::string_view mo
     out += '|';
     out.append(health_token(health)); // fixed vocabulary -- verbatim
     out += '|';
-    out += detail::format_optional_pct(pct_used);
+    out += detail::format_wear_pct(pct_used);   // 0..255 by NVMe spec, never clamped
     out += '|';
-    out += detail::format_optional_pct(spare_pct);
+    out += detail::format_optional_pct(spare_pct); // genuinely 0..100
     out += '|';
     out += yuzu::util::safe_output_field(detail);
     return out;

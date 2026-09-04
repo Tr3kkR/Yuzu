@@ -31,7 +31,7 @@ capability-catalogue headers. It fails, naming the exact offending
      `__guard__.push_rules` is a real, intentional row with no backing
      plugin — Guardian's rule-push is a server-internal dispatch, not
      something any plugin's `actions()` ever lists.)
-  3. The same `plugin.action` is declared by more than one of the seven
+  3. The same `plugin.action` is declared by more than one of the eight
      sources (a DUPLICATE row) — two independently-authored fragments
      racing to classify the same dispatch, which `CommandCapabilityRegistry
      ::classify` resolves as `Ambiguous`, never first-wins (see
@@ -252,7 +252,7 @@ class TestProductionCompositionWiring(unittest.TestCase):
 
 class TestCatalogueCompleteOnRealTree(unittest.TestCase):
     """The actual drift gate: parses the live repository and fails, naming
-    every gap, if the plugins' actions() tables and the seven capability
+    every gap, if the plugins' actions() tables and the eight capability
     sources have drifted apart.
     """
 
