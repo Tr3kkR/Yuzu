@@ -249,6 +249,9 @@ TEST_CASE("MCP #3937: assign_engine_role fails CLOSED on a dropped audit (grant 
         h.rbac_store.set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
     REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
                .has_value());
+    // Explicit before/after bracket (qe parity with the unassign test): the grant
+    // is NOT yet in effect, so the post-call check proves the mutation committed.
+    REQUIRE_FALSE(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
 
     h.audit_succeeds = false;
     auto res = h.call_tool("assign_engine_role",
@@ -286,6 +289,12 @@ TEST_CASE("MCP #3937: unassign_engine_role fails CLOSED on a dropped audit (gran
     CHECK_FALSE(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
 }
 
+// #3937: create/revoke/transfer share the byte-identical fail-closed block with
+// the 5 tested twins (mint/rotate/confirm/assign/unassign) but need additional
+// harness wiring the role fixture lacks to reach their store mutation on the
+// audit-drop path (create/transfer: the supervised-tier + owner FK path;
+// revoke: an engine-credential store) — tracked as a follow-up. The block itself
+// is verified byte-for-byte by the Gate-2 security review.
 TEST_CASE("MCP list_engine_roles: reflects current grants", "[pg][mcp][engine_principal][rbac]") {
     McpEngineRolesHarness h;
     REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
