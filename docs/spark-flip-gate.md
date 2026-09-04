@@ -43,7 +43,20 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
 
 - [ ] **1. Full `/test`, including previous-release upgrade, with `prefer_spark` active post-upgrade.**
 - [ ] **2. TSan/ASan clean** - the item-9 focused rerun (§3 row 9) plus PR-2c's per-issue
-      fault-injection scenario matrix (§5).
+      fault-injection scenario matrix (§5). **Both halves BUILT in PR-2c (#3848)**; the
+      checkbox stays open until PR-6 records the run against the flip tree.
+      **EVIDENCE SOURCE IS A LOCAL TSan BUILD, and must be stated as such wherever this
+      criterion is signed off.** The new checkpoint is tagged `[tsan-heavy]`, which
+      `tests/meson.build` filters out whenever `b_sanitize == none` - so it runs on NO PR
+      and NO push CI leg - and the nightly TSan job runs against `main`, not `dev`. There
+      is therefore no CI artefact for this criterion and there will not be one before the
+      flip: whoever signs it off must run
+      `meson setup build-linux-tsan -Db_sanitize=thread` themselves and paste the output,
+      not link a workflow. The ASan half has the same shape with one extra step - the
+      stock `x64-linux` vcpkg tree cannot run ASan at all (abseil poisons unused
+      flat_hash_map slots at protobuf static-init time and trips a spurious
+      `use-after-poison` before any test runs), so it needs the `x64-linux-asan` triplet
+      built first; `triplets/x64-linux-asan.cmake`'s own header documents this.
 - [ ] **3. 3-OS matrix**, written concretely: per-OS `yuzu.guardian_backend` heartbeat tag +
       `spark_running`/`spark_disabled` posture-key evidence captured, for:
       - Linux - Service mechanism on spark; File/Registry unsupported (left unregistered, per
@@ -100,7 +113,7 @@ grown substantially, largely from PR #3821's rework); drift is called out per ro
 | 6 | Hard agent-side file-hash maximum | **DONE - scope grew to a server-side reject, single-sourced** | #3884 (merged 2026-09-03, `282c3b58a`) landed a new shared header, `common/include/yuzu/guardian_file_hash_limits.hpp` (`kMaxFileHashBytes = 1073741824` / 1 GiB), consumed on BOTH sides: the agent clamps at `guardian_engine.cpp:1057` and `guardian_spark_bridge.hpp:295` (the legacy/spark paths this row originally flagged as unclamped), and the server now REJECTS an over-ceiling authored value at authoring time in `guardian_rule_spec.cpp:152/161`, with the ceiling also published into the JSON schema (`guardian_schema_registry.cpp:177`) - a `static_assert` at `guardian_rule_spec.cpp:25` pins a human-readable error string to the same constant so the two cannot drift textually either. One accepted residual, ruled by Dave 2026-09-02 (ledger commit `5ae6e05db`): a `file-hash-equals` rule authored ABOVE 1 GiB *before* this PR shows a false `<oversize>` drift on upgrade, since the new server-side reject cannot retroactively catch an already-stored rule - mitigated via `docs/user-manual/upgrading.md`'s Version Compatibility table (pointing at `GET /api/v1/guaranteed-state/rules` to find affected rows), not a startup-time enumeration. Verified directly against `origin/dev @ 282c3b58a`, not from #3884's own PR description alone. |
 | 7 | Backpressure-drop surfacing (=#2993) | **DONE** | The lifecycle-log outbox capacity default is 4096 (`guardian_spark_runtime.hpp:170`, `outbox_capacity{4096}`; issue didn't cite a line). #3884 (merged 2026-09-03, `282c3b58a`) wired `outbox_backpressure_drops()` into fleet visibility: a new `uint64_t` counter field + accessor, no longer test-only-consumed. (Same PR also closed #2233 item 7, the sibling lifecycle-audit-log backpressure counter, `lifecycle_backpressure_log_fires_` - a separate counter for a separate log, not this row's own #2993 scope, but landed alongside it in the same batch.) Verified directly against `origin/dev @ 282c3b58a`, not from #3884's own PR description alone. |
 | 8 | Multi-rule mixed-capability selection | **Moved to P3 lane** | Ruled 2026-09-02: the issue's own text says "harmless while spark cannot enforce ... must be enforced before spark gains enforcement" - item 2's no-enforcement-at-flip ruling removes the pre-flip premise. Now a P3 (enforce-cutover) prerequisite, not flip-gating. (This is what dropped PR-3, ~2-4 days, off the flip's critical path before this doc was even drafted.) |
-| 9 | Focused TSan + shutdown/fault-injection | **Open - citations drifted, scope re-confirmed, not narrowed** | The issue cites a single "instantaneous fake backend" TSan test at `test_guardian_spark_runtime.cpp:598–643`. The file has grown to 3551 lines and that range no longer holds a TSan test. There are now **three** TSan-checkpoint test cases (`grep TEST_CASE.*tsan`): `:1530` ("concurrent attach/detach/evaluate/drain do not race"), `:3061` ("concurrent pagers + a drainer do not race"), `:3293` ("concurrent persist + page + prune + drain do not race, QE-1"). None of the three arms `FakeBackend`'s `hang_next_arm`/`hang_next_disarm` gate (added for item 3's own fix, confirmed present and used at `:1744` onward across 10 distinct deterministic single-scenario `TEST_CASE`s) - so the issue's core finding still holds under the current code: concurrency is proven race-free only against an instantaneous fake, not against a backend that can actually block. This is the literal scope #2224's approval was conditioned on. Tracked fresh as **#3848** (PR-2c scope). PR-2c builds the deterministic per-issue scenario seams first (§5), then this rerun executes against that tree. |
+| 9 | Focused TSan + shutdown/fault-injection | **Test BUILT in PR-2c (#3848); rerun still owed by PR-6** | The issue cites a single "instantaneous fake backend" TSan test at `test_guardian_spark_runtime.cpp:598–643`. The file has grown to 3551 lines and that range no longer holds a TSan test. There are now **three** TSan-checkpoint test cases (`grep TEST_CASE.*tsan`): `:1530` ("concurrent attach/detach/evaluate/drain do not race"), `:3061` ("concurrent pagers + a drainer do not race"), `:3293` ("concurrent persist + page + prune + drain do not race, QE-1"). None of the three arms `FakeBackend`'s `hang_next_arm`/`hang_next_disarm` gate (added for item 3's own fix, confirmed present and used at `:1744` onward across 10 distinct deterministic single-scenario `TEST_CASE`s) - so the issue's core finding still holds under the current code: concurrency is proven race-free only against an instantaneous fake, not against a backend that can actually block. This is the literal scope #2224's approval was conditioned on. Tracked fresh as **#3848** (PR-2c scope). PR-2c builds the deterministic per-issue scenario seams first (§5), then this rerun executes against that tree. **PR-2c status:** the missing test now exists - `"concurrent attach/detach/evaluate/drain do not race when the backend and the send callback BLOCK (TSan checkpoint, #3848)"`, tagged `[spark][runtime][liveness][tsan][tsan-heavy]`, which parks `FakeBackend`'s arm, its disarm AND the drain send callback via a `BlockingGate` built as an epoch/pulse extension of the very `hang_next_arm`/`hang_next_disarm` idiom this row names as unused by the other three. It reconciles every subscription id handed out against every id released, and requires the executor's `rejected_key`/`rejected_capacity` to be zero (via a new `GuardianSparkRuntime::io_executor_stats_for_test()`) so that reconciliation is a proof rather than a likelihood. **What it can and cannot show, stated because the framing changed under review:** `attach_rule`'s worker already self-disarms a late arm success via its `still_wanted` re-check, so a leaked subscription is NOT reachable on this tree - the census is a NO-REGRESSION check on that contract, not a leak detector. Verified by mutation: removing that self-disarm fails the census (27 live subscriptions against 6 armed keys). **This row does NOT close on PR-2c** - the criterion is the RERUN against the flip tree, and §2 criterion 2 records that its evidence can only ever be a local TSan build. |
 | 10 | Doc drift | **Fixed in this PR** | `docs/spark-stage2-guardian-consumer-design.md` - the issue cited line 500; the actual current line (file has grown) was 949, still reading "observe rung (2) defaults to the spark path", stale against the re-sequenced ladder (this is impl-rung-7 in current terminology). Corrected as part of this PR - see the diff on that file. |
 
 ## 4. #2340 scenario contract
@@ -199,16 +212,66 @@ tracked separately below)
   with no dedicated telemetry pointing at these specifically today.
 - Operator action: not specified in source.
 - Compensating control: item 9's literal TSan rerun **plus** a per-issue deterministic
-  fault-injection scenario matrix (PR-2c, real engineering, not "run TSan and see") - parked
-  in-flight-teardown entrance for #2815, deterministic shared-key-kill for #2818,
-  `bad_alloc`-at-allocation injection for #2839; #2833 needs code inspection first, no repo
-  evidence located yet. TSan is secondary for #2818 specifically - that's a logic gap, not
-  necessarily a race.
+  fault-injection scenario matrix (PR-2c, real engineering, not "run TSan and see").
+  **THE MATRIX HAS NOW RUN (PR-2c, #3848), AND ALL FOUR WERE CONFIRMED.** None was ruled
+  out; the risk acceptance recorded above is superseded per-issue below. TSan turned out
+  to be secondary for all four, not only #2818: every one was demonstrated by a
+  deterministic seam, and none needed a race to be caught.
+- **#2815 - CONFIRMED and FIXED in PR-2c.** The engine had FOUR call sites that resolve a
+  raw mechanism pointer under `mu_`, release `mu_`, then call into the mechanism
+  (`disarm`, `teardown_arm_race`, `unregister_consumer`, and the live arm path in
+  `arm_impl` - the fourth was missed by the original analysis and found in review).
+  `stop()` waited on none of them and neither did `~SparkEngine`, so the engine could be
+  freed under a parked caller. Demonstrated, not argued: a plain debug build SIGSEGVs, and
+  ASan names it `heap-use-after-free ... in SparkEngine::disarm` at the
+  `mech_ops_mu_by_type_.at()` dereference. Fixed with a function-scoped lease armed as the
+  last statement of the same `mu_` block that resolves the mechanism; `stop()` waits
+  BOUNDED and proceeds on expiry (counting a new `teardown_join_timeouts_total`),
+  `~SparkEngine` waits UNBOUNDED - the unbounded one is what actually closes the UAF. Note
+  the shipped agent was never exposed: F3's `OrphanExitGuard` `hard_exit()`s before
+  `~Agent` while any Guardian I/O worker is live. Any other embedder, and every test, was.
+- **#2818 - CONFIRMED, NOT FIXED. Escalates to its own PR-2d, a hard pre-PR-5
+  prerequisite**, per this section's own revisit trigger. A second consumer that dedups
+  onto a key whose watch is still in flight is handed a success id; when that watch fails,
+  `drop_key_locked` erases every subscription on the key and tells nobody. Pinned at both
+  layers in PR-2c (engine and Guardian). The Guardian pin is the one that matters: after
+  the kill, nothing is armed and nothing is watched, Guardian still reports the rule armed,
+  and the legacy path did not pick it up either - a genuine detection hole, not a fallback.
+  **PR-2d is NOT gated on PR-2e (#3816) landing.** That dependency was an inference and is
+  withdrawn: #3816 supplies an executor-level caller-abandonment signal, #2818 needs an
+  engine-level consumer-death notification. Different primitives, different layers.
+- **#2833 - CONFIRMED but DOMINATED; accepted by documentation, no code change.** The
+  unwatch-failure counters do increment during shutdown, but nothing carries them off the
+  box: the agent's heartbeat composer emits NOTHING once `stop_requested_` is set
+  (`agent.cpp:2552` / `:3281`) and both shutdown paths stop spark before joining the
+  heartbeat thread. A `spark_heartbeat.hpp` change would be inert on the wire; the gate
+  that would have to move is the agent's, and it is deliberate (STOPPED is not FAILED - a
+  cleanly-stopping agent must not page on-call). **Operator consequence, and the reason
+  this is written down rather than closed silently: shutdown-window increments are
+  journal-only (`spdlog::error` at each increment site), never heartbeat-visible, so a
+  zero reading for `yuzu.spark_arm_race_unwatch_failures` or
+  `yuzu.spark_disarm_unwatch_failures` during a shutdown is NOT evidence that nothing was
+  orphaned.** Pinned in PR-2c and disclosed on both counters and on
+  `emit_spark_heartbeat_tags` itself.
+- **#2839 - CONFIRMED and FIXED in PR-2c; Windows evidence still OWED.** `push_retiring`
+  took the owning `unique_ptr` by value and pushed before allocating, so a `bad_alloc`
+  destroyed a `DirWatch` whose `ReadDirectoryChangesW` was still outstanding. Review found
+  three further gaps beyond the original reorder: the gauge-crossing log runs after the
+  transfer and can itself throw, `release_ancestor` is a second call site with the
+  identical pattern, and all THREE `stop()` cancel loops dereferenced their `unique_ptr`
+  unguarded. All four fixed, with a `set_file_retire_fault_hook_for_test` seam to aim the
+  allocation failure. **NOT YET VERIFIED ON WINDOWS**: the mechanism is Windows-only, so
+  the fix body and its test are uncompiled - no red run, no green run, no MSVC compile. A
+  Wee Tam / DGRHP pass is required before this bullet may be treated as closed, and it must
+  also settle whether MSVC `/fsanitize=address` links against the static-CRT grpc override
+  at all (never tested on this repo). If it does not, the evidence downgrades to
+  "injected-throw pin plus `stats().retiring`/`quarantined_total`" - a valid pin, NOT ASan
+  proof - and must be described that way.
 - Owner: not assigned in source material.
-- Milestone: PR-2c (pre-flip verification); contingency PR-2d if anything is demonstrated;
-  teardown package post-flip if genuinely undemonstrated after the matrix.
-- Revisit trigger: any that reproduce/are demonstrated escalate to a contingency PR before
-  PR-5.
+- Milestone: PR-2c DONE for #2815 / #2833 / #2839 (Windows leg outstanding); **PR-2d owed
+  for #2818 before PR-5**.
+- Revisit trigger: fired. #2818 escalated per the rule; #2839 re-opens if the Windows pass
+  contradicts the Linux-side reasoning.
 
 **#2012 + #2011 + #3840** (+#2014, confirm at execution)
 - Detection signal: **none today**, named explicitly in the source ruling - a stuck
