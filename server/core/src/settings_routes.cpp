@@ -5375,7 +5375,10 @@ void SettingsRoutes::register_routes(
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
-        update_registry_->upsert_package(pkg);
+        // Upload path: the row is best-effort here and the failure is already
+        // visible in the log; the rollout path is the one that audits a committed
+        // transition and therefore must not discard this.
+        (void)update_registry_->upsert_package(pkg);
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
@@ -5435,16 +5438,106 @@ void SettingsRoutes::register_routes(
                   if (pct > 100)
                       pct = 100;
 
-                  auto packages = update_registry_->list_packages();
-                  for (auto pkg : packages) {
-                      if (pkg.platform == platform && pkg.arch == arch && pkg.version == version) {
-                          pkg.rollout_pct = pct;
-                          update_registry_->upsert_package(pkg);
-                          spdlog::info("OTA rollout updated: {}/{} v{} -> {}%", platform, arch,
-                                       version, pct);
-                          break;
-                      }
+                  // Capture the PRIOR percentage before the write. It is the whole
+                  // evidentiary value of this row: #3692's scenario is an admin —
+                  // or a compromised admin session — silently de-prioritising a
+                  // mandatory security patch, and "rollout is 0%" does not
+                  // distinguish that from a package that was never rolled out.
+                  // "from=100% to=0%" does. `mandatory` is carried for the same
+                  // reason: it is what makes the de-prioritisation consequential.
+                  // A CHECKED read, NOT list_packages: the ordinary reads on
+                  // this store fail SOFT, returning an empty vector on a closed
+                  // store, a pool-acquire timeout or a query error. That carve-out
+                  // (ADR-0061) was granted because no downstream branch treated an
+                  // empty list as a signal — and an audit branch does. Deriving
+                  // "not_found" from a soft-failed read would let a PG blip during
+                  // a legitimate admin rollout both manufacture key-enumeration
+                  // alerts (audit-log.md names `denied` as that filter) and assert,
+                  // in the evidence record, that a package which exists did not.
+                  // ONE store call, not a find-then-upsert pair. Read and write
+                  // are the same row-locked transaction, so the `from=` this row
+                  // reports is provably the value the commit replaced. As two
+                  // autocommit statements a concurrent write to the same key
+                  // could land between them — and it does not take two admins:
+                  // one session firing two near-simultaneous requests is enough,
+                  // which is exactly the compromised-admin case #3692 exists to
+                  // catch. Same shape as `AuditStore::stamp_complete` (ADR-0040,
+                  // #2697); see update_registry.hpp.
+                  auto change =
+                      update_registry_->update_rollout_checked(platform, arch, version, pct);
+                  // NOT `status == kFound`: the row can be found inside the
+                  // transaction and the write still fail to commit, which is a
+                  // distinct outcome the audit row reports differently.
+                  const bool committed = change.committed;
+                  if (committed)
+                      spdlog::info("OTA rollout updated: {}/{} v{} {}% -> {}%", platform, arch,
+                                   version, change.prior_rollout_pct, pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kFound)
+                      spdlog::error("OTA rollout NOT applied for {}/{} v{}: the package exists "
+                                    "at {}% but the registry write did not commit",
+                                    platform, arch, version, change.prior_rollout_pct);
+                  else if (change.status == UpdateRegistry::PackageLookup::kUnavailable)
+                      spdlog::error("OTA rollout for {}/{} v{}: the registry could not be read; "
+                                    "the package's existence is UNKNOWN, not absent",
+                                    platform, arch, version);
+
+                  // Audited AFTER the write, and reporting what actually happened.
+                  // A rollout change alters which endpoints receive a given binary,
+                  // so it belongs in the same evidence chain as the upload and the
+                  // delete; `spdlog::info` is the application log, not the audit
+                  // log, and nothing else in the request path emits an audit row.
+                  //
+                  // A request naming a package that does not exist changes nothing,
+                  // so it must not record a fictional success. The token is
+                  // `denied` with the reason in `detail`, NOT a bespoke
+                  // `not_found` result: this file's own rejection branches use
+                  // that shape (`user.delete` -> "denied" / "invalid_username"),
+                  // and audit-log.md's probe-detection recipe tells operators to
+                  // filter on `result == "denied"` to surface enumeration — a
+                  // fourth token would be invisible to exactly the rule this row
+                  // exists to feed.
+                  // THE RESULT IS DERIVED FROM THE COMMIT, NOT FROM THE LOOKUP.
+                  // `upsert_package` degrades silently on a closed store, a
+                  // pool-acquire timeout or a query error, so deriving `success`
+                  // from "we found the package" would let this row assert a
+                  // "from=100% to=0%" transition that never reached the database —
+                  // evidence disagreeing with state, in the one record an incident
+                  // responder is meant to be able to trust. `failure` is the
+                  // documented token for a failure the handler audits itself.
+                  // THREE DISTINCT OUTCOMES, and the store-degraded one is NOT
+                  // absence. `denied` is reserved for a package the store actually
+                  // reported as absent, because audit-log.md tells operators to
+                  // filter on it to surface enumeration; a degraded read reports
+                  // `failure`, which is the documented token for a failure the
+                  // handler audits itself. Neither the degraded nor the
+                  // uncommitted branch may claim a `from=`/`to=` transition — the
+                  // detail records what was ATTEMPTED, which asserts nothing false.
+                  const char* result = "failure";
+                  std::string detail;
+                  switch (change.status) {
+                  case UpdateRegistry::PackageLookup::kFound:
+                      result = committed ? "success" : "failure";
+                      // `from=` is now provably the value this write replaced —
+                      // it was read under a row lock in the same transaction, so
+                      // no concurrent writer can have changed it in between.
+                      detail = (committed ? "from=" : "attempted_from=") +
+                               std::to_string(change.prior_rollout_pct) +
+                               (committed ? "% to=" : "% attempted_to=") + std::to_string(pct) +
+                               "% mandatory=" + (change.prior_mandatory ? "true" : "false") +
+                               (committed ? "" : " outcome=write_not_committed");
+                      break;
+                  case UpdateRegistry::PackageLookup::kAbsent:
+                      result = "denied";
+                      detail = "not_found";
+                      break;
+                  case UpdateRegistry::PackageLookup::kUnavailable:
+                      result = "failure";
+                      detail = "attempted_to=" + std::to_string(pct) +
+                               "% outcome=store_unavailable existence_unknown=true";
+                      break;
                   }
+                  audit_fn_(req, "ota.package.rollout_changed", result, "UpdatePackage",
+                            platform + "/" + arch + "/" + version, detail);
 
                   res.set_content(render_updates_fragment(), "text/html; charset=utf-8");
               });
