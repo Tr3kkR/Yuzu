@@ -18,16 +18,20 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <functional>
 #include <latch>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -74,6 +78,97 @@ struct FakeReader : IStateReader {
     void request_stop() noexcept override { stops.fetch_add(1); }
 };
 
+/// An EPOCH/PULSE extension of FakeBackend's hang_next_arm / hang_next_disarm idiom
+/// below, for the #3848 blocking-backend checkpoint.
+///
+/// WHY AN EXTENSION AND NOT A SECOND MECHANISM. hang_next_* is a single-waiter,
+/// single-shot park: a test arms it, one call enters, the test releases it. Exactly right
+/// for pinning one race, useless for a sustained soak where EVERY backend call must be
+/// able to block, repeatedly, on several threads at once, with nobody holding a per-call
+/// handle. So this adds the two things that turn that idiom into a soak gate - a
+/// repeating admission rule (`park_every`) and a broadcast release (`pulse()`) - and
+/// keeps everything else, naming included, the same. Two park styles in one file read as
+/// one family; two unrelated mechanisms would not.
+///
+/// NEVER HANGS THE SUITE. Every wait is a `wait_for` with a generous deadline, and a
+/// deadline hit is COUNTED (`watchdog_trips`) rather than silently absorbed - the test
+/// asserts that count is zero, so a gate that stopped being released fails loudly
+/// instead of wedging the binary the way a bare `wait()` would.
+struct BlockingGate {
+    // ── configuration: set before any thread starts, never touched after ──
+    int park_every{0};              ///< 0 disables the gate entirely, so the existing
+                                    ///< hang_next_* tests are completely unaffected
+    int long_every{0};              ///< every Nth park is a LONG hold; 0 = none
+    std::uint64_t long_hold_pulses{200}; ///< a long hold lasts this many releaser pulses
+
+    mutable std::mutex mu;
+    std::condition_variable cv;
+    bool open_{false};              ///< latched open at shutdown: every park returns at once
+    std::uint64_t epoch{0};         ///< ++ per pulse(); a short park waits for the next one
+    int calls{0};
+    int parks{0};
+    int parked{0};
+    int peak_parked{0};
+    std::uint64_t total_parked{0};
+    std::uint64_t long_holds{0};
+    std::uint64_t watchdog_trips{0};
+    /// At most ONE long hold per lane in flight. Each churner owns one IoClass lane and
+    /// submits one op at a time, so this only stops a second long hold being selected for
+    /// a lane whose previous one has not finished unwinding.
+    std::array<bool, 3> long_in_flight{};
+
+    /// Called from inside a backend call, on whatever thread the executor ran it on.
+    /// `lane` is the IoClass index, or -1 for a call with no lane (the send fn).
+    void maybe_park(int lane) {
+        std::unique_lock lk(mu);
+        if (park_every <= 0)
+            return;
+        if (++calls % park_every != 0)
+            return;
+        const bool want_long = long_every > 0 && (++parks % long_every == 0) && lane >= 0 &&
+                               !long_in_flight[static_cast<std::size_t>(lane)];
+        ++total_parked;
+        ++parked;
+        peak_parked = std::max(peak_parked, parked);
+        bool released = false;
+        if (want_long) {
+            ++long_holds;
+            long_in_flight[static_cast<std::size_t>(lane)] = true;
+            // A LONG hold deliberately outlives the caller's backend_op_deadline, so the
+            // submitter observes IoFailure::Timeout and the late-success path runs. Its
+            // length is counted in RELEASER PULSES, not wall-clock, so it scales with how
+            // slowly a sanitizer build is actually running rather than racing a fixed clock.
+            const auto target = epoch + long_hold_pulses;
+            released = cv.wait_for(lk, std::chrono::seconds{30},
+                                   [&] { return open_ || epoch >= target; });
+            long_in_flight[static_cast<std::size_t>(lane)] = false;
+        } else {
+            const auto target = epoch + 1;
+            released = cv.wait_for(lk, std::chrono::seconds{30},
+                                   [&] { return open_ || epoch >= target; });
+        }
+        if (!released)
+            ++watchdog_trips;
+        --parked;
+    }
+
+    void pulse() {
+        {
+            std::lock_guard lk(mu);
+            ++epoch;
+        }
+        cv.notify_all();
+    }
+    /// Latch every current and future park open. Idempotent; REQUIRED before any join.
+    void open() {
+        {
+            std::lock_guard lk(mu);
+            open_ = true;
+        }
+        cv.notify_all();
+    }
+};
+
 struct FakeBackend : ISparkBackend {
     std::atomic<std::uint64_t> next{1};
     std::atomic<int> arms{0};
@@ -90,25 +185,79 @@ struct FakeBackend : ISparkBackend {
     std::condition_variable gate_cv_;
     bool entered_hang_{false};
     bool released_{false};
-    std::expected<std::uint64_t, std::string> arm(const SparkSpec&) override {
+    /// #3848: the soak gates. Disabled (park_every == 0) unless a test configures them,
+    /// so every pre-existing case behaves exactly as before.
+    BlockingGate arm_park;
+    BlockingGate disarm_park;
+    /// #3848 census: every subscription id this backend HANDED OUT and every id it was
+    /// asked to release. Mutex-guarded, not atomics - these are written from executor
+    /// worker threads AND (for the abandonment self-disarm) from inside the arm worker's
+    /// own lambda, so the vectors themselves are shared state.
+    std::mutex ids_mu_;
+    std::vector<std::uint64_t> armed_ids;
+    std::vector<std::uint64_t> disarmed_ids;
+    void record_armed(std::uint64_t id) {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        armed_ids.push_back(id);
+    }
+    void record_disarmed(std::uint64_t id) {
+        std::lock_guard<std::mutex> lk{ids_mu_};
+        disarmed_ids.push_back(id);
+    }
+    /// The IoClass lane a spec belongs to, as the runtime derives it — the gates key
+    /// their per-lane long-hold state on this. -1 for an inline (non-executor) type.
+    static int lane_of(SparkType t) {
+        switch (t) {
+        case SparkType::File: return 0;
+        case SparkType::Registry: return 1;
+        case SparkType::Service: return 2;
+        default: return -1;
+        }
+    }
+    /// The lane of the id we most recently handed out, so disarm() — which receives only
+    /// an id — can park on the right lane. Written under ids_mu_ by arm().
+    std::unordered_map<std::uint64_t, int> id_lane_;
+
+    std::expected<std::uint64_t, std::string> arm(const SparkSpec& spec) override {
         if (hang_next_arm.exchange(false)) {
             std::unique_lock<std::mutex> lk{gate_mu_};
             entered_hang_ = true;
             gate_cv_.notify_all();
             gate_cv_.wait(lk, [this] { return released_; });
         }
+        // #3848: the soak park sits AFTER the single-shot hang (so the two idioms never
+        // interleave) and BEFORE the failure injections (so a parked arm still resolves
+        // the way an unparked one would).
+        const int lane = lane_of(spec.type);
+        arm_park.maybe_park(lane);
         if (throw_arm.load()) throw std::runtime_error("arm boom");
         if (fail_arm.load()) return std::unexpected(std::string{"no mechanism"});
         arms.fetch_add(1);
-        return next.fetch_add(1);
+        const auto id = next.fetch_add(1);
+        {
+            std::lock_guard<std::mutex> lk{ids_mu_};
+            armed_ids.push_back(id);
+            id_lane_[id] = lane;
+        }
+        return id;
     }
-    void disarm(std::uint64_t) override {
+    void disarm(std::uint64_t id) override {
         if (hang_next_disarm.exchange(false)) {
             std::unique_lock<std::mutex> lk{disarm_gate_mu_};
             disarm_entered_hang_ = true;
             disarm_gate_cv_.notify_all();
             disarm_gate_cv_.wait(lk, [this] { return disarm_released_; });
         }
+        int lane = -1;
+        {
+            std::lock_guard<std::mutex> lk{ids_mu_};
+            disarmed_ids.push_back(id);
+            if (const auto it = id_lane_.find(id); it != id_lane_.end())
+                lane = it->second;
+        }
+        // #3848: recorded BEFORE the park, so a disarm the test then has to wait out is
+        // still counted; the census reconciles ids, never call ordering.
+        disarm_park.maybe_park(lane);
         disarms.fetch_add(1);
     }
     /// Blocks until a hung arm() has actually entered its wait (avoids a racy
@@ -1575,6 +1724,297 @@ TEST_CASE("concurrent attach/detach/evaluate/drain do not race (TSan checkpoint)
     for (auto& th : threads) th.join();
     rt->begin_stop();
     SUCCEED(); // no crash / no TSan report is the assertion
+}
+
+TEST_CASE("concurrent attach/detach/evaluate/drain do not race when the backend and the "
+          "send callback BLOCK (TSan checkpoint, #3848)",
+          "[spark][runtime][liveness][tsan][tsan-heavy]") {
+    // WHY THIS EXISTS. The three committed TSan checkpoints - including the one directly
+    // above - all run against an INSTANTANEOUS FakeBackend: nothing blocks in arm, in
+    // disarm, or in the send callback. Race-freedom is therefore proven only for a
+    // backend that never blocks, which is the one backend production does not have
+    // (a real arm is an OS watch registration behind a mechanism's own lock). This case
+    // re-runs the same churn shape with every one of those three call sites able to park.
+    //
+    // WHAT A FAILURE MEANS, stated precisely because it changed during design. On this
+    // tree the census below is a NO-REGRESSION check, not a leak detector: attach_rule's
+    // worker already self-disarms a late arm success via its `still_wanted` re-check
+    // (guardian_spark_runtime.cpp), so a leaked subscription is not reachable today
+    // whatever this test does. What a surplus WOULD mean is that the self-disarm contract
+    // has been broken - which is exactly the regression a rewrite of that worker lambda
+    // could introduce. Recorded as a finding, never dismissed as a test bug.
+    //
+    // NOT RUN BY ANY PR OR PUSH CI LEG. `[tsan-heavy]` is filtered out whenever
+    // b_sanitize == none (tests/meson.build), and the nightly TSan job runs against main,
+    // not dev. Its evidence is a LOCAL TSan build - docs/spark-flip-gate.md says so.
+    using yuzu::test::spin_until;
+
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+
+    GuardianSparkRuntime::Config cfg;
+    // Short enough that a long backend hold reliably overruns it (the late-success path
+    // is the point), long enough that an ORDINARY one-pulse park never does. The gap
+    // between the two is what keeps the rejection assertion below meaningful: a short
+    // park that spuriously timed out would leave its executor ticket held and make the
+    // NEXT op on that key an AlreadyRunning rejection, which is indistinguishable from a
+    // real dropped disarm.
+    cfg.backend_op_deadline = std::chrono::milliseconds{60};
+    auto rt = make_rt(r, b, cfg);
+
+    // ── the three gates ──
+    // Arms park on every call, and every 8th park is a LONG hold (300 releaser pulses,
+    // ~300 ms against a 60 ms deadline) so the submitter genuinely observes
+    // IoFailure::Timeout and the late-arm-success path runs for real.
+    b->arm_park.park_every = 1;
+    b->arm_park.long_every = 8;
+    b->arm_park.long_hold_pulses = 300;
+    // Disarms park SHORT ONLY. A long-held disarm would still hold its (class, key)
+    // executor ticket when attach_rule's prior-generation disarm timed out, and the arm
+    // that immediately follows it inside the same attach_rule call would be refused
+    // AlreadyRunning - a self-inflicted rejection the census cannot tell from a real one.
+    b->disarm_park.park_every = 1;
+    b->disarm_park.long_every = 0;
+    // The send callback runs with outbox_mu_ RELEASED but drain_mu_ HELD, and
+    // evaluate_key never takes drain_mu_, so a parked send stalls only the drainer.
+    BlockingGate send_park;
+    send_park.park_every = 4;
+
+    // ── per-lane fixtures: one IoClass per churner, disjoint keys and rule ids ──
+    constexpr int kLanes = 3;
+    constexpr int kKeysPerLane = 3;
+    constexpr int kRidsPerLane = 8;
+    constexpr int kIters = 400;
+    const auto spec_for = [](int lane, int k) -> SparkSpec {
+        switch (lane) {
+        case 0: return file_spec("/p3848_" + std::to_string(k));
+        case 1: return reg_spec("HKLM", "K3848_" + std::to_string(k));
+        default: return svc_spec("svc3848_" + std::to_string(k));
+        }
+    };
+    const auto rule_for = [](int lane, const std::string& rid) -> RuleAssertion {
+        switch (lane) {
+        case 0: return file_exists_rule(rid);
+        case 1: return registry_rule(rid, "V", "v");
+        default: return svc_running_rule(rid);
+        }
+    };
+    std::vector<std::string> all_keys;
+    for (int lane = 0; lane < kLanes; ++lane)
+        for (int k = 0; k < kKeysPerLane; ++k)
+            all_keys.push_back(spark_key(spec_for(lane, k)));
+
+    // ── shared state ──
+    std::atomic<bool> go{false};
+    std::atomic<bool> churn_done{false};
+    std::atomic<bool> releaser_stop{false};
+    std::atomic<std::uint64_t> evals{0};
+    std::atomic<std::uint64_t> drains{0};
+    std::atomic<std::uint64_t> sends{0};
+    std::atomic<std::uint64_t> attach_ok{0};
+    std::atomic<std::uint64_t> attach_err{0};
+    std::atomic<std::uint64_t> lane_spin_trips{0}; ///< harness bug detector, asserted zero
+    // Each churner's EXCLUSIVE view of what it left attached. Written only by its owner,
+    // read by the main thread after every churner has joined.
+    std::array<std::map<std::string, std::string>, kLanes> live; // rid -> key
+
+    std::vector<std::thread> workers;
+    std::thread releaser;
+
+    // ONE idempotent shutdown sequence, used by BOTH the normal path and the RAII guard
+    // below - a Catch2 REQUIRE failure mid-test still has to unwind through live, parked
+    // threads safely, and two similar-but-drifting sequences is how that stops working.
+    std::once_flag stopped_once;
+    const auto stop_everything = [&] {
+        std::call_once(stopped_once, [&] {
+            churn_done.store(true);
+            go.store(true); // never leave a worker spinning on a start flag that never sets
+            // GATES OPEN BEFORE ANY JOIN. A worker parked in a gate cannot be joined, and
+            // the releaser is about to stop pulsing.
+            b->arm_park.open();
+            b->disarm_park.open();
+            send_park.open();
+            releaser_stop.store(true);
+            if (releaser.joinable())
+                releaser.join();
+            for (auto& w : workers)
+                if (w.joinable())
+                    w.join();
+            // Executor workers are DETACHED, so joining our own threads says nothing
+            // about them. Wait for the last one to exit before anything they touch dies.
+            (void)spin_until([&] { return rt->active_backend_op_workers() == 0; },
+                             std::chrono::seconds{30});
+        });
+    };
+    struct Cleanup {
+        const std::function<void()>& fn;
+        ~Cleanup() { fn(); }
+    };
+    const std::function<void()> cleanup_fn = stop_everything;
+    Cleanup cleanup{cleanup_fn}; // declared AFTER workers/releaser/gates -> runs BEFORE them
+
+    // ── releaser: the only thing that ever un-parks a gate during the soak ──
+    releaser = std::thread([&] {
+        while (!releaser_stop.load()) {
+            b->arm_park.pulse();
+            b->disarm_park.pulse();
+            send_park.pulse();
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    });
+
+    // ── churners: one IoClass lane each ──
+    for (int lane = 0; lane < kLanes; ++lane) {
+        workers.emplace_back([&, lane] {
+            while (!go.load()) {
+            }
+            for (int i = 0; i < kIters; ++i) {
+                const int j = i % kRidsPerLane;
+                const std::string rid =
+                    "r" + std::to_string(lane) + "_" + std::to_string(j);
+                // A rid MIGRATES across keys over time, so a re-attach hits attach_rule's
+                // prior-generation teardown (detach_rule_locked + an off-lock disarm)
+                // before its own arm - the path a same-rid re-attach actually takes.
+                const int k = ((i / kRidsPerLane) + j) % kKeysPerLane;
+                if (i % 3 == 0) {
+                    rt->detach_rule(rid);
+                    live[static_cast<std::size_t>(lane)].erase(rid);
+                } else {
+                    const auto spec = spec_for(lane, k);
+                    auto res = rt->attach_rule(rid, spec, rule_for(lane, rid), true);
+                    if (res) {
+                        attach_ok.fetch_add(1);
+                        live[static_cast<std::size_t>(lane)][rid] = spark_key(spec);
+                    } else {
+                        attach_err.fetch_add(1);
+                        // attach_rule ALWAYS tears the prior generation down first
+                        // (detach_rule_locked runs in its phase 1, before the arm), so a
+                        // failed attach leaves this rid NOT attached - never still
+                        // attached to whatever it had before.
+                        live[static_cast<std::size_t>(lane)].erase(rid);
+                    }
+                }
+                // THE INVARIANT THAT MAKES THE REJECTION ASSERTION REAL: never submit a
+                // second op for this lane while the previous one's (class, key) executor
+                // ticket is still held. One submitter per lane, so this serializes
+                // nothing across churners - it only waits for this churner's own work.
+                if (!spin_until(
+                        [&] {
+                            const auto st = rt->io_executor_stats_for_test();
+                            return st.active_by_class[static_cast<std::size_t>(lane)] == 0;
+                        },
+                        std::chrono::seconds{30}))
+                    lane_spin_trips.fetch_add(1);
+            }
+        });
+    }
+
+    // ── evaluators: hammer evaluate_key across every lane's keys ──
+    for (int t = 0; t < 3; ++t) {
+        workers.emplace_back([&, t] {
+            while (!go.load()) {
+            }
+            for (int i = 0; i < kIters; ++i) {
+                rt->evaluate_key(all_keys[static_cast<std::size_t>((t + i) % all_keys.size())],
+                                 i % 2 ? EvalReason::Event : EvalReason::Convergence);
+                evals.fetch_add(1);
+            }
+        });
+    }
+
+    // ── drainer: loops on churn_done, not a fixed count. A fixed-count drainer finishes
+    //    before the first arm has even landed once the backend can block. ──
+    workers.emplace_back([&] {
+        while (!go.load()) {
+        }
+        while (!churn_done.load()) {
+            rt->drain([&](const OutboxEntry&) {
+                send_park.maybe_park(-1);
+                sends.fetch_add(1);
+                return SendResult::Sent;
+            });
+            drains.fetch_add(1);
+        }
+    });
+
+    go.store(true);
+    // Join the churners specifically, then stop everything through the SAME function the
+    // RAII guard uses.
+    for (int lane = 0; lane < kLanes; ++lane)
+        workers[static_cast<std::size_t>(lane)].join();
+    churn_done.store(true);
+    stop_everything();
+
+    // One final drain with the gates already open, so nothing is left buffered.
+    rt->drain([&](const OutboxEntry&) {
+        sends.fetch_add(1);
+        return SendResult::Sent;
+    });
+
+    // ── (a) harness health: if any of these fires, nothing below means anything ──
+    CHECK(b->arm_park.watchdog_trips == 0);
+    CHECK(b->disarm_park.watchdog_trips == 0);
+    CHECK(send_park.watchdog_trips == 0);
+    CHECK(lane_spin_trips.load() == 0);
+    CHECK(rt->active_backend_op_workers() == 0);
+
+    // ── (b) the blocking paths were actually exercised ──
+    CHECK(attach_ok.load() > 0);
+    CHECK(b->arm_park.long_holds > 0);
+    CHECK(rt->backend_op_timeouts() > 0); // HARD: a long hold must reach the deadline
+    CHECK(b->disarm_park.total_parked > 0);
+    CHECK(send_park.total_parked > 0);
+    CHECK(evals.load() > 0);
+    CHECK(drains.load() > 0);
+    CHECK(sends.load() > 0);
+    CHECK(rt->outbox_size() == 0);
+
+    // ── (c) census + rejection check, BEFORE begin_stop() ──
+    // Taken before begin_stop() deliberately: once the executor is stopping, a disarm
+    // routed through it is dropped as Stopped, which would present here as a surplus.
+    const auto io = rt->io_executor_stats_for_test();
+    // These two are what make the reconciliation a proof rather than a likelihood. An
+    // AlreadyRunning or CapacityExhausted refusal is counted nowhere at the runtime's own
+    // surface and submit_disarm_off_lock drops it silently, so a non-zero here means a
+    // surplus below could be a declined disarm rather than a leak - the assertion could
+    // no longer distinguish them.
+    for (std::size_t c = 0; c < io.counters.size(); ++c) {
+        CHECK(io.counters[c].rejected_key == 0);
+        CHECK(io.counters[c].rejected_capacity == 0);
+    }
+    std::multiset<std::uint64_t> armed;
+    std::multiset<std::uint64_t> disarmed;
+    {
+        std::lock_guard<std::mutex> lk{b->ids_mu_};
+        armed.insert(b->armed_ids.begin(), b->armed_ids.end());
+        disarmed.insert(b->disarmed_ids.begin(), b->disarmed_ids.end());
+    }
+    for (const auto id : disarmed) {
+        // A disarm for an id that was never armed (or armed fewer times than it is
+        // disarmed) is a DOUBLE-DISARM, a different defect from a leak and one that must
+        // stop the reconciliation rather than quietly cancel a real surplus out of it.
+        REQUIRE(armed.count(id) >= disarmed.count(id));
+    }
+    std::multiset<std::uint64_t> still_armed;
+    for (const auto id : armed)
+        if (disarmed.count(id) == 0)
+            still_armed.insert(id);
+    // Live subscriptions must equal live armed keys: the runtime holds exactly one
+    // subscription per key, however many rules share it.
+    CHECK(still_armed.size() == rt->armed_key_count());
+
+    // ── (d) the churners' exclusive view ──
+    std::size_t expected_rules = 0;
+    std::set<std::string> expected_keys;
+    for (const auto& m : live) {
+        expected_rules += m.size();
+        for (const auto& [rid, key] : m)
+            expected_keys.insert(key);
+    }
+    CHECK(rt->rule_count() == expected_rules);
+    CHECK(rt->armed_key_count() == expected_keys.size());
+
+    rt->begin_stop();
 }
 
 // ── rung 7.4: detach_all, status_for_rule, Lifecycle audit, live-drain waker ─
