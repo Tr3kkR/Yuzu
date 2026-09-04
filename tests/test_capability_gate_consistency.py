@@ -33,7 +33,7 @@ Three things checked against the real, integrated tree:
   3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
      an `.execute_gate` for must equal the number of rows it finds a
      `.plugin`/`.action` pair for, and both must equal 187 (45+55+34+42+5+3+3
-     across the seven fragments) — architect review requirement: a regex that
+     across the eight fragments) — architect review requirement: a regex that
      silently fails to associate a gate with its row must read as a hard
      failure, never as an absent gate.
 
@@ -85,11 +85,12 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_b.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_c.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
 ]
 # 3 + 5 + 45 + 55 + 34 + 42 + 3 — see command_capability.hpp's fragment doc
 # comments and the #1398 design doc's verified row-count audit.
-EXPECTED_TOTAL_ROWS = 187
+EXPECTED_TOTAL_ROWS = 189
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
@@ -249,7 +250,7 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
         # anticipate) must fail loud here, not read as "no gate = fine".
         self.assertEqual(
             len(fragment_rows), pair_only_count,
-            f"parsed {pair_only_count} plugin/action pairs across the seven fragments but "
+            f"parsed {pair_only_count} plugin/action pairs across the eight fragments but "
             f"only {len(fragment_rows)} had an associated .execute_gate — the row/gate "
             "regex has drifted apart from the fragment file format (or a row is missing "
             "its .execute_gate field, which should be a COMPILE failure via each "
@@ -258,9 +259,9 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
         )
         self.assertEqual(
             len(fragment_rows), EXPECTED_TOTAL_ROWS,
-            f"expected exactly {EXPECTED_TOTAL_ROWS} total capability rows across the seven "
+            f"expected exactly {EXPECTED_TOTAL_ROWS} total capability rows across the eight "
             f"fragments, found {len(fragment_rows)} — update EXPECTED_TOTAL_ROWS if a row "
-            "was deliberately added or removed, after confirming the seven per-file counts "
+            "was deliberately added or removed, after confirming the eight per-file counts "
             "in the #1398 design doc's row-count audit are updated too",
         )
         self.assertNotIn(

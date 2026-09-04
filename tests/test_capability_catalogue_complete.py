@@ -2,14 +2,14 @@
 """test_capability_catalogue_complete.py — PR1.9's cross-fragment drift gate.
 
 The capability catalogue (`server/core/src/command_capability.hpp`'s
-`CommandCapability` rows) is authored as SEVEN independent, hand-written
-sources: six per-plugin-group fragment headers
-(`capability_decls/plugin_action_catalogue_{content_dist,a,b,c,d,filesystem_posture}.hpp`,
+`CommandCapability` rows) is authored as EIGHT independent, hand-written
+sources: seven per-plugin-group fragment headers
+(`capability_decls/plugin_action_catalogue_{content_dist,a,b,c,d,disk_actions,filesystem_posture}.hpp`,
 each owned by a different package) plus the core-owned
 `capability_decls/core_dispatch_capabilities.hpp` (the three
 system-initiated dispatches a plugin never receives from a caller —
 `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`). Nobody
-mechanically checks that these seven sources, taken together, actually match
+mechanically checks that these eight sources, taken together, actually match
 what the plugins declare via their `actions()` override. This script is
 that check.
 
@@ -17,12 +17,12 @@ It parses every `actions()` override under `agents/plugins/*/src/*.cpp`
 (each plugin's `name()` override gives the plugin half of the pair; the
 literal strings inside the `static const char* acts[] = {...}` array give
 the action half) and cross-references the result against every
-`.plugin = "..."` / `.action = "..."` pair declared across the seven
+`.plugin = "..."` / `.action = "..."` pair declared across the eight
 capability-catalogue headers. It fails, naming the exact offending
 `plugin.action`, when:
 
   1. A plugin declares an action that has no catalogue row anywhere across
-     the seven sources (a MISSING row) — a plugin ships a capability the
+     the eight sources (a MISSING row) — a plugin ships a capability the
      dispatch-classification layer would report `Unclassified` for.
   2. One of the six per-group fragments declares a `plugin.action` no
      plugin's `actions()` override names (a BOGUS row) — dead, unreachable
@@ -75,6 +75,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_b.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_c.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
@@ -159,7 +160,7 @@ def diff_catalogue(
       - `bogus`: plugin.action pairs one of the six FRAGMENT files declares
         that no plugin actually has (core is exempt — see module docstring).
       - `duplicates`: plugin.action -> list of >=2 source labels that each
-        declared it independently (across all seven sources, fragments and
+        declared it independently (across all eight sources, fragments and
         core alike — a fragment/core collision is exactly as ambiguous to
         `CommandCapabilityRegistry::classify` as a fragment/fragment one).
     """

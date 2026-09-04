@@ -1,7 +1,7 @@
 /**
  * test_capability_catalogue.cpp — PR1.9's cross-cutting invariant gate over
  * the WHOLE capability catalogue: the seven independently-authored sources
- * (the six per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
+ * (the seven per-plugin-group `capability_decls/plugin_action_catalogue_*.hpp`
  * fragments plus the core-owned `capability_decls/core_dispatch_capabilities
  * .hpp`) composed into one `CommandCapabilityRegistry`, exactly as a real
  * dispatch chokepoint eventually will.
@@ -23,6 +23,7 @@
 #include "capability_decls/plugin_action_catalogue_c.hpp"
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "capability_decls/plugin_action_catalogue_d.hpp"
+#include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "command_capability.hpp"
 
@@ -109,6 +110,7 @@ struct LabeledSpan {
         {"b", capdecls::plugin_action_catalogue_b(), false},
         {"c", capdecls::plugin_action_catalogue_c(), false},
         {"d", capdecls::plugin_action_catalogue_d(), false},
+        {"disk_actions", capdecls::plugin_action_catalogue_disk_actions(), false},
         {"filesystem_posture", capdecls::plugin_action_catalogue_filesystem_posture(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
@@ -118,13 +120,14 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, seven sources exactly as a live composition site would use.
+    // literally, eight sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
+        capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     };
@@ -223,6 +226,7 @@ TEST_CASE("capability catalogue: a locally-constructed duplicate span makes the 
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
+        capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
         std::span<const CommandCapability>(kDuplicateStageSpan),
