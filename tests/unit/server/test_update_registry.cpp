@@ -259,6 +259,35 @@ TEST_CASE("UpdateRegistry: binary_path returns update_dir / filename", "[update_
     REQUIRE(path == tmp.path() / "yuzu-agent.exe");
 }
 
+// A STORED filename is revalidated at READ time, not only at upload (#3863).
+// The upload guard protects new rows; these paths are derived from whatever the
+// row already holds, so a row written BEFORE that guard landed, or written
+// straight to the database, would otherwise be resolved here and then read from
+// (CheckForUpdate serves the sidecar beside it) or unlinked (the delete route)
+// outside update_dir_.
+//
+// The assertion is `.empty()`, not "some path inside update_dir_": joining an
+// unsafe name yields update_dir_ ITSELF, and handing that to a remove() is
+// worse than handing it nothing. Without this case the read-time guard could be
+// deleted and every other test here would stay green.
+TEST_CASE("UpdateRegistry: an unsafe stored filename resolves to no path at all",
+          "[update_registry][pg][path]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, update_registry_tpl);
+    TempUpdateDir tmp;
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UpdateRegistry reg(pool, tmp.path());
+    REQUIRE(reg.is_open());
+
+    for (const char* unsafe : {"../escape.exe", "sub/dir.exe", "/abs/path.exe", ""}) {
+        INFO("stored filename = '" << unsafe << "'");
+        auto pkg = make_pkg("windows", "x86_64", "0.1.0", unsafe);
+        CHECK(reg.binary_path(pkg).empty());
+        // The sidecar is derived from the binary path, so it must not fall back
+        // to a bare ".sig" resolved against the process working directory.
+        CHECK(reg.signature_path(pkg).empty());
+    }
+}
+
 // ── list_packages ───────────────────────────────────────────────────────────
 
 TEST_CASE("UpdateRegistry: list_packages returns all upserted packages",

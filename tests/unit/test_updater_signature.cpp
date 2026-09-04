@@ -139,43 +139,37 @@ struct Harness {
     FakeUpdateService svc;
     std::unique_ptr<grpc::Server> server;
     std::unique_ptr<pb::AgentService::Stub> stub;
-    int port{0};
 
+    /// NO LISTENING PORT AND NO TCP CHANNEL — this is deliberate, and it is
+    /// what stopped the Windows MSVC debug leg crashing. Do not "restore" a
+    /// loopback port here.
+    ///
+    /// This harness used to bind 127.0.0.1:0 and dial it back with
+    /// grpc::CreateChannel. That leg died with SIGSEGV (0xc0000005) on five
+    /// consecutive runs, always inside this file, always immediately after the
+    /// last assertion this function evaluates — i.e. in the TCP
+    /// CreateChannel/NewStub statement itself. (Catch2 attributes a fatal
+    /// signal to the last assertion it saw and prints `{Unknown expression
+    /// after the reported line}`; that string is its boilerplate for a caught
+    /// signal, NOT evidence about the expression, so the statement AFTER the
+    /// reported line is the one that faulted.) It reproduced with a server per
+    /// TEST_CASE and with one shared server, after anywhere from 34 to 694
+    /// cases — the socket path was the invariant, not the lifecycle.
+    ///
+    /// InProcessChannel keeps the test honest: a real generated stub, a real
+    /// registered service, a real RPC through gRPC's own machinery — the whole
+    /// point of this file, since verifying the verifier in isolation never
+    /// proved the updater calls it. It just does not involve a socket, an
+    /// ephemeral port, or the Windows IOCP path, none of which this file is
+    /// testing. It also cannot recreate the fd collision a shared server
+    /// caused in test_subprocess_runner.cpp, because it opens no descriptors.
     void start() {
-        // HOLD ONE PROCESS-LIFETIME gRPC INIT REFERENCE, and never release it.
-        //
-        // gRPC's global state is REFCOUNTED: it initialises on the first
-        // server/channel and fully shuts down when the last one is destroyed.
-        // This file builds a server per TEST_CASE and drops it at the end of
-        // that case, so without this the refcount reaches zero between cases
-        // and the next case's BuildAndStart() re-initialises the library from
-        // scratch. That shutdown/re-init cycle is what killed the Windows MSVC
-        // debug leg: SIGSEGV at the SECOND harness's start(), reproducibly, on
-        // every run where a server was created per case — and NOT on the runs
-        // where one shared server meant the library was only ever initialised
-        // once. The sibling harness files in the server test binary never hit
-        // it because that binary keeps other gRPC objects alive throughout, so
-        // its refcount never reaches zero.
-        //
-        // An init reference opens no socket, which is why it is used here in
-        // preference to sharing one server across the file: a shared server
-        // keeps gRPC's descriptors live for the rest of the run, and
-        // test_subprocess_runner.cpp's fd-leak case plants its probe over a
-        // HARDCODED fd number — sharing a server made it steal that number
-        // from gRPC and fail its own precondition on Linux.
-        static const struct GrpcInitOnce {
-            GrpcInitOnce() { ::grpc_init(); } // deliberately no matching ::grpc_shutdown()
-        } kGrpcInitOnce;
-        (void)kGrpcInitOnce;
-
         grpc::ServerBuilder b;
-        b.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
         b.RegisterService(&svc);
         server = b.BuildAndStart();
         REQUIRE(server);
-        REQUIRE(port != 0);
-        stub = pb::AgentService::NewStub(grpc::CreateChannel(
-            "127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
+        stub = pb::AgentService::NewStub(server->InProcessChannel(grpc::ChannelArguments{}));
+        REQUIRE(stub);
     }
     ~Harness() {
         // Teardown order: drop the client channel before the server (no

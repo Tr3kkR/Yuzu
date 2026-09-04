@@ -411,32 +411,63 @@ end;
   file" state that step exists to prevent, reached silently.
 
   This re-checks the result and aborts the install if any inherited ACE remains.
-  It tests an EXIT CODE rather than parsing icacls output: `find` returns 0 when it
-  matches, so the pipeline exits 1 if an "(I)" inherited entry is still listed. }
+
+  IT MUST NOT PIPE icacls INTO find. An earlier form did:
+
+      /C icacls "<dir>" | find "(I)" >nul && exit 1 || exit 0
+
+  and it FAILED OPEN in exactly the case the check exists for. cmd.exe binds
+  && / || to the PIPELINE's exit code -- that is `find`'s, the last command --
+  not icacls's, and only icacls's stdout is piped, not its errors. So when
+  icacls could not run at all (blocked by AV/EDR, or unable to read the ACL) it
+  produced no "(I)"-bearing output, `find` failed to match exactly as it does
+  for a genuinely secured directory, and the script reported SUCCESS. The
+  install then completed "verified" having checked nothing.
+
+  So: no pipe. icacls writes to a file and ResultCode is icacls's OWN exit
+  code, which separates "the command ran and told us the answer" from "the
+  answer was clean". Every way of NOT getting an answer -- cmd would not
+  launch, icacls exited non-zero, the output could not be read back -- FAILS
+  CLOSED and stops the install, because an unverifiable ACL on this directory
+  is indistinguishable from a bad one, and a wrong "secured" is worse than a
+  refusal. }
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
   CertDir: string;
+  AclDump: string;
+  AclText: AnsiString;
 begin
   if CurStep <> ssPostInstall then
     Exit;
 
   CertDir := ExpandConstant('{commonappdata}\Yuzu\agent-certs');
+  AclDump := ExpandConstant('{tmp}\yuzu-agent-certs-acl.txt');
 
   if not Exec(ExpandConstant('{cmd}'),
-              '/C icacls "' + CertDir + '" | find "(I)" >nul && exit 1 || exit 0',
+              '/C icacls "' + CertDir + '" > "' + AclDump + '" 2>&1',
               '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-  begin
-    { Could not run the check at all. Do not fail the install on that alone --
-      the ACL may well be correct and we simply cannot confirm it -- but say so
-      rather than implying it was verified. }
-    MsgBox('Could not verify the permissions on:' + #13#10 + CertDir + #13#10#13#10 +
-           'Confirm manually that it does not inherit permissions before placing ' +
-           'the update trust bundle there.', mbInformation, MB_OK);
-    Exit;
-  end;
+    RaiseException('Could not run the permission check on:' + #13#10 + CertDir + #13#10#13#10 +
+                   'The update trust-anchor directory could not be verified, so the ' +
+                   'installation has been stopped rather than report it secured without ' +
+                   'having checked. Confirm manually that it does not inherit permissions ' +
+                   '(icacls /inheritance:r), then re-run the installer.');
 
   if ResultCode <> 0 then
+    RaiseException('The permission check on the update trust-anchor directory failed:' + #13#10 +
+                   CertDir + #13#10#13#10 +
+                   'icacls could not read the ACL (exit code ' + IntToStr(ResultCode) + ') -- ' +
+                   'security software may have blocked it. The directory has NOT been ' +
+                   'verified, so the installation has been stopped.');
+
+  if not LoadStringFromFile(AclDump, AclText) then
+    RaiseException('Could not read back the permission check for:' + #13#10 + CertDir +
+                   #13#10#13#10 + 'The directory has NOT been verified, so the installation ' +
+                   'has been stopped.');
+
+  DeleteFile(AclDump);
+
+  if Pos('(I)', AclText) > 0 then
     RaiseException('The update trust-anchor directory still inherits permissions:' + #13#10 +
                    CertDir + #13#10#13#10 +
                    'Unprivileged local users may be able to create the trust bundle there ' +
