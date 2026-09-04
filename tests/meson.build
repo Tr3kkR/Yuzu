@@ -438,9 +438,15 @@ agent_test_exe = executable(
                                                 # driven end to end via LocalDispatcher
                                                 # (installed_count only; the Windows leg covers the
                                                 # native rung-1 Uninstall-key registry read)
-    'unit/test_license_scan_actions.cpp',     # Wave 4 PR4.3b: real license_scan.dylib/.so driven
+    'unit/test_license_scan_actions.cpp',    # Wave 4 PR4.3b: real license_scan.dylib/.so driven
                                                 # end to end via LocalDispatcher after the Linux-leg
                                                 # runner migration (POSIX-only, a no-op TU on Windows)
+    'unit/test_filesystem_posture_parsers.cpp', # Wave 6 PR6.1-b: pure /proc/self/mountinfo, quotactl
+                                                # errno classification, fs_snapshot_list attrlist walk,
+                                                # and the legs.hpp pure row formatters
+    'unit/test_filesystem_posture_local_dispatcher.cpp', # Wave 6 PR6.1-b: real filesystem_posture dylib
+                                                # driven end to end via LocalDispatcher (POSIX-only; a no-op
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -474,6 +480,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
     include_directories('../agents/plugins/sccm/src'),           # sccm_parsers.hpp (Wave 3 PR33d pure parser)
     include_directories('../agents/plugins/software_actions/src'), # software_actions_parsers.hpp (Wave 4 PR4.3b pure parser)
+    include_directories('../agents/plugins/filesystem_posture/src'), # filesystem_posture_parsers.hpp / _legs.hpp (Wave 6 PR6.1-b pure headers)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -554,6 +561,7 @@ agent_test_exe = executable(
                 device_identity_plugin_lib,
                 echo_argv_fixture,
                 event_logs_plugin_lib,
+                filesystem_posture_plugin_lib,
                 hardware_plugin_lib,
                 installed_apps_plugin_lib,
                 invalid_name_fixture_plugin,
@@ -879,6 +887,7 @@ if build_server
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
       'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
+      'unit/server/test_plugin_presence_dispatch_gate.cpp', # #3424/#3511: plugin-presence filter at the dispatch chokepoint — mirrors test_quarantine_dispatch_gate.cpp
       'unit/server/test_quarantine_reapply.cpp',           # #3425: shared stored-containment re-dispatch recipe (Layer A) — pure, no store
       'unit/server/test_quarantine_containment_reconciler.cpp', # #3425: reconnect re-application state machine — real store/registry, mock dispatch
       'unit/server/test_result_set_store.cpp',
@@ -1919,7 +1928,7 @@ test('changelog order',
 )
 
 # PR1.9 data-gate: every plugin action has exactly one capability-catalogue row
-# across the five fragment headers, and no fragment claims an action no plugin
+# across the six fragment headers, and no fragment claims an action no plugin
 # declares. Hermetic — parses sources, builds nothing.
 test('capability catalogue completeness',
   _python3_test,

@@ -9,16 +9,18 @@
  * (has_secret invariant, tamper -> skip-not-unsigned-fire, no-secret ->
  * unsigned fire preserved).
  *
- * Most of the dedicated legacy-SQLite backfill TEST_CASE suite (2026-08-25)
- * was removed as part of a fresh-start-by-default policy change (ADR-0009
- * amendment). WebhookStore::migrate_from_sqlite()/migrate_from_sqlite_impl()
- * themselves are UNCHANGED and still present (their removal is a separate,
- * later step) -- this store shipped its backfill (PR #3563) the same day
- * the amendment landed, too late for the "don't build it" guidance to
- * reach it. Two cases were reinstated (governance flagged their removal):
- * the WAL/SHM sidecar 0600 permission-enforcement pair, both regression
- * tests for real findings from PR #3563's own governance/chaos rounds on
- * this still-live, secrets-adjacent boot path.
+ * No legacy-SQLite backfill test coverage: `WebhookStore::migrate_from_sqlite()`/
+ * `migrate_from_sqlite_impl()` themselves were retired
+ * (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0057 Update, 2026-09-03) -- no
+ * production fleet has ever run a pre-Postgres build, so the mandatory backfill never had
+ * real legacy data to protect. The two WAL/SHM sidecar 0600-enforcement regression tests
+ * that used to live here (reinstated 2026-08-25 for real PR #3563 findings) moved to
+ * `test_legacy_sqlite_probe.cpp` against the new `harden_legacy_file_0600()` helper those
+ * findings' hardening logic was generalized into -- move-aside no longer applies (nothing
+ * is migrated, so a `.migrated-<epoch>` rename would misdescribe what happened), so the
+ * move-aside-failure regression test (the second of the original pair) has no remaining
+ * subject and was not carried forward. `server.cpp` now calls `harden_legacy_file_0600()`
+ * then `warn_if_legacy_rows()` at boot instead.
  */
 
 #include "webhook_store.hpp"
@@ -33,12 +35,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 #include <chrono>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -72,84 +71,6 @@ TEST_CASE("WebhookStore::hmac_sha256 is deterministic and key-sensitive", "[webh
 // (docs/postgres-store-playbook.md's test-file-drift note).
 
 namespace {
-
-/// Writes a minimal legacy `webhooks.db` (+ optional `webhook_deliveries`)
-/// SQLite file at `path`, matching the pre-migration SQLite schema exactly.
-/// Reinstated for the two WAL/SHM 0600-enforcement regression tests below
-/// only — governance flagged their removal, since they're real regression
-/// tests for findings from PR #3563's own review, on a still-live path.
-class LegacyWebhookDb {
-public:
-    struct Row {
-        std::int64_t id;
-        std::string url;
-        std::string event_types;
-        std::string secret; // plaintext, as the legacy schema stored it
-        bool enabled{true};
-        std::int64_t created_at;
-    };
-    struct DeliveryRow {
-        std::int64_t id;
-        std::int64_t webhook_id;
-        std::string event_type;
-        std::string payload;
-        int status_code{200};
-        std::int64_t delivered_at;
-        std::string error;
-    };
-
-    explicit LegacyWebhookDb(const std::filesystem::path& path) : path_(path) {
-        REQUIRE(sqlite3_open(path.string().c_str(), &db_) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(db_,
-                             "CREATE TABLE webhooks (id INTEGER PRIMARY KEY, url TEXT NOT NULL, "
-                             "event_types TEXT NOT NULL DEFAULT '*', secret TEXT NOT NULL "
-                             "DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, created_at "
-                             "INTEGER NOT NULL);"
-                             "CREATE TABLE webhook_deliveries (id INTEGER PRIMARY KEY, "
-                             "webhook_id INTEGER NOT NULL, event_type TEXT NOT NULL, payload "
-                             "TEXT NOT NULL, status_code INTEGER NOT NULL DEFAULT 0, "
-                             "delivered_at INTEGER NOT NULL, error TEXT NOT NULL DEFAULT '');",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-    }
-    ~LegacyWebhookDb() {
-        if (db_)
-            sqlite3_close(db_);
-    }
-    LegacyWebhookDb(const LegacyWebhookDb&) = delete;
-    LegacyWebhookDb& operator=(const LegacyWebhookDb&) = delete;
-
-    void insert(const Row& r) {
-        char* sql = sqlite3_mprintf(
-            "INSERT INTO webhooks (id,url,event_types,secret,enabled,created_at) VALUES "
-            "(%lld,%Q,%Q,%Q,%d,%lld)",
-            static_cast<long long>(r.id), r.url.c_str(), r.event_types.c_str(),
-            r.secret.c_str(), r.enabled ? 1 : 0, static_cast<long long>(r.created_at));
-        REQUIRE(sqlite3_exec(db_, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_free(sql);
-    }
-    void insert(const DeliveryRow& d) {
-        char* sql = sqlite3_mprintf(
-            "INSERT INTO webhook_deliveries "
-            "(id,webhook_id,event_type,payload,status_code,delivered_at,error) VALUES "
-            "(%lld,%lld,%Q,%Q,%d,%lld,%Q)",
-            static_cast<long long>(d.id), static_cast<long long>(d.webhook_id),
-            d.event_type.c_str(), d.payload.c_str(), d.status_code,
-            static_cast<long long>(d.delivered_at), d.error.c_str());
-        REQUIRE(sqlite3_exec(db_, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_free(sql);
-    }
-
-    void close() {
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-    }
-
-private:
-    std::filesystem::path path_;
-    sqlite3* db_{nullptr};
-};
 
 /// Polls get_deliveries() until at least `min_count` rows are present or
 /// `timeout` elapses — deliveries land asynchronously on the worker pool.
@@ -185,6 +106,40 @@ TEST_CASE("WebhookStore[pg]: create and list webhook", "[webhook_store][pg]") {
     CHECK((*hooks)[0].has_secret == true); // list() never exposes the secret itself
     CHECK((*hooks)[0].enabled == true);
     CHECK((*hooks)[0].id == *id);
+}
+
+TEST_CASE("WebhookStore[pg]: migration lands at v2 and drops sqlite_backfill_source (#3623)",
+          "[webhook_store][pg][migration]") {
+    // Deliberately NOT WebhookStorePg / webhook_store_pg_template -- both are backed by the
+    // process-wide PgTestTemplate (built once, cloned per fixture), so in a full suite run this
+    // store may already be at v2 by the time this test's clone is taken, making the version
+    // check a no-op read of someone else's already-completed migration rather than a genuine
+    // from-scratch v1->v2 run. YUZU_REQUIRE_PG_MIGRATION_DB is a private, unshared database, so
+    // the WebhookStore construction below always drives a real migration.
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    yuzu::test::TempDir keys;
+    yuzu::server::FileKeyProvider provider(keys.path);
+    yuzu::server::pg::SecretCodec codec(provider);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
+    WebhookStore store{pool, codec};
+    REQUIRE(store.is_open());
+
+    yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(codec.init(conn.get()).has_value());
+
+    yuzu::server::pg::PgResult ver{PQexec(
+        conn.get(), "SELECT version FROM public.schema_meta WHERE store = 'webhook_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+    yuzu::server::pg::PgResult tbl{
+        PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.tables WHERE "
+                           "table_schema = 'webhook_store' AND table_name = "
+                           "'sqlite_backfill_source'")};
+    REQUIRE(tbl.ok());
+    CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
 }
 
 TEST_CASE("WebhookStore[pg]: create without a secret sets has_secret=false",
@@ -430,178 +385,4 @@ TEST_CASE("WebhookStore[pg]: a non-NULL secret with has_secret=false is also a C
         std::vector<std::string>{std::to_string(*id)});
     CHECK(res.status() == PGRES_FATAL_ERROR); // CHECK constraint violation
 }
-
-// ── Legacy-SQLite backfill: WAL/SHM sidecar permission enforcement ─────────
-// Reinstated (governance flagged their removal from the 2026-08-25
-// fresh-start-by-default sweep): both are regression tests for real
-// findings against PR #3563's own review rounds, on WebhookStore's
-// still-live, secrets-adjacent `migrate_from_sqlite()` boot path.
-
-#ifndef _WIN32
-TEST_CASE("WebhookStore[pg]: backfill restricts WAL/SHM sidecars to 0600, not just the main file",
-         "[webhook_store][pg]") {
-    // gov external-review finding (PR #3563): move_legacy_aside chmod'd only
-    // the moved-aside main file — the -wal/-shm sidecars, which can carry
-    // the same PLAINTEXT secret pages the main file's own read-time force
-    // exists to protect, were renamed but left at whatever mode they
-    // already had. Prove both sidecars land at owner-only after backfill.
-    WebhookStorePg store;
-    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy_wal") += ".db";
-    {
-        LegacyWebhookDb legacy(legacy_path);
-        legacy.insert({.id = 1,
-                      .url = "https://example.com/hook",
-                      .event_types = "*",
-                      .secret = "s",
-                      .enabled = true,
-                      .created_at = 1700000000});
-    }
-    // Simulate an unclean-shutdown leftover: dummy sidecar files, group/
-    // world-readable, sitting beside the legacy db. Content is irrelevant —
-    // move_legacy_aside only needs to see them exist at the expected path.
-    for (const char* suffix : {"-wal", "-shm"}) {
-        auto side = legacy_path;
-        side += suffix;
-        std::ofstream(side) << "dummy-sidecar-content";
-        std::filesystem::permissions(side,
-                                     std::filesystem::perms::owner_read |
-                                         std::filesystem::perms::owner_write |
-                                         std::filesystem::perms::group_read |
-                                         std::filesystem::perms::others_read,
-                                     std::filesystem::perm_options::replace);
-    }
-
-    REQUIRE(store->migrate_from_sqlite(legacy_path));
-
-    std::filesystem::path moved_main, moved_wal, moved_shm;
-    for (const auto& entry :
-        std::filesystem::directory_iterator(legacy_path.parent_path())) {
-        const auto s = entry.path().string();
-        if (!s.starts_with(legacy_path.string() + ".migrated-"))
-            continue;
-        if (s.ends_with("-wal"))
-            moved_wal = entry.path();
-        else if (s.ends_with("-shm"))
-            moved_shm = entry.path();
-        else
-            moved_main = entry.path();
-    }
-    REQUIRE_FALSE(moved_main.empty());
-    REQUIRE_FALSE(moved_wal.empty());
-    REQUIRE_FALSE(moved_shm.empty());
-
-    const auto owner_only =
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
-    for (const auto& p : {moved_main, moved_wal, moved_shm}) {
-        std::error_code st_ec;
-        const auto perms = std::filesystem::status(p, st_ec).permissions();
-        REQUIRE_FALSE(st_ec);
-        CHECK((perms & std::filesystem::perms::mask) == owner_only);
-    }
-}
-
-TEST_CASE("WebhookStore[pg]: a sidecar that fails to move is still 0600 at its original path, "
-         "and doesn't block the main file from moving",
-         "[webhook_store][pg]") {
-    // gov Gate 5 chaos analysis CH-1 (PR #3563 fix round): force the `-wal`
-    // rename to fail by pre-occupying its target path with a non-empty
-    // directory (POSIX rename() onto a non-empty directory fails
-    // ENOTEMPTY/EISDIR). Proves two independent claims: (1) the read-time
-    // 0600 force in migrate_from_sqlite_impl protects a sidecar regardless
-    // of whether move_legacy_aside later manages to relocate it; (2) one
-    // sidecar's rename failure doesn't prevent the main file (or the OTHER
-    // sidecar) from moving and being chmod'd normally.
-    //
-    // `aside`'s suffix comes from `now_epoch()` (1s-resolution wall clock)
-    // read INSIDE move_legacy_aside, which this test can't observe
-    // directly — pre-occupy a small window of candidate seconds around
-    // "now" so a slow test runner can't miss the real timestamp.
-    WebhookStorePg store;
-    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_webhook_legacy_wal_fail") += ".db";
-    {
-        LegacyWebhookDb legacy(legacy_path);
-        legacy.insert({.id = 1,
-                      .url = "https://example.com/hook",
-                      .event_types = "*",
-                      .secret = "s",
-                      .enabled = true,
-                      .created_at = 1700000000});
-    }
-    for (const char* suffix : {"-wal", "-shm"}) {
-        auto side = legacy_path;
-        side += suffix;
-        std::ofstream(side) << "dummy-sidecar-content";
-    }
-
-    const auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                         std::chrono::system_clock::now().time_since_epoch())
-                         .count();
-    std::vector<std::filesystem::path> decoy_dirs;
-    // gov Gate 8 (PR #3563 fix round): a generous window — creating a few
-    // dozen empty decoy directories is essentially free, and widening it
-    // costs nothing but removes a real (if unlikely) flake source on a
-    // heavily contended runner where several seconds could elapse between
-    // this read and move_legacy_aside's own now_epoch() call.
-    for (auto t = now - 2; t <= now + 60; ++t) {
-        auto decoy = legacy_path;
-        decoy += ".migrated-" + std::to_string(t) + "-wal";
-        std::error_code mk_ec;
-        if (std::filesystem::create_directory(decoy, mk_ec) && !mk_ec) {
-            std::ofstream(decoy / "occupied") << "blocks the rename target";
-            decoy_dirs.push_back(decoy);
-        }
-    }
-    REQUIRE_FALSE(decoy_dirs.empty());
-
-    REQUIRE(store->migrate_from_sqlite(legacy_path)); // non-fatal: still succeeds
-
-    // The original `-wal` file must still exist at its ORIGINAL path (the
-    // rename never succeeded) and must be 0600 from the read-time force —
-    // independent of the later move that failed for it.
-    auto orphan_wal = legacy_path;
-    orphan_wal += "-wal";
-    REQUIRE(std::filesystem::exists(orphan_wal));
-    {
-        std::error_code st_ec;
-        const auto perms = std::filesystem::status(orphan_wal, st_ec).permissions();
-        REQUIRE_FALSE(st_ec);
-        CHECK((perms & std::filesystem::perms::mask) ==
-             (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write));
-    }
-
-    // The main file and the (unobstructed) -shm sidecar must still have
-    // moved and been chmod'd normally — one sidecar's failure doesn't take
-    // the rest down with it.
-    std::filesystem::path moved_main, moved_shm;
-    for (const auto& entry :
-        std::filesystem::directory_iterator(legacy_path.parent_path())) {
-        const auto s = entry.path().string();
-        if (!s.starts_with(legacy_path.string() + ".migrated-") || s.ends_with("-wal"))
-            continue;
-        if (s.ends_with("-shm"))
-            moved_shm = entry.path();
-        else
-            moved_main = entry.path();
-    }
-    REQUIRE_FALSE(moved_main.empty());
-    REQUIRE_FALSE(moved_shm.empty());
-    const auto owner_only2 =
-        std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
-    for (const auto& p : {moved_main, moved_shm}) {
-        std::error_code st_ec;
-        const auto perms = std::filesystem::status(p, st_ec).permissions();
-        REQUIRE_FALSE(st_ec);
-        CHECK((perms & std::filesystem::perms::mask) == owner_only2);
-    }
-
-    // A second boot against the (now-nonexistent) original main path must
-    // not disturb the orphaned sidecar's permissions — it's never
-    // rediscovered once the main file is gone.
-    REQUIRE(store->migrate_from_sqlite(legacy_path));
-    std::error_code st_ec2;
-    const auto perms2 = std::filesystem::status(orphan_wal, st_ec2).permissions();
-    REQUIRE_FALSE(st_ec2);
-    CHECK((perms2 & std::filesystem::perms::mask) == owner_only2);
-}
-#endif
 

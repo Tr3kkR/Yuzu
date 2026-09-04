@@ -13,11 +13,11 @@
  *  - CRL numbering + record/latest roundtrip, publish_next_crl atomic allocation,
  *    record_crl's duplicate-version refusal.
  *
- * No legacy-SQLite backfill test coverage: the dedicated backfill TEST_CASE suite
- * (ADR-0009/0053) was removed as part of a fresh-start-by-default policy change
- * (ADR-0009 amendment, 2026-08-25) -- no production fleet has ever run a
- * pre-Postgres build. CaStore::migrate_from_sqlite() itself is UNCHANGED and
- * still present (its removal is a separate, later step).
+ * No legacy-SQLite backfill test coverage: `CaStore::migrate_from_sqlite()` itself was retired
+ * (chore/retire-migrate-from-sqlite-batch-a, #3623, ADR-0053 Update, 2026-09-03) -- no production
+ * fleet has ever run a pre-Postgres build, so the mandatory three-table fingerprinted backfill
+ * never had real legacy data to protect. `server.cpp` now runs
+ * `legacy_sqlite_probe::warn_if_legacy_rows` over the three legacy tables instead.
  *
  * Migrated-to-Postgres store (ADR-0012 §1, authoritative/fail-hard). PG-gated: skips when
  * YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken (test_helpers.hpp skip-vs-fail
@@ -113,6 +113,27 @@ TEST_CASE("CaStore reports !is_open on a migration failure", "[ca_store][pg]") {
     PgPool pool{{.conninfo = db.dsn(), .size = 1}};
     CaStore store{pool};
     REQUIRE_FALSE(store.is_open());
+}
+
+TEST_CASE("CaStore migration lands at v2 and drops sqlite_backfill_source (#3623)",
+          "[ca_store][pg][migration]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult ver{PQexec(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                    "'ca_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+    PgResult tbl{PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.tables WHERE "
+                                    "table_schema = 'ca_store' AND table_name = "
+                                    "'sqlite_backfill_source'")};
+    REQUIRE(tbl.ok());
+    CHECK(std::string(PQgetvalue(tbl.get(), 0, 0)) == "0");
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────

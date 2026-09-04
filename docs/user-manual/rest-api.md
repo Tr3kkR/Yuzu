@@ -942,6 +942,12 @@ Engine principals are the durable identities behind autonomous use-case-engine m
 
 **Storage failure:** if the engine-principal store failed to open at startup (no PostgreSQL configured, or a migration failure), every route on this surface returns `503 service unavailable`.
 
+**Audit-persist failure (fail closed on mutations):** these routes emit a privileged-action audit row, and a mutation that cannot record it must never look like a clean success. If the audit-store write itself fails, every **mutating** route (create, revoke, transfer-owner, `credentials`/`credentials/rotate`/`credentials/confirm`, and the role assign/unassign routes documented later) **fails closed** — it returns `503` with a `Sec-Audit-Failed: true` header instead of its normal `2xx` (ADR-1005 "mutations fail closed on audit failure"). The mutation may already have taken effect (the audit is emitted after the store write), so treat such a `503` as *unconfirmed* and reconcile via a read. This is a stricter posture than the software-package/deployment mutations elsewhere in this API, which set-and-proceed (stay `2xx` with `Sec-Audit-Failed`) on the same audit-drop: engine-principal management is a privileged-identity surface, so ADR-1005 holds it to fail-closed rather than proceed-and-signal.
+
+The credential **mint** and **rotate** routes additionally **withhold the one-time secret** on this path — nothing is placed in the `503` body. Recovery differs by route: a **mint** whose audit dropped leaves a credential that exists but is unusable (no one holds its secret) — `GET` the principal to see it, then **rotate** it (mints an audited successor you can then confirm) to obtain a usable secret; a **rotate** whose reveal-audit dropped can be **rotated again within the overlap window** to re-serve the *same* successor secret (an audited re-serve, not a new credential). Note the compounding case under a *sustained* audit outage: repeated mint/rotate failures can leave two unconfirmed credentials, at which point the store's ≤2-active guard blocks further rotation — recover by revoking one unconfirmed credential and re-minting once the audit store is healthy.
+
+The **read** routes (`GET`/list, `GET /{id}`, `GET /audit/no-admin`, `GET /{id}/roles`) and the engine-session denial above instead set the same `Sec-Audit-Failed: true` header but still serve their response — matching the MCP twins' `audit_persisted:false` body field. Reads proceed (rather than fail closed like the behavioural-PII device/network reads) because they commit no state and disclose only authorization **topology metadata** — principal ids, owners, role grants — not per-person behavioural PII; the fail-closed-on-read posture exists specifically to keep individual-identifying data off an unaudited response, which does not apply here. Alert on `Sec-Audit-Failed: true` from this surface as a SOC 2 CC7.2 evidence-gap signal (the same alert that covers the behavioural-PII routes fires on it), while noting the serve behaviour differs: these reads still return data, those withhold it.
+
 **`{id}` convention:** on every route below (`GET /{id}`, `DELETE /{id}`, the `credentials`/`credentials/rotate`/`credentials/confirm`/`transfer-owner` sub-resources), `{id}` is the **full** `principal_id`, i.e. `engine:<slug>` (e.g. `GET /api/v1/engine-principals/engine:vuln-uce`) — none of these routes prepend the `engine:` prefix themselves. This is the opposite convention from the `.../{id}/roles` role-assignment sub-resource documented later in this file, where `{id}` is the **bare slug** and the server reconstructs the full id internally — don't assume the two sections share one convention.
 
 #### `POST /api/v1/engine-principals`
@@ -982,6 +988,7 @@ Create a new engine-principal identity. `principal_id` is derived server-side as
 | `owner_username` empty or does not reference an existing user | `400` — `owner_username must reference an existing user` |
 | `classification` missing or not `internal`/`external` | `400` — store validation error |
 | `justification` empty | `400` — store validation error (`justification cannot be empty`) |
+| The create audit row could not persist | `503` + `Sec-Audit-Failed: true` — the principal may already have been created (audit is emitted after the store write); reconcile via `GET` (see *Audit-persist failure* above) |
 
 **Response (201):**
 
@@ -1057,7 +1064,7 @@ Terminal, irreversible revoke. Every active credential is revoked **first**, the
 }
 ```
 
-**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live.
+**Errors:** `404` — engine principal not found. `503` — a genuine store failure at any step of the sequence (the principal lookup, the credential-store revoke, or the identity revoke itself) — never an idempotent no-op; credentials are revoked strictly before the identity, so a `503` here never leaves the identity flipped to `revoked` while a credential is still live. `503` + `Sec-Audit-Failed: true` — the revoke audit row could not persist (see *Audit-persist failure* above); the revoke may already have taken effect, so reconcile via `GET`.
 
 ---
 
@@ -1086,7 +1093,7 @@ Mint the **first** credential for an engine principal. The raw secret is returne
 
 `token` is the raw secret (shown once); `token_id` and `expires_at` let a pure-REST caller correlate the credential it just minted without a follow-up `GET`.
 
-**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` out of range. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`).
+**Errors:** `404` — engine principal not found. `409` — engine principal is not active (revoked), **or** the principal already has an active credential (mint is single-shot; use `credentials/rotate` instead). `400` — `ttl_days` out of range. `503` — CSPRNG failure or any other store failure (a CSPRNG failure also sets `Retry-After: 5` and increments `yuzu_secure_random_failure_total{reason="prng_failure",site="engine_principal"}`). `503` + `Sec-Audit-Failed: true` — the mint audit row could not persist: the credential was created but its **one-time secret is withheld** (never in the body), so the credential exists but is unusable — see *Audit-persist failure* above for recovery.
 
 ---
 
@@ -1124,6 +1131,7 @@ Overlap-pair rotation (design doc §7): mints a successor credential while the e
 | No active credential found for this principal to rotate | `503` — **not** `400`/`404`. Deliberately conflated with a transient read failure: the internal read that finds "no active credential" cannot be told apart from a silently-failed read, so a genuine "nothing to rotate" is classified as retryable (503) rather than a definitive client error — treating it as 400 could otherwise mislead a caller into minting a redundant second credential during what was actually a transient outage. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `503` |
 | Advisory-lock acquire failure, CSPRNG failure, the engine-referent check itself being unreachable, or a mint/stamp write that did not persist | `503` — retryable store failure |
+| The reveal audit row could not persist | `503` + `Sec-Audit-Failed: true` — the successor was minted but its **one-time secret is withheld**; rotate again within the overlap window to re-serve the *same* audited successor secret (see *Audit-persist failure* above) |
 | MFA step-up not satisfied | `401` |
 | Missing `Security:Write`, or the caller's own session is engine-classed (structural deny belt) | `403` |
 
@@ -1176,6 +1184,7 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | No active credentials, or exactly two that aren't a recognized rotation pair | `503` — **not** `400`. Ambiguity-avoidance: an empty read can't be distinguished from a silently-failed read, and a malformed pair is kept conservative, so these stay retryable rather than a definitive client error. |
 | A non-engine-kind active credential is present for this principal (defensive check) | `400` — `principal has a non-engine active credential` |
 | **The presented `secret` does not hash-match the pending successor's stored secret (#3015 proof of possession)** — reached only after ownership/pair-state/the `token_id` pin/the initiator binding above have all passed | `403` — `rotation secret mismatch — the presented secret does not verify against the pending successor` |
+| The confirm audit row could not persist | `503` + `Sec-Audit-Failed: true` — the rotation was confirmed (predecessor retired) but its audit row did not persist (see *Audit-persist failure* above); a retried confirm returns the terminal `409` (the rotation is already resolved — the replay row above), which itself confirms the mutation took effect |
 | The authoritative successor row could not be re-read to verify the secret (should not happen under the lock already held; fails closed rather than assume a match) | `503` — `failed to verify rotation secret` |
 | Advisory-lock acquire failure, or the confirm/predecessor-revoke/successor-clear write did not persist | `503` — retryable store failure |
 | MFA step-up not satisfied | `401` |
@@ -1206,7 +1215,7 @@ Reassign the named responsible owner of an active engine principal. Admin-forced
 }
 ```
 
-**Errors:** `400` — `new_owner must reference an existing user`. `404` — engine principal not found. `409` — engine principal is not active. `503` — the transfer call itself failed.
+**Errors:** `400` — `new_owner must reference an existing user`. `404` — engine principal not found. `409` — engine principal is not active. `503` — the transfer call itself failed. `503` + `Sec-Audit-Failed: true` — the transfer audit row could not persist (see *Audit-persist failure* above); the transfer may already have taken effect, so reconcile via `GET`.
 
 ---
 
@@ -1580,10 +1589,11 @@ Quarantine a device.
 >   this route validates `whitelist` at write time (`400` instead of `201`
 >   for a malformed value), the same rule MCP's `quarantine_device` already
 >   enforced — so a fresh write here can no longer land in this state. A
->   `validation_failed` reconcile now points at a record migrated from the
->   legacy `quarantine.db` (ADR-0047 backfill, which copies `whitelist`
->   verbatim with no validation) or one written via this route before
->   `d1f71c58f` shipped, not a fresh call. Either way, every reconcile
+>   `validation_failed` reconcile now points at a record written via this
+>   route before `d1f71c58f` shipped, or — on a fleet with pre-#3623 history
+>   — one migrated from a legacy `quarantine.db` by the since-retired
+>   `migrate_from_sqlite` backfill (ADR-0047, which copied `whitelist`
+>   verbatim with no validation), not a fresh call. Either way, every reconcile
 >   attempt then counts `validation_failed` and nothing is ever dispatched.
 >   That failure is loud, not silent — the device stays in
 >   `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"}`
@@ -1609,33 +1619,54 @@ Quarantine a device.
 > [Audit Log](audit-log.md)).
 >
 > **`POST /api/command` reports what it withheld.** The success body carries
-> `withheld_quarantined` — always present, `0` on a clean dispatch — so
-> `agents_reached: 97` on a 100-device group is distinguishable from three
-> devices being offline. The dashboard toast says the same.
+> `withheld_quarantined` and (#3424/#3511) `withheld_unknown_plugin` — both
+> always present, `0` on a clean dispatch — so `agents_reached: 97` on a
+> 100-device group is distinguishable from three devices being offline, and a
+> MIXED partial dispatch (some reached, some plugin-absent) is never silently
+> invisible in the response. The dashboard's own execute console
+> (`/api/dashboard/execute`, a separate HTML-fragment handler, not this route)
+> now names the same containment/quarantine/plugin-absence causes on a
+> zero-agents-reached dispatch; it does not yet surface withheld counts on a
+> MIXED partial dispatch the way this route's success body does — tracked as a
+> follow-up.
 >
-> **Its `503` now names the cause.** Three conditions previously shared one
-> body ("failed to send command to any agent"), and one of them is a
-> fleet-wide policy state rather than a transport failure:
+> **Its `503` now names the cause.** Four conditions previously shared one
+> body ("failed to send command to any agent"), and two of them are
+> fleet-wide/request-wide states rather than a transport failure:
 >
 > | `error.reason` | Meaning | `retry_after_ms` |
 > |---|---|---|
 > | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
 > | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
+> | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. If the plugin name and spelling are correct and it genuinely is installed on the target, the agent's REPORTED inventory is stale: it is populated once at registration and does not refresh until the agent's management connection next re-registers (a reconnect — daemon restart, or any dropped/re-established connection) — this reason can persist until then even after installation completes. | `null` — retrying will not help; check the plugin name/spelling instead, or trigger a reconnect on the target agent if the plugin was only just installed |
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `reason` is a top-level key on the error object, not part of the A4
-> `error.data` envelope. The versioned dispatch routes
-> (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
-> do **not** yet carry this split — they answer their existing
-> "no agents reached" shapes for all three conditions, because the shared
-> dispatch closure returns only a sent count. Tracked as #3424. ADR-1007 added
-> a fourth cause to that same undifferentiated message on
-> `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
-> named target may have been excluded by an already-open concurrency claim
-> rather than being unreachable at all — the response text now says so, and
-> points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
-> this is still prose inside the one undifferentiated 503 body, not a fourth
-> structured `error.reason` value — the same #3424 gap applies to it. The quarantine
+> `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
+> same three-`reason` `503` split as `POST /api/command` above
+> (`containment_unreadable` / `quarantined` / `plugin_not_found`, same
+> `retry_after_ms` values) — closed alongside the architect finding that its
+> response-building code
+> was reading `dispatch_outcome.command_id`/`.sent` only, discarding the
+> richer fields already available on the same struct.
+>
+> **A fourth, structurally distinct condition — `invalid_scope` — is `400`,
+> not part of the `503` table above.** This route (unlike `POST
+> /api/command`) accepts a caller-supplied `scope` expression; a malformed
+> one is a client mistake, not a fleet-state fact, so it reports
+> `error.reason: "invalid_scope"` at `400` with `retry_after_ms: null`,
+> checked before the `503` cascade so a bad expression is never shadowed by
+> `containment_unreadable`. Its generic catch-all
+> (no `reason` key, matching the *(absent)* row above) additionally covers
+> ADR-1007's per-device concurrency-claim exclusion, unique to this route
+> since it — unlike `/api/command` — accepts a `concurrency_mode`: for a
+> `per-device` definition, every named target may have been excluded by an
+> already-open claim rather than being unreachable at all; the message
+> points at `yuzu_server_dispatch_concurrency_skipped_total`. The bundle and
+> result-set producers still do **not** carry this split — their own
+> response-building code was not extended to surface the richer per-arm
+> result their shared dispatch closure now carries (a separate, smaller
+> follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —
@@ -2109,7 +2140,9 @@ role is admin/built-in/otherwise rejected by `validate_assignment` (design
 non-revoked) engine principal exists at `{id}`; `503` — the RBAC or
 engine-principal store is unavailable. A rejected assignment is audited
 `engine_principal.role.assigned` with `result=denied`; success with
-`result=success`.
+`result=success`. `503` + `Sec-Audit-Failed: true` — the assignment audit row
+could not persist (see *Audit-persist failure* above): the grant may already be
+in effect, so reconcile via `GET /{id}/roles`.
 
 ---
 
@@ -2131,7 +2164,9 @@ Unassign a fleet-wide role from an engine principal.
 **Errors:** `400` — the role was not assigned to this principal (store-returned
 error); `401`/`403` — not authenticated, missing `Security:Write`, or MFA
 step-up required/failed; `503` — the RBAC store is unavailable. Audited
-`engine_principal.role.unassigned` on success.
+`engine_principal.role.unassigned` on success. `503` + `Sec-Audit-Failed: true`
+— the unassign audit row could not persist (see *Audit-persist failure* above):
+the grant may already be removed, so reconcile via `GET /{id}/roles`.
 
 ---
 
@@ -3978,13 +4013,16 @@ Create a new webhook subscription.
 
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
-**Security — secret storage and the legacy-file retention window.** A configured signing secret
+**Security — secret storage, and a legacy file's disposal.** A configured signing secret
 is envelope-encrypted at rest (AES-256-GCM, ADR-0010) — a stolen database backup alone cannot
 recover it. There is no rotation endpoint today: to change a secret, delete the webhook and
-recreate it. Deployments that upgraded from a release before the Postgres cutover retain the
-pre-cutover SQLite `webhooks.db` file for one release as a rollback net (ADR-0009); that file
-still holds signing secrets in **plaintext**. If your backup posture for that one-release window
-is unknown, rotate (delete-and-recreate) every webhook's secret once the window has closed.
+recreate it. No production fleet ever ran a pre-Postgres build of this store (#3623), so a
+legacy SQLite `webhooks.db` genuinely holding real data should not exist — but if one is
+somehow found on disk at boot (hardened to 0600, main file and any `-wal`/`-shm`/`-journal` sidecars, and
+warned about in the log), it still holds any signing secrets in **plaintext** and is never
+automatically deleted or rotated. If you find one and don't need it, delete it yourself; if any
+webhook it names might still be relying on that secret, rotate (delete-and-recreate) the
+corresponding webhook's secret via this store first.
 
 **Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the delivered event
 payload is transmitted in cleartext. Production deployments should use `https://` only. The
@@ -4859,7 +4897,7 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
 
-A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first.
+A `200` with `decommissioned: true` is confirmed erasure across every configured store; deleting an unknown `agent_id` is a no-op `200` (nothing to erase). Erasure does not unenroll the agent — a still-enrolled device re-syncs on its next daily cycle, so decommission the device first. This guarantee is scoped to the stores the cascade actually fans across — a leftover legacy `inventory.db` on disk (only possible outside ADR-0009's "no fleet ever ran pre-Postgres" assumption) was never part of it: `InventoryStore::delete_agent()` stopped scrubbing that file when its one-time backfill was retired (#3623), since the erasure branch existed only to serve the backfill.
 
 ---
 
@@ -7479,6 +7517,8 @@ inline drawer's live updates on the **Instructions → Executions** tab.
 **Management-group confinement (#1634).** Gated by `require_fleet_read`/`fleet_read_fn` (ADR-0017 admit-then-filter), not a flat global `Execution:Read` check — a management-group-confined operator is admitted and then sees only their in-scope agents' events. The caller who **dispatched** the execution is always admitted to the stream (visibility only — avoids a false 404 on a just-dispatched execution with zero responses yet), but that ownership never bypasses the per-event redaction below. RBAC-off → unrestricted (legacy-open). **This gate is evaluated once, at subscribe time** — it is not re-checked for the life of the connection. If your scope is narrowed, or your session is revoked, mid-stream, an already-open subscription is not automatically disconnected (tracked: #3788); a full server restart is the only thing that currently drops every live stream.
 
 **Reconnect / replay:** the server keeps a per-execution ring buffer of up to 1000 events covering ~30 seconds of activity. Browsers' `EventSource` automatically sends `Last-Event-ID` on reconnect; the server replays events whose monotonic id is greater than that value before resuming live publication.
+
+**Cross-replica delivery (HA WS-2a-2).** On a multi-replica HA deployment, events that originate on another server replica are delivered onto this replica's live stream by a ~2s cross-replica poll, so a subscriber sees live progress driven from any replica; this delivery is at-least-once (a duplicate may be re-sent, never dropped). The `id:` field is unchanged — it stays a per-channel monotonic value assigned in publish order, so `Last-Event-ID` / `?since` reconnect works exactly as before on the replica you are connected to. Reconnect *across* replicas after a failover is not yet loss-free — see `docs/executions-history-ladder.md`. Single-replica deployments are unaffected.
 
 **Event types:**
 

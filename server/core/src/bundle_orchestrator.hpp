@@ -3,6 +3,7 @@
 #include "authz_model.hpp"    // #1788: VisibleSet — dispatch() confinement param
 #include "bundle_service.hpp" // BundleStepSpec, DispatchedStep, BundleAggregate
 #include "dispatch_caller.hpp" // PR1.9c: DispatchCaller — DispatchFn's caller param
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome — DispatchFn's return type
 
 #include <cstddef>
 #include <cstdint>
@@ -61,7 +62,7 @@ public:
     /// Per-command dispatcher — the SAME shape REST/MCP already use:
     /// returns {command_id, agents_reached}. agents_reached == 0 means the
     /// command did not reach any agent (offline) → that step is dispatch-failed.
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope,
         const std::unordered_map<std::string, std::string>& params,

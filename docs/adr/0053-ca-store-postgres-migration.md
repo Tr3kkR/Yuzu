@@ -502,3 +502,23 @@ work happens well after any barrier releases (pass 15 re-verify, table below).
   — a genuine production serial collision remains believed-negligible given random 128-bit
   serials, and this migration adds the typed-retry infrastructure without asserting the flake's
   root cause is fully diagnosed.
+
+## Update (2026-09-03) — `migrate_from_sqlite()` retired
+
+**Supersedes the "retained for one release" sentence above.** ADR-0009's fresh-start-by-default
+amendment (2026-08-25) establishes that no production Yuzu fleet has ever run a pre-Postgres
+build of any store — the mandatory, three-table, fingerprint-verified backfill this ADR designed
+was real, working code that never had real legacy data to protect.
+
+`CaStore::migrate_from_sqlite()` and its private helpers/types (`LegacyRootRow`, `LegacyIssuedRow`,
+`LegacyCrlRow`, `sha256_hex`, `append_field`, `canonicalize_legacy`, `sqlite_table_exists`,
+`safe`, `kSourcelessFingerprint`) are removed (`chore/retire-migrate-from-sqlite-batch-a`,
+tracking issue #3623). `sqlite_backfill_source` — whose entire purpose was the backfill
+idempotency marker — is dropped via a version-bumped `{2, "DROP TABLE IF EXISTS
+sqlite_backfill_source;"}` migration, appended after the already-shipped v1 rather than editing
+it in place: this store IS constructed in production, so v1 has actually run against real
+dev/UAT databases. `server.cpp`'s boot path now runs `legacy_sqlite_probe::warn_if_legacy_rows`
+over `ca_root`/`ca_issued`/`ca_crl_versions` instead of the backfill — WARN-only (never
+refuse-boot) on a real legacy row found, same posture as every other store in this retirement
+batch; the issued-cert/CRL evidence-chain concern the original mandatory backfill protected
+against a real installation never having existed to trigger it.

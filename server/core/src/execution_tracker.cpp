@@ -6,6 +6,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "secure_random.hpp"
 
 #include <yuzu/audit_retention_rules.hpp>
 #include <yuzu/metrics.hpp>
@@ -328,6 +329,33 @@ const std::vector<pg::PgMigration>& migrations() {
          ");"
          "CREATE INDEX idx_event_outbox_created ON event_outbox(created_at);"
          "CREATE INDEX idx_event_outbox_exec ON event_outbox(execution_id, event_id);"},
+        // HA WS-2a-2 (cross-replica delivery, ADR-2002 §5). Two columns the
+        // durable forward-poll consumer needs, added to the WS-2a-1 table:
+        //   w_xid — the appending transaction's 64-bit xid8 (default
+        //     pg_current_xact_id(), evaluated per-INSERT). The poll cursor is a
+        //     single xid8 COMMIT-SETTLE HORIZON: each pass reads rows whose w_xid
+        //     is in [last_horizon, xmin) where xmin =
+        //     pg_snapshot_xmin(pg_current_snapshot()), then advances last_horizon
+        //     to xmin. Because xmin (the oldest RUNNING xid) is monotonic and
+        //     never passes an uncommitted xid, no still-in-flight lower-id row can
+        //     be straddled and skipped — the id-ordering hazard the WS-2a-1 append
+        //     contract records. A bare `event_id > cursor` skips a slow-committing
+        //     lower id; an `(w_xid, event_id)` KEYSET cursor also skips a low-xid
+        //     txn that was in-flight at boot and commits below the tuple — so the
+        //     cursor is the xmin horizon, and this (w_xid, event_id) index only
+        //     provides the range scan + publish ORDER within a settled window,
+        //     not the cursor position. See poll_event_outbox_once's derivation.
+        //   origin_replica — the process-instance id that appended the row, so a
+        //     replica's poll loop SKIPS its own rows (it already published them
+        //     in-process); other replicas re-publish them onto their local bus.
+        // xid8 (64-bit, wraparound-safe) + pg_current_xact_id()/pg_snapshot_xmin
+        // are PG13+; the substrate is PG18. Existing rows get the migration txn's
+        // xid on the rewrite (all pre-migration, hence already settled).
+        {5,
+         "ALTER TABLE event_outbox ADD COLUMN w_xid xid8 NOT NULL "
+         "  DEFAULT pg_current_xact_id();"
+         "ALTER TABLE event_outbox ADD COLUMN origin_replica TEXT NOT NULL DEFAULT '';"
+         "CREATE INDEX idx_event_outbox_wxid ON event_outbox(w_xid, event_id);"},
     };
     return kMigrations;
 }
@@ -341,8 +369,14 @@ const std::vector<pg::PgMigration>& migrations() {
 // propagate that false out of the enclosing with_txn callback so the whole
 // transaction rolls back — that propagation is what makes the pairing atomic
 // (see the four call sites in upsert_agent_status_once / refresh_counts_once /
-// mark_cancelled). `event_id` is a global durable monotonic BIGINT IDENTITY
-// assigned at INSERT; `created_at` is authored from Postgres now() IN-SQL, so
+// mark_cancelled). `origin_replica` is the appending process's instance id,
+// stamped so a replica's cross-replica poll loop skips its OWN rows (already
+// published in-process) and re-publishes only other replicas'. The durable
+// `event_id` (BIGINT IDENTITY assigned at INSERT) and `w_xid` are for the poll's
+// settle-horizon cursor + the slice-2 durable replay; they are NOT threaded to
+// the in-memory bus (HA WS-2a-2 Option A — the live bus id stays the per-channel
+// counter, see the bus publish body). `created_at` is authored from Postgres
+// now() IN-SQL, so
 // the reap cutoff and the row share one DB clock domain (the same
 // DB-clock-authority reason record_command_execution authors created_at
 // in-SQL).
@@ -364,7 +398,9 @@ const std::vector<pg::PgMigration>& migrations() {
 // committed OR proven rolled back (aborted-txn gaps are permanent); or (b) a
 // txid/snapshot-horizon cursor — poll only rows whose inserting xid is below the
 // database's all-committed xmin horizon (pg_snapshot_xmin(pg_current_snapshot())),
-// which is exactly the "no in-flight lower id can still appear" guarantee. Only a
+// which is exactly the "no in-flight lower id can still appear" guarantee.
+// WS-2a-2 implements (b) — see poll_event_outbox_once (an xmin-horizon WINDOW,
+// endorsed by the 2026-09-02 architect review). Only a
 // per-execution RECONNECT replay (`execution_id = $1 AND event_id > $since` on a
 // `Last-Event-ID` reconnect) is safe with a bare id cursor — those rows are
 // long-committed by the time the consumer reconnects. A per-execution LIVE
@@ -399,14 +435,21 @@ const std::vector<pg::PgMigration>& migrations() {
 // produces no duplicate; only the rare ambiguous-commit case does.
 bool append_event_outbox(PGconn* conn, const std::string& execution_id,
                          const std::string& event_type, const std::string& data,
-                         bool is_terminal) {
+                         bool is_terminal, const std::string& origin_replica) {
     pg::PgResult res = pg::exec_params(
         conn,
         "INSERT INTO execution_tracker.event_outbox "
-        "(execution_id, event_type, data, is_terminal, created_at) "
-        "VALUES ($1, $2, $3, $4, extract(epoch FROM now())::bigint) RETURNING event_id",
-        std::vector<std::string>{execution_id, event_type, data, is_terminal ? "true" : "false"});
-    if (res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1)
+        "(execution_id, event_type, data, is_terminal, created_at, origin_replica) "
+        "VALUES ($1, $2, $3, $4, extract(epoch FROM now())::bigint, $5)",
+        std::vector<std::string>{execution_id, event_type, data, is_terminal ? "true" : "false",
+                                 origin_replica});
+    // w_xid is filled by the column DEFAULT pg_current_xact_id() — the appending
+    // txn's xid, the settle-horizon the cross-replica poll cursors on. The durable
+    // event_id is assigned by the IDENTITY column and read back by the poll from
+    // the outbox (HA WS-2a-2 Option A) — it is deliberately NOT returned to the
+    // caller for the in-memory bus publish (see the bus publish body for why the
+    // live bus id stays the per-channel counter).
+    if (res.status() == PGRES_COMMAND_OK)
         return true;
     // Log the durable-append failure DISTINCTLY (PR #3842 review): the caller's
     // own error log now covers TWO independent statements (its state write and
@@ -422,6 +465,17 @@ bool append_event_outbox(PGconn* conn, const std::string& execution_id,
 } // namespace
 
 ExecutionTracker::ExecutionTracker(pg::PgPool& pool) : pool_(pool) {
+    // HA WS-2a-2: this process's outbox instance identity, stamped as
+    // origin_replica on every durable append for cross-replica skip-own. 16
+    // random bytes → 32 hex chars. A secure-RNG failure leaves it empty (logged)
+    // — self-exclusion then no-ops, which is safe-but-chatty (this replica would
+    // re-publish its own already-published events), never a correctness break.
+    if (auto rid = yuzu::server::random_hex(16); rid) {
+        replica_id_ = *rid;
+    } else {
+        spdlog::error("ExecutionTracker: secure RNG failed for replica id — "
+                      "cross-replica skip-own self-exclusion disabled (safe, chattier)");
+    }
     // Construction-only unbounded acquire (ADR-0012 §2) — every runtime
     // acquire elsewhere in this file is bounded.
     auto lease = pool_.acquire();
@@ -437,6 +491,29 @@ ExecutionTracker::ExecutionTracker(pg::PgPool& pool) : pool_(pool) {
         return;
     }
     open_ = true;
+
+    // HA WS-2a-2 (self-adversarial C1): initialize the cross-replica poll horizon
+    // to the all-committed xmin at CONSTRUCTION — which runs before the server
+    // admits any SSE subscriber — NOT lazily on the first maintenance poll (~2s
+    // later). A lazy first-poll init would advance the horizon past any foreign
+    // event that committed during the boot→first-poll window, so a subscriber
+    // connected at boot would never receive those live events (a LIVE gap the
+    // slice-2 reconnect replay cannot heal). Initializing here makes the first
+    // poll deliver the whole [construction-xmin, first-poll-xmin) window. On an
+    // xmin read failure we leave poll_horizon_ empty + poll_initialized_ false;
+    // the poll's lazy-init fallback then establishes it (ceding that one window),
+    // which is strictly better than refusing to poll.
+    if (pg::PgResult x = pg::exec_params(
+            lease.get(), "SELECT pg_snapshot_xmin(pg_current_snapshot())::text",
+            std::vector<std::string>{});
+        x.status() == PGRES_TUPLES_OK && PQntuples(x.get()) == 1) {
+        poll_horizon_ = col_str(x.get(), 0, 0);
+        poll_initialized_ = true;
+    } else {
+        spdlog::warn("ExecutionTracker: could not read boot poll horizon ({}) — the first "
+                     "cross-replica poll will lazily initialize it, ceding the boot window",
+                     pool_.last_error());
+    }
     // ADR-0009's 2026-08-25 fresh-start-by-default amendment: no
     // migrate_from_sqlite here, unconditionally, no flag. The caller
     // (server.cpp) separately runs legacy_sqlite_probe::warn_if_legacy_rows()
@@ -895,7 +972,7 @@ ExecutionTracker::upsert_agent_status_once(const std::string& execution_id,
 
         // Durable append, atomic with the upsert above. A false rolls both back.
         if (!append_event_outbox(conn, execution_id, "agent-transition", payload.dump(),
-                                 /*is_terminal=*/false))
+                                 /*is_terminal=*/false, replica_id_))
             return false;
 
         if (event_bus_)
@@ -1128,14 +1205,14 @@ bool ExecutionTracker::refresh_counts_once(const std::string& execution_id) {
             if (transitioned_terminal)
                 progress_payload["status"] = final_status_str;
             if (!append_event_outbox(conn, execution_id, "execution-progress",
-                                     progress_payload.dump(), transitioned_terminal))
+                                     progress_payload.dump(), transitioned_terminal, replica_id_))
                 return false;
             if (transitioned_terminal) {
                 terminal_payload["status"] = final_status_str;
                 terminal_payload["agents_success"] = exec->agents_success;
                 terminal_payload["agents_failure"] = exec->agents_failure;
                 if (!append_event_outbox(conn, execution_id, "execution-completed",
-                                         terminal_payload.dump(), /*is_terminal=*/true))
+                                         terminal_payload.dump(), /*is_terminal=*/true, replica_id_))
                     return false;
             }
             if (event_bus_) {
@@ -1237,7 +1314,7 @@ bool ExecutionTracker::mark_cancelled(const std::string& id, const std::string& 
         matched = true;
 
         if (!append_event_outbox(conn, id, "execution-completed", payload.dump(),
-                                 /*is_terminal=*/true))
+                                 /*is_terminal=*/true, replica_id_))
             return false;
 
         if (event_bus_)
@@ -2401,6 +2478,163 @@ std::expected<EventOutboxReapOutcome, std::string> ExecutionTracker::reap_event_
     if (!ok)
         return std::unexpected(err.empty() ? "outbox reap failed" : err);
     return EventOutboxReapOutcome{deleted, clock_anomaly};
+}
+
+// HA WS-2a-2 (ADR-2002 §5): the cross-replica delivery poll. Reference: the
+// enterprise-architect design review 2026-09-02 (verdict ENDORSE/SOUND) + the
+// ID-ORDERING CONTRACT on append_event_outbox above.
+//
+// WHY AN XID HORIZON, NOT A KEYSET. event_outbox.event_id is assigned at INSERT
+// but the row is visible only at COMMIT, so a lower-id txn can commit AFTER a
+// higher-id one (and aborted txns leave permanent id gaps). Two cursors that
+// LOSE events, and the one that does not:
+//   * `event_id > cursor`               — skips a slow-committing lower id
+//                                          forever.                          ✗
+//   * `(w_xid,event_id) > last_read` keyset — ALSO loses at the boot boundary: a
+//     txn in-flight at boot with a LOWER xid commits after boot, lands BELOW the
+//     cursor tuple, and is skipped forever.                                  ✗
+//   * xid8 HORIZON WINDOW — the cursor is a single xid8 `poll_horizon_`. Each
+//     pass reads w_xid IN [poll_horizon_, xmin) and advances poll_horizon_ to
+//     xmin. xmin = pg_snapshot_xmin(pg_current_snapshot()) is the oldest RUNNING
+//     xid and is MONOTONIC NON-DECREASING (new txns always draw HIGHER xids, so
+//     the running-set minimum only rises), so xmin never passes an uncommitted
+//     xid — an in-flight low xid PINS xmin until it settles, then the window
+//     sweeps it up exactly once. No committed row can appear below an
+//     already-advanced horizon.                                              ✓
+// Init poll_horizon_ = xmin at boot: skips all pre-boot history (a reconnecting
+// subscriber replays history from the durable outbox by execution_id — the
+// SEPARATE slice-2 path — NOT this live poll, whose only job is the live tail).
+// The horizon is a CONSERVATIVE cut: it re-delivers the small tail of
+// pre-boot-committed rows whose xid >= boot-xmin (committed while an older txn
+// still ran) — a bounded DUP, never a loss; do NOT "fix" it into a commit-TIME
+// cut (created_at is txn-START time and does not linearize commit order).
+//
+// SINGLE SNAPSHOT (review hardening i): xmin is computed ONCE, in-SQL, in the
+// same statement as the read (the CTE `s`, LEFT-JOINed so xmin comes back even
+// on an empty window), and the horizon advances to THAT xmin — so the window
+// filter and the advance use the IDENTICAL value, no two-snapshot skew. xid8
+// comparisons are done IN SQL against `$1::xid8` (review hardening ii) — NEVER
+// by stringifying and comparing lexically in C++ ('9' > '10' as text is a silent
+// gap); C++ only round-trips the xid8 as decimal text and does numeric equality.
+//
+// CAP IS A HARD STATIC FLOOR (the review's one required guardrail). On a full
+// batch the horizon advances to the LAST row's w_xid (re-reading that one xid's
+// rows next pass — a bounded, tolerated dup) rather than to xmin. That is
+// lossless AND progress-guaranteed ONLY IF the cap exceeds the max rows a SINGLE
+// txn appends (refresh_counts writes 2; upsert/cancel 1 — so <= 3).
+// kPollBatchCap is a compile-time constant far above that, never a runtime knob
+// that could drop to <= 3 and livelock the drain into silent loss. Belt-and-
+// suspenders: a full batch whose first and last w_xid are EQUAL (impossible
+// under <=3-per-xid) is logged as a loud invariant violation, not silently
+// re-pinned.
+//
+// SKIP-OWN: rows this replica appended (origin_replica == replica_id_) were
+// already published in-process at append time, so the poll excludes them via
+// `($2 = '' OR origin_replica <> $2)`. An empty replica_id_ (secure-RNG failure
+// at construction) disables self-exclusion — this replica then re-publishes its
+// OWN events onto its own bus, a tolerated dup (§5), never a miss.
+//
+// OPERATIONAL (head-of-line, architect review): the horizon is the server's
+// GLOBAL all-committed xmin, so one long-running transaction anywhere on that
+// PostgreSQL pins it and DELAYS — never drops — cross-replica delivery until
+// that txn commits. Fine here (outbox txns are tiny/short and the server owns
+// its PG); a long analytic query or a stuck 2PC sharing the substrate would
+// spike cross-replica SSE latency to that txn's lifetime. This is inherent to a
+// loss-free forward drain over an outbox (the id-gap-pending alternative stalls
+// the same way); a NOTIFY hint does not change it.
+//
+// The re-publish is bus-LOCAL — nothing is written back to the outbox — so no
+// cross-replica amplification is possible; duplicate volume is bounded to one
+// window / one xid worth. HOT-STANDBY CAVEAT (review): the monotonic-xmin
+// reasoning holds only against the PRIMARY; the pool DSN points at the primary
+// (ADR-0007), so this is safe as wired — a future standby-read routing would
+// need it re-argued per connection.
+std::expected<int, std::string> ExecutionTracker::poll_event_outbox_once() {
+    if (!open_ || !event_bus_)
+        return 0; // nothing to drain into
+    static constexpr int kPollBatchCap = 512; // >> max rows per single txn (<= 3)
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string("event_outbox poll: pool acquire timeout — ") +
+                               pool_.last_error());
+    PGconn* conn = lease.get();
+
+    // Lazy boot-init: horizon = the current all-committed xmin, so this replica
+    // delivers only events that settle AFTER it booted (pre-boot history is the
+    // reconnect-replay path's job). The first pass establishes the horizon and
+    // delivers nothing.
+    if (!poll_initialized_) {
+        pg::PgResult x = pg::exec_params(
+            conn, "SELECT pg_snapshot_xmin(pg_current_snapshot())::text", std::vector<std::string>{});
+        if (x.status() != PGRES_TUPLES_OK || PQntuples(x.get()) != 1)
+            return std::unexpected(std::string("event_outbox poll init xmin: ") +
+                                   PQerrorMessage(conn));
+        poll_horizon_ = col_str(x.get(), 0, 0);
+        poll_initialized_ = true;
+        return 0;
+    }
+
+    // s LEFT JOIN outbox: the settle-horizon xmin (s.x) always comes back — even
+    // when the window matches no cross-replica rows — so the horizon can advance
+    // to the SAME xmin the filter used. Filter conditions live in ON, not WHERE,
+    // so the null-padded sentinel row survives when there is no match.
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "WITH s AS (SELECT pg_snapshot_xmin(pg_current_snapshot()) AS x) "
+        "SELECT e.event_id, e.execution_id, e.event_type, e.data, e.is_terminal, "
+        "       e.w_xid::text, s.x::text "
+        "FROM s LEFT JOIN execution_tracker.event_outbox e "
+        "  ON e.w_xid >= $1::xid8 AND e.w_xid < s.x "
+        "     AND ($2 = '' OR e.origin_replica <> $2) "
+        "ORDER BY e.w_xid, e.event_id "
+        "LIMIT $3::int",
+        std::vector<std::string>{poll_horizon_, replica_id_, std::to_string(kPollBatchCap)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string("event_outbox poll: ") + PQerrorMessage(conn));
+
+    const int n = PQntuples(res.get());
+    std::string cur_xmin;
+    std::string first_wxid, last_wxid;
+    int published = 0;
+    for (int i = 0; i < n; ++i) {
+        if (i == 0)
+            cur_xmin = col_str(res.get(), i, 6); // s.x — identical on every row
+        if (PQgetisnull(res.get(), i, 0))
+            continue; // empty-window sentinel (LEFT JOIN, no matching outbox row)
+        const std::string execution_id = col_str(res.get(), i, 1);
+        const std::string event_type = col_str(res.get(), i, 2);
+        const std::string data = col_str(res.get(), i, 3);
+        const bool is_terminal = std::string(col(res.get(), i, 4)) == "t";
+        const std::string wxid = col_str(res.get(), i, 5);
+        if (published == 0)
+            first_wxid = wxid;
+        last_wxid = wxid;
+        // Re-publish onto the LOCAL bus with a per-channel counter id (HA WS-2a-2
+        // Option A) — NOT the durable event_id. The durable id (col 0) drives
+        // this poll's ORDER BY / cursor only; the live bus id stays the
+        // reconnect-safe local counter (see the bus publish body). Cross-replica
+        // cursor stability (a failover subscriber resuming by durable id) is the
+        // slice-2 durable-replay concern, not this live re-publish.
+        event_bus_->publish(execution_id, event_type, data, is_terminal);
+        ++published;
+    }
+
+    if (published < kPollBatchCap) {
+        poll_horizon_ = cur_xmin; // whole settled window consumed
+    } else {
+        // Backlog: advance to the last row's xid rather than xmin, re-reading
+        // that one xid's rows next pass (a bounded, tolerated dup). Progress is
+        // guaranteed because a batch of kPollBatchCap rows spans many xids
+        // (<= 3 rows/xid) — UNLESS the invariant is violated, which we surface.
+        if (first_wxid == last_wxid)
+            spdlog::error("ExecutionTracker::poll_event_outbox_once: a full batch ({}) fell "
+                          "entirely within one xid {} — the <=3-rows-per-txn invariant is "
+                          "violated and the cross-replica drain may stall",
+                          kPollBatchCap, last_wxid);
+        poll_horizon_ = last_wxid;
+    }
+    return published;
 }
 
 } // namespace yuzu::server

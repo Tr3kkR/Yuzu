@@ -2,14 +2,14 @@
 """test_capability_catalogue_complete.py — PR1.9's cross-fragment drift gate.
 
 The capability catalogue (`server/core/src/command_capability.hpp`'s
-`CommandCapability` rows) is authored as SIX independent, hand-written
-sources: five per-plugin-group fragment headers
-(`capability_decls/plugin_action_catalogue_{content_dist,a,b,c,d}.hpp`,
+`CommandCapability` rows) is authored as SEVEN independent, hand-written
+sources: six per-plugin-group fragment headers
+(`capability_decls/plugin_action_catalogue_{content_dist,a,b,c,d,filesystem_posture}.hpp`,
 each owned by a different package) plus the core-owned
 `capability_decls/core_dispatch_capabilities.hpp` (the three
 system-initiated dispatches a plugin never receives from a caller —
 `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`). Nobody
-mechanically checks that these six sources, taken together, actually match
+mechanically checks that these seven sources, taken together, actually match
 what the plugins declare via their `actions()` override. This script is
 that check.
 
@@ -17,21 +17,21 @@ It parses every `actions()` override under `agents/plugins/*/src/*.cpp`
 (each plugin's `name()` override gives the plugin half of the pair; the
 literal strings inside the `static const char* acts[] = {...}` array give
 the action half) and cross-references the result against every
-`.plugin = "..."` / `.action = "..."` pair declared across the six
+`.plugin = "..."` / `.action = "..."` pair declared across the seven
 capability-catalogue headers. It fails, naming the exact offending
 `plugin.action`, when:
 
   1. A plugin declares an action that has no catalogue row anywhere across
-     the six sources (a MISSING row) — a plugin ships a capability the
+     the seven sources (a MISSING row) — a plugin ships a capability the
      dispatch-classification layer would report `Unclassified` for.
-  2. One of the five per-group fragments declares a `plugin.action` no
+  2. One of the six per-group fragments declares a `plugin.action` no
      plugin's `actions()` override names (a BOGUS row) — dead, unreachable
      catalogue data, or a typo that silently shadows the real action. (The
      core-owned fragment is exempt from this direction only:
      `__guard__.push_rules` is a real, intentional row with no backing
      plugin — Guardian's rule-push is a server-internal dispatch, not
      something any plugin's `actions()` ever lists.)
-  3. The same `plugin.action` is declared by more than one of the six
+  3. The same `plugin.action` is declared by more than one of the seven
      sources (a DUPLICATE row) — two independently-authored fragments
      racing to classify the same dispatch, which `CommandCapabilityRegistry
      ::classify` resolves as `Ambiguous`, never first-wins (see
@@ -75,6 +75,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_b.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_c.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 
@@ -154,11 +155,11 @@ def diff_catalogue(
 
     Returns `(missing, bogus, duplicates)`:
       - `missing`: plugin.action pairs a plugin declares that no source
-        (any of the five fragments, or core) covers.
-      - `bogus`: plugin.action pairs one of the five FRAGMENT files declares
+        (any of the six per-group headers, or core) covers.
+      - `bogus`: plugin.action pairs one of the six FRAGMENT files declares
         that no plugin actually has (core is exempt — see module docstring).
       - `duplicates`: plugin.action -> list of >=2 source labels that each
-        declared it independently (across all six sources, fragments and
+        declared it independently (across all seven sources, fragments and
         core alike — a fragment/core collision is exactly as ambiguous to
         `CommandCapabilityRegistry::classify` as a fragment/fragment one).
     """
@@ -204,7 +205,7 @@ def format_gaps(
 
 class TestCatalogueCompleteOnRealTree(unittest.TestCase):
     """The actual drift gate: parses the live repository and fails, naming
-    every gap, if the plugins' actions() tables and the six capability
+    every gap, if the plugins' actions() tables and the seven capability
     sources have drifted apart.
     """
 
