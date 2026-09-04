@@ -292,6 +292,25 @@ bool UpdateRegistry::is_eligible(const std::string& agent_id, int rollout_pct) {
 }
 
 std::filesystem::path UpdateRegistry::binary_path(const UpdatePackage& pkg) const {
+    // REVALIDATE AT READ TIME, not only at upload. The upload-time guard (#3863)
+    // protects new rows, but every consumer derives its on-disk path from the
+    // STORED row: `CheckForUpdate` serves the sidecar beside it, and the delete
+    // route unlinks both. A row written before that guard landed — or by direct
+    // database access — would otherwise have its traversal filename resolved
+    // here and then read from, or deleted, outside `update_dir_`.
+    //
+    // Returning an EMPTY path rather than a joined one is deliberate: joining an
+    // empty or malformed name yields `update_dir_` itself, and handing that to a
+    // remove() is far worse than handing it nothing. `exists()`, `remove()` and
+    // `ifstream` on an empty path all fail benignly, so every existing caller
+    // degrades to "no such package" without needing to learn a new contract.
+    if (!is_safe_package_filename(pkg.filename)) {
+        spdlog::error("UpdateRegistry: refusing to resolve a path for {}/{}/{} — stored filename "
+                      "'{}' is not a bare filename; the row predates the upload guard or was "
+                      "written out of band",
+                      pkg.platform, pkg.arch, pkg.version, pkg.filename);
+        return {};
+    }
     return update_dir_ / pkg.filename;
 }
 
@@ -300,7 +319,14 @@ std::filesystem::path UpdateRegistry::signature_path(const UpdatePackage& pkg) c
     // filename is operator-controlled, and letting the signature location be
     // named independently would allow a package to point at some other
     // package's signature.
-    return signature_sidecar_path(binary_path(pkg));
+    //
+    // The empty-path case must NOT be appended to: `signature_sidecar_path({})`
+    // would yield the relative name ".sig", which resolves against the process
+    // working directory rather than against nothing.
+    auto binary = binary_path(pkg);
+    if (binary.empty())
+        return {};
+    return signature_sidecar_path(binary);
 }
 
 } // namespace yuzu::server

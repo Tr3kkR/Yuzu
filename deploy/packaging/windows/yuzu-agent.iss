@@ -400,6 +400,50 @@ begin
   end;
 end;
 
+{ Verify the trust-anchor ACL actually took.
+
+  The [Run] icacls entry is what locks C:\ProgramData\Yuzu\agent-certs down, but
+  Inno's default response to a failed [Run] step is a DISMISSIBLE error. On a host
+  where icacls is blocked (AV/EDR, or a hardened policy) an operator can click
+  through and finish the install with the directory still inheriting ProgramData's
+  ACEs -- which is exactly the "an unprivileged local user pre-plants the anchor
+  file" state that step exists to prevent, reached silently.
+
+  This re-checks the result and aborts the install if any inherited ACE remains.
+  It tests an EXIT CODE rather than parsing icacls output: `find` returns 0 when it
+  matches, so the pipeline exits 1 if an "(I)" inherited entry is still listed. }
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  CertDir: string;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+
+  CertDir := ExpandConstant('{commonappdata}\Yuzu\agent-certs');
+
+  if not Exec(ExpandConstant('{cmd}'),
+              '/C icacls "' + CertDir + '" | find "(I)" >nul && exit 1 || exit 0',
+              '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    { Could not run the check at all. Do not fail the install on that alone --
+      the ACL may well be correct and we simply cannot confirm it -- but say so
+      rather than implying it was verified. }
+    MsgBox('Could not verify the permissions on:' + #13#10 + CertDir + #13#10#13#10 +
+           'Confirm manually that it does not inherit permissions before placing ' +
+           'the update trust bundle there.', mbInformation, MB_OK);
+    Exit;
+  end;
+
+  if ResultCode <> 0 then
+    RaiseException('The update trust-anchor directory still inherits permissions:' + #13#10 +
+                   CertDir + #13#10#13#10 +
+                   'Unprivileged local users may be able to create the trust bundle there ' +
+                   'before you do, which would let them authorise their own agent updates. ' +
+                   'Securing it (icacls /inheritance:r) did not take effect -- security ' +
+                   'software may have blocked it. The installation has been stopped.');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then

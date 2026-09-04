@@ -211,12 +211,23 @@ bool replace_signature_sidecar(const std::filesystem::path& sidecar,
         return !stale_ec;
     }
 
-    // ATOMIC REPLACE, not remove-then-write. CheckForUpdate reads this path
+    // REPLACE VIA RENAME, not remove-then-write. CheckForUpdate reads this path
     // concurrently, so a remove followed by a write publishes a window in which
     // the package is served UNSIGNED — brief, but an agent that polls inside it
     // is refused under --update-require-signature, and the operator sees a
-    // spurious refusal with no cause to point at. Writing a sibling and renaming
-    // means a reader sees either the old signature or the new one, never neither.
+    // spurious refusal with no cause to point at.
+    //
+    // ON POSIX the rename is atomic, so a reader sees either the old signature
+    // or the new one and never neither. ON WINDOWS IT IS NOT: the STL's
+    // replacement is documented as non-atomic for concurrent readers
+    // (microsoft/STL#5501), which can transiently surface ERROR_FILE_NOT_FOUND.
+    // `agent_service_impl` treats an absent sidecar as "no signature", so on a
+    // Windows-hosted server a concurrent re-upload can still expose a narrow
+    // unsigned window to an agent polling inside it — enforced-mode agents get a
+    // spurious refusal, permissive-mode agents apply on the hash alone. Narrower
+    // than remove-then-write, but not zero; closing it needs a publication
+    // primitive with a proven cross-platform reader-visibility guarantee, which
+    // this is not. Do not restate the POSIX guarantee as if it were universal.
     auto tmp = sidecar;
     tmp += ".tmp";
     {

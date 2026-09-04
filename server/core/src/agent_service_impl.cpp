@@ -2102,8 +2102,12 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
         case SidecarOutcome::kAbsent:
             break; // the ordinary unsigned case
         case SidecarOutcome::kOverCap:
-            spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (missing, "
-                          "over the {} byte cap, or not a regular file); serving as unsigned",
+            // NOT "missing" — an absent sidecar is the separate, deliberately
+            // silent kAbsent branch above. Naming it here sends an operator
+            // investigating an oversized or irregular file looking for one that
+            // is not there.
+            spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (over the {} "
+                          "byte cap, or not a regular file); serving as unsigned",
                           latest->filename, kMaxSignatureBytes);
             break;
         case SidecarOutcome::kUnreadable:

@@ -111,8 +111,26 @@ struct Harness {
             "127.0.0.1:" + std::to_string(port), grpc::InsecureChannelCredentials()));
     }
     ~Harness() {
-        if (server)
+        // TEARDOWN ORDER IS LOAD-BEARING, and getting it wrong crashed the
+        // Windows MSVC debug leg with an access violation (0xc0000005) when the
+        // SECOND harness in this binary started — the first one's threads were
+        // still unwinding.
+        //
+        //  1. Drop the client channel first, so no in-flight RPC is still
+        //     addressing a server that is about to go away.
+        //  2. Shutdown() only *initiates* shutdown and returns once the deadline
+        //     passes; it does NOT guarantee handler threads have returned.
+        //     Wait() is what blocks until they actually have. Shutdown-without-
+        //     Wait leaves gRPC background threads running past this scope.
+        //  3. Destroy the server explicitly, while `svc` is still alive — the
+        //     server holds a raw pointer to the registered service, so the
+        //     service must outlive it.
+        stub.reset();
+        if (server) {
             server->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(5));
+            server->Wait();
+            server.reset();
+        }
     }
 };
 
