@@ -41,6 +41,7 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <chrono>
 #include <thread>
 #include <string>
 #include <stdexcept>
@@ -307,6 +308,32 @@ TEST_CASE("a rollout against a DEGRADED registry is audited as failure, never as
     CHECK(row.detail.find("existence_unknown=true") != std::string::npos);
 }
 
+/// Block until a backend in this database is waiting on a lock, or give up.
+///
+/// The route runs on another thread and we must not commit the competing
+/// transaction until it is genuinely blocked — otherwise it reads AFTER the
+/// commit and the case passes whether or not the row was ever locked. (It did:
+/// the first version of this test passed with `FOR UPDATE` deleted.)
+///
+/// Polling `pg_stat_activity` rather than sleeping a fixed time is what keeps
+/// this a wait on OBSERVED STATE rather than a timing assumption; there is no
+/// future or condition variable to wait on across a database connection. The
+/// bound exists so a genuine absence of locking FAILS rather than hangs, and
+/// returning false is itself a real assertion — see the call site.
+[[nodiscard]] bool wait_for_lock_waiter(PGconn* conn) {
+    for (int i = 0; i < 400; ++i) { // ~10s ceiling, far above any real wait
+        pg::PgResult r{PQexec(conn, "SELECT count(*) FROM pg_stat_activity "
+                                    "WHERE datname = current_database() "
+                                    "AND wait_event_type = 'Lock' "
+                                    "AND pid <> pg_backend_pid()")};
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
+            std::string(PQgetvalue(r.get(), 0, 0)) != "0")
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return false;
+}
+
 TEST_CASE("the audited from= is the value the commit replaced, not a stale snapshot",
           "[ota][audit][settings_routes][pg]") {
     // The falsifier for the round-1 blocker. The route used to read the prior
@@ -315,14 +342,20 @@ TEST_CASE("the audited from= is the value the commit replaced, not a stale snaps
     // then asserted `from=<a value this write did not replace>` under a
     // `result=success` that audit-log.md calls "the point of this row".
     //
-    // NO TIMING ASSUMPTION. A competing transaction takes the row and changes it
-    // BEFORE the route is ever called, and holds the lock open across the call.
-    // The route's own `SELECT ... FOR UPDATE` therefore cannot read until that
-    // transaction commits, so the ordering is forced by the lock, not by a sleep.
+    // A competing transaction changes the row to 55 and HOLDS the lock. The
+    // route is then driven on another thread and must block; only once it is
+    // observed blocked does the competing transaction commit. That ordering is
+    // what makes the case decisive:
     //
-    // Without the lock this fails rather than flakes: a plain SELECT does not
-    // block on an uncommitted UPDATE — MVCC hands it the OLD row version — so
-    // the pre-fix code reports from=100 while the value actually replaced was 55.
+    //   with the row lock — the route's SELECT ... FOR UPDATE waits, then reads
+    //                       55, the value the commit left behind: from=55.
+    //   without it        — the SELECT reads straight past the uncommitted row
+    //                       and sees the OLD value (MVCC hands it the previous
+    //                       version); only its UPDATE blocks. It then reports
+    //                       from=100, a value it did not replace.
+    //
+    // Verified by mutation: deleting FOR UPDATE turns from=55 into from=100 and
+    // reddens this case.
     YUZU_REQUIRE_PG_DB_TPL(db, ota_audit_tpl);
     OtaAuditHarness h{db.dsn()};
     h.seed(/*rollout_pct=*/100, /*mandatory=*/true);
@@ -339,13 +372,16 @@ TEST_CASE("the audited from= is the value the commit replaced, not a stale snaps
         REQUIRE(upd.status() == PGRES_COMMAND_OK);
     }
 
-    // The route runs while that row is locked and uncommitted at 55.
     std::unique_ptr<httplib::Response> res;
     std::thread worker([&] { res = h.post_rollout("1.2.3", "7"); });
 
+    // Not a courtesy wait: if nothing ever blocks, nothing locked the row, and
+    // that is the defect this case exists to catch.
+    const bool blocked = wait_for_lock_waiter(other.get());
     pg::PgResult commit{PQexec(other.get(), "COMMIT")};
-    REQUIRE(commit.status() == PGRES_COMMAND_OK);
     worker.join(); // happens-before for everything the worker wrote
+    CHECK(blocked);
+    REQUIRE(commit.status() == PGRES_COMMAND_OK);
 
     REQUIRE(res);
     CHECK(res->status == 200);
