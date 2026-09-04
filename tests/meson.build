@@ -222,6 +222,8 @@ agent_test_exe = executable(
     # real return value; see unit/test_runner_main.cpp and catch2_nomain_dep
     # above.
     'unit/test_runner_main.cpp',
+    'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
+    'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
@@ -786,6 +788,7 @@ if build_server
       'unit/server/test_runtime_config_store.cpp',
       'unit/server/test_nvd.cpp',
       'unit/server/test_cpe_identity_resolver.cpp',
+      'unit/server/test_ota_signature_sidecar.cpp', # server half of OTA signature delivery (#416/#3807)
       'unit/server/test_update_registry.cpp',
       'unit/server/test_legacy_sqlite_probe.cpp',
       'unit/server/test_https_config.cpp',

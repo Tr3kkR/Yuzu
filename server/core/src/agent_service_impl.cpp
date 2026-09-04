@@ -1,5 +1,7 @@
 #include "agent_service_impl.hpp"
 
+#include "ota_signature_sidecar.hpp"
+
 #include "ota_audit_key.hpp"
 
 #include "on_behalf_guard.hpp"
@@ -2081,6 +2083,42 @@ grpc::Status AgentServiceImpl::CheckForUpdate(grpc::ServerContext* context,
     response->set_mandatory(latest->mandatory);
     response->set_eligible(eligible);
     response->set_file_size(latest->file_size);
+
+    // The detached signature, when the operator uploaded one (#416/#3807).
+    //
+    // Read fresh from the sidecar rather than cached: it is a few KB against an
+    // RPC an agent makes every six hours, and a cache would be one more place
+    // for the signature to go stale relative to the binary it covers. A missing
+    // sidecar is the ordinary unsigned case, not an error — the AGENT decides
+    // whether that is acceptable, since this server is not the authority on its
+    // own packages' authenticity.
+    {
+        const auto sig_path = update_registry_->signature_path(*latest);
+        std::string sig;
+        switch (read_signature_sidecar(sig_path, sig)) {
+        case SidecarOutcome::kServed:
+            response->set_update_signature(std::move(sig));
+            break;
+        case SidecarOutcome::kAbsent:
+            break; // the ordinary unsigned case
+        case SidecarOutcome::kOverCap:
+            // NOT "missing" — an absent sidecar is the separate, deliberately
+            // silent kAbsent branch above. Naming it here sends an operator
+            // investigating an oversized or irregular file looking for one that
+            // is not there.
+            spdlog::error("CheckForUpdate: signature sidecar for {} is unusable (over the {} "
+                          "byte cap, or not a regular file); serving as unsigned",
+                          latest->filename, kMaxSignatureBytes);
+            break;
+        case SidecarOutcome::kUnreadable:
+            // Present but unreadable is worth a log: the operator believes this
+            // package is signed and every agent will be told it is not.
+            spdlog::warn("CheckForUpdate: signature sidecar for {} exists but is unreadable; "
+                         "serving the package as unsigned",
+                         latest->filename);
+            break;
+        }
+    }
 
     spdlog::info("CheckForUpdate: agent {} v{} -> v{} (eligible={}, mandatory={})",
                  request->agent_id(), request->current_version(), latest->version, eligible,
