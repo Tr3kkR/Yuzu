@@ -111,13 +111,31 @@ struct SparkEngineStats {
     /// Monotonic. Surfaced as the sparse heartbeat tag `yuzu.spark_arm_race_unwatch_failures`;
     /// the fleet rollup, metrics.md row and alert rule are deferred to the
     /// prefer_spark flip alongside `retiring`/`retiring_cap` (spark_fleet_tags.hpp).
+    ///
+    /// #2833 — WHEN THAT TAG IS UNREACHABLE, which is exactly when it would matter most.
+    /// Increments that happen during SHUTDOWN never reach the wire: the agent's heartbeat
+    /// composer emits NOTHING once stop_requested_ is set (agent.cpp:2552 / :3281), and
+    /// both shutdown paths stop spark BEFORE joining the heartbeat thread (:1085 / :3315
+    /// vs :3095 / :3744). The engine's own gate says the same thing independently —
+    /// emit_spark_heartbeat_tags() takes the ABSENT posture on !running, and stop() has
+    /// already cleared running_. So a shutdown-window increment is JOURNAL-ONLY: its sole
+    /// egress is the spdlog::error at the increment site.
+    ///
+    /// OPERATOR CONSEQUENCE: a zero reading for this tag during a shutdown is NOT evidence
+    /// that nothing was orphaned. Accepted, not fixed — adding an egress here would be
+    /// inert, because the gate that suppresses it is the agent's and is deliberate
+    /// (STOPPED is not FAILED: a cleanly-stopping agent must not page on-call). Pinned by
+    /// "#2833 — a shutdown-window unwatch failure is counted but has NO heartbeat egress"
+    /// in test_spark_mechanism.cpp.
     std::uint64_t arm_race_unwatch_failures_total{0};
     /// Mechanism unwatch() calls that THREW during an ordinary disarm() teardown (#2270).
     /// The counterpart of the counter above, scoped the same way on purpose: that one
     /// covers teardown_arm_race, this one covers disarm(). Neither covers
     /// unregister_consumer() (#2814, worse in kind — see above), so a zero across
     /// BOTH is still not "no orphaned watches fleet-wide". Same per-mechanism
-    /// reclamation bound as its counterpart.
+    /// reclamation bound as its counterpart — and the same #2833 shutdown-window
+    /// unreachability, stated in full at that counter: an increment during shutdown is
+    /// journal-only, so a zero reading then is not evidence nothing was orphaned.
     std::uint64_t disarm_unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
     /// stop() calls whose BOUNDED wait for the in-flight mechanism-teardown lease

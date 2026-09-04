@@ -11,6 +11,7 @@
  */
 
 #include "spark_engine.hpp"
+#include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — the #2833 egress pin
 #include "spark_mechanism.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -1866,6 +1868,81 @@ TEST_CASE("#2815 — stop()'s teardown wait is BOUNDED and counts its own expiry
     // mechanism. Recorded, not lamented — the alternative is hanging shutdown.
     CHECK(fake->unwatch_calls_after_stop() == 1);
     // ~SparkEngine still runs its UNBOUNDED wait here; the lease is already drained.
+}
+
+// ── #2833: the unwatch-failure counters are unreachable in the shutdown window ──
+//
+// DISPOSITION: CONFIRMED, and accepted. Not fixed here, and deliberately so — the gap is
+// DOMINATED by a stronger, entirely intentional gate one layer up, so "fixing" the spark
+// layer would change nothing on the wire.
+//
+// The case below pins both halves of that claim so a future reader does not have to
+// re-derive it, and so the day someone DOES want this egress they find out immediately
+// that spark_heartbeat.hpp is not where the problem is.
+
+TEST_CASE("#2833 — a shutdown-window unwatch failure is counted but has NO heartbeat egress",
+          "[spark][mechanism][teardown]") {
+    // Drive the exact production shape: a disarm parked inside its post-mu_ window while
+    // stop() runs, whose mechanism unwatch() then throws. Post-#2815 stop() waits on the
+    // teardown lease, so the parked disarm genuinely runs its unwatch() against a
+    // still-live mechanism — the counter increments on the real path, not a simulated one.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(sub.has_value());
+
+    ParkGate gate;
+    fake->set_throw_unwatch(true);
+    engine.set_disarm_race_hook_for_test([g = &gate] {
+        ParkGate* local = g;
+        local->park();
+    });
+    std::thread disarmer([&] { engine.disarm(*sub); });
+    REQUIRE(gate.wait_entered());
+
+    std::thread stopper([&] { engine.stop(); });
+    gate.release();
+    disarmer.join();
+    stopper.join();
+
+    // Half one: the failure DID happen and IS counted.
+    const auto ss = engine.stats();
+    CHECK(ss.disarm_unwatch_failures_total == 1);
+    CHECK(ss.arm_race_unwatch_failures_total == 0); // still scoped to its own path
+
+    // Half two: and it has no route off the box. emit_spark_heartbeat_tags() is called
+    // with is_running(), which stop() has already set false, so it takes the ABSENT
+    // posture and emits NOTHING AT ALL — not "the tag is zero", not "the tag is absent
+    // because it is sparse": no tags whatsoever.
+    std::map<std::string, std::string> tags;
+    emit_spark_heartbeat_tags(tags, engine.is_running(), ss, engine.stats_by_type());
+    CHECK_FALSE(engine.is_running());
+    CHECK(tags.empty());
+
+    // THE TAG ITSELF IS FINE — that is the point. Feed the same stats in with running=true
+    // and the egress works perfectly. So the gap is NOT a missing tag in
+    // spark_heartbeat.hpp, and adding one there fixes nothing.
+    std::map<std::string, std::string> live_tags;
+    emit_spark_heartbeat_tags(live_tags, /*running=*/true, ss, engine.stats_by_type());
+    CHECK(live_tags.at("yuzu.spark_disarm_unwatch_failures") == "1");
+
+    // AND THE DOMINATING GATE IS HIGHER STILL, which is why this disposition does not
+    // depend on the engine's own running_ flag at all: agent.cpp:2552 emits NOTHING once
+    // stop_requested_ is set (agent.cpp:3281), and both shutdown paths stop spark AFTER
+    // that flag and BEFORE joining the heartbeat thread (agent.cpp:1085/3315 vs
+    // 3095/3744). So even an engine that somehow still reported running_ during teardown
+    // would compose a beat nobody sends. A change to spark_heartbeat.hpp is inert on the
+    // wire; the gate that would have to move is the agent's, and it is there on purpose
+    // (STOPPED is not FAILED — a cleanly-stopping agent must not page on-call).
+    //
+    // OPERATOR CONSEQUENCE, stated plainly because it is the part that matters: a zero
+    // reading for either unwatch-failure tag during a shutdown is NOT evidence that
+    // nothing was orphaned. The only egress for these increments in that window is the
+    // spdlog::error at each increment site (spark_engine.cpp, disarm() and
+    // teardown_arm_race()) — the agent journal, not the fleet metrics.
 }
 
 TEST_CASE("platform factories honor the mechanism-or-null contract", "[spark][mechanism]") {
