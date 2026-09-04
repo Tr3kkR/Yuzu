@@ -502,8 +502,17 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // netconn_backfill_hwm config key, and keeping it across a disable is the
     // FEATURE (the OS event log retains the paused window, so a re-enable
     // recovers it losslessly — no ghost events possible, nothing to clear).
-    const std::set<std::string_view> non_diff_sources = {"perf", "procperf", "netqual", "module",
-                                                          "netconn"};
+    // power/removable (Wave 6) are CURSOR sources: their only durable state is
+    // the tar_cursor row, not a snapshot-diff baseline, so diff_state_key is
+    // empty for both and apply_source_enabled_transition has nothing to clear.
+    // Unlike netconn, they do NOT recover the paused window on re-enable --
+    // CursorSource::on_enabled_changed(true) re-baselines forward and emits a
+    // capture_gap (tar_cursor.hpp's disable/re-enable contract), so the
+    // re-baseline is the source's own responsibility rather than a state clear
+    // performed out here.
+    const std::set<std::string_view> non_diff_sources = {"perf",     "procperf", "netqual",
+                                                          "module",   "netconn",  "power",
+                                                          "removable"};
 
     for (const auto& src : capture_sources()) {
         const bool is_diff = diff_sources.contains(src.name);

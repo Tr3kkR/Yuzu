@@ -22,6 +22,7 @@
 
 #include "tar_capture_status.hpp" // yuzu::tar::collect_or_retain
 #include "tar_collectors.hpp"
+#include "tar_cursor.hpp" // yuzu::tar::CursorSource, make_cursor_sources
 #include "tar_netqual_nstat.hpp"
 #include "tar_proc_etw.hpp"
 #include "tar_proc_es.hpp"
@@ -918,6 +919,19 @@ public:
             }
         }
 
+        // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
+        // Built once here as TarPlugin-owned members (P-002 — never a
+        // function-local static); make_cursor_sources() returns an empty
+        // vector this wave, so this loop is a no-op until wave 2's
+        // integrator adds the two push_backs. start()ed unconditionally
+        // (like proc_stream_/nstat_client_ above) so an operator flipping
+        // `<name>_enabled` later has a live subscription to resume against —
+        // the `<name>_enabled` gate itself is applied in collect_slow_impl's
+        // per-source region, not here.
+        cursor_sources_ = yuzu::tar::make_cursor_sources();
+        for (auto& src : cursor_sources_)
+            src->start(*db_);
+
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
         return {};
@@ -963,6 +977,14 @@ public:
                 // nstat_client_ under collect_mu_ (collect_fast_impl).
                 nstat_client_->stop();
             }
+            // Cursor-model sources (tar_cursor.hpp): every source's stop() is
+            // a bounded unregister/drain/join of everything it owns — called
+            // here, under collect_mu_, BEFORE db_.reset() below, exactly the
+            // proc_stream_/module_stream_/nstat_client_ ordering above. A
+            // source's stop() contract forbids it from touching db_ (or
+            // taking collect_mu_ itself) once this returns.
+            for (auto& src : cursor_sources_)
+                src->stop();
         }
         db_.reset();
         spdlog::info("TAR plugin shut down");
@@ -1111,6 +1133,14 @@ private:
     // every already-open tcp connection as newly "connected" (see the tcp
     // block's self-heal comment). Guarded by collect_mu_.
     bool nstat_tcp_primary_prev_{false};
+
+    // Cursor-model sources (tar_cursor.hpp: power, removable — wave 2). Built
+    // once in init() from make_cursor_sources() (empty this wave); NOT a
+    // function-local static (P-002) — these are TarPlugin-owned members with
+    // the same lifetime discipline as proc_stream_/module_stream_/
+    // nstat_client_ above: start()ed at init, stop()ped under collect_mu_
+    // in shutdown() BEFORE db_.reset() (see shutdown()).
+    std::vector<std::unique_ptr<yuzu::tar::CursorSource>> cursor_sources_;
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -2042,6 +2072,57 @@ private:
                 }
                 if (ok)
                     db_->set_state(md_key, mapdrive_to_json(*current).dump());
+            }
+        }
+
+        // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
+        // Generic driver over every constructed cursor source -- empty this
+        // wave (make_cursor_sources() returns {}), so this loop is a no-op
+        // until the wave-2 integrator adds the two push_backs; nothing else
+        // in tar_plugin.cpp needs to change when it does. Honours
+        // `<name>_enabled` the same way every other source above does
+        // (registry default via source_enabled -- power/removable default
+        // TRUE per the Alex ruling, tar_schema_registry.cpp).
+        for (auto& src : cursor_sources_) {
+            const std::string src_name = src->name();
+            if (!source_enabled(*db_, src_name)) {
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusSourceDisabled));
+                continue;
+            }
+            auto cursor = db_->get_cursor(src_name);
+            try {
+                // The source persists its own events+cursor atomically via
+                // insert_power_events_and_cursor / insert_removable_events_
+                // and_cursor (tar_db.hpp) from inside collect() -- this
+                // driver only orchestrates the enable gate, cursor load, the
+                // transient-failure skip (rule 1), and the status line.
+                auto result = src->collect(*db_, cursor);
+                total_events += static_cast<int>(result.events_emitted);
+                std::string_view token;
+                switch (result.outcome) {
+                case yuzu::tar::CursorOutcome::Baseline:
+                    token = yuzu::tar::kCollectStatusBaseline;
+                    break;
+                case yuzu::tar::CursorOutcome::Advanced:
+                    token = yuzu::tar::kCollectStatusCursorAdvanced;
+                    break;
+                case yuzu::tar::CursorOutcome::CursorLost:
+                    token = yuzu::tar::kCollectStatusCursorLost;
+                    break;
+                }
+                ctx.write_output(std::format("tar|collect_{}|{}|{}", src_name,
+                                             result.events_emitted, token));
+            } catch (const yuzu::tar::IncompleteCaptureError& e) {
+                // Rule 1: a transient read failure. The source must not have
+                // persisted anything on this path, so the cursor stays
+                // exactly as last written -- skip this tick's status/persist
+                // entirely, same collect_or_retain skip-and-retain contract
+                // as service/mapdrive above (tar_capture_status.hpp:187).
+                spdlog::warn("TAR: {} cursor collect incomplete ({}) -- retaining cursor",
+                            src_name, e.what());
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
             }
         }
 
@@ -3189,6 +3270,22 @@ private:
                     (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
                     pending_nstat_evs_.clear();
+                }
+                // Cursor-model sources (tar_cursor.hpp, P-002): forward the
+                // toggle to the matching source's on_enabled_changed(), under
+                // the same collect_mu_ a collection tick holds, so the
+                // transition is atomic w.r.t. an in-flight collect() -- same
+                // rationale as the #538 baseline-clear atomicity above. The
+                // source itself owns the disable-drain-discard /
+                // re-enable-rebaseline-and-gap contract (tar_cursor.hpp); this
+                // call site only routes the edge.
+                if (transition_ok) {
+                    for (auto& cs : cursor_sources_) {
+                        if (cs->name() == src_name) {
+                            cs->on_enabled_changed(v == "true");
+                            break;
+                        }
+                    }
                 }
             }
             if (!transition_ok) {

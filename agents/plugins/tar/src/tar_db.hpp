@@ -9,6 +9,8 @@
  * Schema:
  *   tar_state  — last-known state per collector for diff computation
  *   tar_config — key/value config (retention_days, redaction patterns, etc.)
+ *   tar_cursor — last-persisted cursor JSON per cursor-model source
+ *                (tar_cursor.hpp: power, removable — wave 2)
  *   plus the typed warehouse tiers generated from the schema registry.
  *
  * The legacy tar_events event log was retired by schema v3; it is neither
@@ -27,6 +29,7 @@
 #include <filesystem>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -294,6 +297,46 @@ struct NetConnRow {
     int64_t reason_code{0}; // WLAN disconnect/fail reason or NCSI change reason
 };
 
+/// One power_live row (cursor-model seam, tar_cursor.hpp) -- a sleep/wake/
+/// AC-power transition. FROZEN by the cursor seam: wave-2 collectors and the
+/// schema registry consume this shape exactly; changing a field is a
+/// contract change, not a refactor. `record_key` is the UNIQUE replay-
+/// idempotence key (tar_cursor.hpp rule 3) -- a value-only field for every
+/// OTHER purpose, never re-derived by a query.
+struct PowerEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // sleep, wake, ac_attached, ac_detached, capture_gap
+    std::string detail;
+    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+};
+
+/// One removable_live row (cursor-model seam, tar_cursor.hpp) -- an
+/// attach/detach transition of removable media, or a process observed
+/// executing from removable media. FROZEN, same rationale as PowerEvent.
+/// `image_path` + `pid` are TYPED identity-adjacent columns (P-004) added
+/// specifically so `exec_from_removable` rows can be correlated to a running
+/// process (ProcessInfo::exec_path, agents/core process_enum.hpp) — NOT
+/// derived from `evidence`, which (like `record_key`) is a value/forensic
+/// field only, never an identity carrier.
+struct RemovableEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // attached, detached, present_at_baseline,
+                        // exec_from_removable, capture_gap
+    std::string device_key;
+    std::string vendor;
+    std::string product;
+    std::string serial;
+    std::string bus;
+    std::string volume;
+    int64_t size_bytes{0};
+    std::string image_path; // typed identity column (P-004); "" when n/a
+    int64_t pid{0};         // typed identity column (P-004); 0 when n/a
+    std::string evidence;   // forensic/value field only — NOT identity
+    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+};
+
 /// Row from an arbitrary SQL query (used by tar.sql action).
 using QueryRow = std::vector<std::string>;
 
@@ -349,6 +392,40 @@ public:
      *         best-effort collector writes may ignore it.
      */
     bool set_state(const std::string& collector, const std::string& json);
+
+    // ── Cursor-model persistence (tar_cursor.hpp) ────────────────────────────
+
+    /**
+     * Get the last-persisted cursor JSON for a cursor-model source (e.g.
+     * "power", "removable"). Returns std::nullopt if no cursor has ever been
+     * persisted for that source -- distinct from an EMPTY string, so a
+     * CursorSource can tell "never run" from "ran and persisted an empty
+     * cursor" (tar_cursor.hpp rule 4: the cursor is always a versioned JSON
+     * document, so a genuinely empty one is not expected, but the API stays
+     * honest either way).
+     */
+    std::optional<std::string> get_cursor(const std::string& source);
+
+    /**
+     * Atomically persist a batch of power events AND the new cursor for the
+     * "power" source in ONE transaction (BEGIN IMMEDIATE..COMMIT, mu_ held
+     * for the whole batch — tar_cursor.hpp rule 6 / this header's
+     * execute_atomic_batch doc above explains why a per-call-locked helper
+     * cannot give this guarantee). Each event is inserted with INSERT OR
+     * IGNORE on the record_key UNIQUE index (tar_cursor.hpp rule 3) so a
+     * replayed event is a silent no-op, never a duplicate row. On ANY
+     * statement failure the whole transaction rolls back — events and cursor
+     * commit or fail together, never one without the other. `events` may be
+     * empty (a tick that only advances the cursor, e.g. a Baseline collect
+     * with nothing to report); the cursor is still persisted.
+     * @return true iff the transaction committed.
+     */
+    bool insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
+                                        const std::string& cursor_json);
+
+    /** Same contract as insert_power_events_and_cursor, for "removable". */
+    bool insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
+                                            const std::string& cursor_json);
 
     // ── Config management ────────────────────────────────────────────────────
 

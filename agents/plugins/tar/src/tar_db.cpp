@@ -140,6 +140,20 @@ constexpr const char* kCreateSchema = R"(
         key   TEXT PRIMARY KEY,
         value TEXT NOT NULL DEFAULT ''
     );
+
+    -- Cursor-model seam (tar_cursor.hpp): one row per cursor-model source
+    -- ("power", "removable" — wave 2), holding its last-persisted opaque
+    -- versioned cursor JSON. Beside tar_state rather than folded into it —
+    -- tar_state's state_json is a snapshot-diff BASELINE (the previous full
+    -- enumeration); a cursor is a LOG POSITION, a different shape with a
+    -- different persistence contract (always written atomically with the
+    -- events it produced — see insert_power_events_and_cursor /
+    -- insert_removable_events_and_cursor).
+    CREATE TABLE IF NOT EXISTS tar_cursor (
+        source      TEXT PRIMARY KEY,
+        cursor_json TEXT NOT NULL,
+        updated_at  INTEGER NOT NULL DEFAULT 0
+    );
 )";
 
 // #559 — self-test a freshly-opened tar.db with PRAGMA integrity_check. A
@@ -827,6 +841,187 @@ bool TarDatabase::set_state(const std::string& collector, const std::string& jso
         return false;
     }
     return true;
+}
+
+// ── Cursor-model persistence (tar_cursor.hpp) ─────────────────────────────────
+
+std::optional<std::string> TarDatabase::get_cursor(const std::string& source) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::nullopt;
+
+    const char* sql = "SELECT cursor_json FROM tar_cursor WHERE source = ?";
+
+    sqlite3_stmt* raw_stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("TarDatabase::get_cursor prepare failed: {}", sqlite3_errmsg(db_));
+        return std::nullopt;
+    }
+    StmtPtr stmt(raw_stmt);
+
+    sqlite3_bind_text(stmt.get(), 1, source.c_str(), static_cast<int>(source.size()),
+                      SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
+        auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        return text ? std::string(text) : std::string{};
+    }
+    return std::nullopt;
+}
+
+namespace {
+
+// Shared body for insert_power_events_and_cursor / insert_removable_events_and_cursor:
+// BEGIN IMMEDIATE, run `insert_events` (which prepares+steps its own INSERT OR
+// IGNORE statement against db), INSERT OR REPLACE the cursor row for `source`,
+// COMMIT -- all under the caller's mu_, all as one transaction (tar_cursor.hpp
+// rule 6). On ANY failure the whole batch is rolled back so events and cursor
+// commit or fail together (tar_db.hpp:458-477 documents why per-call-locked
+// execute_sql cannot give this guarantee, and why BEGIN IMMEDIATE rather than
+// bare BEGIN — IMMEDIATE takes the write lock up front so a concurrent writer
+// on this same connection cannot interleave between the events and the cursor
+// write).
+template <class InsertEventsFn>
+bool insert_events_and_cursor_locked(sqlite3* db, const char* log_prefix,
+                                     const std::string& source, const std::string& cursor_json,
+                                     InsertEventsFn&& insert_events) {
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("{} BEGIN IMMEDIATE: {}", log_prefix, err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        return false;
+    }
+    sqlite3_free(err_msg);
+
+    if (!std::forward<InsertEventsFn>(insert_events)(db, log_prefix)) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+
+    const char* cursor_sql = R"(
+        INSERT INTO tar_cursor (source, cursor_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(source) DO UPDATE SET cursor_json = excluded.cursor_json,
+                                          updated_at = excluded.updated_at
+    )";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db, cursor_sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("{} cursor prepare: {}", log_prefix, sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    StmtPtr cursor_stmt(raw_stmt);
+    sqlite3_bind_text(cursor_stmt.get(), 1, source.c_str(), static_cast<int>(source.size()),
+                      SQLITE_STATIC);
+    sqlite3_bind_text(cursor_stmt.get(), 2, cursor_json.c_str(),
+                      static_cast<int>(cursor_json.size()), SQLITE_STATIC);
+    sqlite3_bind_int64(cursor_stmt.get(), 3, now_epoch_seconds());
+    if (sqlite3_step(cursor_stmt.get()) != SQLITE_DONE) {
+        spdlog::error("{} cursor step: {}", log_prefix, sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    cursor_stmt.reset();
+
+    err_msg = nullptr;
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        spdlog::error("{} commit: {}", log_prefix, err_msg ? err_msg : "unknown");
+        sqlite3_free(err_msg);
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
+                                                 const std::string& cursor_json) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return false;
+
+    return insert_events_and_cursor_locked(
+        db_, "insert_power_events_and_cursor", "power", cursor_json,
+        [&events](sqlite3* db, const char* log_prefix) {
+            if (events.empty())
+                return true;
+            const char* sql = R"(
+                INSERT OR IGNORE INTO power_live (ts, snapshot_id, action, detail, record_key)
+                VALUES (?, ?, ?, ?, ?)
+            )";
+            sqlite3_stmt* raw_stmt = nullptr;
+            if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+                spdlog::error("{} events prepare: {}", log_prefix, sqlite3_errmsg(db));
+                return false;
+            }
+            StmtPtr stmt(raw_stmt);
+            for (const auto& ev : events) {
+                sqlite3_reset(stmt.get());
+                sqlite3_clear_bindings(stmt.get());
+                sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+                sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 4, ev.detail.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 5, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                    spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
+                    return false;
+                }
+            }
+            return true;
+        });
+}
+
+bool TarDatabase::insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
+                                                      const std::string& cursor_json) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return false;
+
+    return insert_events_and_cursor_locked(
+        db_, "insert_removable_events_and_cursor", "removable", cursor_json,
+        [&events](sqlite3* db, const char* log_prefix) {
+            if (events.empty())
+                return true;
+            const char* sql = R"(
+                INSERT OR IGNORE INTO removable_live
+                    (ts, snapshot_id, action, device_key, vendor, product, serial, bus,
+                     volume, size_bytes, image_path, pid, evidence, record_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            )";
+            sqlite3_stmt* raw_stmt = nullptr;
+            if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+                spdlog::error("{} events prepare: {}", log_prefix, sqlite3_errmsg(db));
+                return false;
+            }
+            StmtPtr stmt(raw_stmt);
+            for (const auto& ev : events) {
+                sqlite3_reset(stmt.get());
+                sqlite3_clear_bindings(stmt.get());
+                sqlite3_bind_int64(stmt.get(), 1, ev.ts);
+                sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
+                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 4, ev.device_key.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 5, ev.vendor.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 6, ev.product.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 7, ev.serial.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 8, ev.bus.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 9, ev.volume.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stmt.get(), 10, ev.size_bytes);
+                sqlite3_bind_text(stmt.get(), 11, ev.image_path.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_int64(stmt.get(), 12, ev.pid);
+                sqlite3_bind_text(stmt.get(), 13, ev.evidence.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 14, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                    spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
+                    return false;
+                }
+            }
+            return true;
+        });
 }
 
 // ── Config management ────────────────────────────────────────────────────────

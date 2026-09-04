@@ -49,6 +49,12 @@ inline constexpr std::string_view kCollectStatusUnsupportedPlatform = "unsupport
 inline constexpr std::string_view kCollectStatusBaseline = "baseline";
 inline constexpr std::string_view kCollectStatusSampleRecorded = "sample_recorded";
 inline constexpr std::string_view kCollectStatusAppsRecorded = "apps_recorded";
+// Cursor-model seam (tar_cursor.hpp, CursorOutcome::Advanced/CursorLost) —
+// power/removable's collect_slow status tokens, wave 2. `kCollectStatusBaseline`
+// above is reused for CursorOutcome::Baseline (first-ever successful read, and
+// the re-baseline that follows a CursorLost recovery).
+inline constexpr std::string_view kCollectStatusCursorAdvanced = "cursor_advanced";
+inline constexpr std::string_view kCollectStatusCursorLost = "cursor_lost";
 
 // ── Collector data types ─────────────────────────────────────────────────────
 

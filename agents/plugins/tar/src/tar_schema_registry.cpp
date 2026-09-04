@@ -965,6 +965,128 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 },
             },
         },
+
+        // ── power (cursor-model seam, tar_cursor.hpp) — sleep/wake/AC-power
+        // transitions. LIVE TIER ONLY, no rollups (P-008 — a mirror/aggregate
+        // shape was contradictory for a low-volume host-lifecycle source;
+        // netconn's live-only shape is the precedent). Replay idempotence via
+        // the UNIQUE record_key index below (tar_cursor.hpp rule 3), not
+        // cursor arithmetic.
+        //
+        // ALEX RULING 2026-09-04 (overrides peer finding P-005 and the
+        // Architect's prior adoption of it): power AND removable ship
+        // default_enabled = TRUE — the FIRST default-on capture sources in
+        // the product; every other row in this table (all 8 above, netconn
+        // and mapdrive included) is opt-in. That divergence from the
+        // standing works-council opt-in posture is DELIBERATE and must be
+        // documented plainly in the user-manual pages and changelog, not
+        // quietly. The retrospective-reach control is retained:
+        // power_lookback_seconds (default 604800s / 7 days, 0 = forward-only)
+        // still lets an operator suppress historical backfill without
+        // disabling the source outright — same shape as netconn_lookback_
+        // seconds (ADR-0020).
+        //
+        // os_support: mechanisms are the 2026-09-04 measured bindings
+        // (probe-findings.md); collectors land wave 2.
+        {
+            .name = "power",
+            .dollar_name = "Power",
+            .default_enabled = true,
+            .unique_key_column = "record_key",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupportedConstrained, "powerbroadcast",
+                 "Suspend/resume + AC transitions via "
+                 "PowerRegisterSuspendResumeNotification / WM_POWERBROADCAST, "
+                 "cursor-model (tar_cursor.hpp) — collector lands wave 2."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "logind",
+                 "systemd-logind PrepareForSleep sd-bus signal + power-supply "
+                 "sysfs/udev, cursor-model — collector lands wave 2. Gated by "
+                 "the optional libsystemd dep (YUZU_HAVE_LIBSYSTEMD)."},
+                {"macos",   OsSupportStatus::kSupported, "pmset_log",
+                 "`pmset -g log` retrospective replay (measured working "
+                 "unprivileged on this Mac 2026-09-04, 9,629 lines: "
+                 "probe-findings.md), cursor-model — collector lands wave 2."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 20000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // sleep, wake, ac_attached,
+                                                 // ac_detached, capture_gap
+                        {"detail",      "TEXT"},
+                        {"record_key",  "TEXT"}, // UNIQUE — replay idempotence
+                    },
+                },
+            },
+        },
+
+        // ── removable (cursor-model seam, tar_cursor.hpp) — removable-media
+        // attach/detach transitions, plus exec_from_removable correlation
+        // (process_enum.hpp's ProcessInfo::exec_path, P-004). LIVE TIER ONLY,
+        // no rollups (P-008, same rationale as power above). `image_path` +
+        // `pid` are typed identity-adjacent columns (P-004) — `evidence` and
+        // `record_key` are forensic/value fields only, never identity
+        // carriers. Replay idempotence via the UNIQUE record_key index below.
+        //
+        // Ships default_enabled = TRUE — see the ALEX RULING note on `power`
+        // above; same divergence, same documentation obligation.
+        // removable_lookback_seconds (default 604800s, 0 = forward-only)
+        // governs historical backfill the same way.
+        //
+        // os_support: mechanisms are the 2026-09-04 measured bindings
+        // (probe-findings.md); collectors land wave 2.
+        {
+            .name = "removable",
+            .dollar_name = "Removable",
+            .default_enabled = true,
+            .unique_key_column = "record_key",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "wevtapi",
+                 "EvtQuery over Microsoft-Windows-Partition/Diagnostic (+ "
+                 "Kernel-PnP/Configuration, Storsvc/Diagnostic), channels "
+                 "measured LIVE on the-rig 2026-09-04; the roadmap's "
+                 "DriverFrameworks-UserMode channel is disabled by default "
+                 "and is NOT the binding (probe-findings.md). Collector "
+                 "lands wave 2."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "udev_netlink",
+                 "udev netlink monitor (block subsystem, removable), "
+                 "cursor-model — collector lands wave 2."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "diskarbitration",
+                 "DiskArbitration DADiskAppeared/Disappeared callbacks "
+                 "(headers confirmed in the CLT SDK, probe-findings.md), "
+                 "cursor-model — collector lands wave 2."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 20000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // attached, detached,
+                                                 // present_at_baseline,
+                                                 // exec_from_removable,
+                                                 // capture_gap
+                        {"device_key",  "TEXT"},
+                        {"vendor",      "TEXT"},
+                        {"product",     "TEXT"},
+                        {"serial",      "TEXT"},
+                        {"bus",         "TEXT"},
+                        {"volume",      "TEXT"},
+                        {"size_bytes",  "INTEGER"},
+                        {"image_path",  "TEXT"},    // typed identity column (P-004)
+                        {"pid",         "INTEGER"}, // typed identity column (P-004)
+                        {"evidence",    "TEXT"},    // forensic/value only — not identity
+                        {"record_key",  "TEXT"},    // UNIQUE — replay idempotence
+                    },
+                },
+            },
+        },
     };
     return sources;
 }
@@ -1172,6 +1294,16 @@ std::string generate_warehouse_ddl() {
                 ddl << std::format(
                     "CREATE INDEX IF NOT EXISTS idx_{0}_signed_state ON {0}(signed_state);\n",
                     table_name);
+            }
+
+            // Cursor-model replay idempotence (tar_cursor.hpp rule 3): a
+            // source that declares unique_key_column gets a UNIQUE index on
+            // it for the live tier, so INSERT OR IGNORE makes a replayed
+            // event a no-op instead of a duplicate row.
+            if (g.suffix == "live" && !src.unique_key_column.empty()) {
+                ddl << std::format(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS {0}_record_key_uq ON {0}({1});\n",
+                    table_name, src.unique_key_column);
             }
 
             ddl << "\n";

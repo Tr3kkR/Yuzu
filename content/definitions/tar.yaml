@@ -566,6 +566,72 @@ spec:
           "true" | "false".
         validation:
           pattern: "^(true|false)$"
+      power_enabled:
+        type: string
+        displayName: Power Transition Collector Enabled
+        description: >
+          Enable or disable the sleep/wake/AC-power transition source (power →
+          $Power_Live, cursor-model seam). **ON by default ("true")** — unlike
+          EVERY other capture source in this table (all of which, netconn and
+          mapdrive included, default OFF), power ships enabled out of the box.
+          This is a deliberate divergence from the standing works-council
+          opt-in posture: host sleep/wake and AC-power events are treated as
+          low-sensitivity device-lifecycle telemetry, not usage-class data.
+          Uses a durable log-position cursor (not a snapshot diff), so a
+          restart resumes from where it left off rather than re-scanning; a
+          lost/invalid cursor or a wrapped OS event log re-baselines forward
+          and records a capture_gap rather than replaying from the beginning.
+          Set to "false" to opt out. Requires agent v0.12.0+; older agents
+          silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      power_lookback_seconds:
+        type: string
+        displayName: Power History Lookback (seconds)
+        description: >
+          How far BEFORE enablement the power source's first read may reach
+          into OS-retained sleep/wake/AC-power history (same shape as
+          netconn_lookback_seconds, ADR-0020). Set to "0" to disable the
+          pre-enablement read entirely (forward-only from the moment it is
+          enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7
+          days). Applies to the first read after enablement (and after a late
+          enable); once caught up the source reads only forward. Requires
+          agent v0.12.0+.
+        validation:
+          pattern: "^[0-9]+$"
+      removable_enabled:
+        type: string
+        displayName: Removable Media Collector Enabled
+        description: >
+          Enable or disable the removable-media attach/detach source
+          (removable → $Removable_Live, cursor-model seam), including
+          exec_from_removable correlation (a process observed running from a
+          removable volume). **ON by default ("true")** — like power above,
+          this diverges deliberately from every other source in this table
+          (all default OFF, netconn and mapdrive included): removable-device
+          attach/detach is treated as security-relevant device-lifecycle
+          telemetry an operator should see without an explicit opt-in step.
+          Uses the same durable log-position cursor model as power (see
+          power_enabled) — a lost/invalid cursor re-baselines forward and
+          records a capture_gap rather than replaying history. Set to "false"
+          to opt out. Requires agent v0.12.0+; older agents silently ignore.
+          Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      removable_lookback_seconds:
+        type: string
+        displayName: Removable Media History Lookback (seconds)
+        description: >
+          How far BEFORE enablement the removable source's first read may
+          reach into OS-retained device-attach history (same shape as
+          netconn_lookback_seconds / power_lookback_seconds above). Set to "0"
+          to disable the pre-enablement read entirely (forward-only from the
+          moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default
+          604800 (7 days). Applies to the first read after enablement (and
+          after a late enable); once caught up the source reads only forward.
+          Requires agent v0.12.0+.
+        validation:
+          pattern: "^[0-9]+$"
       network_capture_method:
         type: string
         displayName: Network Capture Method
