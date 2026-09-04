@@ -2,14 +2,14 @@
 """test_capability_catalogue_complete.py — PR1.9's cross-fragment drift gate.
 
 The capability catalogue (`server/core/src/command_capability.hpp`'s
-`CommandCapability` rows) is authored as SEVEN independent, hand-written
-sources: six per-plugin-group fragment headers
-(`capability_decls/plugin_action_catalogue_{content_dist,a,b,c,d,filesystem_posture}.hpp`,
+`CommandCapability` rows) is authored as EIGHT independent, hand-written
+sources: seven per-plugin-group fragment headers
+(`capability_decls/plugin_action_catalogue_{content_dist,a,b,c,d,disk_actions,filesystem_posture}.hpp`,
 each owned by a different package) plus the core-owned
 `capability_decls/core_dispatch_capabilities.hpp` (the three
 system-initiated dispatches a plugin never receives from a caller —
 `tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`). Nobody
-mechanically checks that these seven sources, taken together, actually match
+mechanically checks that these eight sources, taken together, actually match
 what the plugins declare via their `actions()` override. This script is
 that check.
 
@@ -17,21 +17,21 @@ It parses every `actions()` override under `agents/plugins/*/src/*.cpp`
 (each plugin's `name()` override gives the plugin half of the pair; the
 literal strings inside the `static const char* acts[] = {...}` array give
 the action half) and cross-references the result against every
-`.plugin = "..."` / `.action = "..."` pair declared across the seven
+`.plugin = "..."` / `.action = "..."` pair declared across the eight
 capability-catalogue headers. It fails, naming the exact offending
 `plugin.action`, when:
 
   1. A plugin declares an action that has no catalogue row anywhere across
-     the seven sources (a MISSING row) — a plugin ships a capability the
+     the eight sources (a MISSING row) — a plugin ships a capability the
      dispatch-classification layer would report `Unclassified` for.
-  2. One of the six per-group fragments declares a `plugin.action` no
+  2. One of the seven per-group fragments declares a `plugin.action` no
      plugin's `actions()` override names (a BOGUS row) — dead, unreachable
      catalogue data, or a typo that silently shadows the real action. (The
      core-owned fragment is exempt from this direction only:
      `__guard__.push_rules` is a real, intentional row with no backing
      plugin — Guardian's rule-push is a server-internal dispatch, not
      something any plugin's `actions()` ever lists.)
-  3. The same `plugin.action` is declared by more than one of the seven
+  3. The same `plugin.action` is declared by more than one of the eight
      sources (a DUPLICATE row) — two independently-authored fragments
      racing to classify the same dispatch, which `CommandCapabilityRegistry
      ::classify` resolves as `Ambiguous`, never first-wins (see
@@ -75,6 +75,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_b.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_c.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_d.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
@@ -155,11 +156,11 @@ def diff_catalogue(
 
     Returns `(missing, bogus, duplicates)`:
       - `missing`: plugin.action pairs a plugin declares that no source
-        (any of the six per-group headers, or core) covers.
-      - `bogus`: plugin.action pairs one of the six FRAGMENT files declares
+        (any of the seven per-group headers, or core) covers.
+      - `bogus`: plugin.action pairs one of the seven FRAGMENT files declares
         that no plugin actually has (core is exempt — see module docstring).
       - `duplicates`: plugin.action -> list of >=2 source labels that each
-        declared it independently (across all seven sources, fragments and
+        declared it independently (across all eight sources, fragments and
         core alike — a fragment/core collision is exactly as ambiguous to
         `CommandCapabilityRegistry::classify` as a fragment/fragment one).
     """
@@ -203,9 +204,55 @@ def format_gaps(
     return "\n".join(lines)
 
 
+SERVER_CPP = "server/core/src/server.cpp"
+
+
+def _fragment_accessor(rel: str) -> str:
+    """`.../plugin_action_catalogue_disk_actions.hpp` -> the accessor name the
+    production composition site must call."""
+    stem = rel.rsplit("/", 1)[-1].removesuffix(".hpp")
+    return stem + "()"
+
+
+class TestProductionCompositionWiring(unittest.TestCase):
+    """K3 (external functional review): every catalogue test — C++ and Python —
+    composes its OWN list of fragment spans, and the Python gates read the
+    fragment HEADERS. Nothing read `server.cpp`, so deleting the two lines that
+    wire a fragment into the live `CommandCapabilityRegistry` left the entire
+    server suite and both gates green while the plugin's actions classified as
+    Unclassified in production.
+
+    This is a source tripwire, following the precedent at
+    `tests/unit/server/test_agent_properties_scope_authz.cpp`. It is deliberately
+    textual: the point is to guard the one file no compiled test observes.
+    """
+
+    def test_every_fragment_is_included_and_composed_in_server_cpp(self) -> None:
+        server = (REPO_ROOT / SERVER_CPP).read_text(encoding="utf-8")
+        missing_include: list[str] = []
+        missing_compose: list[str] = []
+        for rel in FRAGMENT_FILES:
+            header = rel.rsplit("/", 1)[-1]
+            if f'#include "capability_decls/{header}"' not in server:
+                missing_include.append(header)
+            if _fragment_accessor(rel) not in server:
+                missing_compose.append(_fragment_accessor(rel))
+        self.assertEqual(
+            [], missing_include,
+            f"{SERVER_CPP} does not #include these catalogue fragments, so their rows "
+            f"cannot reach the production registry: {missing_include}",
+        )
+        self.assertEqual(
+            [], missing_compose,
+            f"{SERVER_CPP} includes but never COMPOSES these fragments into the "
+            f"CommandCapabilityRegistry, so every action they declare classifies as "
+            f"Unclassified in production while every test stays green: {missing_compose}",
+        )
+
+
 class TestCatalogueCompleteOnRealTree(unittest.TestCase):
     """The actual drift gate: parses the live repository and fails, naming
-    every gap, if the plugins' actions() tables and the seven capability
+    every gap, if the plugins' actions() tables and the eight capability
     sources have drifted apart.
     """
 
