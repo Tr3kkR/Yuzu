@@ -21,6 +21,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <grpc/grpc.h> // grpc_init — see the init-reference note in Harness::start
 #include <grpcpp/grpcpp.h>
 
 #include <fstream>
@@ -141,6 +142,32 @@ struct Harness {
     int port{0};
 
     void start() {
+        // HOLD ONE PROCESS-LIFETIME gRPC INIT REFERENCE, and never release it.
+        //
+        // gRPC's global state is REFCOUNTED: it initialises on the first
+        // server/channel and fully shuts down when the last one is destroyed.
+        // This file builds a server per TEST_CASE and drops it at the end of
+        // that case, so without this the refcount reaches zero between cases
+        // and the next case's BuildAndStart() re-initialises the library from
+        // scratch. That shutdown/re-init cycle is what killed the Windows MSVC
+        // debug leg: SIGSEGV at the SECOND harness's start(), reproducibly, on
+        // every run where a server was created per case — and NOT on the runs
+        // where one shared server meant the library was only ever initialised
+        // once. The sibling harness files in the server test binary never hit
+        // it because that binary keeps other gRPC objects alive throughout, so
+        // its refcount never reaches zero.
+        //
+        // An init reference opens no socket, which is why it is used here in
+        // preference to sharing one server across the file: a shared server
+        // keeps gRPC's descriptors live for the rest of the run, and
+        // test_subprocess_runner.cpp's fd-leak case plants its probe over a
+        // HARDCODED fd number — sharing a server made it steal that number
+        // from gRPC and fail its own precondition on Linux.
+        static const struct GrpcInitOnce {
+            GrpcInitOnce() { ::grpc_init(); } // deliberately no matching ::grpc_shutdown()
+        } kGrpcInitOnce;
+        (void)kGrpcInitOnce;
+
         grpc::ServerBuilder b;
         b.AddListeningPort("127.0.0.1:0", grpc::InsecureServerCredentials(), &port);
         b.RegisterService(&svc);
@@ -177,9 +204,11 @@ struct Harness {
 // case's own precondition assert. Building and dropping the server inside each
 // TEST_CASE keeps those descriptors out of the rest of the binary's fd space.
 //
-// The Windows SIGSEGV that prompted the hoist was never a harness-lifecycle
-// problem at all — see the note on sha256_hex_of above for what it actually
-// was.
+// What made per-case servers safe on Windows is the gRPC init reference taken
+// in start() — see the note there. Two DISTINCT bugs were confounded here and
+// each masked the other: the cross-thread Catch2 assertion documented on
+// sha256_hex_of (which crashed the runs that shared one server) and the
+// library shutdown/re-init cycle (which crashed the runs that did not).
 
 /// A throwaway "installed agent binary" for the updater to replace.
 struct FakeExe {
