@@ -1351,6 +1351,15 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonQuarantined)}});
 
+        // #3511: same three routes, same discipline, for the plugin-presence
+        // filter — an unseeded series reads as "no dispatch has ever been
+        // withheld for a missing plugin" when the truth may be "the filter
+        // never ran".
+        for (const char* route : {"dispatch_closure", "command", "legacy"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}});
+
         // The containment gate's own outcome series, seeded across its whole
         // closed label set for the same reason. Without this, `absent()` on
         // `outcome="fail_closed"` cannot tell "the gate has never had to fail
@@ -11052,7 +11061,7 @@ private:
     /// reverted, judging the blast radius (18+ fake DispatchFn lambdas plus
     /// the BundleOrchestrator coupling above) disproportionate for an
     /// audit-completeness LOW both external reviewers graded non-blocking.
-    std::pair<std::string, int> dispatch_confined(
+    yuzu::server::ConfinedDispatchOutcome dispatch_confined(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
@@ -11111,7 +11120,7 @@ private:
                                      /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
                                      std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
-            return {command_id, 0};
+            return yuzu::server::ConfinedDispatchOutcome{.command_id = command_id};
 
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
@@ -11186,6 +11195,8 @@ private:
                                                    caller.principal_role, command_id,
                                                    std::move(outcome.denied_quarantined));
         }
+        audit_unknown_plugin_dispatch("dispatch_closure", caller.principal, caller.principal_role,
+                                      command_id, plugin, outcome.unknown_plugin_count);
 
         forward_gateway_pending();
         if (outcome.sent > 0)
@@ -11209,7 +11220,7 @@ private:
                          "necessarily a routine zero-reach dispatch",
                          plugin, norm_action, command_id);
         }
-        return {command_id, outcome.sent};
+        return outcome;
     }
 
     /// #1634: the SINGLE per-agent Response-scope predicate — every Response:Read
@@ -11746,6 +11757,52 @@ private:
             spdlog::error("audit write failed: quarantine.dispatch_denied (command={} "
                           "fail_closed, agents={})",
                           command_id, denied_count);
+    }
+
+    // #3511: the plugin-presence sibling of the quarantine emitters above.
+    // CORRECTED (PR #3939 review): this used to be metric+log only, on the
+    // claimed grounds that plugin absence is an INVENTORY fact rather than a
+    // POLICY decision, so there was "nothing for an auditor to review." That
+    // reasoning does not survive contact with `docs/observability-conventions.md`'s
+    // MUST clause ("Denied operations MUST emit an audit event — spdlog::warn
+    // alone breaks the SOC 2 CC7.2 evidence chain") — a command an operator or
+    // agentic caller asked for was NOT delivered, which is exactly what that
+    // clause exists to make durable, independent of whether a human "decided"
+    // it. Mirrors `audit_quarantine_dispatch_fail_closed`'s shape exactly: ONE
+    // aggregate row per dispatch (`target_id="*"`), not one per withheld id —
+    // this is a single withholding decision applied to a batch, the same
+    // shape as a fail-closed gate denial, not a per-device fact worth its own
+    // row the way a specific quarantine denial is.
+    void audit_unknown_plugin_dispatch(std::string_view route, const std::string& principal,
+                                       const std::string& principal_role,
+                                       const std::string& command_id, const std::string& plugin,
+                                       std::size_t count) {
+        if (count == 0)
+            return;
+        metrics_
+            .counter("yuzu_server_dispatch_target_rejected_total",
+                     {{"route", std::string(route)},
+                      {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}})
+            .increment(static_cast<double>(count));
+        spdlog::warn(
+            "dispatch withheld: route={} command={} plugin={} reason=unknown_plugin agents={}",
+            route, command_id, plugin, count);
+        if (!audit_store_)
+            return;
+        AuditEvent ev{};
+        ev.timestamp = std::time(nullptr);
+        ev.principal = principal.empty() ? "unknown" : principal;
+        ev.principal_role = principal_role;
+        ev.action = "command.dispatch_withheld";
+        ev.target_type = "Command";
+        ev.target_id = "*";
+        ev.detail = "COMMAND_DISPATCH_WITHHELD command=" + command_id + " plugin=" + plugin +
+                    " reason=plugin_not_found agents=" + std::to_string(count);
+        ev.result = "denied";
+        if (!audit_store_->log(ev))
+            spdlog::error("audit write failed: command.dispatch_withheld (command={} plugin={}, "
+                          "agents={})",
+                          command_id, plugin, count);
     }
 
     // Apply stored runtime config overrides on startup. Returns false on a
@@ -15158,6 +15215,17 @@ private:
             // also cost a Postgres round trip. Still shared by all four arm
             // branches below.
             const auto containment_gate = make_containment_gate(plugin, action);
+            // #3424/#3511: same lifecycle as containment_gate — one registry
+            // read for the whole request, shared by every arm branch below.
+            // BR-009: `classified->wire().plugin()`, NOT the raw `plugin`
+            // local — `classify()` is case-insensitive (command_capability.hpp)
+            // and `finalize_classified_command` builds the wire command from
+            // the catalogue-resolved spelling, so a caller who dispatches with
+            // valid-but-non-canonical casing (e.g. "TAR") must be checked
+            // against the SAME spelling every agent's self-reported inventory
+            // uses, or every agent that genuinely has the plugin is spuriously
+            // flagged absent (governance Gate 2 finding, self-review round).
+            const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
 
             int sent = 0;
             // #881: filled by whichever arm branch below actually ran, then
@@ -15170,6 +15238,9 @@ private:
             // dispatch thread, per refused dispatch), so .size() is not the
             // denial count. See ArmDispatchResult.
             std::size_t denied_quarantined_count = 0;
+            // #3511: mirrors denied_quarantined_count for the plugin-presence
+            // filter — see ArmDispatchResult::unknown_plugin_count.
+            std::size_t unknown_plugin_count = 0;
             // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
             // the MCP execute_instruction schema, docs/scope-walking-design.md), and
             // it is handled here as "no scope expression" so the ordering matches the
@@ -15189,7 +15260,7 @@ private:
             const auto dispatch_broadcast = [&]() -> yuzu::server::ArmDispatchResult {
                 return yuzu::server::dispatch_confined_arms(
                     yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-                    /*broadcast_on_none=*/true, containment_gate, confined_sink);
+                    /*broadcast_on_none=*/true, containment_gate, confined_sink, plugin_missing);
             };
 
             if (arm == yuzu::server::DispatchArm::Group) {
@@ -15205,10 +15276,11 @@ private:
                 t.group_members = &members;
                 const auto result = yuzu::server::dispatch_confined_arms(
                     arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
-                    confined_sink);
+                    confined_sink, plugin_missing);
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                unknown_plugin_count = result.unknown_plugin_count;
             } else if (arm == yuzu::server::DispatchArm::Scope) {
                 // Scope expression dispatch.
                 // Owner principal for from_result_set: resolution (review B1).
@@ -15263,10 +15335,11 @@ private:
                     t.scope_matched = &*ladder.matched;
                     const auto result = yuzu::server::dispatch_confined_arms(
                         arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
-                        confined_sink);
+                        confined_sink, plugin_missing);
                     sent = result.sent;
                     denied_quarantined = result.denied_quarantined;
                     denied_quarantined_count = result.denied_quarantined_count;
+                    unknown_plugin_count = result.unknown_plugin_count;
                 }
                 // else: the ladder already audited the abort (db_degraded /
                 // owner_check_failed / principal_unresolved) — sent stays 0.
@@ -15282,10 +15355,11 @@ private:
                 t.agent_ids = &agent_ids;
                 const auto result = yuzu::server::dispatch_confined_arms(
                     arm, t, exec_visible, /*broadcast_on_none=*/true, containment_gate,
-                    confined_sink);
+                    confined_sink, plugin_missing);
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                unknown_plugin_count = result.unknown_plugin_count;
             } else if (arm == yuzu::server::DispatchArm::Broadcast) {
                 // Explicitly asked for the fleet by its published name — #1788
                 // still narrows delivery to the operator's visible set; the
@@ -15295,6 +15369,7 @@ private:
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                unknown_plugin_count = result.unknown_plugin_count;
             } else {
                 // Broadcast ONLY when the caller named no target at all (#2500).
                 // A target that was SUPPLIED but resolved to nothing must never
@@ -15358,6 +15433,13 @@ private:
                 sent = result.sent;
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
+                // #3511: this arm (the omitted-target -> whole-fleet default,
+                // #2500) was missing this copy while every other arm branch
+                // above has it — a plugin-absence withholding on THIS arm
+                // silently fell through to the generic "failed to send
+                // command to any agent" 503 instead of the specific
+                // `plugin_not_found` one below.
+                unknown_plugin_count = result.unknown_plugin_count;
             }
 
             // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -15373,12 +15455,14 @@ private:
                                                        caller.principal_role, command_id,
                                                        std::move(denied_quarantined));
             }
+            audit_unknown_plugin_dispatch("command", caller.principal, caller.principal_role,
+                                          command_id, plugin, unknown_plugin_count);
 
             // Forward commands queued for gateway agents
             forward_gateway_pending();
 
             if (sent == 0) {
-                // #881: say WHICH kind of nothing. All three of these answered
+                // #881/#3511: say WHICH kind of nothing. All four of these answered
                 // "failed to send command to any agent", which reads as an
                 // agent-connectivity outage — so a fail-closed containment
                 // gate, which denies EVERY agent on EVERY dispatch fleet-wide,
@@ -15395,6 +15479,13 @@ private:
                 } else if (denied_quarantined_count > 0) {
                     res.set_content(
                         R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                } else if (unknown_plugin_count > 0) {
+                    // #3511: the dispatched plugin is absent from every target's
+                    // reported inventory — a command guaranteed to fail, withheld
+                    // before dispatch rather than reported as a false success.
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                         "application/json");
                 } else {
                     res.set_content(
@@ -15415,15 +15506,24 @@ private:
                         {"action", action},
                         {"command_id", command_id},
                         {"scope", scope_expr}});
-            res.set_header(
-                "HX-Trigger",
-                "{\"showToast\":{\"message\":\"Command sent to " + std::to_string(sent) +
-                    " agent(s)" +
-                    (denied_quarantined_count == 0
-                         ? std::string{}
-                         : "; " + std::to_string(denied_quarantined_count) +
-                               " withheld (quarantined)") +
-                    "\",\"level\":\"success\"}}");
+            // #3424/#3511 (governance Gate 4 finding, independently raised by
+            // consistency-auditor and unhappy-path): a MIXED partial dispatch
+            // -- some reached, some withheld for plugin absence -- must be as
+            // visible as a mixed quarantine withholding already is, or the
+            // "a mixed cause is never invisible" property the zero-reach
+            // cascade goes out of its way to guarantee silently doesn't hold
+            // once sent > 0.
+            std::string toast_suffix;
+            if (denied_quarantined_count > 0)
+                toast_suffix +=
+                    "; " + std::to_string(denied_quarantined_count) + " withheld (quarantined)";
+            if (unknown_plugin_count > 0)
+                toast_suffix += "; " + std::to_string(unknown_plugin_count) +
+                                " withheld (plugin not found)";
+            res.set_header("HX-Trigger",
+                           "{\"showToast\":{\"message\":\"Command sent to " +
+                               std::to_string(sent) + " agent(s)" + toast_suffix +
+                               "\",\"level\":\"success\"}}");
             // #881: a PARTIAL dispatch must say so. Without this an operator
             // targeting a 100-device group with 3 contained devices reads
             // "Command sent to 97 agent(s)" and has no signal that 3 were
@@ -15436,6 +15536,7 @@ private:
                                 {"command_id", command_id},
                                 {"agents_reached", sent},
                                 {"withheld_quarantined", denied_quarantined_count},
+                                {"withheld_unknown_plugin", unknown_plugin_count},
                                 {"thead_html", agent_service_.thead_for_plugin(plugin)}})
                     .dump(),
                 "application/json");
@@ -19214,7 +19315,7 @@ private:
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id) -> std::pair<std::string, int> {
+                   const std::string& execution_id) -> yuzu::server::ConfinedDispatchOutcome {
             // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
             // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
             // that must confine call command_dispatch_caller_fn / the caller-typed
@@ -19245,7 +19346,8 @@ private:
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id,
-                   const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                   const yuzu::server::DispatchCaller& caller)
+                -> yuzu::server::ConfinedDispatchOutcome {
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
                                      execution_id, caller, /*broadcast_on_none=*/false);
         };
@@ -19259,8 +19361,8 @@ private:
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
-                   const std::string& definition_id,
-                   const std::string& concurrency_mode) -> std::pair<std::string, int> {
+                   const std::string& definition_id, const std::string& concurrency_mode)
+                -> yuzu::server::ConfinedDispatchOutcome {
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
                                      execution_id, caller, /*broadcast_on_none=*/false,
                                      definition_id, concurrency_mode);
@@ -20315,7 +20417,7 @@ private:
                                   const std::vector<std::string>& agent_ids,
                                   const std::string& scope_expr,
                                   const std::unordered_map<std::string, std::string>& parameters)
-                -> std::pair<std::string, int> {
+                -> yuzu::server::ConfinedDispatchOutcome {
                 return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
                                            /*execution_id=*/"");
             },
@@ -20541,7 +20643,7 @@ private:
                                   const std::vector<std::string>& agent_ids,
                                   const std::string& scope_expr,
                                   const std::unordered_map<std::string, std::string>& parameters)
-                -> std::pair<std::string, int> {
+                -> yuzu::server::ConfinedDispatchOutcome {
                 return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
                                            /*execution_id=*/"");
             },
@@ -20937,7 +21039,8 @@ private:
                 const std::string& plugin, const std::string& action,
                 const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                 const std::unordered_map<std::string, std::string>& parameters,
-                const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller& caller)
+                -> yuzu::server::ConfinedDispatchOutcome {
                 return command_dispatch_caller_fn(plugin, action, agent_ids, scope_expr,
                                                   parameters, /*execution_id=*/"", caller);
             },
@@ -21017,12 +21120,12 @@ private:
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const yuzu::server::DispatchCaller& caller)
-                -> std::pair<std::string, int> {
-                auto [command_id, sent] = dispatch_confined(plugin, action, agent_ids, scope_expr,
-                                                            parameters, /*execution_id=*/std::string{},
-                                                            caller, /*broadcast_on_none=*/true);
+                -> yuzu::server::ConfinedDispatchOutcome {
+                auto outcome = dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                                 /*execution_id=*/std::string{}, caller,
+                                                 /*broadcast_on_none=*/true);
 
-                if (sent > 0) {
+                if (outcome.sent > 0) {
                     // Publish RUNNING status + clear results via SSE.
                     // This MUST happen via SSE (not in the POST response)
                     // because the POST response races with SSE output
@@ -21046,7 +21149,7 @@ private:
                     event_bus_.publish("output",
                                        "<strong id=\"row-count\" hx-swap-oob=\"true\">0</strong>");
                 }
-                return {command_id, sent};
+                return outcome;
             },
             // CallerFn — CDX-R7-02 / PLAN-006: resolve the caller's identity +
             // Execution:Execute visible set from the request. The dashboard
@@ -22540,7 +22643,7 @@ private:
                        const std::unordered_map<std::string, std::string>& parameters,
                        const std::string& execution_id,
                        const yuzu::server::DispatchCaller& caller)
-                    -> std::pair<std::string, int> {
+                    -> yuzu::server::ConfinedDispatchOutcome {
                     // MCP normalises an omitted target to kBroadcastScope upstream
                     // (mcp_server.cpp), so broadcast_on_none=true states its
                     // deliberate broadcast-on-empty contract. Same seam as the
@@ -22549,7 +22652,7 @@ private:
                                                execution_id, caller,
                                                /*broadcast_on_none=*/true);
                     spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
-                                 r.second);
+                                 r.sent);
                     return r;
                 },
                 // PR4 B-2: CA inventory + revoke MCP tools (parity with /api/v1/ca/*).
@@ -22853,9 +22956,13 @@ private:
         // the gate, that unfiltered path bypasses containment with no per-id
         // check at all.
         const auto containment_gate = make_containment_gate(plugin, action);
+        // #3424/#3511: same lifecycle as containment_gate — one registry read
+        // for this dispatch. BR-009: `classified->wire().plugin()`, not the
+        // raw `plugin` local — see the /api/command sibling site's comment.
+        const auto plugin_missing = registry_.ids_missing_plugin(classified->wire().plugin());
         auto result = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
-            /*broadcast_on_none=*/false, containment_gate, sink);
+            /*broadcast_on_none=*/false, containment_gate, sink, plugin_missing);
         int sent = result.sent;
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -22871,9 +22978,11 @@ private:
                                                    caller.principal_role, command_id,
                                                    std::move(result.denied_quarantined));
         }
+        audit_unknown_plugin_dispatch("legacy", caller.principal, caller.principal_role,
+                                      command_id, plugin, result.unknown_plugin_count);
 
         if (sent == 0) {
-            // Same three-way split as /api/command above — see the comment
+            // Same four-way split as /api/command above — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
             // operator to the wrong subsystem.
@@ -22885,6 +22994,10 @@ private:
             } else if (result.denied_quarantined_count > 0) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (result.unknown_plugin_count > 0) {
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else {
                 res.set_content(

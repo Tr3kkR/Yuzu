@@ -404,8 +404,12 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             "action FROM $TCP_Live" +
             where + " ORDER BY ts DESC LIMIT 5000";
         const auto caller = caller_fn_(req);
-        const auto [pcmd, psent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", psql}}, caller);
-        const auto [tcmd, tsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}}, caller);
+        const auto pout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", psql}}, caller);
+        const auto tout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}}, caller);
+        const auto& pcmd = pout.command_id;
+        const auto psent = pout.sent;
+        const auto& tcmd = tout.command_id;
+        const auto tsent = tout.sent;
         // Audit at DISPATCH (parity with device-live-info / DEX-perf): the live query
         // hitting the endpoint is the access event and must be recorded even when it
         // reaches no agent or the later poll never completes. Shared #1647 chokepoint:
@@ -603,8 +607,12 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
                 "SELECT interface, ip_address, mac_address, entry_type, ts, action "
                 "FROM $ARP_Live ORDER BY ts DESC LIMIT 20000";
             const auto caller = caller_fn_(req);
-            const auto [dc, dsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}}, caller);
-            const auto [ac, asent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}}, caller);
+            const auto dout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}}, caller);
+            const auto aout = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}}, caller);
+            const auto& dc = dout.command_id;
+            const auto dsent = dout.sent;
+            const auto& ac = aout.command_id;
+            const auto asent = aout.sent;
             // Shared #1647 chokepoint: catch-arm parity + Sec-Audit-Failed per verb
             // (DNS is usage-class PII, kept separately countable). Dispatch posture
             // unchanged; if either evidence row drops, the header is set.
@@ -733,8 +741,12 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         std::string ccmd = get_param(req, "ccmd");
         if (scmd.empty() || ccmd.empty()) {
             const auto caller = caller_fn_(req);
-            const auto [sc, ssent] = dispatch_fn_("tar", "status", {device}, "", {}, caller);
-            const auto [cc, csent] = dispatch_fn_("tar", "compatibility", {device}, "", {}, caller);
+            const auto sout = dispatch_fn_("tar", "status", {device}, "", {}, caller);
+            const auto cout = dispatch_fn_("tar", "compatibility", {device}, "", {}, caller);
+            const auto& sc = sout.command_id;
+            const auto ssent = sout.sent;
+            const auto& cc = cout.command_id;
+            const auto csent = cout.sent;
             (void)detail::emit_behavioral_audit(
                 audit_fn_, req, res, "tar.sources.read", ssent > 0 ? "dispatched" : "no_agents",
                 "Agent", device,
@@ -847,8 +859,10 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             if (val != "on" && val != "off")
                 continue;
             const std::string enabled = (val == "on") ? "true" : "false";
-            const auto [cmd, sent] = dispatch_fn_("tar", "configure", {device}, "",
-                                                  {{src + "_enabled", enabled}}, caller);
+            const auto outcome = dispatch_fn_("tar", "configure", {device}, "",
+                                              {{src + "_enabled", enabled}}, caller);
+            const auto& cmd = outcome.command_id;
+            const auto sent = outcome.sent;
             (void)detail::emit_behavioral_audit(
                 audit_fn_, req, res, "tar.sources.configure", sent > 0 ? "dispatched" : "no_agents",
                 "Agent", device,

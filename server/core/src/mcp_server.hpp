@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 #include <yuzu/server/auth.hpp>
 
 #include "agent_registry.hpp" // #3687: DispatchDenial / DispatchDenialReason — AuthorizeDispatchFn's error type
@@ -215,7 +217,7 @@ public:
     /// its `exec_visible` filter (`yuzu::server::DispatchCaller`, formerly a
     /// bare `VisibleSet`) so the shared `dispatch_confined` seam has a
     /// principal to work with, not only a visibility filter.
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,

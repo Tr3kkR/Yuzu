@@ -1116,13 +1116,42 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
-                 auto [command_id, sent] =
+                 auto dispatch_outcome =
                      dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
                  if (sent == 0) {
+                     // #3424/#3511: don't blame connectivity for a fail-closed
+                     // containment gate, a quarantine denial, or a withheld
+                     // plugin-absent dispatch — same discrimination /api/command
+                     // already surfaces, so the operator reading THIS console
+                     // isn't pointed at the wrong remediation.
+                     const char* message = "No agents connected. Cannot dispatch command.";
+                     if (dispatch_outcome.scope_parse_error) {
+                         // #3424/#3511 PR review fix round: this console
+                         // accepts a scope expression (scope_expr, above)
+                         // and reaches the same ConfinedDispatchOutcome
+                         // scope_parse_error field mcp_server.cpp's
+                         // execute_instruction reads -- checked first, same
+                         // as there, since a malformed expression is a
+                         // caller error, not a fleet-state fact.
+                         message = "Invalid scope expression -- dispatch was not attempted. "
+                                    "Fix the expression and resubmit; retrying unchanged will "
+                                    "not help.";
+                     } else if (dispatch_outcome.containment_unreadable) {
+                         message = "Containment state is unreadable — dispatch is failing "
+                                    "closed and reaching no agent; check the quarantine store.";
+                     } else if (dispatch_outcome.denied_quarantined_count > 0) {
+                         message = "Every target is quarantined — dispatch was withheld, "
+                                    "not attempted.";
+                     } else if (dispatch_outcome.unknown_plugin_count > 0) {
+                         message = "The dispatched plugin is not in any target's reported "
+                                    "inventory — dispatch was withheld, not attempted.";
+                     }
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
-                         " style=\"font-size:0.75rem;color:#f85149\">"
-                         "No agents connected. Cannot dispatch command.</span>",
+                         " style=\"font-size:0.75rem;color:#f85149\">" +
+                             html_escape(message) + "</span>",
                          "text/html; charset=utf-8");
                      return;
                  }
@@ -1312,8 +1341,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] =
+                 auto dispatch_outcome =
                      dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1523,8 +1554,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] = dispatch_fn_(
+                 auto dispatch_outcome = dispatch_fn_(
                      "tar", "status", agent_ids, /*scope_expr=*/"", params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  {
                      std::lock_guard<std::mutex> lk(tar_scan_mu_);
@@ -1736,9 +1769,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] = dispatch_fn_(
+                 auto dispatch_outcome = dispatch_fn_(
                      "tar", "configure", {device_id}, /*scope_expr=*/"",
                      params, caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.reenable", "failure",
@@ -1904,9 +1939,11 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      caller_fn_ ? caller_fn_(req)
                                : yuzu::server::DispatchCaller{
                                      .exec_visible = yuzu::server::authz::deny_all()};
-                 auto [command_id, sent] =
+                 auto dispatch_outcome =
                      dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params,
                                   caller);
+                 auto& command_id = dispatch_outcome.command_id;
+                 auto& sent = dispatch_outcome.sent;
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.purge", "failure", "command", "",

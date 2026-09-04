@@ -1619,33 +1619,54 @@ Quarantine a device.
 > [Audit Log](audit-log.md)).
 >
 > **`POST /api/command` reports what it withheld.** The success body carries
-> `withheld_quarantined` — always present, `0` on a clean dispatch — so
-> `agents_reached: 97` on a 100-device group is distinguishable from three
-> devices being offline. The dashboard toast says the same.
+> `withheld_quarantined` and (#3424/#3511) `withheld_unknown_plugin` — both
+> always present, `0` on a clean dispatch — so `agents_reached: 97` on a
+> 100-device group is distinguishable from three devices being offline, and a
+> MIXED partial dispatch (some reached, some plugin-absent) is never silently
+> invisible in the response. The dashboard's own execute console
+> (`/api/dashboard/execute`, a separate HTML-fragment handler, not this route)
+> now names the same containment/quarantine/plugin-absence causes on a
+> zero-agents-reached dispatch; it does not yet surface withheld counts on a
+> MIXED partial dispatch the way this route's success body does — tracked as a
+> follow-up.
 >
-> **Its `503` now names the cause.** Three conditions previously shared one
-> body ("failed to send command to any agent"), and one of them is a
-> fleet-wide policy state rather than a transport failure:
+> **Its `503` now names the cause.** Four conditions previously shared one
+> body ("failed to send command to any agent"), and two of them are
+> fleet-wide/request-wide states rather than a transport failure:
 >
 > | `error.reason` | Meaning | `retry_after_ms` |
 > |---|---|---|
 > | `containment_unreadable` | The gate is failing closed: containment state cannot be read, so **every** target on **every** dispatch is refused. A server condition, not a device one. | `5000` |
 > | `quarantined` | Every target named is contained. The dispatch was withheld, not attempted. | `null` — retrying will not help until the device is released |
+> | `plugin_not_found` (#3511) | The dispatched plugin is absent from every target's reported inventory — a command guaranteed to fail, withheld before dispatch rather than reported as a false success. Permanent for the current plugin name. If the plugin name and spelling are correct and it genuinely is installed on the target, the agent's REPORTED inventory is stale: it is populated once at registration and does not refresh until the agent's management connection next re-registers (a reconnect — daemon restart, or any dropped/re-established connection) — this reason can persist until then even after installation completes. | `null` — retrying will not help; check the plugin name/spelling instead, or trigger a reconnect on the target agent if the plugin was only just installed |
 > | *(absent)* | Genuinely no agent reachable — the pre-existing meaning. | *(absent)* |
 >
 > `reason` is a top-level key on the error object, not part of the A4
-> `error.data` envelope. The versioned dispatch routes
-> (`POST /api/instructions/{id}/execute`, the bundle and result-set producers)
-> do **not** yet carry this split — they answer their existing
-> "no agents reached" shapes for all three conditions, because the shared
-> dispatch closure returns only a sent count. Tracked as #3424. ADR-1007 added
-> a fourth cause to that same undifferentiated message on
-> `POST /api/instructions/{id}/execute`: for a `per-device` definition, every
-> named target may have been excluded by an already-open concurrency claim
-> rather than being unreachable at all — the response text now says so, and
-> points at the `yuzu_server_dispatch_concurrency_skipped_total` metric, but
-> this is still prose inside the one undifferentiated 503 body, not a fourth
-> structured `error.reason` value — the same #3424 gap applies to it. The quarantine
+> `error.data` envelope. `POST /api/instructions/{id}/execute` carries the
+> same three-`reason` `503` split as `POST /api/command` above
+> (`containment_unreadable` / `quarantined` / `plugin_not_found`, same
+> `retry_after_ms` values) — closed alongside the architect finding that its
+> response-building code
+> was reading `dispatch_outcome.command_id`/`.sent` only, discarding the
+> richer fields already available on the same struct.
+>
+> **A fourth, structurally distinct condition — `invalid_scope` — is `400`,
+> not part of the `503` table above.** This route (unlike `POST
+> /api/command`) accepts a caller-supplied `scope` expression; a malformed
+> one is a client mistake, not a fleet-state fact, so it reports
+> `error.reason: "invalid_scope"` at `400` with `retry_after_ms: null`,
+> checked before the `503` cascade so a bad expression is never shadowed by
+> `containment_unreadable`. Its generic catch-all
+> (no `reason` key, matching the *(absent)* row above) additionally covers
+> ADR-1007's per-device concurrency-claim exclusion, unique to this route
+> since it — unlike `/api/command` — accepts a `concurrency_mode`: for a
+> `per-device` definition, every named target may have been excluded by an
+> already-open claim rather than being unreachable at all; the message
+> points at `yuzu_server_dispatch_concurrency_skipped_total`. The bundle and
+> result-set producers still do **not** carry this split — their own
+> response-building code was not extended to surface the richer per-arm
+> result their shared dispatch closure now carries (a separate, smaller
+> follow-up per route). The quarantine
 > plugin's own four actions (`quarantine`, `unquarantine`, `status`,
 > `whitelist`) are exempt so that release stays reachable, and so are three
 > server-internal pushes that are not operator dispatch —

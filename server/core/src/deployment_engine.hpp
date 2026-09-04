@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file deployment_engine.hpp
 /// The deployment state-machine driver — ONE standalone callable that advances a
 /// deployment one tick. Operator-driven today (the `/auto` deploy poll handler
@@ -76,7 +78,7 @@ using PollFn = std::function<std::unordered_map<std::string, AgentResponse>(cons
 /// Execute without Write must still be refused before `content_dist.stage`
 /// dispatches, and only a caller-carrying seam lets the chokepoint enforce
 /// that as it does for every other operator surface.
-using DispatchFn = std::function<std::pair<std::string, int>(
+using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
     const std::string& plugin, const std::string& action,
     const std::vector<std::string>& agent_ids, const std::string& scope_expr,
     const std::unordered_map<std::string, std::string>& parameters,

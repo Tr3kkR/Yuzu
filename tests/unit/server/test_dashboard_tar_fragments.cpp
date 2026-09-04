@@ -181,9 +181,9 @@ struct FragmentHarness {
                    const std::vector<std::string>& ids, const std::string& scope,
                    const std::unordered_map<std::string, std::string>& params,
                    const yuzu::server::DispatchCaller& caller)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             calls.push_back({plugin, action, scope, ids, params, caller.exec_visible, caller});
-            return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
+            return {.sent = dispatch_sent, .command_id = "cmd-" + std::to_string(calls.size())};
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn,
