@@ -62,7 +62,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "available for the spike exposed virtualised disks only (WSL2 reports four 'Virtual "
          "Disk' SCSI nodes and no /dev/nvme* character devices), and shipping an "
          "NVME_IOCTL_ADMIN_CMD path written from documentation but never exercised is exactly how "
-         "a dead leg reaches production. Tracked as a follow-up to bind against real hardware"},
+         "a dead leg reaches production. Binding it needs a Linux host with real storage, or a VM with disk passthrough; neither was reachable when this shipped"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1, "IOKit IOBlockStorageDevice device characteristics",
          "reports device identity (model, medium type) and whether the device advertises NVMe "
@@ -86,10 +86,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "not implemented in this change: the physical-to-logical join is only meaningful "
          "alongside a bound smart leg, and the Linux smart leg is deferred with it"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 1, "IOKit IOMedia BSD-name walk + getmntinfo(3) MNT_NOWAIT",
-         "maps each whole-disk device to the mount points its partitions serve; an APFS container "
-         "spanning volumes is reported once per mount point rather than deduplicated to the "
-         "container, matching the caveat filesystem_posture.mounts already carries"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "IOKit IOMedia provider walk + getmntinfo(3) MNT_NOWAIT",
+         "one row per IOMedia object, keyed on that object's BSD name, carrying the physical whole "
+         "disk that backs it and any mount points it serves; the physical disk is resolved by "
+         "walking the IOKit provider chain, so a volume inside a synthesized APFS container "
+         "correctly reports the underlying drive rather than the container; a media object that "
+         "serves no mount point still reports its backing disk, and reports '-' for mount points "
+         "rather than being omitted"},
         /* .windows_leg = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "FindFirstVolumeW + IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS + "

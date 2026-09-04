@@ -204,6 +204,52 @@ def format_gaps(
     return "\n".join(lines)
 
 
+SERVER_CPP = "server/core/src/server.cpp"
+
+
+def _fragment_accessor(rel: str) -> str:
+    """`.../plugin_action_catalogue_disk_actions.hpp` -> the accessor name the
+    production composition site must call."""
+    stem = rel.rsplit("/", 1)[-1].removesuffix(".hpp")
+    return stem + "()"
+
+
+class TestProductionCompositionWiring(unittest.TestCase):
+    """K3 (external functional review): every catalogue test — C++ and Python —
+    composes its OWN list of fragment spans, and the Python gates read the
+    fragment HEADERS. Nothing read `server.cpp`, so deleting the two lines that
+    wire a fragment into the live `CommandCapabilityRegistry` left the entire
+    server suite and both gates green while the plugin's actions classified as
+    Unclassified in production.
+
+    This is a source tripwire, following the precedent at
+    `tests/unit/server/test_agent_properties_scope_authz.cpp`. It is deliberately
+    textual: the point is to guard the one file no compiled test observes.
+    """
+
+    def test_every_fragment_is_included_and_composed_in_server_cpp(self) -> None:
+        server = (REPO_ROOT / SERVER_CPP).read_text(encoding="utf-8")
+        missing_include: list[str] = []
+        missing_compose: list[str] = []
+        for rel in FRAGMENT_FILES:
+            header = rel.rsplit("/", 1)[-1]
+            if f'#include "capability_decls/{header}"' not in server:
+                missing_include.append(header)
+            if _fragment_accessor(rel) not in server:
+                missing_compose.append(_fragment_accessor(rel))
+        self.assertEqual(
+            [], missing_include,
+            f"{SERVER_CPP} does not #include these catalogue fragments, so their rows "
+            f"cannot reach the production registry: {missing_include}",
+        )
+        self.assertEqual(
+            [], missing_compose,
+            f"{SERVER_CPP} includes but never COMPOSES these fragments into the "
+            f"CommandCapabilityRegistry, so every action they declare classifies as "
+            f"Unclassified in production while every test stays green: {missing_compose}",
+        )
+
+
 class TestCatalogueCompleteOnRealTree(unittest.TestCase):
     """The actual drift gate: parses the live repository and fails, naming
     every gap, if the plugins' actions() tables and the seven capability

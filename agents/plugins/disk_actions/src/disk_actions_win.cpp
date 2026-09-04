@@ -418,6 +418,19 @@ int emit_volumes(yuzu::CommandContext& ctx) {
 
         // THE JOIN: which physical drives back this volume. CreateFileW wants
         // the volume path WITHOUT its trailing backslash.
+        // F6: fstype is a declared result column that no leg used to fill.
+        // GetVolumeInformationW answers it for a volume that is mounted and
+        // ready; one that is not simply keeps "-", which is the honest answer
+        // rather than a blank the consumer must interpret.
+        std::string fstype = "-";
+        {
+            wchar_t fs_name[MAX_PATH] = {};
+            if (::GetVolumeInformationW(vol.c_str(), nullptr, 0, nullptr, nullptr, nullptr,
+                                        fs_name, MAX_PATH) &&
+                fs_name[0] != L'\0')
+                fstype = yuzu::win::from_wide(fs_name);
+        }
+
         std::string devices = "-";
         std::optional<std::uint64_t> total;
         std::wstring root = vol;
@@ -459,7 +472,7 @@ int emit_volumes(yuzu::CommandContext& ctx) {
             any_extent_failure = true;
         }
 
-        write_volume_row(ctx, vol_utf8, mounts, devices, "-", total, "-");
+        write_volume_row(ctx, vol_utf8, mounts, devices, fstype, total, "-");
 
         if (!::FindNextVolumeW(find.get(), volume, MAX_PATH)) {
             const DWORD err = ::GetLastError();

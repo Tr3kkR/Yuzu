@@ -116,8 +116,13 @@ Bus bus_from_class(std::string_view cls) {
 /// MNT_NOWAIT for the same reason filesystem_posture uses it: a synchronous
 /// getmntinfo can block on an unreachable network mount, and this runs on a
 /// bounded dispatch-pool worker.
-std::map<std::string, std::vector<std::string>> mount_points_by_bsd_name(bool& ok) {
-    std::map<std::string, std::vector<std::string>> out;
+struct MountInfo {
+    std::vector<std::string> mount_points;
+    std::string fstype; ///< F6: a declared column that no leg used to fill
+};
+
+std::map<std::string, MountInfo> mount_points_by_bsd_name(bool& ok) {
+    std::map<std::string, MountInfo> out;
     struct statfs* mnts = nullptr;
     const int n = ::getmntinfo(&mnts, MNT_NOWAIT);
     ok = n > 0;
@@ -128,7 +133,9 @@ std::map<std::string, std::vector<std::string>> mount_points_by_bsd_name(bool& o
         // block device we can join on (network mounts, synthetic roots).
         constexpr std::string_view kDev = "/dev/";
         if (from.rfind(kDev, 0) != 0) continue;
-        out[from.substr(kDev.size())].push_back(mnts[i].f_mntonname);
+        auto& info = out[from.substr(kDev.size())];
+        info.mount_points.push_back(mnts[i].f_mntonname);
+        if (info.fstype.empty()) info.fstype = mnts[i].f_fstypename;
     }
     return out;
 }
@@ -289,17 +296,29 @@ int emit_volumes(yuzu::CommandContext& ctx) {
         // THE JOIN this action exists for: partition -> whole disk, and
         // partition -> mount points.
         std::string joined = "-";
+        std::string fstype = "-";
         if (const auto found = mounts.find(name); found != mounts.end()) {
             joined.clear();
-            for (const auto& mp : found->second) {
+            for (const auto& mp : found->second.mount_points) {
                 if (!joined.empty()) joined += ',';
                 joined += mp;
             }
+            if (!found->second.fstype.empty()) fstype = found->second.fstype;
         }
 
         std::string physical = physical_whole_disk_of(obj.get());
         if (physical.empty()) physical = "-";
-        write_volume_row(ctx, name, joined, physical, "-", total,
+
+        // F3 (spec axis): this action is the physical-to-logical JOIN, not a
+        // third media inventory -- `hardware.disks` already enumerates physical
+        // devices. A row for a whole disk that serves no mount point carries no
+        // join at all (its device column is itself), so emitting it would be
+        // the scope creep the operator ruling explicitly excluded. Every row
+        // that maps SOMETHING -- a partition to its drive, or any media to a
+        // mount point -- is kept.
+        if (joined == "-" && physical == name) continue;
+
+        write_volume_row(ctx, name, joined, physical, fstype, total,
                          mounts_ok ? "-" : "mount-point enumeration failed; the mapping column is "
                                            "incomplete");
         any_row = true;

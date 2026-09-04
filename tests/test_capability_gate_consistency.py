@@ -32,7 +32,7 @@ Three things checked against the real, integrated tree:
      named failure instead.
   3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
      an `.execute_gate` for must equal the number of rows it finds a
-     `.plugin`/`.action` pair for, and both must equal 187 (45+55+34+42+5+3+3
+     `.plugin`/`.action` pair for, and both must equal 189 (45+55+34+42+5+3+2+3
      across the eight fragments) — architect review requirement: a regex that
      silently fails to associate a gate with its row must read as a hard
      failure, never as an absent gate.
@@ -88,7 +88,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
 ]
-# 3 + 5 + 45 + 55 + 34 + 42 + 3 — see command_capability.hpp's fragment doc
+# 3 + 5 + 45 + 55 + 34 + 42 + 2 + 3 — see command_capability.hpp's fragment doc
 # comments and the #1398 design doc's verified row-count audit.
 EXPECTED_TOTAL_ROWS = 189
 
