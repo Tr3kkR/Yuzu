@@ -290,34 +290,48 @@ is **boot-time, restart-required** - accepted with that limitation. **Scope note
 procedure is a UAT-drill spec, written against zero production fleet. It is single-agent
 (one restart at a time) with no fleet-wide orchestration story - flipping this on N agents
 during a real incident is N individual restarts, not covered here. Persistence across restarts
-is the unit's `EnvironmentFile=-/etc/yuzu/yuzu-agent.env` (#3851) - Linux/systemd packages;
-Windows and macOS service configuration is outside this issue. Treat this as the drill
-procedure for evidence collection, not yet a production incident runbook.
+is the unit's `EnvironmentFile=-/etc/yuzu-agent/yuzu-agent.env` (#3851) - Linux/systemd
+packages; Windows and macOS service configuration is outside this issue. Treat this as the
+drill procedure for evidence collection, not yet a production incident runbook. **Path note**:
+deliberately `/etc/yuzu-agent/`, not the shared `/etc/yuzu/` - a co-installed `yuzu-server`
+package re-asserts `/etc/yuzu` as `0750 yuzu:yuzu` on every install/upgrade, and that
+different service account can unlink/replace a file inside it regardless of the file's own
+mode; `/etc/yuzu-agent/` has no such collision.
 
 1. Confirm current state: agent running with `prefer_spark` active, spark armed on at least one
    rule, drift/heartbeat evidence flowing (criterion 5's UAT smoke precondition).
-2. Flip the flag - persist it, then restart. On a systemd-managed agent (the production
-   form):
+2. Flip the flag - persist it, then restart.
+
+   **On Rig B (the §8 drill rig, foreground)** - this is the drill path, run this on the
+   shared box, not the systemd form below:
    ```bash
-   sudo mkdir -p -m 0750 /etc/yuzu
-   sudo touch /etc/yuzu/yuzu-agent.env
-   sudo chown root:root /etc/yuzu/yuzu-agent.env
-   sudo chmod 0600 /etc/yuzu/yuzu-agent.env
-   sudoedit /etc/yuzu/yuzu-agent.env   # ensure exactly one line: YUZU_AGENT_SPARK_DISABLE=1
+   YUZU_AGENT_SPARK_DISABLE=1 ./yuzu-agent ...
+   ```
+
+   **Production systemd form** (recorded here for the eventual incident runbook - do not run
+   this against a shared or hands-off host):
+   ```bash
+   sudo mkdir -p -m 0750 /etc/yuzu-agent
+   sudo touch /etc/yuzu-agent/yuzu-agent.env
+   sudo chown root:root /etc/yuzu-agent/yuzu-agent.env
+   sudo chmod 0600 /etc/yuzu-agent/yuzu-agent.env
+   sudoedit /etc/yuzu-agent/yuzu-agent.env   # ensure exactly one line: YUZU_AGENT_SPARK_DISABLE=1
    sudo systemctl restart yuzu-agent
    ```
    Exactly one `YUZU_AGENT_SPARK_DISABLE=1` line - no `export`, no shell syntax, no trailing
    inline comment (systemd's `EnvironmentFile=` parser does NOT strip a trailing `# ...` the
    way a shell would; the whole rest of the line becomes part of the value, which then fails
-   CLI11 parsing at boot). A foreground UAT agent (Rig B, §8) exports the same variable on its
-   own command line instead: `YUZU_AGENT_SPARK_DISABLE=1 ./yuzu-agent ...`. Drop-in
-   alternative: `sudo systemctl edit yuzu-agent` with `[Service]`
-   `Environment=YUZU_AGENT_SPARK_DISABLE=1` (`EnvironmentFile=` overrides `Environment=` when
-   both exist; an `ExecStart` override is unaffected, since the variable binds via
-   `->envname`, and a CLI flag always wins over the environment). Roll-forward: remove the
-   assignment and restart - not `=0` (works today, per CLI11's source, but the runbook
-   shouldn't couple to that implementation detail). Evidence it took - run the redirection
-   inside the privileged shell, not the calling one:
+   CLI11 parsing at boot). Drop-in alternative: `sudo systemctl edit yuzu-agent` with
+   `[Service]` `Environment=YUZU_AGENT_SPARK_DISABLE=1` (`EnvironmentFile=` overrides
+   `Environment=` when both exist; an `ExecStart` override is unaffected, since the variable
+   binds via `->envname`, and a CLI flag always wins over the environment). Roll-forward:
+   remove the assignment and restart - not `=0` (works today, per CLI11's source, but the
+   runbook shouldn't couple to that implementation detail). **Package-upgrade note**: an
+   `.rpm` upgrade auto-restarts the unit (`%systemd_postun_with_restart`) and so picks up a
+   pending env-file change on its own; a `.deb` upgrade only reloads the unit definition
+   (`systemctl daemon-reload`) and does NOT restart the process - the env change stays
+   pending until an explicit or otherwise-triggered restart. Evidence it took - run the
+   redirection inside the privileged shell, not the calling one:
    ```bash
    pid="$(systemctl show -p MainPID --value yuzu-agent)"
    sudo sh -c 'tr "\0" "\n" < "/proc/$1/environ" | grep -Fx "YUZU_AGENT_SPARK_DISABLE=1"' sh "$pid"
