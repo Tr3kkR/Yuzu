@@ -115,8 +115,9 @@ why). The shipped design instead tracks completion PER DISTINCT LEGACY-FILE CONT
   `startup_failed_`, never a serve-degraded state.
 
 **Deliberately simpler than `RbacStore`'s post-#2703 reference shape** (refuse on ANY column
-mismatch, `docs/ops-runbooks/rbac-store-backfill-recovery.md`): that complexity exists there
-because RBAC identifiers (role/group names) are small and human-chosen, so two independently-
+mismatch — the operator-recovery runbook this historically pointed to, `rbac-store-backfill-recovery.md`,
+was retired along with `RbacStore::migrate_from_sqlite()` itself, #3623): that complexity exists
+there because RBAC identifiers (role/group names) are small and human-chosen, so two independently-
 authored grants can legitimately collide on name and both need operator adjudication.
 `DeploymentStore`'s `id` is a 64-bit random surrogate key (`generate_id()`) — outside an
 astronomical id collision (the rare case the IDENTITY branch below exists to catch), a shared id

@@ -330,3 +330,48 @@ class).
   `LegacySecretWiper`-style wipe-after-the-fact pattern verbatim: reading legacy plaintext
   directly into a zeroizing buffer type from the start would make that pattern unnecessary
   (architect, gov Gate 3, PR #3563 full-PR review) — a cleaner shape for a store starting fresh.
+
+## Update (2026-09-03) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) establishes that no production Yuzu
+fleet has ever run a pre-Postgres build of any store — the mandatory, both-tables,
+fingerprint-verified backfill this ADR designed was real, working code that never had real
+legacy data to protect. `WebhookStore` shipped this backfill (PR #3563) the same day the
+amendment landed, too late for the "don't build it" guidance to reach it — see ADR-0009's own
+Update for that timing note.
+
+`WebhookStore::migrate_from_sqlite()`/`migrate_from_sqlite_impl()` and their backfill-only
+helpers (`kSourcelessFingerprint`, `safe`, `append_field`, `sha256_hex`, `LegacyWebhook`,
+`LegacyDelivery`, `canonicalize_legacy`, `move_legacy_aside`) are removed
+(`chore/retire-migrate-from-sqlite-batch-a`, tracking issue #3623). `sqlite_backfill_source`
+— whose entire purpose was the backfill idempotency marker — is dropped via a version-bumped
+`{2, "DROP TABLE IF EXISTS sqlite_backfill_source;"}` migration, appended after the
+already-shipped v1 rather than edited in place: this store IS constructed in production, so v1
+has actually run against real dev/UAT databases.
+
+**The 0600+sidecar hardening this ADR designed for the read-time force is NOT retired — it
+generalizes.** `legacy_sqlite_probe::harden_legacy_file_0600` (new, `legacy_sqlite_probe.hpp`)
+extracts `migrate_from_sqlite_impl`'s own inline 0600+`-wal`/`-shm` block into the shared helper
+this store's own file header already pointed future secret-bearing callers toward ("extend,
+never fork"). `server.cpp`'s boot path now calls `harden_legacy_file_0600` then
+`legacy_sqlite_probe::warn_if_legacy_rows` over `webhooks`/`webhook_deliveries` instead of the
+backfill — WARN-only (never refuse-boot) on a real legacy row found, same posture as every other
+store in this retirement batch.
+
+**No move-aside.** With nothing migrated, `move_legacy_aside`'s `.migrated-<epoch>` rename would
+misdescribe what happened to the file (nothing was actually carried over), so the legacy file —
+now hardened to 0600 in place, main file and sidecars alike — is left at its original path. The
+WAL/SHM sidecar 0600-enforcement regression tests this ADR's own "Adversarial review" history
+added (PR #3563) moved to `test_legacy_sqlite_probe.cpp` against the new shared helper; the
+companion move-aside-failure regression test has no remaining subject and was not carried
+forward.
+
+**Follow-up disposition:** #3590 (idempotency check comparing sanitized-vs-raw legacy bytes) and
+#3595 (secret bytes surviving in a freed `std::vector` reallocation buffer) are both moot — the
+code paths they describe no longer exist. #3613 (a deleted webhook resurrected by a stale legacy
+snapshot replay) is also moot — nothing replays the legacy file into Postgres anymore, so there
+is no resurrection path. #3562 (operator purge flag for a retained legacy secret-bearing file)
+and #3593 (no compensating Windows ACL for that file) both still apply, re-scoped onto
+`harden_legacy_file_0600`'s POSIX-only retained file at its original path rather than a
+`migrate_from_sqlite_impl`-produced `.migrated-<epoch>` copy. #3561/#3591/#3594/#3614 are
+unaffected by this retirement (none touch the backfill).

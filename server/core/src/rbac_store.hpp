@@ -32,20 +32,19 @@
 ///    replica) or on ANY generation-read error it clears the cache (fail
 ///    toward "assume changed", never extend trust). Bounds cross-replica
 ///    stale-allow to the refresh interval.
-///  - **Backfill: MANDATORY (ADR-0009/0041).** RBAC state is irreducible
-///    operator intent (custom roles, every grant, groups, membership) that
-///    cannot be re-derived — `migrate_from_sqlite` seeds defaults then
-///    backfills operator rows (`ON CONFLICT DO NOTHING`), idempotent / single-
-///    shot (retried from scratch on interruption — not a cursor-resumed
-///    stream, unlike AuditStore's larger dataset) / row-count reconciled, and
-///    boot FAILS CLOSED on failure. The `rbac_enabled` flag is migrated FIRST
-///    and read-back-verified — losing it silently reverts the fleet to
-///    RBAC-off (catastrophic fail-open).
+///  - **`migrate_from_sqlite()` retired (#3623, ADR-0041 Update).** No
+///    production fleet ever ran a pre-Postgres build of this store, so the
+///    mandatory, read-back-verified `rbac_enabled`-flag-first backfill it
+///    implemented never had real legacy data to protect. `server.cpp` now
+///    runs `legacy_sqlite_probe::warn_if_legacy_rows` over `rbac_config`
+///    (the legacy table holding the enabled flag — the row that matters
+///    most) plus `securable_types`/`operations`/`roles`/`role_permissions`/
+///    `principal_roles`/`groups`/`group_members` instead — silent unless
+///    real rows are found, never blocks boot.
 
 #include <atomic>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -135,9 +134,9 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
-    /// Wire a metrics registry for `yuzu_server_rbac_read_degrade_total{reason}`
-    /// and the backfill counter. Set ONCE during single-threaded startup before
-    /// serving; read without synchronisation on serving threads. Null (the
+    /// Wire a metrics registry for `yuzu_server_rbac_read_degrade_total{reason}`.
+    /// Set ONCE during single-threaded startup before serving; read without
+    /// synchronisation on serving threads. Null (the
     /// default, e.g. unit tests) disables emission; every emit site is guarded.
     /// Also resolves and caches `authz_check_seconds_hist_` here (#2703 Gate 7
     /// item Commit B) — a `Histogram&` obtained from a `MetricsRegistry` is
@@ -153,16 +152,6 @@ public:
     /// own short-lived registry), and a dangling write once the first
     /// registry is destroyed.
     void set_metrics(yuzu::MetricsRegistry* m) noexcept;
-
-    /// MANDATORY backfill (ADR-0009/0041). On first boot against an empty
-    /// `rbac_store` with a legacy `rbac.db` present, migrates the `rbac_enabled`
-    /// flag FIRST (read-back-verified — losing it is catastrophic fail-open),
-    /// then backfills custom roles / role_permissions / principal_roles /
-    /// groups / group_members via `ON CONFLICT DO NOTHING`, reconciles row
-    /// counts, and stamps a one-time marker. Returns TRUE on success or when
-    /// already complete; FALSE on any failure — the caller MUST refuse boot
-    /// (fail-closed). The verified-migrated legacy file is moved aside.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Global toggle ────────────────────────────────────────────────────
     /// The cached view of the durable `rbac_enabled` flag, refreshed at most

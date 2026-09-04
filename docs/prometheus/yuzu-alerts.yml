@@ -247,30 +247,6 @@ groups:
             "RbacStore — the authorization substrate".
           runbook_url: "https://docs.yuzu.io/runbooks/rbac-read-degraded"
 
-      - alert: YuzuRbacBackfillFailing
-        # The one-time legacy-rbac.db -> PostgreSQL backfill at boot could not
-        # complete. The server fails the boot CLOSED and retries on next start,
-        # so this pairs with a server that will not come up — surfaced here for
-        # the case where a scrape catches the failed counter before exit.
-        expr: |
-          increase(yuzu_server_rbac_backfill_total{result="failed"}[15m]) > 0
-        labels:
-          severity: critical
-        annotations:
-          summary: "RBAC store Postgres backfill failed — server refusing to boot"
-          description: >-
-            yuzu_server_rbac_backfill_total{result="failed"} moved: the
-            RbacStore migration backfill (legacy rbac.db -> PostgreSQL rbac_store,
-            ADR-0041) could not reconcile/commit, so the server fails the boot
-            closed rather than running on a partial authorization config. It
-            retries on the next start. Check Postgres availability, the
-            rbac_store schema, and the presence/readability of the legacy
-            rbac.db backfill source in the server log — including a
-            HOLDER-SIDE VERIFICATION FAILED line, which means this replica's
-            own legacy rbac.db does not match what the fleet already
-            migrated (see the runbook).
-          runbook_url: "docs/ops-runbooks/rbac-store-backfill-recovery.md"
-
   # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
   # CC6.8) ─────────────────────────────────────────────────────────────────
   # Every BARE (unlabeled) counter in this group is boot-seeded to 0 (never
@@ -437,11 +413,10 @@ groups:
       # Audit-write-failures: a committed SCIM mutation (create/update/patch/
       # delete/deprovision) lost its audit evidence write. This is an evidence
       # INTEGRITY gap on an already-committed change, not a rejected request —
-      # critical, like YuzuSecretDecryptTamperSignal and
-      # YuzuRbacBackfillFailing above. `action` is bounded (create/update/
-      # patch/delete/deprovision-shaped verbs) — preserved via `by (action)`
-      # so a failure on one action class cannot hide inside another's healthy
-      # rate.
+      # critical, like YuzuSecretDecryptTamperSignal above. `action` is
+      # bounded (create/update/patch/delete/deprovision-shaped verbs) —
+      # preserved via `by (action)` so a failure on one action class cannot
+      # hide inside another's healthy rate.
       - alert: YuzuScimAuditWriteFailures
         expr: |
           sum by (action) (increase(yuzu_scim_audit_write_failures_total[1h])) > 0
@@ -953,9 +928,10 @@ groups:
             "validation_failed" means the stored whitelist itself is
             undispatchable - as of #3425 (d1f71c58f) POST /api/v1/quarantine
             validates whitelist at write time, so this now points at a record
-            migrated from the legacy quarantine.db (ADR-0047 backfill, no
-            validation) or one written before d1f71c58f shipped, not a fresh
-            REST write; "busy"/"unconfirmed" mean a dispatch landed but did
+            written before d1f71c58f shipped, or (on a fleet with pre-#3623
+            history) one migrated from a legacy quarantine.db by the
+            since-retired migrate_from_sqlite backfill (ADR-0047, no
+            validation) - not a fresh REST write; "busy"/"unconfirmed" mean a dispatch landed but did
             not (yet) confirm; "degraded" means either a per-agent
             apply/confirm/status call is failing, OR the tick itself is
             failing (check tick_healthy above first to tell which) - NOT
@@ -2729,29 +2705,6 @@ groups:
             Check Postgres reachability for the configured DSN, then
             restart the server - this does not recover on its own.
           runbook_url: "https://docs.yuzu.io/runbooks/analytics-store-not-open"
-      - alert: YuzuMgmtGroupBackfillFailing
-        # The one-time SQLite->Postgres confinement backfill (ADR-0042) reported
-        # a failed outcome. The server fails closed at boot on a backfill failure
-        # (write error, or an over-deep/cyclic legacy tree) and retries next
-        # start, so a failed sample means the server refused to come up with a
-        # partial/empty confinement hierarchy — an operator must repair or move
-        # aside the legacy management-groups.db before it will boot.
-        expr: |
-          sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
-        for: 0m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Management-group confinement backfill failed (server refused to boot)"
-          description: >-
-            yuzu_server_mgmt_group_backfill_total{result="failed"} advanced: the
-            one-time confinement backfill could not complete (Postgres write
-            error, or an over-deep/cyclic legacy management-groups.db). The server
-            fails closed at boot rather than come up with partial confinement and
-            retries on the next start — repair the legacy tree (flatten below 10
-            levels / break the cycle) or move management-groups.db aside, then
-            restart.
-          runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuCustomPropertiesReadDegraded
         # A props.<key> scope-DSL-feeding read against custom_properties_store
         # (ADR-0045) degraded. AgentRegistry::evaluate_scope's bulk preload
