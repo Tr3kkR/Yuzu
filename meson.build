@@ -440,6 +440,7 @@ if build_agent
     subdir('agents/plugins/filesystem')
     subdir('agents/plugins/filesystem_posture')
     subdir('agents/plugins/windows_updates')
+    subdir('agents/plugins/disk_actions')
     subdir('agents/plugins/disk_space')
     subdir('agents/plugins/event_logs')
     subdir('agents/plugins/sccm')
