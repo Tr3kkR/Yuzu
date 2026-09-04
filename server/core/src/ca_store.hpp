@@ -38,11 +38,16 @@
 /// the two callers that legitimately intend a replace: PR6 subordinate-CA import (an explicit,
 /// single-writer, operator-triggered re-root) and test seeding. Never call `set_root()` from
 /// first-boot generation — see `try_insert_root()`'s doc comment for why.
+///
+/// `migrate_from_sqlite()` retired (#3623, ADR-0053 Update): no production fleet ever ran a
+/// pre-Postgres build of this store, so the mandatory three-table fingerprinted backfill it
+/// implemented never had real legacy data to protect. `server.cpp` now runs
+/// `legacy_sqlite_probe::warn_if_legacy_rows` over `ca_root`/`ca_issued`/`ca_crl_versions`
+/// instead — silent unless real rows are found, never blocks boot.
 
 #include <chrono>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -184,16 +189,6 @@ public:
     /// lock across a multi-call critical section, separate from this store's
     /// own per-call leasing.
     [[nodiscard]] pg::PgPool& pool() const noexcept { return pool_; }
-
-    /// Legacy-SQLite backfill (ADR-0009/0053). Call once at server startup, before serving, after
-    /// construction has proven the Postgres schema is open. Idempotent PER DISTINCT LEGACY-FILE
-    /// CONTENT across all THREE legacy tables (`ca_root`, `ca_issued`, `ca_crl_versions`) — never
-    /// a single fleet-wide flag; see the `.cpp` file header for the fingerprinting + conflict
-    /// rules. Fails CLOSED on any error, including a legacy file holding some-but-not-all of the
-    /// three tables (no version of the shipped pre-migration binary can produce that shape).
-    /// Returns true (no-op) when `legacy_db_path` does not exist or holds none of the three
-    /// tables (fresh install). Opens the legacy file READ-ONLY and never deletes/moves it.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Root ──────────────────────────────────────────────────────────────────
 

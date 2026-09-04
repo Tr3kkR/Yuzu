@@ -217,3 +217,19 @@ data).
   to re-apply it, which is exactly the class of bug #3623's own `ProductPackStore` fix corrected
   (a version-bumped `DROP` was mistakenly inserted at an already-shipped store's used slot,
   renumbering its content to a higher version instead of being appended after it).
+
+  **Update (production-code removal completed, 2026-09-03):** two sentences above are now
+  superseded by completed work, not merely by intent. The parenthetical at "its production
+  `migrate_from_sqlite()` stays for now, same as the others" (`WebhookStore`) is superseded —
+  its production `migrate_from_sqlite()` was retired in `chore/retire-migrate-from-sqlite-batch-a`
+  (#3623), see ADR-0057's own Update. And "removing their already-built `migrate_from_sqlite()`
+  is a separate decision (tracked as ongoing cleanup, not mandated by this ADR)" is superseded
+  for the full set: `chore/retire-migrate-from-sqlite-batch-b` (#3898, merged 2026-09-02) retired
+  12 stores' production code, and `chore/retire-migrate-from-sqlite-batch-a` (#3623) retired the
+  remaining 6 (`WebhookStore`, `CaStore`, `InventoryStore`, `RbacStore`, `ManagementGroupStore`,
+  `QuarantineStore`) — each per that store's own risk profile, not a copy-paste of the mechanical
+  template, per the original tracking issue's own acceptance criteria. That closes all 18 stores
+  named in #3623. `AuditStore` remains the sole exception, unaffected by either PR — see the
+  "This default is conditional on the fact, not permanent policy" paragraph above for why. A
+  future store's own retirement, if one is ever added to the ladder after this ADR's amendment,
+  should follow the version-bumped-append shape these two PRs established, not re-derive it.

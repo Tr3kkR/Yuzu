@@ -28,13 +28,21 @@
 /// store deliberately declines it, see ADR-0057). `Webhook`/the internal
 /// delivery-carrying struct therefore never hold plaintext — only the
 /// encrypted blob and `has_secret`.
+///
+/// `migrate_from_sqlite()` retired (#3623, ADR-0057 Update): no production fleet ever ran a
+/// pre-Postgres build of this store, so the mandatory, both-tables, fingerprint-verified
+/// backfill it implemented never had real legacy data to protect. `server.cpp` now runs
+/// `legacy_sqlite_probe::harden_legacy_file_0600` (this store's legacy file may hold a
+/// plaintext signing secret, ADR-0010 §Consequences (a)) then `warn_if_legacy_rows` over
+/// `webhooks`/`webhook_deliveries` instead — silent unless real rows are found, never blocks
+/// boot. No move-aside: with nothing migrated, a `.migrated-<epoch>` rename would misdescribe
+/// what happened to the file, so the legacy file is left in place at its original path.
 
 #include "store_worker_pool.hpp"
 
 #include <chrono>
 #include <cstdint>
 #include <expected>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
@@ -118,16 +126,6 @@ public:
     /// thread right up until it finishes (see the file header).
     bool quiesce(std::chrono::milliseconds timeout);
 
-    /// One-time, idempotent legacy-`webhooks.db` backfill (ADR-0009
-    /// MANDATORY class — both tables; ADR-0057 records why deliveries are
-    /// not treated as skippable telemetry here). Runs at boot, before
-    /// serving, and fails closed on any error. The legacy plaintext
-    /// `secret` column is TRANSFORMED (encrypted), never copied (ADR-0010).
-    /// The legacy file is moved aside (never deleted) on a verified
-    /// success, matching every other secret-bearing/mandatory-backfill
-    /// store on the ladder.
-    [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
-
     /// Create a new webhook. `secret` may be empty (no signing secret —
     /// deliveries fire unsigned, `has_secret=false`); a non-empty secret is
     /// envelope-encrypted before it ever reaches Postgres. Returns the
@@ -202,10 +200,6 @@ private:
     /// discarding the failure (kickoff lesson 3).
     bool record_delivery(int64_t webhook_id, const std::string& event_type,
                          const std::string& payload, int status_code, const std::string& error);
-    /// The actual backfill body; `migrate_from_sqlite` wraps this with the
-    /// `yuzu_server_webhook_backfill_total{result}` metric (NotificationStore
-    /// convention).
-    bool migrate_from_sqlite_impl(const std::filesystem::path& legacy_db_path);
 
     // LAST-DECLARED MEMBER (#3261 governance hardening, ported from the
     // SQLite era) - see the identical comment history on
