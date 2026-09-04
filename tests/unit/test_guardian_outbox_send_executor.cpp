@@ -195,6 +195,46 @@ TEST_CASE("item 4 regression: stop() closes the offer()-to-launch() admission ra
     CHECK(exec.active_worker_count() == 0);
 }
 
+TEST_CASE("#3966: admission (in_flight) and the AliveTicket count are one atomic transaction "
+          "under stop() - active_worker_count() must not transiently read 0 once admission "
+          "is committed",
+          "[spark][guardian][send_executor][chaos]") {
+    // set_post_admission_race_hook_for_test() fires in the gap between launch()'s
+    // bookkeeping lock closing and AliveTicket's own construction - the exact window
+    // #3966 reports. On unfixed code the ticket (and therefore active_worker_count()) is
+    // not counted yet at that point, even though `stopping` is already true and admission
+    // is already committed - the finding's falsified-zero window. On fixed code (the
+    // ticket armed inside the SAME locked block as the bookkeeping) this window cannot be
+    // observed via this hook at all, since the count is already 1 by the time control
+    // reaches a point where a hook could fire after the lock.
+    GuardianOutboxSendExecutor exec;
+    auto entry = lifecycle_entry("e1");
+    std::atomic<int> invocations{0};
+    auto instant = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+
+    std::size_t observed_count = 999;
+    bool observed_stopping_first = false;
+    exec.set_post_admission_race_hook_for_test([&] {
+        exec.stop();
+        observed_count = exec.active_worker_count();
+        observed_stopping_first = true;
+    });
+
+    auto result = exec.offer(entry, instant, 200ms);
+
+    REQUIRE(observed_stopping_first);
+    // The send WAS admitted before stop() ran (unlike the pre-launch race test above) -
+    // stop() only prevents a FUTURE launch, so this call still completes normally.
+    REQUIRE(result.has_value());
+    CHECK(*result == SendResult::Sent);
+    CHECK(invocations.load() == 1);
+    CHECK(observed_count == 1);
+    CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+}
+
 TEST_CASE("stop() prevents a new launch but does not disturb one already in flight",
           "[spark][guardian][send_executor]") {
     GuardianOutboxSendExecutor exec;

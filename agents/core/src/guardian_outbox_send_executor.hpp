@@ -234,6 +234,12 @@ public:
         pre_launch_race_hook_for_test_ = std::move(hook);
     }
 
+    /// Test-only synchronization seam - see the call site in launch() for what race it
+    /// exists to make deterministic (#3966). Production callers never set this.
+    void set_post_admission_race_hook_for_test(std::function<void()> hook) {
+        post_admission_race_hook_for_test_ = std::move(hook);
+    }
+
 private:
     struct State {
         std::mutex mu;
@@ -327,6 +333,13 @@ private:
                 state_->in_flight_event_id = entry.event_id;
                 state_->done = false;
             }
+            // Test seam: fires in the gap between the bookkeeping lock above closing and
+            // AliveTicket's own self-locking ctor below - the exact window #3966 reports
+            // (a concurrent stop() can land here, observe stopping=true and
+            // active_worker_count()==0, while admission is already committed). Production
+            // callers never set this.
+            if (post_admission_race_hook_for_test_)
+                post_admission_race_hook_for_test_();
             // Constructed (and counted, via its self-locking ctor) BEFORE the launch
             // attempt, inside a shared_ptr so a launch failure's synchronous destruction
             // and a launched worker's eventual thread-exit destruction both go through
@@ -381,6 +394,7 @@ private:
 
     std::shared_ptr<State> state_;
     std::function<void()> pre_launch_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::function<void()> post_admission_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
 };
 
 } // namespace yuzu::agent
