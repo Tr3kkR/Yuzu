@@ -5,6 +5,20 @@
  * (the-rig, live Samsung SSD 970 EVO Plus over NVMe) before a line of this was
  * written. The full record is at ~/.claude/roadmaps/wave6-smart-spike.md.
  *
+ * HOST-VERIFIED 2026-09-04 on that same host: this TU compiles under real MSVC
+ * with zero errors, the agent suite passes there (76,268 assertions / 2,553
+ * cases), and both actions were exercised against two live NVMe drives,
+ * emitting distinct per-device wear figures rather than a constant:
+ *
+ *   smart|PhysicalDrive0|Samsung SSD 970 EVO Plus 250GB|nvme|ssd|ok|5|100|-
+ *   smart|PhysicalDrive1|Samsung SSD 970 EVO Plus 1TB|nvme|ssd|ok|1|100|-
+ *   volume|...{c9a5f911}/|C:/|PhysicalDrive0|-|248158093312|-
+ *   volume|...{785383ef}/|D:/|PhysicalDrive1|-|1000187363328|-
+ *
+ * The last two lines are the join this plugin exists for: C: resolves to
+ * PhysicalDrive0 and D: to PhysicalDrive1, so a failing drive can be named in
+ * terms of the drive letters it serves.
+ *
  *   smart    IOCTL_STORAGE_QUERY_PROPERTY with StorageDeviceProperty (identity,
  *            bus type), StorageDeviceSeekPenaltyProperty (SSD vs HDD) and
  *            StorageDeviceProtocolSpecificProperty + ProtocolTypeNvme +
