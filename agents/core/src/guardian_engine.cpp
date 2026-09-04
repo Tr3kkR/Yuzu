@@ -1436,11 +1436,17 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         // sent-label is written (item 7 PR-Ag). Live / compliance / health entries carry no
         // batch key → no-op.
         //
-        // Captures the journal HANDLE, not `this` (C0 #2298): the wrap runs on the drain-worker
-        // thread, and re-reading the lifecycle_journal_ member from there would be an unlocked
-        // read of engine state - and taking mtx_ to read it safely would deadlock against
-        // stop(), which joins this worker while holding mtx_. Resolved here, once, and held by
-        // shared_ptr so the wrap cannot outlive what it points at.
+        // Captures the journal HANDLE, not `this` (C0 #2298): re-reading the lifecycle_journal_
+        // member from wherever this wrap runs would be an unlocked read of engine state, and
+        // taking mtx_ to read it safely risks a deadlock on any thread stop() joins while
+        // holding mtx_. Resolved here, once, and held by shared_ptr so the wrap cannot outlive
+        // what it points at. (#2233 item 4, revised: this wrap - the `send` passed to
+        // GuardianOutboxDrainWorker - no longer necessarily runs ON the drain-worker thread at
+        // all; drain_bounded() routes it through GuardianOutboxSendExecutor's detached worker,
+        // guardian_outbox_send_executor.hpp. mark_batch_sent()'s kv_ write below is therefore a
+        // THIRD caller into KvStore alongside persist()/prune()/page_into_window() - safe only
+        // because KvStore serialises its single connection under its own mutex; see the CONCURRENCY
+        // paragraph in guardian_lifecycle_journal.hpp, which names this caller explicitly.)
         auto journal = lifecycle_journal_; // shared: the wrap keeps it alive on its own
         auto journaled_send = [journal, send = std::move(send)](const OutboxEntry& e) -> SendResult {
             const SendResult r = send(e);
@@ -1528,7 +1534,12 @@ std::size_t GuardianEngine::active_io_workers() const {
     std::lock_guard lock(mtx_);
     // #2233 item 3: spark_runtime_'s own bounded arm/disarm executor is a SECOND
     // source of live backend I/O workers, distinct from spark_reader_'s state-read
-    // executor (guardian_spark_runtime.hpp - dedicated instance, never shared). Both
+    // executor (guardian_spark_runtime.hpp - dedicated instance, never shared).
+    // #2233 item 4 adds a THIRD: spark_drain_worker_'s detached outbox-send executor
+    // (guardian_outbox_send_executor.hpp) - its `send` callback captures AgentImpl
+    // state directly and is safe ONLY because this sum is what keeps main.cpp /
+    // service_win.cpp from tearing that state down while a send is still detached
+    // and running (see guardian_outbox_drain_worker.hpp's class doc). All three
     // must be summed here: this is the orphan-exit contract's sole source of truth
     // (hard_exit.hpp / guardian_io_executor.hpp) - main.cpp/service_win.cpp refuse
     // normal C++ teardown while this is nonzero, and a source left out of the sum
@@ -1536,6 +1547,8 @@ std::size_t GuardianEngine::active_io_workers() const {
     std::size_t n = spark_reader_ ? spark_reader_->active_io_workers() : 0;
     if (spark_runtime_)
         n += spark_runtime_->active_backend_op_workers();
+    if (spark_drain_worker_)
+        n += spark_drain_worker_->active_send_workers();
     return n;
 }
 

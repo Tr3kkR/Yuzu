@@ -3361,12 +3361,17 @@ private:
     // Subscribe stream, mirroring emit_guardian_event but returning a SendResult so
     // the drain can retain-and-retry: Retain when the stream is down (pre-network arm
     // or a reconnect gap) or the Write fails, Sent on a successful Write. Capturing
-    // `this` is lifetime-safe: the drain worker thread is synchronously joined by
-    // guardian_->stop() before ~AgentImpl, and stream_write_mu_/guardian_sink_stream_
-    // are declared before guardian_ so they outlive that stop() (same ordering the
-    // legacy guardian sink relies on). NOTE: at 7.7a prefer_spark is false, so no rule
-    // arms, the outbox is always empty, and this callback is never actually invoked in
-    // production - the mapping is proven by unit tests ([sendmap]) ahead of rung 7.7b.
+    // `this` is lifetime-safe, but NOT via a synchronous join (#2233 item 4, revised):
+    // this callback runs on GuardianOutboxSendExecutor's DETACHED worker
+    // (guardian_outbox_send_executor.hpp), which guardian_->stop() does NOT join. Safety
+    // instead rests on the orphan-exit contract - active_send_workers() is summed into
+    // GuardianEngine::active_io_workers() (guardian_engine.cpp), and main.cpp/
+    // service_win.cpp's hard_exit.hpp guard refuses normal C++ teardown of AgentImpl
+    // (and therefore of stream_write_mu_/guardian_sink_stream_, which this callback
+    // touches) while that count is nonzero - hard_exit()ing instead after a bounded
+    // grace. NOTE: at 7.7a prefer_spark is false, so no rule arms, the outbox is always
+    // empty, and this callback is never actually invoked in production - the mapping is
+    // proven by unit tests ([sendmap]) ahead of rung 7.7b.
     SendResult send_guardian_outbox_entry(const OutboxEntry& e) {
         static constexpr std::string_view kHostPlatform =
 #if defined(_WIN32)
