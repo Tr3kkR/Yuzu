@@ -551,6 +551,10 @@ GuardianJournalStats GuardianEngine::journal_stats() const {
         (spark_drain_worker_ ? spark_drain_worker_->journal_maint_exception_count() : 0);
     s.drain_exceptions = spark_drain_worker_ ? spark_drain_worker_->drain_exception_count() : 0;
     s.sweep_exceptions = spark_scheduler_ ? spark_scheduler_->sweep_exception_count() : 0;
+    // #3953 items 1+2: both GuardianOutboxSendExecutor lanes, summed.
+    s.send_orphan_exceptions =
+        spark_drain_worker_ ? spark_drain_worker_->send_orphan_exception_count() : 0;
+    s.send_stalls = spark_drain_worker_ ? spark_drain_worker_->send_stall_count() : 0;
     return s;
 }
 

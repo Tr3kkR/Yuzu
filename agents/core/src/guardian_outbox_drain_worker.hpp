@@ -392,6 +392,16 @@ public:
         return lifecycle_send_exec_.active_worker_count() + compliance_send_exec_.active_worker_count();
     }
 
+    /// #3953 item 1: fleet sum of both lanes' reclaimed-orphan thrown-exception counts.
+    [[nodiscard]] std::uint64_t send_orphan_exception_count() const {
+        return lifecycle_send_exec_.orphan_exception_count() + compliance_send_exec_.orphan_exception_count();
+    }
+
+    /// #3953 item 2: fleet sum of both lanes' send-stall counts.
+    [[nodiscard]] std::uint64_t send_stall_count() const {
+        return lifecycle_send_exec_.send_stall_count() + compliance_send_exec_.send_stall_count();
+    }
+
     /// Test-only forwarder to the private wrapped_send() (#3953 item 6) - lets a test
     /// drive a single send attempt directly, on the test's own thread, without
     /// start()ing the worker thread. No production caller.

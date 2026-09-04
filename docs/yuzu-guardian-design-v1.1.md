@@ -2603,6 +2603,7 @@ heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 | maintenance exception | a persist/prune/page throw was firewalled and swallowed | `maint_exceptions` | integrity gap, alert |
 | lifecycle backpressure drop | a lifecycle entry was rejected at outbox enqueue for capacity (a staging loss, distinct from `stage_dropped`) | `guardian_journal_backpressure_drops` | integrity gap, alert |
 | drain/send exception | a per-entry drain send threw; the head is retained and that log's drain stops | `guardian_drain_exceptions` / `guardian_send_exceptions` | integrity gap, alert |
+| send stall / orphan-exception (#3953) | a `GuardianOutboxSendExecutor` send (either lane) exceeded its stall threshold before completing/reclaiming, or a reclaimed orphan's result was a thrown exception discarded for lack of anywhere correct to attribute it | `guardian_send_stalls` / `guardian_send_orphan_exceptions` | monitor (stall); diagnostic, not a loss (orphan-exception) |
 
 Two related counters are reported alongside but are **not** journal loss channels:
 `guardian_sweep_exceptions` (a firewalled convergence-sweep throw — drift
