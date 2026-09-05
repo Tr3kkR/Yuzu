@@ -200,8 +200,13 @@ private:
     // process_enum() call; this method's only remaining job is calling
     // enumerate_processes() and picking the platform's path-comparison
     // case-sensitivity (R-016).
+    // `st` is the tick's working cursor state: `exec_seen` gates the emission
+    // so each (device_key, image_path) is reported ONCE per attach session
+    // (K1), and the same set is what makes the stable exec record_key safe.
+    // Only a committed tick persists `st`, so a failed commit re-derives and
+    // re-reports rather than losing the observation.
     void append_exec_from_removable(
-       std::vector<RemovableEvent>& out,
+       std::vector<RemovableEvent>& out, RemovableCursorState& st,
        const std::vector<std::pair<std::string, std::string>>& attached_roots) const {
         if (attached_roots.empty())
             return;
@@ -221,6 +226,9 @@ private:
             ev.pid = m.pid;
             ev.evidence = "process_enum:exec_path";
             ev.record_key = removable_exec_record_key(m.device_key, m.image_path);
+            const std::string seen_key = m.device_key + "\x1f" + m.image_path;
+            if (!st.exec_seen.insert(seen_key).second)
+                continue; // already reported for this attach session
             out.push_back(std::move(ev));
         }
     }
@@ -394,12 +402,14 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     bri.baseline_already_done = baseline_already_done;
     bri.current_keys = current_keys;
     bri.prev_attach_set = prev_attach_set;
+    bri.exec_seen = st.exec_seen;
     bri.pending.reserve(pending.size());
     for (const auto& ev : pending)
         bri.pending.emplace_back(ev.action, ev.device_key);
     const auto decided = decide_baseline_and_reconcile(bri);
     st.attach_set.clear();
     st.attach_set.insert(decided.attach_set.begin(), decided.attach_set.end());
+    st.exec_seen = decided.exec_seen;
 
     for (const auto& key : decided.baseline_keys) {
         const auto it = seen_by_key.find(key);
@@ -443,7 +453,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
         events.push_back(std::move(re));
     }
 
-    append_exec_from_removable(events, attached_roots);
+    append_exec_from_removable(events, st, attached_roots);
 
     // R-004: overflow-drop delta, reported (not yet advanced — see below).
     const auto dropped_now = queue_.dropped();
@@ -813,7 +823,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             }
         }
     }
-    append_exec_from_removable(events, linux_device_roots_);
+    append_exec_from_removable(events, st, linux_device_roots_);
 
     // R-004: overflow-drop delta, reported (not yet advanced — see below).
     const auto dropped_now = queue_.dropped();
@@ -1312,7 +1322,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
         st.attach_set.erase(key);
     }
 
-    append_exec_from_removable(events, attached_roots);
+    append_exec_from_removable(events, st, attached_roots);
 
     CursorCollectResult result;
     result.new_cursor_json = encode_removable_cursor(st);

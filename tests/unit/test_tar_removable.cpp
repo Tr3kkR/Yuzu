@@ -283,7 +283,9 @@ TEST_CASE("removable exec-from-removable: a path under the volume root matches, 
           "[tar][removable][exec]") {
     CHECK(exec_path_under_removable_root("/Volumes/KINGSTON/payload/tool", "/Volumes/KINGSTON"));
     CHECK(exec_path_under_removable_root("/Volumes/KINGSTON/payload/tool", "/Volumes/KINGSTON/"));
-    CHECK(exec_path_under_removable_root(R"(E:\payload\tool.exe)", R"(E:\)"));
+    CHECK(exec_path_under_removable_root(R"(E:\payload\tool.exe)", R"(E:\)",
+                                        /*case_insensitive=*/true,
+                                        /*backslash_is_separator=*/true));
     CHECK(exec_path_under_removable_root("/Volumes/KINGSTON", "/Volumes/KINGSTON")); // exact root itself
 }
 
@@ -300,10 +302,15 @@ TEST_CASE("removable exec-from-removable: case-insensitive comparison matches di
           "paths (Windows/macOS default filesystem semantics), while the default (case-sensitive) "
           "comparison does not -- R-016",
           "[tar][removable][exec]") {
+    // Windows semantics: case-insensitive AND backslash-separated. The two
+    // flags are separate so a POSIX caller can never get the second by asking
+    // for the first (C9), which means a Windows-path case must state both.
     CHECK(exec_path_under_removable_root(R"(E:\Payload\Tool.exe)", R"(e:\payload)",
-                                         /*case_insensitive=*/true));
+                                         /*case_insensitive=*/true,
+                                         /*backslash_is_separator=*/true));
     CHECK_FALSE(exec_path_under_removable_root(R"(E:\Payload\Tool.exe)", R"(e:\payload)",
-                                               /*case_insensitive=*/false));
+                                               /*case_insensitive=*/false,
+                                               /*backslash_is_separator=*/true));
     // Case-sensitive (Linux default) never confuses a differently-cased sibling for a match.
     CHECK_FALSE(exec_path_under_removable_root("/media/USER/tool", "/media/user",
                                                 /*case_insensitive=*/false));
@@ -554,6 +561,67 @@ TEST_CASE("removable Linux mount correlation: a non-/dev/ source (tmpfs/nfs) and
 // ── BoundedPendingQueue<RemovableEvent> ack/retry semantics (P-003) ─────────
 
 // ── decide_baseline_and_reconcile (shared baseline/reconcile decision) ─────
+
+TEST_CASE("a POSIX sibling whose NAME contains a backslash is not under the removable root (C9)",
+          "[tar][removable][exec][c9]") {
+    // On Linux and macOS a backslash is an ordinary filename character. Treating
+    // it as a path boundary makes "/media/user/USB\\decoy" -- a sibling FILE in
+    // /media/user/, not anything below the mount -- match the root
+    // "/media/user/USB". Where the mount parent is writable that plants a
+    // forensic row against a device the binary never ran from.
+    CHECK_FALSE(exec_path_under_removable_root(R"(/media/user/USB\decoy)", "/media/user/USB"));
+
+    // The same shape on Windows IS a real boundary, so it must still match.
+    CHECK(exec_path_under_removable_root(R"(E:\payload\tool.exe)", R"(E:\payload)",
+                                         /*case_insensitive=*/true,
+                                         /*backslash_is_separator=*/true));
+
+    // And a genuine POSIX child is unaffected.
+    CHECK(exec_path_under_removable_root("/media/user/USB/decoy", "/media/user/USB"));
+}
+
+TEST_CASE("exec_from_removable is reported once per attach session, not once per tick, and a "
+          "re-attach reports afresh (K1)",
+          "[tar][removable][exec][k1]") {
+    // The exec record_key is deliberately STABLE for a (device, image) pair --
+    // one row per execution observed, which is what the source is for. But the
+    // row's ts is "now", so re-deriving the event every tick offers the store
+    // the same key with a different payload. The seam refuses that as a
+    // collision and rolls the WHOLE batch back, which repeats every tick for as
+    // long as the process runs: the source goes dark, taking every unrelated
+    // attach/detach and gap in those batches with it. The emission is therefore
+    // gated on exec_seen, which is persisted in the cursor.
+    yuzu::tar::RemovableCursorState st;
+    st.attach_set["usb-1"] = true;
+    st.exec_seen.insert(std::string("usb-1") + "\x1f" + "/Volumes/USB/installer");
+
+    // Round-trip: the gate has to survive a restart, or the first tick after one
+    // re-emits and wedges exactly as before.
+    const auto encoded = yuzu::tar::encode_removable_cursor(st);
+    const auto decoded = yuzu::tar::decode_removable_cursor(encoded);
+    REQUIRE_FALSE(decoded.malformed);
+    CHECK(decoded.exec_seen.size() == 1);
+    CHECK(decoded.exec_seen.count(std::string("usb-1") + "\x1f" + "/Volumes/USB/installer") == 1);
+
+    // Detaching the device forgets its executions, so plugging it back in
+    // reports the same binary again rather than staying silent forever.
+    yuzu::tar::BaselineReconcileInputs in;
+    in.baseline_already_done = true;
+    in.prev_attach_set = {{"usb-1", true}};
+    in.exec_seen = decoded.exec_seen;
+    in.pending = {{"detached", "usb-1"}};
+
+    const auto out = yuzu::tar::decide_baseline_and_reconcile(in);
+    CHECK(out.attach_set.count("usb-1") == 0);
+    CHECK(out.exec_seen.empty());
+
+    // A DIFFERENT device's executions are untouched by that detach.
+    yuzu::tar::BaselineReconcileInputs other = in;
+    other.exec_seen.insert(std::string("usb-2") + "\x1f" + "/Volumes/OTHER/tool");
+    const auto out2 = yuzu::tar::decide_baseline_and_reconcile(other);
+    CHECK(out2.exec_seen.size() == 1);
+    CHECK(out2.exec_seen.count(std::string("usb-2") + "\x1f" + "/Volumes/OTHER/tool") == 1);
+}
 
 TEST_CASE("baseline tick seeds attach_set from what is attached, so the next tick does not "
           "re-report every device as a missed callback (P2)",

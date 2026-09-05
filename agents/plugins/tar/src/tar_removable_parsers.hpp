@@ -32,6 +32,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -375,6 +376,16 @@ struct RemovableCursorState {
     int v{1};
     std::map<std::string, RemovableChannelCursor> channels;
     std::map<std::string, bool> attach_set;
+    // K1: the (device_key, image_path) pairs already REPORTED as
+    // exec_from_removable. The exec record_key is deliberately stable for a
+    // pair -- one row per execution observed on a device, not one per tick --
+    // so the emission must be gated on this set, or every later tick re-derives
+    // the same key with a fresh ts, the seam's replay check sees a differing
+    // payload, and the whole event+cursor transaction is refused. That refusal
+    // repeats every tick for as long as the process runs, taking every other
+    // event in the batch down with it. Persisted, so it survives a restart;
+    // cleared per device on detach, so a re-attach reports afresh.
+    std::set<std::string> exec_seen; // "<device_key>\x1f<image_path>"
     bool baseline_done{false};
     // R-005: distinguishes "never persisted" (nullopt/empty cursor_json --
     // a genuine first-ever run, tar_cursor.hpp rule 2's Baseline case) from
@@ -407,6 +418,11 @@ inline RemovableCursorState decode_removable_cursor(const std::optional<std::str
             for (auto it = j["attach_set"].begin(); it != j["attach_set"].end(); ++it)
                 st.attach_set[it.key()] = it.value().is_boolean() ? it.value().get<bool>() : true;
         }
+        if (j.contains("exec_seen") && j["exec_seen"].is_array()) {
+            for (const auto& e : j["exec_seen"])
+                if (e.is_string())
+                    st.exec_seen.insert(e.get<std::string>());
+        }
     } catch (const nlohmann::json::exception&) {
         RemovableCursorState lost;
         lost.malformed = true; // R-005: a persisted-but-unparseable cursor is CursorLost, not Baseline
@@ -427,6 +443,7 @@ inline std::string encode_removable_cursor(const RemovableCursorState& st) {
     for (const auto& [key, present] : st.attach_set)
         attach_set[key] = present;
     j["attach_set"] = attach_set;
+    j["exec_seen"] = nlohmann::json(st.exec_seen);
     return j.dump();
 }
 
@@ -471,8 +488,18 @@ inline std::string removable_channel_record_key(std::string_view channel,
 /// this source captured. The caller selects the platform-appropriate value
 /// (append_exec_from_removable in tar_removable_collector.cpp) -- this
 /// function has no platform knowledge of its own.
+/// `backslash_is_separator` MUST be false on POSIX. On Linux and macOS a
+/// backslash is an ordinary filename character, so accepting it as a boundary
+/// makes `/media/user/USB\decoy` -- a SIBLING file in `/media/user/`, not
+/// anything under the mount -- match the root `/media/user/USB`. Where the
+/// mount parent is writable that is a way to plant forensic evidence against a
+/// device the binary never ran from. It defaults to the case-insensitivity
+/// flag because the two travel together in practice (Windows paths are
+/// case-insensitive AND backslash-separated), but it is a separate parameter so
+/// a caller can never silently get one without meaning the other.
 inline bool exec_path_under_removable_root(std::string_view exec_path, std::string_view volume_root,
-                                           bool case_insensitive = false) {
+                                           bool case_insensitive = false,
+                                           bool backslash_is_separator = false) {
     if (exec_path.empty() || volume_root.empty())
         return false;
     std::string root(volume_root);
@@ -494,7 +521,7 @@ inline bool exec_path_under_removable_root(std::string_view exec_path, std::stri
     if (exec_path.size() == root.size())
         return true;
     const char next = exec_path[root.size()];
-    return next == '/' || next == '\\';
+    return next == '/' || (backslash_is_separator && next == '\\');
 }
 
 /// One exec-from-removable claim, already reduced to the typed fields
@@ -529,7 +556,8 @@ select_exec_from_removable(const std::vector<std::pair<std::int64_t, std::string
         if (exec_path.empty())
             continue; // P-004: no exec_path, no claim
         for (const auto& [device_key, root] : attached_roots) {
-            if (!exec_path_under_removable_root(exec_path, root, case_insensitive))
+            if (!exec_path_under_removable_root(exec_path, root, case_insensitive,
+                                                /*backslash_is_separator=*/case_insensitive))
                 continue;
             out.push_back(ExecFromRemovableMatch{device_key, exec_path, pid});
             break; // one matching device is enough per process
@@ -762,6 +790,7 @@ correlate_removable_mounts(std::string_view proc_mounts_content,
 ///      OS never delivered, in both directions.
 struct BaselineReconcileInputs {
     bool baseline_already_done{false};
+    std::set<std::string> exec_seen;
     std::unordered_set<std::string> current_keys;
     std::unordered_map<std::string, bool> prev_attach_set;
     // (action, device_key) of the retained pending queue, oldest first.
@@ -770,6 +799,7 @@ struct BaselineReconcileInputs {
 
 struct BaselineReconcileResult {
     std::unordered_map<std::string, bool> attach_set;
+    std::set<std::string> exec_seen; // carried through; detach clears a device's entries
     std::vector<std::string> baseline_keys;     // -> present_at_baseline
     std::vector<std::string> reconcile_added;   // -> attached  (missed appeared)
     std::vector<std::string> reconcile_removed; // -> detached  (missed disappeared)
@@ -778,6 +808,7 @@ struct BaselineReconcileResult {
 inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineReconcileInputs& in) {
     BaselineReconcileResult out;
     out.attach_set = in.prev_attach_set;
+    out.exec_seen = in.exec_seen;
 
     if (!in.baseline_already_done) {
         for (const auto& key : in.current_keys) {
@@ -792,11 +823,23 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
         }
     }
 
+    // Every path that drops a device from attach_set must also forget its
+    // exec observations (K1), or a device that is unplugged and plugged back in
+    // is never re-reported as executing -- the stable exec key would still be
+    // in exec_seen from the previous session.
+    auto forget_execs = [&out](const std::string& device_key) {
+        const std::string prefix = device_key + "\x1f";
+        for (auto it = out.exec_seen.begin(); it != out.exec_seen.end();)
+            it = it->starts_with(prefix) ? out.exec_seen.erase(it) : std::next(it);
+    };
+
     for (const auto& [action, key] : in.pending) {
         if (action == "attached")
             out.attach_set[key] = true;
-        else if (action == "detached")
+        else if (action == "detached") {
             out.attach_set.erase(key);
+            forget_execs(key);
+        }
     }
 
     if (in.baseline_already_done) {
@@ -811,6 +854,7 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
                 continue; // still attached, or already removed by a real callback
             out.reconcile_removed.push_back(key);
             out.attach_set.erase(key);
+            forget_execs(key);
         }
     }
     return out;
