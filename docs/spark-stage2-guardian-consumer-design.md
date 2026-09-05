@@ -677,6 +677,16 @@ call inside `backend_->arm()` can still block a sibling arm/disarm of the SAME
 mechanism type at the `SparkEngine` layer until this caller's own deadline elapses.
 The Pre-Stage-3 dependency above is otherwise unchanged by this landing.
 
+**#3816 (landed)**: item 3's bounded-wait deadline left a residual - a backend arm
+that succeeds just after its caller gives up can mint a live subscription nothing
+tracks. `GuardianIoExecutor::run()` now delivers every result `fn()` returns
+normally exactly once, to either the caller's return value or an
+`on_abandoned(T&&)` callback (a thrown `fn()`/`WorkerThrew` has no `T` to
+deliver and correctly reaches neither), so
+`GuardianSparkRuntime`'s arm consumer can disarm a late success instead of leaking
+it; the state reader needs no callback (a late read is wasted work, nothing
+escapes). See `docs/spark-flip-gate.md` §3 row 3.
+
 ## Health / status surface — the #1939 checklist
 
 Per ADR-1005 (headless platform) a new capability lands on REST **and** MCP, or
