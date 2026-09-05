@@ -232,6 +232,53 @@ TEST_CASE("TarDatabase: a record_key COLLISION is refused, while an exact replay
     CHECK(*c == R"({"v":1,"pos":2})");
 }
 
+TEST_CASE("TarDatabase: a capture_gap retried on a later tick still dedupes, and a real "
+          "transition's timestamp still discriminates (CDX-04)",
+          "[tar][cursor][c1][cdx04]") {
+    // The collision check must not mistake an ordinary RETRY for a collision.
+    // snapshot_id is minted fresh every tick, and a capture_gap's ts is only
+    // "when we noticed" -- a gap's identity is the window encoded in its
+    // record_key. Comparing either would wedge a source that is retrying an
+    // unclosed gap: every attempt would collide, the queue would never ack, and
+    // the gap could never be closed.
+    auto t = make_test_db();
+
+    PowerEvent gap;
+    gap.ts = 100;
+    gap.snapshot_id = 1;
+    gap.action = "capture_gap";
+    gap.detail = "power subscription restarted -- window 900..now";
+    gap.record_key = "winpower:restart:900";
+    REQUIRE(t.db.insert_power_events_and_cursor({gap}, R"({"v":1,"pos":1})"));
+
+    // Tick 2: the same gap, still unclosed. New tick => new snapshot_id, and
+    // "now" has moved on. It is the SAME gap and must commit.
+    PowerEvent retry = gap;
+    retry.ts = 250;
+    retry.snapshot_id = 2;
+    CHECK(t.db.insert_power_events_and_cursor({retry}, R"({"v":1,"pos":2})"));
+
+    // A REAL transition, by contrast, is identified by its timestamp: two
+    // different sleeps sharing a key is the restart-collision class, and it
+    // must still be refused.
+    PowerEvent sleep1;
+    sleep1.ts = 500;
+    sleep1.snapshot_id = 3;
+    sleep1.action = "sleep";
+    sleep1.detail = "lid";
+    sleep1.record_key = "winpower:sw:0";
+    REQUIRE(t.db.insert_power_events_and_cursor({sleep1}, R"({"v":1,"pos":3})"));
+
+    PowerEvent sleep2 = sleep1;
+    sleep2.ts = 9000;      // a DIFFERENT sleep ...
+    sleep2.snapshot_id = 4; // ... whose key collided after a restart
+    CHECK_FALSE(t.db.insert_power_events_and_cursor({sleep2}, R"({"v":1,"pos":4})"));
+
+    auto c = read_cursor(t.db, "power");
+    REQUIRE(c.has_value());
+    CHECK(*c == R"({"v":1,"pos":3})");
+}
+
 TEST_CASE("TarDatabase: insert_removable_events_and_cursor round-trips events + cursor together",
           "[tar][cursor]") {
     auto t = make_test_db();

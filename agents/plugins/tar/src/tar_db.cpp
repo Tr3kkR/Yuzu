@@ -1026,8 +1026,17 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
                     auto* t = reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
                     return t ? std::string_view{t} : std::string_view{};
                 };
-                if (sqlite3_column_int64(dup.get(), 0) == ev.ts &&
-                    sqlite3_column_int64(dup.get(), 1) == ev.snapshot_id &&
+                // Compare only what actually identifies the OS RECORD.
+                // `snapshot_id` is collection metadata -- which tick gathered
+                // it -- and it is freshly minted every tick, so including it
+                // would turn every legitimate retry into a "collision" and
+                // wedge the source permanently. `ts` is identity for a real
+                // transition, but for a capture_gap it is merely "when we
+                // noticed"; a gap's identity lives entirely in its record_key,
+                // which encodes the window bounds. So ts participates for
+                // everything EXCEPT a gap.
+                const bool is_gap = ev.action == "capture_gap";
+                if ((is_gap || sqlite3_column_int64(dup.get(), 0) == ev.ts) &&
                     col(2) == ev.action && col(3) == ev.detail)
                     continue; // an exact replay -- the intended dedupe
                 spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
@@ -1125,8 +1134,12 @@ bool TarDatabase::insert_removable_events_and_cursor(const std::vector<Removable
                     auto* t = reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
                     return t ? std::string_view{t} : std::string_view{};
                 };
-                if (sqlite3_column_int64(dup.get(), 0) == ev.ts &&
-                    sqlite3_column_int64(dup.get(), 1) == ev.snapshot_id &&
+                // Same rule as the power twin: snapshot_id is per-tick
+                // collection metadata and never participates, and ts is
+                // identity for a real attach/detach but only "when we noticed"
+                // for a capture_gap.
+                const bool is_gap = ev.action == "capture_gap";
+                if ((is_gap || sqlite3_column_int64(dup.get(), 0) == ev.ts) &&
                     col(2) == ev.action && col(3) == ev.device_key && col(4) == ev.vendor &&
                     col(5) == ev.product && col(6) == ev.serial && col(7) == ev.bus &&
                     col(8) == ev.volume && sqlite3_column_int64(dup.get(), 9) == ev.size_bytes &&
