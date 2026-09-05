@@ -553,8 +553,8 @@ TEST_CASE("removable Linux mount correlation: a non-/dev/ source (tmpfs/nfs) and
 
 // ── BoundedPendingQueue<RemovableEvent> ack/retry semantics (P-003) ─────────
 
-TEST_CASE("removable queue: ack removes only the committed prefix, so a failed insert leaves the "
-          "batch for retry next tick",
+TEST_CASE("removable queue: a failed commit leaves the whole batch for retry, and acking by "
+          "sequence never eats an event pushed during the commit",
           "[tar][removable][queue]") {
     BoundedPendingQueue<RemovableEvent> q;
     RemovableEvent a;
@@ -569,15 +569,19 @@ TEST_CASE("removable queue: ack removes only the committed prefix, so a failed i
     REQUIRE(q.size() == 3);
 
     // Simulated failed commit: snapshot but do NOT ack.
-    auto batch = q.snapshot();
-    REQUIRE(batch.size() == 3);
+    auto batch = q.snapshot_batch();
+    REQUIRE(batch.items.size() == 3);
     CHECK(q.size() == 3); // untouched — still there for the retry
 
-    // Simulated successful commit of the first two only (e.g. a later insert
-    // failed mid-batch in some hypothetical partial-ack caller): ack(2).
-    q.ack(2);
+    // A late-arriving event lands while that batch is being committed. Acking
+    // by sequence (R-005) removes exactly the three that committed and leaves
+    // the newcomer, which a positional ack(3) would have discarded unseen.
+    RemovableEvent d;
+    d.record_key = "d";
+    q.push(d);
+    q.ack_through(batch.last_seq);
     CHECK(q.size() == 1);
-    CHECK(q.snapshot().front().record_key == "c");
+    CHECK(q.snapshot_batch().items.front().record_key == "d");
 }
 
 TEST_CASE("removable queue: overflow drops the oldest entry and counts it, never silently",
@@ -590,7 +594,7 @@ TEST_CASE("removable queue: overflow drops the oldest entry and counts it, never
     }
     CHECK(q.size() == BoundedPendingQueue<RemovableEvent>::kCap);
     CHECK(q.dropped() == 5);
-    CHECK(q.snapshot().front().record_key == "5"); // the oldest 5 were evicted
+    CHECK(q.snapshot_batch().items.front().record_key == "5"); // the oldest 5 were evicted
 }
 
 // ── Real-leg sections (verification-protocol.md UPDATE 2026-09-04 / P-006) ─
