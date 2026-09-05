@@ -73,6 +73,9 @@ struct GuardianJournalStats {
     // lifecycle_backpressure_drops is lifecycle-specific (a staging LOSS, sibling to stage_dropped).
     std::uint64_t send_exceptions{0};              ///< a per-entry drain send THREW; head retained, that log's drain stops
     std::uint64_t lifecycle_backpressure_drops{0}; ///< lifecycle audit entries rejected at outbox enqueue for capacity (LOSS)
+    // #3953 items 1+2 (GuardianOutboxSendExecutor, both lanes summed).
+    std::uint64_t send_orphan_exceptions{0}; ///< a reclaimed orphan's thrown result, discarded (diagnostic only)
+    std::uint64_t send_stalls{0};            ///< a send exceeded its stall threshold before completing/reclaiming
 };
 
 /// Populate `tags` with the (sparse) journal telemetry. `TagMap` is any map with a string
@@ -113,6 +116,8 @@ void emit_guardian_journal_heartbeat_tags(TagMap& tags, const GuardianJournalSta
     put("yuzu.guardian_sweep_exceptions", s.sweep_exceptions);
     put("yuzu.guardian_send_exceptions", s.send_exceptions);
     put("yuzu.guardian_journal_backpressure_drops", s.lifecycle_backpressure_drops);
+    put("yuzu.guardian_send_orphan_exceptions", s.send_orphan_exceptions);
+    put("yuzu.guardian_send_stalls", s.send_stalls);
 }
 
 /// AGE gauges (flip item 6 + #2364 step-1) - a SEPARATE struct from GuardianJournalStats

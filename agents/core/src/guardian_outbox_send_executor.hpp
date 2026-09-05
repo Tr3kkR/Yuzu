@@ -58,6 +58,9 @@
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <spdlog/spdlog.h> // #3953 items 1+2 - firewalled stall/orphan-exception logging
+
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <exception>
@@ -73,7 +76,27 @@ class YUZU_EXPORT GuardianOutboxSendExecutor {
 public:
     using SendFn = std::function<SendResult(const OutboxEntry&)>;
 
-    GuardianOutboxSendExecutor() : state_(std::make_shared<State>()) {}
+    /// Test-only fault injection for launch()'s admission path (#3966 fold-in - no
+    /// regression coverage existed for either failure mode). `SpawnRefused` mirrors
+    /// `io_detail::spawn_detached` returning false (the OS refused to create the
+    /// thread); `Throw` mirrors a `std::bad_alloc` from anywhere in launch()'s guarded
+    /// region, AFTER the ticket is armed and the worker lambda is built (the ARMED
+    /// rollback path); `ThrowBeforeCommit` mirrors the same failure at the EARLIEST
+    /// point in the guarded region - before any State mutation, before the ticket is
+    /// armed (the UNARMED rollback path). All three take the SAME outer rollback (see
+    /// launch()).
+    enum class LaunchFaultForTest { None, SpawnRefused, Throw, ThrowBeforeCommit };
+
+    /// #3953 item 2: a send still in flight this long (measured from admission to
+    /// completion, or to "still running" if not yet complete) is counted and logged
+    /// once as a stall - matches the production periodic backstop, so this fires only
+    /// once a send has already missed every ordinary re-check. Tests pass a short
+    /// threshold to exercise the path without a real multi-second wait.
+    static constexpr std::chrono::milliseconds kGuardianSendStallThreshold{5'000};
+
+    explicit GuardianOutboxSendExecutor(
+        std::chrono::milliseconds stall_threshold = kGuardianSendStallThreshold)
+        : state_(std::make_shared<State>()), stall_threshold_(stall_threshold) {}
     GuardianOutboxSendExecutor(const GuardianOutboxSendExecutor&) = delete;
     GuardianOutboxSendExecutor& operator=(const GuardianOutboxSendExecutor&) = delete;
 
@@ -97,13 +120,28 @@ public:
         // there is no concurrent-submitter race to guard against here - only
         // against the detached worker thread, which the lock below still covers.
         // The launch-decision read and the launch() call itself are deliberately
-        // NOT done under one held lock: launch() constructs an AliveTicket, whose
-        // ctor/dtor take state_->mu themselves (see below), and that mutex is not
-        // recursive.
+        // NOT done under one held lock: launch() itself re-locks state_->mu for its
+        // own bookkeeping (see below), and that mutex is not recursive.
         bool need_launch = false;
+        bool mismatch_still_running = false;
+        bool stopping_retain = false;
+        bool log_mismatch_stall = false;   ///< item 2: A itself just crossed the threshold
+        bool log_orphan_exception = false; ///< item 1: A's reclaimed result was a throw (first occurrence)
+        bool log_orphan_recovery = false;  ///< item 2: A had stalled earlier and just resolved
+        // The orphan's OWN event_id, captured under the lock before it can be
+        // overwritten by a later launch() - the mismatch-stall and orphan-recovery
+        // logs below are about the OLD (orphaned) entry, never about `entry` (the
+        // NEWLY offered one), so they must not use entry.event_id.
+        std::string orphan_event_id;
         {
+            // Every branch below sets a FLAG rather than `return`ing directly, so the
+            // lock is always released the ordinary way (this block's closing brace)
+            // before any post-lock logging or return - an orphan reclaimed in the SAME
+            // call that also observes `stopping` must still get its diagnostic logged
+            // (#3953 items 1+2), which an early return from inside the lock would skip.
             std::lock_guard<std::mutex> lk{state_->mu};
             if (state_->in_flight && state_->in_flight_event_id != entry.event_id) {
+                orphan_event_id = state_->in_flight_event_id;
                 // The head entry changed under us (generation-supersede purge or a
                 // withdrawal - both ORDINARY operations, not a rare race) while a
                 // send for the OLD head was still running. That worker is orphaned
@@ -115,25 +153,70 @@ public:
                     // reclaiming here unconditionally (an earlier version of this
                     // function never reclaimed at all) would otherwise wedge every
                     // future send permanently, since `event_id` never repeats.
-                    return SendResult::Retain;
+                    //
+                    // #3953 item 2: this is exactly the case a mismatched orphan can be
+                    // stalled indefinitely without ever being observed by the timeout
+                    // path below (that path only runs for the SAME entry) - checked
+                    // here too, under the same lock, so an orphan stuck this long is
+                    // still counted even though nothing ever waits on it directly.
+                    log_mismatch_stall = check_stall_locked();
+                    mismatch_still_running = true;
+                } else {
+                    // The stale worker already finished. Its result (Sent/Retain, or a
+                    // thrown exception now sitting in eptr) applies to an entry that no
+                    // longer exists in the log - there is nothing correct to do with it
+                    // except discard it; reporting it against THIS entry would
+                    // misattribute a success/failure that never happened to it. Reclaim
+                    // the slot and fall through to launch a fresh worker below.
+                    //
+                    // #3953 item 1: the discard itself is still correct (nothing else
+                    // to do with an orphan's result), but a THROWN result is real
+                    // evidence of a problem and is worth a diagnostic signal - count it
+                    // (first occurrence only logs; see the firewalled pattern this
+                    // mirrors in guardian_outbox_drain_worker.cpp).
+                    if (state_->eptr) {
+                        ++state_->orphan_exceptions_discarded;
+                        log_orphan_exception = (state_->orphan_exceptions_discarded == 1);
+                    }
+                    // #3953 item 2 follow-up: check_stall_locked() FIRST, before reading
+                    // stall_logged - an orphan that crosses stall_threshold_ only in its
+                    // final stretch (never observed "still running" past threshold by
+                    // the branch above) would otherwise reach here with stall_logged
+                    // still false, silently undercounting a real stall (governance Gate
+                    // 6 sre finding). done==true here, so this correctly uses
+                    // completed_at, not now(). Recovery then logs whenever THIS orphan
+                    // had stalled - whether just detected here or on an earlier "still
+                    // running" poll - it never reaches the normal consumption path below.
+                    check_stall_locked();
+                    log_orphan_recovery = state_->stall_logged;
+                    state_->in_flight = false;
+                    state_->done = false;
+                    state_->eptr = nullptr;
                 }
-                // The stale worker already finished. Its result (Sent/Retain, or a
-                // thrown exception now sitting in eptr) applies to an entry that no
-                // longer exists in the log - there is nothing correct to do with it
-                // except discard it; reporting it against THIS entry would
-                // misattribute a success/failure that never happened to it. Reclaim
-                // the slot and fall through to launch a fresh worker below.
-                state_->in_flight = false;
-                state_->done = false;
-                state_->eptr = nullptr;
             }
-            if (!state_->in_flight) {
-                if (state_->stopping)
-                    return SendResult::Retain; // do not spawn new work once stopping
-                need_launch = true;
+            if (!mismatch_still_running) {
+                if (!state_->in_flight) {
+                    if (state_->stopping)
+                        stopping_retain = true; // do not spawn new work once stopping
+                    else
+                        need_launch = true;
+                }
+                // else: in_flight for THIS SAME entry - fall through to the wait below.
             }
-            // else: in_flight for THIS SAME entry - fall through to the wait below.
         }
+        // Lock released above (the block's closing brace) - every path funnels
+        // through here now, logging is done with no lock held.
+        if (log_orphan_exception)
+            log_orphan_exception_discarded();
+        if (log_orphan_recovery)
+            log_send_recovery(orphan_event_id);
+        if (mismatch_still_running) {
+            if (log_mismatch_stall)
+                log_send_stall(orphan_event_id);
+            return SendResult::Retain;
+        }
+        if (stopping_retain)
+            return SendResult::Retain; // do not spawn new work once stopping
         if (need_launch) {
             // Test seam: fires in the real race window between offer()'s decision
             // (need_launch=true, state_->mu already released above) and the launch()
@@ -170,17 +253,36 @@ public:
         // than the risk of touching a load-bearing pre-existing shutdown-ordering test's
         // timing assumptions. Left here as a note for whoever revisits this trade-off.
         state_->cv.wait_until(lk, deadline, [&] { return state_->done; });
-        if (!state_->done)
+        // #3953 item 2: evaluated UNCONDITIONALLY here, before checking `done` below -
+        // not gated on the timeout, so a send that crosses stall_threshold_ but still
+        // finishes DURING this same bounded wait is still counted (Fable's review: the
+        // original design gated this on `!state_->done`, which missed exactly that
+        // case). check_stall_locked() itself picks completed_at vs now() correctly for
+        // either outcome.
+        const bool log_new_stall = check_stall_locked();
+        if (!state_->done) {
+            lk.unlock();
+            if (log_new_stall)
+                log_send_stall(entry.event_id);
             return std::nullopt; // still running; caller retains and comes back
+        }
         auto result = state_->result;
         auto eptr = std::move(state_->eptr);
+        // A recovery log fires whenever THIS entry had stalled - whether the crossing
+        // was just detected above (log_new_stall) or on an earlier call (the same-entry
+        // timeout path) - exactly once, since the next launch() resets stall_logged for
+        // whatever entry takes this slot next.
+        const bool log_recovery = state_->stall_logged;
         state_->in_flight = false;
         state_->done = false;
         state_->eptr = nullptr;
-        if (eptr) {
-            lk.unlock(); // never rethrow while holding a lock a catch handler cannot see
-            std::rethrow_exception(eptr);
-        }
+        lk.unlock();
+        if (log_new_stall)
+            log_send_stall(entry.event_id);
+        if (log_recovery)
+            log_send_recovery(entry.event_id);
+        if (eptr)
+            std::rethrow_exception(eptr); // never rethrow while holding a lock a catch handler cannot see
         return result;
     }
 
@@ -196,25 +298,21 @@ public:
         state_->stopping = true;
     }
 
-    // NOT PROVIDED: a callback fired after every completed send, so the caller's own
-    // wake mechanism (e.g. the drain worker's Signal cv/gen) could learn promptly that
-    // a result is available even past offer()'s own bounded wait having given up. Its
-    // absence is a real cadence regression versus pre-fix behavior, not just a missed
-    // optimization: a send that runs longer than the caller's own bounded wait but
-    // still succeeds isn't re-checked until the caller's next enqueue or periodic
-    // backstop, where pre-fix (a blocking inline call) the next tick started as soon
-    // as the send returned (governance Gate 6 sre finding).
-    // Built and wired once (a WakeFn callback stored in State, called right after this
-    // class's own state_->cv.notify_all() in launch()'s worker lambda, under the same
-    // lock that publishes done=true); reverted after it empirically broke a
-    // load-bearing pre-existing timing test, "R4: a refill re-arm does not wait out
-    // the periodic bound" (test_guardian_outbox_drain_worker.cpp), whose whole point
-    // is proving loop() re-arms a forced page from its OWN internal logic with NO
-    // external wake. Disabling the callback made the test pass again 4/4; the exact
-    // mechanism by which the extra per-send wakes broke it was not diagnosed. The
-    // regression's cost is judged smaller than the risk of redesigning ANOTHER
-    // load-bearing pre-existing test under this PR's own time budget - left here as a
-    // note for whoever revisits this trade-off.
+    // NOT PROVIDED: a callback fired after every completed send (#3953 item 3, revised).
+    // Built and wired once (a WakeFn stored in State, called right after this class's
+    // own state_->cv.notify_all() in launch()'s worker lambda) - but it made every
+    // completed send bump the drain worker's sig_->gen and wake loop() immediately,
+    // which broke "R4: a refill re-arm does not wait out the periodic bound"
+    // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
+    // loop re-arms a forced page from its OWN internal logic with NO external wake, and
+    // an unrelated wake source let it pass for the wrong reason. Fixed instead with
+    // has_in_flight_send() (below) plus a WAIT clamp on the drain worker's own side
+    // (guardian_outbox_drain_worker.cpp's loop()) - the drain worker polls it after
+    // every pass and shortens its OWN wait while anything is in flight, rather than this
+    // class waking the drain worker itself. Closes the same cadence cliff (a send
+    // finishing between offer()'s bounded wait and the drain worker's periodic bound
+    // used to wait out the whole bound before being noticed) without adding a wake
+    // source, so R4 is untouched.
 
     /// For GuardianEngine::active_io_workers() (the orphan-exit contract's sole
     /// source of truth) - normally 0 or 1 (this executor is single-flight in the
@@ -228,10 +326,49 @@ public:
         return static_cast<std::size_t>(state_->worker_count);
     }
 
+    /// True whenever ANY send is admitted and not yet consumed - the same-entry
+    /// timeout case AND the mismatched-orphan-still-running case both set
+    /// in_flight, so this reads true in either (#3953 item 3: the caller cannot
+    /// tell them apart from offer()'s return value alone, since wrapped_send()'s
+    /// `.value_or(SendResult::Retain)` collapses both to the same value). Used by
+    /// the drain worker's loop() to re-check sooner than the full periodic bound
+    /// while something is genuinely in flight on this lane.
+    [[nodiscard]] bool has_in_flight_send() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        return state_->in_flight;
+    }
+
+    /// #3953 item 1: an orphan's thrown exception, discarded because it belongs to a
+    /// superseded entry with nowhere correct to attribute it - see the reclaim branch
+    /// in offer(). Diagnostic-signal only; the discard itself is correct behavior.
+    [[nodiscard]] std::uint64_t orphan_exception_count() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        return state_->orphan_exceptions_discarded;
+    }
+
+    /// #3953 item 2: cumulative count of sends (same-entry or mismatched-orphan) that
+    /// crossed kGuardianSendStallThreshold before completing or being reclaimed.
+    [[nodiscard]] std::uint64_t send_stall_count() const {
+        std::lock_guard<std::mutex> lk{state_->mu};
+        return state_->stalls;
+    }
+
     /// Test-only synchronization seam - see the call site in offer() for what race it
     /// exists to make deterministic. Production callers never set this.
     void set_pre_launch_race_hook_for_test(std::function<void()> hook) {
         pre_launch_race_hook_for_test_ = std::move(hook);
+    }
+
+    /// Test-only synchronization seam - see the call site in launch() for what race it
+    /// exists to make deterministic (#3966). Production callers never set this.
+    void set_post_admission_race_hook_for_test(std::function<void()> hook) {
+        post_admission_race_hook_for_test_ = std::move(hook);
+    }
+
+    /// Test-only fault injection - see LaunchFaultForTest. Production callers never
+    /// set this (defaults to None, a no-op).
+    void set_launch_fault_for_test(LaunchFaultForTest fault) {
+        launch_fault_for_test_.store(fault, std::memory_order_relaxed);
     }
 
 private:
@@ -245,36 +382,113 @@ private:
         std::string in_flight_event_id;
         SendResult result{SendResult::Retain};
         std::exception_ptr eptr; ///< set instead of `result` if `send` itself threw
+        // #3953 items 1+2 - observability. orphan_exceptions_discarded/stalls are
+        // CUMULATIVE for the life of this executor (see the accessor doc comments) -
+        // launch()'s locked admission block resets only launched_at/stall_logged
+        // below, which apply to the CURRENT in-flight send only (governance Gate 2/3
+        // truth finding: an earlier revision of this comment wrongly claimed both
+        // counters reset there too).
+        std::uint64_t orphan_exceptions_discarded{0}; ///< a reclaimed orphan's throw, discarded (item 1)
+        std::uint64_t stalls{0};                      ///< sends that crossed stall_threshold_ (item 2)
+        std::chrono::steady_clock::time_point launched_at{};  ///< set by launch(), under the lock
+        std::chrono::steady_clock::time_point completed_at{}; ///< set by the worker, under the publish lock
+        bool stall_logged{false}; ///< this in-flight send already counted/logged as stalled
     };
 
-    /// RAII orphan-exit marker, mirroring guardian_io_executor.hpp's TicketCore
-    /// split: the worker's OWN captured copy is the one that decrements
-    /// worker_count, and it is destroyed by the detached-thread trampoline AFTER
-    /// the worker lambda body has fully returned (notify_all included) - the
-    /// latest point observable before the OS thread itself exits. A copy that
-    /// never reaches a launched thread (the launch-failed path) decrements
-    /// immediately instead, since no thread was ever created to outlive it.
-    struct AliveTicket {
-        explicit AliveTicket(std::shared_ptr<State> s) : state(std::move(s)) {
-            std::lock_guard<std::mutex> lk{state->mu};
-            ++state->worker_count;
+    /// Called with state_->mu HELD. Returns true iff THIS call is the one that newly
+    /// crosses stall_threshold_ (so the caller logs exactly once, outside the lock).
+    /// Compares against completed_at once the send is done, `now()` only while it is
+    /// still genuinely running (#3953 item 2, Fable's review) - comparing against
+    /// `now()` unconditionally would overstate elapsed time for a send that actually
+    /// finished earlier but whose caller was scheduled late to notice, which can flake
+    /// a short test threshold and conflates "how long did this take" with "how long has
+    /// the caller been checking".
+    bool check_stall_locked() {
+        if (!state_->in_flight || state_->stall_logged)
+            return false;
+        const auto reference = state_->done ? state_->completed_at : std::chrono::steady_clock::now();
+        if (reference - state_->launched_at < stall_threshold_)
+            return false;
+        ++state_->stalls;
+        state_->stall_logged = true;
+        return true;
+    }
+
+    /// Called with NO lock held. All three logging helpers are firewalled: an
+    /// observability failure (e.g. spdlog itself throwing) must never escape offer(),
+    /// be miscounted as a send exception, or delay delivery - matches the established
+    /// pattern at guardian_outbox_drain_worker.cpp's `firewalled` lambda.
+    static void log_send_stall(const std::string& event_id) {
+        try {
+            spdlog::warn("Guardian outbox send stalled past its threshold (event_id {}); "
+                         "drain continues, the send stays running detached.",
+                         event_id);
+        } catch (...) {
         }
+    }
+    static void log_send_recovery(const std::string& event_id) {
+        try {
+            spdlog::info("Guardian outbox send (event_id {}) completed after having "
+                         "stalled past its threshold.",
+                         event_id);
+        } catch (...) {
+        }
+    }
+    static void log_orphan_exception_discarded() {
+        try {
+            spdlog::warn("Guardian outbox send: a reclaimed orphan's result was a thrown "
+                         "exception, discarded (it belongs to a superseded entry with "
+                         "nowhere correct to attribute it). Further occurrences counted "
+                         "only.");
+        } catch (...) {
+        }
+    }
+
+    /// RAII orphan-exit marker, mirroring guardian_io_executor.hpp's TicketCore split
+    /// (guardian_io_executor.hpp:474-513): the worker's OWN captured copy is the one
+    /// that decrements worker_count, and it is destroyed by the detached-thread
+    /// trampoline AFTER the worker lambda body has fully returned (notify_all
+    /// included) - the latest point observable before the OS thread itself exits.
+    ///
+    /// UNARMED BY DEFAULT (#3966): the ctor is lock-free/noexcept, and `arm()` - the
+    /// nothrow ++worker_count - is called by launch() as the LAST statement of the
+    /// SAME locked block that commits in_flight/done, under the SAME state_->mu stop()
+    /// takes to set `stopping`. The prior shape armed via a SECOND, independent
+    /// self-locking ctor, called after that locked block had already released the
+    /// lock - so a stop() landing in the gap between the two could return with
+    /// stopping=true while worker_count still read 0, even though admission was
+    /// already committed (the falsified-zero window #3966 reports; falsifier:
+    /// tests/unit/test_guardian_outbox_send_executor.cpp). Mirrors
+    /// GuardianIoExecutor::run()'s own "armed under the lock" pattern
+    /// (guardian_io_executor.hpp:291-317), which this class had deviated from at
+    /// exactly this point. A ticket destroyed before/without `arm()` (the rollback /
+    /// launch-failed path) is a no-op, since no count was ever incremented for it.
+    struct AliveTicket {
+        explicit AliveTicket(std::shared_ptr<State> s) noexcept : state(std::move(s)) {}
         ~AliveTicket() {
+            if (!armed)
+                return;
             std::lock_guard<std::mutex> lk{state->mu};
             if (state->worker_count > 0)
                 --state->worker_count;
         }
+        /// CALLER MUST HOLD state->mu.
+        void arm() noexcept {
+            ++state->worker_count;
+            armed = true;
+        }
         AliveTicket(const AliveTicket&) = delete;
         AliveTicket& operator=(const AliveTicket&) = delete;
         std::shared_ptr<State> state;
+        bool armed{false};
     };
 
-    /// Called from offer() with state_->mu NOT held (AliveTicket's own ctor/dtor take
-    /// it, and it is not recursive). Spawns a detached worker that calls send(entry)
-    /// and publishes the result. Returns false for either of two reasons: the OS
-    /// refused to create the thread (mirrors guardian_io_executor.hpp's LaunchFailed
-    /// path), or a concurrent stop() won the race against offer()'s decision to call
-    /// this function (see the re-check just inside the try block below).
+    /// Called from offer() with state_->mu NOT held. Spawns a detached worker that
+    /// calls send(entry) and publishes the result. Returns false for either of two
+    /// reasons: the OS refused to create the thread (mirrors
+    /// guardian_io_executor.hpp's LaunchFailed path), or a concurrent stop() won the
+    /// race against offer()'s decision to call this function (see the re-check just
+    /// inside the try block below).
     bool launch(const OutboxEntry& entry, const SendFn& send) {
         // Bookkeeping FIRST, under its own lock, BEFORE the worker is spawned - not
         // after. A fast `send` can complete, lock state_->mu, and publish done=true
@@ -288,15 +502,15 @@ private:
         // from offer(), which has exactly one caller thread), so writing them before
         // the worker can possibly touch `done` is race-free by construction.
         //
-        // Everything from here through spawn_detached() can throw std::bad_alloc:
-        // the in_flight_event_id string copy just below (governance Gate 8 cpp-safety
-        // finding - an earlier draft placed this bookkeeping BEFORE the try, so a
-        // thrown bad_alloc on the copy itself left in_flight=true uncaught, the same
-        // wedge class one statement earlier than the guarded region started),
-        // make_shared<AliveTicket>, copying `entry`/`send` into the worker lambda's
-        // captures, and spawn_detached's own payload allocation (guardian_io_executor.hpp's
-        // own doc). ALL of it is inside one try, and any failure - a thrown bad_alloc
-        // OR spawn_detached returning false for an OS-level refusal - takes the SAME
+        // Everything from here through spawn_detached() can throw std::bad_alloc: the
+        // AliveTicket allocation, the in_flight_event_id string copy (governance Gate 8
+        // cpp-safety finding - an earlier draft placed this bookkeeping BEFORE the try,
+        // so a thrown bad_alloc on the copy itself left in_flight=true uncaught, the
+        // same wedge class one statement earlier than the guarded region started),
+        // copying `entry`/`send` into the worker lambda's captures, and
+        // spawn_detached's own payload allocation (guardian_io_executor.hpp's own
+        // doc). ALL of it is inside one try, and any failure - a thrown bad_alloc OR
+        // spawn_detached returning false for an OS-level refusal - takes the SAME
         // rollback path below. An uncaught throw here would unwind with in_flight left
         // true and no worker ever created to set done=true, wedging this entry exactly
         // like the ordering bug this function's rewrite fixed (verified in review) -
@@ -307,6 +521,11 @@ private:
         // drain_log_unlocked's catch and be miscounted as a send_exceptions_ hit.
         bool launched = false;
         try {
+            // Constructed UNARMED, before any lock (its ctor is lock-free/noexcept -
+            // #3966) - a shared_ptr so a launch failure's synchronous destruction and a
+            // launched worker's eventual thread-exit destruction both go through the
+            // same self-locking decrement path.
+            auto ticket = std::make_shared<AliveTicket>(state_);
             {
                 std::lock_guard<std::mutex> lk{state_->mu};
                 // Re-check stopping here, under the SAME lock stop() sets it under and
@@ -316,22 +535,41 @@ private:
                 // can run (adversarial review finding, #3847 item 4 hardening: no
                 // internal governance round caught this, both external reviewers did,
                 // independently). This return precedes every State mutation below -
-                // in_flight is still false, no AliveTicket/worker exists yet - so it
-                // reaches neither the catch(...) block (nothing thrown) nor the
-                // post-try `if (!launched)` rollback further down (nothing was set that
-                // needs unsetting); it is exactly as if offer() had seen stopping=true
-                // itself, one step earlier.
+                // in_flight is still false, the ticket is still unarmed - so it reaches
+                // neither the catch(...) block (nothing thrown) nor the post-try
+                // `if (!launched)` rollback further down (nothing was set that needs
+                // unsetting); it is exactly as if offer() had seen stopping=true itself,
+                // one step earlier.
                 if (state_->stopping)
                     return false;
+                // Fault injection (#3966 fold-in, governance Gate 5 chaos CH-1):
+                // exercises the EARLIEST point in this locked block that could throw -
+                // before ANY State mutation, before the ticket is armed - the UNARMED
+                // rollback path. Distinct from LaunchFaultForTest::Throw below, which
+                // fires after both. Rollback here is trivial by construction (nothing
+                // was set, the ticket's destructor is a no-op), but nothing previously
+                // exercised this exact point directly.
+                if (launch_fault_for_test_.load(std::memory_order_relaxed) ==
+                    LaunchFaultForTest::ThrowBeforeCommit)
+                    throw std::bad_alloc{};
+                state_->in_flight_event_id = entry.event_id; // the ONE throwing step,
+                                                              // FIRST - strong guarantee,
+                                                              // in_flight still false
                 state_->in_flight = true;
-                state_->in_flight_event_id = entry.event_id;
                 state_->done = false;
+                // #3953 items 1+2: reset for the NEW entry this admission is for -
+                // launched_at/stall_logged apply to whichever entry currently holds
+                // the slot.
+                state_->launched_at = std::chrono::steady_clock::now();
+                state_->stall_logged = false;
+                // Armed LAST, in this SAME locked block (#3966) - see AliveTicket::arm().
+                ticket->arm();
             }
-            // Constructed (and counted, via its self-locking ctor) BEFORE the launch
-            // attempt, inside a shared_ptr so a launch failure's synchronous destruction
-            // and a launched worker's eventual thread-exit destruction both go through
-            // the same self-locking decrement path.
-            auto ticket = std::make_shared<AliveTicket>(state_);
+            // Test seam: fires with NO lock held, after admission is committed AND
+            // counted (the SAME locked block above) - production callers never set
+            // this.
+            if (post_admission_race_hook_for_test_)
+                post_admission_race_hook_for_test_();
             auto st = state_;
             auto worker = [st, ticket, entry, send]() mutable noexcept {
                 SendResult r = SendResult::Retain;
@@ -357,6 +595,7 @@ private:
                     std::lock_guard<std::mutex> lk{st->mu};
                     st->result = r;
                     st->eptr = eptr;
+                    st->completed_at = std::chrono::steady_clock::now(); // #3953 item 2
                     st->done = true;
                 }
                 st->cv.notify_all();
@@ -364,14 +603,26 @@ private:
                 // observable point before this OS thread actually exits. Its dtor
                 // self-locks, so this runs safely with no lock held on this thread.
             };
-            launched = io_detail::spawn_detached(std::move(worker));
+            // Fault injection (#3966 fold-in): SpawnRefused mirrors an OS-level
+            // thread-creation refusal without depending on real resource exhaustion;
+            // Throw mirrors a bad_alloc anywhere in this guarded region - both take the
+            // SAME rollback path below via the surrounding try/catch and `if
+            // (!launched)`. Production always takes the plain spawn_detached() branch
+            // (LaunchFaultForTest::None).
+            const auto fault = launch_fault_for_test_.load(std::memory_order_relaxed);
+            if (fault == LaunchFaultForTest::Throw)
+                throw std::bad_alloc{};
+            launched = (fault == LaunchFaultForTest::SpawnRefused)
+                           ? false
+                           : io_detail::spawn_detached(std::move(worker));
         } catch (...) {
             launched = false;
         }
         if (!launched) {
             // Any partially-constructed ticket's local copy has already dropped by now
             // (try/catch unwound it, or the false-return path never released it) ->
-            // worker_count is back to 0 either way.
+            // worker_count is back to 0 either way (the ticket was never armed, or its
+            // armed destructor already ran and decremented).
             std::lock_guard<std::mutex> lk{state_->mu};
             state_->in_flight = false;
             return false;
@@ -380,7 +631,10 @@ private:
     }
 
     std::shared_ptr<State> state_;
+    std::chrono::milliseconds stall_threshold_;
     std::function<void()> pre_launch_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::function<void()> post_admission_race_hook_for_test_; ///< test seam; null = no-op (set-then-use)
+    std::atomic<LaunchFaultForTest> launch_fault_for_test_{LaunchFaultForTest::None}; ///< test seam
 };
 
 } // namespace yuzu::agent

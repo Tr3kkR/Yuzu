@@ -310,7 +310,31 @@ EnumerateResult enumerate_at(int dir_fd, const FileIdentity& root_id, const Enum
                 const std::uint64_t size =
                     (type == EntryType::RegularFile) ? static_cast<std::uint64_t>(st.st_size) : 0;
                 entry.meta =
-                    EntryMeta{type, size, static_cast<std::uint64_t>(st.st_dev) == root_id.dev};
+                    EntryMeta{type, size, static_cast<std::uint64_t>(st.st_dev) == root_id.dev,
+                              // Already in hand from the fstatat above, which is
+                              // parent-handle-relative -- no extra syscall, no path open.
+                              //
+                              // ALWAYS ENGAGED on POSIX, deliberately, and this
+                              // differs from the Windows leg on purpose. fstatat
+                              // always populates st_mtime; POSIX has no "unset"
+                              // encoding, so st_mtime == 0 is a genuine
+                              // 1970-01-01 timestamp (a real value on restored
+                              // archives) rather than absence. Mapping it to
+                              // nullopt would discard a true fact. Windows'
+                              // FILETIME 0 genuinely DOES mean "not set", which
+                              // is why that leg returns nullopt for it.
+                              //
+                              // CAVEAT, and it is the one hole in that reasoning:
+                              // a FUSE or network mount that supplies no
+                              // timestamps also returns st_mtime == 0, which is
+                              // the same "unset" signal Windows maps to nullopt
+                              // but arrives here as a genuine-looking 1970. An
+                              // age filter reads that as maximally old. This is
+                              // within the best-effort SELECTION envelope the
+                              // header documents, not a confinement issue, and
+                              // is left as-is rather than guessing which zero
+                              // is which.
+                              std::optional<std::int64_t>{static_cast<std::int64_t>(st.st_mtime)}};
             }
             result.entries.push_back(std::move(entry));
         }

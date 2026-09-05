@@ -486,6 +486,29 @@ public:
         return io_executor_.active_worker_count();
     }
 
+    /// Test seam (#3848): the bounded arm/disarm executor's own per-class counters,
+    /// which this class otherwise never surfaces anywhere.
+    ///
+    /// WHY A TEST NEEDS THEM. backend_op_timeouts() counts ONLY IoFailure::Timeout. An
+    /// arm or disarm the executor refuses outright - AlreadyRunning (the (class, key)
+    /// single-flight ticket is still held) or CapacityExhausted (the per-class quota is
+    /// full) - is counted NOWHERE at this surface, and submit_disarm_off_lock in
+    /// particular drops such a refusal silently. A concurrency test that reconciles
+    /// "every id armed" against "every id disarmed" therefore cannot distinguish a
+    /// genuinely leaked subscription from a disarm the executor simply declined to run:
+    /// both present as a surplus. Reading rejected_key/rejected_capacity and requiring
+    /// them ZERO is what turns that reconciliation from "the lane partition made a
+    /// collision unlikely" into an actual proof.
+    ///
+    /// TEST-ONLY ON PURPOSE, and the production gap is real and SEPARATE: the runtime
+    /// still has no egress for these counters, and a dropped AlreadyRunning /
+    /// CapacityExhausted disarm is still invisible to an operator. Already tracked as
+    /// #3415 (docs/spark-legacy-delta-registry.md) - do NOT read this accessor as
+    /// having closed it.
+    [[nodiscard]] GuardianIoExecutor::Stats io_executor_stats_for_test() const {
+        return io_executor_.stats();
+    }
+
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
     /// Does NOT join threads (the SparkEngine consumer join is phase 2, owned by

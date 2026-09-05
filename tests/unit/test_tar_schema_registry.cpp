@@ -243,7 +243,12 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }
-    for (const auto* name : {"process", "tcp", "service", "user", "perf"}) {
+    // power/removable are default-ON by the Wave 6 operator ruling — the first
+    // capture sources to ship enabled. They belong in THIS list, not a separate
+    // assertion in the cursor-seam tests: the whole point of this case is that
+    // one file states the enable posture for every source, so a source added
+    // with the wrong default fails here rather than nowhere.
+    for (const auto* name : {"process", "tcp", "service", "user", "perf", "power", "removable"}) {
         INFO("always-on source=" << name);
         CHECK(source_default_enabled(name));
     }

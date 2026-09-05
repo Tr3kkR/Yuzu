@@ -587,11 +587,14 @@ agent_test_exe = executable(
                 windows_updates_plugin_lib,
                 ],
 )
-# Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
-# threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
-# ballooned under Big Tam filesystem contention (four CI jobs sharing one host's /tmp), where
-# one stalled ~8 minutes and timed the whole agent suite out (#2345). In a PLAIN build they
-# detect nothing (no instrumentation), so that cost buys no signal there - skip them. A
+# Three agent tests are [tsan-heavy] (#3848 added the third, a concurrency soak against a
+# BLOCKING Spark backend/send callback - not a SQLite spin-loop, but genuinely contention-
+# dominated in the same way, ~4-15s under TSan): concurrency STRESS checkpoints that spin
+# four to five threads with no throttle, two of them on real SQLite I/O. Their wall time is
+# contention-dominated - it ballooned under Big Tam filesystem contention (four CI jobs
+# sharing one host's /tmp), where one stalled ~8 minutes and timed the whole agent suite out
+# (#2345). In a PLAIN build they detect nothing (no instrumentation), so that cost buys no
+# signal there - skip them. A
 # sanitizer build runs everything (ASan for use-after-free in the concurrent teardown, TSan
 # for the races they exist for), where the ~10x-larger job budget absorbs their cost as it did
 # before this change. The OTHER four [tsan] tests are cheap and bounded (no real SQLite, or a
@@ -637,7 +640,7 @@ test(
   agent_test_exe,
   args: agent_test_args,
   suite: 'agent',
-  timeout: 240, # restored after moving the two [tsan-heavy] spin-loop tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
+  timeout: 240, # restored after moving the (now three, #3848) [tsan-heavy] tests to sanitizer-only (#2345): plain suite is ~28s, so 240s is ~8x headroom and surfaces a genuine hang rather than absorbing it into a loose ceiling.
   depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
 )
 
@@ -723,8 +726,14 @@ tar_test_exe = executable(
     'unit/test_tar_arp.cpp',       # Wave 5 PR5.2: pure /proc/net/arp parser + macOS record mapping (fixture-fed)
     'unit/test_tar_capture_status.cpp', # BR-001 remediation: pure subprocess-capture completeness predicate
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
+    'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
+    # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
+    # the fail-closed reader for the lookback privacy control (tar_cursor.hpp
+    # rule 5). Linking it also means the suite exercises the real factory
+    # rather than a test-local stand-in.
+    '../agents/plugins/tar/src/tar_cursor_sources.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_software_core.cpp',

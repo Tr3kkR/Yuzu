@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -242,6 +243,91 @@ TEST_CASE("the periodic bound drains even without an explicit enqueue-wake",
 
     REQUIRE(spin_until([&] { return sink.count() >= 1; }, 2s)); // the backstop did
     worker.stop();
+}
+
+TEST_CASE("#3953 item 6: stop() closes both lane executors before publishing sig_->stopping "
+          "does not admit a send in the gap",
+          "[spark][guardian][drain][chaos]") {
+    // Never start()ed: offer()'s one-caller contract holds on THIS test thread, so
+    // calling wrapped_send_for_test() directly from inside the hook is deterministic -
+    // no real thread scheduling involved, matching the send_executor file's own
+    // pre_launch_race_hook_for_test_ pattern.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    std::atomic<int> invocations{0};
+    auto sink = [&](const OutboxEntry&) -> SendResult {
+        invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rt, sink);
+
+    auto entry = OutboxEntry::lifecycle("r1", 1, "e1", 1'700'000'000'000'000'000, "armed");
+    std::optional<SendResult> observed;
+    worker.set_stop_race_hook_for_test(
+        [&] { observed = worker.wrapped_send_for_test(entry); });
+
+    worker.stop();
+
+    REQUIRE(observed.has_value());
+    CHECK(*observed == SendResult::Retain);
+    CHECK(invocations.load() == 0);
+    // On TODAY's order this test's own admitted send launches a REAL detached thread
+    // (the executor hasn't been told to stop yet when the hook fires) - spin_until,
+    // don't assert active_send_workers()==0 synchronously: a real worker is in
+    // flight, only its eventual thread-exit decrement makes the count read 0.
+    CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
+}
+
+TEST_CASE("#3953 item 6 follow-up: the gap BETWEEN the two lane executors' own stop() "
+          "calls still admits a compliance send after lifecycle already refuses",
+          "[spark][guardian][drain][chaos]") {
+    // Governance Gate 4 unhappy-path (UP-4): stop() calls lifecycle_send_exec_.stop()
+    // THEN compliance_send_exec_.stop() - a real, tolerated (per the orphan-exit
+    // contract) admission window exists between the two calls, and nothing previously
+    // exercised it in isolation. Never start()ed: offer()'s one-caller contract holds
+    // on THIS test thread.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = std::make_shared<GuardianSparkRuntime>(r, b);
+    std::atomic<int> compliance_invocations{0};
+    std::atomic<int> lifecycle_invocations{0};
+    auto sink = [&](const OutboxEntry& e) -> SendResult {
+        // Sent, not Retain: wrapped_send()'s .value_or(Retain) makes Retain ambiguous
+        // between "refused" and "sent but retained" - Sent disambiguates admission.
+        if (e.domain == OutboxDomain::Lifecycle)
+            lifecycle_invocations.fetch_add(1);
+        else
+            compliance_invocations.fetch_add(1);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rt, sink);
+
+    auto lifecycle_entry = OutboxEntry::lifecycle("r1", 1, "e-lifecycle",
+                                                   1'700'000'000'000'000'000, "armed");
+    GuardDrift drift;
+    drift.rule_id = "r2";
+    auto compliance_entry =
+        OutboxEntry::compliance("r2", 1, "e-compliance", 1'700'000'000'000'000'000, drift);
+
+    std::optional<SendResult> compliance_result;
+    std::optional<SendResult> lifecycle_result;
+    // Fires between lifecycle_send_exec_.stop() and compliance_send_exec_.stop(): at
+    // this instant lifecycle's lane already refuses, compliance's does not yet.
+    worker.set_between_lane_stops_hook_for_test([&] {
+        compliance_result = worker.wrapped_send_for_test(compliance_entry);
+        lifecycle_result = worker.wrapped_send_for_test(lifecycle_entry);
+    });
+
+    worker.stop();
+
+    REQUIRE(compliance_result.has_value());
+    REQUIRE(lifecycle_result.has_value());
+    CHECK(*compliance_result == SendResult::Sent);  // compliance's lane not yet stopped
+    CHECK(*lifecycle_result == SendResult::Retain); // lifecycle's lane already stopped
+    CHECK(compliance_invocations.load() == 1);
+    CHECK(lifecycle_invocations.load() == 0);
+    CHECK(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
 }
 
 TEST_CASE("stop() is idempotent and joins cleanly with nothing pending",
@@ -1577,6 +1663,35 @@ TEST_CASE("item 4: a stalled send is single-flight, never resubmitted while in f
     send_cv.notify_all();
     REQUIRE(spin_until([&] { return worker.active_send_workers() == 0; }, 3s));
     CHECK(invocations.load() == 1); // still exactly one send for the one entry
+    worker.stop();
+}
+
+TEST_CASE("#3953 item 3: an internal re-check bounds detection latency for a send that "
+          "finishes between the per-attempt offer wait and the periodic backstop",
+          "[spark][guardian][drain][chaos]") {
+    // A 1-hour periodic bound - matching R4's own config - so only the internal
+    // re-check (kGuardianSendRecheckInterval) can make progress inside this test's
+    // window; without it, the second entry sits behind loop()'s full 1-hour sleep and
+    // this test times out. Default GuardianMaintenanceConfig (journal=nullptr) means no
+    // maintenance pass runs regardless of interval, so this exercises send cadence only.
+    JournalRig rig;
+    std::atomic<int> sent_count{0};
+    auto sink = [&](const OutboxEntry&) -> SendResult {
+        // Only the FIRST send stalls - long enough to exceed kGuardianSendOfferWait
+        // (200ms) several times over, so the margin against scheduling jitter is wide
+        // (Fable's review: a tighter stall left too little slack against two 200ms
+        // offer waits).
+        if (sent_count.fetch_add(1) == 0)
+            std::this_thread::sleep_for(1s);
+        return SendResult::Sent;
+    };
+    GuardianOutboxDrainWorker worker(*rig.rt, sink, /*periodic_bound_ms=*/3'600'000);
+    worker.start();
+
+    rig.rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rig.rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
+
+    CHECK(spin_until([&] { return sent_count.load() >= 2; }, 5s));
     worker.stop();
 }
 

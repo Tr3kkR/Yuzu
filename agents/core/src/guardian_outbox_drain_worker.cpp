@@ -9,6 +9,7 @@
 #include <chrono>
 #include <random>
 #include <stdexcept>
+#include <utility>
 
 namespace yuzu::agent {
 
@@ -102,27 +103,23 @@ void GuardianOutboxDrainWorker::start() {
         }
         sig->cv.notify_all();
     });
-    // No completion-waker is wired here: a completed send whose result arrives AFTER
-    // wrapped_send()'s own bounded per-attempt wait (kGuardianSendOfferWait, 200ms)
-    // already gave up is only noticed on the next enqueue wake or the periodic
-    // backstop (periodic_bound_ms_, kDefaultPeriodicBoundMs = 5000ms in production) -
-    // a real cadence regression versus pre-fix behavior (governance Gate 6 sre
-    // finding). A WakeFn callback was built and wired once (stored in
-    // GuardianOutboxSendExecutor::State, called right after that class's own
-    // state_->cv.notify_all() in launch()'s worker lambda, under the same lock that
-    // publishes done=true) and made EVERY completed send bump sig_->gen and wake loop()
-    // immediately. That broke "R4: a refill re-arm does not wait out the periodic bound"
+    // No completion-waker callback is wired here (#3953 item 3, revised): a WakeFn
+    // stored in GuardianOutboxSendExecutor::State, called right after that class's own
+    // state_->cv.notify_all() and bumping sig_->gen to wake loop() immediately, was
+    // built and wired once - but it made EVERY completed send a wake SOURCE, which broke
+    // "R4: a refill re-arm does not wait out the periodic bound"
     // (test_guardian_outbox_drain_worker.cpp): that test's whole point is proving the
     // loop re-arms a forced page from ITS OWN internal refill logic with NO external
-    // wake. Disabling the callback made the test pass again 4/4; the exact mechanism by
-    // which the extra per-send wakes broke it was not diagnosed. Reverted for the same
-    // reason offer()'s wake-on-stopping was reverted in
-    // guardian_outbox_send_executor.hpp's offer()/wait_until comment: the regression's
-    // cost is judged smaller than the risk of redesigning another load-bearing
-    // pre-existing timing test in this file under this PR's own time budget. The
-    // callback and its wiring were fully removed (not merely disabled) - left as a note
-    // for whoever revisits this trade-off, since re-adding it means also auditing every
-    // existing test that assumes loop() wakes ONLY on enqueue/notify()/periodic-bound.
+    // wake, and an unrelated wake source let it pass for the wrong reason. Fixed
+    // instead with a WAIT clamp, not a wake: loop() polls
+    // GuardianOutboxSendExecutor::has_in_flight_send() on both lanes after every drain
+    // pass and clamps its OWN wait to kGuardianSendRecheckInterval (200ms) while
+    // anything is in flight - see loop()'s wait computation. This closes the same
+    // cadence cliff (detection latency after completion now bounded by roughly
+    // kGuardianSendOfferWait + kGuardianSendRecheckInterval, not by
+    // periodic_bound_ms_) without adding a wake source, so R4 - whose sink is fully
+    // synchronous and therefore never leaves a send in flight across a cycle boundary -
+    // is untouched.
     thread_ = std::thread([this] {
         // TOP-LEVEL firewall. The inner passes are each firewalled, but the loop's own tail -
         // the lifecycle_headroom() call (std::mutex::lock can throw system_error) and the
@@ -150,6 +147,39 @@ void GuardianOutboxDrainWorker::start() {
 }
 
 void GuardianOutboxDrainWorker::stop() {
+    // Stop admitting new detached sends on BOTH lanes FIRST, before sig_->stopping is
+    // published below (#3953 item 6). Unconditional (not gated on first_stop) and
+    // idempotent (GuardianOutboxSendExecutor::stop() just sets its own `stopping` under
+    // its own lock) - cheap to call on every GuardianOutboxDrainWorker::stop() call,
+    // including a second/concurrent one, and this ordering is what closes the window: a
+    // drain loop that reads should_stop()==false an instant before sig_->stopping flips
+    // still finds BOTH lane executors already refusing admission when it reaches
+    // wrapped_send(), so it cannot slip a new send in behind this call. Does not cancel a
+    // send already in flight - that worker is covered by the orphan-exit contract
+    // (active_send_workers(), summed into GuardianEngine::active_io_workers()), not by
+    // this join.
+    lifecycle_send_exec_.stop();
+    // Test seam: fires with NO lock held, in the real gap between the two lane
+    // executors' own stop() calls (governance Gate 4 unhappy-path UP-4) - at this
+    // instant lifecycle's lane already refuses admission, compliance's does not yet.
+    // Fire-once via std::exchange, not move-then-check: both stop() calls above/below
+    // are unconditional, not gated on first_stop, so a second/idempotent
+    // GuardianOutboxDrainWorker::stop() call (including the one ~GuardianOutboxDrainWorker
+    // makes) must not re-fire this against an already-stopped compliance lane. A moved-from
+    // std::function is only "valid but unspecified" per the standard, not guaranteed empty;
+    // operator=(nullptr_t) has a specified empty postcondition, which is what makes this
+    // fire-once for real rather than for every stdlib we happen to test against.
+    // Guarded by an empty-check first (governance Gate 8 happy-path finding) so the common,
+    // hook-never-set production path stays a plain read of a non-atomic member rather than
+    // an unconditional write - both are currently equivalent (every real stop() caller is
+    // serialized under GuardianEngine::mtx_), but there is no reason to prefer the write.
+    // Production callers never set this.
+    if (between_lane_stops_hook_for_test_) {
+        if (auto hook = std::exchange(between_lane_stops_hook_for_test_, nullptr)) {
+            hook();
+        }
+    }
+    compliance_send_exec_.stop();
     bool first_stop = false;
     {
         // Stored UNDER the mutex even though the flag is atomic: a waiter evaluating the
@@ -162,16 +192,14 @@ void GuardianOutboxDrainWorker::stop() {
         }
     }
     if (first_stop) {
+        // Test seam: fires with NO lock held, after BOTH lane executors already refuse
+        // admission (the calls above) and sig_->stopping is already published (#3953
+        // item 6). Production callers never set this.
+        if (stop_race_hook_for_test_)
+            stop_race_hook_for_test_();
         // Clear the runtime's slot so no NEW enqueue installs a wake; a copy
         // already taken by an in-flight enqueue stays safe (still-alive Signal).
         rt_.set_outbox_enqueue_waker({});
-        // Stop admitting new detached sends on BOTH lanes (#2233 item 4); does not
-        // cancel one already in flight - that worker is covered by the orphan-exit
-        // contract (active_send_workers(), summed into GuardianEngine::active_io_workers()),
-        // not by this join. Before the join below, not after: the loop's own next
-        // wrapped_send() call must see stopping if it races this.
-        lifecycle_send_exec_.stop();
-        compliance_send_exec_.stop();
         sig_->cv.notify_all();
     }
     // The join is OUTSIDE the first_stop guard and keyed on joinable(), not on the
@@ -256,8 +284,12 @@ GuardianMaintenanceResult GuardianOutboxDrainWorker::maintenance_once(GuardianMa
 
 void GuardianOutboxDrainWorker::loop() {
     // GuardianEngine::stop() joins this thread while holding mtx_, so mtx_ must never be
-    // taken here - including from the INJECTED send. The marker is what makes that abort
-    // instead of deadlock; the scheduler's lanes carry it for the same reason.
+    // taken here - the journal's prune/page maintenance runs directly on this thread.
+    // NOT the injected `send` (#3966 fold-in, stale since #3961): send() no longer runs
+    // on this thread at all - it runs on GuardianOutboxSendExecutor's own detached
+    // worker, covered by the orphan-exit contract instead. The marker below is what
+    // makes a violation abort instead of deadlock; the scheduler's lanes carry it for
+    // the same reason.
     const GuardianJoinedThreadRole role_marker;
     // The cadence timers are LOCALS, not members: nothing outside this thread can read
     // or write them, so the public maintenance_once() seam carries no timer state and
@@ -281,6 +313,12 @@ void GuardianOutboxDrainWorker::loop() {
     // it. Nothing here takes the engine mtx_, so running concurrently with the remainder of
     // wire_spark_engine is safe.
     bool skip_wait = true;
+    // #3953 item 3: a LOCAL, not a member (same convention as the timers above) - set
+    // after each drain pass, consumed by the wait computation below. Lets loop() poll a
+    // stalled-past-kGuardianSendOfferWait send sooner than the full periodic bound,
+    // without becoming a wake SOURCE itself (no sig_->gen bump, no notify_all) - see the
+    // wait computation's own comment for why that distinction is what keeps R4 sound.
+    bool send_in_flight_pending = false;
     // Concurrent arm/disarm traffic can refill the window between the end-of-cycle headroom
     // check and the next page pass, so the immediate re-arm could chain indefinitely - each
     // link a full journal scan. The token bucket does NOT bound that: take() is charged only
@@ -341,6 +379,21 @@ void GuardianOutboxDrainWorker::loop() {
                     // the preprocessor expands on the identifier plus '('.
                     wait_ms = (std::max)(remaining, std::chrono::milliseconds{0});
             }
+            // #3953 item 3: a send known in flight on either lane at the end of the last
+            // pass is re-checked sooner than the full periodic bound - closes the
+            // throughput cliff a send finishing between kGuardianSendOfferWait (200ms)
+            // and the periodic backstop used to hit. Deliberately just a WAIT clamp, not
+            // a wake (no gen bump, no notify_all): R4 ("a refill re-arm does not wait out
+            // the periodic bound") discriminates entirely on nothing but its own re-arm
+            // being able to produce a page inside its spin_until window - an added wake
+            // SOURCE would let an unrelated event satisfy that assertion for the wrong
+            // reason, which is exactly the "hollow test" failure R4's own comment warns
+            // against. A shortened WAIT cannot do that: it only changes how long THIS
+            // loop's own cv.wait_for blocks before re-evaluating its own predicate, so R4
+            // (whose sink is fully synchronous - offer() never returns nullopt there, so
+            // send_in_flight_pending is always false in that test) is untouched.
+            if (send_in_flight_pending)
+                wait_ms = (std::min)(wait_ms, kGuardianSendRecheckInterval);
             sig_->cv.wait_for(lk, wait_ms, [this, seen] {
                 return sig_->stopping.load(std::memory_order_acquire) || sig_->gen != seen;
             });
@@ -468,6 +521,17 @@ void GuardianOutboxDrainWorker::loop() {
         if (stop_requested())
             break;
         const auto drained = firewalled_drain();
+
+        // #3953 item 3: firewalled like every other read in this bare-thread tail (the
+        // item-13 seam below models exactly this class of exposure) - a std::system_error
+        // from either executor's mutex lock must not escape and kill the one-shot worker.
+        // Fails toward the existing periodic-bound cadence (false), never toward a crash.
+        try {
+            send_in_flight_pending =
+                lifecycle_send_exec_.has_in_flight_send() || compliance_send_exec_.has_in_flight_send();
+        } catch (...) {
+            send_in_flight_pending = false;
+        }
 
         // TEST-ONLY item-13 seam: model a throw from the loop's OWN tail (the refill re-arm's
         // rt_.lifecycle_headroom() - std::mutex::lock can throw - and the cadence arithmetic),
