@@ -188,6 +188,21 @@ public:
     /// Number of registered routes — handy for assertions in fixture setup.
     std::size_t route_count() const { return routes_.size(); }
 
+    /// Every registered (method, pattern) pair, in registration order.
+    /// Additive accessor for #3991's OpenAPI completeness contract test
+    /// (test_openapi_spec_completeness.cpp), which needs to enumerate the
+    /// full route table without dispatching each one individually. `pattern`
+    /// is the raw string handed to Get/Post/etc — a plain path or an
+    /// httplib-style regex (see `add()` below) — not percent-decoded or
+    /// otherwise normalized.
+    std::vector<std::pair<std::string, std::string>> registered_routes() const {
+        std::vector<std::pair<std::string, std::string>> out;
+        out.reserve(routes_.size());
+        for (const auto& r : routes_)
+            out.emplace_back(r.method, r.pattern);
+        return out;
+    }
+
 private:
     struct Route {
         std::string method;
