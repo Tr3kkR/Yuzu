@@ -502,8 +502,9 @@ public:
     ///
     /// TEST-ONLY ON PURPOSE, and the production gap is real and SEPARATE: the runtime
     /// still has no egress for these counters, and a dropped AlreadyRunning /
-    /// CapacityExhausted disarm is still invisible to an operator. Filed as its own
-    /// follow-up - do NOT read this accessor as having closed it.
+    /// CapacityExhausted disarm is still invisible to an operator. Already tracked as
+    /// #3415 (docs/spark-legacy-delta-registry.md) - do NOT read this accessor as
+    /// having closed it.
     [[nodiscard]] GuardianIoExecutor::Stats io_executor_stats_for_test() const {
         return io_executor_.stats();
     }

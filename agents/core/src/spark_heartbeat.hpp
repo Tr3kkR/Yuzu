@@ -61,9 +61,13 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 /// #2833 — WHAT THIS FUNCTION CANNOT REPORT, AND WHY THE FIX IS NOT HERE. The !running
 /// early-return below is not the only gate, and it is not the binding one. The agent's
 /// heartbeat composer emits NOTHING AT ALL once stop_requested_ is set
-/// (agent.cpp:2552 / :3281), and both shutdown paths stop spark BEFORE joining the
-/// heartbeat thread (agent.cpp:1085 / :3315 vs :3095 / :3744). So every counter that can
-/// ONLY increment during teardown — the two unwatch-failure counters' shutdown-window
+/// (agent.cpp:2582 / :3311). The two shutdown paths' spark-stop and heartbeat-join calls
+/// (agent.cpp:1086 / :3345 vs :3125 / :3774) run on different threads and are not
+/// ordered relative to each other, but that ordering isn't what makes this
+/// unreachable — the stop_requested_ gate above and emit_spark_heartbeat_tags()'s own
+/// !running early-return each independently suppress it regardless of interleaving. So
+/// every counter that can ONLY increment during teardown — the two unwatch-failure
+/// counters' shutdown-window
 /// increments, and teardown_join_timeouts_total in its entirety — is structurally
 /// unreachable from here no matter what this function does. Adding a tag for one of them
 /// would be inert on the wire.

@@ -1364,9 +1364,15 @@ void SparkEngine::stop() noexcept try {
     // 1b) #2815: wait — BOUNDED — for every caller already inside a post-mu_ mechanism
     // window (disarm / teardown_arm_race / unregister_consumer / arm_impl's watch) to
     // leave it, before step 2 starts tearing those same mechanisms down. The locked
-    // block above has already flipped running_ AND stopped_, and all four doors gate
-    // their own entry on those under mu_ BEFORE resolving a mechanism, so no NEW caller
-    // can arm a lease from here on: this waits on a set that only shrinks.
+    // block above has already flipped running_ AND stopped_; disarm/teardown_arm_race/
+    // arm_impl gate their own entry on those under mu_ BEFORE resolving a mechanism, so
+    // no NEW caller can arm a lease there from here on. unregister_consumer() gates on
+    // consumers_ membership instead, which this function doesn't empty until step 3
+    // below — a call landing in this window CAN still arm a lease (see the header's
+    // TeardownLease doc for why that's verified benign, not a gap: every mechanism
+    // serializes its own stop()/unwatch() internally). Either way this wait still
+    // counts every caller genuinely in flight; only the "set that only shrinks" framing
+    // is uniform across three of the four doors, not all four.
     //
     // BOUNDED, AND IT PROCEEDS ON EXPIRY. stop() is called from Agent::stop() and from
     // the Windows SCM control thread; it may never become a place a shutdown can hang,

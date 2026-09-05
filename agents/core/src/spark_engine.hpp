@@ -114,10 +114,11 @@ struct SparkEngineStats {
     ///
     /// #2833 — WHEN THAT TAG IS UNREACHABLE, which is exactly when it would matter most.
     /// Increments that happen during SHUTDOWN never reach the wire: the agent's heartbeat
-    /// composer emits NOTHING once stop_requested_ is set (agent.cpp:2552 / :3281), and
-    /// both shutdown paths stop spark BEFORE joining the heartbeat thread (:1085 / :3315
-    /// vs :3095 / :3744). The engine's own gate says the same thing independently —
-    /// emit_spark_heartbeat_tags() takes the ABSENT posture on !running, and stop() has
+    /// composer emits NOTHING once stop_requested_ is set (agent.cpp:2582 / :3311). The
+    /// two shutdown paths' spark-stop and heartbeat-join calls (:1086 / :3345 vs :3125 /
+    /// :3774) run on different threads and aren't ordered relative to each other, but
+    /// that isn't load-bearing here — the engine's own gate says the same thing
+    /// independently: emit_spark_heartbeat_tags() takes the ABSENT posture on !running, and stop() has
     /// already cleared running_. So a shutdown-window increment is JOURNAL-ONLY: its sole
     /// egress is the spdlog::error at the increment site.
     ///
@@ -144,7 +145,7 @@ struct SparkEngineStats {
     ///
     /// JOURNAL-ONLY BY CONSTRUCTION, and deliberately absent from
     /// emit_spark_heartbeat_tags(): this counter can only ever increment INSIDE stop(),
-    /// which runs after running_ = false, and the heartbeat gate at agent.cpp:2552 emits
+    /// which runs after running_ = false, and the heartbeat gate at agent.cpp:2582 emits
     /// nothing once shutdown has been requested. A heartbeat tag for it would be
     /// unreachable on every path that can set it — the same shape as the two
     /// unwatch-failure counters' shutdown-window increments (#2833). Its egress is the
@@ -659,10 +660,22 @@ private:
     /// under a caller parked in that window (use-after-free). The bounded one is an
     /// API-contract nicety, and stop() must never become a place shutdown can hang.
     ///
-    /// NO NEW CALLER CAN SLIP IN BEHIND stop(): all four doors gate their own entry on
-    /// running_/stopped_ under mu_ BEFORE they resolve a mechanism, so once stop()'s
-    /// early locked block has flipped both flags a later caller resolves nothing and
-    /// arms nothing. The lease counts exactly the callers in flight at that instant.
+    /// NO NEW CALLER CAN SLIP IN BEHIND stop() on three of the four doors: disarm(),
+    /// teardown_arm_race() and arm_impl() gate their own entry on running_/stopped_
+    /// under mu_ BEFORE they resolve a mechanism, so once stop()'s early locked block
+    /// has flipped both flags a later caller resolves nothing and arms nothing.
+    /// unregister_consumer() (door 3) gates differently — on whether `id` is still
+    /// present in consumers_, which stop() doesn't empty until its OWN later step 3
+    /// (the consumers.swap) — so a call landing in that window still arms a lease and
+    /// calls unwatch() on a mechanism stop() may already be tearing down concurrently
+    /// and unsynchronized at the SparkEngine level (governance Gate 4 unhappy-path
+    /// finding). This is verified benign, not merely assumed: every real mechanism
+    /// (spark_file.cpp, spark_service.cpp, spark_registry.cpp) takes its own internal
+    /// mutex around both stop() and unwatch(), so this door's late call is a logically
+    /// stale but data-race-free unwatch on an already-stopping mechanism — the same
+    /// "every real mechanism fails a post-stop unwatch closed" contract this file
+    /// already relies on elsewhere. The lease still counts it correctly; what's not
+    /// true is that the ENTRY GATE is uniform across all four doors.
     ///
     /// A PLAIN ATOMIC, POLLED — a simplicity choice, not a forced one (governance
     /// Gate 3 cpp-expert review: worth recording precisely, since the original
