@@ -58,6 +58,29 @@ void emit_spark_absent_tags(TagMap& tags, bool disabled) {
 /// SPARSE: a counter tag is omitted when 0 (fleet-scale, and every counter is 0 at
 /// rung 1), so a quiescent agent ships only the two always-present capability keys.
 ///
+/// #2833 — WHAT THIS FUNCTION CANNOT REPORT, AND WHY THE FIX IS NOT HERE. The !running
+/// early-return below is not the only gate, and it is not the binding one. The agent's
+/// heartbeat composer emits NOTHING AT ALL once stop_requested_ is set
+/// (agent.cpp:2582 / :3311). The two shutdown paths' spark-stop and heartbeat-join calls
+/// (agent.cpp:1086 / :3345 vs :3125 / :3774) run on different threads and are not
+/// ordered relative to each other, but that ordering isn't what makes this
+/// unreachable — the stop_requested_ gate above and emit_spark_heartbeat_tags()'s own
+/// !running early-return each independently suppress it regardless of interleaving. So
+/// every counter that can ONLY increment during teardown — the two unwatch-failure
+/// counters' shutdown-window
+/// increments, and teardown_join_timeouts_total in its entirety — is structurally
+/// unreachable from here no matter what this function does. Adding a tag for one of them
+/// would be inert on the wire.
+///
+/// Consequence for whoever comes looking: a zero reading for `yuzu.spark_*_unwatch_failures`
+/// during a shutdown is NOT evidence that nothing was orphaned; the journal
+/// (spdlog::error at each increment site in spark_engine.cpp) is the only egress in that
+/// window. If a future change genuinely needs teardown telemetry off the box, the gate to
+/// move is the AGENT's, and it is there on purpose — STOPPED is not FAILED, and bucketing
+/// a cleanly-stopping agent into yuzu_fleet_spark_failed{os} would page on-call on every
+/// restart. Pinned by "#2833 — a shutdown-window unwatch failure is counted but has NO
+/// heartbeat egress" in test_spark_mechanism.cpp.
+///
 /// The `yuzu.spark_mechs` CSV lists only mechanisms that are registered AND FUNCTIONAL.
 /// An inert mechanism — one that started but could not bind its OS facility (no systemd
 /// system bus in a container, OpenSCManager denied, IOCP creation failed) — is EXCLUDED,

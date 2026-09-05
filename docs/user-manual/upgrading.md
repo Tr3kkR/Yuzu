@@ -982,8 +982,15 @@ only when a legacy `inventory.db` happens to be present. This is a deliberate fa
 startup error, never silent data loss), not a bug, but it means "just roll back the binary" is
 not a supported recovery path once this migration has run. The same is true for
 CaStore/ManagementGroupStore/QuarantineStore/WebhookStore below, each for its own dropped marker
-table; RbacStore is the one exception (see its own section) where rollback failure IS
-conditional on a real legacy file being present.
+table. RbacStore is the one genuine exception (see its own section): its retirement migration
+**poisons** the marker rows to a sentinel value rather than deleting them, so an old binary's own
+lookup finds them present (not 0 rows) and — reading a value it understands as "no verified
+source, but not a failure" — boots normally UNLESS a real, unmigrated legacy file is also present
+on that specific host. This is RbacStore's own deliberate choice to tolerate rollback, not an
+artifact of a row count. AuditStore also removes marker rows rather than dropping a table, but do
+NOT assume it behaves the same way as either group — its own section explains why an old binary's
+boot fails just as reliably as the DROP-TABLE group's, via a CHECK constraint rather than a SQL
+error on a missing table.
 
 ## ⚠️ Behaviour change: internal-CA store moves to Postgres (ADR-0053)
 
@@ -1739,120 +1746,85 @@ These are two SEPARATE failure/detection behaviors, not one — do not conflate 
 **Not affected:** `/api/notifications*` request/response behavior is
 unchanged — this is a storage-engine swap only, no API change.
 
-## Audit trail migrates to PostgreSQL — history preserved (AuditStore, ADR-0040)
+## Audit trail on PostgreSQL — legacy `audit.db` no longer imported (AuditStore, ADR-0040)
 
-The audit log (`AuditStore`, the SOC 2 evidence chain) moves from the SQLite
-`audit.db` file to the server's PostgreSQL substrate in this release (ADR-0006
-Wave 1.3), schema `audit_store`. **Unlike the AuthDB/ScimStore and ApiTokenStore
-cutovers above, this is NOT a fresh start — audit history is preserved.** Because
-the audit trail is SOC 2 evidence retained 365 days, pre-cutover rows are
-migrated, not reset.
+The audit log (`AuditStore`, the SOC 2 evidence chain) runs on the server's
+PostgreSQL substrate (ADR-0006 Wave 1.3, schema `audit_store`). No new flag or
+environment variable is needed: the store reuses the shared `--postgres-dsn` /
+`YUZU_POSTGRES_DSN` connection the rest of the server already requires, and
+(like every server store) it **fails closed** at boot if Postgres is
+unreachable — there is no SQLite fallback.
 
-No new flag or environment variable is introduced: the store reuses the shared
-`--postgres-dsn` / `YUZU_POSTGRES_DSN` connection the rest of the server already
-requires, and (like every server store) it **fails closed** at boot if Postgres
-is unreachable — there is no SQLite fallback.
+**No legacy-SQLite migration path.** This release retires `AuditStore`'s
+one-time, mandatory, streamed backfill from a legacy `audit.db` (`#3623`,
+`chore/retire-migrate-from-sqlite-auditstore`, ADR-0009's hard-cutover Update)
+— no production Yuzu fleet has ever run a pre-Postgres build, and this is a
+hard cutover with no migration path held open for any store, including this
+one, accepting permanent audit-trail loss as the failure mode if that premise
+is ever wrong for a specific host. `AuditStore` had been the
+one deliberate, permanent exception to ADR-0009's fresh-start default — audit
+evidence cannot be regenerated the way config or cache state can — until this
+release withdrew it. These are two SEPARATE behaviors, not one — do not
+conflate them:
 
-**What happens on first PG boot:**
+- A reachable Postgres database whose schema can't migrate or open **is**
+  still a fatal startup error (fail-closed), unchanged from before.
+- A legacy `audit.db` file with real content **does NOT** fail startup and its
+  content is **never imported**. Its permissions are forced to owner-only
+  (`0600`, plus its `-wal`/`-shm`/`-journal` sidecars) if they aren't already —
+  this file may hold plaintext secret material from a since-fixed historical
+  bug, same obligation as every other legacy-file-hardening store on this page
+  — POSIX only, a no-op on Windows, #3593 — then the server opens it
+  read-only, purely to count rows in `audit_events` for a diagnostic warning,
+  then boots regardless of what it finds. Beyond that row count, its content
+  is never read, and it is never renamed, moved, or written to. Fresh installs
+  are unaffected — no legacy file, nothing to warn about.
 
-- If a legacy `audit.db` is present, the server runs a **one-time, mandatory,
-  streamed backfill** of every audit row (in bounded batches, so a multi-GB table
-  does not exhaust memory) into `audit_store` before serving. The retention
-  horizon (`ttl_expires_at`) and clock-guard state come across too, so retention
-  behaviour is preserved exactly. Row counts are reconciled and logged.
-- The backfill is **idempotent and resumable** (a `backfill_complete` marker
-  gates re-runs; a crash mid-backfill resumes from where it stopped, with no
-  duplication and no loss).
-- **A failed or partial backfill fails the boot** — the server refuses to serve
-  with a knowingly-incomplete evidence chain, logs a loud diagnostic, and
-  **retries on the next start**. It does not silently start with a partial trail.
-  **The boot log is your primary signal here, not a metric.** The backfill runs
-  during server construction, and a failure stops the boot before the HTTP
-  listener starts, so `/metrics` is never served on that path and the
-  `yuzu_server_audit_backfill_total{result="failed"}` sample is never scraped.
-  The metric's `fresh` / `completed` values are observable on a server that came
-  up; the shipped `YuzuAuditBackfillFailing` sample rule therefore alerts on the
-  *absence* of a success outcome (see `docs/prometheus/yuzu-alerts.yml`), and a
-  wedged replica among healthy ones shows up as a down instance rather than on
-  that alert. **Silence that rule for the upgrade window if your legacy
-  `audit.db` is large enough to make the first boot long** — the server does not
-  serve `/metrics` until the backfill finishes, so a healthy multi-hour backfill
-  looks exactly like a wedged one from outside. The boot log is what tells them
-  apart.
-- **The backfill only ever runs against an empty `audit_store` schema or its own
-  interrupted copy.** Before resuming, it checks that the audit rows already in
-  PostgreSQL really are the partial copy of *this* `audit.db`. If they are not —
-  the usual causes are a DSN pointing at a different deployment's database, or a
-  restore that brought back `audit_events` without `audit_retention_meta` (which
-  carries the `backfill_complete` marker) — the server **refuses to start** with
-  `the existing rows are NOT an interrupted copy of …` rather than resuming past
-  rows it cannot account for and reporting a complete migration. Point the server
-  at the right database, or clear `audit_store.audit_events` if those rows are
-  not wanted, then restart.
-- **A server with no `audit.db` of its own will not "complete" someone else's
-  partial backfill.** The completion marker asserts the trail is whole, so a
-  server that finds audit rows already in PostgreSQL, no marker, and no usable
-  legacy file **refuses to start** rather than stamping the marker over rows it
-  cannot account for. The two ways to reach that state are a replica started
-  while another is still streaming (bring up one replica first, below), and a
-  partial backfill whose `audit.db` was moved aside before it finished. Restore
-  the legacy file and let the backfill finish, or use the abandon procedure in
-  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md)
-  if it is genuinely unrecoverable.
-- After a verified backfill the legacy `audit.db` is **moved aside, not deleted**
-  — it becomes an operator-managed backup of the pre-cutover trail. Relocating or
-  archiving that file afterward is expected and safe. Its `-wal`/`-shm` sidecars,
-  if the previous server stopped uncleanly and left any, are moved with it: the
-  main file **alone is not a usable copy** when a WAL tail exists, so keep the set
-  together if you relocate it.
+**If you see the legacy-row-count warning and the environment genuinely has
+real audit history to keep, there is no automated recovery path**: the
+pre-cutover trail stays exactly where it is, at its configured path (0600
+now enforced on POSIX, #3593; content otherwise untouched) — and is your operator-managed
+record going forward (export it, archive it, keep it under your own
+retention policy; Yuzu will never import it). The generic "reapply manually"
+phrasing in the boot warning fits config-shaped stores below (a webhook
+subscription, a notification preference) where reapplying means re-creating
+the row through the API; it does not apply here in that sense — an audit
+trail is historical evidence, not something you recreate, so "reapply" for
+AuditStore means export-and-archive, never re-import.
 
-**What to expect / do:**
+**Rollback caution.** Do not roll back to a build older than this release.
+Unlike RbacStore above, this is not just a caution about a leftover legacy
+file — an older binary's own (now-removed-from-current-code) backfill logic
+refuses to boot **unconditionally**, with or without a legacy `audit.db`
+present: seeing this database already past this migration (the marker rows
+are gone, but `audit_retention_meta` itself is not — see ADR-0040's Update),
+its own idempotency-marker write hits the SAME migration's CHECK constraint
+(`audit_retention_meta_no_retired_backfill_markers`) and fails with a
+Postgres `23514 check_violation`, table empty or not, legacy file present or
+not. This is the same class of guarantee the DROP-TABLE-group stores above
+get from their `undefined_table` error — a schema-level rejection, not a
+live-row-count race — with one caveat: if a legacy `audit.db` is present,
+the old binary's row inserts into `audit_events` still run and commit before
+this final write fails, so the refusal is loud and deterministic but not
+zero-data-movement the way a first-touch `undefined_table` error is. "Just
+roll back the binary" is not a supported recovery path once this migration
+has run, the same as every DROP-TABLE-group store above. **If AuditStore
+runs as more than one replica, upgrade every replica and any
+`--mfa-reset`/`--break-glass-arm` CLI image together** during a staged
+rollout — a replica or one-shot CLI still on the old binary that boots after
+this migration has run on the shared database will refuse to start, same as
+any other rollback attempt.
 
-- **Budget for a longer first boot on a large `audit.db`.** A trail with tens of
-  millions of rows (~16 GB) can take meaningfully longer to stream than a normal
-  startup. **Widen your startup budget accordingly:** raise the Kubernetes
-  `startupProbe` (and any liveness) failure/period budget, or the Docker Compose
-  healthcheck `start_period`, so the orchestrator does not kill the server
-  mid-backfill and restart it into the same long boot repeatedly. The backfill is
-  resumable, so a killed boot is not corrupting — but it wastes the window.
-- **Scale-out: bring up the replica that HOLDS `audit.db` first — recommended,
-  not load-bearing for safety.** In a multi-replica deployment, starting that
-  one server first and letting it finish the backfill (the `backfill_complete`
-  marker is stamped in `audit_store`) before the rest avoids a refusal, but a
-  wrong boot order no longer loses evidence: if a replica with no legacy
-  `audit.db` of its own boots first against an empty table, it stamps the
-  completion marker over that emptiness (logging a WARNING naming what it
-  forecloses — routine on a genuine fresh install, the signal you started the
-  wrong host on an upgrade) — but the replica that DOES hold the trail does
-  **not** silently trust that marker. It re-reads its own `audit.db`, proves
-  (by fingerprint) whether that file's content was ever actually migrated, and
-  **refuses to boot** on a mismatch rather than reporting success over an
-  unmigrated trail. The file is left untouched at its original path — nothing
-  is lost, but that host needs an operator to resolve it (see
-  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md))
-  before it will serve. Getting the boot order right the
-  first time avoids that operator step; it is no longer the thing standing
-  between you and silent evidence loss. Once the marker is present (and, for
-  every OTHER holder, verified) the remaining replicas start normally;
-  retention afterward is single-swept fleet-wide via an advisory lease (see
-  [Audit Log](audit-log.md#the-retention-clock-guard)).
-- **Reads deny-on-degrade.** After cutover, an audit-store or connection-pool
-  failure makes `GET /api/v1/audit*` return `503` rather than an empty `200`, so
-  an infrastructure blip can never be mistaken for "no audit activity."
-- **The break-glass one-shots run the backfill too.** `--mfa-reset` and
-  `--break-glass-arm` write an audit record without going through boot, so on an
-  upgraded host the first one of them to run performs the same migration a first
-  boot would (streaming the trail, stamping the marker, moving `audit.db` aside)
-  before it writes its record. Budget for that if you use one during the upgrade
-  window; if the backfill cannot complete, the one-shot refuses and changes
-  nothing rather than writing a record that would block every later boot.
+**What to do:** the `YuzuAuditBackfillFailing` alert is removed with this
+release. If you copied it into your own alerting config instead of
+re-importing `docs/prometheus/yuzu-alerts.yml`, remove it or it fires
+permanently via `absent_over_time` on a stale local copy — a CRITICAL page
+that never clears, pointing at boot-log remediation steps that no longer
+exist.
 
-**Backfill refused at boot or from a one-shot?** Both refusal shapes — a
-holder-side verification failure (marker already set, this host's file
-unproven) and an unrecoverable legacy trail (marker absent, rows present) —
-including the SQL for the second one, now live in their own runbook:
-[audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md).
-Not duplicated here.
+**Reads deny-on-degrade.** An audit-store or connection-pool failure makes
+`GET /api/v1/audit*` return `503` rather than an empty `200`, so an
+infrastructure blip can never be mistaken for "no audit activity."
 
 **Not affected:** the audit event vocabulary and REST/MCP query surface are
 unchanged; SIEM export recipes keep working. One deliberate behaviour change: on
@@ -3150,10 +3122,10 @@ psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT store, version, to_timestamp(upgraded_at) FROM public.schema_meta ORDER BY upgraded_at;"
 ```
 
-For `audit_store` specifically, the legacy `audit.db` also **stops existing at its old path**
-after the one-time backfill: it is renamed to `audit.db.migrated-<epoch>` (with any
-`-wal`/`-shm` sidecars). A `sqlite3 /var/lib/yuzu/audit.db` command therefore fails with
-`unable to open database file` on a migrated server, and that is expected, not a fault.
+For `audit_store` specifically, a legacy `audit.db` — if one still exists — is never renamed,
+moved, or modified: Yuzu only opens it read-only, at boot, to warn if it holds rows (see the
+Audit trail section above). `sqlite3 /var/lib/yuzu/audit.db` still opens it normally on a
+migrated server; there is nothing to restore or account for here.
 
 If a migration fails:
 

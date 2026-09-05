@@ -233,3 +233,19 @@ data).
   "This default is conditional on the fact, not permanent policy" paragraph above for why. A
   future store's own retirement, if one is ever added to the ladder after this ADR's amendment,
   should follow the version-bumped-append shape these two PRs established, not re-derive it.
+
+  **Update (hard cutover — the `AuditStore` exception withdrawn, 2026-09-04):** the paragraph
+  above beginning "`AuditStore` (already migrated, ADR-0040, backfill built and shipped) is the
+  one store where this would matter most if the premise ever flips retroactively" is superseded.
+  That paragraph reasoned from the premise holding ("no production fleet has ever run a
+  pre-Postgres build") and kept `AuditStore`'s backfill as insurance against the premise being
+  locally wrong for evidence specifically. The operator's direction inverted the question: not
+  "is the premise still true," but a deliberate policy choice regardless — no migration path
+  held open, for any store, full stop, accepting permanent audit-trail loss as the failure mode
+  if the premise is ever wrong for this store. `AuditStore::migrate_from_sqlite()` was retired
+  in `chore/retire-migrate-from-sqlite-auditstore` (#3623) — see ADR-0040's own Update for the
+  full trace, including why this is a plain `DELETE` of the marker rows rather than `RbacStore`'s
+  poison. This closes the 19th and last store on the ladder; #3623 is now fully resolved with no
+  store carrying a live `migrate_from_sqlite()`. A leftover `audit.db` still gets a boot-time
+  WARN (`legacy_sqlite_probe::warn_if_legacy_rows`) — this Update withdraws the backfill, not
+  the detect-and-warn obligation every other retired store already carries.
