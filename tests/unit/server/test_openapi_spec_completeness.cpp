@@ -198,8 +198,8 @@ TEST_CASE("canonicalize: OpenAPI {id}-style param matches the same shape",
 TEST_CASE("RestApiV1::register_routes vs openapi_spec_json(): every registered "
           "/api/v1 route has a matching OpenAPI paths entry",
           "[openapi][completeness]") {
-    yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
+    yuzu::server::test::TestRouteSink sink;
 
     RestApiV1::AuthFn auth_fn = [](const httplib::Request&,
                                    httplib::Response&) -> std::optional<auth::Session> {
