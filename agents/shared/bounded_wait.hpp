@@ -178,9 +178,26 @@ auto bounded_call_ex(std::chrono::milliseconds timeout, Fn fn) -> BoundedCallRes
         bool done = false;
         Result value{};
     };
-    auto state = std::make_shared<State>();
+    // Setting the call UP can itself throw: make_shared under memory pressure,
+    // and std::thread's constructor with std::system_error when pthread_create
+    // fails at the process thread limit. Neither is inside the worker's own
+    // try/catch below, so before this guard they propagated out of the caller --
+    // and this primitive is reached from plugin entry points whose SDK
+    // trampoline is `extern "C"` with no catch of its own, so the exception
+    // would cross a C ABI and terminate the agent. Resource exhaustion must
+    // degrade to the SAME typed rejection the outstanding-call ceiling already
+    // produces, not take the process down. (The counter itself was already
+    // safe: OutstandingCallGuard's RAII releases the slot on these paths --
+    // that was a separate, earlier fix, and it is not this one.)
+    std::shared_ptr<State> state;
+    try {
+        state = std::make_shared<State>();
+    } catch (...) {
+        return {std::nullopt, BoundedCallStatus::Rejected};
+    }
 
-    std::thread([fn = std::move(fn), state, guard = std::move(*guard)]() mutable {
+    try {
+        std::thread([fn = std::move(fn), state, guard = std::move(*guard)]() mutable {
         try {
             Result v = fn();
             std::lock_guard<std::mutex> lock(state->mtx);
@@ -190,11 +207,18 @@ auto bounded_call_ex(std::chrono::milliseconds timeout, Fn fn) -> BoundedCallRes
             // fn() throwing must not std::terminate() a detached thread.
             // Leave `done` false — a still-waiting caller simply times out.
         }
-        state->cv.notify_all();
-        // `guard` (captured by move) is destroyed with this lambda at the
-        // end of this scope, releasing the outstanding-call slot -- whether
-        // fn() returned normally or threw above.
-    }).detach();
+            state->cv.notify_all();
+            // `guard` (captured by move) is destroyed with this lambda at the
+            // end of this scope, releasing the outstanding-call slot -- whether
+            // fn() returned normally or threw above.
+        }).detach();
+    } catch (...) {
+        // Thread creation failed. `guard` was moved INTO the lambda, so on this
+        // path the thread object never took ownership and the moved-from guard
+        // in this scope releases the slot as it unwinds -- no leak, and fn()
+        // was never invoked, which is exactly the Rejected contract.
+        return {std::nullopt, BoundedCallStatus::Rejected};
+    }
 
     std::unique_lock<std::mutex> lock(state->mtx);
     if (state->cv.wait_for(lock, timeout, [&] { return state->done; }))
