@@ -5,31 +5,16 @@
  * random-sample, degrade-distinguishable reads, and the retention clock guard
  * (#2360) ported to a single-sweeper advisory lease with durable dedup.
  *
- * Most of the dedicated [backfill] TEST_CASE suite (2026-08-25) was removed
- * as part of a fresh-start-by-default policy change (ADR-0009 amendment) —
- * no production fleet has ever run a pre-Postgres build. AuditStore's
- * migrate_from_sqlite() production method itself is UNCHANGED and still
- * present — unlike every other already-migrated store, ADR-0009's amendment
- * explicitly does NOT treat AuditStore as a removal candidate (audit
- * evidence cannot be regenerated the way config/cache state can), so its
- * backfill stays live and boot-invoked indefinitely, not just "for now."
- * It is called by "AuditStore: wiring metrics pre-seeds both closed label
- * sets" (metrics pre-seeding, not backfill correctness) and by one
- * reinstated regression test, "AuditStore #2854: the liveness gauge is
- * seeded from a legacy anchor without a restart" (the liveness-gauge
- * same-instance reseed ordering bug), that governance flagged as still
- * guarding a real bug on a still-live path.
+ * The dedicated [backfill] TEST_CASE suite is gone entirely as of
+ * 2026-09-04 — `AuditStore::migrate_from_sqlite()` itself was the last
+ * `migrate_from_sqlite()` on the ladder to retire (#3623,
+ * `chore/retire-migrate-from-sqlite-auditstore`, ADR-0009's hard-cutover
+ * Update withdrew the permanent exception ADR-0040's own amendment had
+ * carved out for this store). Every store's backfill test suite is gone
+ * with it; store-behaviour tests use a pre-migrated template clone.
  *
- * PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set but
- * broken. Store-behaviour tests use a pre-migrated template clone; that
- * includes "wiring metrics pre-seeds both closed label sets", since its
- * migrate_from_sqlite() calls exercise the marker/metrics contract, not the
- * DDL migration path. "#2854: the liveness gauge is seeded from a legacy
- * anchor without a restart" still calls migrate_from_sqlite() against a
- * genuinely fresh backfill/anchor state, so it keeps plain
- * YUZU_REQUIRE_PG_DB, per that macro's plain-migration-test carve-out — do
- * not convert it without first confirming AuditStore still has no
- * first-boot data-dependent seeding that this test would stop exercising.
+ * PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when it is set
+ * but broken.
  */
 
 #include "audit_store.hpp"
@@ -38,7 +23,6 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
-#include "sqlite_raii.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -47,10 +31,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
-#include <sqlite3.h>
 
 #include <cstdint>
-#include <filesystem>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -170,68 +152,133 @@ std::int64_t row_count(const std::string& dsn) {
     return std::stoll(query_scalar(dsn, "SELECT COUNT(*) FROM audit_store.audit_events"));
 }
 
-// ── Legacy SQLite audit.db builder — reinstated for the #2854 regression test
-// below only (governance flagged its removal: AuditStore's backfill is the
-// one program-wide case that stays live, so this ordering bug's regression
-// coverage should not have been swept with the other 18 stores' tests).
-// Writes the production v3 SQLite schema (all three legacy migrations
-// collapsed) and `count` rows, so migrate_from_sqlite has a realistic source.
-void build_legacy_audit_db(const std::filesystem::path& path, int count,
-                           bool with_principal_class = true, bool with_meta = true) {
-    // TempDir computes a unique path but does NOT create the directory.
-    std::filesystem::create_directories(path.parent_path());
-    SqliteDb db;
-    REQUIRE(sqlite3_open(path.string().c_str(), db.addr()) == SQLITE_OK);
-    const char* schema =
-        "CREATE TABLE audit_events ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, principal TEXT NOT NULL,"
-        " principal_role TEXT NOT NULL, action TEXT NOT NULL, target_type TEXT, target_id TEXT,"
-        " detail TEXT, source_ip TEXT, user_agent TEXT, session_id TEXT, result TEXT NOT NULL,"
-        " ttl_expires_at INTEGER DEFAULT 0);";
-    REQUIRE(sqlite3_exec(db.get(), schema, nullptr, nullptr, nullptr) == SQLITE_OK);
-    if (with_principal_class)
-        REQUIRE(sqlite3_exec(db.get(),
-                             "ALTER TABLE audit_events ADD COLUMN principal_class TEXT NOT NULL "
-                             "DEFAULT '';",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-    if (with_meta)
-        REQUIRE(sqlite3_exec(db.get(),
-                             "CREATE TABLE audit_retention_meta (key TEXT PRIMARY KEY, value "
-                             "INTEGER NOT NULL);",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(db.get(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
-    SqliteStmt stmt;
-    const char* ins =
-        with_principal_class
-            ? "INSERT INTO audit_events (timestamp, principal, principal_role, action, detail, "
-              "result, ttl_expires_at, principal_class) VALUES (?,?,?,?,?,?,?,?)"
-            : "INSERT INTO audit_events (timestamp, principal, principal_role, action, detail, "
-              "result, ttl_expires_at) VALUES (?,?,?,?,?,?,?)";
-    REQUIRE(sqlite3_prepare_v2(db.get(), ins, -1, stmt.addr(), nullptr) == SQLITE_OK);
-    for (int i = 0; i < count; ++i) {
-        sqlite3_reset(stmt.get());
-        sqlite3_bind_int64(stmt.get(), 1, 1000 + i);
-        sqlite3_bind_text(stmt.get(), 2, "admin", -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 3, "admin", -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt.get(), 4, "auth.login", -1, SQLITE_STATIC);
-        const std::string detail = "legacy-" + std::to_string(i);
-        sqlite3_bind_text(stmt.get(), 5, detail.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt.get(), 6, "success", -1, SQLITE_STATIC);
-        sqlite3_bind_int64(stmt.get(), 7, 0);
-        if (with_principal_class)
-            sqlite3_bind_text(stmt.get(), 8, "human", -1, SQLITE_STATIC);
-        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
-    }
-    stmt.reset();
-    if (with_meta)
-        REQUIRE(sqlite3_exec(db.get(),
-                             "INSERT INTO audit_retention_meta (key, value) VALUES "
-                             "('last_pass_now', 1699000000);",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-    REQUIRE(sqlite3_exec(db.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
-}
-
 } // namespace
+
+// ── Migration ────────────────────────────────────────────────────────────────
+
+TEST_CASE("AuditStore migration v2 deletes the backfill marker rows and forbids their "
+          "re-insertion, leaving the clock-guard's durable state untouched (#3623)",
+          "[pg][audit_store][migration]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA audit_store")};
+        REQUIRE(schema.ok());
+
+        // v1 DDL, copied from migrations() in audit_store.cpp — schema-qualified, unlike the
+        // source (a raw PQexec connection has no search_path set the way PgMigrationRunner's
+        // migration transaction does; mirrors the QuarantineStore v1→v2 test precedent).
+        PgResult v1{PQexec(conn.get(),
+                           "CREATE TABLE audit_store.audit_events ("
+                           "  id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"
+                           "  timestamp       BIGINT  NOT NULL,"
+                           "  principal       TEXT    NOT NULL,"
+                           "  principal_role  TEXT    NOT NULL,"
+                           "  action          TEXT    NOT NULL,"
+                           "  target_type     TEXT    NOT NULL DEFAULT '',"
+                           "  target_id       TEXT    NOT NULL DEFAULT '',"
+                           "  detail          TEXT    NOT NULL DEFAULT '',"
+                           "  source_ip       TEXT    NOT NULL DEFAULT '',"
+                           "  user_agent      TEXT    NOT NULL DEFAULT '',"
+                           "  session_id      TEXT    NOT NULL DEFAULT '',"
+                           "  result          TEXT    NOT NULL,"
+                           "  ttl_expires_at  BIGINT  NOT NULL DEFAULT 0,"
+                           "  principal_class TEXT    NOT NULL DEFAULT '');"
+                           "CREATE TABLE audit_store.audit_retention_meta ("
+                           "  key   TEXT PRIMARY KEY,"
+                           "  value TEXT NOT NULL"
+                           ")")};
+        REQUIRE(v1.ok());
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('audit_store', 1, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+
+        // All four keys genuinely present BEFORE v2's DELETE runs — the two retired backfill
+        // markers, and the two the clock guard depends on surviving this migration.
+        PgResult seed{PQexec(
+            conn.get(),
+            "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
+            "('backfill_complete', '1700000000'), "
+            "('backfill_source_fingerprint', '5:15:5000:1000:1004'), "
+            "('last_pass_now', '1700000500'), "
+            "('last_anomaly_facts', '-----')")};
+        REQUIRE(seed.ok());
+    }
+
+    // The real construction path: PgMigrationRunner::run reads version 1 from schema_meta and
+    // applies v2's DELETE against the meta table seeded above.
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AuditStore store{pool};
+    REQUIRE(store.is_open());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult ver{PQexec(conn.get(), "SELECT version FROM public.schema_meta WHERE store = "
+                                    "'audit_store'")};
+    REQUIRE(ver.ok());
+    REQUIRE(PQntuples(ver.get()) == 1);
+    CHECK(std::string(PQgetvalue(ver.get(), 0, 0)) == "2");
+
+    // The two backfill-only markers are GONE.
+    PgResult markers{PQexec(conn.get(),
+                            "SELECT key FROM audit_store.audit_retention_meta WHERE key IN "
+                            "('backfill_complete', 'backfill_source_fingerprint')")};
+    REQUIRE(markers.ok());
+    CHECK(PQntuples(markers.get()) == 0);
+
+    // The clock guard's own durable rows are BYTE-IDENTICAL, not merely present.
+    PgResult surviving{PQexec(
+        conn.get(), "SELECT key, value FROM audit_store.audit_retention_meta ORDER BY key")};
+    REQUIRE(surviving.ok());
+    REQUIRE(PQntuples(surviving.get()) == 2);
+    CHECK(std::string(PQgetvalue(surviving.get(), 0, 0)) == "last_anomaly_facts");
+    CHECK(std::string(PQgetvalue(surviving.get(), 0, 1)) == "-----");
+    CHECK(std::string(PQgetvalue(surviving.get(), 1, 0)) == "last_pass_now");
+    CHECK(std::string(PQgetvalue(surviving.get(), 1, 1)) == "1700000500");
+
+    // Gate 4 unhappy-path UP-1 (round 4): a plain DELETE alone leaves a window where an old
+    // binary can re-stamp `backfill_complete` while `audit_events` is still empty, after which
+    // nothing ever deletes it again. v2 also adds a CHECK constraint forbidding either marker
+    // key outright, so this must survive independent of table content: re-inserting EITHER
+    // key, even into an otherwise-empty table, is rejected at the constraint (23514
+    // check_violation), never silently accepted.
+    PgResult constraint{PQexec(
+        conn.get(),
+        "SELECT 1 FROM pg_constraint WHERE conname = "
+        "'audit_retention_meta_no_retired_backfill_markers' AND connamespace = "
+        "'audit_store'::regnamespace")};
+    REQUIRE(constraint.ok());
+    CHECK(PQntuples(constraint.get()) == 1);
+
+    for (const char* key : {"backfill_complete", "backfill_source_fingerprint"}) {
+        const std::string sql = std::string("INSERT INTO audit_store.audit_retention_meta "
+                                             "(key, value) VALUES ('") +
+                                 key + "', 'x')";
+        PgResult rejected{PQexec(conn.get(), sql.c_str())};
+        CHECK_FALSE(rejected.ok());
+        const char* sqlstate =
+            rejected ? PQresultErrorField(rejected.get(), PG_DIAG_SQLSTATE) : nullptr;
+        REQUIRE(sqlstate != nullptr);
+        CHECK(std::string(sqlstate) == "23514"); // check_violation
+    }
+
+    // The constraint is scoped to these two keys only — an ordinary key/value row is
+    // unaffected, matching the clock guard's own untouched rows above.
+    PgResult ordinary{
+        PQexec(conn.get(), "INSERT INTO audit_store.audit_retention_meta (key, value) "
+                            "VALUES ('some_other_key', 'ok')")};
+    CHECK(ordinary.ok());
+}
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -570,15 +617,10 @@ TEST_CASE("AuditStore #2854: an ordinary restart seeds the liveness gauge from t
     CHECK(store.last_pass_unixtime() == 1700000000);
 }
 
-// Adversarial review (Kimi H1 / Codex C-P2-1), and the reason the A-3 alert is
-// keyed the way it is. `YuzuAuditBackfillFailing` fires on the ABSENCE of a
-// success outcome, so the family has to exist on a healthy server — and the
-// ordinary restart of an already-migrated server reaches NO outcome at all: it
-// returns at the marker check. Without the pre-seed in `set_metrics`, that
-// healthy restart exports nothing and the critical alert pages every time.
-// Both halves are asserted here: the seed exists, and the marker-present restart
-// leaves it at 0 rather than incrementing something untrue.
-TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
+// Per docs/observability-conventions.md: a bounded-label counter is
+// pre-seeded to 0 at boot so an `absent()`-based alert stays meaningful on a
+// healthy server before any degrade has ever fired.
+TEST_CASE("AuditStore: wiring metrics pre-seeds the read-degrade label set",
           "[pg][audit_store][metrics]") {
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -589,53 +631,9 @@ TEST_CASE("AuditStore: wiring metrics pre-seeds both closed label sets",
     store.set_metrics(&metrics);
 
     const std::string seeded = metrics.serialize();
-    for (const char* result : {"completed", "fresh", "failed"})
-        CHECK(seeded.find(std::string("yuzu_server_audit_backfill_total{result=\"") + result +
-                          "\"} 0") != std::string::npos);
     for (const char* reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
         CHECK(seeded.find(std::string("yuzu_server_audit_read_degrade_total{reason=\"") + reason +
                           "\"} 0") != std::string::npos);
-
-    // An already-migrated server restarting: marker present, so migrate_from_sqlite
-    // short-circuits. The success series must still be THERE (else the alert
-    // pages) and must still read 0 (else the counter lies about what happened).
-    REQUIRE(store.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db")); // stamps the marker
-    AuditStore restarted(pool);
-    REQUIRE(restarted.is_open());
-    yuzu::MetricsRegistry restart_metrics;
-    restarted.set_metrics(&restart_metrics);
-    REQUIRE(restarted.migrate_from_sqlite("/nonexistent-yuzu-test/audit.db"));
-    const std::string after = restart_metrics.serialize();
-    CHECK(after.find("yuzu_server_audit_backfill_total{result=\"completed\"} 0") !=
-          std::string::npos);
-    CHECK(after.find("yuzu_server_audit_backfill_total{result=\"fresh\"} 0") != std::string::npos);
-}
-
-TEST_CASE("AuditStore #2854: the liveness gauge is seeded from a legacy anchor without a "
-          "restart",
-          "[pg][audit_store][backfill]") {
-    // The ORDERING bug #2854 fixes: a seed placed only in the constructor reads
-    // before this backfill has a chance to run, so on the FIRST Postgres boot —
-    // the exact upgrade the feature exists for — the gauge would stay at 0
-    // forever. `migrate_from_sqlite`'s success chokepoint (`backfill_ok`) must
-    // re-seed after copying the legacy anchor, on the SAME store instance,
-    // with no restart in between.
-    YUZU_REQUIRE_PG_MIGRATION_DB(db);
-    yuzu::test::TempDir dir{std::string_view{"yuzu_test_audit_seed_"}};
-    auto legacy = dir.path / "audit.db";
-    build_legacy_audit_db(legacy, /*count=*/5); // seeds legacy last_pass_now=1699000000
-
-    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    AuditStore store(pool);
-    REQUIRE(store.is_open());
-    // Pre-backfill: no durable anchor on this (fresh) Postgres database yet —
-    // the constructor's own seed correctly finds nothing.
-    CHECK(store.last_pass_unixtime() == 0);
-
-    REQUIRE(store.migrate_from_sqlite(legacy));
-    // Post-backfill, same instance: the copied legacy anchor is now visible
-    // without a process restart.
-    CHECK(store.last_pass_unixtime() == 1699000000);
 }
 
 // Gate 3 cpp-expert, who measured both halves on PG 18: `result` and
@@ -1067,10 +1065,7 @@ TEST_CASE("AuditStore #2854: a non-integer anchor seeds the anomaly sentinel, ne
           "[pg][audit_store][retention][clock-guard]") {
     // Corrupt/hand-edited durable state is an anomaly, not a clean slate —
     // laundering it into `0` would silently hand it the liveness family's
-    // "never ran" grace instead of surfacing it. Mirrors the same standing
-    // invariant `migrate_from_sqlite`'s legacy-meta copy already enforces for
-    // exactly this reason (a non-INTEGER legacy value is carried across as
-    // text rather than coerced to 0).
+    // "never ran" grace instead of surfacing it.
     YUZU_REQUIRE_PG_DB_TPL(db, auditstore_tpl);
     exec_sql(db.dsn(), "INSERT INTO audit_store.audit_retention_meta (key, value) VALUES "
                        "('last_pass_now', 'not-a-number')");

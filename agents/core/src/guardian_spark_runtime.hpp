@@ -468,12 +468,45 @@ public:
     [[nodiscard]] std::uint64_t backend_op_busy() const noexcept {
         return backend_op_busy_.load(std::memory_order_relaxed);
     }
+    /// #3816: attach_rule's on_abandoned callback fired with a live subscription -
+    /// the caller already timed out, but backend_->arm() went on to succeed. The
+    /// executor's own Counters::abandoned counts every routed-to-callback result
+    /// (success or failure of the inner backend call alike, T-agnostic); THIS
+    /// counter is the runtime's own late-SUCCESS-specific view (#3813's distinction
+    /// kept at the source), incremented only when the callback actually disarms a
+    /// live subscription. Lock-free.
+    [[nodiscard]] std::uint64_t backend_op_late_arms() const noexcept {
+        return backend_op_late_arms_.load(std::memory_order_relaxed);
+    }
     /// Live backend I/O workers for #2233 item 3's bounded arm/disarm executor - a
     /// second source GuardianEngine::active_io_workers() must sum alongside the
     /// state reader's own count for the process orphan-exit contract to stay
     /// accurate (hard_exit.hpp / guardian_io_executor.hpp).
     [[nodiscard]] std::size_t active_backend_op_workers() const {
         return io_executor_.active_worker_count();
+    }
+
+    /// Test seam (#3848): the bounded arm/disarm executor's own per-class counters,
+    /// which this class otherwise never surfaces anywhere.
+    ///
+    /// WHY A TEST NEEDS THEM. backend_op_timeouts() counts ONLY IoFailure::Timeout. An
+    /// arm or disarm the executor refuses outright - AlreadyRunning (the (class, key)
+    /// single-flight ticket is still held) or CapacityExhausted (the per-class quota is
+    /// full) - is counted NOWHERE at this surface, and submit_disarm_off_lock in
+    /// particular drops such a refusal silently. A concurrency test that reconciles
+    /// "every id armed" against "every id disarmed" therefore cannot distinguish a
+    /// genuinely leaked subscription from a disarm the executor simply declined to run:
+    /// both present as a surplus. Reading rejected_key/rejected_capacity and requiring
+    /// them ZERO is what turns that reconciliation from "the lane partition made a
+    /// collision unlikely" into an actual proof.
+    ///
+    /// TEST-ONLY ON PURPOSE, and the production gap is real and SEPARATE: the runtime
+    /// still has no egress for these counters, and a dropped AlreadyRunning /
+    /// CapacityExhausted disarm is still invisible to an operator. Already tracked as
+    /// #3415 (docs/spark-legacy-delta-registry.md) - do NOT read this accessor as
+    /// having closed it.
+    [[nodiscard]] GuardianIoExecutor::Stats io_executor_stats_for_test() const {
+        return io_executor_.stats();
     }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
@@ -645,17 +678,21 @@ private:
     /// the arm's completion abandons + disarms instead of committing a rule nobody
     /// wants any more.
     ///
-    /// `generation` (adversarial review C1/c1 follow-up, security-guardian F2 /
-    /// cpp-safety HIGH): the worker's own self-disarm check (attach_rule) must
-    /// match BOTH rule_id AND this episode's generation, not rule_id alone. A
-    /// same-rule_id RETRY - which this PR's own policy_generation-hold-and-retry
-    /// behavior causes ordinarily, not just as a rare race - re-populates
-    /// arming_keys_[key] with a FRESH InFlightArm for the SAME rule_id while the
-    /// ORIGINAL (still-wedged) worker is still running. Without the generation
-    /// check, that stale worker's self-disarm check would match the RETRY's own
-    /// marker (same rule_id) and wrongly conclude "still wanted", handing a live
-    /// subscription back to a caller that already gave up on it - reopening the
-    /// abandonment-leak window on every retry, not once.
+    /// `generation`: no longer read by any timeout-then-late-success path (#3816
+    /// moved that decision entirely into GuardianIoExecutor, which needs no
+    /// rule_id/generation - it decides purely from whether ITS OWN caller is still
+    /// waiting). Still load-bearing for arming_rollback's own undo (attach_rule):
+    /// on a throw during this call's own argument evaluation, arming_rollback must
+    /// erase arming_keys_[key] ONLY if it still holds the SAME episode that
+    /// rollback's fn was built for - matching BOTH rule_id AND generation, not
+    /// rule_id alone, so a same-rule_id RETRY that has since re-populated
+    /// arming_keys_[key] with a FRESH InFlightArm (this PR's own
+    /// policy_generation-hold-and-retry behavior causes this ordinarily, not just
+    /// as a rare race) is not mistaken for the episode being rolled back. Without
+    /// the generation check, an earlier episode's rollback could erase a DIFFERENT,
+    /// still-live episode's marker for the same key - matters for a caller that
+    /// invokes this class directly across threads without GuardianEngine's own
+    /// mtx_ serialization (tests), same caveat as the busy-check above.
     struct InFlightArm {
         std::string rule_id;
         std::uint64_t generation{0};
@@ -786,6 +823,7 @@ private:
     GuardianIoExecutor io_executor_;
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_busy_{0};       ///< attach_rule rejected: key already arming
+    std::atomic<std::uint64_t> backend_op_late_arms_{0};  ///< #3816: late-succeeding arm disarmed by on_abandoned
 
     mutable std::mutex outbox_mu_;
     GuardianOutbox outbox_;

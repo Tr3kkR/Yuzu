@@ -50,9 +50,11 @@
 /// migration solves.
 
 #include <cstdint>
+#include <cstddef>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -198,11 +200,50 @@ public:
     /// Pure — no DB.
     std::filesystem::path binary_path(const UpdatePackage& pkg) const;
 
+    /// Path to the package's detached CMS signature, if the operator supplied
+    /// one at upload (#416/#3807). A SIDECAR beside the binary rather than a
+    /// column on the row, mirroring how plugin signatures are stored, so the
+    /// signature travels with the artifact and needs no schema migration.
+    ///
+    /// The server does not verify this and is deliberately not trusted to: the
+    /// agent checks it against a trust anchor placed on disk at install time,
+    /// out of band of this server entirely. Absent file means unsigned.
+    std::filesystem::path signature_path(const UpdatePackage& pkg) const;
+
 private:
     pg::PgPool& pool_;
     bool open_{false};
     std::filesystem::path update_dir_;
     yuzu::MetricsRegistry* metrics_{nullptr};
 };
+
+/// Is `name` safe to use as an OTA package filename? (#3863)
+///
+/// Every OTA artifact path is built as `update_dir_ / filename` — the binary, its
+/// `.sig` sidecar, and the `.upload.<n>.tmp` staging file. The filename arrives
+/// from an operator-supplied multipart part, so without this check a name of
+/// `../../../../etc/cron.d/x` escapes the update directory, and an ABSOLUTE name
+/// is worse still: `operator/` discards the left operand entirely when the right
+/// is absolute, so `/etc/cron.d/x` ignores `update_dir_` without needing any
+/// `..` at all. Either way the uploaded bytes land wherever the server account
+/// can write, which is arbitrary file write and, via cron or a unit file, code
+/// execution.
+///
+/// ALLOWLIST, NOT AN ESCAPE-SCAN. This accepts a bare filename and rejects
+/// everything else, rather than trying to strip or normalise a hostile one —
+/// normalising is where this class of bug comes back, because it invites
+/// "just one more" separator or encoding to be handled. Callers reject; nothing
+/// rewrites the operator's name behind their back.
+///
+/// Rejects: empty; `.` and `..`; anything containing `/`, `\\`, or `:`. The
+/// backslash and colon are rejected on every platform, not just Windows — the
+/// server may run on Windows, where both are path-significant (`:` also selects
+/// an NTFS alternate data stream), and a rule that varies by build host is a rule
+/// nobody can reason about.
+[[nodiscard]] inline bool is_safe_package_filename(std::string_view name) {
+    if (name.empty() || name == "." || name == "..")
+        return false;
+    return name.find_first_of("/\\:") == std::string_view::npos;
+}
 
 } // namespace yuzu::server
