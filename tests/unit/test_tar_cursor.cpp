@@ -61,7 +61,7 @@ TestTarDb make_test_db() {
 // second, parallel persistence path.
 class FakePowerCursorSource final : public CursorSource {
 public:
-    std::string name() const override { return "power"; }
+    std::string name() const noexcept override { return "power"; }
 
     void start(TarDatabase& db) override {
         started_ = true;

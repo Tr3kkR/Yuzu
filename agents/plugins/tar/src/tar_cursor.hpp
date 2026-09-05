@@ -38,7 +38,7 @@
 //     from-zero replay of an OS event log/USB history is exactly the kind of
 //     unbounded backfill this seam avoids), and return CursorOutcome::
 //     CursorLost from collect(). The measured case this rule exists for:
-//     runDir/fixtures shows a Kernel-PnP/Configuration channel observed going
+//     the Wave 6 capture fixtures shows a Kernel-PnP/Configuration channel observed going
 //     1432 -> 1352 records mid-capture (the provider recycled/wrapped the
 //     channel) -- a real, not hypothetical, log-wrap.
 //
@@ -48,6 +48,35 @@
 //     after rule 2's re-baseline, or a retry) must never double-insert -- the
 //     database's unique index is the single source of truth for "have I
 //     already stored this event", not any offset math a source might do.
+//
+//     TWO INVARIANTS THIS PLACES ON YOU, because the store VERIFIES the claim
+//     rather than trusting it. A key that is already present is only accepted
+//     as a replay when the stored row's payload MATCHES; a differing payload is
+//     a key collision, and the whole transaction is refused so the cursor
+//     cannot advance past an event that was never stored. Therefore:
+//
+//     (a) EVERY FIELD YOU PERSIST MUST BE DETERMINISTICALLY RE-DERIVABLE from
+//         the same OS record. Format a per-tick value -- a timestamp, a
+//         "now", a counter, a duration -- into `detail`/`evidence` and the
+//         re-offered event no longer matches itself, so it is refused EVERY
+//         tick: the cursor never advances, and the whole batch, including
+//         unrelated good events, is lost. `snapshot_id` is excluded from the
+//         comparison for exactly this reason, and `ts` is excluded for a
+//         `capture_gap` (see (b)); nothing else is.
+//
+//     (b) A `capture_gap`'s RECORD_KEY MUST ENCODE ITS WINDOW. Because `ts` is
+//         excluded for gaps -- a gap's ts is "when we noticed", not identity --
+//         two gaps sharing a key and a `detail` are the SAME gap. Encode the
+//         bounds (`<leg>:restart:<since_ms>`), or ten distinct gaps collapse
+//         into one while the cursor advances past all ten.
+//
+//     A source whose `collect()` cannot persist -- the atomic insert returns
+//     false, from a full disk, SQLITE_BUSY, or the collision refusal above --
+//     MUST throw IncompleteCaptureError rather than returning an outcome. The
+//     driver's only channels are the outcome and `events_emitted`, so a
+//     returned Advanced/Baseline after a failed persist reports a clean tick to
+//     the operator while nothing was written. Rule 1's retain-and-retry path is
+//     the correct response and the throw is what selects it.
 //
 //  4. Cursor state is PER-INPUT, carried inside one opaque, versioned JSON
 //     blob (`{"v":1, ...}` -- the version lets a source evolve its internal
@@ -68,9 +97,13 @@
 //  6. A subscription/callback-fed source must never DESTRUCTIVELY drain its
 //     callback queue before the corresponding DB transaction commits (P-003).
 //     BoundedPendingQueue below is the shared mechanism: push() is safe to
-//     call from an OS callback thread, snapshot() copies out a batch without
-//     removing it, and ack(n) removes exactly the acknowledged prefix -- and
-//     must be called ONLY after the event+cursor transaction
+//     call from an OS callback thread, snapshot_batch() copies out a batch
+//     without removing it, and ack_through(batch.last_seq) removes exactly the
+//     entries that batch contained, BY SEQUENCE. There is deliberately no
+//     positional ack(n): an overflow eviction between the snapshot and the ack
+//     makes "the first n" a different n, which silently discards unacked
+//     events (R-005). ack_through() must be called ONLY after the
+//     event+cursor transaction
 //     (insert_power_events_and_cursor / insert_removable_events_and_cursor)
 //     has actually committed. A batch that fails to persist stays in the
 //     queue and is retried next tick. This mirrors the existing pending_
@@ -213,7 +246,13 @@ public:
     /// Stable source name ("power", "removable", ...). Also the tar_cursor
     /// primary key and the `<name>_enabled` / `<name>_lookback_seconds`
     /// config-key prefix.
-    [[nodiscard]] virtual std::string name() const = 0;
+    /// noexcept because the driver calls it OUTSIDE its exception guards --
+    /// to label a log line, to match a source during config routing, and from
+    /// inside init()'s own catch handler. The SDK execute trampoline is
+    /// `extern "C"` with no catch, so a throwing name() would cross a C ABI and
+    /// terminate the agent from a plain configuration write. Return a stored
+    /// constant; never build the string on demand.
+    [[nodiscard]] virtual std::string name() const noexcept = 0;
 
     /// Arm whatever OS subscription this source needs. Called once at plugin
     /// init for every constructed source, regardless of its current

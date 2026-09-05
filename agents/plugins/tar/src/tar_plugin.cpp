@@ -3359,7 +3359,21 @@ private:
                     (src_name == "tcp") ? source_enabled(*db_, "tcp") : false;
                 // Same capture-before-apply for cursor sources (see the routing
                 // block below): read the prior state while it is still prior.
-                const bool cursor_prev_enabled = source_enabled(*db_, src_name);
+                //
+                // Canonicalised the way apply_source_enabled_transition itself
+                // does it, NOT via source_enabled(). The two disagree on a
+                // corrupt value: source_enabled() fails closed, so "errored"
+                // reads as NOT enabled, while the transition's disable leg fires
+                // on any non-"false" prev -- errored included. Deriving the edge
+                // from the collect-time gate therefore made
+                // `<name>_enabled=false` over a tampered value write paused_at
+                // while routing NO on_enabled_changed(false), so the source
+                // never drained and discarded the paused window and committed it
+                // on the next enable. The forensic-pause contract is exactly
+                // what that breaks, so the edge must be the transition's own.
+                const std::string_view cursor_prev_canon = yuzu::tar::canonical_source_enabled(
+                   db_->get_config(std::string(src_name) + "_enabled",
+                                   yuzu::tar::source_default_enabled(src_name) ? "true" : "false"));
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
@@ -3412,7 +3426,10 @@ private:
                 // silently discarding history it had not yet replayed -- the
                 // consumer cannot defend against this, because it cannot tell an
                 // edge from a re-assert.
-                if (transition_ok && (v == "true") != cursor_prev_enabled) {
+                // An EDGE is exactly what the transition treated as one.
+                const bool cursor_edge = (v == "false" && cursor_prev_canon != "false") ||
+                                         (v == "true" && cursor_prev_canon != "true");
+                if (transition_ok && cursor_edge) {
                     for (auto& cs : cursor_sources_) {
                         if (cs->name() == src_name) {
                             // ABI containment, same reason as the collect loop:

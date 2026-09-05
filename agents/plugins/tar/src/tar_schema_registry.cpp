@@ -987,7 +987,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // seconds (ADR-0020).
         //
         // os_support: mechanisms are the 2026-09-04 measured bindings
-        // (probe-findings.md); collectors land wave 2.
+        // (hardware-probe measurement, Wave 6); collectors land wave 2.
         {
             .name = "power",
             .dollar_name = "Power",
@@ -1005,7 +1005,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kPlanned, "pmset_log",
                  "`pmset -g log` retrospective replay (measured working "
                  "unprivileged on this Mac 2026-09-04, 9,629 lines: "
-                 "probe-findings.md), cursor-model — collector lands wave 2."},
+                 "hardware-probe measurement, Wave 6), cursor-model — collector lands wave 2."},
             },
             .granularities = {
                 {
@@ -1038,7 +1038,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // governs historical backfill the same way.
         //
         // os_support: mechanisms are the 2026-09-04 measured bindings
-        // (probe-findings.md); collectors land wave 2.
+        // (hardware-probe measurement, Wave 6); collectors land wave 2.
         {
             .name = "removable",
             .dollar_name = "Removable",
@@ -1050,14 +1050,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "Kernel-PnP/Configuration, Storsvc/Diagnostic), channels "
                  "measured LIVE on the-rig 2026-09-04; the roadmap's "
                  "DriverFrameworks-UserMode channel is disabled by default "
-                 "and is NOT the binding (probe-findings.md). Collector "
+                 "and is NOT the binding (hardware-probe measurement, Wave 6). Collector "
                  "lands wave 2."},
                 {"linux",   OsSupportStatus::kPlanned, "udev_netlink",
                  "udev netlink monitor (block subsystem, removable), "
                  "cursor-model — collector lands wave 2."},
                 {"macos",   OsSupportStatus::kPlanned, "diskarbitration",
                  "DiskArbitration DADiskAppeared/Disappeared callbacks "
-                 "(headers confirmed in the CLT SDK, probe-findings.md), "
+                 "(headers confirmed in the CLT SDK, hardware-probe measurement, Wave 6), "
                  "cursor-model — collector lands wave 2."},
             },
             .granularities = {
