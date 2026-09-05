@@ -937,6 +937,21 @@ public:
         for (auto& src : cursor_sources_) {
             try {
                 src->start(*db_);
+                // A source is constructed CAPTURING. start() arms the OS
+                // subscription regardless of the configured enable state --
+                // deliberately, so a later enable does not have to pay a cold
+                // arm -- so a source whose persisted state is DISABLED must be
+                // told so immediately, before the first callback can arrive.
+                // Without this, an agent restarted while the source is disabled
+                // buffers the forbidden window (macOS queues callbacks, Linux's
+                // netlink socket fills) and commits it on the first later
+                // enable: on_enabled_changed(true) is a no-op because the fresh
+                // process never saw a disable. tar_cursor.hpp's lifecycle rule
+                // is absolute -- NOTHING from a paused window is ever stored --
+                // and the disabled-collect path only skips the tick, it does
+                // not discard what the OS already handed the source.
+                if (!source_enabled(*db_, src->name()))
+                    src->on_enabled_changed(false);
             } catch (const std::exception& e) {
                 spdlog::error("TAR: cursor source '{}' failed to start: {} -- continuing "
                               "without it",

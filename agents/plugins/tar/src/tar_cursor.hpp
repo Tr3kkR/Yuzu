@@ -219,6 +219,14 @@ public:
     /// init for every constructed source, regardless of its current
     /// `<name>_enabled` state (see on_enabled_changed doc above for why).
     /// A no-op for a pure-replay source.
+    ///
+    /// Because start() arms unconditionally, the driver calls
+    /// `on_enabled_changed(false)` IMMEDIATELY afterwards when the persisted
+    /// state is disabled. A source must therefore not assume it is capturing
+    /// just because start() returned: an agent restarted while the source is
+    /// disabled would otherwise buffer the forbidden window and commit it on
+    /// the first later enable, since a fresh process never observed a disable
+    /// edge. Nothing from a paused window is ever stored -- restart included.
     virtual void start(TarDatabase& db) = 0;
 
     /// One collect tick. `cursor_json` is the last-persisted cursor
