@@ -190,6 +190,18 @@ std::vector<std::string> full_fixture_lines() {
 // leg's item type or a plain int; the defect and fix are generic over
 // Event).
 
+// get_cursor() is tri-state since the seam's C2 fix: the outer expected says
+// whether the READ succeeded, the inner optional whether a cursor exists.
+// These tests are all about a successful read, so this asserts that much and
+// unwraps -- silently treating a read error as "no cursor" would re-introduce
+// the exact confusion C2 removed.
+static std::optional<std::string> read_cursor(yuzu::tar::TarDatabase& db,
+                                              const std::string& source) {
+    auto r = db.get_cursor(source);
+    REQUIRE(r.has_value());
+    return *r;
+}
+
 TEST_CASE("BoundedPendingQueue: R-005 regression -- ack_through cannot erase "
           "an entry pushed after the snapshot it acks, even across overflow",
           "[tar_power][queue][r-005]") {
@@ -1001,7 +1013,7 @@ TEST_CASE("mac_power_collect_impl: invokes the exact pmset argv/options and pers
     CHECK(captured_opts.deadline == std::chrono::seconds{20});
 
     CHECK(result.outcome == CursorOutcome::Baseline);
-    auto persisted = t.db.get_cursor("power");
+    auto persisted = read_cursor(t.db, "power");
     REQUIRE(persisted.has_value());
     CHECK(*persisted == result.new_cursor_json);
 }
@@ -1017,7 +1029,7 @@ TEST_CASE("mac_power_collect_impl: a spawn failure throws IncompleteCaptureError
     };
     REQUIRE_THROWS_AS(mac_power_collect_impl(t.db, std::nullopt, fake_run),
                       yuzu::tar::IncompleteCaptureError);
-    CHECK_FALSE(t.db.get_cursor("power").has_value());
+    CHECK_FALSE(read_cursor(t.db, "power").has_value());
 }
 
 TEST_CASE("mac_power_collect_impl: a deadline timeout throws IncompleteCaptureError",
@@ -1076,7 +1088,7 @@ TEST_CASE("mac_power_collect_impl: full-fixture (REAL, ~42-line noisy document) 
     };
 
     auto first = mac_power_collect_impl(t.db, std::nullopt, fake_run);
-    auto cursor_after_first = t.db.get_cursor("power");
+    auto cursor_after_first = read_cursor(t.db, "power");
     REQUIRE(cursor_after_first.has_value());
     auto second = mac_power_collect_impl(t.db, cursor_after_first, fake_run);
 
@@ -1110,7 +1122,7 @@ TEST_CASE("MacPowerCursorSource: on_enabled_changed(true) forces exactly one cap
     };
     auto baseline = mac_power_collect_impl(t.db, std::nullopt, fake_run);
     CHECK(baseline.outcome == CursorOutcome::Baseline);
-    auto cursor_after_baseline = t.db.get_cursor("power");
+    auto cursor_after_baseline = read_cursor(t.db, "power");
     REQUIRE(cursor_after_baseline.has_value());
 
     // Simulate the "disabled window": had this source been re-enabled with
