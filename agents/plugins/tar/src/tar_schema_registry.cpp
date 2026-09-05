@@ -975,9 +975,14 @@ const std::vector<CaptureSourceDef>& build_sources() {
         //
         // ALEX RULING 2026-09-04 (overrides peer finding P-005 and the
         // Architect's prior adoption of it): power AND removable ship
-        // default_enabled = TRUE — the FIRST default-on capture sources in
-        // the product; every other row in this table (all 8 above, netconn
-        // and mapdrive included) is opt-in. That divergence from the
+        // default_enabled = TRUE. NOT the first default-on sources in the
+        // product -- process/tcp/service/user/perf have always been on, as
+        // machine-scope operational telemetry, and this file's own test
+        // (test_tar_schema_registry.cpp) asserts it. These are the first
+        // WORKS-COUNCIL-CLASS sources to ship enabled: of the eight added
+        // since 1.5 under the opt-in posture (procperf, netqual, module,
+        // software, arp, dns, netconn, mapdrive) every one defaults OFF, and
+        // power/removable are the first of THAT class to diverge. That divergence from the
         // standing works-council opt-in posture is DELIBERATE and must be
         // documented plainly in the user-manual pages and changelog, not
         // quietly. The retrospective-reach control is retained:

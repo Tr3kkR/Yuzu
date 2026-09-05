@@ -332,7 +332,10 @@ header):
    machine-scope asset inventory), letting an operator opt in per host.
 
    **Amended (Wave 6, operator ruling 2026-09-04).** `power` and `removable`
-   ship `default_enabled = true` — the first sources to do so — and, as the
+   ship `default_enabled = true` — the first *works-council-class* sources to do
+   so (the five machine-scope sources `process`/`tcp`/`service`/`user`/`perf`
+   have always been on; of the eight added since 1.5 under the opt-in
+   posture, every one defaults off) — and, as the
    roadmap brings each existing source in for change, that source moves to
    default-on too. The works-council reasoning above is NOT withdrawn: it now
    attaches to the `<name>_lookback_seconds` control (`0` = forward-only)

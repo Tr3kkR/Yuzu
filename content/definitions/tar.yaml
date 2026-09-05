@@ -571,13 +571,20 @@ spec:
         displayName: Power Transition Capture Enabled (collector not yet shipped)
         description: >
           Enable or disable the sleep/wake/AC-power transition source (power →
-          $Power_Live, cursor-model seam). **ON by default ("true")** — unlike
-          EVERY other capture source in this table (all of which, netconn and
-          mapdrive included, default OFF), power's configuration defaults to
-          enabled.
-          This is a deliberate divergence from the standing works-council
-          opt-in posture: host sleep/wake and AC-power events are treated as
-          low-sensitivity device-lifecycle telemetry, not usage-class data.
+          $Power_Live, cursor-model seam). **ON by default ("true")** — the
+          first works-council-class source to ship enabled. Note this is NOT
+          the product's first default-on source: process, tcp, service, user
+          and perf have always been on as machine-scope operational telemetry.
+          Of the eight sources added since 1.5 under the works-council opt-in
+          posture (procperf, netqual, module, software, arp, dns, netconn,
+          mapdrive) every one defaults OFF, and power is the first of THAT
+          class to diverge.
+          The divergence is deliberate, but it does NOT mean the data is
+          low-sensitivity: the SOC 2 data inventory classifies $Power_Live as
+          usage-class / behavioral-adjacent, because the TIMING of sleep/wake
+          and AC events is a presence and working-hours proxy. Treat it as
+          co-determination-relevant and use power_lookback_seconds=0 where a
+          retrospective read is not lawful.
           **No collector is registered in this release.** The schema, this key
           and its default ship now; the collector that fills $Power_Live lands
           in a following change, so the tables stay queryable and EMPTY until
