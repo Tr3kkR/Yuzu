@@ -139,6 +139,8 @@ struct CommandHarness {
     bool discard_send_time_called = false;
     std::string discarded_command_id;
     bool record_send_time_called = false;
+    // Governance round 1 closure evidence (SAFE-1/UP-2).
+    bool record_send_time_throws = false;
 
     Deps deps;
     yuzu::server::test::TestRouteSink sink;
@@ -249,7 +251,11 @@ struct CommandHarness {
             discarded_command_id = command_id;
             return true;
         };
-        deps.record_send_time_fn = [this](const std::string&) { record_send_time_called = true; };
+        deps.record_send_time_fn = [this](const std::string&) {
+            record_send_time_called = true;
+            if (record_send_time_throws)
+                throw std::runtime_error("record_send_time threw");
+        };
         deps.thead_for_plugin_fn = [this](const std::string& plugin) -> std::string {
             if (thead_throws)
                 throw std::runtime_error("thead_for_plugin threw");
@@ -369,6 +375,37 @@ TEST_CASE("/api/command: send-time is discarded when the confined-dispatch sink 
     CHECK(h.record_send_time_called);
     CHECK(h.discard_send_time_called);
     CHECK(h.discarded_command_id.find("noop-") == 0);
+}
+
+// ──────── Governance round 1 closure evidence (SAFE-1/UP-2) ────────────────
+
+TEST_CASE("/api/command: send-time is discarded even when record_send_time_fn itself throws",
+          "[command_routes]") {
+    // Pre-fix, the SendTimeGuard was constructed AFTER the
+    // record_send_time_fn call — a throw INSIDE that call (e.g.
+    // AgentServiceImpl::record_send_time's own internal
+    // publish_send_times_gauge_locked step) ran with no guard yet
+    // constructed, so `discard_send_time_called` would stay false here:
+    // this case is exactly the window the reorder closes. Post-fix, the
+    // guard is a fully-constructed local object by the time
+    // record_send_time_fn is called, so it still runs its destructor
+    // (RAII) during unwinding. Matches the existing sink_throws test's
+    // shape immediately above: the throw is not caught anywhere in the
+    // production handler (nothing wraps this specific call in a
+    // guarded()-style catch, deliberately — this is a leak-prevention
+    // fix, not a response-shaping one), so it is caught here the way an
+    // httplib worker's own exception boundary would catch it.
+    CommandHarness h;
+    h.record_send_time_throws = true;
+    bool threw = false;
+    try {
+        (void)h.sink.Post("/api/command",
+                          R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(h.discard_send_time_called);
 }
 
 // ───────────────── Fix #3: throwing audit sink on a denial path ────────────
@@ -565,4 +602,11 @@ TEST_CASE("/api/command: audit_quarantine_dispatch_fail_closed throwing still re
                            R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
     REQUIRE(res);
     CHECK(res->status == 503);
+    // Governance round 1 closure evidence (UP-1b): the throw above used to
+    // degrade to a log line ONLY — assert the metric value itself, not a
+    // log/stdout grep.
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "command"}, {"phase", "audit_quarantine_dispatch_fail_closed"}})
+              .value() == 1);
 }

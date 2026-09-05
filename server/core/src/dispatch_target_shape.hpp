@@ -41,9 +41,10 @@
 ///   - `dispatch_confined_arms` (dispatch_confined_arms.hpp) decides WHO IS
 ///     REACHED for every caller — the per-arm visible-set intersection (#1788).
 ///     `ServerImpl::dispatch_confined` (the shared closure serving Dashboard,
-///     MCP, workflow and instruction execute) and the `/api/command` inline
-///     path BOTH route through it; the two byte-identical four-arm copies that
-///     previously existed are gone.
+///     MCP, workflow and instruction execute) and `command_routes.cpp`'s
+///     `/api/command` handler (moved out of server.cpp by #2557) BOTH route
+///     through it; the two byte-identical four-arm copies that previously
+///     existed are gone.
 ///   - What each caller still owns is its own TARGET RESOLUTION (group store,
 ///     scope engine, principal from a live session vs an execution row) and
 ///     its own audit/HTTP shaping. Those legitimately differ, which is why one

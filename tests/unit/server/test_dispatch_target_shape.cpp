@@ -218,11 +218,11 @@ TEST_CASE("#2500 — the route-level reason set matches what the routes actually
     // iterated. This binds the two: a reason emitted by a route without a home
     // here, or a reason added here that no route emits, fails.
     //
-    // Keep in step with the emit sites: `body_type` (server.cpp /api/command,
-    // workflow_routes.cpp execute), `parent_id_type`/`parent_id_empty`
+    // Keep in step with the emit sites: `body_type` (command_routes.cpp
+    // /api/command, workflow_routes.cpp execute), `parent_id_type`/`parent_id_empty`
     // (rest_api_v1.cpp run_async + from-inventory-query), `closure_no_target`
     // (server.cpp shared command_dispatch_fn), `destructive_untargeted`
-    // (#3685: server.cpp /api/command Destructive RefuseUntargeted arm AND
+    // (#3685: command_routes.cpp /api/command Destructive RefuseUntargeted arm AND
     // mcp_server.cpp execute_instruction's C8 pre-mint + main-handler sites —
     // the one reason in this array with more than one owning surface),
     // `destructive_no_visible_target` (#2557: command_routes.cpp's Destructive

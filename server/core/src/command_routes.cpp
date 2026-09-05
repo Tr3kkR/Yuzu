@@ -44,7 +44,7 @@ namespace {
 /// mechanism, not in the actual accepted set or the length limit — both
 /// verified against the pre-extraction original before this file was
 /// written: `kIdentMax == 128`, `_`/`.`/`-` legal.
-bool bad_ident(std::string_view v) {
+[[nodiscard]] bool bad_ident(std::string_view v) {
     constexpr std::size_t kIdentMax = 128;
     if (v.size() > kIdentMax)
         return true;
@@ -54,6 +54,25 @@ bool bad_ident(std::string_view v) {
     });
 }
 
+/// Governance round 1 (UP-1b): the counterpart to the local `audit_fn`
+/// wrapper's own throw-counting (below) — a throwing `guarded()` site
+/// deserves the SAME `yuzu_server_dispatch_fanout_throw_total{route,phase}`
+/// observability, not just a log line. `phase` is the call site's own
+/// `what` label, reused directly rather than mapped through a second
+/// taxonomy. Wrapped in its own try/catch, empty on purpose (matches the
+/// `audit_fn` wrapper's pattern at :131-152 below) so a metrics-registry
+/// failure can never itself escape `guarded()`'s catch block.
+void record_fanout_throw(yuzu::MetricsRegistry* metrics, const char* phase) {
+    if (!metrics)
+        return;
+    try {
+        metrics->counter("yuzu_server_dispatch_fanout_throw_total",
+                         {{"route", "command"}, {"phase", phase}})
+            .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch)
+    }
+}
+
 /// #2557 fix #3/#6: a post-dispatch side effect (an audit helper that isn't
 /// `AuditFn`-shaped, an event emission, a gateway forward) that throws must
 /// not take the whole `/api/command` response down with it — the dispatch
@@ -61,14 +80,19 @@ bool bad_ident(std::string_view v) {
 /// run, so an exception here must degrade the response, never turn a real
 /// success into an uncaught-exception 500. Logged at ERROR (not silently
 /// swallowed) so the failure is still observable in the server log even
-/// though the caller gets a clean 200.
-void guarded(const std::string& command_id, const char* what, const std::function<void()>& fn) {
+/// though the caller gets a clean 200, and counted via `record_fanout_throw`
+/// above (governance round 1, UP-1b) so it is also observable without
+/// grepping the log.
+void guarded(const std::string& command_id, const char* what, yuzu::MetricsRegistry* metrics,
+            const std::function<void()>& fn) {
     try {
         fn();
     } catch (const std::exception& e) {
         spdlog::error("post-dispatch {} threw for command {}: {}", what, command_id, e.what());
+        record_fanout_throw(metrics, what);
     } catch (...) {
         spdlog::error("post-dispatch {} threw for command {}", what, command_id);
+        record_fanout_throw(metrics, what);
     }
 }
 
@@ -128,7 +152,14 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // "the sink threw" apart from "the sink cleanly declined" in
         // `yuzu_server_dispatch_fanout_throw_total`, which a plain `false`
         // return never distinguished before.
-        const Deps::AuditFn audit_fn = [raw = deps.audit_fn, metrics = deps.metrics](
+        // CPPX-3 (governance round 1): `raw` is a REFERENCE to `deps.audit_fn`,
+        // not a copy — `deps` is a member of the OUTER persistent route
+        // lambda (captured once at `sink.Post(...)` registration, alive for
+        // the server's lifetime), and this inner wrapper never outlives a
+        // single request's handler invocation, which is always shorter. A
+        // by-value capture here copied the whole wrapped `std::function`
+        // object on every request for no reason.
+        const Deps::AuditFn audit_fn = [&raw = deps.audit_fn, metrics = deps.metrics](
                                            const httplib::Request& r, const std::string& action_,
                                            const std::string& result,
                                            const std::string& target_type,
@@ -189,10 +220,28 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             // here: an invisible one cannot reach the alert this change
             // ships, and this is the shape three reviewers had to find by
             // reading rather than by watching a dashboard.
-            deps.metrics
-                ->counter("yuzu_server_dispatch_target_rejected_total",
-                         {{"route", "command"}, {"reason", std::string(kReasonBodyType)}})
-                .increment();
+            //
+            // Governance round 1 (UP-4a): this increment previously had NO
+            // try/catch at all — a throw here (metrics-registry exhaustion,
+            // an allocation failure inside Counter/MetricFamily) propagated
+            // uncaught, skipping the `emit_behavioral_audit` call immediately
+            // below entirely. `command_id` is not generated until AFTER
+            // classification succeeds, well past this point, so the request
+            // is identified by `plugin`/`action` instead.
+            try {
+                deps.metrics
+                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", std::string(kReasonBodyType)}})
+                    .increment();
+            } catch (const std::exception& e) {
+                spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                             "(reason={}): {}",
+                             plugin, action, kReasonBodyType, e.what());
+            } catch (...) {
+                spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                             "(reason={})",
+                             plugin, action, kReasonBodyType);
+            }
             // #2557 fix #3/#6: emit_behavioral_audit (rest_audit.hpp) rather
             // than a raw AuditFn call + manual Sec-Audit-Failed header — the
             // helper sets that header itself on a persist failure, and the
@@ -218,10 +267,25 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         if (auto bv = yuzu::server::check_targeting_shape(body)) {
-            deps.metrics
-                ->counter("yuzu_server_dispatch_target_rejected_total",
-                         {{"route", "command"}, {"reason", bv->reason}})
-                .increment();
+            // Governance round 1 (UP-4a): same fix as the body-type counter
+            // above — no try/catch meant a throw here skipped the audit call
+            // below entirely. `command_id` does not exist yet at this point
+            // either, so the log line identifies the request by
+            // `plugin`/`action` instead.
+            try {
+                deps.metrics
+                    ->counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "command"}, {"reason", bv->reason}})
+                    .increment();
+            } catch (const std::exception& e) {
+                spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                             "(reason={}): {}",
+                             plugin, action, bv->reason, e.what());
+            } catch (...) {
+                spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                             "(reason={})",
+                             plugin, action, bv->reason);
+            }
             // The detail carries WHAT was being attempted, not just why it
             // was refused. The success row records `plugin:action -> N
             // agent(s)`; a denial that records only `reason=` lets an
@@ -340,7 +404,18 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                                       {"reason",
                                        std::string(yuzu::server::kReasonDestructiveUntargeted)}})
                             .increment();
-                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                    } catch (const std::exception& e) {
+                        // Governance round 1 (UP-4b): every empty catch in
+                        // this file except this pre-existing one and its
+                        // DestructiveNoVisibleTarget sibling below already
+                        // logs — this one silently swallowed.
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason=destructive_untargeted): {}",
+                                     plugin, action, e.what());
+                    } catch (...) {
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason=destructive_untargeted)",
+                                     plugin, action);
                     }
                     // #3685 fix round (adversarial review F2): audited like
                     // the check_targeting_shape refusal above in this same
@@ -397,7 +472,16 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                                   std::string(
                                       yuzu::server::kReasonDestructiveNoVisibleTarget)}})
                             .increment();
-                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                    } catch (const std::exception& e) {
+                        // Governance round 1 (UP-4c): same fix as the
+                        // RefuseUntargeted sibling above.
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason=destructive_no_visible_target): {}",
+                                     plugin, action, e.what());
+                    } catch (...) {
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason=destructive_no_visible_target)",
+                                     plugin, action);
                     }
                     const bool audit_ok = yuzu::server::detail::emit_behavioral_audit(
                         audit_fn, req, res, "command.dispatch", "denied", "command", "",
@@ -523,22 +607,34 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        deps.record_send_time_fn(command_id);
-
-        // #2557 fix #2/#4 (send-time leak): `record_send_time_fn` above just
-        // inserted an entry keyed on `command_id` into
+        // #2557 fix #2/#4 (send-time leak): `record_send_time_fn` below
+        // inserts an entry keyed on `command_id` into
         // `AgentServiceImpl::cmd_send_times_`, which is normally erased when
         // a LATER agent response for this exact command_id arrives. A
         // dispatch that reaches zero agents (sent == 0) or that throws
         // before any response can ever arrive leaves that entry behind
         // forever — nothing else ever revisits it. `sent` is declared and
-        // the guard constructed HERE, immediately after the one
-        // unconditional `record_send_time_fn` call and BEFORE anything below
-        // that could throw (the containment-gate store read, the registry
-        // plugin-presence query, the confined-dispatch sink itself), so
-        // every exit from this point on — including a mid-fan-out exception
-        // and the ordinary sent==0 -> 503 path far below — is covered by the
-        // SAME mechanism.
+        // the guard constructed HERE, immediately BEFORE the one
+        // unconditional `record_send_time_fn` call.
+        //
+        // Governance round 1 (SAFE-1/UP-2): an earlier revision constructed
+        // the guard AFTER this call, reasoning it only needed to cover what
+        // came below. That left a window where a throw INSIDE
+        // `record_send_time_fn` itself — including its own internal
+        // `AgentServiceImpl::publish_send_times_gauge_locked` step — would
+        // already have inserted the `cmd_send_times_` entry with no guard
+        // yet in scope to clean it up: an uncaught 500 for an
+        // already-classified/authorized command, AND a permanently leaked
+        // entry. Constructing the guard FIRST means every exit from this
+        // point on — a throw inside `record_send_time_fn` itself, the
+        // containment-gate store read, the registry plugin-presence query,
+        // the confined-dispatch sink, and the ordinary sent==0 -> 503 path
+        // far below — is covered by the SAME mechanism.
+        // `AgentServiceImpl::discard_send_time`'s own find()-on-a-
+        // not-yet-inserted-key path is a safe no-op (returns `false`, and
+        // throws only on a mutex-lock failure, which the guard's own
+        // `catch` below already absorbs), so constructing the guard before
+        // the entry exists is not itself a hazard.
         int sent = 0;
         struct SendTimeGuard {
             const Deps::DiscardSendTimeFn& discard;
@@ -549,10 +645,19 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                     return;
                 try {
                     (void)discard(command_id);
-                } catch (...) { // NOLINT(bugprone-empty-catch)
+                } catch (const std::exception& e) {
+                    // SAFE-4 (governance round 1): every other guarded()
+                    // catch site in this file logs at ERROR — this one used
+                    // to swallow silently, the one asymmetry in the file.
+                    spdlog::error("discard_send_time threw for command {}: {}", command_id,
+                                 e.what());
+                } catch (...) {
+                    spdlog::error("discard_send_time threw for command {}", command_id);
                 }
             }
         } send_time_guard{deps.discard_send_time_fn, command_id, sent};
+
+        deps.record_send_time_fn(command_id);
 
         // #881: the ONE store read for this whole request (never per
         // arm, never per agent) — computed once here, AFTER every early
@@ -723,12 +828,28 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 // reachable, and a wrong reason on a fleet-safety refusal is
                 // worse than no reason.
                 const auto sink_reason = body.contains("agent_ids")
-                                             ? kTargetingShapeReasons[1]  // agent_ids_empty
-                                             : kTargetingShapeReasons[4]; // scope_empty
-                deps.metrics
-                    ->counter("yuzu_server_dispatch_target_rejected_total",
-                             {{"route", "command"}, {"reason", std::string(sink_reason)}})
-                    .increment();
+                                             ? yuzu::server::kReasonAgentIdsEmpty
+                                             : yuzu::server::kReasonScopeEmpty;
+                // Governance round 1 (UP-4a): same fix as the two counters
+                // above — no try/catch meant a throw here skipped the audit
+                // call below entirely. `command_id` IS in scope by this
+                // point (generated above, before the arm dispatch), so it is
+                // included here even though the audit row below deliberately
+                // omits it (see that call's own comment).
+                try {
+                    deps.metrics
+                        ->counter("yuzu_server_dispatch_target_rejected_total",
+                                 {{"route", "command"}, {"reason", std::string(sink_reason)}})
+                        .increment();
+                } catch (const std::exception& e) {
+                    spdlog::error("dispatch_target_rejected_total counter threw for command {} "
+                                 "({}:{}, reason={}): {}",
+                                 command_id, plugin, action, sink_reason, e.what());
+                } catch (...) {
+                    spdlog::error("dispatch_target_rejected_total counter threw for command {} "
+                                 "({}:{}, reason={})",
+                                 command_id, plugin, action, sink_reason);
+                }
                 // Empty target_id, matching the source-side denial above: the
                 // same verb must not carry two different target shapes, and a
                 // command_id for a command that was never dispatched reads in
@@ -775,26 +896,26 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // skip the others, and none of them may turn an already-successful
         // dispatch into an uncaught-exception 500.
         if (containment_gate.fail_closed) {
-            guarded(command_id, "audit_quarantine_dispatch_fail_closed", [&] {
+            guarded(command_id, "audit_quarantine_dispatch_fail_closed", deps.metrics, [&] {
                 deps.audit_quarantine_dispatch_fail_closed_fn(
                     "command", caller.principal, caller.principal_role, command_id,
                     denied_quarantined_count);
             });
         } else {
-            guarded(command_id, "audit_quarantine_dispatch_denied_batch", [&] {
+            guarded(command_id, "audit_quarantine_dispatch_denied_batch", deps.metrics, [&] {
                 deps.audit_quarantine_dispatch_denied_batch_fn(
                     "command", caller.principal, caller.principal_role, command_id,
                     std::move(denied_quarantined));
             });
         }
-        guarded(command_id, "audit_unknown_plugin_dispatch", [&] {
+        guarded(command_id, "audit_unknown_plugin_dispatch", deps.metrics, [&] {
             deps.audit_unknown_plugin_dispatch_fn("command", caller.principal,
                                                   caller.principal_role, command_id, plugin,
                                                   unknown_plugin_count);
         });
 
         // Forward commands queued for gateway agents
-        guarded(command_id, "forward_gateway_pending",
+        guarded(command_id, "forward_gateway_pending", deps.metrics,
                [&] { deps.forward_gateway_pending_fn(); });
 
         if (sent == 0) {
@@ -832,7 +953,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         deps.metrics->counter("yuzu_commands_dispatched_total").increment();
-        guarded(command_id, "publish(command-status)", [&] {
+        guarded(command_id, "publish(command-status)", deps.metrics, [&] {
             deps.publish_fn("command-status",
                             "<span id=\"status-badge\" class=\"badge-running\""
                             " hx-swap-oob=\"outerHTML\">RUNNING</span>");
@@ -846,7 +967,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         const bool audit_ok = yuzu::server::detail::emit_behavioral_audit(
             audit_fn, req, res, "command.dispatch", "success", "command", command_id,
             plugin + ":" + action + " → " + std::to_string(sent) + " agent(s)");
-        guarded(command_id, "emit_event(command.dispatched)", [&] {
+        guarded(command_id, "emit_event(command.dispatched)", deps.metrics, [&] {
             deps.emit_event_fn("command.dispatched", req, {{"target_count", sent}},
                                {{"plugin", plugin},
                                 {"action", action},
@@ -871,7 +992,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // empty string (cosmetic rendering only) rather than aborting an
         // otherwise-successful response.
         std::string thead_html;
-        guarded(command_id, "thead_for_plugin",
+        guarded(command_id, "thead_for_plugin", deps.metrics,
                [&] { thead_html = deps.thead_for_plugin_fn(plugin); });
         // #881: a PARTIAL dispatch must say so. Without this an operator
         // targeting a 100-device group with 3 contained devices reads

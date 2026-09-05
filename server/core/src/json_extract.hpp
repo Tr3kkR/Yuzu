@@ -1,9 +1,12 @@
 #pragma once
 
 /// @file json_extract.hpp
-/// Shared JSON body-extraction helpers, consolidated out of three previously
+/// Shared JSON body-extraction helpers, consolidated out of two previously
 /// independent copies (#2557): `server.cpp`'s seven `ServerImpl` statics and
-/// `settings_routes.cpp`'s anonymous-namespace `extract_json_string`. This is
+/// `settings_routes.cpp`'s anonymous-namespace `extract_json_string`.
+/// (Governance round 1, ARCH-2: the commit message this header shipped with
+/// claimed three; only these two files were actually observed removing a
+/// local copy at extraction time.) This is
 /// a pure move — every function below is byte-identical in BEHAVIOR to the
 /// copy it replaces (verified line-by-line against both originals before this
 /// header was written), never a rewrite.

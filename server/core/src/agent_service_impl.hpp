@@ -308,8 +308,14 @@ public:
     /// entry survives until SOME LATER agent response happens to carry the
     /// same `command_id` (which, for a dispatch that reached nobody, never
     /// happens) — a slow, unbounded leak of `cmd_send_times_` entries on every
-    /// refused/zero-reach `/api/command` dispatch. Exception-safe (never
-    /// throws) and safe to call from a destructor/RAII guard.
+    /// refused/zero-reach `/api/command` dispatch. Safe to call from a
+    /// destructor/RAII guard: it does not throw except on a mutex-lock
+    /// failure (`std::system_error`, `std::lock_guard`'s constructor), which
+    /// every caller's own `catch` already absorbs. Deliberately NOT marked
+    /// `noexcept` (governance round 1, CPPX-2) — a `noexcept` violation
+    /// calls `std::terminate()` before any caller's `catch` runs, which
+    /// would be strictly worse than letting that vanishingly rare failure
+    /// propagate to a guard that already handles it.
     /// @return true if an entry was actually removed.
     bool discard_send_time(const std::string& command_id);
 

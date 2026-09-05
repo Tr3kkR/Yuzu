@@ -1624,8 +1624,12 @@ Quarantine a device.
 > 100-device group is distinguishable from three devices being offline, and a
 > MIXED partial dispatch (some reached, some plugin-absent) is never silently
 > invisible in the response. The success body also carries `audit_emitted`
-> (#2557), the same field every denial response on this route already
-> carries — present and `false` only when the paired `command.dispatch`
+> (#2557), the same field every denial arm that calls `emit_behavioral_audit`
+> on this route already carries (the body-type, targeting-shape,
+> Destructive-untargeted, Destructive-no-visible-target, no-target-named and
+> classification-denial 400/403/404 arms) — NOT the scope-parse 400 (an
+> unrelated JSON shape with no audit call at all) or the sent==0 503 family,
+> neither of which ever carried it — present and `false` only when the paired `command.dispatch`
 > `result=success` audit row failed to persist (the response also sets
 > `Sec-Audit-Failed: true` in that case), omitted entirely when no audit
 > store is configured. Before #2557 the success path's audit call was

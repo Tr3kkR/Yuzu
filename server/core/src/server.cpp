@@ -1385,6 +1385,38 @@ public:
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonUnknownPlugin)}});
 
+        // Governance round 1 for #2557 (UP-1b): `yuzu_server_dispatch_fanout_
+        // throw_total` was introduced by the #2557 extraction (the local
+        // `audit_fn` wrapper in `command_routes.cpp`) but was never pre-seeded
+        // at boot — an oversight this closes now that `command_routes.cpp`'s
+        // shared `guarded()` catch block also feeds this same series, widening
+        // `phase` from the wrapper's original two values to every `guarded()`
+        // post-dispatch site name. `route` is `command` only today (the one
+        // surface either emitter wraps). `phase` is a closed set spelled out
+        // here rather than iterated from a shared array — unlike the `reason`
+        // constants above, these are hardcoded per-call-site string literals
+        // in `command_routes.cpp`, not sourced from a header constant: `success`/
+        // `denial` (the `audit_fn` wrapper) plus the seven `guarded()` site
+        // names (`audit_quarantine_dispatch_fail_closed`,
+        // `audit_quarantine_dispatch_denied_batch`, `audit_unknown_plugin_dispatch`,
+        // `forward_gateway_pending`, `publish(command-status)`,
+        // `emit_event(command.dispatched)`, `thead_for_plugin`).
+        metrics_.describe(
+            "yuzu_server_dispatch_fanout_throw_total",
+            "POST /api/command post-dispatch side effects (the audit sink, or any "
+            "guarded() post-dispatch helper) that THREW rather than failing cleanly, "
+            "by which one. A well-behaved sink/helper should fail via its own return "
+            "value, not an exception; a non-zero rate points at a bug in that sink/"
+            "helper rather than at ordinary degradation.",
+            "counter");
+        for (const char* phase : {"success", "denial", "audit_quarantine_dispatch_fail_closed",
+                                  "audit_quarantine_dispatch_denied_batch",
+                                  "audit_unknown_plugin_dispatch", "forward_gateway_pending",
+                                  "publish(command-status)", "emit_event(command.dispatched)",
+                                  "thead_for_plugin"})
+            metrics_.counter("yuzu_server_dispatch_fanout_throw_total",
+                             {{"route", "command"}, {"phase", phase}});
+
         // The containment gate's own outcome series, seeded across its whole
         // closed label set for the same reason. Without this, `absent()` on
         // `outcome="fail_closed"` cannot tell "the gate has never had to fail
@@ -22231,8 +22263,9 @@ private:
         auto classified = build_classified_command(caller, plugin, action, command_id);
         if (!classified) {
             // #1398 (governance Gate 6 sre finding, HIGH/BLOCKING): mirror
-            // the /api/command denial block exactly (server.cpp, ~line
-            // 14343) — this route was named explicitly in-scope by the
+            // the /api/command denial block exactly (command_routes.cpp as
+            // of #2557 — moved out of server.cpp, so no line number here
+            // stays meaningful) — this route was named explicitly in-scope by the
             // design doc's Decision 7 ("REST (/api/command,
             // forward_legacy_command): 403 ... with the specific denial
             // reason in the audit detail") but was never actually touched
@@ -22316,7 +22349,8 @@ private:
                                       command_id, plugin, result.unknown_plugin_count);
 
         if (sent == 0) {
-            // Same four-way split as /api/command above — see the comment
+            // Same four-way split as /api/command (command_routes.cpp as of
+            // #2557 — no longer "above" in this file) — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
             // operator to the wrong subsystem.
