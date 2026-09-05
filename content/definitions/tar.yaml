@@ -568,19 +568,26 @@ spec:
           pattern: "^(true|false)$"
       power_enabled:
         type: string
-        displayName: Power Transition Collector Enabled
+        displayName: Power Transition Capture Enabled (collector not yet shipped)
         description: >
           Enable or disable the sleep/wake/AC-power transition source (power →
           $Power_Live, cursor-model seam). **ON by default ("true")** — unlike
           EVERY other capture source in this table (all of which, netconn and
-          mapdrive included, default OFF), power ships enabled out of the box.
+          mapdrive included, default OFF), power's configuration defaults to
+          enabled.
           This is a deliberate divergence from the standing works-council
           opt-in posture: host sleep/wake and AC-power events are treated as
           low-sensitivity device-lifecycle telemetry, not usage-class data.
-          Uses a durable log-position cursor (not a snapshot diff), so a
-          restart resumes from where it left off rather than re-scanning; a
-          lost/invalid cursor or a wrapped OS event log re-baselines forward
-          and records a capture_gap rather than replaying from the beginning.
+          **No collector is registered in this release.** The schema, this key
+          and its default ship now; the collector that fills $Power_Live lands
+          in a following change, so the tables stay queryable and EMPTY until
+          then — an empty result means "not yet collecting", never "nothing
+          happened".
+          The source WILL use a durable log-position cursor (not a snapshot
+          diff), so a restart will resume from where it left off rather than
+          re-scanning; a lost/invalid cursor or a wrapped OS event log will
+          re-baseline forward and record a capture_gap rather than replaying
+          from the beginning.
           Set to "false" to opt out. Requires agent v0.12.0+; older agents
           silently ignore. Valid: "true" | "false".
         validation:
@@ -601,7 +608,7 @@ spec:
           pattern: "^[0-9]+$"
       removable_enabled:
         type: string
-        displayName: Removable Media Collector Enabled
+        displayName: Removable Media Capture Enabled (collector not yet shipped)
         description: >
           Enable or disable the removable-media attach/detach source
           (removable → $Removable_Live, cursor-model seam), including
@@ -611,9 +618,14 @@ spec:
           (all default OFF, netconn and mapdrive included): removable-device
           attach/detach is treated as security-relevant device-lifecycle
           telemetry an operator should see without an explicit opt-in step.
-          Uses the same durable log-position cursor model as power (see
-          power_enabled) — a lost/invalid cursor re-baselines forward and
-          records a capture_gap rather than replaying history. Set to "false"
+          **No collector is registered in this release.** The schema, this key
+          and its default ship now; the collector that fills $Removable_Live lands
+          in a following change, so the tables stay queryable and EMPTY until
+          then — an empty result means "not yet collecting", never "nothing
+          happened".
+          The source WILL use the same durable log-position cursor model as
+          power (see power_enabled) — a lost/invalid cursor will re-baseline
+          forward and record a capture_gap rather than replaying history. Set to "false"
           to opt out. Requires agent v0.12.0+; older agents silently ignore.
           Valid: "true" | "false".
         validation:

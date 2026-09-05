@@ -845,18 +845,21 @@ bool TarDatabase::set_state(const std::string& collector, const std::string& jso
 
 // ── Cursor-model persistence (tar_cursor.hpp) ─────────────────────────────────
 
-std::optional<std::string> TarDatabase::get_cursor(const std::string& source) {
+std::expected<std::optional<std::string>, std::string>
+TarDatabase::get_cursor(const std::string& source) {
     std::lock_guard lock(mu_);
     if (!db_)
-        return std::nullopt;
+        return std::unexpected("TarDatabase::get_cursor: no open database");
 
     const char* sql = "SELECT cursor_json FROM tar_cursor WHERE source = ?";
 
     sqlite3_stmt* raw_stmt = nullptr;
     int rc = sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr);
     if (rc != SQLITE_OK) {
-        spdlog::error("TarDatabase::get_cursor prepare failed: {}", sqlite3_errmsg(db_));
-        return std::nullopt;
+        std::string err = std::string("TarDatabase::get_cursor prepare failed: ") +
+                          sqlite3_errmsg(db_);
+        spdlog::error("{}", err);
+        return std::unexpected(std::move(err));
     }
     StmtPtr stmt(raw_stmt);
 
@@ -866,9 +869,18 @@ std::optional<std::string> TarDatabase::get_cursor(const std::string& source) {
     rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW) {
         auto text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-        return text ? std::string(text) : std::string{};
+        return std::optional<std::string>(text ? std::string(text) : std::string{});
     }
-    return std::nullopt;
+    if (rc != SQLITE_DONE) {
+        // A step that is neither ROW nor DONE is a read FAILURE. Returning
+        // nullopt here would tell the caller "never persisted" -- see the
+        // header. Only SQLITE_DONE means the query ran and matched nothing.
+        std::string err = std::string("TarDatabase::get_cursor step failed: ") +
+                          sqlite3_errmsg(db_);
+        spdlog::error("{}", err);
+        return std::unexpected(std::move(err));
+    }
+    return std::optional<std::string>{};
 }
 
 namespace {
@@ -971,6 +983,23 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
                 return false;
             }
             StmtPtr stmt(raw_stmt);
+            // Collision check, paid ONLY when a row is actually ignored.
+            // INSERT OR IGNORE cannot tell a legitimate replay (the same OS
+            // record re-offered after a failed commit) from a COLLISION (two
+            // different OS records that derived the same key). Both look like
+            // success, and on a collision the cursor advances past an event
+            // that was silently discarded -- forensic loss reported as a clean
+            // tick. A non-empty key does not establish identity; only the
+            // stored payload does.
+            const char* dup_sql = R"(
+                SELECT ts, snapshot_id, action, detail FROM power_live WHERE record_key = ?
+            )";
+            sqlite3_stmt* raw_dup = nullptr;
+            if (sqlite3_prepare_v2(db, dup_sql, -1, &raw_dup, nullptr) != SQLITE_OK) {
+                spdlog::error("{} dup-check prepare: {}", log_prefix, sqlite3_errmsg(db));
+                return false;
+            }
+            StmtPtr dup(raw_dup);
             for (const auto& ev : events) {
                 sqlite3_reset(stmt.get());
                 sqlite3_clear_bindings(stmt.get());
@@ -983,6 +1012,29 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
                     spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
                     return false;
                 }
+                if (sqlite3_changes(db) != 0)
+                    continue; // inserted -- the ordinary path, no extra work
+                sqlite3_reset(dup.get());
+                sqlite3_clear_bindings(dup.get());
+                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(dup.get()) != SQLITE_ROW) {
+                    spdlog::error("{} dup-check: record_key '{}' was ignored but no stored row "
+                                  "could be read back", log_prefix, ev.record_key);
+                    return false;
+                }
+                auto col = [&](int i) {
+                    auto* t = reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
+                    return t ? std::string_view{t} : std::string_view{};
+                };
+                if (sqlite3_column_int64(dup.get(), 0) == ev.ts &&
+                    sqlite3_column_int64(dup.get(), 1) == ev.snapshot_id &&
+                    col(2) == ev.action && col(3) == ev.detail)
+                    continue; // an exact replay -- the intended dedupe
+                spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
+                              "event, so accepting this batch would advance the cursor past an "
+                              "event that was never stored -- failing the transaction instead",
+                              log_prefix, ev.record_key);
+                return false;
             }
             return true;
         });
@@ -1024,6 +1076,17 @@ bool TarDatabase::insert_removable_events_and_cursor(const std::vector<Removable
                 return false;
             }
             StmtPtr stmt(raw_stmt);
+            const char* dup_sql = R"(
+                SELECT ts, snapshot_id, action, device_key, vendor, product, serial, bus,
+                       volume, size_bytes, image_path, pid, evidence
+                  FROM removable_live WHERE record_key = ?
+            )";
+            sqlite3_stmt* raw_dup = nullptr;
+            if (sqlite3_prepare_v2(db, dup_sql, -1, &raw_dup, nullptr) != SQLITE_OK) {
+                spdlog::error("{} dup-check prepare: {}", log_prefix, sqlite3_errmsg(db));
+                return false;
+            }
+            StmtPtr dup(raw_dup);
             for (const auto& ev : events) {
                 sqlite3_reset(stmt.get());
                 sqlite3_clear_bindings(stmt.get());
@@ -1045,6 +1108,36 @@ bool TarDatabase::insert_removable_events_and_cursor(const std::vector<Removable
                     spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
                     return false;
                 }
+                // See the power twin: only a row that was actually IGNORED is
+                // checked, and only an exact replay is accepted. A collision
+                // would otherwise advance the cursor past a discarded event.
+                if (sqlite3_changes(db) != 0)
+                    continue;
+                sqlite3_reset(dup.get());
+                sqlite3_clear_bindings(dup.get());
+                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                if (sqlite3_step(dup.get()) != SQLITE_ROW) {
+                    spdlog::error("{} dup-check: record_key '{}' was ignored but no stored row "
+                                  "could be read back", log_prefix, ev.record_key);
+                    return false;
+                }
+                auto col = [&](int i) {
+                    auto* t = reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
+                    return t ? std::string_view{t} : std::string_view{};
+                };
+                if (sqlite3_column_int64(dup.get(), 0) == ev.ts &&
+                    sqlite3_column_int64(dup.get(), 1) == ev.snapshot_id &&
+                    col(2) == ev.action && col(3) == ev.device_key && col(4) == ev.vendor &&
+                    col(5) == ev.product && col(6) == ev.serial && col(7) == ev.bus &&
+                    col(8) == ev.volume && sqlite3_column_int64(dup.get(), 9) == ev.size_bytes &&
+                    col(10) == ev.image_path && sqlite3_column_int64(dup.get(), 11) == ev.pid &&
+                    col(12) == ev.evidence)
+                    continue; // an exact replay -- the intended dedupe
+                spdlog::error("{} record_key COLLISION on '{}': the stored row is a DIFFERENT "
+                              "event, so accepting this batch would advance the cursor past an "
+                              "event that was never stored -- failing the transaction instead",
+                              log_prefix, ev.record_key);
+                return false;
             }
             return true;
         });

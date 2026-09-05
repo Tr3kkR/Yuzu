@@ -20,6 +20,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <sqlite3.h>
 #include <cstddef>
 #include <filesystem>
 #include <optional>
@@ -139,19 +140,96 @@ private:
 
 // ── tar_cursor persistence: round trip ───────────────────────────────────────
 
+// get_cursor() is tri-state: a read FAILURE is an error, distinct from "no row"
+// (C2). Every assertion below is about a successful read, so this helper
+// asserts that much and unwraps -- a test that silently accepted an error as
+// "no cursor" would be asserting the exact confusion C2 removed.
+static std::optional<std::string> read_cursor(yuzu::tar::TarDatabase& db,
+                                              const std::string& source) {
+    auto r = db.get_cursor(source);
+    REQUIRE(r.has_value());
+    return *r;
+}
+
 TEST_CASE("TarDatabase: get_cursor returns nullopt before any cursor is persisted",
           "[tar][cursor]") {
     auto t = make_test_db();
-    CHECK_FALSE(t.db.get_cursor("power").has_value());
+    CHECK_FALSE(read_cursor(t.db, "power").has_value());
+}
+
+TEST_CASE("TarDatabase: a cursor READ FAILURE is an error, never mistaken for 'never persisted' "
+          "(C2)",
+          "[tar][cursor][c2]") {
+    // The whole point of the tri-state. If a failed read returned nullopt, the
+    // driver would hand that to collect(), the source would treat the tick as a
+    // first-ever baseline and commit the CURRENT log position -- silently
+    // skipping every event between the durable cursor and now, and emitting no
+    // capture_gap, because nothing in the chain ever knew a cursor existed.
+    auto t = make_test_db();
+    REQUIRE(t.db.insert_power_events_and_cursor({}, R"({"v":1,"pos":10})"));
+    {
+        auto ok = t.db.get_cursor("power");
+        REQUIRE(ok.has_value());
+        REQUIRE(ok->has_value());
+        CHECK(**ok == R"({"v":1,"pos":10})");
+    }
+
+    // Break the read out from under it, on a SECOND raw connection to the same
+    // file (the test_kv_store.cpp pattern) so the TarDatabase handle is
+    // untouched and the failure is a genuine one at prepare time.
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(raw, "DROP TABLE tar_cursor", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    auto broken = t.db.get_cursor("power");
+    REQUIRE_FALSE(broken.has_value());          // an ERROR ...
+    CHECK_FALSE(broken.error().empty());        // ... that says what went wrong
 }
 
 TEST_CASE("TarDatabase: insert_power_events_and_cursor persists the cursor even with zero events",
           "[tar][cursor]") {
     auto t = make_test_db();
     REQUIRE(t.db.insert_power_events_and_cursor({}, R"({"v":1,"pos":10})"));
-    auto c = t.db.get_cursor("power");
+    auto c = read_cursor(t.db, "power");
     REQUIRE(c.has_value());
     CHECK(*c == R"({"v":1,"pos":10})");
+}
+
+TEST_CASE("TarDatabase: a record_key COLLISION is refused, while an exact replay still dedupes "
+          "(C1)",
+          "[tar][cursor][c1]") {
+    // INSERT OR IGNORE cannot, by itself, tell a legitimate replay from a
+    // collision: both are "a row with this key already exists". Accepting a
+    // collision would commit the cursor past an event that was never stored --
+    // forensic loss reported as a clean tick. Only an exact payload match is a
+    // replay.
+    auto t = make_test_db();
+
+    PowerEvent a;
+    a.ts = 100;
+    a.snapshot_id = 1;
+    a.action = "sleep";
+    a.detail = "lid";
+    a.record_key = "winpower:sw:0";
+
+    REQUIRE(t.db.insert_power_events_and_cursor({a}, R"({"v":1,"pos":1})"));
+
+    // Exact replay: the same OS record re-offered after a failed commit. This
+    // MUST still succeed, or every ordinary retry would wedge the source.
+    CHECK(t.db.insert_power_events_and_cursor({a}, R"({"v":1,"pos":2})"));
+
+    // Collision: a DIFFERENT event that derived the same key -- exactly what a
+    // process-local counter reset produces on an agent restart.
+    PowerEvent b = a;
+    b.ts = 900;
+    b.action = "wake";
+    CHECK_FALSE(t.db.insert_power_events_and_cursor({b}, R"({"v":1,"pos":3})"));
+
+    // ... and because the batch failed, the cursor did NOT advance past it.
+    auto c = read_cursor(t.db, "power");
+    REQUIRE(c.has_value());
+    CHECK(*c == R"({"v":1,"pos":2})");
 }
 
 TEST_CASE("TarDatabase: insert_removable_events_and_cursor round-trips events + cursor together",
@@ -177,7 +255,7 @@ TEST_CASE("TarDatabase: insert_removable_events_and_cursor round-trips events + 
     auto res = t.db.execute_query("SELECT COUNT(*) FROM removable_live");
     REQUIRE(res.has_value());
     CHECK(res->rows[0][0] == "1");
-    CHECK(t.db.get_cursor("removable") == std::string(R"({"v":1})"));
+    CHECK(read_cursor(t.db, "removable") == std::string(R"({"v":1})"));
 }
 
 // ── Replay idempotence via UNIQUE record_key ────────────────────────────────
@@ -202,7 +280,7 @@ TEST_CASE("power_live: duplicate record_key is a no-op (row count unchanged), cu
     CHECK(res->rows[0][0] == "1");
     // The cursor itself is NOT gated by record_key idempotence -- it still
     // advances to whatever the (idempotent) tick reports.
-    CHECK(t.db.get_cursor("power") == std::string(R"({"v":2})"));
+    CHECK(read_cursor(t.db, "power") == std::string(R"({"v":2})"));
 }
 
 // ── Atomic commit/rollback ───────────────────────────────────────────────────
@@ -225,7 +303,7 @@ TEST_CASE("insert_power_events_and_cursor rolls back the cursor when the event i
     // Neither half landed: the cursor is exactly what it was before this
     // call (rule 6 / tar_db.hpp:458-477 -- events and cursor commit or fail
     // together).
-    CHECK(t.db.get_cursor("power") == std::string(R"({"v":1})"));
+    CHECK(read_cursor(t.db, "power") == std::string(R"({"v":1})"));
 }
 
 TEST_CASE("insert_removable_events_and_cursor rolls back the cursor when the event insert fails",
@@ -240,7 +318,7 @@ TEST_CASE("insert_removable_events_and_cursor rolls back the cursor when the eve
     ev.action = "detached";
     ev.record_key = "will-not-land";
     CHECK_FALSE(t.db.insert_removable_events_and_cursor({ev}, R"({"v":2})"));
-    CHECK(t.db.get_cursor("removable") == std::string(R"({"v":1})"));
+    CHECK(read_cursor(t.db, "removable") == std::string(R"({"v":1})"));
 }
 
 // ── Generated DDL ─────────────────────────────────────────────────────────────
@@ -289,10 +367,10 @@ TEST_CASE("CursorSource contract: a successful collect persists events + cursor 
     auto result = src.collect(t.db, std::nullopt);
     CHECK(result.outcome == CursorOutcome::Baseline);
     CHECK(result.events_emitted == 1);
-    CHECK(t.db.get_cursor("power") == result.new_cursor_json);
+    CHECK(read_cursor(t.db, "power") == result.new_cursor_json);
 
     // A second tick with a prior cursor present reports Advanced.
-    auto result2 = src.collect(t.db, t.db.get_cursor("power"));
+    auto result2 = src.collect(t.db, read_cursor(t.db, "power"));
     CHECK(result2.outcome == CursorOutcome::Advanced);
 }
 
@@ -302,15 +380,15 @@ TEST_CASE("CursorSource contract: IncompleteCaptureError leaves the persisted cu
     FakePowerCursorSource src;
     src.start(t.db);
     auto seed = src.collect(t.db, std::nullopt);
-    REQUIRE(t.db.get_cursor("power") == seed.new_cursor_json);
+    REQUIRE(read_cursor(t.db, "power") == seed.new_cursor_json);
 
     // Rule 1: a transient failure throws rather than returning a result --
     // the driver (simulated here directly) must not call any persist path
     // on this branch, so the cursor is exactly what it was before.
     src.throw_incomplete = true;
-    const auto cursor_before = t.db.get_cursor("power");
+    const auto cursor_before = read_cursor(t.db, "power");
     REQUIRE_THROWS_AS(src.collect(t.db, cursor_before), IncompleteCaptureError);
-    CHECK(t.db.get_cursor("power") == cursor_before);
+    CHECK(read_cursor(t.db, "power") == cursor_before);
 }
 
 TEST_CASE("CursorSource contract: CursorLost emits a capture_gap and re-baselines forward",
@@ -328,7 +406,7 @@ TEST_CASE("CursorSource contract: CursorLost emits a capture_gap and re-baseline
     CHECK(res->rows.size() == 1);
     // Re-baselined at "now", never replay-from-zero -- the new cursor is
     // exactly what this tick persisted, not derived from the stale input.
-    CHECK(t.db.get_cursor("power") == result.new_cursor_json);
+    CHECK(read_cursor(t.db, "power") == result.new_cursor_json);
 }
 
 TEST_CASE("CursorSource lifecycle: stop() runs while the database is still open",

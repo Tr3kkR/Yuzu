@@ -2106,7 +2106,21 @@ private:
                                              yuzu::tar::kCollectStatusSourceDisabled));
                 continue;
             }
-            auto cursor = db_->get_cursor(src_name);
+            auto cursor_read = db_->get_cursor(src_name);
+            if (!cursor_read) {
+                // The cursor could not be READ. That is a transient failure of
+                // the store, not evidence about this source, so rule 1 applies:
+                // retain the cursor exactly as last written and skip the tick.
+                // Passing nullopt through would tell the source it had never
+                // run, and it would re-baseline forward -- skipping everything
+                // between the durable cursor and now, with no capture_gap.
+                spdlog::warn("TAR: {} cursor read failed ({}) -- retaining cursor, skipping tick",
+                            src_name, cursor_read.error());
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                continue;
+            }
+            const auto& cursor = *cursor_read;
             try {
                 // The source persists its own events+cursor atomically via
                 // insert_power_events_and_cursor / insert_removable_events_
@@ -2137,6 +2151,31 @@ private:
                 // as service/mapdrive above (tar_capture_status.hpp:187).
                 spdlog::warn("TAR: {} cursor collect incomplete ({}) -- retaining cursor",
                             src_name, e.what());
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+            } catch (const std::exception& e) {
+                // ABI containment. The SDK's execute trampoline
+                // (sdk/include/yuzu/plugin.hpp) is an extern "C" boundary with
+                // no try/catch of its own, so ANY exception that escapes here
+                // crosses it and std::terminate()s the whole agent -- and TAR
+                // is in-process and default-on, so that is the agent, not just
+                // this plugin. A collector is REQUIRED to map its failures to
+                // IncompleteCaptureError or CursorLost (tar_cursor.hpp rules 1
+                // and 2), but rule 2 names "the cursor JSON fails to parse" as
+                // a first-class outcome and nlohmann::json throws by default,
+                // so the single most likely consumer mistake is exactly the one
+                // that would take the process down. Contain it and lose the
+                // tick instead. Same reasoning as start()'s guard above and the
+                // dns/netqual pre-collection stage's catch (...).
+                spdlog::error("TAR: {} cursor collect threw ({}) -- source skipped this tick; "
+                              "a CursorSource must map failures to IncompleteCaptureError or "
+                              "CursorOutcome::CursorLost, never throw",
+                              src_name, e.what());
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+            } catch (...) {
+                spdlog::error("TAR: {} cursor collect threw a non-std exception -- source "
+                              "skipped this tick", src_name);
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
             }
@@ -3361,7 +3400,27 @@ private:
                 if (transition_ok && (v == "true") != cursor_prev_enabled) {
                     for (auto& cs : cursor_sources_) {
                         if (cs->name() == src_name) {
-                            cs->on_enabled_changed(v == "true");
+                            // ABI containment, same reason as the collect loop:
+                            // on_enabled_changed() is declared noexcept-free and
+                            // the SDK execute trampoline is an extern "C"
+                            // boundary with no catch, so an escaping exception
+                            // here terminates the agent from a plain
+                            // configuration write. Losing the pause/resume
+                            // bookkeeping for one toggle is the strictly better
+                            // outcome, and it is logged loudly because a source
+                            // that throws here has an un-honoured P-002 contract.
+                            try {
+                                cs->on_enabled_changed(v == "true");
+                            } catch (const std::exception& e) {
+                                spdlog::error("TAR: {} on_enabled_changed threw ({}) -- the "
+                                              "source's pause/resume bookkeeping for this "
+                                              "toggle is not applied", src_name, e.what());
+                            } catch (...) {
+                                spdlog::error("TAR: {} on_enabled_changed threw a non-std "
+                                              "exception -- the source's pause/resume "
+                                              "bookkeeping for this toggle is not applied",
+                                              src_name);
+                            }
                             break;
                         }
                     }

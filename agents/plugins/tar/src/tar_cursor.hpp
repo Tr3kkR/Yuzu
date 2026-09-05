@@ -185,6 +185,27 @@ struct CursorCollectResult {
 /// The full lifecycle contract every cursor-model TAR source implements.
 /// See the header comment above for the per-method contract; this class adds
 /// no behaviour of its own -- it is a pure interface.
+///
+/// EXCEPTIONS -- a contract, not a style note. A CursorSource is reached
+/// through the SDK's `execute` trampoline, which is an `extern "C"` boundary
+/// with no try/catch of its own (sdk/include/yuzu/plugin.hpp). An exception
+/// that escapes one of these methods therefore crosses a C ABI and
+/// std::terminate()s the process -- and TAR runs in-process and default-on, so
+/// that is the whole agent, not just this plugin.
+///
+/// So: `collect()` throws ONLY IncompleteCaptureError, and every other failure
+/// maps to a CursorOutcome (rule 2's CursorLost is the catch-all for a cursor
+/// that cannot be trusted). `start()`, `stop()` and `on_enabled_changed()`
+/// throw nothing at all. This is easy to get wrong in exactly one place: rule 2
+/// names "the cursor JSON fails to parse" as a first-class outcome, and JSON
+/// parsers throw by default -- so a source that hands the stored cursor
+/// straight to a parser without catching is the likely mistake, and it is the
+/// one that takes the agent down.
+///
+/// The driver contains an escape anyway (tar_plugin.cpp) and loses the tick
+/// rather than the process. That backstop exists because the cost of being
+/// wrong is the whole agent; it does NOT relax the rule above, because a
+/// contained throw still silently costs a collection tick.
 class CursorSource {
 public:
     virtual ~CursorSource() = default;

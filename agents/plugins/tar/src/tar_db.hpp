@@ -403,8 +403,17 @@ public:
      * cursor" (tar_cursor.hpp rule 4: the cursor is always a versioned JSON
      * document, so a genuinely empty one is not expected, but the API stays
      * honest either way).
+     *
+     * A READ FAILURE is an error, never a nullopt. Collapsing the two would let
+     * a transient SQLite failure look identical to "this source has never run":
+     * the driver would hand nullopt to collect(), the source would treat the
+     * tick as a first-ever baseline, and it would commit the CURRENT log
+     * position -- silently skipping everything between the durable old cursor
+     * and now, with no capture_gap, because nothing involved ever knew a cursor
+     * existed. nullopt therefore means exactly one thing: the query succeeded
+     * and matched no row.
      */
-    std::optional<std::string> get_cursor(const std::string& source);
+    std::expected<std::optional<std::string>, std::string> get_cursor(const std::string& source);
 
     /**
      * Atomically persist a batch of power events AND the new cursor for the
