@@ -84,9 +84,14 @@ public:
             gap.detail = "cursor lost (fixture)";
             gap.record_key = next_key();
             const std::string new_cursor = R"({"v":1,"pos":"rebaselined"})";
-            const bool ok = db.insert_power_events_and_cursor({gap}, new_cursor);
-            return {new_cursor, ok ? std::size_t{1} : std::size_t{0}, CursorOutcome::CursorLost,
-                    "lost"};
+            // Rule 3: a failed persist THROWS. Returning an outcome here would
+            // report a clean tick while nothing was written -- the exact shape
+            // the contract names. This fake is the only CursorSource in the
+            // tree and a consumer author will copy it, so it must obey the
+            // contract it demonstrates.
+            if (auto r = db.insert_power_events_and_cursor({gap}, new_cursor); !r)
+                throw IncompleteCaptureError("fixture: gap persist failed");
+            return {new_cursor, std::size_t{1}, CursorOutcome::CursorLost, "lost"};
         }
 
         PowerEvent ev;
@@ -95,10 +100,11 @@ public:
         ev.action = "wake";
         ev.record_key = next_key();
         const std::string new_cursor = R"({"v":1,"pos":"advanced"})";
-        const bool ok = db.insert_power_events_and_cursor({ev}, new_cursor);
+        if (auto r = db.insert_power_events_and_cursor({ev}, new_cursor); !r)
+            throw IncompleteCaptureError("fixture: event persist failed");
         const auto outcome = cursor_json.has_value() ? CursorOutcome::Advanced
                                                      : CursorOutcome::Baseline;
-        return {new_cursor, ok ? std::size_t{1} : std::size_t{0}, outcome, ""};
+        return {new_cursor, std::size_t{1}, outcome, ""};
     }
 
     void stop() noexcept override {

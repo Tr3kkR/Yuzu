@@ -416,6 +416,28 @@ public:
     std::expected<std::optional<std::string>, std::string> get_cursor(const std::string& source);
 
     /**
+     * Why the atomic inserts do not return a bare bool.
+     *
+     * They can fail two ways that demand OPPOSITE responses, and a bool
+     * collapses them:
+     *
+     *  - `Transient` — BEGIN/COMMIT/step failed (SQLITE_BUSY, I/O, disk full).
+     *    Nothing is wrong with the batch. Rule 1 applies: retain the cursor and
+     *    retry next tick, and the retry will eventually succeed.
+     *
+     *  - `KeyCollision` — a `record_key` in the batch names a row that already
+     *    exists with a DIFFERENT payload, so accepting it would advance the
+     *    cursor past an event that was never stored. This is a SOURCE DEFECT
+     *    (rule 3(a): every persisted field must be deterministically
+     *    re-derivable), and it is PERMANENT: the source re-derives the same
+     *    poison batch every tick, the store refuses it every tick, the cursor
+     *    never advances and the queue never drains. Capture is dead, and if the
+     *    caller treats it as transient the only symptom is a repeating log line.
+     *    A caller MUST NOT retry a KeyCollision indefinitely — surface it.
+     */
+    enum class CursorInsertError { Transient, KeyCollision };
+
+    /**
      * Atomically persist a batch of power events AND the new cursor for the
      * "power" source in ONE transaction (BEGIN IMMEDIATE..COMMIT, mu_ held
      * for the whole batch — tar_cursor.hpp rule 6 / this header's
@@ -427,14 +449,15 @@ public:
      * commit or fail together, never one without the other. `events` may be
      * empty (a tick that only advances the cursor, e.g. a Baseline collect
      * with nothing to report); the cursor is still persisted.
-     * @return true iff the transaction committed.
+     * @return {} iff the transaction committed; otherwise the discriminant
+     *         above, which the caller MUST act on differently.
      */
-    bool insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
-                                        const std::string& cursor_json);
+    std::expected<void, CursorInsertError> insert_power_events_and_cursor(
+        const std::vector<PowerEvent>& events, const std::string& cursor_json);
 
     /** Same contract as insert_power_events_and_cursor, for "removable". */
-    bool insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
-                                            const std::string& cursor_json);
+    std::expected<void, CursorInsertError> insert_removable_events_and_cursor(
+        const std::vector<RemovableEvent>& events, const std::string& cursor_json);
 
     // ── Config management ────────────────────────────────────────────────────
 

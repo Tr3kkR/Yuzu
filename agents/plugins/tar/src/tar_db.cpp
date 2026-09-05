@@ -949,7 +949,7 @@ bool insert_events_and_cursor_locked(sqlite3* db, const char* log_prefix,
 
 } // namespace
 
-bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
+std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
                                                  const std::string& cursor_json) {
     // A blank record_key is silently catastrophic: the UNIQUE index makes
     // INSERT OR IGNORE drop every event after the first, and the call still
@@ -960,17 +960,21 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
             spdlog::error("TarDatabase::insert_power_events_and_cursor: refusing a batch with an "
                           "empty record_key -- the dedupe index would discard all but "
                           "the first event and report success");
-            return false;
+            return std::unexpected(CursorInsertError::KeyCollision);
         }
     }
 
     std::lock_guard lock(mu_);
     if (!db_)
-        return false;
+        return std::unexpected(CursorInsertError::Transient);
 
-    return insert_events_and_cursor_locked(
+    // Set by the events lambda when it refuses a batch on a payload mismatch.
+    // That refusal is PERMANENT -- the same batch is re-derived and re-refused
+    // every tick -- so it must not reach the caller as an ordinary failure.
+    bool collided = false;
+    const bool ok = insert_events_and_cursor_locked(
         db_, "insert_power_events_and_cursor", "power", cursor_json,
-        [&events](sqlite3* db, const char* log_prefix) {
+        [&events, &collided](sqlite3* db, const char* log_prefix) {
             if (events.empty())
                 return true;
             const char* sql = R"(
@@ -1053,13 +1057,18 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
                               "event, so accepting this batch would advance the cursor past an "
                               "event that was never stored -- failing the transaction instead",
                               log_prefix, ev.record_key);
+                collided = true;
                 return false;
             }
             return true;
         });
+    if (ok)
+        return {};
+    return std::unexpected(collided ? CursorInsertError::KeyCollision
+                                    : CursorInsertError::Transient);
 }
 
-bool TarDatabase::insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
+std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
                                                       const std::string& cursor_json) {
     // A blank record_key is silently catastrophic: the UNIQUE index makes
     // INSERT OR IGNORE drop every event after the first, and the call still
@@ -1070,17 +1079,19 @@ bool TarDatabase::insert_removable_events_and_cursor(const std::vector<Removable
             spdlog::error("TarDatabase::insert_removable_events_and_cursor: refusing a batch with an "
                           "empty record_key -- the dedupe index would discard all but "
                           "the first event and report success");
-            return false;
+            return std::unexpected(CursorInsertError::KeyCollision);
         }
     }
 
     std::lock_guard lock(mu_);
     if (!db_)
-        return false;
+        return std::unexpected(CursorInsertError::Transient);
 
-    return insert_events_and_cursor_locked(
+    // See the power twin.
+    bool collided = false;
+    const bool ok = insert_events_and_cursor_locked(
         db_, "insert_removable_events_and_cursor", "removable", cursor_json,
-        [&events](sqlite3* db, const char* log_prefix) {
+        [&events, &collided](sqlite3* db, const char* log_prefix) {
             if (events.empty())
                 return true;
             const char* sql = R"(
@@ -1167,10 +1178,15 @@ bool TarDatabase::insert_removable_events_and_cursor(const std::vector<Removable
                               "event, so accepting this batch would advance the cursor past an "
                               "event that was never stored -- failing the transaction instead",
                               log_prefix, ev.record_key);
+                collided = true;
                 return false;
             }
             return true;
         });
+    if (ok)
+        return {};
+    return std::unexpected(collided ? CursorInsertError::KeyCollision
+                                    : CursorInsertError::Transient);
 }
 
 // ── Config management ────────────────────────────────────────────────────────
