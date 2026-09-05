@@ -4534,10 +4534,16 @@ public:
                 gateway_service_->set_fleet_topology_store(fleet_topology_store_.get());
         }
 
-        // Initialize audit store — PostgreSQL (ADR-0040, schema audit_store),
-        // born-on-PG like the other migrated stores: fail-closed on open, then
-        // a MANDATORY backfill of the legacy audit.db (SOC 2 evidence chain —
-        // refuse boot rather than serve a knowingly-incomplete trail).
+        // Initialize audit store — PostgreSQL (ADR-0040, schema audit_store), born-on-PG like the
+        // other migrated stores: fail-closed on open. NO backfill (ADR-0009's 2026-08-25
+        // fresh-start-by-default amendment, extended to AuditStore by the 2026-09-04 hard-cutover
+        // Update — no migration path is held open, incl. for evidence): the legacy audit.db is
+        // never copied; the detect-and-warn obligation still applies (audit history is compliance
+        // evidence, not expendable telemetry), so legacy_sqlite_probe::harden_legacy_file_0600()
+        // (this file's `detail` column may hold a pre-fix plaintext secret — `sanitized_detail`'s
+        // own doc comment, ADR-0010 §Consequences (a) — the now-retired backfill never rewrote
+        // the legacy file to redact it, WebhookStore precedent) then warn_if_legacy_rows() open
+        // the legacy file read-only and warn (with a row count) only if it actually holds rows.
         {
             if (pg_pool_ && !startup_failed_) {
                 audit_store_ =
@@ -4548,22 +4554,12 @@ public:
                                   "created/opened)");
                     startup_failed_ = true;
                 } else {
-                    // Wire metrics BEFORE the backfill so yuzu_server_audit_backfill_total
-                    // actually emits — the backfill's own outcome metric was dead when
-                    // set_metrics ran after it (Gate 2 security MEDIUM).
                     audit_store_->set_metrics(&metrics_);
-                    auto audit_db = cfg_.db_dir() / "audit.db";
-                    if (!audit_store_->migrate_from_sqlite(audit_db)) {
-                        spdlog::error("[PG] Refusing to start: audit store backfill from legacy {} "
-                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
-                                      "log lines). The SOC 2 evidence chain must be complete before "
-                                      "serving; the next boot retries. Operator remediation: repair "
-                                      "the file, or quarantine it aside if it is unrecoverable.",
-                                      audit_db.string());
-                        startup_failed_ = true;
-                    } else {
-                        audit_store_->start_cleanup();
-                    }
+                    legacy_sqlite_probe::harden_legacy_file_0600(cfg_.db_dir() / "audit.db",
+                                                                 "AuditStore");
+                    legacy_sqlite_probe::warn_if_legacy_rows(cfg_.db_dir() / "audit.db",
+                                                             "AuditStore", {"audit_events"});
+                    audit_store_->start_cleanup();
                 }
             }
             // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
