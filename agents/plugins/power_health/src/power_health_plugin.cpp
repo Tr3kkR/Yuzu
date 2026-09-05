@@ -207,6 +207,16 @@ auto bounded_call_tracked(Fn fn) -> std::optional<std::invoke_result_t<Fn>> {
     return yuzu::shared::bounded_call(kBoundedCallTimeout, std::move(fn));
 }
 
+// As above, but reporting WHY an empty result came back. A caller holding an
+// OS handle that fn() uses needs that distinction: a timeout means a detached
+// thread may still be using the handle, a ceiling rejection means fn() never
+// ran at all. See bounded_wait.hpp's BoundedCallStatus.
+template <typename Fn>
+auto bounded_call_tracked_ex(Fn fn) -> yuzu::shared::BoundedCallResult<Fn> {
+    OutstandingGuard guard;
+    return yuzu::shared::bounded_call_ex(kBoundedCallTimeout, std::move(fn));
+}
+
 // ─────────────────────────────────────────────────────────── battery ──────
 
 #ifdef _WIN32
@@ -317,22 +327,36 @@ int do_thermal(yuzu::CommandContext& ctx) {
         return 0;
     }
 
-    const auto collected = bounded_call_tracked([query]() { return PdhCollectQueryData(query) == ERROR_SUCCESS; });
-    if (!collected) {
-        // Timed out (or the ceiling rejected the call) — bounded_call()'s
-        // detached thread may still be executing PdhCollectQueryData(query)
-        // against this exact handle. Closing it here would race a live PDH
-        // call on another thread (a cross-thread handle-lifetime violation,
-        // not merely an unload-safety one — PH-002), so on this path the
-        // query is intentionally LEAKED rather than closed: one leaked
-        // PDH_HQUERY per timed-out poll is the accepted trade over a
-        // use-after-close, matching plugin.hpp:245's "accept a bounded
-        // resource residue instead" guidance applied to a live handle.
+    const auto collected =
+        bounded_call_tracked_ex([query]() { return PdhCollectQueryData(query) == ERROR_SUCCESS; });
+    if (collected.status == yuzu::shared::BoundedCallStatus::Rejected) {
+        // The outstanding-call ceiling refused the call, so PdhCollectQueryData
+        // was NEVER invoked and no thread was ever created against this handle.
+        // Nothing can be racing it, so it closes normally. This path is
+        // deliberately separated from the timeout below: rejection is what
+        // happens when the agent is already loaded, i.e. in bursts, so leaking
+        // here would be an unbounded handle leak under exactly the conditions
+        // that provoke it -- and it would buy nothing, since the accepted
+        // trade below exists only to avoid racing a LIVE call.
+        PdhCloseQuery(query);
+        ctx.write_output(
+            yuzu::power_health::format_thermal_line({"unavailable", "pdh_collect_rejected", {}}));
+        return 0;
+    }
+    if (collected.status == yuzu::shared::BoundedCallStatus::TimedOut) {
+        // Timed out — bounded_call()'s detached thread may still be executing
+        // PdhCollectQueryData(query) against this exact handle. Closing it here
+        // would race a live PDH call on another thread (a cross-thread
+        // handle-lifetime violation, not merely an unload-safety one —
+        // PH-002), so on THIS path the query is intentionally LEAKED rather
+        // than closed: one leaked PDH_HQUERY per timed-out poll is the accepted
+        // trade over a use-after-close, matching plugin.hpp:245's "accept a
+        // bounded resource residue instead" guidance applied to a live handle.
         ctx.write_output(
             yuzu::power_health::format_thermal_line({"unavailable", "pdh_collect_timed_out", {}}));
         return 0;
     }
-    if (!*collected) {
+    if (!*collected.value) {
         PdhCloseQuery(query); // the call itself returned (no longer racing another thread)
         ctx.write_output(
             yuzu::power_health::format_thermal_line({"unavailable", "pdh_collect_failed", {}}));
