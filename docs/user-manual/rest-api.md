@@ -4930,9 +4930,9 @@ Delete a result set.
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token |
-| 404 | No such set, or not owned by the caller |
+| 404 | No such set, or not owned by the caller. Also returned if the delete itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
 | 409 | `RESULT_SET_PINNED` — unpin the set before deleting it |
-| 503 | Result-set store unavailable |
+| 503 | Result-set store unavailable (ownership lookup only) |
 
 #### `GET /api/v1/result-sets/{id}/members`
 
@@ -4986,9 +4986,9 @@ Pin (exempt from TTL expiry) or unpin a result set.
 | Status | Reason |
 |---|---|
 | 403 | Service-scoped API token |
-| 404 | No such set, or not owned by the caller |
+| 404 | No such set, or not owned by the caller. Also returned if the pin/unpin write itself fails after ownership is confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found. |
 | 409 | `PIN_LIMIT` — owner is at the per-owner pin cap (pin only) |
-| 503 | Result-set store unavailable |
+| 503 | Result-set store unavailable (ownership lookup only) |
 
 ---
 
