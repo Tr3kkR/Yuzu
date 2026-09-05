@@ -726,8 +726,14 @@ tar_test_exe = executable(
     'unit/test_tar_arp.cpp',       # Wave 5 PR5.2: pure /proc/net/arp parser + macOS record mapping (fixture-fed)
     'unit/test_tar_capture_status.cpp', # BR-001 remediation: pure subprocess-capture completeness predicate
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
+    'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
+    # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
+    # the fail-closed reader for the lookback privacy control (tar_cursor.hpp
+    # rule 5). Linking it also means the suite exercises the real factory
+    # rather than a test-local stand-in.
+    '../agents/plugins/tar/src/tar_cursor_sources.cpp',
     '../agents/plugins/tar/src/tar_sql_executor.cpp',
     '../agents/plugins/tar/src/tar_diff.cpp',
     '../agents/plugins/tar/src/tar_software_core.cpp',

@@ -9,6 +9,8 @@
  * Schema:
  *   tar_state  — last-known state per collector for diff computation
  *   tar_config — key/value config (retention_days, redaction patterns, etc.)
+ *   tar_cursor — last-persisted cursor JSON per cursor-model source
+ *                (tar_cursor.hpp: power, removable — wave 2)
  *   plus the typed warehouse tiers generated from the schema registry.
  *
  * The legacy tar_events event log was retired by schema v3; it is neither
@@ -27,6 +29,7 @@
 #include <filesystem>
 #include <atomic>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -294,6 +297,46 @@ struct NetConnRow {
     int64_t reason_code{0}; // WLAN disconnect/fail reason or NCSI change reason
 };
 
+/// One power_live row (cursor-model seam, tar_cursor.hpp) -- a sleep/wake/
+/// AC-power transition. FROZEN by the cursor seam: wave-2 collectors and the
+/// schema registry consume this shape exactly; changing a field is a
+/// contract change, not a refactor. `record_key` is the UNIQUE replay-
+/// idempotence key (tar_cursor.hpp rule 3) -- a value-only field for every
+/// OTHER purpose, never re-derived by a query.
+struct PowerEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // sleep, wake, ac_attached, ac_detached, capture_gap
+    std::string detail;
+    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+};
+
+/// One removable_live row (cursor-model seam, tar_cursor.hpp) -- an
+/// attach/detach transition of removable media, or a process observed
+/// executing from removable media. FROZEN, same rationale as PowerEvent.
+/// `image_path` + `pid` are TYPED identity-adjacent columns (P-004) added
+/// specifically so `exec_from_removable` rows can be correlated to a running
+/// process (ProcessInfo::exec_path, agents/core process_enum.hpp) — NOT
+/// derived from `evidence`, which (like `record_key`) is a value/forensic
+/// field only, never an identity carrier.
+struct RemovableEvent {
+    int64_t ts{0};
+    int64_t snapshot_id{0};
+    std::string action; // attached, detached, present_at_baseline,
+                        // exec_from_removable, capture_gap
+    std::string device_key;
+    std::string vendor;
+    std::string product;
+    std::string serial;
+    std::string bus;
+    std::string volume;
+    int64_t size_bytes{0};
+    std::string image_path; // typed identity column (P-004); "" when n/a
+    int64_t pid{0};         // typed identity column (P-004); 0 when n/a
+    std::string evidence;   // forensic/value field only — NOT identity
+    std::string record_key; // UNIQUE — replay idempotence (INSERT OR IGNORE)
+};
+
 /// Row from an arbitrary SQL query (used by tar.sql action).
 using QueryRow = std::vector<std::string>;
 
@@ -350,12 +393,93 @@ public:
      */
     bool set_state(const std::string& collector, const std::string& json);
 
+    // ── Cursor-model persistence (tar_cursor.hpp) ────────────────────────────
+
+    /**
+     * Get the last-persisted cursor JSON for a cursor-model source (e.g.
+     * "power", "removable"). Returns std::nullopt if no cursor has ever been
+     * persisted for that source -- distinct from an EMPTY string, so a
+     * CursorSource can tell "never run" from "ran and persisted an empty
+     * cursor" (tar_cursor.hpp rule 4: the cursor is always a versioned JSON
+     * document, so a genuinely empty one is not expected, but the API stays
+     * honest either way).
+     *
+     * A READ FAILURE is an error, never a nullopt. Collapsing the two would let
+     * a transient SQLite failure look identical to "this source has never run":
+     * the driver would hand nullopt to collect(), the source would treat the
+     * tick as a first-ever baseline, and it would commit the CURRENT log
+     * position -- silently skipping everything between the durable old cursor
+     * and now, with no capture_gap, because nothing involved ever knew a cursor
+     * existed. nullopt therefore means exactly one thing: the query succeeded
+     * and matched no row.
+     */
+    std::expected<std::optional<std::string>, std::string> get_cursor(const std::string& source);
+
+    /**
+     * Why the atomic inserts do not return a bare bool.
+     *
+     * They can fail two ways that demand OPPOSITE responses, and a bool
+     * collapses them:
+     *
+     *  - `Transient` — BEGIN/COMMIT/step failed (SQLITE_BUSY, I/O, disk full).
+     *    Nothing is wrong with the batch. Rule 1 applies: retain the cursor and
+     *    retry next tick, and the retry will eventually succeed.
+     *
+     *  - `KeyCollision` — a `record_key` in the batch names a row that already
+     *    exists with a DIFFERENT payload, so accepting it would advance the
+     *    cursor past an event that was never stored. This is a SOURCE DEFECT
+     *    (rule 3(a): every persisted field must be deterministically
+     *    re-derivable), and it is PERMANENT: the source re-derives the same
+     *    poison batch every tick, the store refuses it every tick, the cursor
+     *    never advances and the queue never drains. Capture is dead, and if the
+     *    caller treats it as transient the only symptom is a repeating log line.
+     *    A caller MUST NOT retry a KeyCollision indefinitely — surface it.
+     */
+    enum class CursorInsertError { Transient, KeyCollision };
+
+    /**
+     * Atomically persist a batch of power events AND the new cursor for the
+     * "power" source in ONE transaction (BEGIN IMMEDIATE..COMMIT, mu_ held
+     * for the whole batch — tar_cursor.hpp rule 6 / this header's
+     * execute_atomic_batch doc above explains why a per-call-locked helper
+     * cannot give this guarantee). Each event is inserted with INSERT OR
+     * IGNORE on the record_key UNIQUE index (tar_cursor.hpp rule 3) so a
+     * replayed event is a silent no-op, never a duplicate row. On ANY
+     * statement failure the whole transaction rolls back — events and cursor
+     * commit or fail together, never one without the other. `events` may be
+     * empty (a tick that only advances the cursor, e.g. a Baseline collect
+     * with nothing to report); the cursor is still persisted.
+     * @return {} iff the transaction committed; otherwise the discriminant
+     *         above, which the caller MUST act on differently.
+     */
+    std::expected<void, CursorInsertError> insert_power_events_and_cursor(
+        const std::vector<PowerEvent>& events, const std::string& cursor_json);
+
+    /** Same contract as insert_power_events_and_cursor, for "removable". */
+    std::expected<void, CursorInsertError> insert_removable_events_and_cursor(
+        const std::vector<RemovableEvent>& events, const std::string& cursor_json);
+
     // ── Config management ────────────────────────────────────────────────────
 
     /**
      * Get a config value by key, with an optional default.
      */
     std::string get_config(const std::string& key, const std::string& default_val = "");
+
+    /**
+     * Tri-state config read, for callers where "unreadable" and "unset" must not
+     * mean the same thing.
+     *
+     * `get_config` above returns the caller's default for BOTH, which is fine
+     * for a cosmetic setting and wrong for a control. The lookback privacy key
+     * is the case that forced this: a transient SQLite failure would otherwise
+     * turn an operator's `<name>_lookback_seconds=0` into the 7-day default and
+     * read OS-retained history on a host where that is not lawful — the control
+     * failing OPEN. Same shape, and same reason, as get_cursor's tri-state:
+     * nullopt means the query SUCCEEDED and matched no row; an error means the
+     * read failed and the caller must decide for itself, not inherit a default.
+     */
+    std::expected<std::optional<std::string>, std::string> try_get_config(const std::string& key);
 
     /**
      * Set a config value.
