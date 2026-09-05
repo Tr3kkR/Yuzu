@@ -172,6 +172,14 @@ TEST_CASE("removable channel wrap: a stored cursor behind the oldest retained re
     CHECK(channel_cursor_wrapped(1, 81));
     CHECK_FALSE(channel_cursor_wrapped(/*stored=*/100, /*oldest_retained=*/81));
     CHECK_FALSE(channel_cursor_wrapped(/*stored=*/81, /*oldest_retained=*/81)); // equal = not wrapped
+    // C3: the boundary is the first UNREAD record. Committed through 80 and
+    // retention has aged out everything through 80 -- record 81 is still there
+    // and is exactly what we are about to read, so this is the healthy steady
+    // state, not a wrap. Reporting it as one made the collector head-jump over
+    // record 81 and lose it for real.
+    CHECK_FALSE(channel_cursor_wrapped(/*stored=*/80, /*oldest_retained=*/81));
+    // One further along IS a wrap: 81 was the first unread and it is gone.
+    CHECK(channel_cursor_wrapped(/*stored=*/80, /*oldest_retained=*/82));
 }
 
 // ── Device identity (P-011) ─────────────────────────────────────────────────

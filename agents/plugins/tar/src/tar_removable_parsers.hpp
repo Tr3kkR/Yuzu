@@ -453,7 +453,17 @@ inline std::string encode_removable_cursor(const RemovableCursorState& st) {
 /// runDir/fixtures is a real instance, not a hypothetical.
 inline bool channel_cursor_wrapped(std::int64_t stored_record_id,
                                    std::int64_t oldest_retained_record_id) {
-    return stored_record_id < oldest_retained_record_id;
+    // The boundary is the FIRST UNREAD record, not the stored one. The channel
+    // is read with `EventRecordID > stored` (exclusive), so the next record we
+    // owe is `stored + 1`; nothing is lost until the oldest retained record is
+    // past it. Comparing against `stored` itself declared a wrap in the ordinary
+    // healthy case -- retention had removed everything through the record we had
+    // already committed, exactly as intended -- and the collector responded by
+    // jumping the cursor to the head, skipping the very record it was about to
+    // read. The false wrap thus CAUSED the loss it reported.
+    // Written as a subtraction on the right so a stored id at the top of the
+    // range cannot overflow.
+    return oldest_retained_record_id > 0 && stored_record_id < oldest_retained_record_id - 1;
 }
 
 // ── record_key builders (replay idempotence, tar_cursor.hpp rule 3) ────────
