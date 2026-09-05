@@ -3124,7 +3124,11 @@ TEST_CASE("File spark (real mechanism): a zombie left by a throwing unwatch is d
     REQUIRE(mech->watch("trigger", FileSparkParams{trigger_file.string()}).has_value());
     std::this_thread::sleep_for(150ms); // let the trigger's read arm
     { std::ofstream(trigger_file, std::ios::app) << "change"; } // fires → worker blocks in emit()
-    CHECK(eventually([&] { return gate->emit_calls.load() >= 1; }));
+    // REQUIRE, not CHECK (governance Gate 8 cpp-safety finding): a missed wedge here
+    // would silently degrade this test back to the pre-rewrite racy form instead of
+    // failing loudly and attributing the failure to the precondition. GateOpener
+    // already covers the resulting unwind path, so promoting this is free.
+    REQUIRE(eventually([&] { return gate->emit_calls.load() >= 1; }));
     // The worker is now wedged for the rest of this test — it cannot process kA's
     // aborted completion no matter how fast CancelIoEx's kernel-side abort is.
 
@@ -3245,7 +3249,9 @@ TEST_CASE("File spark (real mechanism): a zombie ancestor watch is drained, not 
     REQUIRE(mech->watch("trigger", FileSparkParams{trigger_file.string()}).has_value());
     std::this_thread::sleep_for(150ms); // let the trigger's read arm
     { std::ofstream(trigger_file, std::ios::app) << "change"; } // fires → worker blocks in emit()
-    CHECK(eventually([&] { return gate->emit_calls.load() >= 1; }));
+    // REQUIRE, not CHECK (governance Gate 8 cpp-safety finding) — see the sibling test
+    // above for why.
+    REQUIRE(eventually([&] { return gate->emit_calls.load() >= 1; }));
     // The worker is now wedged for the rest of this test.
 
     REQUIRE(mech->watch("k1", FileSparkParams{absent1.string()}).has_value());
