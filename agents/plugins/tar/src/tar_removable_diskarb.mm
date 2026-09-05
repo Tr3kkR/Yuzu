@@ -39,7 +39,12 @@
 namespace yuzu::tar {
 
 struct RemovableDiskArbSession::Impl {
-    DASessionRef session{nullptr};
+    // S2: owned through the shared ScopedCFRef like every other CFTypeRef in
+    // this file. It was the one exception -- a raw ref with a hand-rolled
+    // CFRelease in stop() -- which meant an exception or an early return added
+    // between DASessionCreate() and that release would have leaked the
+    // session, and it contradicted this file's own header contract.
+    yuzu::agent::ScopedCFRef<DASessionRef> session;
     dispatch_queue_t queue{nullptr};
     std::function<void(RemovableDiskArbEvent)> on_event;
     std::atomic<bool> running{false};
@@ -196,25 +201,27 @@ void RemovableDiskArbSession::start(std::function<void(RemovableDiskArbEvent)> o
     if (impl_->running.exchange(true))
         return; // already started — start() must be idempotent (P-002)
     impl_->on_event = std::move(on_event);
-    impl_->session = DASessionCreate(kCFAllocatorDefault);
-    if (impl_->session == nullptr) {
+    impl_->session.reset(DASessionCreate(kCFAllocatorDefault));
+    if (!impl_->session) {
         impl_->running = false;
         return;
     }
     impl_->queue = dispatch_queue_create("com.yuzu.tar.removable.diskarb", DISPATCH_QUEUE_SERIAL);
-    DASessionSetDispatchQueue(impl_->session, impl_->queue);
-    DARegisterDiskAppearedCallback(impl_->session, nullptr, &on_disk_appeared, impl_.get());
-    DARegisterDiskDisappearedCallback(impl_->session, nullptr, &on_disk_disappeared, impl_.get());
+    DASessionSetDispatchQueue(impl_->session.get(), impl_->queue);
+    DARegisterDiskAppearedCallback(impl_->session.get(), nullptr, &on_disk_appeared, impl_.get());
+    DARegisterDiskDisappearedCallback(impl_->session.get(), nullptr, &on_disk_disappeared,
+                                      impl_.get());
 }
 
 void RemovableDiskArbSession::stop() noexcept {
     if (!impl_->running.exchange(false))
         return; // never started, or already stopped
-    if (impl_->session != nullptr) {
-        DAUnregisterCallback(impl_->session, reinterpret_cast<void*>(&on_disk_appeared), impl_.get());
-        DAUnregisterCallback(impl_->session, reinterpret_cast<void*>(&on_disk_disappeared),
+    if (impl_->session) {
+        DAUnregisterCallback(impl_->session.get(), reinterpret_cast<void*>(&on_disk_appeared),
                              impl_.get());
-        DASessionSetDispatchQueue(impl_->session, nullptr); // unschedule
+        DAUnregisterCallback(impl_->session.get(), reinterpret_cast<void*>(&on_disk_disappeared),
+                             impl_.get());
+        DASessionSetDispatchQueue(impl_->session.get(), nullptr); // unschedule
     }
     if (impl_->queue != nullptr) {
         // Block until any callback already dispatched onto the queue has
@@ -222,10 +229,10 @@ void RemovableDiskArbSession::stop() noexcept {
         dispatch_sync(impl_->queue, ^{
         });
     }
-    if (impl_->session != nullptr) {
-        CFRelease(impl_->session);
-        impl_->session = nullptr;
-    }
+    // Released here, AFTER the queue drain above -- the ordering is the
+    // contract, so the owner is reset explicitly rather than left to Impl's
+    // destructor.
+    impl_->session.reset();
     impl_->queue = nullptr; // ARC-managed (libdispatch objects are toll-free bridged)
     impl_->on_event = nullptr;
     impl_->admitted.clear(); // a future restart begins from a clean admitted-device slate

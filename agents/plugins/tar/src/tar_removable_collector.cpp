@@ -46,6 +46,7 @@
 #include "tar_db.hpp"
 
 #include <yuzu/agent/process_enum.hpp>
+#include <yuzu/agent/scoped_fd.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -129,40 +130,16 @@ std::uint64_t seed_process_local_seq() {
 #if defined(__linux__)
 namespace {
 
-// R-019: RAII owner for the netlink uevent socket. start()/stop() open and
-// close it across the source's whole lifetime (a class member, not a
-// function-local), so a bare `int` with a matching ::close() in stop() only
-// protects the NORMAL path — an exception thrown between open and the next
-// stop() (e.g. from a std::string allocation elsewhere in start()) would
-// leak the fd. A destructor-backed owner closes on every path, including
-// that one.
-class ScopedFd {
-public:
-    ScopedFd() noexcept = default;
-    explicit ScopedFd(int fd) noexcept : fd_(fd) {}
-    ~ScopedFd() { reset(); }
-    ScopedFd(const ScopedFd&) = delete;
-    ScopedFd& operator=(const ScopedFd&) = delete;
-    ScopedFd(ScopedFd&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
-    ScopedFd& operator=(ScopedFd&& other) noexcept {
-        if (this != &other) {
-            reset();
-            fd_ = other.fd_;
-            other.fd_ = -1;
-        }
-        return *this;
-    }
-    void reset(int fd = -1) noexcept {
-        if (fd_ >= 0)
-            ::close(fd_);
-        fd_ = fd;
-    }
-    [[nodiscard]] int get() const noexcept { return fd_; }
-    [[nodiscard]] bool valid() const noexcept { return fd_ >= 0; }
-
-private:
-    int fd_{-1};
-};
+// R-019: the netlink uevent socket is owned across the source's whole
+// lifetime (a class member, not a function-local), so a bare `int` with a
+// matching ::close() in stop() only protects the NORMAL path -- an exception
+// thrown between open and the next stop() would leak the fd. The owner is
+// `yuzu::agent::ScopedFd` (agents/core/include/yuzu/agent/scoped_fd.hpp), the
+// shared primitive, NOT a local copy: an earlier revision hand-rolled one here
+// whose reset() lacked the shared type's self-reset guard, which is exactly
+// the kind of silent divergence a second copy of an ownership primitive
+// produces.
+using yuzu::agent::ScopedFd;
 
 } // namespace
 #endif
@@ -576,9 +553,12 @@ SysfsBlockIdentity read_sysfs_block_identity(const std::string& devname) {
 }
 
 int open_uevent_netlink_socket() {
-    const int fd = ::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
-                           NETLINK_KOBJECT_UEVENT);
-    if (fd < 0) {
+    // Own the descriptor BEFORE the first decision that can leave this
+    // function, so no exit path -- present or later added -- can leak it. The
+    // caller takes it by release() only once bind() has succeeded.
+    ScopedFd fd{::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                         NETLINK_KOBJECT_UEVENT)};
+    if (!fd.valid()) {
         spdlog::warn("TAR removable: netlink socket() failed (errno {})", errno);
         return -1;
     }
@@ -586,12 +566,11 @@ int open_uevent_netlink_socket() {
     addr.nl_family = AF_NETLINK;
     addr.nl_pid = 0;
     addr.nl_groups = 1; // the kernel's single kobject-uevent multicast group
-    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+    if (::bind(fd.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
         spdlog::warn("TAR removable: netlink bind() failed (errno {})", errno);
-        ::close(fd);
-        return -1;
+        return -1; // ScopedFd closes it
     }
-    return fd;
+    return fd.release();
 }
 
 /// R-019: RAII owner for a `DIR*` — a local raw opendir/closedir pair only
