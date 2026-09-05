@@ -338,6 +338,35 @@ TEST_CASE("power_live: duplicate record_key is a no-op (row count unchanged), cu
 
 // ── Atomic commit/rollback ───────────────────────────────────────────────────
 
+TEST_CASE("the lookback privacy control fails CLOSED: unreadable means forward-only, never the "
+          "default",
+          "[tar][cursor][lookback]") {
+    // get_config returns the supplied default for BOTH "unset" and "unreadable",
+    // so reading the lookback naively turns a transient SQLite failure into a
+    // 7-day retrospective read on a host where the operator set 0 precisely
+    // because such a read is not lawful there -- a privacy control failing OPEN.
+    auto t = make_test_db();
+
+    // Genuinely absent -> the documented default applies.
+    CHECK(lookback_seconds_or_forward_only(t.db, "power", 604800) == 604800);
+
+    // Explicitly stored -> honoured, including the operator's forward-only 0.
+    REQUIRE(t.db.set_config("power_lookback_seconds", "0"));
+    CHECK(lookback_seconds_or_forward_only(t.db, "power", 604800) == 0);
+
+    REQUIRE(t.db.set_config("power_lookback_seconds", "3600"));
+    CHECK(lookback_seconds_or_forward_only(t.db, "power", 604800) == 3600);
+
+    // Unreadable (the config table is gone) -> 0, NOT the 7-day default. This is
+    // the assertion that matters: the naive get_config(key, default) shape
+    // returns 604800 here.
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(raw, "DROP TABLE tar_config", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(raw);
+    CHECK(lookback_seconds_or_forward_only(t.db, "power", 604800) == 0);
+}
+
 TEST_CASE("an embedded NUL cannot silently truncate a persisted field or collapse two keys",
           "[tar][cursor][nul]") {
     // sqlite3_bind_text with length -1 stops at the first NUL. Two consequences,

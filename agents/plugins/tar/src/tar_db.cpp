@@ -1233,6 +1233,39 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_removabl
 
 // ── Config management ────────────────────────────────────────────────────────
 
+std::expected<std::optional<std::string>, std::string>
+TarDatabase::try_get_config(const std::string& key) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected("TarDatabase::try_get_config: no open database");
+
+    const char* sql = "SELECT value FROM tar_config WHERE key = ?";
+    sqlite3_stmt* raw_stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
+        std::string err =
+           std::string("TarDatabase::try_get_config prepare failed: ") + sqlite3_errmsg(db_);
+        spdlog::error("{}", err);
+        return std::unexpected(std::move(err));
+    }
+    StmtPtr stmt(raw_stmt);
+    sqlite3_bind_text(stmt.get(), 1, key.c_str(), static_cast<int>(key.size()), SQLITE_STATIC);
+
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW) {
+        const auto* t = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        return std::optional<std::string>(
+           t ? std::string(t, static_cast<std::size_t>(sqlite3_column_bytes(stmt.get(), 0)))
+             : std::string{});
+    }
+    if (rc != SQLITE_DONE) {
+        std::string err =
+           std::string("TarDatabase::try_get_config step failed: ") + sqlite3_errmsg(db_);
+        spdlog::error("{}", err);
+        return std::unexpected(std::move(err));
+    }
+    return std::optional<std::string>{}; // succeeded, no row
+}
+
 std::string TarDatabase::get_config(const std::string& key, const std::string& default_val) {
     std::lock_guard lock(mu_);
     if (!db_)

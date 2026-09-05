@@ -94,6 +94,17 @@
 //     removable follow the identical shape rather than inventing a second
 //     one.
 //
+//     IT FAILS CLOSED. `TarDatabase::get_config` returns the DEFAULT on a read
+//     failure -- no open db, a failed prepare, a step that is neither ROW nor
+//     DONE -- so reading the lookback naively turns a transient SQLite failure
+//     into a 7-day retrospective read on a host where the operator set 0
+//     precisely because a retrospective read is not lawful there. That is a
+//     privacy control failing OPEN, and it is the same defect class the
+//     get_cursor tri-state exists to prevent, one call away. So: a source that
+//     cannot READ its lookback treats it as 0 (forward-only), never as the
+//     default. Use lookback_seconds_or_forward_only() below; do not call
+//     get_config for this key directly.
+//
 //  6. A subscription/callback-fed source must never DESTRUCTIVELY drain its
 //     callback queue before the corresponding DB transaction commits (P-003).
 //     BoundedPendingQueue below is the shared mechanism: push() is safe to
@@ -239,6 +250,19 @@ struct CursorCollectResult {
 /// rather than the process. That backstop exists because the cost of being
 /// wrong is the whole agent; it does NOT relax the rule above, because a
 /// contained throw still silently costs a collection tick.
+/// Read `<name>_lookback_seconds`, FAILING CLOSED (rule 5).
+///
+/// A retrospective source must never widen its own reach because a config read
+/// failed. `TarDatabase::get_config` cannot distinguish "unset" from
+/// "unreadable" -- it returns the supplied default for both -- so a naive read
+/// turns a transient SQLite failure into a 7-day retrospective read on a host
+/// where the operator set 0 precisely because such a read is not lawful there.
+/// This returns the declared default ONLY when the key is genuinely absent;
+/// anything unreadable or malformed yields 0 (forward-only).
+[[nodiscard]] std::int64_t lookback_seconds_or_forward_only(TarDatabase& db,
+                                                            const std::string& source,
+                                                            std::int64_t declared_default);
+
 class CursorSource {
 public:
     /// Must be safe on a source that was NEVER stop()ped -- a start() that

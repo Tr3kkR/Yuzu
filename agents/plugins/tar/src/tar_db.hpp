@@ -467,6 +467,21 @@ public:
     std::string get_config(const std::string& key, const std::string& default_val = "");
 
     /**
+     * Tri-state config read, for callers where "unreadable" and "unset" must not
+     * mean the same thing.
+     *
+     * `get_config` above returns the caller's default for BOTH, which is fine
+     * for a cosmetic setting and wrong for a control. The lookback privacy key
+     * is the case that forced this: a transient SQLite failure would otherwise
+     * turn an operator's `<name>_lookback_seconds=0` into the 7-day default and
+     * read OS-retained history on a host where that is not lawful — the control
+     * failing OPEN. Same shape, and same reason, as get_cursor's tri-state:
+     * nullopt means the query SUCCEEDED and matched no row; an error means the
+     * read failed and the caller must decide for itself, not inherit a default.
+     */
+    std::expected<std::optional<std::string>, std::string> try_get_config(const std::string& key);
+
+    /**
      * Set a config value.
      */
     /// False once the store has failed closed -- either it never opened, or a
