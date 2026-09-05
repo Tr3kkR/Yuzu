@@ -427,15 +427,20 @@ TEST_CASE("#3953 item 1: a reclaimed orphan's thrown exception is counted, not j
 TEST_CASE("#3953 item 2: a same-entry send stalled past the threshold is counted once, "
           "and a recovery log fires on eventual completion",
           "[spark][guardian][send_executor][chaos]") {
-    GuardianOutboxSendExecutor exec{50ms}; // short threshold - no real multi-second wait
+    // Threshold is 300ms, not the file's usual 50ms: the very next line's "not yet
+    // stalled" check must survive ONE 20ms-bounded offer() call actually taking
+    // meaningfully longer than 20ms of wall clock (detached-thread spawn overhead,
+    // scheduling jitter) - observed flaking on a loaded macOS CI runner at 50ms
+    // (2.5x margin was not enough; 15x is).
+    GuardianOutboxSendExecutor exec{300ms};
     StallingSend send;
     auto entry = lifecycle_entry("e1");
 
     auto first = exec.offer(entry, std::ref(send), 20ms);
     CHECK_FALSE(first.has_value());
-    CHECK(exec.send_stall_count() == 0); // not stalled yet - under the 50ms threshold
+    CHECK(exec.send_stall_count() == 0); // not stalled yet - under the threshold
 
-    // Repeated 20ms offers on the SAME entry until the 50ms threshold is crossed.
+    // Repeated 20ms offers on the SAME entry until the threshold is crossed.
     // NON-fatal (CHECK, not REQUIRE): send.release() below MUST run regardless, or the
     // detached worker - still blocked in send.cv.wait() - outlives this stack frame's
     // synchronization primitives once the test function returns.
