@@ -1,0 +1,91 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/settings/management-groups",
+    "capability_id": "post.api-settings-management-groups",
+    "rest_v1_twin": {
+      "method": "POST",
+      "path": "/api/v1/management-groups"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/management-groups/{param}",
+    "capability_id": "delete.api-settings-management-groups-param",
+    "rest_v1_twin": {
+      "method": "DELETE",
+      "path": "/api/v1/management-groups/{param}"
+    },
+    "mcp_twin": null,
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/create-group-form",
+    "capability_id": "get.fragments-create-group-form",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/device/info",
+    "capability_id": "get.fragments-device-info",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/device/live",
+    "capability_id": "get.fragments-device-live",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/device/live/result",
+    "capability_id": "get.fragments-device-live-result",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/device/live/run",
+    "capability_id": "get.fragments-device-live-run",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/device/page",
+    "capability_id": "get.fragments-device-page",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/devices/list",
+    "capability_id": "get.fragments-devices-list",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/management-groups",
+    "capability_id": "get.fragments-settings-management-groups",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/management-groups"
+    },
+    "mcp_twin": "list_management_groups",
+    "status": "twinned"
+  }
+]

@@ -421,6 +421,18 @@ jobs:
           bash scripts/ci/check-metrics-help-ascii.sh --selftest
           bash scripts/ci/check-metrics-help-ascii.sh
 
+      # API parity ledger gate (#3991, F1 of the #2146 programme; ADR-0031
+      # INV-31-4). Pure lexical source-tree analysis — no build deps — so it
+      # belongs here beside the other preflight gates rather than in a build
+      # job. Fails on an unledgered fragment/legacy route, a stale twin
+      # claim, an undocumented+unallowlisted /api/v1 route, the untwinned-row
+      # ratchet regressing, or docs/api-parity-ledger.md's generated block
+      # going stale. See that script's module docstring for the full
+      # contract and the "lexical tripwire, not a proof" caveat.
+      - name: API parity ledger gate (#3991)
+        run: |
+          python3 scripts/ci/check-api-parity.py
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"
