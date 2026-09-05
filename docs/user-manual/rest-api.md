@@ -1623,7 +1623,20 @@ Quarantine a device.
 > always present, `0` on a clean dispatch — so `agents_reached: 97` on a
 > 100-device group is distinguishable from three devices being offline, and a
 > MIXED partial dispatch (some reached, some plugin-absent) is never silently
-> invisible in the response. The dashboard's own execute console
+> invisible in the response. The success body also carries `audit_emitted`
+> (#2557), the same field every denial arm that calls `emit_behavioral_audit`
+> on this route already carries (the body-type, targeting-shape,
+> Destructive-untargeted, Destructive-no-visible-target, no-target-named and
+> classification-denial 400/403/404 arms) — NOT the scope-parse 400 (an
+> unrelated JSON shape with no audit call at all) or the sent==0 503 family,
+> neither of which ever carried it — present and `false` only when the paired `command.dispatch`
+> `result=success` audit row failed to persist (the response also sets
+> `Sec-Audit-Failed: true` in that case), omitted entirely when no audit
+> store is configured. Before #2557 the success path's audit call was
+> unguarded against a throwing sink and never reported this field at all —
+> the one response shape most likely to be read as "everything is fine" was
+> also the one place a silent audit-persist failure was invisible to the
+> caller. The dashboard's own execute console
 > (`/api/dashboard/execute`, a separate HTML-fragment handler, not this route)
 > now names the same containment/quarantine/plugin-absence causes on a
 > zero-agents-reached dispatch; it does not yet surface withheld counts on a
@@ -6784,8 +6797,17 @@ is then confined to their currently visible agents (management-group scope); an 
 confines to nothing returns:
 
 ```json
-{"error": {"code": 404, "message": "no reachable in-scope agent"}, "meta": {"api_version": "v1"}}
+{"error": {"code": 404, "message": "no reachable in-scope agent"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
 ```
+
+(#2557) This 404 is now counted
+(`yuzu_server_dispatch_target_rejected_total{route="command",reason="destructive_no_visible_target"}`)
+and audited (`command.dispatch`, `result=denied`, same `audit_emitted` convention as every other
+denial on this route) — previously it carried neither, so an incident review of "an operator
+tried to dispatch a Destructive action at devices they cannot see" found nothing at all.
+Distinct from `destructive_untargeted` above: that reason means the caller named no target at
+all; `destructive_no_visible_target` means a non-empty `agent_ids` list WAS supplied, but every
+named id fell outside the caller's visible-agent confinement.
 
 A `plugin.action` pair the registry cannot classify (`Unclassified`/`Ambiguous`) is **not**
 independently denied by this gate — it falls through to the same dispatch chokepoint that denies

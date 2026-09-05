@@ -1063,10 +1063,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                              // answers in its own idiom for the reason given in
                              // the RefuseUntargeted arm. Audited as a scope
                              // violation, matching the sibling destructive
-                             // fragment (tar retention-paused purge) rather
-                             // than /api/command, which audits nothing on this
-                             // arm — an operator dropped by confinement is
-                             // exactly the event an incident review looks for.
+                             // fragment (tar retention-paused purge) — as of
+                             // #2557's fix #5, /api/command now ALSO audits
+                             // and counts this arm (it previously audited
+                             // nothing here) — an operator dropped by
+                             // confinement is exactly the event an incident
+                             // review looks for.
                              // Log the requested target. Without this the
                              // agent an operator actually asked for is in
                              // NEITHER channel on this arm: the audit row

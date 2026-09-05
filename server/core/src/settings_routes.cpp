@@ -18,6 +18,7 @@
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
+#include "json_extract.hpp" // #2557: shared extract_json_string (was an anonymous-namespace copy)
 #include "mcp_policy.hpp"
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
@@ -221,15 +222,8 @@ std::string highlight_yaml_kv(const std::string& line) {
     return errors;
 }
 
-std::string extract_json_string(const std::string& body, const std::string& key) {
-    try {
-        auto j = nlohmann::json::parse(body);
-        if (j.contains(key) && j[key].is_string()) {
-            return j[key].get<std::string>();
-        }
-    } catch (...) {}
-    return {};
-}
+// extract_json_string moved to json_extract.hpp (#2557) — SettingsRoutes
+// lives in namespace yuzu::server, so this unqualified name still resolves.
 
 } // anonymous namespace
 
