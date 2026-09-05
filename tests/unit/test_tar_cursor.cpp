@@ -332,6 +332,50 @@ TEST_CASE("power_live: duplicate record_key is a no-op (row count unchanged), cu
 
 // ── Atomic commit/rollback ───────────────────────────────────────────────────
 
+TEST_CASE("a mid-batch refusal rolls back the events that ALREADY inserted, not just the cursor "
+          "(observes the transaction, not its absence)",
+          "[tar][cursor][atomicity]") {
+    // The sibling tests below force the FIRST statement to fail by dropping the
+    // table, so nothing ever inserts and the cursor write never runs -- they
+    // pass with no transaction at all and cannot observe a rollback. This one
+    // can: a good event inserts, a colliding one is refused mid-loop, and the
+    // good row must be GONE afterwards. Replacing ROLLBACK with COMMIT fails
+    // exactly here.
+    auto t = make_test_db();
+
+    PowerEvent seed;
+    seed.ts = 100;
+    seed.snapshot_id = 1;
+    seed.action = "sleep";
+    seed.detail = "lid";
+    seed.record_key = "collide";
+    REQUIRE(t.db.insert_power_events_and_cursor({seed}, R"({"v":1,"pos":1})"));
+
+    PowerEvent good;
+    good.ts = 200;
+    good.snapshot_id = 2;
+    good.action = "wake";
+    good.record_key = "good-row";
+
+    PowerEvent collides = seed;      // same key ...
+    collides.ts = 900;               // ... different payload => refused
+    collides.snapshot_id = 2;
+
+    CHECK_FALSE(t.db.insert_power_events_and_cursor({good, collides}, R"({"v":1,"pos":2})"));
+
+    // `good` inserted before the refusal. If the transaction did not roll back
+    // it would still be here -- a forensic row from a batch the store told the
+    // caller it had REJECTED.
+    auto rows = t.db.execute_query("SELECT COUNT(*) FROM power_live WHERE record_key = 'good-row'");
+    REQUIRE(rows.has_value());
+    CHECK(rows->rows[0][0] == "0");
+
+    // ... and the cursor did not advance either.
+    auto c = read_cursor(t.db, "power");
+    REQUIRE(c.has_value());
+    CHECK(*c == R"({"v":1,"pos":1})");
+}
+
 TEST_CASE("insert_power_events_and_cursor rolls back the cursor when the event insert fails",
           "[tar][cursor]") {
     auto t = make_test_db();
@@ -347,9 +391,10 @@ TEST_CASE("insert_power_events_and_cursor rolls back the cursor when the event i
     ev.record_key = "will-not-land";
     CHECK_FALSE(t.db.insert_power_events_and_cursor({ev}, R"({"v":2})"));
 
-    // Neither half landed: the cursor is exactly what it was before this
-    // call (rule 6 / tar_db.hpp:458-477 -- events and cursor commit or fail
-    // together).
+    // Narrow by construction: the table is gone, so the FIRST statement fails
+    // and nothing was inserted to roll back. This shows the cursor is not
+    // written when the events cannot be -- the rollback itself is observed by
+    // the mid-batch-refusal test above.
     CHECK(read_cursor(t.db, "power") == std::string(R"({"v":1})"));
 }
 
