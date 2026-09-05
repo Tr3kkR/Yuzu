@@ -224,10 +224,14 @@ TEST_CASE("#2500 — the route-level reason set matches what the routes actually
     // (server.cpp shared command_dispatch_fn), `destructive_untargeted`
     // (#3685: server.cpp /api/command Destructive RefuseUntargeted arm AND
     // mcp_server.cpp execute_instruction's C8 pre-mint + main-handler sites —
-    // the one reason in this array with more than one owning surface).
-    const std::array<std::string_view, 6> emitted_by_routes{
-        "body_type",         "parent_id_type",         "parent_id_empty",
-        "closure_no_target", "scope_unsupported", "destructive_untargeted"};
+    // the one reason in this array with more than one owning surface),
+    // `destructive_no_visible_target` (#2557: command_routes.cpp's Destructive
+    // gate, the confine-to-visible-agents 404 arm).
+    const std::array<std::string_view, 7> emitted_by_routes{
+        "body_type",          "parent_id_type",
+        "parent_id_empty",    "closure_no_target",
+        "scope_unsupported",  "destructive_untargeted",
+        "destructive_no_visible_target"};
 
     CHECK(kRouteRejectReasons.size() == emitted_by_routes.size());
     for (const auto r : emitted_by_routes) {

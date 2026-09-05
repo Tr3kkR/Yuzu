@@ -979,6 +979,28 @@ groups:
             denials are observed on yuzu_server_quarantine_gate_total and audited
             as quarantine.dispatch_denied.
 
+      - alert: YuzuDispatchFanoutThrew
+        expr: |
+          increase(yuzu_server_dispatch_fanout_throw_total[15m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "POST /api/command's audit sink is throwing, not cleanly declining"
+          description: >-
+            yuzu_server_dispatch_fanout_throw_total is non-zero on
+            {{ $labels.route }} (phase={{ $labels.phase }}). The wired AuditFn
+            (ultimately AuditStore::log) threw an exception rather than
+            returning false — a distinct condition from an ordinary
+            persist failure, which yuzu_server_audit_emit_failed_total /
+            YuzuAuditPersistFailures already cover and which the caller-visible
+            response (Sec-Audit-Failed, audit_emitted:false) is unaffected by
+            either way. A well-behaved audit sink should report failure via its
+            bool return, not an exception; a non-zero rate here points at a bug
+            in the audit sink itself (e.g. an allocation failure surfacing as
+            bad_alloc, or a logic error) rather than at ordinary store
+            degradation. for: 2m avoids paging on a single transient throw.
+
   - name: yuzu-tls
     rules:
       - alert: YuzuCertificateExpiringSoon

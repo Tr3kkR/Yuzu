@@ -302,6 +302,17 @@ public:
     // Record send time for latency measurement.
     void record_send_time(const std::string& command_id);
 
+    /// #2557: drops the send-time record for a fan-out that reached nobody
+    /// (`sent == 0`) or a dispatch that never completed (an exception unwound
+    /// before any agent response arrived). Without this, `record_send_time`'s
+    /// entry survives until SOME LATER agent response happens to carry the
+    /// same `command_id` (which, for a dispatch that reached nobody, never
+    /// happens) — a slow, unbounded leak of `cmd_send_times_` entries on every
+    /// refused/zero-reach `/api/command` dispatch. Exception-safe (never
+    /// throws) and safe to call from a destructor/RAII guard.
+    /// @return true if an entry was actually removed.
+    bool discard_send_time(const std::string& command_id);
+
     /// Register the executions-tracker row id that this command_id belongs
     /// to (PR 2). Called by the dispatch path after `create_execution`
     /// returns the new id. The mapping is consumed by the response-receipt
@@ -394,6 +405,17 @@ private:
     std::mutex cmd_times_mu_;
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> cmd_send_times_;
     std::unordered_set<std::string> cmd_first_seen_;
+
+    /// #2557: the ONE place `cmd_send_times_` is erased. Every mutation site
+    /// (a completed round-trip, `discard_send_time`) goes through this so the
+    /// `yuzu_cmd_send_times_pending` gauge can never drift from the map's true
+    /// size — a bare `.erase(it)` at a new call site would be exactly that
+    /// drift. Caller holds `cmd_times_mu_`.
+    void erase_send_time_locked(
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point>::iterator it);
+    /// Publishes the current `cmd_send_times_.size()` to the pending-count
+    /// gauge. Caller holds `cmd_times_mu_`.
+    void publish_send_times_gauge_locked();
     // The former in-process `cmd_execution_ids_` map (command_id ->
     // execution_id) moved to Postgres (HA WS-1(1b), ADR-2002 section 5) —
     // see ExecutionTracker::record_command_execution /
