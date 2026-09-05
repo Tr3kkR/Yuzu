@@ -110,6 +110,14 @@ struct CaptureSourceDef {
     // (Declared before os_support so the designated initialisers in
     // build_sources() stay in member-declaration order.)
     bool default_enabled = true;
+    // Non-empty for a source whose LIVE tier enforces replay idempotence via a
+    // UNIQUE index (tar_cursor.hpp rule 3 — the cursor-model seam). When set,
+    // generate_warehouse_ddl() emits
+    // `CREATE UNIQUE INDEX IF NOT EXISTS <table>_record_key_uq ON <table>(<this column>)`
+    // for the live tier only. Empty ("") for every source that has no such
+    // column (the default — a plain diff-driven source has no idempotence
+    // requirement beyond its own diff logic).
+    std::string_view unique_key_column;
     std::vector<OsSupport> os_support;
     std::vector<GranularityDef> granularities;
 };
