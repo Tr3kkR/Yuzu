@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cwctype>
 #include <filesystem>
+#include <functional> // #2839 retire fault hook
 #include <memory>
 #include <mutex>
 #include <string>
@@ -184,6 +185,20 @@ public:
             unwatch_locked(key);
         }
         auto& slot = dirs_[dirkey];
+        // Security-guardian Gate 2 finding: #2839's reorder (push_retiring taking a
+        // reference, erasing dirs_[dirkey] only after the transfer completes) means a
+        // throw during a PRIOR unwatch()/release_ancestor() leaves this exact key
+        // pointing at a `removing` zombie instead of freeing it for reuse — the hazard
+        // the "Free dirkey for reuse NOW" comment in unwatch_locked() exists to close,
+        // reopened on the throw path. Left unguarded, a same-directory watch() lands
+        // here, `slot` is non-null so the `if (!slot)` branch below is skipped, and the
+        // NEW key gets silently attached to a watch already cancelled and awaiting
+        // reclaim — watch() reports success, but nothing will ever fire for it. Drain
+        // the zombie first: push_retiring leaves `slot` untouched on a throw (its own
+        // contract), so a failure here just propagates to watch_guarded()'s existing
+        // failure handling exactly like any other watch() failure — no new hazard.
+        if (slot && slot->removing)
+            push_retiring(slot);
         if (!slot) {
             slot = std::make_unique<DirWatch>();
             slot->dir = parent.wstring();
@@ -232,18 +247,29 @@ public:
         // that many (skipping our control wake), with a bounded wait so a lost
         // completion can never hang shutdown.
         std::size_t pending = 0;
-        auto cancel = [&](DirWatch& w) {
-            if (w.handle && w.io_pending) {
-                ::CancelIoEx(w.handle.get(), &w.ov);
+        // #2839: takes the OWNER, not a reference to the pointee, so the null check
+        // covers all THREE loops at once. Every one of them used to deref `*w`
+        // unguarded, while the quarantine sweep below already guarded — the asymmetry
+        // was the bug: a push_retiring that threw past its ownership move left a
+        // moved-from (null) unique_ptr keyed in dirs_/ancestors_, and this was the loop
+        // that dereferenced it. The reorder in push_retiring means that null can no
+        // longer be produced; the guard stays because a cancel loop walking
+        // caller-owned containers must not be the thing that decides whether some future
+        // caller is allowed to leave a null behind.
+        auto cancel = [&](const std::unique_ptr<DirWatch>& w) {
+            if (!w)
+                return;
+            if (w->handle && w->io_pending) {
+                ::CancelIoEx(w->handle.get(), &w->ov);
                 ++pending;
             }
         };
         for (auto& [k, w] : dirs_)
-            cancel(*w);
+            cancel(w);
         for (auto& [k, w] : ancestors_)
-            cancel(*w);
+            cancel(w);
         for (auto& w : retiring_)
-            cancel(*w);
+            cancel(w);
         bool lost_completion = false;
         while (pending > 0) {
             DWORD bytes = 0;
@@ -328,11 +354,52 @@ private:
     /// choke point unwatch_locked() and release_ancestor() both route a
     /// cancelled DirWatch through, so the gauge and the cap in watch() stay
     /// consistent with each other regardless of which caller triggered it.
-    void push_retiring(std::unique_ptr<DirWatch> w) {
-        retiring_.push_back(std::move(w));
-        if (retiring_gauge_.fetch_add(1, std::memory_order_relaxed) + 1 == kRetiringCap / 2)
-            spdlog::warn("spark_file: retiring_ crossed {} of {} pending IOCP teardowns",
-                         kRetiringCap / 2, kRetiringCap);
+    ///
+    /// #2839 — WHY THE PARAMETER IS A REFERENCE AND THE ORDER IS WHAT IT IS.
+    /// This used to take the owning unique_ptr BY VALUE and start with
+    /// `retiring_.push_back(std::move(w))`. Two ways that lost:
+    ///   * push_back reallocates, so it can throw std::bad_alloc. The by-value
+    ///     parameter is then destroyed during the unwind — DESTROYING A DirWatch
+    ///     WHOSE ReadDirectoryChangesW IS STILL OUTSTANDING. The kernel goes on to
+    ///     write into that freed buffer and OVERLAPPED whenever the read completes.
+    ///     That is the defect: not a leak, a use-after-free the process cannot see.
+    ///   * the gauge-crossing spdlog::warn runs AFTER the transfer and allocates too,
+    ///     so under the same memory pressure it escapes this function and its caller,
+    ///     skipping the caller's `dirs_.erase(di)` / `ancestors_.erase(it)` and leaving
+    ///     a MOVED-FROM (null) unique_ptr keyed in the map — which stop()'s cancel
+    ///     loops then dereferenced.
+    ///
+    /// The order below makes the whole transfer effectively atomic from the caller's
+    /// point of view. `retiring_.emplace_back()` is the only allocating step and it runs
+    /// while the CALLER still owns the watch, so a throw there loses nothing: the entry
+    /// stays fully in dirs_/ancestors_, already `removing` + cancelled, and drop_watch()
+    /// still frees it when the aborted completion drains (it searches all three
+    /// containers). The move-assign that follows is noexcept, and the log is contained.
+    /// So the outcome is always ONE of: fully quarantined into retiring_, or fully
+    /// retained where it was — never the half state.
+    ///
+    /// The caller MUST erase its map entry only AFTER this returns.
+    void push_retiring(std::unique_ptr<DirWatch>& w) {
+        // #2839 seam: fires immediately before the one allocating statement, so a test
+        // can aim a std::bad_alloc at it. Single-shot — consumed on use.
+        if (retire_fault_hook_for_test_) {
+            auto hook = std::move(retire_fault_hook_for_test_);
+            retire_fault_hook_for_test_ = nullptr;
+            hook();
+        }
+        retiring_.emplace_back();        // MAY THROW — `w` untouched, caller keeps ownership
+        retiring_.back() = std::move(w); // noexcept: unique_ptr move-assign
+        const auto prev = retiring_gauge_.fetch_add(1, std::memory_order_relaxed);
+        if (prev + 1 == kRetiringCap / 2) {
+            // CONTAINED. Losing a log line is strictly better than unwinding a completed
+            // ownership transfer — the same trade arm_impl makes for its "armed" log
+            // (spark_engine.cpp). Nothing past the move above may escape this function.
+            try {
+                spdlog::warn("spark_file: retiring_ crossed {} of {} pending IOCP teardowns",
+                             kRetiringCap / 2, kRetiringCap);
+            } catch (...) {
+            }
+        }
     }
 
     /// Core of unwatch(); ASSUMES mu_ IS ALREADY HELD. Also called by watch()
@@ -360,10 +427,19 @@ private:
             // the worker free the DirWatch when the (aborted) completion drains —
             // never free memory a pending completion points at. Else drop now.
             release_ancestor(w);
-            // Guard shape matches release_ancestor's below exactly (io_pending
-            // implies handle everywhere in this file, but check both so the
-            // two "same pattern" sites stay textually identical — governance
-            // Gate-4 consistency finding).
+            // Same guard as release_ancestor's below — deliberately, so the two
+            // "cancel it and let the worker free it" sites stay in lockstep. Both
+            // conditions are checked at both sites even though io_pending implies
+            // handle everywhere in this file.
+            //
+            // The OPERANDS ARE IN THE OPPOSITE ORDER at the two sites, and that is the
+            // whole of the difference: this one reads `io_pending && handle`,
+            // release_ancestor reads `handle && io_pending`. Both are pure member reads
+            // with no side effects, so the order cannot matter. An earlier version of
+            // this comment claimed the two sites were "textually identical", which they
+            // have never been — corrected rather than papered over, because a reader
+            // diffing the pair on the strength of that claim would conclude one of them
+            // had been edited.
             if (w.io_pending && w.handle) {
                 w.removing = true;
                 ::CancelIoEx(w.handle.get(), &w.ov);
@@ -376,7 +452,11 @@ private:
                 // is no live ReadDirectoryChangesW behind it (governance
                 // finding, PR #1927 review), matching release_ancestor's
                 // existing retiring_ pattern above.
-                push_retiring(std::move(di->second));
+                // #2839: the erase runs only after the transfer has COMPLETED. If
+                // push_retiring throws, this entry stays whole in dirs_ (already
+                // `removing` and cancelled), and the worker's drop_watch() frees it when
+                // the aborted completion drains.
+                push_retiring(di->second);
                 dirs_.erase(di);
             } else {
                 dirs_.erase(di);
@@ -506,6 +586,35 @@ private:
             return true; // already depending on exactly this ancestor — no churn
         release_ancestor(dependent);
         auto& slot = ancestors_[akey];
+        // Same zombie-reattachment hazard as watch()'s dirs_ lookup above (security-
+        // guardian Gate 2 finding), but arm_ancestor() is ALSO called directly from
+        // run()'s worker-thread loop (the `!ok`/is_ancestor branches below), which has
+        // NO exception containment above it — unlike watch(), which watch_guarded()
+        // always wraps. Letting push_retiring's rare bad_alloc escape from here would
+        // std::terminate the process instead of just failing one arm. So contain it
+        // locally: a `false` return reports the fault via collect_health() (`faulted`),
+        // with no dedicated retry of this specific ancestor arm — an imprecision in an
+        // earlier draft of this comment claimed a guaranteed retry that doesn't exist
+        // (governance Gate 8 cpp-expert finding). push_retiring leaves the zombie
+        // untouched on a throw, so nothing is lost if a later pass DOES reach it.
+        //
+        // OBSERVABILITY NOTE (governance Gate 8 cross-platform finding): unlike a
+        // throwing unwatch() reached via SparkEngine's disarm()/teardown_arm_race(),
+        // which increment a counted, logged failure stat, this catch — and
+        // release_ancestor()'s matching one below — swallow with no counter and no
+        // log line at all. That is a real, deliberate asymmetry (this call site has no
+        // SparkEngine catch above it to report to), not fixed here: adding a counter
+        // would mean growing SparkMechanismStats, a shared interface across all three
+        // mechanisms, for a Windows-only, bad_alloc-only, ancestor-path-only fault —
+        // out of proportion to this fix. docs/spark-flip-gate.md's #2833 entry is
+        // scoped accordingly.
+        if (slot && slot->removing) {
+            try {
+                push_retiring(slot);
+            } catch (...) {
+                return false;
+            }
+        }
         if (!slot) {
             slot = std::make_unique<DirWatch>();
             slot->dir = anc.wstring();
@@ -537,7 +646,38 @@ private:
         if (it->second->handle && it->second->io_pending) {
             it->second->removing = true;
             ::CancelIoEx(it->second->handle.get(), &it->second->ov);
-            push_retiring(std::move(it->second));
+            // #2839: the SECOND call site, with the identical push-then-erase hazard —
+            // the original fix named only unwatch_locked's. Same contract: erase only
+            // after the transfer completed; a throw leaves the entry whole in ancestors_
+            // for drop_watch() to reclaim.
+            //
+            // Governance Gate 3 (cpp-expert) finding: release_ancestor() is reachable
+            // from run() with NO exception containment above it — directly (via
+            // reresolve_absent(), called from run()'s is_ancestor branch) and via
+            // arm_ancestor()'s own three unguarded calls to this function before its
+            // own zombie-drain code (which IS wrapped, below). An uncaught throw here
+            // would std::terminate the worker thread's process, not just fail one arm
+            // — the exact hazard the zombie-drain fix elsewhere in this file was
+            // written to avoid, missed here because this call predates that fix.
+            // Contained the same way: on failure the entry simply stays in ancestors_
+            // (already `removing`, cancelled) for drop_watch() to reclaim when the
+            // aborted completion drains — no different from the ordinary "leave it
+            // whole" contract push_retiring already documents for a throw, just
+            // caught here instead of propagating into un-owned territory.
+            //
+            // MUST return, not fall through, on a caught throw: push_retiring leaves
+            // `it->second` UNTOUCHED (its own contract — the caller keeps ownership),
+            // so falling through to ancestors_.erase(it) below would destroy a live
+            // DirWatch this call never actually transferred out — freeing memory a
+            // cancelled-but-undrained kernel I/O may still reference. That is exactly
+            // the use-after-free class #2839 exists to prevent, reintroduced here if
+            // the erase runs unconditionally after a caught (rather than propagated)
+            // throw.
+            try {
+                push_retiring(it->second);
+            } catch (...) {
+                return;
+            }
         }
         ancestors_.erase(it);
     }
@@ -731,12 +871,39 @@ private:
     /// Started, but the IOCP could not be created — every watch() will be refused.
     /// Atomic so stats() (const, heartbeat thread) reads it without mu_.
     std::atomic<bool> inert_{false};
+    /// #2839 test seam; null = no-op. Set-then-use, single-shot: push_retiring consumes
+    /// it. Guarded by mu_ in effect — push_retiring only ever runs under it — but the
+    /// installer (set_file_retire_fault_hook_for_test) takes mu_ explicitly so a test
+    /// that arms the hook from another thread is not a data race.
+    std::function<void()> retire_fault_hook_for_test_;
+
+public:
+    /// #2839: install the retire fault hook. Public so the TU-boundary free function
+    /// below can reach it after its dynamic_cast; takes mu_ because the hook member is
+    /// read under mu_ by push_retiring.
+    void set_retire_fault_hook_for_test(std::function<void()> hook) {
+        std::lock_guard lk(mu_);
+        retire_fault_hook_for_test_ = std::move(hook);
+    }
 };
 
 } // namespace
 
 std::unique_ptr<ISparkMechanism> make_file_mechanism() {
     return std::make_unique<WindowsFileMechanism>();
+}
+
+bool set_file_retire_fault_hook_for_test(ISparkMechanism& mech, std::function<void()> hook) {
+    // The dynamic_cast has to happen HERE, inside the only TU that can name the type
+    // (WindowsFileMechanism is anonymous-namespace). That is the whole reason this seam
+    // is a free function rather than a method — see the declaration in
+    // spark_mechanism.hpp. A non-file mechanism returns false rather than silently
+    // installing nothing.
+    auto* file = dynamic_cast<WindowsFileMechanism*>(&mech);
+    if (file == nullptr)
+        return false;
+    file->set_retire_fault_hook_for_test(std::move(hook));
+    return true;
 }
 
 } // namespace yuzu::agent
@@ -747,6 +914,14 @@ namespace yuzu::agent {
 
 std::unique_ptr<ISparkMechanism> make_file_mechanism() {
     return nullptr; // no mechanism → SparkEngine rejects arm(File) off Windows
+}
+
+bool set_file_retire_fault_hook_for_test(ISparkMechanism&, std::function<void()>) {
+    // #2839: nothing to hook. make_file_mechanism() returns nullptr here, so no file
+    // mechanism can exist on this platform. Defined rather than omitted so the
+    // declaration links everywhere and a cross-platform test can call it and branch on
+    // the result, instead of every caller needing its own #ifdef.
+    return false;
 }
 
 } // namespace yuzu::agent

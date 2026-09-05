@@ -293,7 +293,7 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **~105 routes inline** on
+startup. `server.cpp` wires those owners, *and* registers a further **105 routes inline** on
 `web_server_->{Get,Post,Put,Delete}` — the health and readiness probes, the static-asset surface,
 much of the `/api/*` dashboard JSON, and `POST /api/command`
 (`server/core/src/server.cpp:7951`). It constructs no `HttplibRouteSink` of its own, so none of
@@ -332,9 +332,12 @@ fragments shipped a destructive operation with no route-handler coverage until #
 **Invariant.** New route owners register through `HttpRouteSink&`; new routes on an existing owner
 register through the sink that owner already uses. Do not add a handler that only the
 `httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
-Registrations outside the sink are pre-existing debt, not a precedent to copy: seven route owners
-(40 registrations — `DiscoveryRoutes` joined the sink pattern in PR #3064) plus `server.cpp`'s
-~105 inline ones, roughly 145 in total.
+Registrations outside the sink are pre-existing debt, not a precedent to copy: after #2542 PR-1
+(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), `mcp_server.cpp` is the only
+remaining route owner registering directly on a raw `svr.{Get,Post,Delete}` (3 registrations) —
+plus `server.cpp`'s own 105 inline routes (a bare `grep -c` of the pattern above returns 106; one
+hit at `server.cpp:9468` is a comment, not a registration), which are not a route-owner class and
+are untouched by this migration; 108 registrations remain outside the sink in total.
 
 ## Storage Architecture
 

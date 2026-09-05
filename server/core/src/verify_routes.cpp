@@ -2,6 +2,7 @@
 
 #include "app_perf_compare.hpp"   // build_comparison, PairedComparison
 #include "app_perf_daily_store.hpp" // kRetentionDays (window clamp)
+#include "http_route_sink.hpp"   // HttpRouteSink, HttplibRouteSink
 #include "rest_a4_envelope.hpp"   // detail::make_correlation_id
 #include "rest_audit.hpp"         // detail::emit_behavioral_audit (#1647 chokepoint)
 #include "verify_ui.hpp"
@@ -56,6 +57,13 @@ int parse_window(const httplib::Request& req) {
 
 void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                    GroupsFn groups_fn, AppPerfCohortFn cohort_fn, AuditFn audit_fn) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(groups_fn),
+                    std::move(cohort_fn), std::move(audit_fn));
+}
+
+void VerifyRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                   GroupsFn groups_fn, AppPerfCohortFn cohort_fn, AuditFn audit_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     groups_fn_ = std::move(groups_fn);
@@ -63,7 +71,7 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
     audit_fn_ = std::move(audit_fn);
 
     // ── Config form — chrome; gates Infrastructure:Read like the /auto page ──
-    svr.Get("/fragments/auto/verify", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/auto/verify", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res))
             return;
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
@@ -75,7 +83,7 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
     });
 
     // ── Aggregate result — reads DEX app-perf → GuaranteedState:Read ──
-    svr.Get("/fragments/auto/verify/run", [this](const httplib::Request& req,
+    sink.Get("/fragments/auto/verify/run", [this](const httplib::Request& req,
                                                  httplib::Response& res) {
         if (!auth_fn_(req, res))
             return;
@@ -156,7 +164,7 @@ void VerifyRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn 
     // via the audited `GET /dex/devices/{id}/app-perf` — the cohort drill is a strict
     // subset, no NEW exposure. **If this surface is ever moved onto `scoped_perm_fn`,
     // the cohort here MUST be re-intersected with the caller's visible devices first.**
-    svr.Get("/fragments/auto/verify/drill", [this](const httplib::Request& req,
+    sink.Get("/fragments/auto/verify/drill", [this](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!auth_fn_(req, res))
             return;

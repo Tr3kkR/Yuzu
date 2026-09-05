@@ -36,6 +36,8 @@
 
 namespace yuzu::server {
 
+class HttpRouteSink; // server/core/src/http_route_sink.hpp
+
 class VerifyRoutes {
 public:
     using AuthFn =
@@ -47,6 +49,11 @@ public:
     using AuditFn = DexRoutes::AuditFn;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, GroupsFn groups_fn,
+                         AppPerfCohortFn cohort_fn, AuditFn audit_fn);
+
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, GroupsFn groups_fn,
                          AppPerfCohortFn cohort_fn, AuditFn audit_fn);
 
 private:

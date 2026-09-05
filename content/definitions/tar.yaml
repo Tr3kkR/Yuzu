@@ -566,6 +566,101 @@ spec:
           "true" | "false".
         validation:
           pattern: "^(true|false)$"
+      power_enabled:
+        type: string
+        displayName: Power Transition Capture Enabled (collector not yet shipped)
+        description: >
+          Enable or disable the sleep/wake/AC-power transition source (power →
+          $Power_Live, cursor-model seam). **ON by default ("true")** — the
+          first works-council-class source to ship enabled. Note this is NOT
+          the product's first default-on source: process, tcp, service, user
+          and perf have always been on as machine-scope operational telemetry.
+          Of the eight sources added since 1.5 under the works-council opt-in
+          posture (procperf, netqual, module, software, arp, dns, netconn,
+          mapdrive) every one defaults OFF, and power is the first of THAT
+          class to diverge.
+          The divergence is deliberate, but it does NOT mean the data is
+          low-sensitivity: the SOC 2 data inventory classifies $Power_Live as
+          usage-class / behavioral-adjacent, because the TIMING of sleep/wake
+          and AC events is a presence and working-hours proxy. Treat it as
+          co-determination-relevant and use power_lookback_seconds=0 where a
+          retrospective read is not lawful.
+          **No collector is registered in this release.** The schema, this key
+          and its default ship now; the collector that fills $Power_Live lands
+          in a following change, so the tables stay queryable and EMPTY until
+          then — an empty result means "not yet collecting", never "nothing
+          happened".
+          The source WILL use a durable log-position cursor (not a snapshot
+          diff), so a restart will resume from where it left off rather than
+          re-scanning; a lost/invalid cursor or a wrapped OS event log will
+          re-baseline forward and record a capture_gap rather than replaying
+          from the beginning.
+          Set to "false" to opt out. Requires agent v0.12.0+; older agents
+          silently ignore. Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      power_lookback_seconds:
+        type: string
+        displayName: Power History Lookback (seconds)
+        description: >
+          How far BEFORE enablement the power source's first read may reach
+          into OS-retained sleep/wake/AC-power history (same shape as
+          netconn_lookback_seconds, ADR-0020). Set to "0" to disable the
+          pre-enablement read entirely (forward-only from the moment it is
+          enabled). Clamped to 0-7776000 (0 - 90 days); default 604800 (7
+          days). Applies to the first read after enablement (and after a late
+          enable); once caught up the source reads only forward. Requires
+          agent v0.12.0+.
+        validation:
+          pattern: "^[0-9]+$"
+      removable_enabled:
+        type: string
+        displayName: Removable Media Capture Enabled (collector not yet shipped)
+        description: >
+          Enable or disable the removable-media attach/detach source
+          (removable → $Removable_Live, cursor-model seam), including
+          exec_from_removable correlation (a process observed running from a
+          removable volume). **ON by default ("true")** — the first
+          works-council-class source to ship enabled, alongside power. This is
+          NOT the product's first default-on source: process, tcp, service,
+          user and perf have always been on as machine-scope operational
+          telemetry. Of the eight sources added since 1.5 under the
+          works-council opt-in posture every one defaults OFF, and removable is
+          one of the first two of THAT class to diverge.
+          The divergence is deliberate and it does NOT mean the data is
+          low-sensitivity — this is the MORE sensitive of the two. The SOC 2
+          data inventory classifies $Removable_Live as usage/identity-class:
+          it records device vendor, product and SERIAL, plus the executed
+          binary path and pid of any process running from a removable volume.
+          Treat it as co-determination-relevant and set
+          removable_lookback_seconds=0 where a retrospective read of OS-retained
+          removable history is not lawful.
+          **No collector is registered in this release.** The schema, this key
+          and its default ship now; the collector that fills $Removable_Live lands
+          in a following change, so the tables stay queryable and EMPTY until
+          then — an empty result means "not yet collecting", never "nothing
+          happened".
+          The source WILL use the same durable log-position cursor model as
+          power (see power_enabled) — a lost/invalid cursor will re-baseline
+          forward and record a capture_gap rather than replaying history. Set to "false"
+          to opt out. Requires agent v0.12.0+; older agents silently ignore.
+          Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
+      removable_lookback_seconds:
+        type: string
+        displayName: Removable Media History Lookback (seconds)
+        description: >
+          How far BEFORE enablement the removable source's first read may
+          reach into OS-retained device-attach history (same shape as
+          netconn_lookback_seconds / power_lookback_seconds above). Set to "0"
+          to disable the pre-enablement read entirely (forward-only from the
+          moment it is enabled). Clamped to 0-7776000 (0 - 90 days); default
+          604800 (7 days). Applies to the first read after enablement (and
+          after a late enable); once caught up the source reads only forward.
+          Requires agent v0.12.0+.
+        validation:
+          pattern: "^[0-9]+$"
       network_capture_method:
         type: string
         displayName: Network Capture Method
