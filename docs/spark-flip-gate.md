@@ -65,7 +65,20 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
 - [ ] **5. UAT smoke**: arm on spark → induced drift → dashboard edge; `--spark-disable` rollback
       drill restores legacy enforcement (procedure in §6); journal gauges live; `/status`
       reports real `errored_rules` (this is PR #3175's fix - confirmed shipped, see "#2298
-      sub-item confirmation" below).
+      sub-item confirmation" below). **The rollback-drill half is DONE (2026-09-04/05, Rig B on
+      BigColin, §6, §8)** - `--spark-disable` restart confirmed to restore legacy enforcement in
+      ~8.6s, with a subsequent 14-hour clean run showing zero spark-state leak. **The
+      arm-on-spark → induced-drift → dashboard-edge half is NOT yet demonstrated** - attempted
+      on both Rig B (Linux, blocked: no sudo-free way to flip a system service's state, and
+      `file-change` has no mechanism on Linux at all - `spark_mechanism.hpp:25-31`) and DGRHP
+      (Windows, where `file-change` IS supported): the rule/baseline were created and confirmed
+      correct server-side, but arm/drift-detection could not be confirmed within reasonable
+      effort - an agent restart taken mid-attempt (to work around a suspected `#2049`-shaped
+      stale-Subscribe gap) broke log visibility for that process (WMI-launched with no output
+      redirect), and no new event appeared in `/api/v1/guaranteed-state/events` after inducing
+      the drift. **Tracked as an explicit follow-up, not resolved by this update** - whoever
+      picks this up next should restart the DGRHP agent WITH proper log capture first, then
+      re-verify the file guard actually arms and fires before trusting this half of criterion 5.
 - [ ] **6. Legacy-vs-spark parity capture**, any diff fully explained by
       `docs/spark-legacy-delta-registry.md`.
 - [ ] **7. Resource evidence** vs `docs/spark-rebuild-baselines/`.
@@ -502,8 +515,15 @@ testing only, never committed or pushed**, to make the achievable regime reachab
 night rather than several days - a testing-only acceleration, not a claim about production
 cadence, and not evidence toward criterion 7 (resource evidence) at the halved rate.
 
-**Rig B (UAT smoke, §2 criterion 5, + the `--spark-disable` rollback drill, §6) has not been
-run yet** - not attempted this pass, still fully open.
+**UPDATE (2026-09-05): Rig B's rollback drill ran, on BigColin as originally planned - correcting
+the "has not been run yet" note above (it was already run and recorded in the rig's own logs
+before this doc's first draft; not caught until re-verified this pass).** `--spark-disable`
+restart confirmed legacy enforcement resumed in ~8.6s (`T0`→boot-log confirmation), followed by a
+clean 14-hour run with zero spark-state leak observed. See §2 criterion 5 for the full evidence
+and the still-open induced-drift half. UAT smoke's arm-on-spark → induced-drift → dashboard-edge
+sequence was attempted on Rig B too but blocked (Linux: no sudo-free service-state flip, no
+`file-change` mechanism at all) and moved to DGRHP, where it remains unresolved - tracked as a
+follow-up, not this update's to close.
 
 ## Also closed out by this PR
 
