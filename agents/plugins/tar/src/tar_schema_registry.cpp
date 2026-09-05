@@ -1332,7 +1332,12 @@ bool is_queryable_table(std::string_view real_table_name) {
     // its "no such table" error into a weak existence oracle distinct from the
     // generic authorizer denial (#760 UP-8).
     static const std::unordered_set<std::string> allowed = [] {
-        std::unordered_set<std::string> s{"tar_state", "tar_config"};
+        // tar_cursor joins them (S3): without it a wedged cursor source is
+        // entirely unobservable -- no reset path exists, and the only remedy is
+        // deleting tar.db, which destroys every OTHER source's history too.
+        // Reading it exposes a source name, a position and updated_at; the
+        // cursor payload is the source's own bookkeeping, not captured content.
+        std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_cursor"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);
         return s;

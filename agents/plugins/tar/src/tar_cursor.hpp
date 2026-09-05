@@ -85,6 +85,23 @@
 //     that single JSON document; tar_cursor stores exactly one row per source
 //     name, never one row per input.
 //
+//  4b. FREE-TEXT FIELDS ARE THE SOURCE'S RESPONSIBILITY, AND THE SEAM DOES NOT
+//     REDACT FOR YOU. `removable_live.image_path` and `evidence` are free text
+//     and the atomic inserts write them verbatim. The user manual states the
+//     built-in redaction patterns are "enforced on every collect path"; that is
+//     a claim about the SOURCE, because this seam has no hook. So:
+//
+//       - `evidence` is a MECHANISM description -- what was read and how
+//         ("macos:diskarbitration:disk4s1"). It is never a command line, never
+//         a username, never captured content.
+//       - a path that can contain a user's name (a `/Volumes/...` or
+//         `/media/<user>/...` executable) goes through the same sanitiser the
+//         module stream uses (`redact_module_dir`, tar_module_stream.hpp),
+//         which exists precisely to make this structurally hard to forget.
+//
+//     Get this wrong and a username reaches a default-ON, works-council-class
+//     table that the SOC 2 inventory does not disclose as carrying one.
+//
 //  5. A RETROSPECTIVE source (one whose first read can reach into OS-retained
 //     history from before the source was ever enabled) honours a
 //     `<name>_lookback_seconds` config key -- default 604800 (7 days), and

@@ -620,11 +620,21 @@ spec:
           Enable or disable the removable-media attach/detach source
           (removable → $Removable_Live, cursor-model seam), including
           exec_from_removable correlation (a process observed running from a
-          removable volume). **ON by default ("true")** — like power above,
-          this diverges deliberately from every other source in this table
-          (all default OFF, netconn and mapdrive included): removable-device
-          attach/detach is treated as security-relevant device-lifecycle
-          telemetry an operator should see without an explicit opt-in step.
+          removable volume). **ON by default ("true")** — the first
+          works-council-class source to ship enabled, alongside power. This is
+          NOT the product's first default-on source: process, tcp, service,
+          user and perf have always been on as machine-scope operational
+          telemetry. Of the eight sources added since 1.5 under the
+          works-council opt-in posture every one defaults OFF, and removable is
+          one of the first two of THAT class to diverge.
+          The divergence is deliberate and it does NOT mean the data is
+          low-sensitivity — this is the MORE sensitive of the two. The SOC 2
+          data inventory classifies $Removable_Live as usage/identity-class:
+          it records device vendor, product and SERIAL, plus the executed
+          binary path and pid of any process running from a removable volume.
+          Treat it as co-determination-relevant and set
+          removable_lookback_seconds=0 where a retrospective read of OS-retained
+          removable history is not lawful.
           **No collector is registered in this release.** The schema, this key
           and its default ship now; the collector that fills $Removable_Live lands
           in a following change, so the tables stay queryable and EMPTY until

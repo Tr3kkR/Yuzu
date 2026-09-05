@@ -2146,6 +2146,13 @@ private:
                             src_name, cursor_read.error());
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
                 continue;
             }
             const auto& cursor = *cursor_read;
@@ -2169,6 +2176,13 @@ private:
                     token = yuzu::tar::kCollectStatusCursorLost;
                     break;
                 }
+                // S1: a heartbeat an operator can alert on. `live_rows == 0` is
+                // ambiguous -- a healthy quiet source and a wedged one look the
+                // same -- so record WHEN this source last completed a tick.
+                // Staleness relative to slow_interval is then an expressible
+                // alert, which absence never was.
+                db_->set_config(std::string(src_name) + "_last_collect_ts",
+                                std::to_string(now_epoch_seconds()));
                 ctx.write_output(std::format("tar|collect_{}|{}|{}", src_name,
                                              result.events_emitted, token));
             } catch (const yuzu::tar::IncompleteCaptureError& e) {
@@ -2181,6 +2195,13 @@ private:
                             src_name, e.what());
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
             } catch (const std::exception& e) {
                 // ABI containment. The SDK's execute trampoline
                 // (sdk/include/yuzu/plugin.hpp) is an extern "C" boundary with
@@ -2201,11 +2222,25 @@ private:
                               src_name, e.what());
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
             } catch (...) {
                 spdlog::error("TAR: {} cursor collect threw a non-std exception -- source "
                               "skipped this tick", src_name);
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
             }
         }
 
