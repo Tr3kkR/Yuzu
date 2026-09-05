@@ -553,6 +553,67 @@ TEST_CASE("removable Linux mount correlation: a non-/dev/ source (tmpfs/nfs) and
 
 // ── BoundedPendingQueue<RemovableEvent> ack/retry semantics (P-003) ─────────
 
+// ── decide_baseline_and_reconcile (shared baseline/reconcile decision) ─────
+
+TEST_CASE("baseline tick seeds attach_set from what is attached, so the next tick does not "
+          "re-report every device as a missed callback (P2)",
+          "[tar][removable][baseline][p2]") {
+    BaselineReconcileInputs first;
+    first.baseline_already_done = false;
+    first.current_keys = {"dev-a", "dev-b"};
+
+    const auto t1 = decide_baseline_and_reconcile(first);
+    CHECK(t1.baseline_keys.size() == 2);
+    CHECK(t1.reconcile_added.empty());
+    // The load-bearing assertion: baseline RECORDED what it saw.
+    REQUIRE(t1.attach_set.size() == 2);
+    CHECK(t1.attach_set.count("dev-a") == 1);
+    CHECK(t1.attach_set.count("dev-b") == 1);
+
+    // Tick 2, nothing changed on the host and no callbacks fired. Before the
+    // fix attach_set persisted EMPTY, so the reconciler re-reported both
+    // devices as `attached` with evidence claiming a missed DiskArbitration
+    // callback -- a fabricated attach event on every agent, every restart.
+    BaselineReconcileInputs second;
+    second.baseline_already_done = true;
+    second.current_keys = first.current_keys;
+    second.prev_attach_set = t1.attach_set;
+
+    const auto t2 = decide_baseline_and_reconcile(second);
+    CHECK(t2.baseline_keys.empty());
+    CHECK(t2.reconcile_added.empty());
+    CHECK(t2.reconcile_removed.empty());
+    CHECK(t2.attach_set.size() == 2);
+}
+
+TEST_CASE("a detach callback queued during the baseline tick still wins over the seed",
+          "[tar][removable][baseline]") {
+    BaselineReconcileInputs in;
+    in.baseline_already_done = false;
+    in.current_keys = {"dev-a", "dev-b"};
+    in.pending = {{"detached", "dev-a"}};
+
+    const auto out = decide_baseline_and_reconcile(in);
+    CHECK(out.attach_set.count("dev-a") == 0); // the real callback ordered last
+    CHECK(out.attach_set.count("dev-b") == 1);
+}
+
+TEST_CASE("reconciliation still recovers a callback the OS never delivered, both directions",
+          "[tar][removable][baseline]") {
+    BaselineReconcileInputs in;
+    in.baseline_already_done = true;
+    in.current_keys = {"dev-new"};              // arrived, no callback
+    in.prev_attach_set = {{"dev-gone", true}};  // left, no callback
+
+    const auto out = decide_baseline_and_reconcile(in);
+    REQUIRE(out.reconcile_added.size() == 1);
+    CHECK(out.reconcile_added[0] == "dev-new");
+    REQUIRE(out.reconcile_removed.size() == 1);
+    CHECK(out.reconcile_removed[0] == "dev-gone");
+    CHECK(out.attach_set.count("dev-new") == 1);
+    CHECK(out.attach_set.count("dev-gone") == 0);
+}
+
 TEST_CASE("removable queue: a failed commit leaves the whole batch for retry, and acking by "
           "sequence never eats an event pushed during the commit",
           "[tar][removable][queue]") {

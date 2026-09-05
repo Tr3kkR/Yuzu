@@ -387,6 +387,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     const auto attached_now = da_session_->snapshot_attached();
     std::vector<std::pair<std::string, std::string>> attached_roots;
     std::unordered_set<std::string> current_keys;
+    std::unordered_map<std::string, const RemovableDiskArbEvent*> seen_by_key;
     attached_roots.reserve(attached_now.size());
     current_keys.reserve(attached_now.size());
     for (const auto& ev : attached_now) {
@@ -396,20 +397,8 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             attached_roots.emplace_back(key.device_key, ev.volume_path);
         current_keys.insert(key.device_key);
 
-        if (!baseline_already_done && !prev_attach_set.count(key.device_key)) {
-            RemovableEvent re;
-            re.ts = now_seconds();
-            re.action = "present_at_baseline";
-            re.device_key = key.device_key;
-            re.vendor = ev.vendor;
-            re.product = ev.product;
-            re.volume = ev.volume_path;
-            re.size_bytes = ev.size_bytes;
-            re.bus = "diskarb";
-            re.evidence = "macos:getfsstat+diskarbitration:baseline:anonymous-serial-fallback";
-            re.record_key = removable_baseline_record_key(key.device_key);
-            events.push_back(std::move(re));
-        }
+        // Device metadata for whichever keys the decision below names.
+        seen_by_key.emplace(key.device_key, &ev);
     }
     st.baseline_done = true;
 
@@ -418,49 +407,63 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     // snapshot and ack can never mis-target an unacked entry.
     const auto batch = queue_.snapshot_batch();
     const auto& pending = batch.items;
-    // R-003: derive attach_set mutations from the RETAINED snapshot (not a
-    // one-shot inline mutation at push time) so a prior tick's failed commit
-    // replays correctly here too — `pending` includes both this tick's new
-    // callbacks and any still-unacked from a prior failed attempt.
-    for (const auto& ev : pending) {
-        if (ev.action == "attached")
-            st.attach_set[ev.device_key] = true;
-        else if (ev.action == "detached")
-            st.attach_set.erase(ev.device_key);
+
+    // The baseline seeding, the retained-queue replay (R-003) and the R-001
+    // reconciliation are ONE decision over the same attach_set, and it is pure
+    // -- decide_baseline_and_reconcile() in tar_removable_parsers.hpp owns it
+    // so the unit suites can drive it without a DiskArbitration session. This
+    // leg supplies only the OS reads and the device metadata.
+    BaselineReconcileInputs bri;
+    bri.baseline_already_done = baseline_already_done;
+    bri.current_keys = current_keys;
+    bri.prev_attach_set = prev_attach_set;
+    bri.pending.reserve(pending.size());
+    for (const auto& ev : pending)
+        bri.pending.emplace_back(ev.action, ev.device_key);
+    const auto decided = decide_baseline_and_reconcile(bri);
+    st.attach_set.clear();
+    st.attach_set.insert(decided.attach_set.begin(), decided.attach_set.end());
+
+    for (const auto& key : decided.baseline_keys) {
+        const auto it = seen_by_key.find(key);
+        if (it == seen_by_key.end())
+            continue;
+        const auto& ev = *it->second;
+        RemovableEvent re;
+        re.ts = now_seconds();
+        re.action = "present_at_baseline";
+        re.device_key = key;
+        re.vendor = ev.vendor;
+        re.product = ev.product;
+        re.volume = ev.volume_path;
+        re.size_bytes = ev.size_bytes;
+        re.bus = "diskarb";
+        re.evidence = "macos:getfsstat+diskarbitration:baseline:anonymous-serial-fallback";
+        re.record_key = removable_baseline_record_key(key);
+        events.push_back(std::move(re));
     }
+
     events.insert(events.end(), pending.begin(), pending.end());
 
-    // R-001 reconciliation: recover from a DA appeared/disappeared callback
-    // DiskArbitration never delivered. Only meaningful once baseline has run
-    // at least once (on the very first tick every "missing" key is simply
-    // the initial baseline, already handled above).
-    if (baseline_already_done) {
-        for (const auto& key : current_keys) {
-            if (st.attach_set.count(key))
-                continue; // already accounted for by a callback this tick
-            RemovableEvent re;
-            re.ts = now_seconds();
-            re.action = "attached";
-            re.device_key = key;
-            re.bus = "diskarb";
-            re.evidence = "macos:diskarbitration:reconcile:missed-appeared-callback";
-            re.record_key = next_seq_record_key("reconcile_add", key);
-            events.push_back(std::move(re));
-            st.attach_set[key] = true;
-        }
-        for (const auto& [key, present] : prev_attach_set) {
-            if (!present || current_keys.count(key) || !st.attach_set.count(key))
-                continue; // still attached, or already removed by a real callback this tick
-            RemovableEvent re;
-            re.ts = now_seconds();
-            re.action = "detached";
-            re.device_key = key;
-            re.bus = "diskarb";
-            re.evidence = "macos:diskarbitration:reconcile:missed-disappeared-callback";
-            re.record_key = next_seq_record_key("reconcile_rm", key);
-            events.push_back(std::move(re));
-            st.attach_set.erase(key);
-        }
+    for (const auto& key : decided.reconcile_added) {
+        RemovableEvent re;
+        re.ts = now_seconds();
+        re.action = "attached";
+        re.device_key = key;
+        re.bus = "diskarb";
+        re.evidence = "macos:diskarbitration:reconcile:missed-appeared-callback";
+        re.record_key = next_seq_record_key("reconcile_add", key);
+        events.push_back(std::move(re));
+    }
+    for (const auto& key : decided.reconcile_removed) {
+        RemovableEvent re;
+        re.ts = now_seconds();
+        re.action = "detached";
+        re.device_key = key;
+        re.bus = "diskarb";
+        re.evidence = "macos:diskarbitration:reconcile:missed-disappeared-callback";
+        re.record_key = next_seq_record_key("reconcile_rm", key);
+        events.push_back(std::move(re));
     }
 
     append_exec_from_removable(events, attached_roots);

@@ -35,6 +35,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::tar {
@@ -742,6 +743,79 @@ correlate_removable_mounts(std::string_view proc_mounts_content,
 // Implemented in tar_removable_diskarb.mm, which is the ONLY place CoreFoundation/
 // DiskArbitration symbols appear (docs/native-objcpp-conventions.md; structure
 // copied from wifi_corewlan.mm).
+
+/// ── Baseline + reconciliation decision (pure) ─────────────────────────────
+///
+/// The live legs differ only in HOW they learn the currently-attached set
+/// (DiskArbitration, udev, the event log); what they must DO with it is
+/// identical, and it is the part that has been wrong twice. Extracted here so
+/// it is reachable from the unit suites without a DiskArbitration session:
+/// the collector owns the OS call and the device metadata, this owns the
+/// decision.
+///
+/// Order is load-bearing and mirrors the collector's:
+///   1. baseline (first tick only) — seed `attach_set` from what is attached
+///      NOW, and name the devices that need a `present_at_baseline` row;
+///   2. pending — apply the queued OS callbacks, so a real `detached` that
+///      arrived during the baseline tick still wins;
+///   3. reconcile (only once baseline has run) — recover from a callback the
+///      OS never delivered, in both directions.
+struct BaselineReconcileInputs {
+    bool baseline_already_done{false};
+    std::unordered_set<std::string> current_keys;
+    std::unordered_map<std::string, bool> prev_attach_set;
+    // (action, device_key) of the retained pending queue, oldest first.
+    std::vector<std::pair<std::string, std::string>> pending;
+};
+
+struct BaselineReconcileResult {
+    std::unordered_map<std::string, bool> attach_set;
+    std::vector<std::string> baseline_keys;     // -> present_at_baseline
+    std::vector<std::string> reconcile_added;   // -> attached  (missed appeared)
+    std::vector<std::string> reconcile_removed; // -> detached  (missed disappeared)
+};
+
+inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineReconcileInputs& in) {
+    BaselineReconcileResult out;
+    out.attach_set = in.prev_attach_set;
+
+    if (!in.baseline_already_done) {
+        for (const auto& key : in.current_keys) {
+            // P2: seed UNCONDITIONALLY. Emitting the baseline rows without
+            // recording them persisted `baseline_done = true` beside an empty
+            // attach_set, so the very next tick's reconcile step re-reported
+            // every already-attached device as an `attached` event whose
+            // evidence claimed a missed OS callback that never happened.
+            out.attach_set[key] = true;
+            if (!in.prev_attach_set.count(key))
+                out.baseline_keys.push_back(key);
+        }
+    }
+
+    for (const auto& [action, key] : in.pending) {
+        if (action == "attached")
+            out.attach_set[key] = true;
+        else if (action == "detached")
+            out.attach_set.erase(key);
+    }
+
+    if (in.baseline_already_done) {
+        for (const auto& key : in.current_keys) {
+            if (out.attach_set.count(key))
+                continue; // already accounted for by a callback this tick
+            out.reconcile_added.push_back(key);
+            out.attach_set[key] = true;
+        }
+        for (const auto& [key, present] : in.prev_attach_set) {
+            if (!present || in.current_keys.count(key) || !out.attach_set.count(key))
+                continue; // still attached, or already removed by a real callback
+            out.reconcile_removed.push_back(key);
+            out.attach_set.erase(key);
+        }
+    }
+    return out;
+}
+
 #ifdef __APPLE__
 
 /// One DiskArbitration appear/disappear callback, or one baseline-snapshot
