@@ -35,7 +35,7 @@ separately as **#3849**.
 | Sign-off | _(blank - filled by PR-6 once every §2 criterion is green **AND** every §3 row not at a terminal disposition (RULED closed / DONE with no residual / Moved to P3 / Fixed) is itself resolved or explicitly risk-accepted - §2 alone is not the whole gate. Row 4 (#3847) is now fully DONE (items 1/6 via #3884, item 4 via #3961) - superseded by its own residuals, **#3953** (deferred LOW/INFO findings from #3961's review rounds - see the issue for the current count, not a number restated here; forcing function: `p3-audit-classification-note` in `governance.d/3847-outbox-send-executor.rGvKq2.jsonl` says a related finding re-derives HIGH->CRITICAL once this path goes live) and **#3966** (a post-merge adversarial-review finding, not yet folded into #3953). As of this PR that's #3953, #3966, and row 9 (#3848) - row 3's #3816 residual is now DONE via PR-2e (both #3816 and #3831, row 3's other residual, are fixed) - checked here, not folded into a 10th criterion)_ |
 | This PR | PR-1 of 7: PR-1 (this doc) → **PR-2a (#2233 items 1/6/7 → #3847's original 1/6 slice + #2993; + #3831 batch) - DONE, merged as #3884, 2026-09-03** → **#2233 item 4, #3847 narrowed to this alone - DONE, merged as #3961, 2026-09-04T15:20:25Z - fixed the drain worker's stalled-sink hazard: `drain_bounded()`'s injected `send` now runs on a detached `GuardianOutboxSendExecutor` (guardian_outbox_send_executor.hpp) - one single-flight instance per lane (lifecycle, compliance/health) - instead of the worker's own joined thread, so a stalled sink no longer wedges journal maintenance or the next drain tick; covered by the orphan-exit contract (`GuardianEngine::active_io_workers()`), same as the existing state-reader/arm-disarm executors** → PR-2c (fault-injection seams + item-9 TSan rerun, #3848) → [PR-2d, contingency only, if PR-2c's seams demonstrate a real defect - resolves before PR-5, per §5's risk register] → **PR-4 (promtool CH-2/CH-5-PROM) - DONE, merged as #3858, 2026-09-02T13:00:49Z** → **PR-2e (#3816's design PR) - `GuardianIoExecutor` abandonment-signal API, shared by `GuardianSparkRuntime` + `GuardianStateReader` - DONE, this branch** (filed 2026-09-01, predating this doc, missing from this doc's first draft and added only after a PR review caught the omission; see §3 row 3 for the fix itself) → PR-5 (the flip) → PR-6 (evidence closeout). Sequencing note for §8: PR-4 landed independently of #3816 (neither blocked the other), so Rig A/B provisioning (which follows PR-2a/PR-2c per §8) was never delayed by #3816. PR-3 (#2233 item 8) was dropped before this doc was written - item 8 moved to the P3 lane (§3 row 8). PR-2b (item 5) is dropped by this doc (§3 row 5). |
 | Re-verified against | `origin/dev @ bd387afec` (2026-09-02); the kickoff plan's citations were pinned to `880900f1e1` - every file:line citation below was re-checked against the newer HEAD, not copied blind. Drift is called out inline where found. |
-| Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A third round, this PR's own PR-4-merged update, re-based this branch on `origin/dev` post-#3857-merge and re-verified its new citations (`tests/prometheus/yuzu-guardian-journal-extracted.test.yml`'s CH-2a/b/c and CH-5-PROM cases 1-6, `docs/prometheus/yuzu-alerts.yml`'s `TelemetryDark` rule expression) directly against `origin/dev` at that later point, not against `e333b6cb2`. A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. A fourth round, this PR's own item-4 fix, re-based this branch on `origin/dev` post-#3884-merge (`c7febf76a`) and re-verified §3 rows 1/6/7 and row 3's #3831 sub-clause against #3884's actual merged content (`gh pr view 3884`, merge commit `282c3b58a`) rather than the peer-session summary that first reported it - directly, not by re-derivation from the earlier citations above. A fifth round, this PR's own governance fix-up (two BLOCKING concurrency defects found independently by two Gate 2/3 reviewers in the fix's first draft, both fixed; a new direct-coverage test file added), re-based this branch a SECOND time onto `origin/dev` at `e2f745606` (an unrelated ccache/CI PR, #3917, had merged in between) and re-verified every row-4 file:line citation against the post-fix-round tree directly. A sixth round, a fresh doc-only follow-up PR after #3961 merged (`acd83bd48`, 2026-09-04), fixed row 4's stale "awaiting merge" status, its `wrapped_send()` line-number drift (`:389`→`:408`), a self-contradiction where the row still stated a residual count the same PR's own synthesis doc claimed had been dropped, updated the §1 Sign-off row to point at #3953 and #3966 (superseding row 4/#3847 as the gating items, item 4 now DONE), and folded #3966 (a post-merge external adversarial review's admission-race finding, not fixed by anything in this branch) into row 4's own body text as well. This round went through its OWN governance (Gate 2 security-guardian+docs-writer, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness) after an earlier ungoverned push of the same PR was caught and corrected; that review found and fixed three more instances of the identical staleness class in locations the first pass missed - §1's "This PR" ladder row (still framed item 4 as in-flight), a §0 intro-paragraph clause with the same problem, and an overstated "same bounded-by-join reasoning" claim about #3966 relative to the row's other, dormancy-bounded residuals - plus a #3966/#3953 scope-conflation defect the first commit introduced and a markdown bold-span break caught before commit via a bold-marker-count check. Verified directly against `origin/dev @ acd83bd48` - the merge commit itself, not a peer-session summary. **Separately, PR-2e** (a later, distinct PR on branch `fix/3816-guardian-io-executor-abandonment-signal`, built off `origin/dev @ 6d40b3993`) re-verified and fixed row 3's stale `#3816` citations (`guardian_spark_runtime.cpp:379-389` had drifted to `:487-506` pre-fix; row 3's `guardian_io_executor.hpp:376-388`/`:386`/`:387` citations were rewritten to describe the post-fix code, which no longer has that structure) and shipped the fix those citations were tracking - see row 3's own closing paragraph. |
+| Last full re-verification | 2026-09-02, this PR, against `origin/dev @ e333b6cb2` post-rebase (no cited file changed between `bd387afec` and `e333b6cb2` - checked directly). Two later fix rounds (same date) added content re-verified against the same base: #3816 itself (§3 row 3, citing `guardian_spark_runtime.cpp:379-389`, `guardian_io_executor.hpp:376-388`, and `guardian_state_reader.cpp:59-71`), plus independent review nits folded into the same rounds (the "Shipped posture" rewrite citing `agent.cpp:1207/1222-1226`, `guardian_engine.cpp:1244/1406`, `spark_mechanism.hpp:25-31`; the §6 em-dash fix at `agent.cpp:1196`; the §5 "unbounded" addition at `spark_engine.hpp:540-543`). A third round, this PR's own PR-4-merged update, re-based this branch on `origin/dev` post-#3857-merge and re-verified its new citations (`tests/prometheus/yuzu-guardian-journal-extracted.test.yml`'s CH-2a/b/c and CH-5-PROM cases 1-6, `docs/prometheus/yuzu-alerts.yml`'s `TelemetryDark` rule expression) directly against `origin/dev` at that later point, not against `e333b6cb2`. A future reader should treat any citation as unverified past this point until re-run; there is no automated staleness check on this doc. A fourth round, this PR's own item-4 fix, re-based this branch on `origin/dev` post-#3884-merge (`c7febf76a`) and re-verified §3 rows 1/6/7 and row 3's #3831 sub-clause against #3884's actual merged content (`gh pr view 3884`, merge commit `282c3b58a`) rather than the peer-session summary that first reported it - directly, not by re-derivation from the earlier citations above. A fifth round, this PR's own governance fix-up (two BLOCKING concurrency defects found independently by two Gate 2/3 reviewers in the fix's first draft, both fixed; a new direct-coverage test file added), re-based this branch a SECOND time onto `origin/dev` at `e2f745606` (an unrelated ccache/CI PR, #3917, had merged in between) and re-verified every row-4 file:line citation against the post-fix-round tree directly. A sixth round, a fresh doc-only follow-up PR after #3961 merged (`acd83bd48`, 2026-09-04), fixed row 4's stale "awaiting merge" status, its `wrapped_send()` line-number drift (`:389`→`:408`), a self-contradiction where the row still stated a residual count the same PR's own synthesis doc claimed had been dropped, updated the §1 Sign-off row to point at #3953 and #3966 (superseding row 4/#3847 as the gating items, item 4 now DONE), and folded #3966 (a post-merge external adversarial review's admission-race finding, not fixed by anything in this branch) into row 4's own body text as well. This round went through its OWN governance (Gate 2 security-guardian+docs-writer, Gate 4 happy-path+unhappy-path+consistency-auditor, Gate 6 compliance-officer+sre+enterprise-readiness) after an earlier ungoverned push of the same PR was caught and corrected; that review found and fixed three more instances of the identical staleness class in locations the first pass missed - §1's "This PR" ladder row (still framed item 4 as in-flight), a §0 intro-paragraph clause with the same problem, and an overstated "same bounded-by-join reasoning" claim about #3966 relative to the row's other, dormancy-bounded residuals - plus a #3966/#3953 scope-conflation defect the first commit introduced and a markdown bold-span break caught before commit via a bold-marker-count check. Verified directly against `origin/dev @ acd83bd48` - the merge commit itself, not a peer-session summary. **Separately, PR-2e** (a later, distinct PR on branch `fix/3816-guardian-io-executor-abandonment-signal`, built off `origin/dev @ 6d40b3993`) re-verified and fixed row 3's stale `#3816` citations (`guardian_spark_runtime.cpp:379-389` had drifted to `:487-506` pre-fix; row 3's `guardian_io_executor.hpp:376-388`/`:386`/`:387` citations were rewritten to describe the post-fix code, which no longer has that structure) and shipped the fix those citations were tracking - see row 3's own closing paragraph. **Separately again, this doc-only follow-up** (branch `docs/spark-flip-gate-ch5-findings`, built off `origin/dev @ 57ec64433`, 2026-09-05): records the DGRHP exploratory CH-5-UAT pass (§4, §8) and its two production-defect findings, re-verified directly against this same base - `spark_registry.cpp`'s watcher-callback path and `guardian_spark_runtime.cpp`'s `build_entries()` for the event_id-timestamp semantics (§4), `agent.cpp:2269/:2643` for the Heartbeat deadline claim and its subsequent retraction via a live bounded repro on the DGRHP rig itself (not a citation-only check), and `spark_mechanism.hpp:25-31` for the BigColin platform-blocker citation (§8). Not a numbered PR-1..PR-6 slot - this is evidence toward the CH-5-UAT driver step in §4's own PR-sequence paragraph, which sits outside that ladder. |
 
 ## 2. Flip-green criteria (1)–(9)
 
@@ -161,8 +161,56 @@ Do not conflate them:**
   a 0 reading is ambiguous without this stage). **OPEN: no latency pass/fail threshold is defined
   anywhere** - no percentile, sample-size, or platform-matrix target exists in the design doc or
   any other committed source, despite this being "the flip's genuine go/no-go" per that doc's
-  own item 7. Tracked as **#3850** (filed while writing this doc); must be resolved before Rig A
-  (§8) can produce an objective pass/fail result rather than a subjective call.
+  own item 7. Tracked as **#3850** (filed while writing this doc, still OPEN) - the exploratory
+  pass below deliberately did not propose a threshold from a 12-30 sample run; this update does
+  not resolve #3850.
+
+  **Exploratory pass run (2026-09-04/05, DGRHP - Windows, not BigColin; see §8 for why),
+  Sol (`gpt-5.6-sol`) + Fable reviewed, all findings independently re-verified against code
+  before being recorded here.** Found the "hold at the hard ceiling" premise above is not
+  mechanically achievable under sustained load: `prune_locked_` resets the journal fully to the
+  soft cap (1000 batches) every single 120s pass regardless of delivery/sent-label status, so
+  occupancy above 1000 can only exist transiently within a single 120s window - the hard ceiling
+  (2000/64MiB) is a backstop for a "chronically-failing prune" per its own doc comment, not a
+  load-reachable steady state. Reaching it needs a burst (>1000 net-new batches within one
+  120s window) or a prune-fail injection; neither was attempted this pass. **The design doc's
+  own item 7 wording ("holding the journal at its hard ceiling") needs the same correction** -
+  flagged here, not yet fixed in that doc. The achievable organic/moderate-load regime found on
+  this rig was ~550-750 batches (~24-27 batches/120s churn ceiling - more parallelism made
+  things worse past ~24 lanes, likely a server-side per-client limit).
+
+  A 30-sample stratified latency probe taken in that regime (churn-paused window, fresh agent
+  restart, ms-precision via `event_id`'s embedded wall-clock - NOT `updated_at`, which truncates
+  to whole seconds before reaching Postgres) measured **6.6-7.0s (mean 6837ms)**. Label this
+  **detection-to-server-ingest latency, not stimulus-to-detection**: tracing the registry
+  watcher path confirms `event_id`'s embedded timestamp is minted in
+  `GuardianSparkRuntime::build_entries()` at evaluation-completion time (post OS-notification
+  callback, pre-outbox-enqueue, on the consumer thread per ADR-0021's queued tier) - not the raw
+  instant the underlying value changed. The figure most likely reflects the downstream
+  outbox/transport/Postgres-write path rather than registry-notification lag, but that was never
+  isolated by direct measurement. No pass/fail threshold is proposed from these samples; this
+  feeds #3850, it does not resolve it.
+
+  **Two real production defects surfaced, neither flip-blocking on its own but both worth
+  folding into flip-readiness review**: (1) `GuardianOutbox` (4096-entry capacity) can stall
+  completely when its drain worker's send target is dead - confirmed via a dedicated stall test
+  (`pending_` climbed to 4096 and pinned there, `backpressure_drops()` climbed into the tens of
+  thousands, and the backlog drained instantly the moment a live stream reopened - a
+  head-of-line block, not a capacity fill from cumulative churn, which was separately ruled out).
+  Commented on the existing **#2993** (no telemetry consumer for this counter) with this
+  real-world reproduction. (2) The stall's root cause was initially attributed to the Heartbeat
+  RPC having no client-side deadline (filed **#3989**), but a follow-up isolated repro
+  **retracted that causal claim**: a clean server stop/restart detects the dead session and
+  recovers within one heartbeat tick regardless of the missing deadline (still worth fixing as
+  defensive hygiene, matching `Register`/`ReportInventory`'s convention - correction comment
+  posted on #3989). **#2049** (`TryCancel()` not reliably unblocking a transport-stalled
+  Subscribe read) is the likelier primary mechanism for the actual stall instead - now two
+  independent occurrences on that issue, commented there. Separately, a single global
+  `policy_generation` counter means ANY rule mutation anywhere triggers a fleet-wide `full_sync`
+  teardown+rearm on every agent's next heartbeat - not only a persistently-failing rule as
+  **#2278** originally scoped. Split out as its own sibling issue, **#3990**, since the two are
+  different triggers (one-shot burst per mutation vs. a standing retry loop) sharing the same
+  root counter - a follow-up on #2278 records the distinction and points there.
 
 Both gate the flip independently; neither substitutes for the other.
 
@@ -190,6 +238,12 @@ that is stated explicitly rather than inferred or invented.
 - Owner: not assigned in source material - needs an owner before hardening package 1 starts.
 - Milestone: hardening package 1, immediately post-P3.
 - Revisit trigger: before alert-enablement AND before any production fleet.
+- **Related finding, not itself risk-accepted here (2026-09-04/05, DGRHP exploratory pass,
+  §4/§8)**: a single global `policy_generation` counter makes ANY rule mutation fleet-wide
+  trigger the same full-teardown/rebuild storm #2278 describes, not only a persistently-failing
+  rule - filed as sibling issue **#3990**. Widens how often this package's #2278 half is
+  actually exercised in practice; worth re-weighing this row's milestone/priority once #3990 is
+  triaged, not assumed unchanged.
 
 **#2815 + #2818 + #2833 + #2839** (teardown UAF-class; #2797's legacy half and #2012/#2011
 tracked separately below)
@@ -433,6 +487,23 @@ close to merging (PR-2b is dropped per §3 row 5, confirmed by the operator 2026
 when this rig-dependent evidence-collection phase is actually about to begin. The capacity
 numbers above are a 2026-09-02 point-in-time reading; re-verify immediately before
 provisioning rather than trusting this reading weeks later.
+
+**UPDATE (2026-09-04/05): Rig A actually ran on DGRHP (Windows), not BigColin.** BigColin's
+attempt hit a platform blocker: File/Registry spark mechanisms are dead on Linux
+(`spark_mechanism.hpp:25-31` - only Service registers there without libsystemd-dependent
+support), so a Linux rig cannot exercise the same mechanism mix this gate needs. Moved to
+DGRHP after checking coordination with a peer session already using that box. Actual duration
+was one overnight exploratory pass, not the 4-7 days estimated in the table above - the "hold
+at the hard ceiling" premise doesn't work mechanically under sustained load (§4's exploratory
+findings), so the long-duration plan the table describes was never the right shape for what's
+actually achievable; see §4 for what was measured and found instead. Cadence constants
+(`kGuardianFileLaneCadenceMs`, `errored_refresh_ms`) were halved **locally on DGRHP for this
+testing only, never committed or pushed**, to make the achievable regime reachable in one
+night rather than several days - a testing-only acceleration, not a claim about production
+cadence, and not evidence toward criterion 7 (resource evidence) at the halved rate.
+
+**Rig B (UAT smoke, §2 criterion 5, + the `--spark-disable` rollback drill, §6) has not been
+run yet** - not attempted this pass, still fully open.
 
 ## Also closed out by this PR
 
