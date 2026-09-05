@@ -1228,6 +1228,11 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     RemovableCursorState st = decode_removable_cursor(cursor_json);
     std::vector<RemovableEvent> events;
     std::vector<std::string> failing_channels;
+    // C4: a channel that was REQUIRED to jump to its head but could not read it.
+    // The head jump is the whole mechanism that stops a re-enable or a wrap from
+    // replaying history it must not replay, so a tick where one failed cannot be
+    // allowed to commit and clear the state that says the jump is still owed.
+    bool head_jump_unfulfilled = false;
     bool any_wrap = false;
 
     // R-005: a persisted-but-unparseable cursor is CursorLost. decode already
@@ -1275,8 +1280,22 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             // forward-only lookback (0): jump straight to the channel's
             // current head, no scan.
             if (force_head_jump || (first_run && lookback_s == 0)) {
-                if (auto head = query_single_record_id(ch.path, EvtQueryReverseDirection))
+                if (auto head = query_single_record_id(ch.path, EvtQueryReverseDirection)) {
                     st.channels[ch.key].record_id = *head;
+                } else if (force_head_jump) {
+                    // C4: NOT a silent skip. Committing this tick would clear
+                    // pending_reenable_gap_, so the next tick would see
+                    // force_head_jump false, take the retrospective backfill
+                    // branch, and read forward THROUGH the disabled window --
+                    // replaying exactly the events the pause promised were never
+                    // captured.
+                    failing_channels.push_back(ch.key);
+                    head_jump_unfulfilled = true;
+                } else {
+                    // First run with lookback 0: no history is owed either way,
+                    // so an unreadable head is an ordinary channel failure.
+                    failing_channels.push_back(ch.key);
+                }
                 continue;
             }
             // Genuine retrospective backfill, bounded by
@@ -1345,8 +1364,16 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
                           std::to_string(*oldest) + " > stored " + std::to_string(stored) + ")";
             gap.record_key = next_seq_record_key("wrap", ch.key);
             events.push_back(std::move(gap));
-            if (auto head = query_single_record_id(ch.path, EvtQueryReverseDirection))
+            if (auto head = query_single_record_id(ch.path, EvtQueryReverseDirection)) {
                 st.channels[ch.key].record_id = *head; // re-baseline forward, never replay-from-zero
+            } else {
+                // C4: the wrap gap and the re-baseline are one decision. Emitting
+                // the gap without moving the cursor would commit a report of loss
+                // while leaving the cursor behind the retained window, so the same
+                // wrap is re-detected and re-reported on every subsequent tick.
+                failing_channels.push_back(ch.key);
+                head_jump_unfulfilled = true;
+            }
             continue;
         }
 
@@ -1489,6 +1516,15 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
             result.detail += c + " ";
     }
 
+    if (head_jump_unfulfilled) {
+        // Rule 1: nothing is persisted, so pending_reenable_gap_ and the stored
+        // cursors survive untouched and the whole tick is retried. One
+        // temporarily unreadable channel costs a tick; letting it through costs
+        // the integrity of the pause contract.
+        throw IncompleteCaptureError(
+           "TAR removable: a Windows channel owed a head jump but its head could not be read -- "
+           "retaining cursor and re-enable state");
+    }
     if (!db.insert_removable_events_and_cursor(events, result.new_cursor_json))
         throw IncompleteCaptureError("TAR removable: Windows event/cursor commit failed");
     pending_reenable_gap_ = false; // only clear after the commit above succeeds (R-003)
