@@ -191,6 +191,14 @@ private:
     // — see R-003), so a failed commit's delta is re-derived and re-reported
     // next tick instead of being silently absorbed.
     std::size_t last_reported_dropped_{0};
+#if defined(__linux__)
+    // C8: kernel-side loss, reported on the same commit-gated cadence as the
+    // userspace queue overflow -- counted here, advanced only after commit.
+    std::size_t netlink_dropped_bursts_{0};
+    std::size_t netlink_recv_errors_{0};
+    std::size_t last_reported_netlink_bursts_{0};
+    std::size_t last_reported_netlink_errors_{0};
+#endif
 
     std::string next_seq_record_key(std::string_view prefix, std::string_view device_key) {
         return std::string(prefix) + ":" + std::string(device_key) + ":" +
@@ -282,6 +290,27 @@ private:
                       "could be committed (P-003 bounded-queue overflow, cumulative dropped)",
                       dropped_delta);
         ev.record_key = next_seq_record_key("overflow_gap", "removable");
+        return ev;
+    }
+
+    // C8: the kernel-side twin of the queue overflow above. A netlink socket
+    // whose receive buffer fills DROPS uevents and reports ENOBUFS -- the
+    // kernel's view and ours have diverged, and a device that attached and
+    // detached inside the lost burst is gone: the /sys/block reconciliation
+    // repairs final STATE, so it recovers a device still present, but it can
+    // never see one that came and went.
+    RemovableEvent make_netlink_loss_gap_event(std::size_t dropped_bursts,
+                                               std::size_t recv_errors) {
+        RemovableEvent ev;
+        ev.ts = now_seconds();
+        ev.action = "capture_gap";
+        ev.evidence = std::format(
+           "removable netlink receive lost messages — {} ENOBUFS drop(s) and {} receive "
+           "error(s) since the last report; uevents dropped by the kernel socket buffer are "
+           "unrecoverable, so a device that attached and detached within that window left no "
+           "row (per-tick /sys/block reconciliation recovers only devices still attached)",
+           dropped_bursts, recv_errors);
+        ev.record_key = next_seq_record_key("netlink_loss_gap", "removable");
         return ev;
     }
 
@@ -689,8 +718,26 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
         char buf[8192];
         for (;;) {
             const ssize_t n = ::recv(netlink_fd_.get(), buf, sizeof(buf), MSG_DONTWAIT);
-            if (n <= 0)
-                break; // EAGAIN/EWOULDBLOCK or error — nothing more pending
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                break; // drained — the ordinary exit
+            if (n <= 0) {
+                // C8: NOT the same thing. A netlink socket whose receive buffer
+                // fills DROPS messages and reports ENOBUFS; the kernel's view
+                // and ours have diverged and the lost uevents are gone. The
+                // per-tick /sys/block reconciliation repairs final STATE, so a
+                // device still attached is recovered -- but a device that
+                // attached and detached inside the lost burst is invisible to
+                // it, which is precisely the evidence this source exists to
+                // capture. Treating that as "nothing more pending" reported a
+                // complete tick over known-incomplete data. Count it and let
+                // the gap below report it, commit-gated like the userspace
+                // queue overflow it is the kernel-side twin of.
+                if (n < 0)
+                    ++netlink_recv_errors_;
+                if (n < 0 && errno == ENOBUFS)
+                    ++netlink_dropped_bursts_;
+                break;
+            }
             const auto rec = parse_uevent_message(std::string_view(buf, static_cast<std::size_t>(n)));
             if (!rec || !is_block_disk_uevent(*rec))
                 continue;
@@ -882,10 +929,17 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     if (dropped_delta > 0)
         events.push_back(make_overflow_gap_event(dropped_delta));
 
+    // C8: same shape as the overflow above -- reported now, advanced only once
+    // the commit that carries it has succeeded.
+    const auto bursts_delta = netlink_dropped_bursts_ - last_reported_netlink_bursts_;
+    const auto errors_delta = netlink_recv_errors_ - last_reported_netlink_errors_;
+    if (bursts_delta > 0 || errors_delta > 0)
+        events.push_back(make_netlink_loss_gap_event(bursts_delta, errors_delta));
+
     CursorCollectResult result;
     result.new_cursor_json = encode_removable_cursor(st);
     result.events_emitted = events.size();
-    result.outcome = (cursor_was_lost || reenable_gap_pending)
+    result.outcome = (cursor_was_lost || reenable_gap_pending || bursts_delta > 0)
                         ? CursorOutcome::CursorLost
                         : (cursor_json.has_value() ? CursorOutcome::Advanced : CursorOutcome::Baseline);
     if (!mounts_note.empty())
@@ -898,6 +952,8 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     queue_.ack_through(batch.last_seq);
     pending_reenable_gap_ = false;
     last_reported_dropped_ = dropped_now;
+    last_reported_netlink_bursts_ = netlink_dropped_bursts_;
+    last_reported_netlink_errors_ = netlink_recv_errors_;
     return result;
 }
 
