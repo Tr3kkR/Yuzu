@@ -217,6 +217,22 @@ bool wait_teardown_leases(const std::atomic<std::uint64_t>& count,
 /// fix deliberately makes. Dormant in the shipped agent: main.cpp's OrphanExitGuard
 /// hard_exit()s while any Guardian I/O worker is still live, long before ~Agent - so a
 /// wedged worker terminates the process there, not here.
+///
+/// That coverage claim rests on three facts in three other files (governance Gate 6 sre
+/// finding O1 — recorded here so a future change to any of them doesn't silently
+/// invalidate it): (1) register_mechanism() only accepts File/Registry/Service — Interval/
+/// Startup/Disk are timer-driven and never hold a raw mechanism pointer a door could
+/// resolve (this function, the type-gate a few lines above register_mechanism's body);
+/// (2) every production arm()/disarm() call for those three types runs inside a
+/// GuardianIoExecutor worker (guardian_spark_runtime.cpp's io_executor_ routing), whose
+/// active_worker_count() is exactly what OrphanExitGuard samples in main.cpp/
+/// service_win.cpp — so a parked door caller stays counted for as long as it's parked;
+/// (3) unregister_consumer() (door 3, the one door stop() doesn't gate via running_/
+/// stopped_) has exactly one production call site, rollback_spark_wiring_locked's
+/// boot-time construction-failure path (guardian_engine.cpp), reached with zero armed
+/// subscriptions to unwatch. A fourth spark type, a second unregister_consumer() caller,
+/// or an I/O path that bypasses GuardianIoExecutor would each need this comment
+/// re-verified.
 void wait_teardown_leases_forever(const std::atomic<std::uint64_t>& count) noexcept {
     while (count.load(std::memory_order_acquire) != 0)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1373,6 +1389,17 @@ void SparkEngine::stop() noexcept try {
     // serializes its own stop()/unwatch() internally). Either way this wait still
     // counts every caller genuinely in flight; only the "set that only shrinks" framing
     // is uniform across three of the four doors, not all four.
+    //
+    // BUDGET NOTE (governance Gate 6 sre finding D1): this wait draws on the same
+    // consumer_join_budget_ms_ as step 3's consumer join below, sequentially — so
+    // SparkEngine::stop()'s own worst-case contribution to the agent's total shutdown
+    // wall time roughly DOUBLES versus before this fix (default ~2s -> ~4s) when a
+    // mechanism teardown is genuinely still in flight. Checked against
+    // ShutdownDeadlineGuard's 20s grace and the composed ~40s figure documented at
+    // agent.cpp's kShutdownDeadlineGrace (service_win.cpp has its own prior-incident
+    // writeup of exactly this class of uncosted budget-stacking, PR #3737) — this
+    // addition fits comfortably inside both. Recorded here so the next person who
+    // changes a shutdown budget in this area has the current total already in hand.
     //
     // BOUNDED, AND IT PROCEEDS ON EXPIRY. stop() is called from Agent::stop() and from
     // the Windows SCM control thread; it may never become a place a shutdown can hang,
