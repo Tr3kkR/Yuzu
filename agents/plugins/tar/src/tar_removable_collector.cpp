@@ -1402,10 +1402,31 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     std::unordered_set<std::string> current_keys;
     attached_roots.reserve(volumes.size());
     current_keys.reserve(volumes.size());
+    // C7: the two Windows legs do NOT share an identity authority for an
+    // ANONYMOUS device. The event leg keys on the PnP ParentId; this snapshot
+    // keys on a volume GUID / PHYSICALDRIVE<n> / drive letter. Those are not
+    // alternative spellings of one identifier, so one physical device gets two
+    // device_keys: the snapshot's key looks like a brand-new attach, and the
+    // event leg's key looks like a device that has vanished, producing a
+    // fabricated attach/detach pair every tick.
+    //
+    // compute_device_key ignores platform_instance_id whenever a trusted serial
+    // is present, so the legs agree BY CONSTRUCTION exactly when used_serial is
+    // true. Reconciliation is therefore restricted to those devices. An
+    // anonymous device is still fully reported by the event leg -- which is the
+    // authoritative history source on Windows -- it just no longer has a second,
+    // incompatible identity inventing transitions for it here. The residual is
+    // that an anonymous device attached before the agent started and older than
+    // the event-log lookback gets no baseline row; that is a missing row, not a
+    // fabricated one, and it is the strictly safer failure for forensic
+    // evidence.
     for (const auto& v : volumes) {
         const auto key = compute_device_key(v.vendor, v.product, v.serial, v.instance_id);
         attached_roots.emplace_back(key.device_key, v.drive_letter + "\\");
+        if (!key.used_serial)
+            continue; // identity not comparable with the event leg's — see above
         current_keys.insert(key.device_key);
+        st.snapshot_keyed.insert(key.device_key);
         if (!st.attach_set.count(key.device_key)) {
             RemovableEvent re;
             re.ts = now_seconds();
@@ -1439,6 +1460,8 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     for (const auto& [key, present] : prev_attach_set) {
         if (!present || current_keys.count(key) || !st.attach_set.count(key))
             continue;
+        if (!st.snapshot_keyed.count(key))
+            continue; // C7: never detach a key this snapshot cannot even express
         RemovableEvent re;
         re.ts = now_seconds();
         re.action = "detached";

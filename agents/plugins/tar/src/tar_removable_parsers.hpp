@@ -386,6 +386,13 @@ struct RemovableCursorState {
     // event in the batch down with it. Persisted, so it survives a restart;
     // cleared per device on detach, so a re-attach reports afresh.
     std::set<std::string> exec_seen; // "<device_key>\x1f<image_path>"
+    // C7: device_keys the Windows SNAPSHOT leg is able to express -- i.e. those
+    // derived from a trusted serial, which is exactly when compute_device_key
+    // ignores the platform instance id and the two legs agree by construction.
+    // A key from the event leg for an ANONYMOUS device is keyed on the PnP
+    // ParentId, which the snapshot cannot reproduce, so the snapshot must never
+    // conclude that such a device has detached merely because it cannot see it.
+    std::set<std::string> snapshot_keyed;
     bool baseline_done{false};
     // R-005: distinguishes "never persisted" (nullopt/empty cursor_json --
     // a genuine first-ever run, tar_cursor.hpp rule 2's Baseline case) from
@@ -423,6 +430,11 @@ inline RemovableCursorState decode_removable_cursor(const std::optional<std::str
                 if (e.is_string())
                     st.exec_seen.insert(e.get<std::string>());
         }
+        if (j.contains("snapshot_keyed") && j["snapshot_keyed"].is_array()) {
+            for (const auto& e : j["snapshot_keyed"])
+                if (e.is_string())
+                    st.snapshot_keyed.insert(e.get<std::string>());
+        }
     } catch (const nlohmann::json::exception&) {
         RemovableCursorState lost;
         lost.malformed = true; // R-005: a persisted-but-unparseable cursor is CursorLost, not Baseline
@@ -444,6 +456,7 @@ inline std::string encode_removable_cursor(const RemovableCursorState& st) {
         attach_set[key] = present;
     j["attach_set"] = attach_set;
     j["exec_seen"] = nlohmann::json(st.exec_seen);
+    j["snapshot_keyed"] = nlohmann::json(st.snapshot_keyed);
     return j.dump();
 }
 

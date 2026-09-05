@@ -570,6 +570,35 @@ TEST_CASE("removable Linux mount correlation: a non-/dev/ source (tmpfs/nfs) and
 
 // ── decide_baseline_and_reconcile (shared baseline/reconcile decision) ─────
 
+TEST_CASE("compute_device_key: the two Windows legs agree exactly when a trusted serial is "
+          "present, which is why only those keys may drive reconciliation (C7)",
+          "[tar][removable][identity][c7]") {
+    // The Windows event leg keys an anonymous device on the PnP ParentId; the
+    // snapshot leg keys it on a volume GUID / PHYSICALDRIVE<n> / drive letter.
+    // With a trusted serial, compute_device_key ignores the instance id
+    // entirely, so both legs land on the same key.
+    const auto ev_serial = compute_device_key("Kingston", "DataTraveler", "SN-REAL-1",
+                                              R"(USB\VID_0951&PID_1666\5)");
+    const auto snap_serial = compute_device_key("Kingston", "DataTraveler", "SN-REAL-1",
+                                                R"(\\?\Volume{GUID}\)");
+    CHECK(ev_serial.used_serial);
+    CHECK(snap_serial.used_serial);
+    CHECK(ev_serial.device_key == snap_serial.device_key); // agree by construction
+
+    // Without one, the instance id IS the identity — and the two legs supply
+    // different identifiers, so the same physical device splits in two. That
+    // is why the snapshot no longer reconciles anonymous devices: it would see
+    // its own key as a new attach and the event leg's key as a device that had
+    // vanished, fabricating an attach/detach pair every tick.
+    const auto ev_anon = compute_device_key("Generic", "Flash Disk", "",
+                                            R"(USB\VID_0000&PID_0000\7)");
+    const auto snap_anon = compute_device_key("Generic", "Flash Disk", "",
+                                              R"(\\?\Volume{OTHER-GUID}\)");
+    CHECK_FALSE(ev_anon.used_serial);
+    CHECK_FALSE(snap_anon.used_serial);
+    CHECK(ev_anon.device_key != snap_anon.device_key);
+}
+
 TEST_CASE("a POSIX sibling whose NAME contains a backslash is not under the removable root (C9)",
           "[tar][removable][exec][c9]") {
     // On Linux and macOS a backslash is an ordinary filename character. Treating
