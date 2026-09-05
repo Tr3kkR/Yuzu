@@ -86,6 +86,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
+  - [Result Sets](#result-sets)
   - [Software Licensing (SLE)](#software-licensing-sle)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
@@ -4813,6 +4814,181 @@ Results carry a **per-agent scope drop filter** — the `require_fleet_read` gat
 | 503 | The gate's own RBAC/tag-store lookup is unavailable or degraded, the software inventory store is unavailable or degraded, or the `require_fleet_read` gate itself is unwired (server misconfiguration) — all A4 envelope with `correlation_id`, `retry_after_ms: 5000` where retryable — **never an empty 200** |
 
 On a `503` the store (or the confinement check itself) could not be read; do **not** treat it as "not installed anywhere" (ADR-0016 §7 authoritative reads). A genuine empty result is `200` with `count: 0`.
+
+---
+
+### Result Sets
+
+The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is not always constructed — these routes register only when it is wired.
+
+`ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
+
+**Example `ResultSet` object** (returned by several routes below):
+
+```json
+{
+  "id": "rs_a1b2c3d4e5f6",
+  "name": "Ubuntu fleet, patched",
+  "owner_principal": "alice",
+  "created_at": 1711900800,
+  "ttl_at": 1712505600,
+  "last_used_at": 1711900800,
+  "pinned": false,
+  "parent_id": "",
+  "source_kind": "manual_curate",
+  "status": "materialized",
+  "source_execution_id": "",
+  "device_count": 42
+}
+```
+
+`parent_id` is `""` when the set has no parent. `source_kind` is one of `manual_curate` (direct `POST /result-sets`), `inventory_query`, `tar_query`, or `instruction_result`. `status` is `pending` until an asynchronous producer's dispatch responses land, then `materialized`.
+
+#### `GET /api/v1/result-sets`
+
+List the caller's owned result sets, newest first.
+
+**Permission:** Session-authenticated (owner-scoped; no RBAC permission).
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `cursor` | string | Opaque pagination cursor from a previous response |
+| `limit` | integer | Max results (default 50, max 500) |
+
+**Response:**
+
+```json
+{
+  "data": { "result_sets": [ { "...": "ResultSet objects, see above" } ], "next_cursor": "" },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token — result-set listing cannot be confined to the token's service |
+
+A store-level read failure is not surfaced as an error on this route — `ResultSetStore::list_by_owner` deliberately returns a plain (possibly empty) container rather than `std::expected` (ADR-0036 "not yet widened" class), so a degraded store answers `200` with an empty `result_sets` array, not a `503`.
+
+#### `POST /api/v1/result-sets`
+
+Create a result set directly from a pre-computed device-id list (e.g. an operator with a CSV of device ids). Synchronous — lands `materialized` immediately, no dispatch involved.
+
+**Permission:** Session-authenticated (owner-scoped).
+
+**Request body:**
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Human-readable name |
+| `source_kind` | string | No | Defaults to `manual_curate` |
+| `source_payload` | object | No | Stored as JSON; defaults to `{}` |
+| `parent_id` | string | No | Must reference a set the caller owns (else `404`) |
+| `device_ids` | array of string | No | The initial member set |
+
+**Response (201):** A `ResultSet` object (see above).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `RESULT_SET_TOO_MANY_MEMBERS` (`device_ids` exceeds the per-set cap), or another `ResultSetError` (every non-quota `create_materialized` failure — including a store-level error — maps to `400`, not `503`) |
+| 403 | Service-scoped API token |
+| 404 | `parent_id` supplied but not owned/found |
+| 429 | `RESULT_SET_QUOTA` — owner is at the per-owner set cap |
+
+#### `GET /api/v1/result-sets/{id}`
+
+Fetch one result set by id.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response (200):** A `ResultSet` object (see above).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | `RESULT_SET_NOT_FOUND` — no such set, or not owned by the caller (identical body either way — no enumeration oracle) |
+| 503 | Result-set store unavailable |
+
+#### `DELETE /api/v1/result-sets/{id}`
+
+Delete a result set.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response:** `{"data": {"deleted": true}, "meta": {"api_version": "v1"}}`
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller |
+| 409 | `RESULT_SET_PINNED` — unpin the set before deleting it |
+| 503 | Result-set store unavailable |
+
+#### `GET /api/v1/result-sets/{id}/members`
+
+Page through a result set's member device ids.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Query parameters:**
+
+| Param | Type | Description |
+|---|---|---|
+| `cursor` | string | Opaque pagination cursor |
+| `limit` | integer | Max results (default 1000, max 10000) |
+
+**Response:** `{"data": {"device_ids": [...], "next_cursor": ""}, "meta": {"api_version": "v1"}}`
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller |
+| 503 | Result-set store unavailable |
+
+#### `GET /api/v1/result-sets/{id}/lineage`
+
+Read a result set's ancestor chain (walks `parent_id` links up to the root).
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response:** `{"data": {"chain": [{"id": "...", "name": "...", "source_kind": "...", "device_count": 0}]}, "meta": {"api_version": "v1"}}`
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller |
+| 503 | Result-set store unavailable |
+
+#### `POST /api/v1/result-sets/{id}/pin`<br>`POST /api/v1/result-sets/{id}/unpin`
+
+Pin (exempt from TTL expiry) or unpin a result set.
+
+**Permission:** Session-authenticated (owner-scoped, `load_owned`).
+
+**Response (200):** The updated `ResultSet` object (`pinned` flipped).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 403 | Service-scoped API token |
+| 404 | No such set, or not owned by the caller |
+| 409 | `PIN_LIMIT` — owner is at the per-owner pin cap (pin only) |
+| 503 | Result-set store unavailable |
 
 ---
 
