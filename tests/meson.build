@@ -687,6 +687,22 @@ if host_machine.system() == 'windows'
   tar_test_deps += cxx.find_library('ws2_32')   # winsock2 symbols the iphlpapi/netioapi headers in tar_netqual_boot.cpp pull in
   tar_test_deps += cxx.find_library('mpr')      # tar_mapdrive_collector.cpp WNet outbound
   tar_test_deps += cxx.find_library('netapi32') # tar_mapdrive_collector.cpp NetSessionEnum inbound
+  tar_test_deps += cxx.find_library('powrprof') # tar_power_collector.cpp PowerRegisterSuspendResumeNotification
+elif host_machine.system() == 'linux'
+  # tar_power_collector.cpp is compiled DIRECTLY into this exe, and its Linux
+  # sleep/wake leg is compile-gated on YUZU_HAVE_LIBSYSTEMD. That define was
+  # added to the plugin's args only, so the whole sd-bus leg -- and the two test
+  # cases that exercise it -- compiled OUT of this binary on Linux, where the
+  # #else branch SUCCEEDs with a "skipped" message. The suite stayed green while
+  # testing nothing, on the one platform that is this leg's enforcement point.
+  # Mirror the plugin's block (agents/plugins/tar/meson.build) so the tests
+  # compile in wherever the plugin's leg does.
+  libsystemd_test_dep = dependency('libsystemd', required: get_option('systemd_guard'),
+                                   include_type: 'system')
+  if libsystemd_test_dep.found()
+    tar_test_deps += libsystemd_test_dep
+    tar_test_cpp_args += '-DYUZU_HAVE_LIBSYSTEMD'
+  endif
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
   # audit-token helpers, gated on the framework being present (full Xcode SDK).
