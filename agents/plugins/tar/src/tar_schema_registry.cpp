@@ -999,18 +999,18 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .default_enabled = true,
             .unique_key_column = "record_key",
             .os_support = {
-                {"windows", OsSupportStatus::kPlanned, "powerbroadcast",
+                {"windows", OsSupportStatus::kSupportedConstrained, "powerbroadcast",
                  "Suspend/resume + AC transitions via "
                  "PowerRegisterSuspendResumeNotification / WM_POWERBROADCAST, "
-                 "cursor-model (tar_cursor.hpp) — collector lands wave 2."},
-                {"linux",   OsSupportStatus::kPlanned, "logind",
+                 "cursor-model (tar_cursor.hpp)."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "logind",
                  "systemd-logind PrepareForSleep sd-bus signal + power-supply "
-                 "sysfs/udev, cursor-model — collector lands wave 2. Gated by "
+                 "sysfs/udev, cursor-model. Gated by "
                  "the optional libsystemd dep (YUZU_HAVE_LIBSYSTEMD)."},
-                {"macos",   OsSupportStatus::kPlanned, "pmset_log",
+                {"macos",   OsSupportStatus::kSupported, "pmset_log",
                  "`pmset -g log` retrospective replay (measured working "
                  "unprivileged on this Mac 2026-09-04, 9,629 lines: "
-                 "hardware-probe measurement, Wave 6), cursor-model — collector lands wave 2."},
+                 "hardware-probe measurement, Wave 6), cursor-model."},
             },
             .granularities = {
                 {
