@@ -327,3 +327,124 @@ winner sweeps). The in-process cleanup thread's join-before-store-teardown contr
   recipe, and name **EXISTS, never a counting aggregate**, as the probe form (Gate 3
   performance measured the difference on this store; `result_set_store.cpp` still carries the
   counting form and should be converted before the remaining #2508 stores copy it).
+
+## Update (2026-09-04) — `migrate_from_sqlite()` retired
+
+ADR-0009's fresh-start-by-default amendment (2026-08-25) named `AuditStore` as the sole
+**permanent** exception: "audit evidence cannot be regenerated the way config or cache state
+can." This ADR's "Skippable backfill: rejected" line above (Considered and rejected) recorded
+the same reasoning for the mandatory backfill this document originally designed. Both are
+superseded here, at the operator's explicit direction: a hard cutover with no migration path
+held open, for any store, accepting permanent audit-trail loss as the failure mode if the "no
+production fleet" premise is ever wrong for this store specifically. #3623 (batches A and B,
+merged 2026-09-03) had already retired the other 18 stores' `migrate_from_sqlite()`;
+`chore/retire-migrate-from-sqlite-auditstore` retires the 19th and last.
+
+`AuditStore::migrate_from_sqlite()` and its private helpers (`legacy_has_column`,
+`LegacyTableStatus`, `legacy_has_table`, `LegacyFingerprint`, `legacy_fingerprint`,
+`parse_fingerprint`, `stamp_complete`, `move_legacy_aside`, `kBackfillTxnTimeout`,
+`kBackfillBatchRows`, the `Sourceless` enum) are removed, along with the now-permanently-false
+`backfill_pending_` write gate on `log()` (nothing sets it once the only caller is gone) and the
+`yuzu_server_audit_backfill_total{result}` counter + its `YuzuAuditBackfillFailing` alert.
+`audit_retention_meta` is NOT dropped — it also holds the clock guard's permanent durable state
+(`last_pass_now`, `last_anomaly_facts`, `bootstrap_settled`, #2360/#2579) — and its two
+backfill-only rows (`backfill_complete`, `backfill_source_fingerprint`) are removed via a
+version-bumped v2 migration appended after the already-shipped v1, never edited in place: this
+store is constructed in production, so v1 has run against real dev/UAT databases.
+
+**DELETE, not poison — the opposite choice from `RbacStore`'s v4 (ADR-0041's own Update,
+same PR family), and deliberately so.** `RbacStore`'s retired code fell through marker-absence
+into an unconditional overwrite of a live security flag (`rbac_enabled`) sourced from whatever a
+local legacy file held — silent and dangerous, so that migration POISONS the marker to force an
+old binary rolling back down its own pre-existing safe branches instead of a bare `DELETE`.
+`AuditStore::migrate_from_sqlite()` was already engineered against exactly this failure shape,
+across three governance rounds (Gate 3 architect A-2/A-4, Gate 4 unhappy-path UP-1/UP-10 round
+3, Gate 8 architect round 3; #2661/#2854) — verified by reading the pre-retirement code directly
+(`git show 8992b5274:server/core/src/audit_store.cpp`, the `origin/dev` HEAD this PR branched
+from) rather than assumed from precedent:
+
+**Gate 4 unhappy-path UP-1 (round 4) found that the DELETE alone does not actually reach this
+guarantee.** An earlier draft of this Update reasoned through the sub-cases individually — marker
+absent with an empty table, marker absent with a non-empty table, marker absent with a real
+legacy file, marker already present — and concluded each one refuses loudly except a narrow
+empty-table window where an old binary re-stamps `backfill_complete='sourceless'` via its own
+`complete_without_source`/`Sourceless::StampIfEmpty` default (pre-retirement file, line ~964).
+That per-case reasoning was accurate as far as it went, but it missed the composition:
+`audit_retention_meta` is never wiped again once v2 has run, so a stamp made during that one
+narrow window is **permanent** — no later v2 re-run ever revisits it. Every subsequent old-binary
+boot on that database, at any later time, however much data `audit_events` holds by then, now
+takes the marker-**present** branch instead, which — when no legacy file remains at the
+configured path, the ordinary case — returns success with **zero row-count check at all**
+(pre-retirement file, lines ~928-940). One lost race permanently and silently disarms the refusal
+for that database. UP-2 compounds this: the break-glass one-shot CLI (`--mfa-reset`/
+`--break-glass-arm`) constructs a full `AuditStore` unconditionally on every invocation, so
+running it from a freshly-built image against a fleet whose daemons haven't yet upgraded can
+manufacture the empty-table window directly, on a live fleet, outside any planned rollout.
+
+**The fix is a CHECK constraint added in the SAME v2 migration as the DELETE, DELETE ordered
+first, one transaction** — closing the race rather than narrowing it:
+
+```sql
+DELETE FROM audit_retention_meta WHERE key IN ('backfill_complete', 'backfill_source_fingerprint');
+ALTER TABLE audit_retention_meta ADD CONSTRAINT audit_retention_meta_no_retired_backfill_markers
+    CHECK (key NOT IN ('backfill_complete', 'backfill_source_fingerprint'));
+```
+
+**Must stay one migration — an interim commit on this branch briefly split it and Gate 5
+chaos-injector (round 1) found why that was worse.** The split moved the DELETE into v2 and the
+ADD CONSTRAINT into a new v3, to avoid depending on checking every local/dev Postgres instance for
+drift from an even earlier commit's DELETE-only v2 (see the drift-check record below — that
+concern turned out to already be closed). But a crash between v2's COMMIT and v3's BEGIN is a real
+durable state: `audit_retention_meta` has no marker rows and no constraint yet, and an old
+binary — which does not take `PgMigrationRunner`'s advisory lock, by its own explicit design — can
+land a marker `INSERT` into exactly that gap. v3's `ALTER TABLE ADD CONSTRAINT` then fails
+validating the row it finds, so the **current** binary's own `AuditStore` refuses to open too, not
+merely an old one — a wedge until an operator manually deletes the row, worse than the silent
+UP-1 disarm this fix exists to close. Folded into one transaction, DELETE and ADD CONSTRAINT
+commit together or roll back together, so no durable state exists where the marker could be
+absent but the constraint not yet in force. The DELETE ordered first is also what makes a retry
+**self-healing**, not merely atomic: if an old binary's insert lands and this transaction's own
+`ALTER` blocks on it and then fails, the *next* attempt's `DELETE` clears that very row before its
+`ALTER` validates — a split migration has no `DELETE` in its second step to do this.
+
+Same shape as `RbacStore`'s own v2 constraint (`rbac_meta_enabled_canonical`) on the same
+key/value-meta table pattern — but where RbacStore's constraint narrows the *values* a key may
+hold, this one forbids the *keys* outright. With it in place, `stamp_complete`'s `INSERT` fails
+(`23514 check_violation`, independent of `ON CONFLICT` arbitration — Postgres validates CHECK
+constraints before conflict resolution) on two of the four sub-cases above: marker-absent with an
+empty table (the UP-1 window itself) and a real local legacy file. The other two never reach an
+`INSERT` at all: a non-empty `audit_events` was already refused by the pre-existing
+`pg_rows_before` guard, unrelated to this fix, and marker-present is structurally unreachable,
+since the marker can never be (re-)inserted. `migrate_from_sqlite` returns `false` on every one of
+the four, and `server.cpp` sets `startup_failed_`, deterministically, not merely in the realistic
+case. The refusal itself is the same class of guarantee the `DROP TABLE` group gets from
+`42P01`/`undefined_table` — a schema-level rejection, not a live-row-count race — while still
+leaving `audit_retention_meta` itself in place for the clock guard's permanent rows. One caveat
+this framing does not extend to: in the legacy-file-present sub-case, the old binary's row
+inserts into `audit_events` (each in their own idempotent transaction, `ON CONFLICT (id) DO
+NOTHING`) run and commit *before* the final `stamp_complete` call that now fails — the refusal
+here is loud and deterministic, but it is not zero-data-movement the way an `undefined_table`
+error on first touch is. Nothing in the current codebase writes either backfill key any more
+(`migrate_from_sqlite` and its helpers are fully deleted), so the constraint can never reject
+legitimate current-binary activity.
+
+**Drift-check record (Gate 6 security-guardian, round 1) — the concern the brief split tried to
+address, resolved the safer way instead.** This SQL has been identical since its first commit on
+this branch; `git merge-base --is-ancestor <that commit> origin/main` and `origin/dev` both return
+false (this branch has never shipped), and a direct `schema_meta` query against the two Postgres
+instances reachable from this box showed both still at v1 — no rig anywhere has run a build with a
+different v2 to drift from.
+
+`server.cpp` now runs `legacy_sqlite_probe::harden_legacy_file_0600(audit.db, "AuditStore")` (POSIX
+only — a documented no-op on Windows, #3593 — `audit_events.detail` may hold plaintext secret
+material from a since-fixed historical bug) followed by
+`legacy_sqlite_probe::warn_if_legacy_rows(audit.db, "AuditStore", {"audit_events"})` at
+construction instead — WARN-only, log-only, never blocking, the same treatment every other
+retired store gets. This is a deliberate, explicit choice: "no migration
+paths held open" governs the DATA path (nothing imports a legacy file's rows any more), not the
+detect-and-warn smoke detector every other retired store keeps — an operator finding a real,
+row-holding `audit.db` still gets a loud boot-time signal that the "no production fleet"
+premise may be locally wrong, even though nothing will act on it. `open_one_shot_audit()`
+(`main.cpp`, the `--mfa-reset`/`--break-glass-arm` break-glass CLI paths) drops its
+`legacy_audit_db` parameter and `Sourceless::Refuse` call entirely — it now just constructs
+`AuditStore` and checks `is_open()`, matching every other one-shot audit writer.
