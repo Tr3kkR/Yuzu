@@ -866,15 +866,33 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
     }
 
     if (in.baseline_already_done) {
+        // K3: reconciliation diffs the pending CALLBACKS against a SNAPSHOT of
+        // the device set, and the two are not taken atomically. A device
+        // unplugged mid-tick can therefore have a real `detached` callback in
+        // `pending` while the snapshot, taken a moment earlier, still lists it.
+        // Without this guard the pending loop above removes the key and the
+        // loop below immediately re-adds it as a "missed appeared-callback" --
+        // evidence for a callback that never went missing -- leaving it in
+        // attach_set so a second, reconcile-derived `detached` follows next
+        // tick: three rows for one removal, one of them false. A key the OS
+        // has already spoken about this tick needs no reconciling in either
+        // direction; the snapshot is the weaker witness and must not override
+        // a callback that actually arrived.
+        std::unordered_set<std::string> pending_keys;
+        pending_keys.reserve(in.pending.size());
+        for (const auto& [action, key] : in.pending)
+            pending_keys.insert(key);
+
         for (const auto& key : in.current_keys) {
-            if (out.attach_set.count(key))
+            if (out.attach_set.count(key) || pending_keys.count(key))
                 continue; // already accounted for by a callback this tick
             out.reconcile_added.push_back(key);
             out.attach_set[key] = true;
         }
         for (const auto& [key, present] : in.prev_attach_set) {
-            if (!present || in.current_keys.count(key) || !out.attach_set.count(key))
-                continue; // still attached, or already removed by a real callback
+            if (!present || in.current_keys.count(key) || !out.attach_set.count(key) ||
+                pending_keys.count(key))
+                continue; // still attached, or already spoken for by a callback this tick
             out.reconcile_removed.push_back(key);
             out.attach_set.erase(key);
             forget_execs(key);

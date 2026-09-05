@@ -703,6 +703,42 @@ TEST_CASE("a detach callback queued during the baseline tick still wins over the
     CHECK(out.attach_set.count("dev-b") == 1);
 }
 
+TEST_CASE("a real detach arriving mid-tick is not re-attached by the stale snapshot (K3)",
+          "[tar][removable][baseline][k3]") {
+    // Kimi's falsifier, verbatim. The device set snapshot and the pending
+    // callback queue are NOT captured atomically: a stick unplugged between the
+    // two leaves a real `detached` callback in pending while the snapshot still
+    // lists the device. Before the guard, the pending loop removed the key and
+    // the reconcile loop immediately re-added it with evidence claiming a
+    // missed appeared-callback that never went missing -- and left it in
+    // attach_set, so a second reconcile-derived `detached` followed next tick.
+    // Three rows for one removal, one of them factually false, on a default-on
+    // forensic source.
+    yuzu::tar::BaselineReconcileInputs in;
+    in.baseline_already_done = true;
+    in.current_keys = {"dev-a"};              // snapshot taken BEFORE the eject
+    in.prev_attach_set = {{"dev-a", true}};
+    in.pending = {{"detached", "dev-a"}};     // the real callback, taken after
+
+    const auto out = yuzu::tar::decide_baseline_and_reconcile(in);
+    CHECK(out.reconcile_added.empty());   // <- the fabricated row
+    CHECK(out.reconcile_removed.empty()); // the real callback already covers it
+    CHECK(out.attach_set.count("dev-a") == 0); // and it is genuinely gone
+
+    // The mirror case: an `attached` callback in flight while the snapshot has
+    // not caught up must not be double-reported either.
+    yuzu::tar::BaselineReconcileInputs in2;
+    in2.baseline_already_done = true;
+    in2.current_keys = {};                    // snapshot predates the arrival
+    in2.prev_attach_set = {};
+    in2.pending = {{"attached", "dev-b"}};
+
+    const auto out2 = yuzu::tar::decide_baseline_and_reconcile(in2);
+    CHECK(out2.reconcile_added.empty());
+    CHECK(out2.reconcile_removed.empty());
+    CHECK(out2.attach_set.count("dev-b") == 1);
+}
+
 TEST_CASE("reconciliation still recovers a callback the OS never delivered, both directions",
           "[tar][removable][baseline]") {
     BaselineReconcileInputs in;
