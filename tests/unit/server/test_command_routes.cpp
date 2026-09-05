@@ -610,3 +610,93 @@ TEST_CASE("/api/command: audit_quarantine_dispatch_fail_closed throwing still re
                        {{"route", "command"}, {"phase", "audit_quarantine_dispatch_fail_closed"}})
               .value() == 1);
 }
+
+// Governance round 1 closure evidence (UP-1b), remaining guarded() call
+// sites: the counter-increment property above is asserted once per site so a
+// regression narrowed to a single `guarded()` call cannot hide behind the
+// others passing.
+
+TEST_CASE("/api/command: forward_gateway_pending throwing increments the fanout counter",
+          "[command_routes]") {
+    CommandHarness h;
+    h.forward_gateway_throws = true;
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "command"}, {"phase", "forward_gateway_pending"}})
+              .value() == 1);
+}
+
+TEST_CASE("/api/command: audit_unknown_plugin_dispatch throwing increments the fanout counter",
+          "[command_routes]") {
+    CommandHarness h;
+    h.audit_unknown_plugin_throws = true;
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "command"}, {"phase", "audit_unknown_plugin_dispatch"}})
+              .value() == 1);
+}
+
+TEST_CASE("/api/command: audit_quarantine_dispatch_denied_batch throwing increments the fanout "
+          "counter",
+          "[command_routes]") {
+    CommandHarness h;
+    h.audit_quarantine_throws = true;
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "command"}, {"phase", "audit_quarantine_dispatch_denied_batch"}})
+              .value() == 1);
+}
+
+TEST_CASE("/api/command: thead_for_plugin throwing increments the fanout counter",
+          "[command_routes]") {
+    CommandHarness h;
+    h.thead_throws = true;
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "command"}, {"phase", "thead_for_plugin"}})
+              .value() == 1);
+}
+
+TEST_CASE("/api/command: publish(command-status) throwing increments the fanout counter",
+          "[command_routes]") {
+    CommandHarness h;
+    h.publish_throws = true;
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "command"}, {"phase", "publish(command-status)"}})
+              .value() == 1);
+}
+
+TEST_CASE("/api/command: emit_event(command.dispatched) throwing increments the fanout counter",
+          "[command_routes]") {
+    CommandHarness h;
+    h.emit_event_throws = true;
+    auto res = h.sink.Post("/api/command",
+                           R"({"plugin":"noop","action":"run","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_fanout_throw_total",
+                       {{"route", "command"}, {"phase", "emit_event(command.dispatched)"}})
+              .value() == 1);
+}
