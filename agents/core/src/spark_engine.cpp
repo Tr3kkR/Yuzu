@@ -1384,9 +1384,13 @@ void SparkEngine::stop() noexcept try {
     // arm_impl gate their own entry on those under mu_ BEFORE resolving a mechanism, so
     // no NEW caller can arm a lease there from here on. unregister_consumer() gates on
     // consumers_ membership instead, which this function doesn't empty until step 3
-    // below — a call landing in this window CAN still arm a lease (see the header's
-    // TeardownLease doc for why that's verified benign, not a gap: every mechanism
-    // serializes its own stop()/unwatch() internally). Either way this wait still
+    // below — a call landing in this window CAN still arm a lease, but that is NOT the
+    // same as an unwatch() racing a concurrently-stopping mechanism (governance Gate 8
+    // cpp-expert finding, re-correcting an earlier draft of this paragraph that implied
+    // exactly that race): unregister_consumer()'s own to_unwatch collection is ALSO
+    // running_-gated, so a call landing here collects nothing and its post-mu_ unwatch
+    // loop runs zero times. What's genuinely different about door 3 is narrower — see
+    // the header's TeardownLease doc for the full account. Either way this wait still
     // counts every caller genuinely in flight; only the "set that only shrinks" framing
     // is uniform across three of the four doors, not all four.
     //

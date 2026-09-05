@@ -660,10 +660,12 @@ private:
     /// under a caller parked in that window (use-after-free). The bounded one is an
     /// API-contract nicety, and stop() must never become a place shutdown can hang.
     ///
-    /// NO NEW CALLER CAN SLIP IN BEHIND stop() on three of the four doors: disarm(),
+    /// NO NEW CALLER CAN ARM A LEASE BEHIND stop() on three of the four doors: disarm(),
     /// teardown_arm_race() and arm_impl() gate their own entry on running_/stopped_
     /// under mu_ BEFORE they resolve a mechanism, so once stop()'s early locked block
-    /// has flipped both flags a later caller resolves nothing and arms nothing.
+    /// has flipped both flags a later caller resolves nothing and arms nothing. (Door 3
+    /// is the exception to THIS claim only — its unwatch()-gating is uniform across all
+    /// four doors; see below.)
     /// unregister_consumer() (door 3) gates ENTRY differently — on whether `id` is
     /// still present in consumers_, which stop() doesn't empty until its OWN later
     /// step 3 (the consumers.swap) — so a call landing in that window still arms a
