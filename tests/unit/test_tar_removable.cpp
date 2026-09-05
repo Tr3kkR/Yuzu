@@ -389,10 +389,10 @@ TEST_CASE("removable record_key builders: distinct inputs produce distinct, stab
           "[tar][removable][recordkey]") {
     CHECK(removable_baseline_record_key("abc") == removable_baseline_record_key("abc"));
     CHECK(removable_baseline_record_key("abc") != removable_baseline_record_key("def"));
-    CHECK(removable_exec_record_key("abc", "/bin/tool") ==
-         removable_exec_record_key("abc", "/bin/tool"));
-    CHECK(removable_exec_record_key("abc", "/bin/tool") !=
-         removable_exec_record_key("abc", "/bin/other"));
+    CHECK(removable_exec_record_key("abc", 1700000000, "/bin/tool") ==
+         removable_exec_record_key("abc", 1700000000, "/bin/tool"));
+    CHECK(removable_exec_record_key("abc", 1700000000, "/bin/tool") !=
+         removable_exec_record_key("abc", 1700000000, "/bin/other"));
     CHECK(removable_channel_record_key("partition", 156) ==
          removable_channel_record_key("partition", 156));
     CHECK(removable_channel_record_key("partition", 156) !=
@@ -615,6 +615,52 @@ TEST_CASE("a POSIX sibling whose NAME contains a backslash is not under the remo
 
     // And a genuine POSIX child is unaffected.
     CHECK(exec_path_under_removable_root("/media/user/USB/decoy", "/media/user/USB"));
+}
+
+TEST_CASE("a re-attach starts a new exec session, so the same binary does not re-collide (HIGH-3)",
+          "[tar][removable][exec][session]") {
+    // The exec key must be STABLE while a device stays attached (one row per
+    // execution, and a retry must dedupe) but DIFFER across attach sessions.
+    // Clearing exec_seen on detach without changing the key meant a replug plus
+    // a re-run re-derived the previous session's key with a new ts -- which the
+    // store reads as a payload mismatch and refuses on every tick. That is the
+    // same wedge exec_seen exists to prevent, reached through the clearing path.
+    yuzu::tar::BaselineReconcileInputs attach;
+    attach.baseline_already_done = true;
+    attach.now = 1000;
+    attach.pending = {{"attached", "usb-1"}};
+    const auto s1 = yuzu::tar::decide_baseline_and_reconcile(attach);
+    REQUIRE(s1.attach_epoch.count("usb-1") == 1);
+    CHECK(s1.attach_epoch.at("usb-1") == 1000);
+
+    // Detach ends the session and forgets the executions.
+    yuzu::tar::BaselineReconcileInputs detach;
+    detach.baseline_already_done = true;
+    detach.now = 2000;
+    detach.prev_attach_set = {{"usb-1", true}};
+    detach.attach_epoch = s1.attach_epoch;
+    detach.exec_seen = {std::string("usb-1") + "\x1f" + "/Volumes/USB/tool"};
+    detach.pending = {{"detached", "usb-1"}};
+    const auto s2 = yuzu::tar::decide_baseline_and_reconcile(detach);
+    CHECK(s2.attach_epoch.count("usb-1") == 0);
+    CHECK(s2.exec_seen.empty());
+
+    // Re-attach starts a NEW session ...
+    yuzu::tar::BaselineReconcileInputs again;
+    again.baseline_already_done = true;
+    again.now = 3000;
+    again.attach_epoch = s2.attach_epoch;
+    again.pending = {{"attached", "usb-1"}};
+    const auto s3 = yuzu::tar::decide_baseline_and_reconcile(again);
+    CHECK(s3.attach_epoch.at("usb-1") == 3000);
+
+    // ... so the same binary on the same device yields a DIFFERENT key, and the
+    // store sees a new record rather than a colliding replay.
+    CHECK(removable_exec_record_key("usb-1", 1000, "/Volumes/USB/tool") !=
+          removable_exec_record_key("usb-1", 3000, "/Volumes/USB/tool"));
+    // While the session lasts, the key is stable so a retry still dedupes.
+    CHECK(removable_exec_record_key("usb-1", 3000, "/Volumes/USB/tool") ==
+          removable_exec_record_key("usb-1", 3000, "/Volumes/USB/tool"));
 }
 
 TEST_CASE("exec_from_removable is reported once per attach session, not once per tick, and a "

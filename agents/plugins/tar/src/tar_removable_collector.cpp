@@ -241,7 +241,11 @@ private:
             ev.image_path = m.image_path;
             ev.pid = m.pid;
             ev.evidence = "process_enum:exec_path";
-            ev.record_key = removable_exec_record_key(m.device_key, m.image_path);
+            const auto ep = st.attach_epoch.find(m.device_key);
+            if (ep == st.attach_epoch.end())
+                continue; // not in a known attach session -- no honest key to mint
+            ev.record_key =
+               removable_exec_record_key(m.device_key, ep->second, m.image_path);
             const std::string seen_key = m.device_key + "\x1f" + m.image_path;
             if (!st.exec_seen.insert(seen_key).second)
                 continue; // already reported for this attach session
@@ -474,6 +478,8 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     bri.current_keys = current_keys;
     bri.prev_attach_set = prev_attach_set;
     bri.exec_seen = st.exec_seen;
+    bri.attach_epoch = st.attach_epoch;
+    bri.now = now_seconds();
     bri.pending.reserve(pending.size());
     for (const auto& ev : pending)
         bri.pending.emplace_back(ev.action, ev.device_key);
@@ -481,6 +487,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     st.attach_set.clear();
     st.attach_set.insert(decided.attach_set.begin(), decided.attach_set.end());
     st.exec_seen = decided.exec_seen;
+    st.attach_epoch = decided.attach_epoch;
 
     for (const auto& key : decided.baseline_keys) {
         const auto it = seen_by_key.find(key);

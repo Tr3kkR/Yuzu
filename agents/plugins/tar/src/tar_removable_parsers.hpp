@@ -393,6 +393,10 @@ struct RemovableCursorState {
     // ParentId, which the snapshot cannot reproduce, so the snapshot must never
     // conclude that such a device has detached merely because it cannot see it.
     std::set<std::string> snapshot_keyed;
+    // device_key -> the epoch second at which this attach session began. Scopes
+    // the exec record_key (see removable_exec_record_key) so a re-attach is a
+    // new session rather than a colliding replay of the old one.
+    std::map<std::string, std::int64_t> attach_epoch;
     bool baseline_done{false};
     // R-005: distinguishes "never persisted" (nullopt/empty cursor_json --
     // a genuine first-ever run, tar_cursor.hpp rule 2's Baseline case) from
@@ -435,6 +439,11 @@ inline RemovableCursorState decode_removable_cursor(const std::optional<std::str
                 if (e.is_string())
                     st.snapshot_keyed.insert(e.get<std::string>());
         }
+        if (j.contains("attach_epoch") && j["attach_epoch"].is_object()) {
+            for (auto it = j["attach_epoch"].begin(); it != j["attach_epoch"].end(); ++it)
+                if (it.value().is_number_integer())
+                    st.attach_epoch[it.key()] = it.value().get<std::int64_t>();
+        }
     } catch (const nlohmann::json::exception&) {
         RemovableCursorState lost;
         lost.malformed = true; // R-005: a persisted-but-unparseable cursor is CursorLost, not Baseline
@@ -457,6 +466,10 @@ inline std::string encode_removable_cursor(const RemovableCursorState& st) {
     j["attach_set"] = attach_set;
     j["exec_seen"] = nlohmann::json(st.exec_seen);
     j["snapshot_keyed"] = nlohmann::json(st.snapshot_keyed);
+    nlohmann::json epochs = nlohmann::json::object();
+    for (const auto& [k, e] : st.attach_epoch)
+        epochs[k] = e;
+    j["attach_epoch"] = epochs;
     return j.dump();
 }
 
@@ -485,9 +498,21 @@ inline std::string removable_baseline_record_key(std::string_view device_key) {
     return "baseline:" + std::string(device_key);
 }
 
+/// Scoped to the ATTACH SESSION, not just the device.
+///
+/// The key must be stable while a device stays attached -- one row per
+/// execution observed, and a retry after a failed commit must dedupe. But it
+/// must DIFFER across attach sessions: unplugging and replugging the stick and
+/// running the same binary again is a genuinely new observation, and if it
+/// re-derived the previous session's key with a new ts the store would read the
+/// differing payload as a collision and refuse the batch on every tick -- the
+/// same wedge the exec_seen gate exists to prevent, reached through the
+/// detach-clears-exec_seen path instead.
 inline std::string removable_exec_record_key(std::string_view device_key,
+                                             std::int64_t attach_epoch,
                                              std::string_view image_path) {
-    return "exec:" + std::string(device_key) + ":" + std::string(image_path);
+    return "exec:" + std::string(device_key) + ":" + std::to_string(attach_epoch) + ":" +
+           std::string(image_path);
 }
 
 inline std::string removable_channel_record_key(std::string_view channel,
@@ -814,6 +839,8 @@ correlate_removable_mounts(std::string_view proc_mounts_content,
 struct BaselineReconcileInputs {
     bool baseline_already_done{false};
     std::set<std::string> exec_seen;
+    std::map<std::string, std::int64_t> attach_epoch;
+    std::int64_t now{0}; // stamped as the session start for a newly-attached device
     std::unordered_set<std::string> current_keys;
     std::unordered_map<std::string, bool> prev_attach_set;
     // (action, device_key) of the retained pending queue, oldest first.
@@ -822,6 +849,7 @@ struct BaselineReconcileInputs {
 
 struct BaselineReconcileResult {
     std::unordered_map<std::string, bool> attach_set;
+    std::map<std::string, std::int64_t> attach_epoch; // session start per device
     std::set<std::string> exec_seen; // carried through; detach clears a device's entries
     std::vector<std::string> baseline_keys;     // -> present_at_baseline
     std::vector<std::string> reconcile_added;   // -> attached  (missed appeared)
@@ -832,6 +860,12 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
     BaselineReconcileResult out;
     out.attach_set = in.prev_attach_set;
     out.exec_seen = in.exec_seen;
+    out.attach_epoch = in.attach_epoch;
+    // A device that is newly present starts a session; one already tracked keeps
+    // the session it had, so the exec key stays stable while it remains plugged.
+    auto begin_session = [&out, now = in.now](const std::string& key) {
+        out.attach_epoch.try_emplace(key, now);
+    };
 
     if (!in.baseline_already_done) {
         for (const auto& key : in.current_keys) {
@@ -841,6 +875,7 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
             // every already-attached device as an `attached` event whose
             // evidence claimed a missed OS callback that never happened.
             out.attach_set[key] = true;
+            begin_session(key);
             if (!in.prev_attach_set.count(key))
                 out.baseline_keys.push_back(key);
         }
@@ -857,10 +892,12 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
     };
 
     for (const auto& [action, key] : in.pending) {
-        if (action == "attached")
+        if (action == "attached") {
             out.attach_set[key] = true;
-        else if (action == "detached") {
+            begin_session(key);
+        } else if (action == "detached") {
             out.attach_set.erase(key);
+            out.attach_epoch.erase(key); // the session ends with the device
             forget_execs(key);
         }
     }
@@ -888,6 +925,7 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
                 continue; // already accounted for by a callback this tick
             out.reconcile_added.push_back(key);
             out.attach_set[key] = true;
+            begin_session(key);
         }
         for (const auto& [key, present] : in.prev_attach_set) {
             if (!present || in.current_keys.count(key) || !out.attach_set.count(key) ||
@@ -895,6 +933,7 @@ inline BaselineReconcileResult decide_baseline_and_reconcile(const BaselineRecon
                 continue; // still attached, or already spoken for by a callback this tick
             out.reconcile_removed.push_back(key);
             out.attach_set.erase(key);
+            out.attach_epoch.erase(key);
             forget_execs(key);
         }
     }
