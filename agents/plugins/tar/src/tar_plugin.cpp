@@ -929,6 +929,10 @@ public:
         // the `<name>_enabled` gate itself is applied in collect_slow_impl's
         // per-source region, not here.
         cursor_sources_ = yuzu::tar::make_cursor_sources();
+        // A consumer's factory returning a null entry would be dereferenced
+        // unguarded at four sites; drop them once, here, rather than checking
+        // at each. (cpp-safety, Gate 3.)
+        std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
         // start() is not noexcept in the CursorSource contract, and this runs
         // inside init(): an escaping exception would cross the plugin C-ABI.
         // One source failing to arm its subscription must not take the whole
@@ -953,15 +957,24 @@ public:
                 if (!source_enabled(*db_, src->name()))
                     src->on_enabled_changed(false);
             } catch (const std::exception& e) {
-                spdlog::error("TAR: cursor source '{}' failed to start: {} -- continuing "
-                              "without it",
+                spdlog::error("TAR: cursor source '{}' failed to start: {} -- dropping it",
                               src->name(), e.what());
+                src.reset();
             } catch (...) {
                 spdlog::error("TAR: cursor source '{}' failed to start (unknown exception) -- "
-                              "continuing without it",
+                              "dropping it",
                               src->name());
+                src.reset();
             }
         }
+        // A source whose start() threw has NO armed subscription, so leaving it
+        // in the vector meant collect() ran against it every tick and returned
+        // an ordinary Advanced/0-events result -- a dead source reporting
+        // health, which is worse than an absent one. It also never received the
+        // on_enabled_changed(false) that the block above argues must land
+        // before the first callback can arrive, because that call is inside the
+        // same try. Found by both the architect and cpp-safety.
+        std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());

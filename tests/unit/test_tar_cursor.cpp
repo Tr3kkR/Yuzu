@@ -338,6 +338,40 @@ TEST_CASE("power_live: duplicate record_key is a no-op (row count unchanged), cu
 
 // ── Atomic commit/rollback ───────────────────────────────────────────────────
 
+TEST_CASE("an embedded NUL cannot silently truncate a persisted field or collapse two keys",
+          "[tar][cursor][nul]") {
+    // sqlite3_bind_text with length -1 stops at the first NUL. Two consequences,
+    // both silent: a record_key of "\0a" is NON-empty in C++ so it passes the
+    // empty-key guard, yet binds as zero-length -- so "\0a" and "\0b" become one
+    // row; and a stored-then-truncated `detail` no longer equals the value
+    // re-offered on a retry, so the payload compare fails and the source is
+    // refused forever. Fixed-width USB string descriptors and EvtRender buffers
+    // both produce embedded NULs in practice.
+    auto t = make_test_db();
+
+    PowerEvent a;
+    a.ts = 1;
+    a.snapshot_id = 1;
+    a.action = "sleep";
+    a.record_key = std::string("\0a", 2);
+    CHECK_FALSE(t.db.insert_power_events_and_cursor({a}, R"({"v":1})"));
+
+    // A NUL inside an ordinary payload field must round-trip intact, or the
+    // replay comparison refuses the event on every later tick.
+    PowerEvent b;
+    b.ts = 2;
+    b.snapshot_id = 1;
+    b.action = "wake";
+    b.detail = std::string("head\0tail", 9);
+    b.record_key = "nul-detail";
+    REQUIRE(t.db.insert_power_events_and_cursor({b}, R"({"v":1,"pos":1})"));
+
+    // Re-offering the identical event is a replay and MUST be accepted; if the
+    // stored `detail` had been truncated at the NUL it would now mismatch and
+    // be refused as a collision.
+    CHECK(t.db.insert_power_events_and_cursor({b}, R"({"v":1,"pos":2})"));
+}
+
 TEST_CASE("a mid-batch refusal rolls back the events that ALREADY inserted, not just the cursor "
           "(observes the transaction, not its absence)",
           "[tar][cursor][atomicity]") {

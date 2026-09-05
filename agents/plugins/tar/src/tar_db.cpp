@@ -962,6 +962,17 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_power_ev
                           "the first event and report success");
             return std::unexpected(CursorInsertError::KeyCollision);
         }
+        // A key containing a NUL is NOT caught by empty() but binds as
+        // zero-length TEXT, so "\0a" and "\0b" collapse to one row -- the same
+        // silent discard the guard above exists to prevent, wearing a
+        // non-empty key. Fixed-width USB string descriptors and EvtRender
+        // buffers are both realistic sources of one.
+        if (ev.record_key.find('\0') != std::string::npos) {
+            spdlog::error("TarDatabase::insert_power_events_and_cursor: refusing a batch whose "
+                          "record_key contains a NUL -- it is non-empty but binds as "
+                          "zero-length, collapsing distinct keys onto one row");
+            return std::unexpected(CursorInsertError::KeyCollision);
+        }
     }
 
     std::lock_guard lock(mu_);
@@ -1009,9 +1020,9 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_power_ev
                 sqlite3_clear_bindings(stmt.get());
                 sqlite3_bind_int64(stmt.get(), 1, ev.ts);
                 sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 4, ev.detail.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 5, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), static_cast<int>(ev.action.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 4, ev.detail.c_str(), static_cast<int>(ev.detail.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 5, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
                 // RETURNING, not sqlite3_changes(): this connection is opened
                 // SQLITE_OPEN_FULLMUTEX and shared, and FULLMUTEX serialises
                 // individual calls, NOT the step->changes PAIR. Reading
@@ -1030,15 +1041,25 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_power_ev
                 // SQLITE_DONE with no row == the INSERT was IGNORED.
                 sqlite3_reset(dup.get());
                 sqlite3_clear_bindings(dup.get());
-                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
                 if (sqlite3_step(dup.get()) != SQLITE_ROW) {
                     spdlog::error("{} dup-check: record_key '{}' was ignored but no stored row "
                                   "could be read back", log_prefix, ev.record_key);
                     return false;
                 }
+                // Length from sqlite3_column_bytes, NOT strlen. Constructing a
+                // string_view from the char* alone stops at an embedded NUL, so
+                // a stored "head\0tail" would compare equal to "head" -- and
+                // unequal to the value actually re-offered on a replay, which
+                // refuses the event as a collision on every later tick. The
+                // bind side has the same trap and is fixed the same way.
                 auto col = [&](int i) {
-                    auto* t = reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
-                    return t ? std::string_view{t} : std::string_view{};
+                    const auto* t =
+                       reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
+                    if (t == nullptr)
+                        return std::string_view{};
+                    return std::string_view{t, static_cast<std::size_t>(
+                                                  sqlite3_column_bytes(dup.get(), i))};
                 };
                 // Compare only what actually identifies the OS RECORD.
                 // `snapshot_id` is collection metadata -- which tick gathered
@@ -1079,6 +1100,17 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_removabl
             spdlog::error("TarDatabase::insert_removable_events_and_cursor: refusing a batch with an "
                           "empty record_key -- the dedupe index would discard all but "
                           "the first event and report success");
+            return std::unexpected(CursorInsertError::KeyCollision);
+        }
+        // A key containing a NUL is NOT caught by empty() but binds as
+        // zero-length TEXT, so "\0a" and "\0b" collapse to one row -- the same
+        // silent discard the guard above exists to prevent, wearing a
+        // non-empty key. Fixed-width USB string descriptors and EvtRender
+        // buffers are both realistic sources of one.
+        if (ev.record_key.find('\0') != std::string::npos) {
+            spdlog::error("TarDatabase::insert_removable_events_and_cursor: refusing a batch whose "
+                          "record_key contains a NUL -- it is non-empty but binds as "
+                          "zero-length, collapsing distinct keys onto one row");
             return std::unexpected(CursorInsertError::KeyCollision);
         }
     }
@@ -1122,18 +1154,18 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_removabl
                 sqlite3_clear_bindings(stmt.get());
                 sqlite3_bind_int64(stmt.get(), 1, ev.ts);
                 sqlite3_bind_int64(stmt.get(), 2, ev.snapshot_id);
-                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 4, ev.device_key.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 5, ev.vendor.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 6, ev.product.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 7, ev.serial.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 8, ev.bus.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 9, ev.volume.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), static_cast<int>(ev.action.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 4, ev.device_key.c_str(), static_cast<int>(ev.device_key.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 5, ev.vendor.c_str(), static_cast<int>(ev.vendor.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 6, ev.product.c_str(), static_cast<int>(ev.product.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 7, ev.serial.c_str(), static_cast<int>(ev.serial.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 8, ev.bus.c_str(), static_cast<int>(ev.bus.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 9, ev.volume.c_str(), static_cast<int>(ev.volume.size()), SQLITE_STATIC);
                 sqlite3_bind_int64(stmt.get(), 10, ev.size_bytes);
-                sqlite3_bind_text(stmt.get(), 11, ev.image_path.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 11, ev.image_path.c_str(), static_cast<int>(ev.image_path.size()), SQLITE_STATIC);
                 sqlite3_bind_int64(stmt.get(), 12, ev.pid);
-                sqlite3_bind_text(stmt.get(), 13, ev.evidence.c_str(), -1, SQLITE_STATIC);
-                sqlite3_bind_text(stmt.get(), 14, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 13, ev.evidence.c_str(), static_cast<int>(ev.evidence.size()), SQLITE_STATIC);
+                sqlite3_bind_text(stmt.get(), 14, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
                 // Same as the power twin. RETURNING, not sqlite3_changes(): this connection is opened
                 // SQLITE_OPEN_FULLMUTEX and shared, and FULLMUTEX serialises
                 // individual calls, NOT the step->changes PAIR. Reading
@@ -1152,15 +1184,25 @@ std::expected<void, TarDatabase::CursorInsertError> TarDatabase::insert_removabl
                 // SQLITE_DONE with no row == the INSERT was IGNORED.
                 sqlite3_reset(dup.get());
                 sqlite3_clear_bindings(dup.get());
-                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), -1, SQLITE_STATIC);
+                sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), static_cast<int>(ev.record_key.size()), SQLITE_STATIC);
                 if (sqlite3_step(dup.get()) != SQLITE_ROW) {
                     spdlog::error("{} dup-check: record_key '{}' was ignored but no stored row "
                                   "could be read back", log_prefix, ev.record_key);
                     return false;
                 }
+                // Length from sqlite3_column_bytes, NOT strlen. Constructing a
+                // string_view from the char* alone stops at an embedded NUL, so
+                // a stored "head\0tail" would compare equal to "head" -- and
+                // unequal to the value actually re-offered on a replay, which
+                // refuses the event as a collision on every later tick. The
+                // bind side has the same trap and is fixed the same way.
                 auto col = [&](int i) {
-                    auto* t = reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
-                    return t ? std::string_view{t} : std::string_view{};
+                    const auto* t =
+                       reinterpret_cast<const char*>(sqlite3_column_text(dup.get(), i));
+                    if (t == nullptr)
+                        return std::string_view{};
+                    return std::string_view{t, static_cast<std::size_t>(
+                                                  sqlite3_column_bytes(dup.get(), i))};
                 };
                 // Same rule as the power twin: snapshot_id is per-tick
                 // collection metadata and never participates, and ts is

@@ -241,6 +241,11 @@ struct CursorCollectResult {
 /// contained throw still silently costs a collection tick.
 class CursorSource {
 public:
+    /// Must be safe on a source that was NEVER stop()ped -- a start() that
+    /// threw is dropped without one, and a host that fails mid-bring-up may
+    /// destroy sources directly. Do not leave a live OS callback pointing at
+    /// members this destructor is about to release; unregister here too if
+    /// stop() has not run.
     virtual ~CursorSource() = default;
 
     /// Stable source name ("power", "removable", ...). Also the tar_cursor
