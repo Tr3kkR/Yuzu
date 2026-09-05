@@ -1667,16 +1667,22 @@ TEST_CASE("#2815 door 1/4 — stop() waits for an in-flight disarm() teardown",
     });
 
     std::thread disarmer([&] { engine.disarm(*sub); });
+    // stopper is hoisted (default-constructed) here, BEFORE guard, so guard is the
+    // LAST-declared of the three and destructs FIRST on any unwind — a std::thread
+    // declared after the guard would destruct before it (reverse declaration order),
+    // and terminate() if still joinable when the guard never gets a chance to join it
+    // (governance Gate 8 finding, security-guardian + quality-engineer independently).
+    std::thread stopper;
     ThreadJoinGuard guard{&gate};
     guard.track(disarmer);
+    guard.track(stopper);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
-    std::thread stopper([&] {
+    stopper = std::thread([&] {
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
-    guard.track(stopper);
 
     // PRE-FIX this is TRUE within a millisecond or two: stop() takes lifecycle_mu_,
     // flips the flags, joins the wheel and tears the mechanisms down without ever
@@ -1716,16 +1722,18 @@ TEST_CASE("#2815 door 2/4 — stop() waits for an in-flight consumer-race teardo
     });
 
     std::thread armer([&] { (void)engine.arm(*c, file_spec("/etc/hosts")); });
+    // stopper hoisted before guard — see door 1/4's comment on why (Gate 8 finding).
+    std::thread stopper;
     ThreadJoinGuard guard{&gate};
     guard.track(armer);
+    guard.track(stopper);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
-    std::thread stopper([&] {
+    stopper = std::thread([&] {
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
-    guard.track(stopper);
     CHECK_FALSE(became_true_within(stop_returned, 300ms));
 
     gate.release();
@@ -1752,16 +1760,18 @@ TEST_CASE("#2815 door 3/4 — stop() waits for an in-flight unregister_consumer(
     });
 
     std::thread dropper([&] { engine.unregister_consumer(*c); });
+    // stopper hoisted before guard — see door 1/4's comment on why (Gate 8 finding).
+    std::thread stopper;
     ThreadJoinGuard guard{&gate};
     guard.track(dropper);
+    guard.track(stopper);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
-    std::thread stopper([&] {
+    stopper = std::thread([&] {
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
-    guard.track(stopper);
     CHECK_FALSE(became_true_within(stop_returned, 300ms));
 
     gate.release();
@@ -1797,16 +1807,18 @@ TEST_CASE("#2815 door 4/4 — stop() waits for an in-flight arm_impl() watch cal
 
     std::expected<SparkEngine::SubscriptionId, std::string> armed;
     std::thread armer([&] { armed = engine.arm(*c, file_spec("/etc/hosts")); });
+    // stopper hoisted before guard — see door 1/4's comment on why (Gate 8 finding).
+    std::thread stopper;
     ThreadJoinGuard guard{&gate};
     guard.track(armer);
+    guard.track(stopper);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> stop_returned{false};
-    std::thread stopper([&] {
+    stopper = std::thread([&] {
         engine.stop();
         stop_returned.store(true, std::memory_order_release);
     });
-    guard.track(stopper);
     CHECK_FALSE(became_true_within(stop_returned, 300ms));
 
     gate.release();
@@ -1859,17 +1871,19 @@ TEST_CASE("#2815 — a DEDUP arm (mech stays null) is still leased before its M1
     std::expected<SparkEngine::SubscriptionId, std::string> deduped;
     SparkEngine* raw = engine.get();
     std::thread armer([&] { deduped = raw->arm(*c2, file_spec("/etc/hosts")); }); // DEDUP: mech stays null
+    // killer hoisted before guard — see door 1/4's comment on why (Gate 8 finding).
+    std::thread killer;
     ThreadJoinGuard guard{&gate};
     guard.track(armer);
+    guard.track(killer);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> destroyed{false};
-    std::thread killer([&] {
+    killer = std::thread([&] {
         engine->stop();
         engine.reset(); // ~SparkEngine — must NOT free consumers_mu_/consumers_ while `armer` is parked
         destroyed.store(true, std::memory_order_release);
     });
-    guard.track(killer);
 
     CHECK_FALSE(became_true_within(destroyed, 300ms));
 
@@ -1911,17 +1925,19 @@ TEST_CASE("#2815 — ~SparkEngine waits UNBOUNDED for an in-flight teardown befo
 
     SparkEngine* raw = engine.get();
     std::thread disarmer([raw, sub_id] { raw->disarm(sub_id); });
+    // killer hoisted before guard — see door 1/4's comment on why (Gate 8 finding).
+    std::thread killer;
     ThreadJoinGuard guard{&gate};
     guard.track(disarmer);
+    guard.track(killer);
     REQUIRE(gate.wait_entered());
 
     std::atomic<bool> destroyed{false};
-    std::thread killer([&] {
+    killer = std::thread([&] {
         engine->stop();
         engine.reset(); // ~SparkEngine — must NOT free while `disarmer` is parked
         destroyed.store(true, std::memory_order_release);
     });
-    guard.track(killer);
 
     CHECK_FALSE(became_true_within(destroyed, 300ms));
 
@@ -2005,12 +2021,14 @@ TEST_CASE("#2833 — a shutdown-window unwatch failure is counted but has NO hea
         local->park();
     });
     std::thread disarmer([&] { engine.disarm(*sub); });
+    // stopper hoisted before guard — see door 1/4's comment on why (Gate 8 finding).
+    std::thread stopper;
     ThreadJoinGuard guard{&gate};
     guard.track(disarmer);
+    guard.track(stopper);
     REQUIRE(gate.wait_entered());
 
-    std::thread stopper([&] { engine.stop(); });
-    guard.track(stopper);
+    stopper = std::thread([&] { engine.stop(); });
     gate.release();
     disarmer.join();
     stopper.join();

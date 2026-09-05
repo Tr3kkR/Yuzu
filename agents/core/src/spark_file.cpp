@@ -592,10 +592,22 @@ private:
         // NO exception containment above it — unlike watch(), which watch_guarded()
         // always wraps. Letting push_retiring's rare bad_alloc escape from here would
         // std::terminate the process instead of just failing one arm. So contain it
-        // locally: a caller already treats a `false` return as an ordinary fault to
-        // retry on the next health-check pass, which is exactly the right response to
-        // "couldn't drain the zombie slot right now" — push_retiring leaves the zombie
-        // untouched on a throw, so nothing is lost by retrying later.
+        // locally: a `false` return reports the fault via collect_health() (`faulted`),
+        // with no dedicated retry of this specific ancestor arm — an imprecision in an
+        // earlier draft of this comment claimed a guaranteed retry that doesn't exist
+        // (governance Gate 8 cpp-expert finding). push_retiring leaves the zombie
+        // untouched on a throw, so nothing is lost if a later pass DOES reach it.
+        //
+        // OBSERVABILITY NOTE (governance Gate 8 cross-platform finding): unlike a
+        // throwing unwatch() reached via SparkEngine's disarm()/teardown_arm_race(),
+        // which increment a counted, logged failure stat, this catch — and
+        // release_ancestor()'s matching one below — swallow with no counter and no
+        // log line at all. That is a real, deliberate asymmetry (this call site has no
+        // SparkEngine catch above it to report to), not fixed here: adding a counter
+        // would mean growing SparkMechanismStats, a shared interface across all three
+        // mechanisms, for a Windows-only, bad_alloc-only, ancestor-path-only fault —
+        // out of proportion to this fix. docs/spark-flip-gate.md's #2833 entry is
+        // scoped accordingly.
         if (slot && slot->removing) {
             try {
                 push_retiring(slot);

@@ -241,8 +241,17 @@ tracked separately below)
   withdrawn: #3816 supplies an executor-level caller-abandonment signal, #2818 needs an
   engine-level consumer-death notification. Different primitives, different layers.
 - **#2833 - CONFIRMED but DOMINATED; accepted by documentation, no code change.** The
-  unwatch-failure counters do increment during shutdown, but nothing carries them off the
-  box: the agent's heartbeat composer emits NOTHING once `stop_requested_` is set
+  unwatch-failure counters do increment during shutdown **on the `dirs_`/direct-unwatch
+  path** — the ancestor-teardown path (`arm_ancestor()`/`release_ancestor()`'s own
+  zombie-drain/throw-containment, #2839 follow-up) has no counter at all: those
+  `catch(...)` blocks have no `SparkEngine` frame above them to report a failure to
+  (governance Gate 8 cross-platform finding). A `bad_alloc` there is silently dropped
+  regardless of shutdown state, not just during it — a narrower, Windows-only,
+  ancestor-path-only gap than this row's original scope, disclosed rather than fixed
+  here (see the code comment at `arm_ancestor()`'s zombie-drain block).
+
+  On the `dirs_`/direct-unwatch path the counters DO increment, but nothing carries
+  them off the box: the agent's heartbeat composer emits NOTHING once `stop_requested_` is set
   (`agent.cpp:2582` / `:3311`) — independently of whichever order the two shutdown
   paths' spark-stop and heartbeat-join calls happen to interleave in, since
   `emit_spark_heartbeat_tags()`'s own `!running` early-return suppresses it too. A

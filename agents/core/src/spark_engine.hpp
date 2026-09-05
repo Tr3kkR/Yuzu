@@ -664,18 +664,25 @@ private:
     /// teardown_arm_race() and arm_impl() gate their own entry on running_/stopped_
     /// under mu_ BEFORE they resolve a mechanism, so once stop()'s early locked block
     /// has flipped both flags a later caller resolves nothing and arms nothing.
-    /// unregister_consumer() (door 3) gates differently — on whether `id` is still
-    /// present in consumers_, which stop() doesn't empty until its OWN later step 3
-    /// (the consumers.swap) — so a call landing in that window still arms a lease and
-    /// calls unwatch() on a mechanism stop() may already be tearing down concurrently
-    /// and unsynchronized at the SparkEngine level (governance Gate 4 unhappy-path
-    /// finding). This is verified benign, not merely assumed: every real mechanism
-    /// (spark_file.cpp, spark_service.cpp, spark_registry.cpp) takes its own internal
-    /// mutex around both stop() and unwatch(), so this door's late call is a logically
-    /// stale but data-race-free unwatch on an already-stopping mechanism — the same
-    /// "every real mechanism fails a post-stop unwatch closed" contract this file
-    /// already relies on elsewhere. The lease still counts it correctly; what's not
-    /// true is that the ENTRY GATE is uniform across all four doors.
+    /// unregister_consumer() (door 3) gates ENTRY differently — on whether `id` is
+    /// still present in consumers_, which stop() doesn't empty until its OWN later
+    /// step 3 (the consumers.swap) — so a call landing in that window still arms a
+    /// lease (governance Gate 8 cpp-expert finding, correcting an earlier draft of
+    /// this paragraph that overstated door 3's residual risk: it does NOT still call
+    /// unwatch() on a mechanism stop() may be concurrently tearing down). The actual
+    /// unwatch() call is gated by the SAME running_ check as the other three doors —
+    /// it sits on the to_unwatch collection inside this window, not on the lease —
+    /// so once stop() flips running_ false, a racing unregister_consumer() collects
+    /// nothing and its post-mu_ unwatch loop runs zero times. What's genuinely
+    /// different about door 3 is narrower: the lease itself is armed
+    /// UNCONDITIONALLY (see unregister_consumer()'s own comment), because this
+    /// function's tail — quiesce_consumer() — touches consumer_join_budget_ms_/
+    /// consumer_threads_detached_ regardless of whether any mechanism call happened.
+    /// So a post-flip caller can still arm a lease with an empty unwatch loop
+    /// (harmless, slightly conservative over-counting), never a live unwatch()
+    /// racing a concurrently-stopping mechanism. What's not true is that the ENTRY
+    /// GATE on the LEASE is uniform across all four doors — it is uniform on the
+    /// mechanism-unwatch path.
     ///
     /// A PLAIN ATOMIC, POLLED — a simplicity choice, not a forced one (governance
     /// Gate 3 cpp-expert review: worth recording precisely, since the original
