@@ -661,9 +661,9 @@ architecturally more likely to GROW the `[pg]` population than shrink it:
 each store that migrates onto Postgres adds its own `[pg]`-tagged
 CRUD/behaviour cases (exactly what shards E/I/G/J already carry), while each
 store's narrow, already-thin `migrate_from_sqlite` backfill suite was only
-ever prunable once — that pruning has since landed for 18 of the 19
-already-migrated stores (#3623, `AuditStore` the sole permanent exception),
-so it is no longer a standing offset against future growth the way it was
+ever prunable once — that pruning has since landed for all 19 already-migrated
+stores (#3623, `AuditStore` the last to lose it), so it is no longer a
+standing offset against future growth the way it was
 when this section was written. The margin bought here is a plain safety
 cushion on top of
 what the split alone already earns (every new shard's real-diagnostic-scaled
