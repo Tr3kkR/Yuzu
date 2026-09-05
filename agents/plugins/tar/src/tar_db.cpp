@@ -975,7 +975,7 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
                 return true;
             const char* sql = R"(
                 INSERT OR IGNORE INTO power_live (ts, snapshot_id, action, detail, record_key)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?) RETURNING record_key
             )";
             sqlite3_stmt* raw_stmt = nullptr;
             if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
@@ -1008,12 +1008,22 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
                 sqlite3_bind_text(stmt.get(), 3, ev.action.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_text(stmt.get(), 4, ev.detail.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_text(stmt.get(), 5, ev.record_key.c_str(), -1, SQLITE_STATIC);
-                if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                // RETURNING, not sqlite3_changes(): this connection is opened
+                // SQLITE_OPEN_FULLMUTEX and shared, and FULLMUTEX serialises
+                // individual calls, NOT the step->changes PAIR. Reading
+                // db->nChange afterwards is a data race whose wrong answer would
+                // make this check miss a real collision or refuse a valid batch
+                // (routed-concerns "SQLite sqlite3_changes()" row, issue #1033).
+                // RETURNING folds the answer into the statement: a returned row
+                // means this INSERT actually inserted.
+                const int step_rc = sqlite3_step(stmt.get());
+                if (step_rc == SQLITE_ROW)
+                    continue; // inserted -- the ordinary path, no extra work
+                if (step_rc != SQLITE_DONE) {
                     spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
                     return false;
                 }
-                if (sqlite3_changes(db) != 0)
-                    continue; // inserted -- the ordinary path, no extra work
+                // SQLITE_DONE with no row == the INSERT was IGNORED.
                 sqlite3_reset(dup.get());
                 sqlite3_clear_bindings(dup.get());
                 sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), -1, SQLITE_STATIC);
@@ -1077,7 +1087,7 @@ bool TarDatabase::insert_removable_events_and_cursor(const std::vector<Removable
                 INSERT OR IGNORE INTO removable_live
                     (ts, snapshot_id, action, device_key, vendor, product, serial, bus,
                      volume, size_bytes, image_path, pid, evidence, record_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING record_key
             )";
             sqlite3_stmt* raw_stmt = nullptr;
             if (sqlite3_prepare_v2(db, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
@@ -1113,15 +1123,22 @@ bool TarDatabase::insert_removable_events_and_cursor(const std::vector<Removable
                 sqlite3_bind_int64(stmt.get(), 12, ev.pid);
                 sqlite3_bind_text(stmt.get(), 13, ev.evidence.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_text(stmt.get(), 14, ev.record_key.c_str(), -1, SQLITE_STATIC);
-                if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                // Same as the power twin. RETURNING, not sqlite3_changes(): this connection is opened
+                // SQLITE_OPEN_FULLMUTEX and shared, and FULLMUTEX serialises
+                // individual calls, NOT the step->changes PAIR. Reading
+                // db->nChange afterwards is a data race whose wrong answer would
+                // make this check miss a real collision or refuse a valid batch
+                // (routed-concerns "SQLite sqlite3_changes()" row, issue #1033).
+                // RETURNING folds the answer into the statement: a returned row
+                // means this INSERT actually inserted.
+                const int step_rc = sqlite3_step(stmt.get());
+                if (step_rc == SQLITE_ROW)
+                    continue; // inserted -- the ordinary path, no extra work
+                if (step_rc != SQLITE_DONE) {
                     spdlog::error("{} events step: {}", log_prefix, sqlite3_errmsg(db));
                     return false;
                 }
-                // See the power twin: only a row that was actually IGNORED is
-                // checked, and only an exact replay is accepted. A collision
-                // would otherwise advance the cursor past a discarded event.
-                if (sqlite3_changes(db) != 0)
-                    continue;
+                // SQLITE_DONE with no row == the INSERT was IGNORED.
                 sqlite3_reset(dup.get());
                 sqlite3_clear_bindings(dup.get());
                 sqlite3_bind_text(dup.get(), 1, ev.record_key.c_str(), -1, SQLITE_STATIC);
