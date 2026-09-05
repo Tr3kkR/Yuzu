@@ -429,7 +429,18 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     // baseline source AND the per-tick "what's live now" source for
     // exec-from-removable root correlation AND (R-001) the reconciliation
     // source that recovers from a DA callback that was never delivered.
-    const auto attached_now = da_session_->snapshot_attached();
+    const auto snapshot = da_session_->snapshot_attached();
+    if (!snapshot) {
+        // C6: rule 1. The snapshot is BOTH the exec-root correlation source and
+        // the reconciliation source, so a failed one is a failed tick -- not an
+        // empty device set. Diffing an empty set against the persisted
+        // attach_set would commit a detach for every device and clear the
+        // durable state, and the next healthy scan would commit a false
+        // re-attach for each. Throwing retains the cursor untouched.
+        throw IncompleteCaptureError(
+           "TAR removable: macOS getfsstat/DiskArbitration snapshot failed -- retaining cursor");
+    }
+    const auto& attached_now = *snapshot;
     std::vector<std::pair<std::string, std::string>> attached_roots;
     std::unordered_set<std::string> current_keys;
     std::unordered_map<std::string, const RemovableDiskArbEvent*> seen_by_key;
@@ -813,7 +824,17 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
     // scan the previous round gated behind `if (!st.baseline_done)`.
     const bool baseline_already_done = st.baseline_done;
     std::unordered_map<std::string, std::string> current_scan; // devname -> device_key
-    if (ScopedDir dir{::opendir("/sys/block")}) {
+    ScopedDir dir{::opendir("/sys/block")};
+    if (!dir) {
+        // C6: rule 1. An unopenable /sys/block is a FAILED scan, not an empty
+        // one. Falling through with an empty current_scan makes the
+        // reconciliation below emit `detached` for every known device and clear
+        // the durable state, and the next healthy scan re-attaches them all --
+        // fabricated evidence in both directions from one transient error.
+        throw IncompleteCaptureError(
+           "TAR removable: Linux /sys/block scan failed -- retaining cursor");
+    }
+    {
         while (struct dirent* entry = ::readdir(dir.get())) {
             const std::string name = entry->d_name;
             if (name == "." || name == "..")

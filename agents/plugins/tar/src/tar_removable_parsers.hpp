@@ -906,7 +906,15 @@ public:
     /// every currently-mounted removable volume -- used for baseline and for
     /// exec-from-removable's currently-attached-roots list. Safe to call from
     /// collect() (not the DA queue).
-    [[nodiscard]] std::vector<RemovableDiskArbEvent> snapshot_attached() const;
+    /// nullopt means the SNAPSHOT FAILED -- distinct from an empty vector,
+    /// which means the scan succeeded and nothing removable is attached.
+    /// Collapsing the two let a transient getfsstat/DASession failure look
+    /// like "every device just detached": the reconciler diffed the empty set
+    /// against the persisted attach_set, committed a detach for every device
+    /// and cleared the durable state, and the next healthy scan committed a
+    /// false re-attach for each one (C6). Rule 1 governs a failed acquisition:
+    /// retain the cursor and skip the tick.
+    [[nodiscard]] std::optional<std::vector<RemovableDiskArbEvent>> snapshot_attached() const;
 
     // Opaque, defined only in tar_removable_diskarb.mm. Public (not private)
     // because the callback trampolines in that .mm need the type name to

@@ -27,6 +27,8 @@
 
 #include <yuzu/agent/scoped_cfref.hpp>
 
+#include <optional>
+
 #include <spdlog/spdlog.h>
 
 #include <sys/mount.h> // getfsstat / struct statfs — tar_mapdrive_collector.cpp precedent
@@ -238,24 +240,28 @@ void RemovableDiskArbSession::stop() noexcept {
     impl_->admitted.clear(); // a future restart begins from a clean admitted-device slate
 }
 
-std::vector<RemovableDiskArbEvent> RemovableDiskArbSession::snapshot_attached() const {
+std::optional<std::vector<RemovableDiskArbEvent>> RemovableDiskArbSession::snapshot_attached() const {
     std::vector<RemovableDiskArbEvent> out;
 
     // Size-then-fill getfsstat(2), MNT_NOWAIT (tar_mapdrive_collector.cpp
     // precedent) — a live snapshot of the current mount table, nothing
     // historical.
     const int n = getfsstat(nullptr, 0, MNT_NOWAIT);
-    if (n <= 0)
-        return out;
+    if (n < 0)
+        return std::nullopt; // C6: a FAILED sizing call, not an empty mount table
+    if (n == 0)
+        return out;          // genuinely nothing mounted
     std::vector<struct statfs> bufs(static_cast<std::size_t>(n));
     const int filled =
         getfsstat(bufs.data(), static_cast<int>(bufs.size() * sizeof(struct statfs)), MNT_NOWAIT);
-    if (filled <= 0)
+    if (filled < 0)
+        return std::nullopt; // C6: the fill call failed
+    if (filled == 0)
         return out;
 
     yuzu::agent::ScopedCFRef<DASessionRef> local_session(DASessionCreate(kCFAllocatorDefault));
     if (!local_session)
-        return out;
+        return std::nullopt; // C6: no session means we learned nothing, not that nothing is attached
 
     for (int i = 0; i < filled; ++i) {
         const std::string from(bufs[static_cast<std::size_t>(i)].f_mntfromname);
