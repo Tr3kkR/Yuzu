@@ -1,0 +1,58 @@
+[
+  {
+    "method": "GET",
+    "path": "/api/notifications",
+    "capability_id": "get.api-notifications",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/notifications/{param}/dismiss",
+    "capability_id": "post.api-notifications-param-dismiss",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/notifications/{param}/read",
+    "capability_id": "post.api-notifications-param-read",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/webhooks",
+    "capability_id": "get.api-webhooks",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/webhooks",
+    "capability_id": "post.api-webhooks",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/webhooks/{param}",
+    "capability_id": "delete.api-webhooks-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/webhooks/{param}/deliveries",
+    "capability_id": "get.api-webhooks-param-deliveries",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

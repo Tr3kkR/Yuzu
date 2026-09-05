@@ -1,0 +1,66 @@
+[
+  {
+    "method": "POST",
+    "path": "/api/settings/api-tokens",
+    "capability_id": "post.api-settings-api-tokens",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/api-tokens/{param}",
+    "capability_id": "delete.api-settings-api-tokens-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/users",
+    "capability_id": "post.api-settings-users",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/settings/users/{param}",
+    "capability_id": "delete.api-settings-users-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/settings/users/{param}/role",
+    "capability_id": "post.api-settings-users-param-role",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/api-tokens",
+    "capability_id": "get.fragments-settings-api-tokens",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/tokens",
+    "capability_id": "get.fragments-settings-tokens",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/settings/users",
+    "capability_id": "get.fragments-settings-users",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]

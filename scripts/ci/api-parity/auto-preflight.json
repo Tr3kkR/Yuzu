@@ -1,0 +1,34 @@
+[
+  {
+    "method": "GET",
+    "path": "/fragments/auto",
+    "capability_id": "get.fragments-auto",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/auto/delete",
+    "capability_id": "post.fragments-auto-delete",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/auto/result",
+    "capability_id": "get.fragments-auto-result",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/fragments/auto/run",
+    "capability_id": "post.fragments-auto-run",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  }
+]
