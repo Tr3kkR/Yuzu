@@ -167,7 +167,15 @@ private:
     BoundedPendingQueue<RemovableEvent> queue_;
     std::atomic<std::uint64_t> seq_{seed_process_local_seq()};
     bool was_disabled_{false};
+    // Both unobservable windows a live leg can owe: a configured pause, and the
+    // agent simply not running. They are reported the same way -- one gap,
+    // emitted once, cleared only after the commit succeeds -- but an analyst
+    // must be able to tell them apart, so the evidence text names which it was.
+    enum class GapCause { Disabled, Restart };
+
     bool pending_reenable_gap_{false};
+    // Which window the pending gap describes -- set beside the flag.
+    GapCause pending_gap_cause_{GapCause::Disabled};
     // R-002: serializes on_enabled_changed against the macOS DA callback,
     // which runs on DiskArbitration's own dispatch-queue thread — entirely
     // independent of whatever thread calls on_enabled_changed. Holding the
@@ -233,14 +241,20 @@ private:
         }
     }
 
-    RemovableEvent make_reenable_gap_event() {
+    RemovableEvent make_reenable_gap_event(GapCause cause = GapCause::Disabled) {
         RemovableEvent ev;
         ev.ts = now_seconds();
         ev.action = "capture_gap";
-        ev.evidence = "removable source re-enabled after a disabled window; the disabled "
-                     "window's own attach/detach activity was never captured (P-002 "
-                     "forensic-pause contract)";
-        ev.record_key = next_seq_record_key("reenable_gap", "removable");
+        ev.evidence =
+           cause == GapCause::Restart
+              ? "removable source resumed after the agent was not running; this leg is "
+                "live-only (no OS history API), so attach/detach activity during that "
+                "window was never captured and cannot be backfilled"
+              : "removable source re-enabled after a disabled window; the disabled "
+                "window's own attach/detach activity was never captured (P-002 "
+                "forensic-pause contract)";
+        ev.record_key = next_seq_record_key(
+           cause == GapCause::Restart ? "restart_gap" : "reenable_gap", "removable");
         return ev;
     }
 
@@ -303,9 +317,26 @@ std::string macos_platform_instance_id(const RemovableDiskArbEvent& ev) {
 
 } // namespace
 
-void RemovableCursorSource::start(TarDatabase&) {
+// C5/K2: the live legs cannot observe anything while the agent process is
+// stopped, and a restart is otherwise indistinguishable from an ordinary tick
+// -- the persisted cursor carries baseline_done=true, so the first collect
+// reports Advanced. Worse, the reconcile step then attributes whatever changed
+// during the downtime to "missed-appeared/disappeared-callback", which is
+// fabricated evidence: no callback was missed, the process was not running.
+// docs/user-manual/tar-removable.md promises a capture_gap for exactly this
+// window. So: if a cursor was already persisted, this process did not write
+// it, and the window between it and now is unobservable. Arm the same
+// pending-gap machinery the re-enable path uses -- it is emitted exactly once
+// and cleared only after the commit succeeds. Windows needs none of this: its
+// event log retains records written while the agent was down, so that leg has
+// real history to replay rather than a hole to declare.
+void RemovableCursorSource::start(TarDatabase& db) {
     if (da_session_)
         return; // P-002: start() must be idempotent
+    if (auto existing = db.get_cursor("removable"); existing && existing->has_value()) {
+        pending_reenable_gap_ = true;
+        pending_gap_cause_ = GapCause::Restart;
+    }
     da_session_ = std::make_unique<RemovableDiskArbSession>();
     da_session_->start([this](RemovableDiskArbEvent ev) {
         // Runs on the DA private dispatch queue — must not block or touch
@@ -353,7 +384,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
 
     const bool reenable_gap_pending = pending_reenable_gap_;
     if (reenable_gap_pending)
-        events.push_back(make_reenable_gap_event());
+        events.push_back(make_reenable_gap_event(pending_gap_cause_));
 
     if (!da_session_)
         throw IncompleteCaptureError("TAR removable: macOS DiskArbitration session not started");
@@ -500,6 +531,7 @@ void RemovableCursorSource::on_enabled_changed(bool enabled) {
         queue_.discard_all();
         capturing_enabled_.store(true, std::memory_order_release);
         pending_reenable_gap_ = true;
+        pending_gap_cause_ = GapCause::Disabled;
         was_disabled_ = false;
     }
 }
@@ -604,9 +636,26 @@ private:
 
 } // namespace
 
-void RemovableCursorSource::start(TarDatabase&) {
+// C5/K2: the live legs cannot observe anything while the agent process is
+// stopped, and a restart is otherwise indistinguishable from an ordinary tick
+// -- the persisted cursor carries baseline_done=true, so the first collect
+// reports Advanced. Worse, the reconcile step then attributes whatever changed
+// during the downtime to "missed-appeared/disappeared-callback", which is
+// fabricated evidence: no callback was missed, the process was not running.
+// docs/user-manual/tar-removable.md promises a capture_gap for exactly this
+// window. So: if a cursor was already persisted, this process did not write
+// it, and the window between it and now is unobservable. Arm the same
+// pending-gap machinery the re-enable path uses -- it is emitted exactly once
+// and cleared only after the commit succeeds. Windows needs none of this: its
+// event log retains records written while the agent was down, so that leg has
+// real history to replay rather than a hole to declare.
+void RemovableCursorSource::start(TarDatabase& db) {
     if (netlink_fd_.valid())
         return; // P-002: idempotent
+    if (auto existing = db.get_cursor("removable"); existing && existing->has_value()) {
+        pending_reenable_gap_ = true;
+        pending_gap_cause_ = GapCause::Restart;
+    }
     netlink_fd_.reset(open_uevent_netlink_socket());
 }
 
@@ -630,7 +679,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
 
     const bool reenable_gap_pending = pending_reenable_gap_;
     if (reenable_gap_pending)
-        events.push_back(make_reenable_gap_event());
+        events.push_back(make_reenable_gap_event(pending_gap_cause_));
 
     // Drain the netlink socket non-blocking (spec: "drained non-blocking per
     // tick") — no persistent reader thread, so a batch read here IS the
@@ -870,6 +919,7 @@ void RemovableCursorSource::on_enabled_changed(bool enabled) {
                                                           // kernel-buffered datagrams are gone
                                                           // with the old one
         pending_reenable_gap_ = true;
+        pending_gap_cause_ = GapCause::Disabled;
         was_disabled_ = false;
     }
 }
@@ -1113,7 +1163,7 @@ CursorCollectResult RemovableCursorSource::collect(TarDatabase& db,
 
     const bool is_reenable = pending_reenable_gap_;
     if (pending_reenable_gap_) {
-        events.push_back(make_reenable_gap_event());
+        events.push_back(make_reenable_gap_event(pending_gap_cause_));
         st.channels.clear(); // force every channel to head-jump, no backfill scan
     }
     // Rule 2 ("never replay-from-zero"): a lost cursor re-baselines at the
@@ -1350,6 +1400,7 @@ void RemovableCursorSource::on_enabled_changed(bool enabled) {
         was_disabled_ = true;
     } else if (was_disabled_) {
         pending_reenable_gap_ = true;
+        pending_gap_cause_ = GapCause::Disabled;
         was_disabled_ = false;
     }
 }
