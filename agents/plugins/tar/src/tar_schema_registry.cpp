@@ -994,15 +994,15 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .default_enabled = true,
             .unique_key_column = "record_key",
             .os_support = {
-                {"windows", OsSupportStatus::kSupportedConstrained, "powerbroadcast",
+                {"windows", OsSupportStatus::kPlanned, "powerbroadcast",
                  "Suspend/resume + AC transitions via "
                  "PowerRegisterSuspendResumeNotification / WM_POWERBROADCAST, "
                  "cursor-model (tar_cursor.hpp) — collector lands wave 2."},
-                {"linux",   OsSupportStatus::kSupportedConstrained, "logind",
+                {"linux",   OsSupportStatus::kPlanned, "logind",
                  "systemd-logind PrepareForSleep sd-bus signal + power-supply "
                  "sysfs/udev, cursor-model — collector lands wave 2. Gated by "
                  "the optional libsystemd dep (YUZU_HAVE_LIBSYSTEMD)."},
-                {"macos",   OsSupportStatus::kSupported, "pmset_log",
+                {"macos",   OsSupportStatus::kPlanned, "pmset_log",
                  "`pmset -g log` retrospective replay (measured working "
                  "unprivileged on this Mac 2026-09-04, 9,629 lines: "
                  "probe-findings.md), cursor-model — collector lands wave 2."},
@@ -1045,17 +1045,17 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .default_enabled = true,
             .unique_key_column = "record_key",
             .os_support = {
-                {"windows", OsSupportStatus::kSupported, "wevtapi",
+                {"windows", OsSupportStatus::kPlanned, "wevtapi",
                  "EvtQuery over Microsoft-Windows-Partition/Diagnostic (+ "
                  "Kernel-PnP/Configuration, Storsvc/Diagnostic), channels "
                  "measured LIVE on the-rig 2026-09-04; the roadmap's "
                  "DriverFrameworks-UserMode channel is disabled by default "
                  "and is NOT the binding (probe-findings.md). Collector "
                  "lands wave 2."},
-                {"linux",   OsSupportStatus::kSupportedConstrained, "udev_netlink",
+                {"linux",   OsSupportStatus::kPlanned, "udev_netlink",
                  "udev netlink monitor (block subsystem, removable), "
                  "cursor-model — collector lands wave 2."},
-                {"macos",   OsSupportStatus::kSupportedConstrained, "diskarbitration",
+                {"macos",   OsSupportStatus::kPlanned, "diskarbitration",
                  "DiskArbitration DADiskAppeared/Disappeared callbacks "
                  "(headers confirmed in the CLT SDK, probe-findings.md), "
                  "cursor-model — collector lands wave 2."},

@@ -929,8 +929,24 @@ public:
         // the `<name>_enabled` gate itself is applied in collect_slow_impl's
         // per-source region, not here.
         cursor_sources_ = yuzu::tar::make_cursor_sources();
-        for (auto& src : cursor_sources_)
-            src->start(*db_);
+        // start() is not noexcept in the CursorSource contract, and this runs
+        // inside init(): an escaping exception would cross the plugin C-ABI.
+        // One source failing to arm its subscription must not take the whole
+        // TAR plugin down with it -- the mapdrive block above guards the same
+        // hazard for the same reason.
+        for (auto& src : cursor_sources_) {
+            try {
+                src->start(*db_);
+            } catch (const std::exception& e) {
+                spdlog::error("TAR: cursor source '{}' failed to start: {} -- continuing "
+                              "without it",
+                              src->name(), e.what());
+            } catch (...) {
+                spdlog::error("TAR: cursor source '{}' failed to start (unknown exception) -- "
+                              "continuing without it",
+                              src->name());
+            }
+        }
 
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
@@ -2927,6 +2943,8 @@ private:
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
         auto netconn_lookback = params.get("netconn_lookback_seconds");
+        auto power_lookback = params.get("power_lookback_seconds");
+        auto removable_lookback = params.get("removable_lookback_seconds");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
@@ -2943,6 +2961,15 @@ private:
         // fat-fingered bound; a non-numeric value is rejected.
         int64_t netconn_lookback_secs = 0;
         bool netconn_lookback_provided = false;
+        // The same forward-only privacy control for the two cursor sources. The
+        // manual and the SOC 2 data inventory both present `0` as the works-council
+        // lawfulness lever, so the key has to be REACHABLE: do_configure enumerates
+        // a fixed key set and silently ignores anything outside it, which would have
+        // made a documented control inert.
+        int64_t power_lookback_secs = 0;
+        bool power_lookback_provided = false;
+        int64_t removable_lookback_secs = 0;
+        bool removable_lookback_provided = false;
 
         // M13 contract: validate EVERY parameter in the request in PHASE 1 and
         // only persist them in PHASE 2 once all pass. A request that mixes a
@@ -3015,6 +3042,35 @@ private:
             }
             // Clamp rather than reject an out-of-range bound (see the field decl).
             netconn_lookback_secs = yuzu::tar::nq_clamp_lookback(netconn_lookback_secs);
+        }
+
+        struct LookbackSpec {
+            const char* key;
+            std::string_view raw;
+            int64_t* out;
+            bool* provided;
+        };
+        LookbackSpec power_lookback_spec{"power_lookback_seconds", power_lookback,
+                                         &power_lookback_secs, &power_lookback_provided};
+        LookbackSpec removable_lookback_spec{"removable_lookback_seconds", removable_lookback,
+                                             &removable_lookback_secs,
+                                             &removable_lookback_provided};
+        for (auto* spec : {&power_lookback_spec, &removable_lookback_spec}) {
+            if (spec->raw.empty())
+                continue;
+            *spec->provided = true;
+            bool parsed = false;
+            try {
+                *spec->out = std::stoll(std::string{spec->raw});
+                parsed = true;
+            } catch (...) {}
+            if (!parsed) {
+                ctx.write_output(std::format("error|{} must be an integer 0-7776000 "
+                                             "(0 = forward-only, no pre-enablement read)",
+                                             spec->key));
+                return 1;
+            }
+            *spec->out = yuzu::tar::nq_clamp_lookback(*spec->out);
         }
 
         // Cross-field validation BEFORE any writes
@@ -3182,6 +3238,17 @@ private:
                 std::format("config|netconn_lookback_seconds|{}", netconn_lookback_secs));
             changed = true;
         }
+        if (power_lookback_provided) {
+            db_->set_config("power_lookback_seconds", std::to_string(power_lookback_secs));
+            ctx.write_output(std::format("config|power_lookback_seconds|{}", power_lookback_secs));
+            changed = true;
+        }
+        if (removable_lookback_provided) {
+            db_->set_config("removable_lookback_seconds", std::to_string(removable_lookback_secs));
+            ctx.write_output(
+                std::format("config|removable_lookback_seconds|{}", removable_lookback_secs));
+            changed = true;
+        }
         if (have_redaction) {
             db_->set_config("redaction_patterns", std::string{redaction});
             ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
@@ -3236,6 +3303,9 @@ private:
                 // loss would be unobservable).
                 const bool tcp_prev_enabled =
                     (src_name == "tcp") ? source_enabled(*db_, "tcp") : false;
+                // Same capture-before-apply for cursor sources (see the routing
+                // block below): read the prior state while it is still prior.
+                const bool cursor_prev_enabled = source_enabled(*db_, src_name);
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
@@ -3279,7 +3349,16 @@ private:
                 // source itself owns the disable-drain-discard /
                 // re-enable-rebaseline-and-gap contract (tar_cursor.hpp); this
                 // call site only routes the edge.
-                if (transition_ok) {
+                // Routed on an EDGE only. `cursor_prev_enabled` is captured before
+                // apply_source_enabled_transition() above, for the same reason the
+                // tcp/nstat drain is edge-gated (C1): an idempotent
+                // `<name>_enabled=true` re-assert is routine from desired-state
+                // reconciliation and is NOT a pause boundary. Routing it as one
+                // makes the source re-baseline forward and emit a capture_gap,
+                // silently discarding history it had not yet replayed -- the
+                // consumer cannot defend against this, because it cannot tell an
+                // edge from a re-assert.
+                if (transition_ok && (v == "true") != cursor_prev_enabled) {
                     for (auto& cs : cursor_sources_) {
                         if (cs->name() == src_name) {
                             cs->on_enabled_changed(v == "true");

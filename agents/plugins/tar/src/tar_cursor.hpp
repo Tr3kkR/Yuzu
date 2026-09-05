@@ -164,9 +164,17 @@ enum class CursorOutcome {
                 // any other successful collect().
 };
 
-/// One collect() tick's result. `new_cursor_json` is persisted atomically with
-/// whatever events this tick emitted (insert_*_events_and_cursor, tar_db.hpp)
-/// -- the driver never persists one without the other.
+/// One collect() tick's result.
+///
+/// The SOURCE persists, not the driver: from inside collect() it calls
+/// insert_*_events_and_cursor (tar_db.hpp), which writes this tick's events
+/// and the new cursor in ONE transaction, so the two can never disagree.
+/// `new_cursor_json` REPORTS the value the source committed -- the driver does
+/// not write it, and a caller comparing it against get_cursor() is asserting
+/// that the source held up its end (which is exactly what the unit tests do).
+/// An earlier revision of this comment said the driver persists; it does not,
+/// and on a frozen contract that both consumers read, the distinction decides
+/// where the atomicity guarantee actually lives.
 struct CursorCollectResult {
     std::string new_cursor_json; // opaque, versioned ({"v":1,...}) -- rule 4
     std::size_t events_emitted{0};
@@ -208,8 +216,18 @@ public:
     virtual void stop() noexcept = 0;
 
     /// The operator flipped `<name>_enabled`. See the header comment above
+    /// The operator flipped `<name>_enabled`. See the header comment above
     /// for the disable/re-enable contract (forensic-pause parity, P-002).
-    virtual void on_enabled_changed(bool enabled) = 0;
+    ///
+    /// Deliberately takes NO TarDatabase&. It is called UNDER `collect_mu_`, the
+    /// same lock every collect tick holds, so it can never race one -- and for
+    /// that same reason it must NOT itself take `collect_mu_`, exactly as stop()
+    /// must not. A source therefore has no database to write to here, and A
+    /// re-enable therefore records its intent (a flag) and the NEXT collect()
+    /// emits the single capture_gap covering the disabled window and
+    /// re-baselines forward -- and only clears that flag once the insert has
+    /// committed, so a failed tick re-reports rather than losing the gap.
+virtual void on_enabled_changed(bool enabled) = 0;
 };
 
 /// Wave-2 factories (defined in the wave-2 .cpp that implements each source).
@@ -280,12 +298,11 @@ std::vector<std::unique_ptr<CursorSource>> make_cursor_sources();
 ///                          undercount, actual loss, which is the
 ///                          conservative direction.
 ///
-/// snapshot() and ack(n) below are SUPERSEDED (R-005): positional ack(n) has
-/// the snapshot-to-ack overflow race described above. They are RETAINED,
-/// UNMODIFIED in contract (signature and behaviour), only so already-built
-/// callers keep compiling; every new call site uses snapshot_batch()/
-/// ack_through() instead, and the pair is scheduled for deletion once the
-/// last positional-ack caller migrates.
+/// There is deliberately NO positional ack. An earlier revision kept a
+/// snapshot()/ack(n) pair "so already-built callers keep compiling"; no such
+/// caller existed, and this header is FROZEN for its two consumers, so the
+/// only thing it could have done is let one of them reintroduce R-005. Ack is
+/// by sequence, or not at all.
 template <class Event>
 class BoundedPendingQueue {
 public:
@@ -303,26 +320,6 @@ public:
             ++dropped_;
         }
         q_.emplace_back(next_seq_++, std::move(ev));
-    }
-
-    /// SUPERSEDED (R-005) -- see the class comment; use snapshot_batch().
-    /// Non-destructive copy of everything currently queued, oldest first.
-    [[nodiscard]] std::vector<Event> snapshot() const {
-        std::lock_guard lock(mu_);
-        std::vector<Event> out;
-        out.reserve(q_.size());
-        for (const auto& entry : q_)
-            out.push_back(entry.second);
-        return out;
-    }
-
-    /// SUPERSEDED (R-005) -- see the class comment; use ack_through().
-    /// Remove the first `n` entries (clamped to the current size). Call only
-    /// after the corresponding batch has committed durably.
-    void ack(std::size_t n) {
-        std::lock_guard lock(mu_);
-        n = std::min(n, q_.size());
-        q_.erase(q_.begin(), q_.begin() + static_cast<std::ptrdiff_t>(n));
     }
 
     /// Non-destructive copy of everything currently queued, oldest first,

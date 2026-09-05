@@ -939,6 +939,19 @@ bool insert_events_and_cursor_locked(sqlite3* db, const char* log_prefix,
 
 bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& events,
                                                  const std::string& cursor_json) {
+    // A blank record_key is silently catastrophic: the UNIQUE index makes
+    // INSERT OR IGNORE drop every event after the first, and the call still
+    // reports success -- forensic loss indistinguishable from an empty tick.
+    // Refuse instead, so a collector that fails to derive a key is a loud bug.
+    for (const auto& ev : events) {
+        if (ev.record_key.empty()) {
+            spdlog::error("TarDatabase::insert_power_events_and_cursor: refusing a batch with an "
+                          "empty record_key -- the dedupe index would discard all but "
+                          "the first event and report success");
+            return false;
+        }
+    }
+
     std::lock_guard lock(mu_);
     if (!db_)
         return false;
@@ -977,6 +990,19 @@ bool TarDatabase::insert_power_events_and_cursor(const std::vector<PowerEvent>& 
 
 bool TarDatabase::insert_removable_events_and_cursor(const std::vector<RemovableEvent>& events,
                                                       const std::string& cursor_json) {
+    // A blank record_key is silently catastrophic: the UNIQUE index makes
+    // INSERT OR IGNORE drop every event after the first, and the call still
+    // reports success -- forensic loss indistinguishable from an empty tick.
+    // Refuse instead, so a collector that fails to derive a key is a loud bug.
+    for (const auto& ev : events) {
+        if (ev.record_key.empty()) {
+            spdlog::error("TarDatabase::insert_removable_events_and_cursor: refusing a batch with an "
+                          "empty record_key -- the dedupe index would discard all but "
+                          "the first event and report success");
+            return false;
+        }
+    }
+
     std::lock_guard lock(mu_);
     if (!db_)
         return false;

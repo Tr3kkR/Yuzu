@@ -330,6 +330,18 @@ header):
    works-council posture. A source MAY also ship `default_enabled = false` as a
    cautious roll-out default even when it carries no PII (e.g. `software` —
    machine-scope asset inventory), letting an operator opt in per host.
+
+   **Amended (Wave 6, operator ruling 2026-09-04).** `power` and `removable`
+   ship `default_enabled = true` — the first sources to do so — and, as the
+   roadmap brings each existing source in for change, that source moves to
+   default-on too. The works-council reasoning above is NOT withdrawn: it now
+   attaches to the `<name>_lookback_seconds` control (`0` = forward-only)
+   rather than to the enable flag, and it applies **at upgrade** rather than at
+   an operator's opt-in, which is a stronger obligation, not a weaker one. A
+   default-on source MUST therefore state the divergence plainly in its
+   user-manual page, its changelog fragment, and the SOC 2 data inventory —
+   never only in a code comment. Do not read the paragraph above as licence to
+   ship a new source opt-in without asking; the ruling is the current posture.
 6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
    gated on `source_enabled(*db_, "<source>")`: enumerate → diff → insert →
    `set_state` (advance the diff baseline **only on insert success**). For an
@@ -368,6 +380,17 @@ drained event type is not `ProcEvent`. The established precedent is
 **sibling interface with the identical lifecycle contract**, because its
 drained type is `ModuleEvent`. The contract, not the base class, is the
 invariant.
+
+**`BoundedPendingQueue<Event>` (`tar_cursor.hpp`, Wave 6) is a third bounded
+buffer in this plugin and a deliberate exception to "reuse `EventRing<T>`.**
+It exists because a cursor source's drain must be NON-DESTRUCTIVE: entries stay
+queued until the event+cursor transaction commits, and are then released by
+SEQUENCE, so a failed insert retries the same batch and an overflow eviction
+between snapshot and ack cannot destroy an entry that was never committed.
+`EventRing<T>`'s `drain()` removes on read, which cannot express that. Use
+`EventRing<T>` for a stream whose loss is acceptable and counted; use
+`BoundedPendingQueue` when the events are forensic and the sink is
+transactional. Do not add a fourth.
 
 **`NstatClient` (`tar_netqual_nstat.*`) is the second such case and a
 deliberate, documented exception to a literal `ProcStreamCollector` subclass:**

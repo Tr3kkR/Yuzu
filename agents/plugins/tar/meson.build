@@ -49,8 +49,13 @@ if host_machine.system() == 'windows'
   tar_deps += cxx.find_library('mpr')      # WNetOpenEnumW / WNetGetUserW — outbound mapped drives (tar_mapdrive_collector)
   tar_deps += cxx.find_library('netapi32') # NetSessionEnum — inbound share sessions (tar_mapdrive_collector)
 elif host_machine.system() == 'linux'
-  # Optional sd-bus leg for the wave-2 removable cursor source (UDisks2 device
-  # attach/detach over D-Bus). Same tri-state systemd_guard feature option +
+  # Optional sd-bus leg for the wave-2 POWER cursor source: systemd-logind's
+  # PrepareForSleep signal, which is the only sleep/wake source on Linux.
+  # NOT for removable — that leg binds to a udev netlink socket, exactly as the
+  # `removable`/linux row in tar_schema_registry.cpp declares. An earlier
+  # revision of this comment said UDisks2 over D-Bus, which contradicted the
+  # capability row shipping beside it and would have pointed the consuming
+  # change at a binding no probe ever measured. Same tri-state systemd_guard feature option +
   # found-check + YUZU_HAVE_LIBSYSTEMD compile-gate shape as agents/plugins/
   # wifi/meson.build and device_identity/meson.build — never a second option
   # — so a build without systemd_guard enabled still compiles (the wave-2
@@ -63,7 +68,7 @@ elif host_machine.system() == 'linux'
     tar_cpp_args += '-DYUZU_HAVE_LIBSYSTEMD'
   else
     message('TAR: libsystemd not used (systemd_guard != enabled, and not found) — '
-            + 'removable falls back to the udev/argv rungs unconditionally')
+            + 'the power source sleep/wake leg degrades to AC-state polling only unconditionally')
   endif
 elif host_machine.system() == 'darwin'
   # Endpoint Security process stream (tar_proc_es). The ES framework ships only

@@ -376,20 +376,59 @@ TEST_CASE("BoundedPendingQueue: a failed insert leaves entries unacked; a retry 
     q.push(2);
     q.push(3);
 
-    auto batch = q.snapshot();
-    REQUIRE(batch.size() == 3);
+    auto batch = q.snapshot_batch();
+    REQUIRE(batch.items.size() == 3);
 
     // Simulated failed insert: do NOT ack -- the batch must still be there
     // for the next tick's retry.
-    CHECK(q.snapshot().size() == 3);
+    CHECK(q.snapshot_batch().items.size() == 3);
 
-    // Simulated successful insert: ack exactly the snapshotted count.
-    q.ack(batch.size());
-    CHECK(q.snapshot().empty());
+    // Simulated successful insert: ack through the batch's own last sequence.
+    q.ack_through(batch.last_seq);
+    CHECK(q.snapshot_batch().items.empty());
 
-    // A second ack (nothing new pushed) is a safe no-op, not a crash/underflow.
-    q.ack(5);
-    CHECK(q.snapshot().empty());
+    // Re-acking the same sequence, with nothing new pushed, is a safe no-op.
+    q.ack_through(batch.last_seq);
+    CHECK(q.snapshot_batch().items.empty());
+}
+
+TEST_CASE("BoundedPendingQueue: an overflow eviction BETWEEN snapshot and ack cannot destroy an "
+          "uncommitted entry -- the R-005 regression, deterministic and single-threaded",
+          "[tar][cursor][queue][r005]") {
+    // The defect this pins: with the queue full, ack-by-COUNT erased N entries
+    // from the front. An eviction landing between snapshot_batch() and the ack
+    // shifts every index by one, so the Nth erased entry is one the batch never
+    // contained -- destroyed without ever being committed, while the drop was
+    // charged to an entry that DID commit. Ack-by-sequence cannot do that,
+    // because a sequence number identifies an entry rather than a position.
+    BoundedPendingQueue<int> q;
+    constexpr std::size_t kCap = BoundedPendingQueue<int>::kCap;
+
+    for (std::size_t i = 0; i < kCap; ++i)
+        q.push(static_cast<int>(i));
+    REQUIRE(q.size() == kCap);
+
+    // The collect() tick snapshots the full queue and begins its transaction.
+    const auto batch = q.snapshot_batch();
+    REQUIRE(batch.items.size() == kCap);
+    REQUIRE(batch.items.front() == 0);
+
+    // While that transaction is in flight, a callback fires. The queue is full,
+    // so the push evicts the OLDEST entry -- which is inside the batch, and is
+    // about to commit -- and appends an entry the batch does NOT contain.
+    const int kUncommitted = 999999;
+    q.push(kUncommitted);
+    REQUIRE(q.size() == kCap);
+
+    // The transaction commits. Ack through the sequence the batch reported.
+    q.ack_through(batch.last_seq);
+
+    // The entry pushed after the snapshot MUST survive: it was never committed,
+    // so acking the batch must not have removed it. Under positional ack(kCap)
+    // this assertion fails -- the erase would have consumed it.
+    const auto after = q.snapshot_batch();
+    REQUIRE(after.items.size() == 1);
+    CHECK(after.items.front() == kUncommitted);
 }
 
 TEST_CASE("BoundedPendingQueue: overflow drops the OLDEST entry and counts it cumulatively",
@@ -402,11 +441,11 @@ TEST_CASE("BoundedPendingQueue: overflow drops the OLDEST entry and counts it cu
     CHECK(q.size() == BoundedPendingQueue<int>::kCap);
     CHECK(q.dropped() == kOverBy);
 
-    auto batch = q.snapshot();
-    REQUIRE_FALSE(batch.empty());
+    auto batch = q.snapshot_batch();
+    REQUIRE_FALSE(batch.items.empty());
     // The oldest kOverBy entries (0..kOverBy-1) were dropped -- the front of
     // the queue is now entry kOverBy, not 0.
-    CHECK(batch.front() == static_cast<int>(kOverBy));
+    CHECK(batch.items.front() == static_cast<int>(kOverBy));
 }
 
 TEST_CASE("BoundedPendingQueue: the dropped count surfaces in the next capture_gap event",
