@@ -39,9 +39,16 @@ churns the ledger. Each row records:
 **What populated this first PR.** Every row was extracted mechanically by
 `check-api-parity.py`'s lexical scanner (verified self-consistent against
 this session's fresh measurement: 173 registered `/api/v1/*` routes, 133
-OpenAPI path+method entries, 91 MCP tools, 202 fragment/legacy routes, 40
+OpenAPI path+method entries, 91 MCP tools, 278 fragment/legacy routes, 40
 routes registered but undocumented in OpenAPI - all seeded into this PR's
-`ALLOWLIST_OPENAPI_MISSING`). Most rows default to `status: "planned:#2146"`
+`ALLOWLIST_OPENAPI_MISSING`). An initial version of the extractor matched
+only dot-notation verb calls (`receiver.Get(...)`) and missed the ~107
+arrow-notation registrations `server.cpp` makes directly on `web_server_`
+(`web_server_->Get(...)`, the same false-negative class `docs/architecture.md`
+"Route Registration" already documents from #2542) - undercounting the
+fragment/legacy universe by 76 routes (202 vs the true 278) until fixed in
+this same PR before push; see that section for the receiver-agnostic
+extraction pattern this scanner now uses. Most rows default to `status: "planned:#2146"`
 per #3991's own scoping - this PR's job was to build the machine-checked
 scaffolding honestly, not to hunt down a precise tracking issue or verify
 every capability's twin status by hand. **13 rows were hand-verified against
@@ -54,11 +61,12 @@ The follow-on programme (#2146) files precise per-domain issues from the
 
 **What this is not.** A proof. `check-api-parity.py`'s own docstring says so
 directly: it is a **lexical tripwire** (regex extraction, not a C++ parser),
-the same class of gate as the sibling
-`scripts/ci/check-inline-route-registrations.py` (a different question -
-inline-vs-sink route registration style, not REST/MCP/OpenAPI/fragment
-parity - reusing the same general regex-extraction-plus-ratchet-baseline
-technique). A fully
+the same general regex-extraction-plus-ratchet-baseline technique issue
+#2557's in-progress inline-route gate uses for a different question
+(inline-vs-sink route registration style, not REST/MCP/OpenAPI/fragment
+parity) - as of this writing that gate lives only on the unmerged
+`ci/inline-route-gate` branch, not `dev`, so treat it as a sibling *design*,
+not a shipped file to depend on. A fully
 general version needs a type-aware/clang-based approach - see #2572. This
 ledger and its gate are also a deliberate **stopgap**: ADR-0032 interlock
 (j) / issue #2678 will eventually generate the capability projection this
@@ -74,7 +82,9 @@ ledger row; a ledger row still claiming a route that no longer exists
 twin does not actually exist in the current extraction; a registered
 `/api/v1/*` route missing from OpenAPI and not in the allowlist; the total
 untwinned-row count growing past the baseline recorded in the script (the
-baseline may shrink as F2+ wires real twins, never grow); and this
+baseline shrinks as F2+ wires real twins, and rises only when a change
+raises it with a stated reviewed reason - a newly-discovered fragment route,
+or extraction-completeness catching up to a route that already existed); and this
 document's generated block going stale relative to a fresh render. See
 `tests/unit/server/test_openapi_spec_completeness.cpp` for the in-process
 unit-test half (RestApiV1's own `register_routes()` vs `openapi_spec()`,
@@ -98,7 +108,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | viz | 2 | 2 | 0 |
 | executions | 6 | 1 | 5 |
 | scope-result-sets | 1 | 0 | 1 |
-| instructions | 15 | 0 | 15 |
+| instructions | 24 | 0 | 24 |
 | compliance-policy | 19 | 1 | 18 |
 | settings | 15 | 0 | 15 |
 | rbac | 8 | 0 | 8 |
@@ -108,12 +118,12 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 0 | 19 |
-| other | 7 | 0 | 7 |
-| **Total** | **202** | **13** | **189** |
+| other | 74 | 0 | 74 |
+| **Total** | **278** | **13** | **265** |
 
 Registered `/api/v1/*` routes: 173. OpenAPI `paths` entries: 133. Missing from OpenAPI: 40 (40 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 91.
 
-Ratchet baseline (untwinned rows, may only shrink): 189.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 265.
 
 <!-- END GENERATED -->
 
@@ -127,6 +137,10 @@ Ratchet baseline (untwinned rows, may only shrink): 189.
   work this ledger is a stopgap for.
 - `scripts/ci/check-capability-matrix.sh` - the ratchet-gate shape this
   script's baseline/allowlist mechanics are modeled on.
-- `scripts/ci/check-inline-route-registrations.py` - sibling lexical gate
-  (different question, same general technique), owned by the concurrent
-  #2542/#2557 `HttpRouteSink` migration campaign.
+- Issue #2557's in-progress inline-route gate (unmerged `ci/inline-route-gate`
+  branch, not yet on `dev`) - sibling lexical-gate design (different
+  question, same general technique), owned by the concurrent #2542/#2557
+  `HttpRouteSink` migration campaign.
+- `docs/architecture.md` "Route Registration" - the receiver-agnostic
+  `(\.|->)` extraction pattern this scanner uses, and the #2542 false
+  negative it exists to avoid repeating.

@@ -94,10 +94,16 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # deliberate, reviewed classification, not a backlog item) - "0 untwinned"
 # is not this gate's success criterion, "no regression from the reviewed
 # baseline" is. May SHRINK as F2+ wires real REST/MCP twins and flips
-# `planned` rows to "twinned"; may never GROW. Lower this in the SAME change
-# that lowers the real count - see check-capability-matrix.sh's CDX-P2-006
-# comment for why an un-lowered baseline is not a real ratchet.
-BASELINE_UNTWINNED = 189
+# `planned` rows to "twinned". May also GROW, but ONLY for a reviewed reason
+# stated in the same change that raises it - either a genuinely new route
+# just registered, or (as in the #3991 fix that took this from 189 to 265)
+# extraction-completeness catching up to a route that already existed but
+# was previously invisible to the lexical scan; growth from a silent
+# regression in the check itself is never legitimate. Lower (or, with a
+# stated reason, raise) this in the SAME change that changes the real count -
+# see check-capability-matrix.sh's CDX-P2-006 comment for why an un-adjusted
+# baseline is not a real ratchet.
+BASELINE_UNTWINNED = 265
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.
@@ -303,17 +309,21 @@ def parse_literal_at(text, pos):
     return None, pos
 
 
-_VERB_CALL = re.compile(r"\b(\w+)\.(" + "|".join(VERBS) + r")\s*\(")
+_VERB_CALL = re.compile(r"\b(\w+)(?:\.|->)(" + "|".join(VERBS) + r")\s*\(")
 
 # httplib::Client call sites (directory_sync.cpp, analytics_sinks.cpp,
-# nvd_client.cpp, offload_target_store.cpp, webhook_store.cpp - all outbound
-# HTTP clients, never route registrations) always pass a runtime variable as
-# their first argument, by construction - fetching a caller-supplied URL is
-# the entire point of an httplib::Client. These receiver names are the
-# verified, complete false-positive set (grepped across the whole tree at
-# #3991-time); a verb call through any OTHER receiver with no literal first
-# argument is unexpected and still warns loudly below rather than being
-# silently dropped.
+# nvd_client.cpp, offload_target_store.cpp, webhook_store.cpp, oidc_provider.cpp,
+# settings_routes.cpp - all outbound HTTP clients, never route registrations)
+# always pass a runtime variable as their first argument, by construction -
+# fetching a caller-supplied URL is the entire point of an httplib::Client.
+# These receiver names are the verified, complete false-positive set (grepped
+# across the whole tree at #3991-time, both `.` and `->` forms - see
+# docs/architecture.md "Route Registration" for why the receiver-agnostic
+# `(\.|->)` pattern is required at all: a dot-only grep silently missed
+# server.cpp's ~107 `web_server_->{Get,Post,...}(` inline registrations, the
+# exact false negative #2542 already documented once); a verb call through
+# any OTHER receiver with no literal first argument is unexpected and still
+# warns loudly below rather than being silently dropped.
 _KNOWN_CLIENT_RECEIVERS = {"cli", "client"}
 
 
@@ -628,8 +638,9 @@ def render_doc_block(ledger_rows, bucket_b, openapi_paths, allowlist_set, mcp_to
                  f"pending F2, {missing_openapi - len(allowlist_set)} "
                  f"unallowlisted). MCP tools: {len(mcp_tools)}.")
     lines.append("")
-    lines.append(f"Ratchet baseline (untwinned rows, may only shrink): "
-                 f"{BASELINE_UNTWINNED}.")
+    lines.append(f"Ratchet baseline (untwinned rows; shrinks as routes are "
+                 f"twinned, or rises only with a reviewed reason stated in "
+                 f"the change that raises it): {BASELINE_UNTWINNED}.")
     lines.append("")
     lines.append(DOC_END)
     return "\n".join(lines) + "\n"

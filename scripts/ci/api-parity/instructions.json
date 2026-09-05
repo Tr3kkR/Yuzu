@@ -1,8 +1,80 @@
 [
   {
+    "method": "GET",
+    "path": "/api/instructions",
+    "capability_id": "get.api-instructions",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions",
+    "capability_id": "post.api-instructions",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions/import",
+    "capability_id": "post.api-instructions-import",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions/validate-yaml",
+    "capability_id": "post.api-instructions-validate-yaml",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "POST",
+    "path": "/api/instructions/yaml",
+    "capability_id": "post.api-instructions-yaml",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "DELETE",
+    "path": "/api/instructions/{param}",
+    "capability_id": "delete.api-instructions-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/instructions/{param}",
+    "capability_id": "get.api-instructions-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "PUT",
+    "path": "/api/instructions/{param}",
+    "capability_id": "put.api-instructions-param",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
     "method": "POST",
     "path": "/api/instructions/{param}/execute",
     "capability_id": "post.api-instructions-param-execute",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
+    "path": "/api/instructions/{param}/export",
+    "capability_id": "get.api-instructions-param-export",
     "rest_v1_twin": null,
     "mcp_twin": null,
     "status": "planned:#2146"
