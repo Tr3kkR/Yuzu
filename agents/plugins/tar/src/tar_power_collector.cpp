@@ -431,6 +431,7 @@ public:
 
         SubscriptionTickInputs tick_in;
         tick_in.leg_tag = "winpower";
+        tick_in.run_nonce_ms = this_run_start_ms_;
         tick_in.items.reserve(batch.items.size());
         for (const auto& item : batch.items)
             tick_in.items.push_back(SubscriptionRawItem{item.seq, item.ts, item.kind});
@@ -741,6 +742,7 @@ public:
 
         SubscriptionTickInputs tick_in;
         tick_in.leg_tag = "linuxpower";
+        tick_in.run_nonce_ms = this_run_start_ms_;
         tick_in.items.reserve(batch.items.size() + 1);
         for (const auto& item : batch.items)
             tick_in.items.push_back(SubscriptionRawItem{item.seq, item.ts, item.kind});

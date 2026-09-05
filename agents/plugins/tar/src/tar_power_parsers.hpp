@@ -602,6 +602,16 @@ struct SubscriptionRawItem {
 
 struct SubscriptionTickInputs {
     std::string leg_tag;                    // "winpower" | "linuxpower" -- record_key namespace
+    // Per-process-life nonce (the collector's start time, epoch ms), mixed into
+    // the record_keys derived from PROCESS-LOCAL COUNTERS -- `seq` and
+    // `dropped_total`. Both reset to 0 when the agent restarts, so without this
+    // the second process life re-emits "winpower:sw:0" and the store's
+    // INSERT OR IGNORE on record_key discards a genuinely new event while
+    // reporting success. The timestamp-derived keys below (gap, restart,
+    // subcorrupt, accorrupt) are content-addressed and already idempotent
+    // across restarts, so they deliberately do NOT take the nonce -- mixing it
+    // in would make a re-reported restart gap duplicate instead of dedupe.
+    std::int64_t run_nonce_ms{0};
     std::vector<SubscriptionRawItem> items; // queue snapshot, oldest first
     std::string last_ac{"unknown"};
     std::optional<std::int64_t> pending_gap_since_ms; // set together, or neither
@@ -674,18 +684,23 @@ inline SubscriptionTickResult build_subscription_tick_events(const SubscriptionT
             in.now, "capture_gap",
             "power queue overflow: " + std::to_string(in.dropped_total - in.last_reported_dropped) +
                 " event(s) dropped (bounded queue at capacity)",
-            in.leg_tag + ":overflow:" + std::to_string(in.dropped_total)});
+            in.leg_tag + ":" + std::to_string(in.run_nonce_ms) + ":overflow:" +
+                std::to_string(in.dropped_total)});
     }
 
     for (const auto& item : in.items) {
         if (item.kind == "sleep" || item.kind == "wake") {
-            out.events.push_back(PowerEventDraft{item.ts, item.kind, in.sleep_wake_detail,
-                                                  in.leg_tag + ":sw:" + std::to_string(item.seq)});
+            out.events.push_back(PowerEventDraft{
+                item.ts, item.kind, in.sleep_wake_detail,
+                in.leg_tag + ":" + std::to_string(in.run_nonce_ms) + ":sw:" +
+                    std::to_string(item.seq)});
         } else if (item.kind == "ac" || item.kind == "batt") {
             auto action = ac_transition_action(out.new_last_ac, item.kind);
             if (!action.empty())
-                out.events.push_back(PowerEventDraft{item.ts, action, in.ac_detail,
-                                                     in.leg_tag + ":ac:" + std::to_string(item.seq)});
+                out.events.push_back(PowerEventDraft{
+                    item.ts, action, in.ac_detail,
+                    in.leg_tag + ":" + std::to_string(in.run_nonce_ms) + ":ac:" +
+                        std::to_string(item.seq)});
             out.new_last_ac = item.kind;
         }
     }

@@ -774,6 +774,54 @@ TEST_CASE("build_subscription_tick_events: sleep/wake items become events 1:1, e
     CHECK(out.events[0].record_key != out.events[1].record_key);
 }
 
+TEST_CASE("build_subscription_tick_events: counter-derived record_keys survive an agent "
+          "restart, timestamp-derived ones stay idempotent (SP-1)",
+          "[tar_power][subscription][sp1]") {
+    // `seq` and `dropped_total` are PROCESS-LOCAL counters: both restart at 0
+    // with the agent. Without the run nonce the second process life re-emits
+    // "winpower:sw:0" for a genuinely new sleep, and TarDb's INSERT OR IGNORE
+    // on record_key discards it while reporting success -- silent data loss on
+    // every single restart, not a rare race.
+    SubscriptionTickInputs first;
+    first.leg_tag = "winpower";
+    first.run_nonce_ms = 1'700'000'000'000;
+    first.items = {{0, 100, "sleep"}};
+    first.dropped_total = 3;
+    first.sleep_wake_detail = "d";
+    // A restart gap is CONTENT-addressed (its since_ms), so it must dedupe
+    // across process lives -- the same gap re-reported is the same gap.
+    first.restart_gap_since_ms = 900;
+
+    SubscriptionTickInputs second = first;
+    second.run_nonce_ms = 1'700'000'060'000; // one minute later: a new process life
+
+    auto a = build_subscription_tick_events(first);
+    auto b = build_subscription_tick_events(second);
+    REQUIRE(a.events.size() == b.events.size());
+
+    auto key_for = [](const SubscriptionTickResult& r, const std::string& infix) {
+        for (const auto& e : r.events)
+            if (e.record_key.find(infix) != std::string::npos)
+                return e.record_key;
+        return std::string{};
+    };
+
+    // Counter-derived: MUST differ, or the restart's events are swallowed.
+    REQUIRE_FALSE(key_for(a, ":sw:").empty());
+    CHECK(key_for(a, ":sw:") != key_for(b, ":sw:"));
+    REQUIRE_FALSE(key_for(a, ":overflow:").empty());
+    CHECK(key_for(a, ":overflow:") != key_for(b, ":overflow:"));
+
+    // Timestamp-derived: MUST match, or the same gap is reported twice.
+    REQUIRE_FALSE(key_for(a, ":restart:").empty());
+    CHECK(key_for(a, ":restart:") == key_for(b, ":restart:"));
+
+    // Within one process life the key is stable, so an ordinary commit retry
+    // still dedupes rather than double-inserting.
+    auto a_again = build_subscription_tick_events(first);
+    CHECK(key_for(a, ":sw:") == key_for(a_again, ":sw:"));
+}
+
 TEST_CASE("build_subscription_tick_events: AC items are state-change-driven, unknown "
           "seeds silently",
           "[tar_power][subscription]") {
