@@ -42,6 +42,6 @@ mapdrive	macos	constrained	getfsstat
 power	windows	planned	powerbroadcast
 power	linux	planned	logind
 power	macos	planned	pmset_log
-removable	windows	planned	wevtapi
-removable	linux	planned	udev_netlink
-removable	macos	planned	diskarbitration
+removable	windows	supported	wevtapi
+removable	linux	constrained	udev_netlink
+removable	macos	constrained	diskarbitration
