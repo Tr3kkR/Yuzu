@@ -492,7 +492,7 @@ implementation is.
 | os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
 | os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
 | power_health | battery | linux | constrained | 1 | /sys/class/power_supply uevent parsing | fixture-verified; no live Linux venue in this run |
-| power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | - |
+| power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop |
 | power_health | battery | windows | supported | 1 | GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is fixture-tested through the injected boundary and is UNVERIFIED on real battery hardware pending the reviewer's laptop run |
 | power_health | thermal | linux | constrained | 1 | /sys/class/thermal zone parsing | fixture-verified; no live Linux venue in this run |
 | power_health | thermal | macos | constrained | 1 | NSProcessInfo.thermalState + IOPMGetThermalWarningLevel | reports a 4-level thermal-pressure enum, never a temperature reading |

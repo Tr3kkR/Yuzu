@@ -270,7 +270,11 @@ spec:
         maxLength: 256
 
   result:
-    # set_power_plan|ok|<previous_guid>|<new_guid>
+    # EVERY branch emits four fields after the discriminator, matching the
+    # positional `columns` below; `-` marks an absent field, never an
+    # empty one. A success row that omitted `reason` would shift
+    # previous_guid into reason and new_guid into previous_guid.
+    # set_power_plan|ok|-|<previous_guid>|<new_guid>
     # set_power_plan|error|<reason>|<guid_or_dash>|<guid_or_dash>
     columns:
       - name: status
