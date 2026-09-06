@@ -903,10 +903,41 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // and kBaselinePrefix records (deliberately untouched by full_sync — see
         // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
         // a baseline either).
-        const auto rule_keys = kv_->list(kKvNamespace, kRulePrefix);
-        const int cleared = rule_keys.empty() ? 0 : kv_->del_keys(kKvNamespace, rule_keys);
-        if (cleared > 0)
-            spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
+        // Gate 4 governance BLOCKING-class finding (unhappy-path UP-1): `list()`'s
+        // bare `while (step()==SQLITE_ROW)` loop cannot distinguish end-of-rows
+        // from a mid-scan I/O error (kv_store.cpp's own comment on `list_entries`
+        // names this exact gap) - the OLD full_sync teardown used a single atomic
+        // `clear()` DELETE statement, which has no partial-failure mode at all, so
+        // switching to list()+del_keys() for the #4021 baseline-preserving scoped
+        // sweep introduced a genuinely NEW one: a mid-scan error would silently
+        // return a TRUNCATED key list, and the (fully transactional) del_keys()
+        // would then "successfully" delete only that truncated subset - some
+        // rule: keys gone, others surviving, with the cleared-count log line
+        // reporting it as an ordinary success. A surviving stale rule: key is
+        // re-armed by start_local()'s restart re-arm loop even after the server
+        // removed it from policy, silently re-enforcing on next restart - a
+        // genuine compliance-evidence integrity gap for a product whose whole
+        // point is Guaranteed State. Use the fallible list_entries() (which DOES
+        // check the post-loop rc) instead, and on a genuine read failure, hold
+        // the generation for retry and skip the sweep entirely THIS pass rather
+        // than risk a partial delete - stale rule: keys lingering one extra cycle
+        // is safe; a truncated delete masquerading as success is not.
+        auto rule_key_rows = kv_->list_entries(kKvNamespace, kRulePrefix);
+        if (!rule_key_rows) {
+            ++reconcile_failures;
+            arm_failures_.fetch_add(1, std::memory_order_relaxed);
+            spdlog::error("Guardian: full_sync rule-key sweep failed ({}) - holding "
+                         "policy_generation for retry rather than risk a partial delete",
+                         rule_key_rows.error().message);
+        } else {
+            std::vector<std::string> rule_keys;
+            rule_keys.reserve(rule_key_rows->size());
+            for (auto& row : *rule_key_rows)
+                rule_keys.push_back(std::move(row.key));
+            const int cleared = rule_keys.empty() ? 0 : kv_->del_keys(kKvNamespace, rule_keys);
+            if (cleared > 0)
+                spdlog::info("Guardian: full_sync cleared {} prior rule(s)", cleared);
+        }
         // Re-persist the policy generation marker (rewritten unconditionally here,
         // same as before this change — harmless whether or not the key survived).
         persist_generation_locked();
@@ -1352,13 +1383,17 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                                fp = baseline_fingerprint](const std::string& hash) {
                 guardian_persist_baseline(kv, rule_id, fp, hash);
             };
-            // Gate 3 quality-engineer follow-up: last_file_expected_hash_for_test_
-            // only proves the SEED lookup ran, not that the capture callback was
-            // actually attached — deleting the assignment above would leave every
-            // Linux test (which never runs a real FileGuard to observe the
-            // callback firing) green. This is set unconditionally right after the
-            // assignment so a test can assert it happened.
-            last_file_on_baseline_wired_for_test_ = true;
+            // Gate 3 quality-engineer follow-up, hardened per Gate 4 happy-path
+            // (the two statements were independent — deleting the assignment
+            // above while leaving this one untouched still left the flag true
+            // and the regression test green, exactly the gap the flag exists to
+            // catch). Derives the flag FROM the assignment's own observable
+            // result instead of asserting it separately: last_file_expected_hash_
+            // for_test_ only proves the SEED lookup ran, not that the capture
+            // callback was actually attached — deleting the assignment above
+            // now flips this false too, since `fcfg.on_baseline` would then be
+            // empty.
+            last_file_on_baseline_wired_for_test_ = static_cast<bool>(fcfg.on_baseline);
         } else {
             // file-exists: "absent" → drift when the file EXISTS; anything else
             // (default "present") → drift when the file is missing / has been deleted.
