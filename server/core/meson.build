@@ -530,6 +530,7 @@ yuzu_server_core_lib = static_library(
     'src/software_licensing_ingestion.cpp',
     'src/app_usage_store.cpp',
     'src/app_usage_ingestion.cpp',
+    'src/app_usage_routes.cpp',
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
     'src/agent_decommission.cpp',

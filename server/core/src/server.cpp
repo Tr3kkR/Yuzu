@@ -22159,9 +22159,6 @@ private:
                 // MCP twin of GET /api/v1/sle/agents/{id} (machine-scope facts; the
                 // per-user user_ref PII stays on the audited REST drill).
                 software_licensing_store_.get(),
-                // wave 7 PR7.2: backs the get_agent_app_usage MCP twin of
-                // GET /api/v1/forensics/agents/{id}/app-usage.
-                app_usage_store_.get(),
                 // PR 4.2 — engine role-assignment MCP twins.
                 engine_principal_store_.get(),
                 // Periodic Access Reviews (SOC 2 CC6.2) — the campaign store plus the
@@ -22204,7 +22201,10 @@ private:
                 // /api/command's visible-set half uses, now carrying identity too.
                 [this](const auth::Session& s) -> yuzu::server::DispatchCaller {
                     return derive_dispatch_caller(s);
-                });
+                },
+                // wave 7 PR7.2: backs the get_agent_app_usage MCP twin of
+                // GET /api/v1/forensics/agents/{id}/app-usage.
+                app_usage_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------

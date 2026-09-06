@@ -1258,7 +1258,6 @@ private:
             /*mcp_streamed_post_enabled=*/&streamed_post_enabled_,
             /*allowed_origins=*/allowed_origins_for_test,
             /*software_licensing_store=*/software_licensing_store_for_test,
-            /*app_usage_store=*/app_usage_store_for_test,
             // Spelled out only because the streamed-POST params after them are
             // what this call actually needs; nullptr is the pre-existing default.
             /*engine_principal_store=*/nullptr,
@@ -1271,7 +1270,8 @@ private:
             // that does not opt in cannot accidentally start streaming.
             /*stream_budget=*/stream_budget_for_test,
             /*revalidate_fn=*/revalidate_fn_for_test,
-            /*principal_audit_fn=*/principal_audit_fn_for_test);
+            /*principal_audit_fn=*/principal_audit_fn_for_test,
+            /*app_usage_store=*/app_usage_store_for_test);
     }
 };
 
@@ -12104,8 +12104,16 @@ TEST_CASE("MCP get_agent_app_usage: corrupt rbac.db (non-null, closed) → #1717
     CHECK(saw_failure);
 }
 
-TEST_CASE("MCP get_agent_app_usage: missing agent_id → invalid params", "[mcp]") {
+TEST_CASE("MCP get_agent_app_usage: missing agent_id → invalid params", "[mcp][pg]") {
+    // A real open RbacStore, matching query_software_licenses's identical case —
+    // a null/closed store trips the #1717 fail-closed guard before this check runs.
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_app_usage_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
     McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&,
                                     const std::string&) { return true; };
@@ -12117,8 +12125,14 @@ TEST_CASE("MCP get_agent_app_usage: missing agent_id → invalid params", "[mcp]
     CHECK(res->body.find("agent_id is required") != std::string::npos);
 }
 
-TEST_CASE("MCP get_agent_app_usage: out-of-scope agent is 403'd by the scoped gate", "[mcp]") {
+TEST_CASE("MCP get_agent_app_usage: out-of-scope agent is 403'd by the scoped gate", "[mcp][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_app_usage_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
     McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
     ts.app_usage_store_for_test = nullptr; // gate refuses before any store read
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response& res,
                                     const std::string&, const std::string&,
@@ -12137,8 +12151,14 @@ TEST_CASE("MCP get_agent_app_usage: out-of-scope agent is 403'd by the scoped ga
     CHECK(res->body.find("\"result\"") == std::string::npos);
 }
 
-TEST_CASE("MCP get_agent_app_usage: store unavailable → A4 internal error", "[mcp]") {
+TEST_CASE("MCP get_agent_app_usage: store unavailable → A4 internal error", "[mcp][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_app_usage_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
+    REQUIRE(rbac.is_open());
     McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
     ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
                                     const std::string&, const std::string&,
                                     const std::string&) { return true; };

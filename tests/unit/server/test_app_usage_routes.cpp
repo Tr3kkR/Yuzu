@@ -49,7 +49,11 @@ struct AppUsageHarness {
     std::vector<std::string> scoped_agents; // ...or just these agents (in-scope set)
     bool degrade_agent = false;
     bool audit_should_fail = false;
-    bool gate_unwired = false; // omit the scoped gate entirely (fail-closed 503)
+    // omit the scoped gate entirely (fail-closed 503). Read only in the constructor
+    // below (register_routes decides WHICH closure to install at construction time,
+    // not per-request), so it must be passed to the constructor — setting the member
+    // after construction is a no-op, the gate is already wired by then.
+    const bool gate_unwired;
 
     std::vector<AgentLastUsedRow> agent_rows;
 
@@ -58,7 +62,7 @@ struct AppUsageHarness {
     // The (securable_type, operation, agent_id) each SCOPED gate check was ASKED.
     std::vector<std::string> scoped_calls; // "type|op|agent_id"
 
-    AppUsageHarness() {
+    explicit AppUsageHarness(bool gate_unwired_ = false) : gate_unwired(gate_unwired_) {
         auto scoped = [this](const httplib::Request&, httplib::Response& res,
                              const std::string& type, const std::string& op,
                              const std::string& agent_id) {
@@ -135,8 +139,7 @@ TEST_CASE("app-usage: scoped gate — in-scope 200, out-of-scope 403", "[app_usa
 
 TEST_CASE("app-usage: gate unwired → fail-closed 503, never a legacy-open read",
           "[app_usage_routes]") {
-    AppUsageHarness h;
-    h.gate_unwired = true;
+    AppUsageHarness h(/*gate_unwired_=*/true);
     h.agent_rows = {row("chrome.exe", 1699000000, 1700000500)};
     auto res = h.sink.Get("/api/v1/forensics/agents/agent-1/app-usage");
     REQUIRE(res);

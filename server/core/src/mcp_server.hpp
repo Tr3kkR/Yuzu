@@ -527,9 +527,6 @@ public:
                             // ADR-0024: backs the query_software_licenses discovery read
                             // (the MCP twin of GET /api/v1/sle/agents/{id}).
                             SoftwareLicensingStore* software_licensing_store = nullptr,
-                            // wave 7 PR7.2: backs the get_agent_app_usage discovery read
-                            // (the MCP twin of GET /api/v1/forensics/agents/{id}/app-usage).
-                            AppUsageStore* app_usage_store = nullptr,
                             // PR 4.2 (design §4.1): backs assign_engine_role /
                             // unassign_engine_role / list_engine_roles — the MCP twins
                             // of the REST engine-principal role-assignment surface.
@@ -575,7 +572,11 @@ public:
                             // to today, which is the correct degradation.
                             yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                             StreamRevalidateFn revalidate_fn = {},
-                            StreamPrincipalAuditFn principal_audit_fn = {});
+                            StreamPrincipalAuditFn principal_audit_fn = {},
+                            // wave 7 PR7.2: backs the get_agent_app_usage discovery read
+                            // (the MCP twin of GET /api/v1/forensics/agents/{id}/app-usage).
+                            // Trailing optional dep, like the rest of this parameter tail.
+                            AppUsageStore* app_usage_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -636,8 +637,6 @@ public:
                             const bool* mcp_streamed_post_enabled = nullptr,
                          std::vector<std::string> allowed_origins = {},
                          SoftwareLicensingStore* software_licensing_store = nullptr,
-                         // wave 7 PR7.2: backs get_agent_app_usage (see build_handler).
-                         AppUsageStore* app_usage_store = nullptr,
                          // PR 4.2 (design §4.1): engine-principal role-assignment MCP
                          // twins (the 4.2 grant handlers capture this param).
                          EnginePrincipalStore* engine_principal_store = nullptr,
@@ -662,7 +661,10 @@ public:
                          StreamPrincipalAuditFn principal_audit_fn = {},
                          // #1788 / PLAN-006: per-request DispatchCaller deriver,
                          // forwarded to build_handler for MCP dispatch confinement.
-                         CallerFn caller_fn = {});
+                         CallerFn caller_fn = {},
+                         // wave 7 PR7.2: backs get_agent_app_usage (see build_handler).
+                         // Trailing optional dep, identical contract.
+                         AppUsageStore* app_usage_store = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

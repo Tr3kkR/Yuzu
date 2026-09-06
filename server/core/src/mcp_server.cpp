@@ -3112,11 +3112,10 @@ McpServer::HandlerFn McpServer::build_handler(
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
     const bool* mcp_streamed_post_enabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
-    AppUsageStore* app_usage_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
-    StreamPrincipalAuditFn principal_audit_fn) {
+    StreamPrincipalAuditFn principal_audit_fn, AppUsageStore* app_usage_store) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -14415,7 +14414,6 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool* mcp_streamed_post_enabled,
                                 std::vector<std::string> allowed_origins,
                                 SoftwareLicensingStore* software_licensing_store,
-                                AppUsageStore* app_usage_store,
                                 EnginePrincipalStore* engine_principal_store,
                                 AccessReviewStore* access_review_store, AuthDB* auth_db,
                                 DirectorySync* directory_sync,
@@ -14423,7 +14421,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
-                                CallerFn caller_fn) {
+                                CallerFn caller_fn, AppUsageStore* app_usage_store) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -14447,7 +14445,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                            sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                            std::move(allowed_origins),
-                           software_licensing_store, app_usage_store, engine_principal_store,
+                           software_licensing_store, engine_principal_store,
                            access_review_store,
                            auth_db, directory_sync, std::move(caller_fn),
                            // 2f PR 3b: the streamed-POST arm leases from the SAME
@@ -14455,7 +14453,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            // moving here is safe) - one arithmetic for every
                            // held-open worker, whichever verb pinned it.
                            stream_budget, std::move(revalidate_fn),
-                           std::move(principal_audit_fn)));
+                           std::move(principal_audit_fn), app_usage_store));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
