@@ -6960,6 +6960,20 @@ not apply here.
 {"error": {"code": 400, "message": "destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
 ```
 
+**Forensics-class capabilities are SINGLE-TARGET — exactly one explicit, in-scope `agent_id`,
+no `scope` (Wave 7 PR7.2).** A row on the `Forensics` securable (e.g. `execution_artifacts.
+shimcache`) is `ReadOnly`, not `Destructive`, but a forensic read is per-device by nature: naming
+zero ids, more than one id, or any `scope` (including `"__all__"`) is refused before the read
+reaches an agent, with its own distinct message:
+
+```json
+{"error": {"code": 400, "message": "forensic read requires exactly one explicit in-scope agent_id; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
+```
+
+A Forensics read that names its one target confines to the caller's visible agents exactly like
+a Destructive row — the 404 `no reachable in-scope agent` body above answers an out-of-group id
+the same way.
+
 `audit_emitted` follows this file's usual convention (see `DELETE /api/v1/sessions?username=<name>` above):
 present and `false` only when the paired `command.dispatch` audit row failed to persist (the response also
 sets `Sec-Audit-Failed: true` in that case), and omitted entirely when no audit store is configured — absent

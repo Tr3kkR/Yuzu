@@ -967,7 +967,8 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // group:/__all__ selection into scope_expr, so this is
                          // the post-validation shape the header's caller
                          // contract requires — never a raw extraction result.
-                         /*scope_key_present=*/!scope_expr.empty());
+                         /*scope_key_present=*/!scope_expr.empty(),
+                         /*agent_id_count=*/agent_ids.size());
                      // Exhaustive, no `default:` — the same switch shape
                      // /api/command and MCP's backstop use over this enum, and
                      // the reason ClassifyMiss is an enumerator rather than a
@@ -1001,9 +1002,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                  metrics_
                                      ->counter("yuzu_server_dispatch_target_rejected_total",
                                                {{"route", "dashboard"},
-                                                {"reason",
-                                                 std::string(yuzu::server::
-                                                                 kReasonDestructiveUntargeted)}})
+                                                {"reason", std::string(gate.refusal_reason)}})
                                      .increment();
                              } catch (...) { // NOLINT(bugprone-empty-catch)
                              }
@@ -1012,17 +1011,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          // %0a would inject a line break into the server log. The
                          // sibling /api/command refusal sanitises its logged fields
                          // for exactly this reason; match it rather than deviate.
-                         spdlog::warn("dashboard execute: refusing {}:{} — Destructive actions "
-                                      "require explicit agent_ids (scope='{}')",
-                                      plugin, action,
+                         // Wave 7 PR7.2: this arm now also covers a Forensics
+                         // single-target refusal (reason=forensic_untargeted).
+                         spdlog::warn("dashboard execute: refusing {}:{} — {} "
+                                      "(scope='{}')",
+                                      plugin, action, gate.refusal_reason,
                                       onbehalf::sanitize_for_log(scope_expr, 128));
                          // Audited under this surface's own command.dispatch
                          // verb, with the same `reason=` detail prefix
                          // /api/command's twin refusal writes.
                          audit_fn_(req, "command.dispatch", "denied", "command", "",
-                                   "reason=" +
-                                       std::string(yuzu::server::kReasonDestructiveUntargeted) +
-                                       " " + onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                   "reason=" + std::string(gate.refusal_reason) + " " +
+                                       onbehalf::sanitize_for_log(plugin, 128) + ":" +
                                        onbehalf::sanitize_for_log(action, 128));
                          // In-surface denial shape: every other refusal in this
                          // handler is a 200 carrying an OOB result-context
@@ -1033,8 +1033,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                          res.set_content(
                              "<span id=\"result-context\" hx-swap-oob=\"true\""
                              " style=\"font-size:0.75rem;color:#f85149\">" +
-                                 html_escape(
-                                     std::string(yuzu::server::kDestructiveUntargetedMessage)) +
+                                 html_escape(std::string(gate.refusal_message)) +
                                  "</span>"
                                  "<div id=\"chart-deck-host\" hx-swap-oob=\"innerHTML\"></div>",
                              "text/html; charset=utf-8");

@@ -1327,6 +1327,15 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // Wave 7 PR7.2: the Forensics single-target refusal — same three
+        // routes as its Destructive sibling above, since
+        // `evaluate_destructive_targeting` is called generically for any
+        // classified capability on all three (a Forensics row is never
+        // Destructive, but reaches the same gate).
+        for (const char* route : {"command", "mcp", "dashboard"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
         // #2557: `destructive_no_visible_target` is emitted ONLY by
         // `/api/command`'s confine-to-visible-agents 404 arm today — unlike
         // its `destructive_untargeted` sibling above, MCP's execute_instruction
@@ -4321,7 +4330,6 @@ public:
                 }
             }
         }
-
         // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
         // and session credentials are stored as SHA-256 digests, never a
         // sealed SecretCodec blob (upload_grant_store.hpp file header).
