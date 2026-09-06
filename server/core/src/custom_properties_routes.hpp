@@ -6,8 +6,9 @@
 /// operator-authored per-agent metadata (`props.<key>` in scope
 /// expressions) plus its optional per-key type/validation schemas. One
 /// owning store (`CustomPropertiesStore`), genuinely cohesive — matching
-/// PR-2's "single subsystem" grouping precedent rather than PR-3's
-/// explicitly-heterogeneous one. Every handler body is copied verbatim from
+/// `page_routes`' single-subsystem grouping precedent rather than
+/// `dashboard_api_routes`'s explicitly-heterogeneous one. Every handler
+/// body is copied verbatim from
 /// server.cpp; the changes are the receiver (`web_server_->` -> `sink.`),
 /// the gate closures (`require_scoped_permission`/`require_permission` ->
 /// `deps.scoped_perm_fn`/`deps.perm_fn`), the member access
@@ -39,12 +40,15 @@
 /// matching server.cpp's original code exactly.
 ///
 /// AUDIT ASYMMETRY (preserved verbatim, not a defect introduced by this
-/// move): both GET routes are unaudited (pure reads); PUT/DELETE
-/// property audit both their failure and success outcomes; POST
-/// /api/property-schemas audits ONLY success — a validation/db failure on
-/// schema upsert returns its error response with no matching audit call.
-/// This is the pre-existing server.cpp behaviour, copied as-is; it is not
-/// this extraction's place to change it.
+/// move): both GET routes are unaudited (pure reads). PUT/DELETE audit
+/// their mid-body validation/not-found and success outcomes, but — like
+/// GET and POST — an early store-unavailable 503 on ANY of the 5 routes
+/// returns before `deps.audit_fn` is ever reached, so that specific path is
+/// unaudited on all 5. POST /api/property-schemas additionally audits ONLY
+/// success even once the store IS available — a validation/db failure past
+/// that point returns its error response with no matching audit call. This
+/// is the pre-existing server.cpp behaviour, copied as-is; it is not this
+/// extraction's place to change it.
 
 #include <yuzu/server/auth.hpp>
 
@@ -54,11 +58,11 @@
 #include <string>
 
 namespace yuzu::server {
-
 class HttpRouteSink;
 class CustomPropertiesStore;
+} // namespace yuzu::server
 
-namespace custom_properties {
+namespace yuzu::server::custom_properties {
 
 /// Construction deps for `register_custom_properties_routes`. Every
 /// closure/pointer is bound once at start_web_server() time in server.cpp
@@ -99,5 +103,4 @@ struct Deps {
 /// Register all 5 Custom Properties API routes against `sink`.
 void register_custom_properties_routes(HttpRouteSink& sink, Deps deps);
 
-} // namespace custom_properties
-} // namespace yuzu::server
+} // namespace yuzu::server::custom_properties

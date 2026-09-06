@@ -151,11 +151,13 @@ TEST_CASE("custom_properties_routes: the 3 per-agent routes gate on scoped_perm_
     CHECK(h.last_scoped_type == "Infrastructure");
     CHECK(h.last_scoped_op == "Write");
     CHECK(h.last_scoped_agent_id == "agent-2");
+    CHECK(h.last_perm_type.empty()); // never touched perm_fn
 
     h.sink.Delete("/api/agents/agent-3/properties/role");
     CHECK(h.last_scoped_type == "Infrastructure");
     CHECK(h.last_scoped_op == "Write");
     CHECK(h.last_scoped_agent_id == "agent-3");
+    CHECK(h.last_perm_type.empty()); // never touched perm_fn
 }
 
 TEST_CASE("custom_properties_routes: the 2 schema routes gate on the plain global "
@@ -172,6 +174,7 @@ TEST_CASE("custom_properties_routes: the 2 schema routes gate on the plain globa
     h.sink.Post("/api/property-schemas", R"({"key":"role"})");
     CHECK(h.last_perm_type == "Infrastructure");
     CHECK(h.last_perm_op == "Write");
+    CHECK(h.last_scoped_type.empty()); // never touched scoped_perm_fn
 }
 
 TEST_CASE("custom_properties_routes: a scoped_perm_fn denial 403s before the store is "
@@ -477,7 +480,8 @@ TEST_CASE("custom_properties_routes: GET properties degrades to 503 (never a fal
 // review finding, #2542 PR-4).
 // ═══════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("wiring: server.cpp still calls register_custom_properties_routes",
+TEST_CASE("custom_properties_routes: wiring -- server.cpp still calls "
+          "register_custom_properties_routes",
           "[server][routes][custom_properties_routes]") {
 #ifndef YUZU_SERVER_SRC_DIR
 #error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
