@@ -643,10 +643,17 @@ jobs:
         # against evidence instead of staying a guess. Runs after meson's own kill (or
         # the job-level cancel) has already happened, not "before teardown" - it
         # inspects co-tenant processes on the box, not the killed process itself.
-        # Scoped to THIS step's own outcome (id: test above), matching the TSan job's
-        # gdb-capture step's pattern above - an unrelated Configure/Build/vcpkg
-        # failure earlier in this job must not trigger an irrelevant process dump.
-        if: steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled'
+        #
+        # BOTH clauses are required, exactly per the TSan job's gdb-capture step
+        # above (#1038): a bare `steps.test.outcome == ...` has no status-check
+        # function, so GitHub ANDs an implicit success() onto it - unsatisfiable
+        # the moment Test fails, making the step permanently unreachable dead
+        # code (this exact mistake shipped here once already in this PR's own
+        # governance round and was caught by build-ci's Gate 8 re-verify).
+        # `failure() || cancelled()` restores reachability; the outcome check
+        # stays as the inner clause so an unrelated Configure/Build/vcpkg
+        # failure earlier in this job doesn't trigger an irrelevant process dump.
+        if: (failure() || cancelled()) && (steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled')
         # `tasklist /v` shows PID/session/user/CPU/window-title, not command lines -
         # it will list every process on this SYSTEM-identity, 4-runner-shared box
         # (CLAUDE.md's standing single-identity invariant), which lands in this
