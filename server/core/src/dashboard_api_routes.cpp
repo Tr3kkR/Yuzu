@@ -16,12 +16,13 @@ namespace yuzu::server::dashboard_api {
 
 void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
     // Fail fast at boot, not per-request: an unset visible_agents_json_fn is a
-    // caller wiring bug (this codebase has no other precedent for asserting a
-    // required Deps field, so this is the first — a future field with the
-    // same "no safe degrade" property should follow this shape). Catching it
-    // here means the server refuses to start rather than serving a silent,
-    // permanent 503 with no signal (governance Gate 4/6 finding on the PR
-    // that introduced this module).
+    // caller wiring bug, same class as CommandCapabilityRegistry's constructor
+    // (command_capability.hpp) throwing on a missing required input — no other
+    // *Deps-struct* field in this campaign asserts itself this way yet, so a
+    // future field with the same "no safe degrade" property should follow this
+    // shape. Catching it here means the server refuses to start rather than
+    // serving a silent, permanent 503 with no signal (governance Gate 4/6
+    // finding on the PR that introduced this module).
     if (!deps.visible_agents_json_fn) {
         throw std::invalid_argument(
             "register_dashboard_api_routes: deps.visible_agents_json_fn must be bound");
@@ -70,10 +71,10 @@ void register_dashboard_api_routes(HttpRouteSink& sink, Deps deps) {
     // that internal check before any permission verdict is reached, so this
     // external ordering does not change the caller-visible status code
     // (verified against auth_routes.cpp's require_permission/require_auth;
-    // governance Gate 4 finding). What this order DOES guarantee, and is the
-    // only reason to preserve it, is that `perm_fn` — not the explicit
-    // `auth_fn` call below it — is the thing that runs and is exercised on
-    // every request, matching the pre-extraction code exactly.
+    // governance Gate 4 finding). What this order DOES guarantee is that
+    // `perm_fn` is the first gate every request hits — the explicit
+    // `auth_fn` call below is reached only after a permission verdict —
+    // matching the pre-extraction code exactly.
     sink.Get("/api/agents", [deps](const httplib::Request& req,
                                    httplib::Response& res) {
         if (!deps.perm_fn(req, res, "Infrastructure", "Read"))

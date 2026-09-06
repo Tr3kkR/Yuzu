@@ -305,8 +305,8 @@ page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, 
 more owners, both registered against the same stack-local `inline_sink`: `/api/me`, `/api/agents`,
 `/api/audit`, `POST /api/export/json-to-csv`, `POST /api/scope/validate`,
 `/api/analytics/{status,recent}` (7 routes) are `dashboard_api_routes.{hpp,cpp}`, and
-`/api/nvd/{status,sync,match}` (3 routes) are `nvd_routes.{hpp,cpp}` — both registered against the
-same stack-local `inline_sink` constructed in `start_web_server()`.)
+`/api/nvd/{status,sync,match}` (3 routes) are `nvd_routes.{hpp,cpp}` — that `inline_sink` is
+constructed in `start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
 name:
