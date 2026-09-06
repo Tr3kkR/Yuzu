@@ -13,6 +13,7 @@
 #include "scope_engine.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
+#include "workflow_model.hpp" // #4030: shared workflow/workflow-execution/schedule row builders
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -1888,6 +1889,202 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             .dump(),
                         "application/json");
     });
+
+    // -- REST v1 twins (#4030: executions/workflows/schedules read-twin programme) --
+    //
+    // Each route below is a genuine v1 twin of an existing unversioned/fragment
+    // route above: same gate, same store call, same data -- but the JSON body
+    // is built by a SHARED pure function from workflow_model.hpp
+    // (workflow_row_json/workflow_detail_json/workflow_execution_detail_json/
+    // schedule_row_json) that the MCP twins (list_workflows/get_workflow/
+    // get_workflow_execution/list_schedules, mcp_server.cpp) call too --
+    // docs/api-twin-recipe.md Rule 1: REST and MCP cannot drift on field set
+    // by construction. New v1 error paths use the A4 envelope helpers
+    // (detail::a4_error) per the recipe's guidance, unlike this file's older
+    // unversioned handlers above (predate the recipe; left as-is, out of
+    // scope for this twin PR).
+
+    // GET /api/v1/workflows -- v1 twin of GET /api/workflows above.
+    sink.Get("/api/v1/workflows", [perm_fn, workflow_engine](const httplib::Request& req,
+                                                             httplib::Response& res) {
+        if (!perm_fn(req, res, "Workflow", "Read"))
+            return;
+        if (!workflow_engine || !workflow_engine->is_open()) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
+            return;
+        }
+        WorkflowQuery q;
+        if (req.has_param("name"))
+            q.name_filter = req.get_param_value("name");
+        try {
+            if (req.has_param("limit"))
+                q.limit = std::stoi(req.get_param_value("limit"));
+        } catch (const std::exception&) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
+            return;
+        }
+        if (q.limit <= 0) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "limit must be a positive integer"),
+                            "application/json");
+            return;
+        }
+        auto workflows_result = workflow_engine->list_workflows(q);
+        if (!workflows_result) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res,
+                                             yuzu::server::genericize_db_error(
+                                                 "list_workflows", workflows_result.error()),
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& w : *workflows_result)
+            arr.push_back(workflow_row_json(w));
+        res.set_content(
+            nlohmann::json(
+                {{"data", arr},
+                 {"pagination", {{"total", arr.size()}, {"start", 0}, {"page_size", 50}}},
+                 {"meta", {{"api_version", "v1"}}}})
+                .dump(),
+            "application/json");
+    });
+
+    // GET /api/v1/workflows/:id -- v1 twin of GET /api/workflows/:id above.
+    sink.Get(R"(/api/v1/workflows/([^/]+))",
+            [perm_fn, workflow_engine](const httplib::Request& req, httplib::Response& res) {
+                if (!perm_fn(req, res, "Workflow", "Read"))
+                    return;
+                if (!workflow_engine) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto workflow_result = workflow_engine->get_workflow(id);
+                if (!workflow_result) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         yuzu::server::genericize_db_error(
+                                             "get_workflow", workflow_result.error()),
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                if (!*workflow_result) {
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "workflow not found"),
+                                    "application/json");
+                    return;
+                }
+                res.set_content(nlohmann::json({{"data", workflow_detail_json(**workflow_result)},
+                                                {"meta", {{"api_version", "v1"}}}})
+                                    .dump(),
+                                "application/json");
+            });
+
+    // GET /api/v1/workflow-executions/:id -- v1 twin of
+    // GET /api/workflow-executions/:id above. #4030 confinement decision:
+    // WorkflowExecution.agent_ids_json names agents directly, so this route
+    // gates on fleet_read_fn (not the legacy route's plain perm_fn) and
+    // confines the emitted agent_ids array to the caller's visible scope --
+    // reviewer-flagged scope point in the issue, resolved here.
+    sink.Get(R"(/api/v1/workflow-executions/([^/]+))",
+            [fleet_read_fn, audit_fn, workflow_engine](const httplib::Request& req,
+                                                        httplib::Response& res) {
+                if (!fleet_read_fn) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn(req, res, "Workflow", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                if (!workflow_engine) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto id = req.matches[1].str();
+                auto exec_result = workflow_engine->get_execution(id);
+                if (!exec_result) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         yuzu::server::genericize_db_error(
+                                             "get_execution", exec_result.error()),
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+                if (!*exec_result) {
+                    res.status = 404;
+                    res.set_content(detail::a4_error(res, "execution not found"),
+                                    "application/json");
+                    return;
+                }
+                const auto& exec = **exec_result;
+                // #4030 audit decision: workflow-execution results carry
+                // operator-supplied step parameters/output, worth the same
+                // audit posture as instruction executions -- audited, verb
+                // `workflow_execution.detail.fetch` (new; distinct from the
+                // aggregate `execution.detail.fetch` verb, a different data
+                // model per the issue's own disambiguation). This file's
+                // AuditFn is void-returning (predates rest_audit.hpp's
+                // checked-bool try_persist_audit/emit_behavioral_audit --
+                // widening that type ripples through every call site + the
+                // server.cpp wiring lambda, out of scope for this twin PR),
+                // so this is a set-and-proceed call, not REST's usual
+                // fail-closed posture.
+                if (audit_fn)
+                    audit_fn(req, "workflow_execution.detail.fetch", "success",
+                            "WorkflowExecution", exec.id, "");
+                res.set_content(
+                    nlohmann::json({{"data", workflow_execution_detail_json(exec, gate.scope)},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            });
+
+    // GET /api/v1/schedules -- v1 twin of GET /fragments/schedules above; same
+    // two-stage gate (deny_service_scoped_schedule_list, already declared
+    // above, then Schedule:Read) -- schedules carry no per-agent axis, so
+    // fleet_read_fn does not apply here (matches the fragment's own gate
+    // shape, not a per-agent list).
+    sink.Get("/api/v1/schedules",
+            [perm_fn, schedule_engine, deny_service_scoped_schedule_list](
+                const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_schedule_list(req, res))
+                    return;
+                if (!perm_fn(req, res, "Schedule", "Read"))
+                    return;
+                if (!schedule_engine) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "schedule engine not available"),
+                                    "application/json");
+                    return;
+                }
+                auto scheds = schedule_engine->query_schedules();
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& s : scheds)
+                    arr.push_back(schedule_row_json(s));
+                res.set_content(
+                    nlohmann::json(
+                        {{"data", arr},
+                         {"pagination", {{"total", arr.size()}, {"start", 0}, {"page_size", 50}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            });
 
     // -- Single Instruction Execution API --------------------------------------
 

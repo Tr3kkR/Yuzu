@@ -22141,7 +22141,9 @@ private:
                 // /api/command's visible-set half uses, now carrying identity too.
                 [this](const auth::Session& s) -> yuzu::server::DispatchCaller {
                     return derive_dispatch_caller(s);
-                });
+                },
+                // #4030: backs list_workflows/get_workflow/get_workflow_execution.
+                workflow_engine_.get());
         }
 
         // -- Listen -----------------------------------------------------------

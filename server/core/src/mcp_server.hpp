@@ -45,6 +45,7 @@
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "workflow_engine.hpp" // #4030: WorkflowEngine — list_workflows/get_workflow/get_workflow_execution
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -571,7 +572,12 @@ public:
                             // to today, which is the correct degradation.
                             yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                             StreamRevalidateFn revalidate_fn = {},
-                            StreamPrincipalAuditFn principal_audit_fn = {});
+                            StreamPrincipalAuditFn principal_audit_fn = {},
+                            // #4030: backs list_workflows/get_workflow/get_workflow_execution
+                            // — WorkflowEngine was not previously threaded into McpServer at
+                            // all. Trailing optional dep; nullptr leaves the three tools
+                            // answering an internal-error JSON-RPC response.
+                            WorkflowEngine* workflow_engine = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -656,7 +662,10 @@ public:
                          StreamPrincipalAuditFn principal_audit_fn = {},
                          // #1788 / PLAN-006: per-request DispatchCaller deriver,
                          // forwarded to build_handler for MCP dispatch confinement.
-                         CallerFn caller_fn = {});
+                         CallerFn caller_fn = {},
+                         // #4030: backs list_workflows/get_workflow/get_workflow_execution —
+                         // forwarded to build_handler.
+                         WorkflowEngine* workflow_engine = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

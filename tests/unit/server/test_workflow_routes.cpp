@@ -39,6 +39,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <memory>
@@ -2725,3 +2726,163 @@ TEST_CASE("POST /api/scope/estimate: an ordinary session reaches the estimator",
 // used to use is reserved for migration/fresh-DB tests; ordinary store CRUD belongs on the
 // PgTestTemplate-backed YUZU_REQUIRE_PG_DB_TPL, per-test migration DDL being exactly what drove
 // the 2026-07-12 Windows server-suite timeout).
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4030 — REST v1 twins: /api/v1/workflows, /api/v1/workflows/{id},
+// /api/v1/workflow-executions/{id}, /api/v1/schedules. Shared-builder parity
+// with the legacy routes above is asserted by comparing response bodies.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GET /api/v1/workflows: lists workflows via the shared builder",
+          "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-V1WF", "v1wf");
+    h.make_workflow("v1-list-workflow", "def-V1WF");
+
+    auto res = h.sink.Get("/api/v1/workflows");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("data"));
+    REQUIRE(body["data"].is_array());
+    bool found = false;
+    for (const auto& w : body["data"]) {
+        REQUIRE(w.contains("id"));
+        REQUIRE(w.contains("step_count"));
+        if (w["name"] == "v1-list-workflow")
+            found = true;
+    }
+    CHECK(found);
+    CHECK(body["meta"]["api_version"] == "v1");
+}
+
+TEST_CASE("GET /api/v1/workflows/:id: full detail including yaml_source",
+          "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-V1WF2", "v1wf2");
+    auto wf_id = h.make_workflow("v1-detail-workflow", "def-V1WF2");
+
+    auto res = h.sink.Get("/api/v1/workflows/" + wf_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["id"] == wf_id);
+    CHECK(body["data"]["name"] == "v1-detail-workflow");
+    CHECK(body["data"].contains("yaml_source"));
+    REQUIRE(body["data"]["steps"].is_array());
+    REQUIRE(body["data"]["steps"].size() == 1);
+    CHECK(body["data"]["steps"][0]["instruction_id"] == "def-V1WF2");
+}
+
+TEST_CASE("GET /api/v1/workflows/:id: 404 for an unknown id", "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+
+    auto res = h.sink.Get("/api/v1/workflows/does-not-exist");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("GET /api/v1/workflows: 403 when Workflow:Read is denied", "[pg][workflow][v1][twins]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.perm_grant = false;
+
+    auto res = h.sink.Get("/api/v1/workflows");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("GET /api/v1/workflow-executions/:id: confines agent_ids to the caller's fleet-read "
+          "scope (#4030 scoping decision)",
+          "[pg][workflow][v1][twins][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-V1WFX", "v1wfx");
+    auto wf_id = h.make_workflow("v1-exec-workflow", "def-V1WFX");
+    h.dispatch_cmd_override = "cmd-v1wfx";
+    h.dispatch_sent_override = 1;
+
+    auto exec_res = h.sink.Post("/api/workflows/" + wf_id + "/execute",
+                                R"({"agent_ids":["agent-A","agent-B"]})");
+    REQUIRE(exec_res);
+    REQUIRE(exec_res->status == 202);
+    auto exec_body = nlohmann::json::parse(exec_res->body);
+    auto exec_id = exec_body["execution_id"].get<std::string>();
+
+    // Confine the caller to agent-A only.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    auto res = h.sink.Get("/api/v1/workflow-executions/" + exec_id);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["data"]["id"] == exec_id);
+    REQUIRE(body["data"]["agent_ids"].is_array());
+    std::vector<std::string> ids;
+    for (const auto& a : body["data"]["agent_ids"])
+        ids.push_back(a.get<std::string>());
+    CHECK(std::find(ids.begin(), ids.end(), "agent-A") != ids.end());
+    CHECK(std::find(ids.begin(), ids.end(), "agent-B") == ids.end());
+
+    // #4030: audited (workflow_execution.detail.fetch) — operator-supplied
+    // step parameters/output are worth the same posture as instruction
+    // executions.
+    bool audited = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action == "workflow_execution.detail.fetch" && c.target_id == exec_id)
+            audited = true;
+    }
+    CHECK(audited);
+}
+
+TEST_CASE("GET /api/v1/workflow-executions/:id: 403 when fleet_read_fn denies",
+          "[pg][workflow][v1][twins][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.fleet_read_grant = false;
+
+    auto res = h.sink.Get("/api/v1/workflow-executions/anything");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("GET /api/v1/schedules: reaches the same two-stage gate as the fragment twin",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/api/v1/schedules");
+    REQUIRE(res);
+    // schedule_engine is nullptr in this harness (matches the fragment twin's
+    // own "Not available" test above) — 503, not a denial.
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("GET /api/v1/schedules: a service-scoped token is denied the fleet-wide list",
+          "[pg][workflow][v1][twins][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.mock_token_scope_service = "svc-a";
+
+    auto res = h.sink.Get("/api/v1/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}

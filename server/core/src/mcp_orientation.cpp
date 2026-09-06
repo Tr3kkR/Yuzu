@@ -108,8 +108,15 @@ constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
 constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_instructions",
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
+// #4030: WorkflowEngine's multi-step orchestration — its own family, distinct
+// from both "Instructions & schedules" (single InstructionDefinitions) and
+// "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
+// Workflow composes multiple steps, and its execution record is a different
+// data model from an Execution (see get_workflow_execution's tool doc).
+constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
+                                           "get_workflow_execution"};
 
-constexpr std::array<ToolFamily, 24> kFamilies{{
+constexpr std::array<ToolFamily, 25> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
@@ -151,6 +158,8 @@ constexpr std::array<ToolFamily, 24> kFamilies{{
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",
      kDiscovery},
+    {"Workflows", "multi-step workflow definitions and their per-step execution records",
+     kWorkflows},
 }};
 
 }  // namespace
