@@ -1981,7 +1981,7 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         // rollup_by_rule(store_->agent_rule_statuses().value_or(...)) call
         // above in this file. The main guards-overview route (this file,
         // ~line 399) and the per-device Guardian lens (device_routes.cpp)
-        // both already guard this correctly (503/placeholder on nullopt) —
+        // both already guard this correctly (placeholder on nullopt) —
         // this gap is specific to the two per-item detail fragments.
         for (const auto& s : yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id)
                                   .value_or(std::vector<yuzu::server::GuardianRuleAgentStatusRow>{})) {
