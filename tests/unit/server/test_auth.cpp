@@ -307,6 +307,135 @@ TEST_CASE("update_role still succeeds and clears sessions on a warm cache",
     REQUIRE(entry->role == Role::admin);
 }
 
+// ── authenticate / verify_password: cold-cache DB truth (#4020) ────────────
+//
+// Third member of the cold-cache family above. `users_` is warmed only by
+// load_config() and by THIS process's own per-username writes, so an account
+// created through AuthDB by another process (the dashboard's
+// POST /api/settings/users before a restart, SCIM, another replica) was
+// invisible to authenticate()/verify_password(): both did `users_.find()`
+// and reported "unknown user" without ever asking AuthDB, so a
+// dashboard-created operator permanently 401'd after any server restart,
+// indistinguishable from a bad password. The fix hydrates `users_` from the
+// authoritative AuthDB row on a cache miss (find_user_or_hydrate), mirroring
+// the remove_user/update_role posture: the DB is the truth, the map is a
+// read-optimisation.
+//
+// The "cold" AuthManager below is a SECOND manager over the same AuthDB that
+// never upserted the user itself - the same stand-in for a freshly-booted
+// process the CC6.8/CC6.7 cases use. The row is seeded through a WARM manager
+// (not a hand-built hash) so it carries the production kPbkdf2Iterations
+// digest a real dashboard create would have written.
+TEST_CASE("authenticate succeeds for a cold-cache DB hit (#4020)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // genuinely cold
+
+    auto token = cold_mgr.authenticate("cora", "password1234");
+    REQUIRE(token.has_value());
+    auto session = cold_mgr.validate_session(*token);
+    REQUIRE(session.has_value());
+    REQUIRE(session->username == "cora");
+    REQUIRE(session->role == Role::admin);
+
+    // The miss hydrated the cache: a cache-only reader now sees the account.
+    REQUIRE(cold_mgr.get_user_role("cora") == Role::admin);
+}
+
+TEST_CASE("authenticate still rejects a bad password on a cold cache (#4020)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE_FALSE(cold_mgr.authenticate("cora", "wrong-password").has_value());
+    REQUIRE_FALSE(cold_mgr.verify_password("cora", "wrong-password").has_value());
+}
+
+TEST_CASE("verify_password returns the DB role for a cold-cache DB hit (#4020)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // genuinely cold
+
+    auto role = cold_mgr.verify_password("cora", "password1234");
+    REQUIRE(role.has_value());
+    REQUIRE(*role == Role::admin);
+    REQUIRE(cold_mgr.get_user_role("cora") == Role::admin); // hydrated
+}
+
+TEST_CASE("cold-cache hydration never resurrects a soft-deleted user (#4020)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
+    REQUIRE(warm_mgr.remove_user("cora")); // is_active = false
+
+    // get_user filters is_active, so the cold miss stays a miss - the removed
+    // account must not come back to life through the hydration path.
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE_FALSE(cold_mgr.authenticate("cora", "password1234").has_value());
+    REQUIRE_FALSE(cold_mgr.verify_password("cora", "password1234").has_value());
+    REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // nothing cached
+}
+
+TEST_CASE("authenticate on a cold cache is a plain miss for an unknown user (#4020)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    REQUIRE_FALSE(cold_mgr.authenticate("nonexistent", "password1234").has_value());
+    REQUIRE_FALSE(cold_mgr.verify_password("nonexistent", "password1234").has_value());
+}
+
+TEST_CASE("a hydrated entry is superseded by a later in-process role change (#4020)",
+          "[pg][auth][session][cold_cache]") {
+    // upsert_user against an AuthDB-backed store is create-only (INSERT ... ON
+    // CONFLICT DO NOTHING — see its own doc comment) — a password CHANGE for an
+    // existing user has no route through it, so the reachable "later in-process
+    // write supersedes the hydrated cache entry" case is a role change.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::user));
+
+    AuthManager cold_mgr;
+    cold_mgr.set_auth_db(auth_db.get());
+    auto role = cold_mgr.verify_password("cora", "password1234"); // hydrates
+    REQUIRE(role.has_value());
+    REQUIRE(*role == Role::user);
+
+    // A role change through THIS manager replaces the hydrated entry in place
+    // (find_user_or_hydrate's try_emplace does not clobber it — update_role
+    // mutates the existing map entry directly).
+    REQUIRE(cold_mgr.update_role("cora", Role::admin));
+    role = cold_mgr.verify_password("cora", "password1234");
+    REQUIRE(role.has_value());
+    REQUIRE(*role == Role::admin);
+}
+
 // ── Authentication ───────────────────────────────────────────────────────────
 
 TEST_CASE("authenticate succeeds with correct password", "[auth][session]") {

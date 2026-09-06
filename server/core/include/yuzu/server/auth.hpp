@@ -860,6 +860,25 @@ public:
 private:
     static std::string generate_session_token();
 
+    /// Why a `users_` credential lookup produced no entry (#4020): "no such
+    /// active row" vs "AuthDB could not answer". Kept distinct so a DB outage
+    /// is never logged or counted as a bad username.
+    enum class UserLookupMiss { NotFound, DbError };
+
+    /// Look a user up for a credential check, hydrating `users_` from AuthDB on
+    /// a cache miss (#4020). `users_` is warmed only by load_config() and by THIS
+    /// process's own per-username writes, so a row created anywhere else (a
+    /// dashboard `POST /api/settings/users` before a restart, SCIM, another
+    /// replica) is invisible to a cache-only lookup - authenticate() and
+    /// verify_password() reported "unknown user" for a genuinely active account
+    /// until the next cfg-file boot. The AuthDB row is authoritative and the map
+    /// is a read-optimisation layered on top (the remove_user / update_role /
+    /// reactivate_user contract). PG I/O runs OUTSIDE `mu_`; the insert never
+    /// overwrites an entry an in-process write installed while that read was in
+    /// flight. Returns a COPY so callers run PBKDF2 without holding `mu_`.
+    /// Caller must NOT hold `mu_`.
+    std::expected<UserEntry, UserLookupMiss> find_user_or_hydrate(const std::string& username);
+
     // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
     // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.
 

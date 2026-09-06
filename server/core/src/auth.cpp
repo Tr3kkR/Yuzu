@@ -684,6 +684,41 @@ bool AuthManager::session_generation_view_stale() const {
 
 // ── Authentication ──────────────────────────────────────────────────────────
 
+std::expected<UserEntry, AuthManager::UserLookupMiss>
+AuthManager::find_user_or_hydrate(const std::string& username) {
+    {
+        std::shared_lock lock(mu_);
+        auto it = users_.find(username);
+        if (it != users_.end())
+            return it->second;
+    }
+    if (!auth_db_)
+        return std::unexpected(UserLookupMiss::NotFound); // cfg-file mode: the map IS the truth
+
+    // Cold cache (#4020): the row may exist in AuthDB even though this process
+    // never cached it. Read it OUTSIDE mu_ (durable PG I/O, same lock ordering as
+    // the other AuthDB-first paths). get_user filters is_active, so a
+    // soft-deleted account stays a miss here.
+    auto db_user = auth_db_->get_user(username);
+    if (!db_user) {
+        if (db_user.error() == yuzu::server::AuthDBError::UserNotFound)
+            return std::unexpected(UserLookupMiss::NotFound);
+        spdlog::error("AuthManager: AuthDB lookup for '{}' failed on a cold cache - failing "
+                      "closed (no credential check)",
+                      username);
+        return std::unexpected(UserLookupMiss::DbError);
+    }
+
+    std::unique_lock lock(mu_);
+    // try_emplace, never insert_or_assign: an upsert_user (new password) or
+    // reactivate_user that landed while the read above was in flight has already
+    // installed a NEWER entry than the row we hold; clobbering it would make the
+    // new password fail until the next restart. Whatever is cached now wins.
+    auto [it, inserted] = users_.try_emplace(username, *db_user);
+    (void)inserted;
+    return it->second;
+}
+
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
                                                      const std::string& password) {
     // Time the PBKDF2 verify path. Histogram is observed even on failure
@@ -693,10 +728,12 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // 100k iterations runs ~50-150 ms on commodity hardware.
     const auto t_start = std::chrono::steady_clock::now();
 
-    std::unique_lock lock(mu_);
-
-    auto it = users_.find(username);
-    if (it == users_.end()) {
+    // Cache-or-AuthDB lookup (#4020); a COPY, so PBKDF2 below runs off mu_.
+    auto entry = find_user_or_hydrate(username);
+    if (!entry) {
+        if (entry.error() == UserLookupMiss::DbError)
+            return std::nullopt; // AuthDB unreachable: fail closed, already logged, not a
+                                 // bad-username signal (no unknown_user histogram sample)
         spdlog::warn("Auth failed: unknown user '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -709,10 +746,10 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         return std::nullopt;
     }
 
-    auto salt = hex_to_bytes(it->second.salt_hex);
+    auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
-    if (!constant_time_compare(hash, it->second.hash_hex)) {
+    if (!constant_time_compare(hash, entry->hash_hex)) {
         spdlog::warn("Auth failed: bad password for '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -738,15 +775,13 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     yuzu::server::SessionWriteParams params;
     params.username = username;
     params.display_name = username; // local auth: username IS the human label
-    params.role = role_to_string(it->second.role);
+    params.role = role_to_string(entry->role);
     params.auth_source = "local";
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
     // password login carries no MFA proof yet — a step-up stamps it later.
-    // Release the map lock before the write-through: persist_new_session does
-    // durable PG I/O and re-takes mu_ to cache (non-recursive) — never hold mu_
-    // across it. `params` stays valid after unlock.
-    lock.unlock();
+    // mu_ is not held here: persist_new_session does durable PG I/O and
+    // re-takes mu_ to cache (non-recursive) — never hold mu_ across it.
     if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
 
@@ -768,9 +803,10 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
     // session creation. Histogram labels match authenticate() so dashboards
     // continue to roll up "password verify" cost across both call sites.
     const auto t_start = std::chrono::steady_clock::now();
-    std::shared_lock lock(mu_);
-    auto it = users_.find(username);
-    if (it == users_.end()) {
+    auto entry = find_user_or_hydrate(username); // cache-or-AuthDB (#4020), a COPY
+    if (!entry) {
+        if (entry.error() == UserLookupMiss::DbError)
+            return std::nullopt; // fail closed; logged by the helper, not an unknown_user sample
         spdlog::warn("verify_password failed: unknown user '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -782,9 +818,9 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
         }
         return std::nullopt;
     }
-    auto salt = hex_to_bytes(it->second.salt_hex);
+    auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
-    if (!constant_time_compare(hash, it->second.hash_hex)) {
+    if (!constant_time_compare(hash, entry->hash_hex)) {
         spdlog::warn("verify_password failed: bad password for '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -796,8 +832,7 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
         }
         return std::nullopt;
     }
-    auto role = it->second.role;
-    lock.unlock();
+    auto role = entry->role;
     if (auth_db_) {
         auto db_user = auth_db_->get_user(username);
         if (!db_user) {
