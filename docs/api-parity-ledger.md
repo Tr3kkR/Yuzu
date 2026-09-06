@@ -122,13 +122,13 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | access-reviews | 2 | 0 | 2 |
 | ca-pki | 3 | 2 | 1 |
 | ota | 15 | 0 | 15 |
-| enrollment | 19 | 0 | 19 |
+| enrollment | 19 | 5 | 14 |
 | other | 74 | 0 | 74 |
-| **Total** | **278** | **13** | **265** |
+| **Total** | **278** | **18** | **260** |
 
-Registered `/api/v1/*` routes: 173. OpenAPI `paths` entries: 172. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 91.
+Registered `/api/v1/*` routes: 178. OpenAPI `paths` entries: 177. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 93.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 265.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 260.
 
 <!-- END GENERATED -->
 
