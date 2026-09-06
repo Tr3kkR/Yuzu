@@ -181,7 +181,9 @@ struct JournalRecord {
     std::uint64_t generation{0};
     std::string event_id; // wire idempotency key; boot-nonce'd; PRESERVED verbatim on replay
     std::int64_t enqueued_ns{0}; // wall ns at enqueue; the frozen wire timestamp source
-    std::string kind;            // "armed" | "disarmed"
+    std::string kind;            // "armed" | "disarmed" | "errored" (#2818) - keep in lockstep
+                                 // with guardian_lifecycle_journal.cpp's replay allowlist AND
+                                 // guardian_outbox.hpp's documented lifecycle_kind vocabulary
     std::string guard_type;
     std::string rule_name;
 };

@@ -759,8 +759,12 @@ private:
     /// subscriptions() finding it Dead). Staleness-guarded on `subscription_id`
     /// against keys_[key]->subscription: a fresh re-arm superseding this key between
     /// the detection and this call means there is nothing to do. Detaches every rule
-    /// on the key as "errored".
-    void on_subscription_lost(const std::string& key, std::uint64_t subscription_id);
+    /// on the key as "errored". `detail` is the mechanism's failure text (from
+    /// SparkEvent::detail on the push path) or a synthetic reason (the poll backstop) -
+    /// logged only (journal-only, not on the wire - enterprise-readiness Gate 6: a
+    /// wire-payload extension is deliberately deferred, see spark-flip-gate.md).
+    void on_subscription_lost(const std::string& key, std::uint64_t subscription_id,
+                               const std::string& detail);
     /// #2818: `key`'s watch toggled health WITHOUT being torn down (B1 Faulted/
     /// Recovered) - same staleness guard, but does NOT touch keys_/rules_/index_,
     /// since the key is still armed. Surfaces a Health-domain outbox entry per active

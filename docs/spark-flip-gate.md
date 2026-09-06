@@ -599,11 +599,11 @@ tracked separately below)
 - Revisit trigger: fired, and resolved. All four of this row's issues are now fixed or
   accepted-by-documentation.
 
-**PR-2d follow-up hardening (governance Gate 4/5, filed 2026-09-06)** - four findings
-from PR-2d's own review, none blocking (all SHOULD, all OOM/backpressure-only or bounded
-by the ~5s poll backstop), tracked here rather than re-litigated as new #2815-class
-entries since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in
-it:
+**PR-2d follow-up hardening (governance Gate 4/5/6, filed 2026-09-06)** - findings from
+PR-2d's own review, none blocking (all SHOULD, all OOM/backpressure-only, dormant-until-
+flip, or bounded by the ~5s poll backstop), tracked here rather than re-litigated as new
+#2815-class entries since they're hardening ON TOP OF an already-correct #2818 fix, not a
+defect in it:
 - **#4051** (P1) - the dedup-race window named in `revalidate_subscriptions()`'s own doc
   comment: a Lost notification can be discarded as stale by `on_subscription_lost`'s
   staleness guard if it's processed before the sibling arm's own commit lands, stranding
@@ -630,10 +630,48 @@ it:
   belongs with this doc's own pre-PR-5 checklist rather than a freestanding ticket that
   could drift out of sync with it. **Must be resolved (or explicitly re-risk-accepted)
   before PR-5's sign-off** - added to this doc's own gating surface, not merely noted.
-- Owner: not assigned for any of the four.
-- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + a pre-PR-5 GATING item
-  (guard.errored census recognition, no issue number - tracked here).
-- Revisit trigger: before PR-5's sign-off, all four re-checked; #4051 specifically
+- **Journal-quarantine finding (enterprise-readiness Gate 6) - FOUND AND FIXED IN PR-2d
+  ITSELF, not deferred.** `guardian_lifecycle_journal.cpp`'s replay-validation allowlist
+  only recognized `"armed"`/`"disarmed"` - the exact same class of gap as C-1 above, but
+  more severe: a `guard.errored` record surviving a crash/restart before it drained live
+  would have been silently QUARANTINED as tampered, destroying the very audit record
+  #2818 exists to produce, in the exact scenario (durability across a restart) it's meant
+  to survive. Fixed by widening the allowlist to include `"errored"`, with a new
+  regression test that empirically proved red (the record was genuinely quarantined,
+  `records_paged==0`) before the fix and green after. Kept here as a record that this
+  class of gap was checked and closed for `"errored"` specifically, not just C-1's
+  narrower census-display symptom.
+- **Observability gaps (sre Gate 6), PRE-PR-5 GATING, not fixed here** - three related
+  findings, none new resource cost, all folded into this checklist rather than filed
+  standalone since they're small additions to existing telemetry surfaces, not new
+  designs: (1) the new `subscription_lost_total` stat joins the already-known-dark
+  `SparkEngineStats` set - `spark_heartbeat.hpp` is untouched by this PR, so nothing
+  polls it; **a future "just add the heartbeat tag" fix must also account for the poll
+  backstop path**, which calls `on_subscription_lost` directly and never increments this
+  counter at all, so a naive fix would under-report exactly the population the backstop
+  exists to catch. (2) `revalidate_subscriptions()`'s own tick has no liveness/repair
+  telemetry - no counter/log distinguishes "ticked, found nothing" from "ticked, repaired
+  N" from "didn't tick" (the nearest signal, `ConvergenceScheduler`'s shared
+  `sweep_exceptions_`, is shared across five call sites and can't attribute a throw to
+  this sweep specifically). (3) an errored rule has no age/duration gauge, breaking house
+  convention (`GuardianJournalAgeStats`'s AGE-gauge pattern, flip item 6/#2364, is the
+  established shape for "a single stuck instance is the fleet signal" and has no
+  equivalent here) - combined with C-1, an on-call engineer has zero signal short of
+  reading the per-agent lifecycle journal file directly.
+- **Dormant-claim verifiability (compliance-officer Gate 6), PRE-PR-5, cross-PR scope** -
+  every "dormant while `prefer_spark_=false`" disposition in this row (and elsewhere in
+  this doc) rests on a code-reading assertion, not an auditor-checkable per-deployment
+  signal. The wire-level tag already exists (`kGuardianBackendTag`/`yuzu.guardian_backend`,
+  correctly distinguishing legacy vs. spark enforcement per agent) and is ingested
+  server-side into the per-agent `status_tags` map, but **no server code reads it** - no
+  REST field, no dashboard surface. Not specific to #2818 (it's a general PR-5-readiness
+  gap), so not filed as its own #2818-scoped issue; recorded here since several of this
+  PR's own non-blocking dispositions depend on it.
+- Owner: not assigned for any item above.
+- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two pre-PR-5 GATING items
+  (guard.errored census recognition; the three sre observability gaps) - no issue numbers,
+  tracked here.
+- Revisit trigger: before PR-5's sign-off, everything above re-checked; #4051 specifically
   re-checked before any production fleet (dedup races become far more frequent under
   real load than in this PR's own governance testing).
 

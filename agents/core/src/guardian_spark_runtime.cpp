@@ -693,7 +693,8 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
 }
 
 void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
-                                                 std::uint64_t subscription_id) {
+                                                 std::uint64_t subscription_id,
+                                                 const std::string& detail) {
     // #2818: the underlying watch for `key` was torn down entirely - every rule
     // currently on it lost its enforcement, not just withdrew from it. Report each as
     // "errored" (guardian_outbox.hpp's documented vocabulary) rather than "disarmed" -
@@ -725,6 +726,20 @@ void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
         // evaluate_key's own shared_ptr-identity re-check for the ordinary Fired case.
         if (kit == keys_.end() || kit->second->subscription != subscription_id)
             return;
+        // enterprise-readiness Gate 6: the mechanism's failure reason (SparkEvent::detail)
+        // was being silently dropped entirely - unretrievable by engineering or a customer
+        // reading their own journal, since the "errored" audit entry itself has no free-text
+        // field for it. Logged here rather than added to the wire payload: extending the
+        // Lifecycle wire event's schema is a protocol change, deliberately deferred (folded
+        // into this doc's pre-PR-5 list) rather than made under a hardening round's time
+        // pressure. This log line is the interim "why", for local debugging only.
+        try {
+            spdlog::warn("Guardian spark: key '{}' subscription {} lost ({}) - detaching {} "
+                         "rule(s) as errored",
+                         key, subscription_id, detail.empty() ? "no reason given" : detail,
+                         index_->rules_for(key).size());
+        } catch (...) {
+        }
         const std::vector<std::string> rule_ids = index_->rules_for(key); // copy: mutates below
         for (const auto& rid : rule_ids)
             detach_rule_locked(rid, "errored"); // DisarmWork discarded: the guard above
@@ -796,7 +811,10 @@ void GuardianSparkRuntime::revalidate_subscriptions() {
     }
     for (const auto& [key, subscription_id] : snapshot) {
         if (backend_->subscription_health(subscription_id) == SubscriptionHealth::Dead)
-            on_subscription_lost(key, subscription_id);
+            on_subscription_lost(key, subscription_id, "detected dead by the poll backstop "
+                                                        "(revalidate_subscriptions) - no push "
+                                                        "notification ever confirmed, or one "
+                                                        "was silently dropped");
     }
 }
 
@@ -807,7 +825,7 @@ void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
         evaluate_key(ev.key, EvalReason::Event);
         return;
     case SparkEventKind::Lost:
-        on_subscription_lost(ev.key, ev.subscription_id);
+        on_subscription_lost(ev.key, ev.subscription_id, ev.detail);
         return;
     case SparkEventKind::Faulted:
         on_subscription_faulted(ev.key, ev.subscription_id, /*faulted=*/true, ev.detail);

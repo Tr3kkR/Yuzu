@@ -3218,6 +3218,26 @@ TEST_CASE("page_into_window replays a persisted batch with provenance", "[spark]
     CHECK_FALSE(lc[0].journal_batch_key.empty());
 }
 
+TEST_CASE("page_into_window replays an \"errored\" record without quarantining it (#2818, "
+          "enterprise-readiness Gate 6)",
+          "[spark][runtime][journal]") {
+    // Before this fix, guardian_lifecycle_journal.cpp's replay allowlist only recognized
+    // "armed"/"disarmed" - an "errored" record (GuardianSparkRuntime::on_subscription_lost,
+    // #2818) surviving a crash/restart before it drained live would have been silently
+    // QUARANTINED here as tampered, destroying the exact audit record #2818 exists to
+    // produce, in the exact scenario (durability across a restart) it's meant to survive.
+    PageRig rig;
+    rig.persist("r1", "errored");
+    auto stats = rig.journal->page_into_window(*rig.rt, /*now_ms=*/1'700'000'100'000);
+    CHECK(stats.records_paged == 1); // replayed, not quarantined
+    CHECK(rig.journal->quarantined() == 0);
+
+    auto lc = drain_lifecycle(*rig.rt);
+    REQUIRE(lc.size() == 1);
+    CHECK(lc[0].lifecycle_kind == "errored");
+    CHECK(lc[0].event_id == "e-r1");
+}
+
 TEST_CASE("page_into_window does not re-page a windowed entry (skips entries already windowed)",
           "[spark][runtime][journal]") {
     PageRig rig;
