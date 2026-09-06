@@ -82,7 +82,8 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
       BigColin, §6, §8)** - `--spark-disable` restart confirmed to restore legacy enforcement in
       ~8.6s, with a subsequent 14-hour clean run showing zero spark-state leak. **The
       arm-on-spark → induced-drift → dashboard-edge half is now ALSO DONE (2026-09-06, DGRHP,
-      Windows, `file-change` mechanism)** - root-caused and fixed the two blockers the prior
+      Windows, `file-change` mechanism - a second data point on Linux/`service-status-change`
+      followed the same day, Rig B/BigColin, see §8's later update)** - root-caused and fixed the two blockers the prior
       attempt left open, then attempted the full path three times across two arm windows: the
       first (corroborating-only - its `Emit` fired but was lost to an outbox stall before
       reaching the server, so it doesn't close the loop on its own) in the first window; the
@@ -822,10 +823,33 @@ sudo-free service-state flip, no `file-change` mechanism at all) and moved to DG
 for the full evidence (root cause of the prior login/logging blockers, the three-edit repro, the
 `drift.detected` REST events, and the one-shot-watch/#2049-adjacent findings that came out of it).
 Criterion 5 is fully green. Linux (Rig B / BigColin) remains structurally unable to exercise
-`file-change` at all; a Service-type drift there would need a scoped `NOPASSWD` sudoers grant
-for the rig's own test-driver account (`docs/agent-privilege-model.md`'s sudoers-construction
-pattern) to stop a watched systemd unit - genuinely optional now that Windows evidence is solid,
-not attempted here since it would touch BigColin's real sudoers config, not just rig-local state.
+`file-change` at all - that platform gap is unchanged.
+
+**UPDATE (2026-09-06, later): the previously-optional Linux Service-type drift data point is
+now also DONE, on Rig B/BigColin.** Dave authorized the scoped `NOPASSWD` sudoers grant
+(`docs/agent-privilege-model.md`'s sudoers-construction pattern, narrowed to `dgr ALL=(root)
+NOPASSWD: /usr/bin/systemctl stop yuzu-drift-test-dummy.service, /usr/bin/systemctl start
+yuzu-drift-test-dummy.service` - a scratch no-op unit created for this test only, never a real
+system service) and ran it himself since the assistant has no passwordless sudo on that box.
+**Real, non-obvious blocker found and fixed along the way**: a freshly-created Guardian rule
+does not arm just because it exists in the store - per CLAUDE.md's own Guardian invariant, a
+**Baseline** is the deployable unit, and enforcement gates on `deployed_member_rule_ids()` from
+a baseline's `deployed_snapshot`, not the live rule set. The new rule (`rigb-drift-test-dummy-
+service`) sat silently un-armed through TWO agent restarts (confirmed via `Guardian engine
+started (cached_rules=3, ...)` / `network-connected (..., rules=3)` never reflecting the 4th
+rule) with no error anywhere - creating it via `POST /api/v1/guaranteed-state/rules` alone was
+never going to work; it needed a new Baseline (`POST /fragments/guardian/baselines`, no clean
+JSON API exists for this - HTMX-form-only) containing it, then an explicit `.../deploy` call.
+Once deployed: `SparkEngine: armed 'service|29:yuzu-drift-test-dummy.service'` confirmed via
+agent log, `guard.armed`/`guard.compliant` events at `2026-09-06T15:44:39Z`. `sudo -n systemctl
+stop` (same second: `2026-09-06T15:45:06Z` for both the command and the resulting `drift.detected`
+event) produced `{"event_type":"drift.detected","guard_type":"service","detected_value":
+"stopped","expected_value":"running"}` - confirmed via REST AND the live dashboard fragment
+(`GET /fragments/guardian/events?type=drift.detected` rendered this exact rule/event at the top
+of the list, `.et-drift_detected` class, no ambiguity with another rule family this time).
+Service restored to running immediately after. This closes the gate doc's own explicit "genuinely
+optional... not attempted here" deferral - both `file-change` (DGRHP) and `service-status-change`
+(Rig B) spark mechanisms now have live, event-driven, dashboard-confirmed evidence.
 
 ## Also closed out by this PR
 
