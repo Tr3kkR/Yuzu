@@ -170,10 +170,21 @@ std::string make_baseline_key(const std::string& rule_id) {
 /// fingerprint mismatch is simply treated as "no baseline yet", never a failure).
 /// Only `file-hash-equals` baselines-on-arm today; a future baselining assertion
 /// kind extends this, never guesses a shared shape with an unrelated one.
+///
+/// Gate 2 governance (security-guardian): deliberately does NOT fold
+/// `kBaselineSchemaVersion` into this string (an earlier draft did, as a "v1|"
+/// prefix). A future schema bump would then change the fingerprint of every
+/// EXISTING record fleet-wide with no code change to the record's actual
+/// content — read_baseline_record's fingerprint-mismatch branch would silently
+/// treat every one of them as "a genuine retarget" and let the very next arm
+/// recapture fresh, a mass, unlogged version of the exact relaunder #4021
+/// exists to close. The schema version is carried ONLY in the stored record's
+/// own `j["schema"]` field (see guardian_persist_baseline) and validated there
+/// by read_baseline_record - version drift is a distinct failure (Malformed),
+/// never conflated with "different target".
 std::string guardian_baseline_fingerprint(std::string_view assertion_type,
                                           std::string_view target) {
-    return "v" + std::to_string(kBaselineSchemaVersion) + "|" + std::string(assertion_type) +
-          "|" + std::string(target);
+    return std::string(assertion_type) + "|" + std::string(target);
 }
 
 bool is_valid_baseline_hash(const std::string& h) {
@@ -201,8 +212,14 @@ struct BaselineRecord {
     std::string hash;
 };
 
-BaselineReadOutcome read_baseline_record_locked(KvStore& kv, const std::string& rule_id,
-                                                BaselineRecord& out) {
+/// Gate 2 governance (security-guardian): NOT `_locked` despite the name every
+/// other `*_locked` helper in this file uses for "called under mtx_" - this one
+/// touches only `KvStore` (its own internal mutex) and is called from a guard
+/// worker thread that must NEVER take `GuardianEngine::mtx_` (guardian_persist_baseline's
+/// call site). Named without the suffix so a future maintainer doesn't add
+/// engine-state access here on the false assumption mtx_ is already held.
+BaselineReadOutcome read_baseline_record(KvStore& kv, const std::string& rule_id,
+                                         BaselineRecord& out) {
     auto raw = kv.get_entry(kKvNamespace, make_baseline_key(rule_id));
     if (!raw)
         return BaselineReadOutcome::ReadError;
@@ -214,6 +231,14 @@ BaselineReadOutcome read_baseline_record_locked(KvStore& kv, const std::string& 
     } catch (const nlohmann::json::exception&) {
         return BaselineReadOutcome::Malformed;
     }
+    // Schema-version drift is a DISTINCT failure from a fingerprint mismatch
+    // (Gate 2 governance): a record from a future/incompatible schema must
+    // never be silently treated as "a different target, capture fresh" (which
+    // would recapture EVERY existing baseline fleet-wide, unlogged, the moment
+    // kBaselineSchemaVersion is ever bumped) - it needs its own migration path
+    // when one is written, not a silent reinterpretation as a retarget.
+    if (j.value("schema", -1) != kBaselineSchemaVersion)
+        return BaselineReadOutcome::Malformed;
     out.fingerprint = j.value("fingerprint", std::string{});
     out.hash = j.value("hash", std::string{});
     if (!is_valid_baseline_hash(out.hash))
@@ -234,7 +259,7 @@ BaselineReadOutcome read_baseline_record_locked(KvStore& kv, const std::string& 
 std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string& rule_id,
                                                    const std::string& fingerprint) {
     BaselineRecord rec;
-    switch (read_baseline_record_locked(kv, rule_id, rec)) {
+    switch (read_baseline_record(kv, rule_id, rec)) {
     case BaselineReadOutcome::Absent:
         return std::nullopt; // genuinely no baseline yet - first-ever arm for this rule_id
     case BaselineReadOutcome::ReadError:
@@ -290,7 +315,7 @@ void guardian_persist_baseline(KvStore* kv, const std::string& rule_id,
     if (!kv)
         return;
     BaselineRecord existing;
-    switch (read_baseline_record_locked(*kv, rule_id, existing)) {
+    switch (read_baseline_record(*kv, rule_id, existing)) {
     case BaselineReadOutcome::Ok:
         if (existing.fingerprint == fingerprint) {
             spdlog::warn("Guardian: refusing to overwrite rule '{}''s persisted baseline with a "

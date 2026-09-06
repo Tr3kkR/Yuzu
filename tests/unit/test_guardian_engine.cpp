@@ -188,7 +188,7 @@ TEST_CASE("a persisted baseline matching this rule's fingerprint seeds the arm",
     const std::string hash(64, 'a');
     nlohmann::json j;
     j["schema"] = 1;
-    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
     j["hash"] = hash;
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
@@ -202,7 +202,7 @@ TEST_CASE("a persisted baseline for a DIFFERENT target does not seed (fingerprin
     GuardianFixture f;
     nlohmann::json j;
     j["schema"] = 1;
-    j["fingerprint"] = "v1|file-hash-equals|/tmp/some-other-path";
+    j["fingerprint"] = "file-hash-equals|/tmp/some-other-path";
     j["hash"] = std::string(64, 'b');
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
@@ -216,7 +216,7 @@ TEST_CASE("an authored expected_hash always wins over any persisted baseline",
     GuardianFixture f;
     nlohmann::json j;
     j["schema"] = 1;
-    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
     j["hash"] = std::string(64, 'c');
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
@@ -231,7 +231,7 @@ TEST_CASE("full_sync clears the prior rule set but PRESERVES a persisted baselin
     GuardianFixture f;
     nlohmann::json j;
     j["schema"] = 1;
-    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
     j["hash"] = std::string(64, 'e');
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
@@ -262,7 +262,7 @@ TEST_CASE("a full_sync that DOES re-arm the baselined rule seeds it from the per
     const std::string original_hash(64, 'f');
     nlohmann::json j;
     j["schema"] = 1;
-    j["fingerprint"] = "v1|file-hash-equals|/tmp/x";
+    j["fingerprint"] = "file-hash-equals|/tmp/x";
     j["hash"] = original_hash;
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
@@ -297,7 +297,7 @@ TEST_CASE("a full_sync that DOES re-arm the baselined rule seeds it from the per
 TEST_CASE("persist refuses to overwrite an existing SAME-fingerprint baseline",
           "[guardian][engine][baseline][persist]") {
     GuardianFixture f;
-    const std::string fp = "v1|file-hash-equals|/tmp/x";
+    const std::string fp = "file-hash-equals|/tmp/x";
     const std::string good(64, 'a');
     const std::string drifted(64, 'b');
     nlohmann::json j;
@@ -319,7 +319,7 @@ TEST_CASE("persist refuses to overwrite an existing SAME-fingerprint baseline",
 TEST_CASE("persist writes normally when no baseline exists yet",
           "[guardian][engine][baseline][persist]") {
     GuardianFixture f;
-    const std::string fp = "v1|file-hash-equals|/tmp/x";
+    const std::string fp = "file-hash-equals|/tmp/x";
     const std::string hash(64, 'c');
 
     yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, hash);
@@ -334,11 +334,11 @@ TEST_CASE("persist writes normally for a genuine retarget (different fingerprint
     GuardianFixture f;
     nlohmann::json j;
     j["schema"] = 1;
-    j["fingerprint"] = "v1|file-hash-equals|/tmp/old-path";
+    j["fingerprint"] = "file-hash-equals|/tmp/old-path";
     j["hash"] = std::string(64, 'd');
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
-    const std::string new_fp = "v1|file-hash-equals|/tmp/new-path";
+    const std::string new_fp = "file-hash-equals|/tmp/new-path";
     const std::string new_hash(64, 'e');
     yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", new_fp, new_hash);
 
@@ -350,7 +350,7 @@ TEST_CASE("persist writes normally for a genuine retarget (different fingerprint
 TEST_CASE("persist writes normally over a malformed existing record (self-heals)",
           "[guardian][engine][baseline][persist]") {
     GuardianFixture f;
-    const std::string fp = "v1|file-hash-equals|/tmp/x";
+    const std::string fp = "file-hash-equals|/tmp/x";
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", "not valid json"));
 
     const std::string hash(64, 'f');
