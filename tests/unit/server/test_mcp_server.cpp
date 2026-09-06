@@ -3494,6 +3494,40 @@ TEST_CASE("MCP Guardian: list_guardian_events with agent_id scopes via scoped_pe
     CHECK(ts.audit_log.back() == "dex.device.view|success");
 }
 
+TEST_CASE("MCP Guardian: list_guardian_events with agent_id admits a service-scoped token",
+          "[pg][mcp][integration][guardian]") {
+    // list_guardian_events is ServiceScopeClass::confined (not denied): C8 must
+    // let a service-scoped token THROUGH to the handler's own per-device
+    // scoped_perm_fn gate when agent_id is supplied, matching REST GET
+    // /guaranteed-state/events exactly. A `denied` classification would 403
+    // this call at C8 before the handler's real per-device mechanism ever ran
+    // — this is the regression this test guards against.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "rule-one");
+    mcp_seed_status(store, "e1", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.mock_token_scope_service = "printers";
+    std::string last_scoped_agent;
+    ts.scoped_perm_fn_for_test = [&](const httplib::Request&, httplib::Response&,
+                                     const std::string&, const std::string&,
+                                     const std::string& agent_id) -> bool {
+        last_scoped_agent = agent_id;
+        return true;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":55,"params":{"name":"list_guardian_events","arguments":{"agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(last_scoped_agent == "WS-1");
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+}
+
 TEST_CASE("MCP Guardian: get_guardian_rule_status returns every reporting agent for one rule",
           "[pg][mcp][integration][guardian]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);

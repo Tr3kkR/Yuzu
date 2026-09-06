@@ -1939,16 +1939,24 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
-    // #4037 — get_guardian_status/list_guardian_rules/list_guardian_events all
-    // deny a service-scoped token outright (fleet-wide reads with no per-device
-    // slice to confine to, mirroring their REST siblings' deny_fleet_wide_service_scoped
-    // / require_list_read bare-deny posture — list_guardian_events specifically does
-    // NOT get `confined` here even though its optional agent_id branch has a real
-    // per-device gate, matching the issue's explicit instruction not to give this
-    // tool better confinement than #3238 tracks fixing on the fleet branch).
+    // #4037 — get_guardian_status/list_guardian_rules/get_guardian_rule_status
+    // deny a service-scoped token outright: fleet-wide reads (status/rules) or
+    // a rule-centric drilldown with no single-agent slice to confine to,
+    // mirroring their REST siblings' require_list_read bare-deny posture.
     {"get_guardian_status", {"GuaranteedState", "Read"}},
     {"list_guardian_rules", {"GuaranteedState", "Read"}},
-    {"list_guardian_events", {"GuaranteedState", "Read"}},
+    // list_guardian_events is `confined`, not `denied`: unlike the three tools
+    // above it, its handler has TWO branches (see the dispatch code) — an
+    // optional agent_id narrows to a real per-device scoped_perm_fn gate,
+    // matching REST GET /guaranteed-state/events exactly. `denied` would 403
+    // a service-scoped token's agent_id-supplied call before the handler's
+    // own branch logic ever runs (C8 fires before tier/approval), refusing a
+    // call REST admits — a stricter MCP-only gate, the same class of defect
+    // the issue says not to introduce, just in the opposite direction. The
+    // handler's own fleet-wide branch still calls deny_fleet_wide_service_scoped
+    // (#3238, explicitly NOT this issue's job to fix — kept identical to REST's
+    // gap, not "fixed" here with different MCP-only behavior).
+    {"list_guardian_events", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_guardian_rule_status", {"GuaranteedState", "Read"}},
     // get_guardian_device_guards uses scoped_perm_fn_ (require_scoped_permission),
     // which DOES apply a service-scoped token's own service-tag confinement per
