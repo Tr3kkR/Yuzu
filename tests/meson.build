@@ -455,6 +455,11 @@ agent_test_exe = executable(
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
                                                 # explicit named SKIP rather than passing silently.
+    'unit/test_autoruns_parsers.cpp',   # Wave 7 PR7.1: pure parsers over REAL CAPTURE fixtures (dispatcher test lands with the OS legs)
+    'unit/test_autoruns_local_dispatcher.cpp',  # Wave 7 PR7.1: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_autoruns_win_local.cpp',         # Wave 7 PR7.1: Windows leg (+ OS-independent WMI join tests)
+    'unit/test_autoruns_linux_local.cpp',       # Wave 7 PR7.1: Linux leg (+ read_file_bounded internals)
+    'unit/test_autoruns_macos_local.cpp',       # Wave 7 PR7.1: macOS leg (CFPropertyList over REAL plists)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -464,6 +469,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -508,6 +514,11 @@ agent_test_exe = executable(
   cpp_args: test_partial_init_args + agent_platform_args + agent_test_native_args +
             ['-DYUZU_AGENT_SRC_DIR="' +
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
+             '"',
+             # Wave 7 PR7.1: committed fixture root; autoruns' REAL CAPTURE tests
+             # REQUIRE(exists), never skip.
+             '-DYUZU_TEST_FIXTURE_DIR="' +
+             (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
   # catch2_nomain_dep (#1648 diagnostic): yuzu_agent_tests supplies its own main()
   # via unit/test_runner_main.cpp, so it links Catch2 without Catch2Main.
@@ -591,6 +602,7 @@ agent_test_exe = executable(
                 users_plugin_lib,
                 wifi_plugin_lib,
                 power_health_plugin_lib,
+                autoruns_plugin_lib,  # Wave 7 PR7.1
                 windows_updates_plugin_lib,
                 ],
 )

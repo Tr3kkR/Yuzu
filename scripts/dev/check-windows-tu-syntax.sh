@@ -53,6 +53,7 @@ SHIM
 tus=(
     agents/plugins/disk_actions/src/disk_actions_win.cpp
     agents/plugins/power_health/src/power_health_plugin.cpp
+    agents/plugins/autoruns/src/autoruns_win.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
@@ -61,7 +62,7 @@ for tu in "${tus[@]}"; do
     [ -f "$tu" ] || { echo "  SKIP  $tu (not present)"; continue; }
     src_dir=$(dirname "$tu")
     if "$CXX" -std=c++23 -fsyntax-only -fno-elide-constructors \
-        -I "$shim" -I "$src_dir" -I agents/shared -I sdk/include \
+        -I "$shim" -I "$src_dir" -I agents/shared -I agents/core/include -I sdk/include \
         "$tu" 2>"$shim/err.log"; then
         echo "  ok    $tu"
     else
