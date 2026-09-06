@@ -8068,6 +8068,42 @@ The **agentic-first (A1) structured surface** for the same destructive purge —
 
 **Audit:** `tar.source.purge` `result=requested` is written **before** dispatch (fail-closed). **Metric:** `yuzu_tar_source_purge_total{result}`. **Agent version:** same `tar.purge_source` (v0.14.0+) requirement as the fragment.
 
+#### `GET /api/v1/tar/process-tree`
+
+**API-parity read twin (#4027).** The **agentic-first (A1) structured surface** for the process-tree viewer's device picker — JSON twin of the operator-scoped device list `GET /fragments/tar/process-tree` renders into its host-picker `<select>`.
+
+**Permission:** `Infrastructure:Read`. A service-scoped API token is denied outright (403, `tar.device_picker.view` denied) — the fleet-wide device-enumeration guard shared with `GET /api/v1/tar/capture-sources` below, since neither route names a single `agent_id` to confine a service-scoped token's own tag against.
+
+**Request:** no parameters.
+
+**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`. Includes **offline** devices (each row carries `online`) unlike the HTML picker, which hides them as a presentation-only choice — an API/MCP caller isn't choosing a live-dispatch target the way the picker is.
+
+**Audit:** none on success — a device identity/online list, not per-device behavioral content (matches the fragment's own today-unaudited posture).
+
+#### `GET /api/v1/tar/capture-sources`
+
+**API-parity read twin (#4027).** Same shape and gates as `GET /api/v1/tar/process-tree` above — JSON twin of the operator-scoped device list `GET /fragments/tar/capture-sources` renders into its host picker (ADR-0015).
+
+**Permission:** `Infrastructure:Read`. Same service-scoped-token 403 as the process-tree twin.
+
+**Response:** `{"data":{"devices":[{"agent_id","hostname","os","arch","agent_version","online"}]},"meta":{"api_version":"v1"}}`.
+
+#### `GET /api/v1/tar/retention-paused`
+
+**API-parity read twin (#4027).** JSON twin of `GET /fragments/tar/retention-paused`: the **calling operator's** most recent `tar.status` scan (per-username state), filtered to their visible agents, one row per (agent, paused source).
+
+**Permission:** `Infrastructure:Read`.
+
+**Request:** no parameters.
+
+**Response:** `{"data":{"scan_id","scan_count","scan_at","agents_responded","agents_with_no_paused_sources","agents_filtered_out_of_scope","store_degraded","rows":[{"agent_id","agent_display","source","paused_at","live_rows","oldest_ts","value_error","enabled_raw"}]},"meta":{"api_version":"v1"}}`. `scan_id` is `""` when the operator has not dispatched a scan yet — `POST /fragments/tar/retention-paused/scan` is dashboard-only today (a mutating dispatch route, out of scope for #4027).
+
+**Headers:** `Cache-Control: no-store, private` + `Vary: Cookie` — per-operator-scoped data, same UP-11 posture as the fragment.
+
+**Audit:** none on success — scan/config metadata, not per-device behavioral content (matches the fragment's own today-unaudited posture).
+
+**Not twinned (#4027 exception, recorded in `scripts/ci/api-parity/tar.json`):** `GET /fragments/tar/process-tree/result` and `GET /fragments/tar/process-tree/detail` are deliberately not given REST/MCP twins by #4027. Both depend on artifacts (a `pcmd`/`tcmd` command-id pair for `/result`; a cache `token` for `/detail`) that today are mintable only through the dashboard-only `GET /fragments/tar/process-tree/run` route, which is itself excluded (a dispatch-shaped GET batched with a later dispatch-twin effort, #3994). Revisit once that later batch ships a `/run` twin that can mint a token/command-id pair over the API.
+
 #### `GET /fragments/tar/capture-sources`
 
 Render the **Capture sources** frame body for `/tar` (ADR-0015): an operator-scoped device picker plus a target the per-source toggle table loads into on host change.

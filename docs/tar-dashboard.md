@@ -162,7 +162,10 @@ No changes to the `tar.sql` agent action; the change is purely server-side scope
 > shipped reconstructs the tree from **the agent's existing local TAR warehouse
 > only** (`$Process_Live` + `$TCP_Live`, queried via the read-only `tar.sql`
 > action) — there is **no agent-side seed action, no `action='seed'` rows, no
-> `__checkpoint__` rows, and no `/api/v1/tar/process-tree` REST surface**. This was
+> `__checkpoint__` rows, and (until #4027) no `/api/v1/tar/process-tree` REST
+> surface at all**. #4027 added `GET /api/v1/tar/process-tree` as the frame's
+> device-PICKER list twin only (§5.6) — the per-device reconstructed-tree JSON
+> surface this paragraph is about remains deferred. This was
 > a deliberate scope choice (local-TAR-data-only); the consequence is an honest
 > completeness limit (see "Honesty" below). Modules: server engine
 > `server/core/src/tar_process_tree.{hpp,cpp}` (pure, unit-tested), routes
@@ -274,9 +277,21 @@ in-panel error and caches nothing rather than minting a weak token.
 
 ### 5.6 Deferred
 
-- **Agentic-first REST/MCP parity** (`GET /api/v1/tar/process-tree/{id}` + an MCP
-  tool) — deferred to a tracked follow-up, mirroring the precedent set for the
-  device live-info seam (also dashboard-only at first).
+- **Agentic-first REST/MCP parity for the reconstruction itself** — a JSON
+  surface returning the PER-DEVICE reconstructed tree (`{device_id}` in the
+  path, the `/result`+`/detail` fragments' data) — remains deferred. #4027
+  (API-parity programme) shipped REST+MCP twins for the OTHER three TAR
+  fragment reads — the process-tree and capture-sources device PICKER lists
+  (`GET /api/v1/tar/process-tree` / `GET /api/v1/tar/capture-sources`, no
+  `{device_id}` segment — distinct routes from the still-deferred one above,
+  no path collision) and the retention-paused source list (`GET
+  /api/v1/tar/retention-paused`) — plus MCP tools `list_tar_process_tree_devices`
+  / `list_tar_capture_sources_devices` / `list_tar_retention_paused`. #4027
+  deliberately did NOT twin `/fragments/tar/process-tree/result` or `.../detail`:
+  both depend on artifacts (a `pcmd`/`tcmd` pair; a cache `token`) mintable only
+  via the dashboard-only `/run` route, itself excluded as dispatch-shaped
+  (batched with #3994). Revisit once a `/run` twin lands — see
+  `scripts/ci/api-parity/tar.json`'s `exception:` rows on those two paths.
 - **Loaded modules / libraries** — out of scope: TAR records no module-load data; it
   would need a new collector (ETW `Image`/`Load`) or a live modules probe.
 - **Seed snapshot** (the original §5.1 below) — intentionally not built; revisit only
