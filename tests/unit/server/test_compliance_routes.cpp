@@ -11,6 +11,7 @@
  * TSan-hostile live-socket pattern.
  */
 
+#include "authz_gates.hpp"
 #include "compliance_routes.hpp"
 #include "test_route_sink.hpp"
 
@@ -19,6 +20,7 @@
 
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -39,6 +41,21 @@ struct ComplianceHarness {
     /// Empty ⇒ an ordinary session; a test sets this to prove the fragment
     /// deny fires independently of any perm_fn grant.
     std::string mock_token_scope_service;
+    /// #4034: when false, audit_fn reports a persistence failure (returns
+    /// false) so a test can exercise the set-and-proceed Sec-Audit-Failed
+    /// header on GET /api/v1/compliance/{id}.
+    bool audit_ok{true};
+
+    /// #4034 — a fake `authz::FleetReadGate` gate the harness controls per
+    /// test, same shape as test_rest_inventory_software.cpp's `InvHarness`.
+    /// `nullopt` (default) ⇒ the gate does not exist (registered with no
+    /// fleet_read_fn at all — misconfigured call site, 503); a test that
+    /// wants the gate wired sets this via `wire_fleet_read_fn()` before
+    /// constructing the harness is not possible (register_routes runs in
+    /// the ctor), so this harness always wires a real fake gate and a test
+    /// drives its behaviour via `fleet_admitted`/`fleet_scope` below.
+    bool fleet_admitted{true};
+    std::optional<std::unordered_set<std::string>> fleet_scope; // nullopt = TOP/unfiltered
 
     ComplianceHarness() {
         auto auth_fn = [this](const httplib::Request&,
@@ -53,15 +70,29 @@ struct ComplianceHarness {
                           const std::string&) -> bool { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) {
+                               const std::string& target_id, const std::string& detail) -> bool {
             audit_calls.push_back({action, result, target_type, target_id, detail});
+            return audit_ok;
         };
         auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
                           const nlohmann::json&) {};
         auto agents_json_fn = []() -> std::string { return "[]"; };
+        ComplianceRoutes::FleetReadFn fleet_read_fn =
+            [this](const httplib::Request&, httplib::Response& res, const std::string&,
+                  const std::string&) -> authz::FleetReadGate {
+            if (!fleet_admitted) {
+                res.status = 403;
+                res.set_content(R"({"error":{"message":"permission denied"}})",
+                                "application/json");
+                return {};
+            }
+            return {true, fleet_scope};
+        };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn,
-                               /*policy_store=*/nullptr, agents_json_fn);
+                               /*policy_store=*/nullptr, agents_json_fn,
+                               /*policy_evaluator=*/nullptr, /*metrics=*/nullptr,
+                               std::move(fleet_read_fn));
     }
 };
 
@@ -146,4 +177,86 @@ TEST_CASE("/fragments/compliance/{policy_id}: an ordinary session reaches the de
     for (const auto& c : h.audit_calls) {
         CHECK(c.action != "compliance.fragment.access_denied");
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4034 — GET /api/v1/compliance* + /api/v1/polic* REST v1 twins. The
+// harness's `policy_store` is always nullptr (matching the pre-existing
+// #3559 item 3 gap: ComplianceHarness cannot exercise a store-backed
+// branch), so these pin the auth/gate/envelope/degraded-service wiring, not
+// the real query/builder output — the confined_policy_compliance tally
+// itself is unit-tested directly (pure, no store) in
+// test_compliance_model.cpp.
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GET /api/v1/policy-fragments: null store -> 503 A4 body",
+          "[compliance][rest]") {
+    ComplianceHarness h;
+    auto res = h.sink.Get("/api/v1/policy-fragments");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
+    CHECK(j["meta"]["api_version"].get<std::string>() == "v1");
+}
+
+TEST_CASE("GET /api/v1/policies: null store -> 503 A4 body", "[compliance][rest]") {
+    ComplianceHarness h;
+    auto res = h.sink.Get("/api/v1/policies");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+}
+
+TEST_CASE("GET /api/v1/policies/{id}: null store -> 503 A4 body", "[compliance][rest]") {
+    ComplianceHarness h;
+    auto res = h.sink.Get("/api/v1/policies/pol_1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+}
+
+TEST_CASE("GET /api/v1/compliance: null store -> 503 A4 body", "[compliance][rest]") {
+    ComplianceHarness h;
+    auto res = h.sink.Get("/api/v1/compliance");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+}
+
+TEST_CASE("GET /api/v1/compliance/{id}: fleet_read_fn denies -> gate's own response, "
+          "no store touched, no route audit",
+          "[compliance][rest][security]") {
+    ComplianceHarness h;
+    h.fleet_admitted = false;
+
+    auto res = h.sink.Get("/api/v1/compliance/pol_1");
+    REQUIRE(res);
+    CHECK(res->status == 403); // the fake gate's own denial response
+    for (const auto& c : h.audit_calls)
+        CHECK(c.action != "compliance.agent_statuses.view");
+}
+
+TEST_CASE("GET /api/v1/compliance/{id}: fleet_read_fn admits, null store -> 503, "
+          "gate is the SOLE authorization (never stacked with perm_fn)",
+          "[compliance][rest]") {
+    ComplianceHarness h;
+    h.fleet_admitted = true;
+
+    auto res = h.sink.Get("/api/v1/compliance/pol_1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["code"].get<int>() == 503);
+    // The route never reached the audit call (null-store short-circuit
+    // precedes it) — same "no access, no audit row" contract as the null
+    // store case above.
+    for (const auto& c : h.audit_calls)
+        CHECK(c.action != "compliance.agent_statuses.view");
 }

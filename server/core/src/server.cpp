@@ -19441,7 +19441,8 @@ private:
                 emit_event(event_type, req, attrs, payload_data);
             },
             policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
-            policy_evaluator_.get(), &metrics_); // #2500 targeting-refusal counter
+            policy_evaluator_.get(), &metrics_, // #2500 targeting-refusal counter
+            fleet_read_fn); // #4034 — GET /api/v1/compliance/{id}'s sole gate
 
         // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
         // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
