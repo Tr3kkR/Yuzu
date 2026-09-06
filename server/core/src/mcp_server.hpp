@@ -8,6 +8,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "auth_routes.hpp" // #4037: ListReadGate — get_guardian_status's require_list_read confinement seam
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
@@ -464,6 +465,30 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
+    /// (ADR-0017), backing `get_guardian_status`'s real confinement. Same
+    /// shape as `RestApiV1::ListReadFn`/`ListReadGate` (auth_routes.hpp) reused
+    /// verbatim, not redefined, so the REST `GET /guaranteed-state/status`
+    /// list-read gate and this MCP twin cannot drift — server.cpp wires the
+    /// SAME `list_read_fn` lambda into both surfaces (one conversion, two
+    /// surfaces, mirroring `fleet_read_fn`/`set_fleet_read_fn` immediately
+    /// above). Route-class distinction from `FleetReadFn` above (ADR-1006
+    /// Decision 2, closes #3218): `require_list_read` is the sole gate on
+    /// fleet-wide ROLLUP routes — it refuses a service-scoped session
+    /// outright, since a rollup has no per-service slice to narrow to — and
+    /// is NOT interchangeable with `require_fleet_read`. MUST be this tool's
+    /// SOLE authorization gate — never stacked with `perm_fn`/`tier_allows`
+    /// for the same `(securable_type, operation)` (same BLOCKING defect class
+    /// `require_fleet_read`'s own doc comment warns against; `require_list_read`
+    /// already replicates the MCP-tier ladder internally). Unset (default-
+    /// constructed) ⇒ the tool fails CLOSED (503 "unwired"), mirroring
+    /// `RestApiV1`'s own unwired contract for the identical seam.
+    using ListReadFn =
+        std::function<yuzu::server::ListReadGate(const httplib::Request&, httplib::Response&,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation)>;
+    void set_list_read_fn(ListReadFn fn) { list_read_fn_ = std::move(fn); }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -690,6 +715,8 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // #4037 — see set_list_read_fn above.
+    ListReadFn list_read_fn_;
 };
 
 // The (tool, securable, operation) test-only accessors that formerly lived here

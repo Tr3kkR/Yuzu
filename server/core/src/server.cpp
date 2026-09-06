@@ -21939,6 +21939,12 @@ private:
             // decision for the same caller (same conversion, same underlying
             // require_fleet_read call).
             mcp_server_->set_fleet_read_fn(fleet_read_fn);
+            // #4037 — the SAME list_read_fn lambda wired into the REST
+            // registration's trailing list_read_fn param below, so the REST
+            // GET /guaranteed-state/status and MCP get_guardian_status twins
+            // cannot observe a different admit decision for the same caller
+            // (same conversion, same underlying require_list_read call).
+            mcp_server_->set_list_read_fn(list_read_fn);
             // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
             // wired UNCONDITIONALLY exactly like kek_ops above (never
             // gated behind an unrelated conditional — see the KEK comment
