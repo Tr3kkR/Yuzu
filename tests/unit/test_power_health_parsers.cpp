@@ -761,3 +761,54 @@ TEST_CASE("interpret_iops_source: present + AC + not charging + below full is no
     CHECK(to_string(row.state) != "unknown");
     CHECK(row.percent == 88);
 }
+
+TEST_CASE("parse_linux_power_supply_uevent: the kernel's own \"Not charging\" is not_charging",
+          "[power_health][battery][linux]") {
+    // POWER_SUPPLY_STATUS is a closed set of five values in the kernel's
+    // power_supply.h — Unknown, Charging, Discharging, Not charging, Full — and
+    // "Not charging" is the sysfs spelling of the same firmware charge-hold the
+    // Windows and macOS legs report. It was falling into `unknown`, the same
+    // information loss PR #4009's review caught on the other two platforms;
+    // this is the third leg of that sweep.
+    //
+    // Linux is the easy case precisely because the kernel states the status
+    // outright instead of leaving it to be inferred from two booleans.
+    static constexpr std::string_view kNotCharging =
+        "POWER_SUPPLY_NAME=BAT0\n"
+        "POWER_SUPPLY_TYPE=Battery\n"
+        "POWER_SUPPLY_PRESENT=1\n"
+        "POWER_SUPPLY_STATUS=Not charging\n"
+        "POWER_SUPPLY_CAPACITY=80\n";
+    auto row = parse_linux_power_supply_uevent(kNotCharging);
+    REQUIRE(row.has_value());
+    CHECK(row->present);
+    CHECK(row->state == BatteryState::not_charging);
+    CHECK(to_string(row->state) != "unknown");
+    CHECK(row->percent == 80);
+}
+
+TEST_CASE("parse_linux_power_supply_uevent: the kernel's own \"Unknown\" stays unknown",
+          "[power_health][battery][linux]") {
+    // The boundary that keeps `unknown` meaningful on this leg: the kernel has
+    // an explicit Unknown, and it must not be absorbed by not_charging. Same
+    // role as the ACLineStatus==255 case on Windows.
+    static constexpr std::string_view kUnknown =
+        "POWER_SUPPLY_NAME=BAT0\n"
+        "POWER_SUPPLY_TYPE=Battery\n"
+        "POWER_SUPPLY_PRESENT=1\n"
+        "POWER_SUPPLY_STATUS=Unknown\n"
+        "POWER_SUPPLY_CAPACITY=80\n";
+    auto row = parse_linux_power_supply_uevent(kUnknown);
+    REQUIRE(row.has_value());
+    CHECK(row->state == BatteryState::unknown);
+
+    // ...and so does a status outside the documented set.
+    static constexpr std::string_view kBogus =
+        "POWER_SUPPLY_NAME=BAT0\n"
+        "POWER_SUPPLY_TYPE=Battery\n"
+        "POWER_SUPPLY_PRESENT=1\n"
+        "POWER_SUPPLY_STATUS=Nonsense\n";
+    auto bogus = parse_linux_power_supply_uevent(kBogus);
+    REQUIRE(bogus.has_value());
+    CHECK(bogus->state == BatteryState::unknown);
+}
