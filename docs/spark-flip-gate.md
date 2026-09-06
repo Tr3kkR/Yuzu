@@ -75,23 +75,62 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
       added here for precision.)
 - [ ] **4. Gateway path evidence** - spark detection/heartbeat data surviving a gateway-proxied
       agent, not just direct-connect.
-- [ ] **5. UAT smoke**: arm on spark → induced drift → dashboard edge; `--spark-disable` rollback
+- [x] **5. UAT smoke**: arm on spark → induced drift → dashboard edge; `--spark-disable` rollback
       drill restores legacy enforcement (procedure in §6); journal gauges live; `/status`
       reports real `errored_rules` (this is PR #3175's fix - confirmed shipped, see "#2298
-      sub-item confirmation" below). **The rollback-drill half is DONE (2026-09-04/05, Rig B on
+      sub-item confirmation" below). **The rollback-drill half was DONE 2026-09-04/05 (Rig B on
       BigColin, §6, §8)** - `--spark-disable` restart confirmed to restore legacy enforcement in
       ~8.6s, with a subsequent 14-hour clean run showing zero spark-state leak. **The
-      arm-on-spark → induced-drift → dashboard-edge half is NOT yet demonstrated** - attempted
-      on both Rig B (Linux, blocked: no sudo-free way to flip a system service's state, and
-      `file-change` has no mechanism on Linux at all - `spark_mechanism.hpp:25-31`) and DGRHP
-      (Windows, where `file-change` IS supported): the rule/baseline were created and confirmed
-      correct server-side, but arm/drift-detection could not be confirmed within reasonable
-      effort - an agent restart taken mid-attempt (to work around a suspected `#2049`-shaped
-      stale-Subscribe gap) broke log visibility for that process (WMI-launched with no output
-      redirect), and no new event appeared in `/api/v1/guaranteed-state/events` after inducing
-      the drift. **Tracked as an explicit follow-up, not resolved by this update** - whoever
-      picks this up next should restart the DGRHP agent WITH proper log capture first, then
-      re-verify the file guard actually arms and fires before trusting this half of criterion 5.
+      arm-on-spark → induced-drift → dashboard-edge half is now ALSO DONE (2026-09-06, DGRHP,
+      Windows, `file-change` mechanism)** - root-caused and fixed the two blockers the prior
+      attempt left open, then reproduced the full path twice:
+      - **Root cause of the prior blocker, not just a retry**: the admin login that broke wasn't
+        an AuthManager cfg-reload problem (this build has no `AuthManager` cfg-reload path left
+        at all - `AuthDB::seed_admin_if_empty()` seeds Postgres's `auth.users` exactly once, on
+        an EMPTY table, from the cfg file's `username:role:salt_hex:hash_hex` line
+        (`main.cpp`); a cfg edit after that first seed is inert). Fixed by deleting the stale
+        `auth.users` row and restarting the server so it re-seeds from a known cfg line
+        (PBKDF2-HMAC-SHA256, 100k iterations, per `auth.cpp`'s `AuthManager::pbkdf2_sha256`/
+        `upsert_user`). Separately, `/login` takes `application/x-www-form-urlencoded`
+        (`extract_form_value`), not JSON - the wrong content-type alone produces the same
+        generic 401 as a bad password. The prior attempt's broken agent log capture (bare WMI
+        `Win32_Process.Create`, no redirect) is fixed for good by launching with
+        `yuzu-agent.exe`'s own `--log-file` flag - redirect-independent, survives any future
+        WMI-launched restart.
+      - **Live repro, twice, with a clean quiet window (outbox drained to 0 before each write,
+        no concurrent churn)**: armed rule `dgrhp-drift-test-file` (`file-hash-equals` on
+        `C:\rigA\drift-test.txt`, spark type `file-change`) confirmed armed via
+        `/api/v1/guaranteed-state/rules`. First induced edit (2026-09-06T10:18:19Z) fired an
+        agent-side `Emit` in the SAME SECOND (`agent.log`), confirming the IOCP path fires
+        immediately - but the resulting entry never reached the server (see the outbox finding
+        below), so it doesn't count as the demonstration on its own. After restarting the agent
+        (which re-arms against current file content as the new baseline - expected, not a bug,
+        per `pending_initial=ABSENT` semantics) and confirming a clean 0-pending outbox, a
+        SECOND induced edit (2026-09-06T10:25:37Z) fired `Emit` in the same second again, and
+        this time a `drift.detected` event landed server-side within the same second:
+        `GET /api/v1/guaranteed-state/events?rule_id=dgrhp-drift-test-file` returned
+        `{"event_type":"drift.detected","detected_value":"80517dbd...","expected_value":
+        "5584d13c...","timestamp":"2026-09-06T10:25:37Z"}` - a real hash mismatch, not a
+        coincidental compliant re-arm. This is the dashboard-edge evidence: the same REST
+        surface (`/api/v1/guaranteed-state/events`) the Guardian lens/device page renders from.
+      - **Retires an open campaign question, not just closes the checklist item**: the
+        "one-shot registry/file watch" observation recorded in §4/§8 below (a second divergence
+        in the same arm-window going undetected) was flagged there as possibly an artifact of
+        outbox congestion rather than a real mechanism limit, never cleanly isolated. This
+        repro's SECOND edit was a second divergence inside the same arm-window with a
+        confirmed-healthy (0-pending) outbox, and it was detected immediately - the one-shot
+        theory does not hold under clean conditions; downgrade it from "unresolved" to
+        "disproven as a general defect, was congestion-shaped." Not re-opening it as an issue.
+      - **Also reproduces, live, a related-but-separate existing finding - not new, no issue
+        filed**: after the server-only restart (agent untouched), the outbox `pending` count
+        climbed from 787 to 1088 over several minutes and never drained, mirroring the
+        `#2049`-shaped "Subscribe doesn't reliably reconnect after a server-only restart"
+        symptom this workstream already has open threads on (§3 row 4's #3953/#3966 family,
+        the retracted #3989 causal chain). The FIRST induced edit's `Emit` was almost certainly
+        lost into this exact stall (its entry never surfaced server-side); the agent restart
+        that unblocked the SECOND edit is the same documented workaround, not a new fix.
+        Recorded here as corroborating evidence for the existing tracked gap, not filed
+        separately.
 - [ ] **6. Legacy-vs-spark parity capture**, any diff fully explained by
       `docs/spark-legacy-delta-registry.md`.
 - [ ] **7. Resource evidence** vs `docs/spark-rebuild-baselines/`.
@@ -657,11 +696,18 @@ cadence, and not evidence toward criterion 7 (resource evidence) at the halved r
 the "has not been run yet" note above (it was already run and recorded in the rig's own logs
 before this doc's first draft; not caught until re-verified this pass).** `--spark-disable`
 restart confirmed legacy enforcement resumed in ~8.6s (`T0`→boot-log confirmation), followed by a
-clean 14-hour run with zero spark-state leak observed. See §2 criterion 5 for the full evidence
-and the still-open induced-drift half. UAT smoke's arm-on-spark → induced-drift → dashboard-edge
-sequence was attempted on Rig B too but blocked (Linux: no sudo-free service-state flip, no
-`file-change` mechanism at all) and moved to DGRHP, where it remains unresolved - tracked as a
-follow-up, not this update's to close.
+clean 14-hour run with zero spark-state leak observed. UAT smoke's arm-on-spark →
+induced-drift → dashboard-edge sequence was attempted on Rig B too but blocked (Linux: no
+sudo-free service-state flip, no `file-change` mechanism at all) and moved to DGRHP.
+
+**UPDATE (2026-09-06): the induced-drift half is now ALSO DONE, on DGRHP.** See §2 criterion 5
+for the full evidence (root cause of the prior login/logging blockers, the two-edit repro, the
+`drift.detected` REST event, and the one-shot-watch/#2049-adjacent findings that came out of it).
+Criterion 5 is fully green. Linux (Rig B / BigColin) remains structurally unable to exercise
+`file-change` at all; a Service-type drift there would need a scoped `NOPASSWD` sudoers grant
+for the rig's own test-driver account (`docs/agent-privilege-model.md`'s sudoers-construction
+pattern) to stop a watched systemd unit - genuinely optional now that Windows evidence is solid,
+not attempted here since it would touch BigColin's real sudoers config, not just rig-local state.
 
 ## Also closed out by this PR
 
