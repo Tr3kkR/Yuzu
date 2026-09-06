@@ -84,43 +84,81 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
       arm-on-spark → induced-drift → dashboard-edge half is now ALSO DONE (2026-09-06, DGRHP,
       Windows, `file-change` mechanism)** - root-caused and fixed the two blockers the prior
       attempt left open, then reproduced the full path twice:
-      - **Root cause of the prior blocker, not just a retry**: the admin login that broke wasn't
-        an AuthManager cfg-reload problem (this build has no `AuthManager` cfg-reload path left
-        at all - `AuthDB::seed_admin_if_empty()` seeds Postgres's `auth.users` exactly once, on
-        an EMPTY table, from the cfg file's `username:role:salt_hex:hash_hex` line
-        (`main.cpp`); a cfg edit after that first seed is inert). Fixed by deleting the stale
-        `auth.users` row and restarting the server so it re-seeds from a known cfg line
-        (PBKDF2-HMAC-SHA256, 100k iterations, per `auth.cpp`'s `AuthManager::pbkdf2_sha256`/
-        `upsert_user`). Separately, `/login` takes `application/x-www-form-urlencoded`
-        (`extract_form_value`), not JSON - the wrong content-type alone produces the same
-        generic 401 as a bad password. The prior attempt's broken agent log capture (bare WMI
+      - **Root cause of the prior blocker, not just a retry** (corrected 2026-09-06 after
+        "Rig Test" traced the opposite on the same build and the source confirms them):
+        `main.cpp` calls `auth_mgr.load_config(cfg_path)` unconditionally on every boot,
+        populating `AuthManager`'s in-memory `users_` map straight from the cfg file's
+        `username:role:salt_hex:hash_hex` line - `verify_password()`/`authenticate()`
+        (`auth.cpp`) check the password against *that* map, not against Postgres. So a cfg
+        edit + a full server restart genuinely does take effect, no `auth.users` touch
+        needed. `AuthDB::seed_admin_if_empty()` is a separate, one-time Postgres bootstrap
+        (seeds `auth.users` only when empty, for role/active-status/MFA lookups) and plays
+        no part in the credential check itself. The actual blocker in this session was the
+        `/login` request shape below; a `DELETE FROM auth.users` + restart done along the
+        way was not the fix and is not needed to reset this rig's admin login - a cfg edit
+        + restart suffices. Separately, `/login` takes
+        `application/x-www-form-urlencoded` (`extract_form_value`), not JSON - the wrong
+        content-type alone produces the same generic 401 as a bad password, which is what
+        actually cost the time here. The prior attempt's broken agent log capture (bare WMI
         `Win32_Process.Create`, no redirect) is fixed for good by launching with
         `yuzu-agent.exe`'s own `--log-file` flag - redirect-independent, survives any future
         WMI-launched restart.
-      - **Live repro, twice, with a clean quiet window (outbox drained to 0 before each write,
-        no concurrent churn)**: armed rule `dgrhp-drift-test-file` (`file-hash-equals` on
+      - **Live repro, three times, in ONE arm window with no restart between the second and
+        third**: armed rule `dgrhp-drift-test-file` (`file-hash-equals` on
         `C:\rigA\drift-test.txt`, spark type `file-change`) confirmed armed via
-        `/api/v1/guaranteed-state/rules`. First induced edit (2026-09-06T10:18:19Z) fired an
-        agent-side `Emit` in the SAME SECOND (`agent.log`), confirming the IOCP path fires
-        immediately - but the resulting entry never reached the server (see the outbox finding
-        below), so it doesn't count as the demonstration on its own. After restarting the agent
-        (which re-arms against current file content as the new baseline - expected, not a bug,
-        per `pending_initial=ABSENT` semantics) and confirming a clean 0-pending outbox, a
-        SECOND induced edit (2026-09-06T10:25:37Z) fired `Emit` in the same second again, and
-        this time a `drift.detected` event landed server-side within the same second:
-        `GET /api/v1/guaranteed-state/events?rule_id=dgrhp-drift-test-file` returned
-        `{"event_type":"drift.detected","detected_value":"80517dbd...","expected_value":
-        "5584d13c...","timestamp":"2026-09-06T10:25:37Z"}` - a real hash mismatch, not a
-        coincidental compliant re-arm. This is the dashboard-edge evidence: the same REST
-        surface (`/api/v1/guaranteed-state/events`) the Guardian lens/device page renders from.
+        `/api/v1/guaranteed-state/rules` (armed at 2026-09-06T10:21:05Z, per the
+        `guard.armed`/`guard.compliant` pair at that timestamp in the events log - the file's
+        content at that instant became the new baseline `expected_value`, an observation
+        worth a question for a rule with no explicit configured `expected` value, not one
+        this session resolved). DGRHP is one of this workstream's designated `prefer_spark`
+        test rigs (§6 step 1's own procedure opens with "confirm ... agent running with
+        `prefer_spark` active, spark armed" before any of this applies - the "Shipped posture
+        today" row above is about the production default, not these rigs). This session read
+        the `RIGA-DEBUG` log lines (a locally-patched debug prefix, not present in this repo's
+        source tree, so not independently confirmed here to originate in
+        `guardian_spark_runtime.cpp` specifically vs. the legacy path) as evidence of arm state
+        rather than re-confirming `prefer_spark`/spark-armed via an authenticated `/status` or
+        heartbeat-tag read - worth closing with one more read if this becomes load-bearing
+        elsewhere. First induced edit (2026-09-06T10:18:19Z, before the
+        10:21:05Z re-arm above) fired an agent-side `Emit` in the SAME SECOND (`agent.log`),
+        confirming the IOCP path fires immediately - but the resulting entry never reached
+        the server (see the outbox finding below), so it doesn't count as a demonstration on
+        its own. After restarting the agent and confirming a clean 0-pending outbox, a SECOND
+        induced edit (2026-09-06T10:25:37Z) fired `Emit` in the same second again, and a
+        `drift.detected` event carrying that same detection timestamp was visible via
+        `GET /api/v1/guaranteed-state/events?rule_id=dgrhp-drift-test-file` when checked
+        roughly 8 minutes later - `{"event_type":"drift.detected","detected_value":
+        "80517dbd...","expected_value":"5584d13c...","timestamp":"2026-09-06T10:25:37Z"}`, a
+        real hash mismatch, not a coincidental compliant re-arm (server-side ingest latency
+        was not separately measured). A THIRD induced edit (2026-09-06T10:52:02Z), with NO
+        agent or server restart since the second edit, produced a fresh `Emit` in the agent
+        log at the same second (`11:52:02.118` local, PID `31856` - the same event-driven
+        worker PID as the second edit, distinct from the periodic re-verification loop's PID
+        `15844` seen re-flagging the still-unremediated second divergence every ~5 minutes in
+        between) and a NEW `drift.detected` event at `2026-09-06T10:52:02Z` - confirmed via
+        REST within seconds this time. Its `detected_value` was the empty-file SHA-256
+        (`e3b0c442...`), not the marker text's hash - the write raced the eval (PowerShell's
+        `Out-File` truncates before it writes content, and the IOCP callback fired on the
+        truncate), a real but benign timing artifact of the test method, not the mechanism -
+        the divergence was still real and still detected. This is the dashboard-edge
+        evidence, confirmed against the render path, not just the REST route: the Guardian
+        lens's event-timeline fragment (`GET /fragments/guardian/events`,
+        `GuardianRoutes::render_events_fragment` in `guardian_routes.cpp`) calls the same
+        `GuaranteedStateStore::query_events()` the REST handler reads, and renders
+        `drift.detected` rows with their own CSS class (`guardian_ui.cpp`'s `.et-drift_detected`).
       - **Retires an open campaign question, not just closes the checklist item**: the
         "one-shot registry/file watch" observation recorded in §4/§8 below (a second divergence
         in the same arm-window going undetected) was flagged there as possibly an artifact of
         outbox congestion rather than a real mechanism limit, never cleanly isolated. This
-        repro's SECOND edit was a second divergence inside the same arm-window with a
-        confirmed-healthy (0-pending) outbox, and it was detected immediately - the one-shot
-        theory does not hold under clean conditions; downgrade it from "unresolved" to
-        "disproven as a general defect, was congestion-shaped." Not re-opening it as an issue.
+        session produced a SECOND and a THIRD distinct divergence inside the same arm-window
+        (the third with no restart at all since the second, and a confirmed-healthy 0-pending
+        outbox throughout), and both were detected immediately - the one-shot theory does not
+        hold under clean conditions for the `file-change` mechanism; downgrade it from
+        "unresolved" to "disproven as a general defect for file-change, was congestion-shaped."
+        The original observation was on a registry-type rule, not re-tested here (Registry
+        mechanism is also Windows-only File/Registry-class, same watcher family) - scoping the
+        retraction to what was actually re-tested rather than the whole family. Not re-opening
+        it as an issue.
       - **Also reproduces, live, a related-but-separate existing finding - not new, no issue
         filed**: after the server-only restart (agent untouched), the outbox `pending` count
         climbed from 787 to 1088 over several minutes and never drained, mirroring the
@@ -701,8 +739,8 @@ induced-drift → dashboard-edge sequence was attempted on Rig B too but blocked
 sudo-free service-state flip, no `file-change` mechanism at all) and moved to DGRHP.
 
 **UPDATE (2026-09-06): the induced-drift half is now ALSO DONE, on DGRHP.** See §2 criterion 5
-for the full evidence (root cause of the prior login/logging blockers, the two-edit repro, the
-`drift.detected` REST event, and the one-shot-watch/#2049-adjacent findings that came out of it).
+for the full evidence (root cause of the prior login/logging blockers, the three-edit repro, the
+`drift.detected` REST events, and the one-shot-watch/#2049-adjacent findings that came out of it).
 Criterion 5 is fully green. Linux (Rig B / BigColin) remains structurally unable to exercise
 `file-change` at all; a Service-type drift there would need a scoped `NOPASSWD` sudoers grant
 for the rig's own test-driver account (`docs/agent-privilege-model.md`'s sudoers-construction
