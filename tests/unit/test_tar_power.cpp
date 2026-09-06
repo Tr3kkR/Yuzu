@@ -5,7 +5,12 @@
  *
  * FIXTURE PROVENANCE (P-014: pure sections below run on every platform):
  *
- *   REAL CAPTURE: fixtures/power-macos-pmset.txt -- host braga, macOS
+ *   PROVENANCE: fixtures/power-macos-pmset.txt is a REAL CAPTURE of the log
+ *   FORMAT and of the AC-source lines, from a desktop that never sleeps. The
+ *   Sleep/Wake/DarkWake cases below are RECONSTRUCTED to that same format and
+ *   are UNVERIFIED against a Mac that actually sleeps -- stated here because
+ *   an invented fixture that claims to be a capture proves nothing.
+ *   Original note: host braga, macOS
  *   26.5.1 arm64, captured 2026-09-04T12:09:20+01:00 via `pmset -g log`
  *   (unprivileged, uid 501). 9,629 raw lines / 2,604 sleep-wake-domain
  *   entries in the full capture; this file excerpts the load-bearing
@@ -92,7 +97,7 @@ TestTarDb make_test_db() {
     return TestTarDb{std::move(*result), tmp};
 }
 
-// REAL CAPTURE (fixtures/power-macos-pmset.txt lines 8-9, braga 26.5.1
+// RECONSTRUCTED to the captured format (this host never sleeps; see the header) -- braga 26.5.1
 // arm64, 2026-09-04, `pmset -g log`) -- the P-007 regression pair: two
 // DISTINCT 'Using AC' summary lines at the SAME second, differing only in
 // their assertion-summary text. Reproduced WITHOUT the 4-space indent the
@@ -114,7 +119,7 @@ const std::string kOrdinaryAssertionsLine =
     "PreventUserIdleDisplaySleep \"com.apple.audio.context299.preventuseridledisplaysleep\" "
     "00:01:15  id:0x0x500008bd6 [System: PrevIdle DeclUser kDisp]          ";
 
-// REAL CAPTURE (fixtures/power-macos-pmset.txt lines 94-133, braga 26.5.1
+// RECONSTRUCTED to the captured format (this host never sleeps; see the header) -- braga 26.5.1
 // arm64, 2026-09-04, `pmset -g log`) -- the file's own "raw 40-line
 // contiguous excerpt (parser must survive real interleaving)" block,
 // reproduced verbatim, byte-for-byte (trailing padding included). None of
@@ -450,7 +455,7 @@ TEST_CASE("compute_pmset_occurrences: a different second resets the per-crc coun
 // ── macOS cursor codec ───────────────────────────────────────────────────────
 
 TEST_CASE("encode/decode_mac_power_cursor: round trip", "[tar_power][cursor]") {
-    MacPowerCursor c{1, 1757000000, 0xdeadbeef, 3, "ac"};
+    MacPowerCursor c{1, 1757000000, 0xdeadbeef, 3, /*ts_group_size=*/0, "ac"};
     auto json = encode_mac_power_cursor(c);
     auto decoded = decode_mac_power_cursor(json);
     REQUIRE(decoded.has_value());
@@ -483,7 +488,7 @@ TEST_CASE("locate_exact_tail: REAL CAPTURE P-007 pair -- the cursor for line 1 f
           "[tar_power][tail]") {
     auto entries = parse_pmset_log({kP007Line1, kP007Line2});
     auto occ = compute_pmset_occurrences(entries);
-    MacPowerCursor cursor{1, entries[0].ts, entries[0].line_crc, occ[0], "unknown"};
+    MacPowerCursor cursor{1, entries[0].ts, entries[0].line_crc, occ[0], /*ts_group_size=*/0, "unknown"};
     auto tail = locate_exact_tail(entries, occ, cursor);
     REQUIRE(tail.outcome == MacTailOutcome::kFound);
     CHECK(tail.index == 0);
@@ -493,7 +498,7 @@ TEST_CASE("locate_exact_tail: not found when the tail's ts group is absent (wrap
           "[tar_power][tail]") {
     auto entries = parse_pmset_log({kP007Line2}); // only line 2 present
     auto occ = compute_pmset_occurrences(entries);
-    MacPowerCursor cursor{1, entries[0].ts, /*crc of a line that isn't here*/ 0x1234, 1, "unknown"};
+    MacPowerCursor cursor{1, entries[0].ts, /*crc of a line that isn't here*/ 0x1234, 1, /*ts_group_size=*/0, "unknown"};
     auto tail = locate_exact_tail(entries, occ, cursor);
     CHECK(tail.outcome == MacTailOutcome::kNotFound);
 }
@@ -503,7 +508,7 @@ TEST_CASE("locate_exact_tail: wall-clock regression when the log's newest entry 
           "[tar_power][tail]") {
     auto entries = parse_pmset_log({kP007Line1});
     auto occ = compute_pmset_occurrences(entries);
-    MacPowerCursor cursor{1, entries[0].ts + 3600, 0xffff, 1, "unknown"}; // cursor "from the future"
+    MacPowerCursor cursor{1, entries[0].ts + 3600, 0xffff, 1, /*ts_group_size=*/0, "unknown"}; // cursor "from the future"
     auto tail = locate_exact_tail(entries, occ, cursor);
     CHECK(tail.outcome == MacTailOutcome::kWallClockRegression);
 }
@@ -623,7 +628,7 @@ TEST_CASE("decide_mac_power_collect: restart with an unchanged log emits zero ev
           "[tar_power][decide]") {
     auto entries = parse_pmset_log({kP007Line1, kP007Line2});
     auto occ = compute_pmset_occurrences(entries);
-    MacPowerCursor cursor{1, entries.back().ts, entries.back().line_crc, occ.back(), "ac"};
+    MacPowerCursor cursor{1, entries.back().ts, entries.back().line_crc, occ.back(), /*ts_group_size=*/0, "ac"};
     auto decision = decide_mac_power_collect(entries, true, cursor, 604800, entries.back().ts + 5);
     CHECK(decision.events.empty());
     CHECK_FALSE(decision.cursor_lost);
@@ -666,7 +671,7 @@ TEST_CASE("decide_mac_power_collect: full-fixture (REAL, ~42-line noisy document
     // Cursor points EXACTLY at entries[0] (kP007Line1) with last_ac="batt":
     // entries[1] (kP007Line2, also using_ac) is then a genuine batt->ac
     // transition, not a silent unknown-state seed.
-    MacPowerCursor tail_cursor{1, entries[0].ts, entries[0].line_crc, occ[0], "batt"};
+    MacPowerCursor tail_cursor{1, entries[0].ts, entries[0].line_crc, occ[0], /*ts_group_size=*/0, "batt"};
     auto first = decide_mac_power_collect(entries, true, tail_cursor, 604800, entries.back().ts + 5);
     CHECK_FALSE(first.cursor_lost);
     REQUIRE(first.events.size() == 1);
@@ -701,7 +706,7 @@ TEST_CASE("decide_mac_power_collect: a tail that cannot be located (log wrapped)
           "[tar_power][decide]") {
     auto entries = parse_pmset_log({kP007Line1, kP007Line2});
     // A cursor pointing at a line/occurrence that is not in this log at all.
-    MacPowerCursor stale_cursor{1, entries[0].ts - 10000, 0x1, 1, "batt"};
+    MacPowerCursor stale_cursor{1, entries[0].ts - 10000, 0x1, 1, /*ts_group_size=*/0, "batt"};
     auto decision = decide_mac_power_collect(entries, true, stale_cursor, 604800, entries.back().ts);
     REQUIRE(decision.cursor_lost);
     REQUIRE(decision.events.size() == 1);
@@ -809,6 +814,45 @@ TEST_CASE("a source disabled before its first-ever collect does not replay the p
     CHECK(out.cursor_lost);
     // And it re-baselines forward rather than reporting a clean first read.
     CHECK_FALSE(out.is_baseline);
+}
+
+TEST_CASE("an eviction that renumbers a same-second group is refused, not mis-bound (MEDIUM-2)",
+          "[tar_power][decide][tailgroup]") {
+    // Occurrences are recomputed per read. If the log front-evicts the EARLIER
+    // of two byte-identical same-second lines, the survivor renumbers from 2 to
+    // 1 -- straight into a cursor that stored occurrence 1. The tail would then
+    // bind to a record that was never reported, replay would resume past it,
+    // and that record is lost with no gap. The stored group size makes the
+    // renumbering detectable.
+    const std::string a =
+        "2026-08-28 08:00:00 +0100 Wake                \tWaking up from a Power Button "
+        "sleep [CDNCA]                                  ";
+    const std::string b =
+        "2026-08-28 08:00:00 +0100 Wake                \tWaking up from a Maintenance "
+        "wake  [CDNCA]                                  ";
+
+    auto both = parse_pmset_log({a, b});
+    REQUIRE(both.size() == 2);
+    auto occ_both = compute_pmset_occurrences(both);
+
+    // Cursor written while BOTH were present, pointing at the first.
+    MacPowerCursor cursor{1, both[0].ts, both[0].line_crc, occ_both[0],
+                          /*ts_group_size=*/2, "unknown"};
+
+    // The earlier line is evicted; only the survivor remains, renumbered to 1.
+    auto survivor = parse_pmset_log({b});
+    auto occ_surv = compute_pmset_occurrences(survivor);
+    REQUIRE(occ_surv[0] == 1);
+    REQUIRE(occ_surv[0] == cursor.occurrence); // it now LOOKS like the cursor's line
+
+    auto found = locate_exact_tail(survivor, occ_surv, cursor);
+    CHECK(found.outcome == MacTailOutcome::kTailGroupGone); // refused, not mis-bound
+
+    // A group that GREW is the ordinary append and must still bind, or every
+    // same-second append becomes a spurious gap.
+    MacPowerCursor grew{1, both[0].ts, both[0].line_crc, occ_both[0],
+                        /*ts_group_size=*/1, "unknown"};
+    CHECK(locate_exact_tail(both, occ_both, grew).outcome == MacTailOutcome::kFound);
 }
 
 TEST_CASE("an UNARMED subscription reports one deduping gap instead of reading as continuous "

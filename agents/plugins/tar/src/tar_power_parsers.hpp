@@ -86,7 +86,9 @@ struct PmsetLogEntry {
 
 /// Fixed-width `pmset -g log` line prefix: "YYYY-MM-DD HH:MM:SS +HHMM ",
 /// exactly 26 bytes, verified against every line in the REAL CAPTURE fixture
-/// (fixtures/power-macos-pmset.txt). Returns the parsed UTC epoch seconds and
+/// (fixtures/power-macos-pmset.txt -- the 26-byte prefix and the padded Domain
+/// column are a real capture; see that file's header for what it does NOT
+/// prove). Returns the parsed UTC epoch seconds and
 /// the byte offset of the first character after the prefix, or nullopt for
 /// any line that does not match this shape (section headers, blank lines,
 /// `=== ... ===` fixture markers, `pmset -g batt`/`-g ps` trailer lines).
@@ -267,6 +269,19 @@ struct MacPowerCursor {
     std::int64_t last_ts{0};
     std::uint32_t last_line_crc{0};
     std::int64_t occurrence{1};
+    // How many entries shared `last_ts` when this cursor was written.
+    //
+    // `occurrence` alone is NOT a stable identity across a wrapping log.
+    // Occurrences are recomputed per read, so if the log front-evicts the
+    // EARLIER of two byte-identical same-second lines, the survivor renumbers
+    // from 2 to 1 -- straight into the cursor's stored occurrence. The tail
+    // then binds to a record we had NOT yet reported, replay resumes past it,
+    // and that record is lost with no gap. Recording the group's size makes the
+    // change detectable: a group that is no longer the size it was is not the
+    // group this cursor points into, so the honest answer is rule 2 rather than
+    // a confident mis-bind. 0 means "written before this field existed" and is
+    // accepted without the check, so an upgrade does not force a re-baseline.
+    std::int64_t ts_group_size{0};
     std::string last_ac{"unknown"};
 };
 
@@ -281,7 +296,9 @@ inline std::string encode_mac_power_cursor(const MacPowerCursor& c) {
         ac = "unknown";
     return "{\"v\":1,\"last_ts\":" + std::to_string(c.last_ts) +
            ",\"last_line_crc\":" + std::to_string(c.last_line_crc) +
-           ",\"occurrence\":" + std::to_string(c.occurrence) + ",\"last_ac\":\"" + ac + "\"}";
+           ",\"occurrence\":" + std::to_string(c.occurrence) +
+           ",\"ts_group_size\":" + std::to_string(c.ts_group_size) + ",\"last_ac\":\"" + ac +
+           "\"}";
 }
 
 /// Decode + validate. Returns nullopt for ANYTHING short of a well-formed
@@ -309,6 +326,12 @@ inline std::optional<MacPowerCursor> decode_mac_power_cursor(const std::string& 
         c.occurrence = j.at("occurrence").get<std::int64_t>();
         if (c.occurrence < 1)
             return std::nullopt;
+        // Optional: absent on a cursor written before the field existed.
+        if (j.contains("ts_group_size") && j.at("ts_group_size").is_number_integer()) {
+            c.ts_group_size = j.at("ts_group_size").get<std::int64_t>();
+            if (c.ts_group_size < 0)
+                return std::nullopt;
+        }
         c.last_ac = j.at("last_ac").get<std::string>();
         if (c.last_ac != "ac" && c.last_ac != "batt" && c.last_ac != "unknown")
             return std::nullopt;
@@ -318,7 +341,17 @@ inline std::optional<MacPowerCursor> decode_mac_power_cursor(const std::string& 
     }
 }
 
-enum class MacTailOutcome { kFound, kNotFound, kWallClockRegression };
+enum class MacTailOutcome {
+    kFound,
+    kNotFound,
+    kWallClockRegression,
+    // The cursor's timestamp group is no longer the size it was, so an
+    // eviction has renumbered the occurrences and the stored occurrence can no
+    // longer be trusted to name the same line. Treated exactly like kNotFound
+    // by policy (capture_gap + forward re-baseline); reported separately so the
+    // log says WHY, since a confident mis-bind here loses a record silently.
+    kTailGroupGone
+};
 
 struct MacTailSearch {
     MacTailOutcome outcome{MacTailOutcome::kNotFound};
@@ -338,6 +371,24 @@ inline MacTailSearch locate_exact_tail(const std::vector<PmsetLogEntry>& entries
                                        const MacPowerCursor& cursor) {
     if (!entries.empty() && entries.back().ts < cursor.last_ts)
         return MacTailSearch{MacTailOutcome::kWallClockRegression, 0};
+    // How many entries currently share the cursor's timestamp.
+    std::int64_t current_group = 0;
+    for (const auto& e : entries)
+        if (e.ts == cursor.last_ts)
+            ++current_group;
+    // Only a SHRUNK group is dangerous, and the distinction is the whole point.
+    // Occurrences are assigned in order within a timestamp group, so appending a
+    // new same-second line leaves every existing member's occurrence untouched
+    // -- a group that GREW is the ordinary case where the log gained an entry
+    // between reads, and refusing to bind there would turn every same-second
+    // append into a spurious gap. Losing an EARLIER member is what renumbers the
+    // survivors into somebody else's occurrence, and that is what this catches.
+    // (0 = a cursor written before this field existed; accept it rather than
+    // force a re-baseline on upgrade.)
+    if (cursor.ts_group_size != 0 && current_group != 0 &&
+        current_group < cursor.ts_group_size)
+        return MacTailSearch{MacTailOutcome::kTailGroupGone, 0};
+
     for (std::size_t i = 0; i < entries.size(); ++i) {
         if (entries[i].ts == cursor.last_ts && entries[i].line_crc == cursor.last_line_crc &&
             occurrences[i] == cursor.occurrence)
@@ -456,12 +507,26 @@ inline MacPowerCollectDecision decide_mac_power_collect(const std::vector<PmsetL
         last_ac = cur;
     };
 
+    // Size of the timestamp group a given entry belongs to -- stored on the
+    // cursor so a later read can tell that an eviction has renumbered it.
+    auto group_size_at = [&](std::size_t i) -> std::int64_t {
+        std::int64_t n = 0;
+        for (const auto& e : entries)
+            if (e.ts == entries[i].ts)
+                ++n;
+        return n;
+    };
+
     auto rebaseline_at_log_end = [&](std::string last_ac) {
         if (entries.empty()) {
-            out.new_cursor = MacPowerCursor{1, now, 0, 1, last_ac};
+            out.new_cursor = MacPowerCursor{1, now, 0, 1, 0, last_ac};
         } else {
-            out.new_cursor = MacPowerCursor{1, entries.back().ts, entries.back().line_crc,
-                                            occurrences.back(), last_ac};
+            out.new_cursor = MacPowerCursor{1,
+                                            entries.back().ts,
+                                            entries.back().line_crc,
+                                            occurrences.back(),
+                                            group_size_at(entries.size() - 1),
+                                            last_ac};
         }
     };
 
