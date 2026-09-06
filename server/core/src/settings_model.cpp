@@ -4,24 +4,84 @@
 
 #include "settings_model.hpp"
 
+#include <algorithm>
+#include <cctype>
+
 namespace yuzu::server::settings_model {
 
-std::string sanitize_url_userinfo(const std::string& url) {
+namespace {
+
+// True if `s` looks like a bare "host" or "host:port" with no userinfo --
+// i.e. either no ':' at all, or the LAST ':' is followed only by digits (a
+// plausible port). Real hosts never contain '@' or an internal '/'; this is
+// the signal `sanitize_url_userinfo` uses below to tell "an unencoded '/'
+// inside the userinfo landed here" (looks_like_bare_host == false, keep
+// searching for the real '@') apart from "this genuinely is the host, the
+// '/' right after it starts the path" (looks_like_bare_host == true, a
+// later '@' -- if any -- belongs to the path, not to credentials; #4028
+// fix-round finding UP-1's ".../db@table` regression case).
+bool looks_like_bare_host(std::string_view s) {
+    auto colon = s.find_last_of(':');
+    if (colon == std::string_view::npos)
+        return true;
+    auto port = s.substr(colon + 1);
+    return !port.empty() &&
+           std::all_of(port.begin(), port.end(),
+                       [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+}  // namespace
+
+std::string sanitize_url_userinfo(std::string_view url) {
     if (url.empty())
-        return url;
+        return std::string(url);
     // Authority starts right after "scheme://" if present, else at the very
     // start of the string (a bare "user:pass@host" with no scheme is still
-    // sanitized). The authority ends at the first '/' (start of the path) or
-    // end-of-string if the URL carries no path.
+    // sanitized).
     std::size_t authority_start = 0;
-    if (auto scheme_end = url.find("://"); scheme_end != std::string::npos)
+    if (auto scheme_end = url.find("://"); scheme_end != std::string_view::npos)
         authority_start = scheme_end + 3;
-    auto path_start = url.find('/', authority_start);
-    auto authority_end = (path_start == std::string::npos) ? url.size() : path_start;
-    auto at_pos = url.find('@', authority_start);
-    if (at_pos == std::string::npos || at_pos >= authority_end)
-        return url; // no userinfo present in the authority component
-    return url.substr(0, authority_start) + url.substr(at_pos + 1);
+
+    // A query string or fragment can carry its OWN credential form this
+    // function otherwise never models at all -- e.g. ClickHouse's HTTP
+    // interface also accepts "?user=admin&password=..." with no '@'
+    // anywhere in the URL (#4028 fix-round finding UP-2). This is a
+    // display-only sanitizer with no obligation to hand back a working
+    // URL, so query string and fragment are dropped unconditionally rather
+    // than selectively redacted (selective redaction would need to
+    // enumerate every driver's own query-parameter convention and stays
+    // wrong for the next one).
+    auto qf = url.find_first_of("?#", authority_start);
+    std::string base(url.substr(0, qf == std::string_view::npos ? url.size() : qf));
+
+    auto slash = base.find('/', authority_start);
+    auto authority_end = (slash == std::string::npos) ? base.size() : slash;
+
+    // Userinfo delimiter is the LAST '@' before authority_end, not the
+    // first: a password containing an unescaped '@' (e.g. "p@ss") left the
+    // first-'@' search stop mid-password, leaking the remainder verbatim
+    // (original sec-H1 report).
+    auto at_pos = base.find_last_of('@');
+    if (at_pos != std::string::npos && at_pos < authority_end && at_pos >= authority_start)
+        return base.substr(0, authority_start) + base.substr(at_pos + 1);
+
+    // No '@' found before the naive authority boundary. Either there is
+    // genuinely no userinfo (the common case -- e.g. ".../db@table", where
+    // "host:9000" before the '/' looks like a bare host and this branch
+    // must NOT fire), or the naive boundary itself is wrong: a password
+    // containing an unescaped '/' (e.g. "pa/ss") makes the FIRST '/' land
+    // inside the userinfo, well before the real '@' (original UP-1
+    // report), which is exactly what `looks_like_bare_host` distinguishes.
+    // If what precedes the '/' does NOT look like a plausible host[:port],
+    // widen the search for '@' past that '/' and, if found, treat
+    // everything up to it as userinfo.
+    if (slash != std::string::npos &&
+        !looks_like_bare_host(base.substr(authority_start, slash - authority_start))) {
+        if (auto wider_at = base.find('@', slash); wider_at != std::string::npos)
+            return base.substr(0, authority_start) + base.substr(wider_at + 1);
+    }
+
+    return base; // no userinfo present in the authority component
 }
 
 nlohmann::json build_tls_settings(const Config& cfg) {
@@ -126,7 +186,7 @@ nlohmann::json build_analytics_settings(const Config& cfg) {
 nlohmann::json build_plugin_signing_settings(
     bool required,
     const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
-    const std::string& trust_bundle_pem) {
+    std::string_view trust_bundle_pem) {
     nlohmann::json j;
     const bool enabled = bundle.has_value() && bundle->has_value();
     j["enabled"] = enabled;

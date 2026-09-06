@@ -3853,6 +3853,14 @@ No bundle uploaded (still 200, not 404 — a normal operational state): `enabled
 `cert_count: 0`, `sha256: ""`, `subjects: []`, `trust_bundle_pem: ""`. A bundle present on disk but
 unreadable returns 500 (A4 error envelope) instead.
 
+**Errors:** 503 (A4 envelope, `retry_after_ms` set) in two cases distinct from the audit fail-closed
+503 above — the `required` flag's backing `runtime_config_store` read failed (the response would
+otherwise be unable to distinguish a genuine outage from a healthy "not required"), or the trust
+bundle was concurrently uploaded/cleared between this request's existence check and its PEM
+re-read. Both are retryable; neither indicates real plugin-signature enforcement is affected — that
+is gated independently, at agent pack-install time, by a boot-time server flag this route and its
+backing store have no influence over.
+
 #### `GET /api/v1/settings/gateway`
 
 Erlang gateway upstream status: enabled state, listen address, gateway mode, live session count.

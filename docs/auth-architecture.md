@@ -2635,7 +2635,13 @@ the separate `clickhouse_password` field — a URL with embedded userinfo creden
 (`clickhouse://user:pass@host:9000/db`) leaked the credential regardless. The shared builder now
 strips URL userinfo unconditionally (`settings_model::sanitize_url_userinfo`) before either surface
 ever sees it, and never reads the raw password into a response at all — only a
-`clickhouse_password_set` bool.
+`clickhouse_password_set` bool. Fix-round hardening (governance Gate 2-5) found the initial strip
+itself incomplete: an unescaped `@` or `/` inside the userinfo let part or all of a credential
+through (`user:p@ss@host`, `user:pa/ss@host`), and a query-string credential form (`?password=...`,
+no `@` at all) was not modeled. `sanitize_url_userinfo` now finds the userinfo delimiter as the
+LAST `@` before the authority boundary (not the first), widens that boundary search past an
+unencoded `/` when what precedes it does not look like a plausible `host[:port]`, and drops any
+query string or fragment unconditionally rather than selectively redacting it.
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 

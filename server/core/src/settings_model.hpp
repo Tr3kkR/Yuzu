@@ -34,22 +34,31 @@
 #include <expected>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace yuzu::server::settings_model {
 
-/// Strip embedded userinfo (`user:pass@` / `user@`) from a URL's authority
-/// before it is ever serialized or rendered. #4028 Evidence:
-/// `render_analytics_fragment` masked the discrete `clickhouse_password`
-/// Config field but rendered `clickhouse_url` verbatim — a URL of the form
+/// Strip embedded userinfo (`user:pass@` / `user@`) from a URL's authority,
+/// and drop any query string or fragment outright, before the URL is ever
+/// serialized or rendered. #4028 Evidence: `render_analytics_fragment`
+/// masked the discrete `clickhouse_password` Config field but rendered
+/// `clickhouse_url` verbatim — a URL of the form
 /// `clickhouse://admin:s3cr3t@host:9000` leaks the credential regardless of
 /// the separate field's own masking. `build_analytics_settings` below is the
 /// only caller; exposed here so the sanitizer itself is unit-testable
 /// without going through the full builder.
 ///
-/// Only touches the AUTHORITY component (between `scheme://` — or the start
-/// of the string if there is no `scheme://` — and the first `/`). A URL with
-/// no userinfo is returned unchanged (no `@` before the authority ends).
-[[nodiscard]] std::string sanitize_url_userinfo(const std::string& url);
+/// Handles three input shapes a naive first-'@'/first-'/' scan does not:
+/// a password containing an unescaped '@' (the last '@' before the
+/// authority boundary is the real delimiter, not the first), a password
+/// containing an unescaped '/' (which would otherwise truncate the
+/// authority boundary INSIDE the userinfo and make the real '@' read as
+/// past it, leaving the URL returned completely unsanitized), and
+/// query-string credentials (`?user=...&password=...`, which never
+/// involve an '@' at all) — the query string and fragment are dropped
+/// unconditionally rather than selectively redacted. A URL with no
+/// userinfo, query, or fragment is returned unchanged.
+[[nodiscard]] std::string sanitize_url_userinfo(std::string_view url);
 
 /// `GET /fragments/settings/tls` + `GET /api/v1/settings/tls`. TlsConfig:Read.
 /// {enabled, server_cert_path, server_key_path, ca_cert_path,
@@ -119,6 +128,6 @@ namespace yuzu::server::settings_model {
 [[nodiscard]] nlohmann::json build_plugin_signing_settings(
     bool required,
     const std::optional<std::expected<plugin_signing::TrustBundleStats, std::string>>& bundle,
-    const std::string& trust_bundle_pem = {});
+    std::string_view trust_bundle_pem = {});
 
 } // namespace yuzu::server::settings_model

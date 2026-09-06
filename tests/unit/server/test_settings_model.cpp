@@ -62,6 +62,42 @@ TEST_CASE("sanitize_url_userinfo handles an empty string", "[settings][settings_
     CHECK(sm::sanitize_url_userinfo("") == "");
 }
 
+// #4028 fix-round hardening (governance Gate 2-5: security-guardian,
+// quality-engineer F1, unhappy-path UP-1/UP-2, chaos-injector CH-1) —
+// adversarial regression coverage for three bypasses the original
+// first-'@'/first-'/' scan missed.
+
+TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '@'",
+          "[settings][settings_model][security]") {
+    // A naive FIRST-'@' scan stops mid-password here, leaking "ss@host..."
+    // verbatim. The real delimiter is the LAST '@' before the authority
+    // boundary.
+    CHECK(sm::sanitize_url_userinfo("clickhouse://admin:p@ss@host:9000/yuzu") ==
+          "clickhouse://host:9000/yuzu");
+}
+
+TEST_CASE("sanitize_url_userinfo strips a password containing an unescaped '/'",
+          "[settings][settings_model][security]") {
+    // A naive FIRST-'/' authority boundary lands INSIDE the userinfo here
+    // ("admin:pa" / "ss@host..."), which makes the real '@' read as past the
+    // boundary and the whole URL fall through completely unsanitized. The
+    // fix widens the search past the early '/' whenever what precedes it
+    // does not look like a plausible host[:port].
+    CHECK(sm::sanitize_url_userinfo("clickhouse://admin:pa/ss@host:9000/yuzu") ==
+          "clickhouse://host:9000/yuzu");
+}
+
+TEST_CASE("sanitize_url_userinfo strips a query-string credential form entirely",
+          "[settings][settings_model][security]") {
+    // ClickHouse's HTTP interface also accepts credentials as query
+    // parameters with no '@' anywhere in the URL — a shape the original
+    // implementation never modeled at all. The query string (and any
+    // fragment) is dropped unconditionally rather than selectively
+    // redacted.
+    CHECK(sm::sanitize_url_userinfo("http://host:8123/?user=admin&password=s3cr3t") ==
+          "http://host:8123/");
+}
+
 // ── build_analytics_settings — the security-fix regression coverage ─────
 
 TEST_CASE("build_analytics_settings sanitizes the ClickHouse URL and never emits the raw password",

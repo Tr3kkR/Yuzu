@@ -3000,15 +3000,40 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
     // this renderer reads the view's fields rather than `bundle`/`required`
     // directly, so both surfaces present the identical underlying data.
     auto bundle = read_on_disk_bundle();
-    const bool required =
-        runtime_config_store_ &&
-        runtime_config_store_->get_value(plugin_signing::kPluginSigningRequiredKey) == "true";
+
+    // #4028 fix-round finding UP-3/CH-2 (governance Gate 4/5, re-derived by
+    // sre/compliance-officer/enterprise-readiness): `get_value()` collapses
+    // a genuine runtime_config_store read failure to "", identically to a
+    // healthy "not required" — and this badge/toggle IS the deliverable an
+    // operator reads to know the require-signature state (I3: the caller
+    // cannot tell degraded from healthy). Real pack-install enforcement is
+    // independent of this flag (sole gate is
+    // ProductPackStore::require_signed_packs_, set from the CLI flag at
+    // boot — see runtime_config_store.hpp's file header) so this is a
+    // display-honesty fix, not an enforcement-bypass fix. `get()` lets a
+    // degraded read say so instead of silently reporting "false". The REST
+    // handler below applies the identical `get()` switch — keep both in
+    // sync (sre finding: a REST/dashboard divergence here would be worse
+    // than the original bug).
+    bool required = false;
+    bool required_status_unknown = false;
+    if (runtime_config_store_) {
+        auto rc = runtime_config_store_->get(plugin_signing::kPluginSigningRequiredKey);
+        if (!rc.has_value()) {
+            required_status_unknown = true;
+        } else {
+            required = rc->has_value() && rc->value().value == "true";
+        }
+    }
     const auto v = settings_model::build_plugin_signing_settings(required, bundle);
     const bool enabled = v.at("enabled").get<bool>();
 
     // Status badge
     std::string badge_color, badge_text;
-    if (enabled && required) {
+    if (required_status_unknown) {
+        badge_color = "#da3633"; // red -- distinct from every real state below
+        badge_text = "Require-signature status unknown (config store unavailable)";
+    } else if (enabled && required) {
         badge_color = "#238636"; // green
         badge_text = "Enforced (required)";
     } else if (enabled) {
@@ -3022,6 +3047,14 @@ std::string SettingsRoutes::render_plugin_signing_fragment() {
             "  <span style=\"font-size:0.75rem;background:" +
             badge_color + ";color:#fff;padding:0.2rem 0.6rem;border-radius:4px;font-weight:600\">" +
             badge_text + "</span></div>";
+    if (required_status_unknown) {
+        html += "<div class=\"feedback feedback-error\">Runtime config store is unavailable, "
+                "so the Require-signature toggle's saved value could not be read. This does "
+                "<strong>not</strong> disable real enforcement -- that is gated independently, "
+                "at agent pack-install time, by a boot-time server flag this store has no "
+                "influence over. It means this page cannot currently show whether Require is "
+                "on or off. Retry shortly.</div>";
+    }
 
     // Current state
     if (enabled) {
@@ -3233,8 +3266,13 @@ void SettingsRoutes::register_routes(
         if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.tls.read",
                                            "success", "TlsConfig", "tls", "REST settings read")) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "audit subsystem unavailable; refusing to "
-                                                   "serve settings data without durable evidence"),
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
                             "application/json");
             return;
         }
@@ -3429,8 +3467,13 @@ void SettingsRoutes::register_routes(
         if (!detail::emit_behavioral_audit(audit_read_fn_, req, res, "settings.https.read",
                                            "success", "TlsConfig", "https", "REST settings read")) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "audit subsystem unavailable; refusing to "
-                                                   "serve settings data without durable evidence"),
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
                             "application/json");
             return;
         }
@@ -3461,8 +3504,13 @@ void SettingsRoutes::register_routes(
                                                     "REST settings read")) {
                      res.status = 503;
                      res.set_content(
-                         detail::a4_error(res, "audit subsystem unavailable; refusing to serve "
-                                               "settings data without durable evidence"),
+                         detail::a4_error(res,
+                                          "audit subsystem unavailable; refusing to serve "
+                                          "settings data without durable evidence",
+                                          detail::A4ErrorOpts{
+                                              .retry_after_ms = 5000,
+                                              .remediation = "retry after the audit subsystem "
+                                                             "recovers"}),
                          "application/json");
                      return;
                  }
@@ -3958,16 +4006,55 @@ void SettingsRoutes::register_routes(
                                            "success", "PluginSigning", "trust_bundle",
                                            "agent plugin-policy fetch")) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "audit subsystem unavailable; refusing to "
-                                                   "serve settings data without durable evidence"),
+            res.set_content(detail::a4_error(res,
+                                             "audit subsystem unavailable; refusing to "
+                                             "serve settings data without durable evidence",
+                                             detail::A4ErrorOpts{
+                                                 .retry_after_ms = 5000,
+                                                 .remediation = "retry after the audit subsystem "
+                                                                "recovers"}),
                             "application/json");
             return;
         }
 
         auto disk = read_on_disk_bundle();
-        const bool required =
-            runtime_config_store_ &&
-            runtime_config_store_->get_value(plugin_signing::kPluginSigningRequiredKey) == "true";
+
+        // #4028 fix-round finding UP-3/CH-2 (governance Gate 4/5, re-derived
+        // by sre/compliance-officer/enterprise-readiness): this route's
+        // `required` field IS the deliverable an operator or automation
+        // polls to learn the require-signature state -- `get_value()`
+        // collapsed a genuine runtime_config_store read failure to "",
+        // identical to a healthy "not required" (I3: the caller cannot
+        // tell degraded from healthy). Real pack-install enforcement is
+        // independent of this flag (sole gate is
+        // ProductPackStore::require_signed_packs_, set from the CLI flag at
+        // boot -- see runtime_config_store.hpp's file header), so this is a
+        // display-honesty fix, not an enforcement-bypass fix: a degraded
+        // read now fails the REQUEST closed (503) rather than answer with a
+        // value it cannot stand behind. The dashboard fragment renderer
+        // above applies the identical `get()` switch -- keep both in sync.
+        bool required = false;
+        if (runtime_config_store_) {
+            auto rc = runtime_config_store_->get(plugin_signing::kPluginSigningRequiredKey);
+            if (!rc.has_value()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res,
+                        "runtime config store unavailable; plugin-signing required status "
+                        "could not be determined",
+                        detail::A4ErrorOpts{
+                            .retry_after_ms = 5000,
+                            .remediation =
+                                "Retry shortly; if this persists, check Postgres connectivity "
+                                "for the runtime_config_store schema. Real plugin-signature "
+                                "enforcement (ProductPackStore, boot-time CLI flag) is "
+                                "unaffected by this outage."}),
+                    "application/json");
+                return;
+            }
+            required = rc->has_value() && rc->value().value == "true";
+        }
 
         // Bundle unreadable (exists on disk, failed to parse) → 500. Bundle
         // ABSENT (disk == nullopt) is a normal operational state, not a
@@ -3986,6 +4073,25 @@ void SettingsRoutes::register_routes(
         std::string pem;
         if (disk && disk->has_value()) {
             std::ifstream f(trust_bundle_path(), std::ios::binary);
+            if (!f) {
+                // #4028 fix-round finding (cpp-safety): the bundle existed
+                // moments ago when read_on_disk_bundle() parsed it above,
+                // but a concurrent upload/clear can remove or replace the
+                // file between that read and this one -- do not silently
+                // fall through to enabled=true with an empty
+                // trust_bundle_pem (indistinguishable from "an empty
+                // bundle" to a caller). Fail closed; the caller retries
+                // against whatever the now-current state is.
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(
+                        res, "trust bundle changed while serving this request",
+                        detail::A4ErrorOpts{
+                            .retry_after_ms = 1000,
+                            .remediation = "retry -- the bundle was modified concurrently"}),
+                    "application/json");
+                return;
+            }
             pem.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
         }
         auto data = settings_model::build_plugin_signing_settings(required, disk);

@@ -1775,6 +1775,17 @@ dpkg-query -W -f='${db:Status-Abbrev}\n' | grep -c '^hi'
 
 A nonzero result means that host's `installed_count` will report a higher number after upgrading, by exactly that many. If your automation only compares the count to a rough threshold or trend, no action is needed; if it asserts an exact expected value, re-baseline it after upgrading.
 
+### vNEXT — `GET /api/v1/agent/plugin-policy` response body is now enveloped, not flat (#4028) (breaking)
+
+**What changed.** This route already existed pre-#4028 (documented here as the trust-bundle-PEM distribution path for agent config management) but was off the REST-v1 API-parity ledger. #4028 hardens it onto the same conventions every other `/api/v1/*` route in this manual uses:
+
+- **Success body moves under `data`.** Previously a flat top-level object — `{"enabled":..., "required":..., "trust_bundle_pem":..., "cert_count":..., "sha256":...}`. Now `{"data": {"enabled":..., "required":..., "cert_count":..., "sha256":..., "subjects": [...], "bundle_unreadable": <bool>, "bundle_error"?: <string>, "trust_bundle_pem":...}, "meta": {"api_version": "v1"}}` — every existing field moved one level deeper, under `.data`. `subjects` and `bundle_unreadable`/`bundle_error` are new fields, not renames.
+- **Error body is now the standard A4 envelope.** The old `500` ("Trust bundle on disk is unreadable") returned a bespoke `{"error": {"code":500, "message":...}}, "meta": {"api_version": "v1"}}` shape. It now returns the same `error.code`/`error.message`/`error.correlation_id`/`error.retry_after_ms` envelope every other REST v1 route uses — `code` and `message` stay at the same path, so a consumer reading only those two keys is unaffected.
+- **Authorization moves from `require_admin` to the `PluginSigning:Read` RBAC permission** (seeded Administrator-only). An MCP-tier token is denied this route regardless, at the tier chokepoint, before the permission check runs.
+- **Two new `503` (retry) responses** where the route previously answered `200` with a value it could not stand behind: a concurrent trust-bundle upload/clear racing this request's PEM re-read, and a `runtime_config_store` outage backing the `required` flag (previously silently reported as `required:false` on either fault).
+
+**Who this affects.** Any script, admin tool, or manual `curl` pipeline reading this route directly. Update field access from `response["trust_bundle_pem"]` etc. to `response["data"]["trust_bundle_pem"]`. No CLI flag or configuration change is needed — this is a response-shape and error-handling change only.
+
 ---
 
 ## Settings Page
