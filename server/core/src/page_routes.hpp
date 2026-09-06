@@ -45,10 +45,15 @@
 ///   GET /viz/host/:agent_id                 (auth_fn + viz kill switch)
 ///   GET /instructions                       (auth_fn)
 ///
-/// ORDERING: `/viz/fleet` MUST be registered before `/viz/host/([^/]+)` —
-/// see the comment carried over onto that registration in page_routes.cpp
-/// (first-match-wins routing; a literal path registered after a regex that
-/// could swallow it would never be reached).
+/// ORDERING: `/viz/fleet` is registered before `/viz/host/([^/]+)` — see the
+/// comment carried over onto that registration in page_routes.cpp. Today's
+/// regex requires a literal `host/` segment, so it cannot in fact collide
+/// with `/viz/fleet` regardless of order (governance #2542, 3-way
+/// convergence: architect/happy-path/unhappy-path independently confirmed
+/// the ordering isn't currently load-bearing). Kept anyway as a
+/// forward-compatibility guard against a future, broader pattern like
+/// `R"(/viz/([^/]+))"`, which WOULD swallow `fleet` as a path parameter if
+/// registered first — preserve this order if such a route is ever added.
 
 #include <yuzu/server/auth.hpp>
 

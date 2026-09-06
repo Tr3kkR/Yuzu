@@ -348,6 +348,12 @@ TEST_CASE("page_routes: a null deps.viz_disabled is treated as not-disabled, nev
     auto r = sink2.Get("/viz/fleet");
     REQUIRE(r);
     CHECK(r->status == 200);
+
+    // The header doc describes the null-safe contract as shared by BOTH viz
+    // routes — exercise /viz/host/:id here too, not just /viz/fleet.
+    auto host = sink2.Get("/viz/host/abc123");
+    REQUIRE(host);
+    CHECK(host->status == 200);
 }
 
 TEST_CASE("page_routes: /viz/fleet serves 200 when authed and enabled",
