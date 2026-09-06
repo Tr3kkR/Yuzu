@@ -157,6 +157,17 @@ constexpr auto kBoundedCallTimeout = 2000ms;
 // touched directly outside OutstandingGuard/shutdown() below.
 std::atomic<int> g_outstanding_calls{0};
 
+// Queries deliberately abandoned on the timeout path below, and the ceiling on
+// them. The bounded-call ceiling does NOT bound this: it caps CONCURRENT
+// detached threads, and a chronically slow provider produces calls that exceed
+// the timeout but still complete, so the slot is freed every time and the
+// ceiling never engages while one PDH_HQUERY leaks per poll, forever. Only a
+// permanent black hole is self-limiting. Past the ceiling this leg stops
+// opening queries at all and answers unavailable, which is honest and bounded
+// -- an agent leaking handles indefinitely is neither.
+std::atomic<int> g_abandoned_pdh_queries{0};
+constexpr int kMaxAbandonedPdhQueries = 16;
+
 // RAII guard bracketing ONE bounded_call_tracked() invocation from the
 // CALLING thread's own perspective: increments on construction, decrements
 // on destruction — both always run on the calling thread's own stack,
@@ -300,6 +311,14 @@ int do_battery(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
 int do_thermal(yuzu::CommandContext& ctx) {
     PDH_HQUERY query = nullptr;
+    if (g_abandoned_pdh_queries.load(std::memory_order_relaxed) >= kMaxAbandonedPdhQueries) {
+        // Refuse to add to an already-bounded residue. Reported distinctly so an
+        // operator sees a degraded provider rather than a silent absence.
+        ctx.write_output(
+           yuzu::power_health::format_thermal_line({"unavailable", "pdh_provider_degraded", {}}));
+        return 0;
+    }
+
     if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) {
         ctx.write_output(yuzu::power_health::format_thermal_line({"unavailable", "pdh_open_failed", {}}));
         return 0;
@@ -352,6 +371,7 @@ int do_thermal(yuzu::CommandContext& ctx) {
         // than closed: one leaked PDH_HQUERY per timed-out poll is the accepted
         // trade over a use-after-close, matching plugin.hpp:245's "accept a
         // bounded resource residue instead" guidance applied to a live handle.
+        g_abandoned_pdh_queries.fetch_add(1, std::memory_order_relaxed);
         ctx.write_output(
             yuzu::power_health::format_thermal_line({"unavailable", "pdh_collect_timed_out", {}}));
         return 0;
@@ -363,15 +383,31 @@ int do_thermal(yuzu::CommandContext& ctx) {
         return 0;
     }
 
+    // A FETCH FAILURE IS NOT "no thermal zones".
+    //
+    // interpret_windows_pdh_thermal() reports an empty sample set as the
+    // explicit, positive claim `no_thermal_zones_exposed` -- which is the right
+    // answer for a desktop that genuinely exposes none, and a lie if we simply
+    // failed to read. The add-counter step twenty lines above already takes
+    // care to keep those apart (PH-010); the fetch step did not, so a
+    // PDH_MORE_DATA from an instance appearing between the sizing and the real
+    // call, or any other fetch error, was reported as a host with no thermal
+    // sensors. Track it and report it as its own outcome.
     DWORD buffer_size = 0, item_count = 0;
-    PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, nullptr);
+    const PDH_STATUS size_status =
+       PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, nullptr);
+    // PDH_MORE_DATA is the EXPECTED answer to a sizing call; anything else that
+    // is not success means the sizing itself failed.
+    bool fetch_ok = (size_status == ERROR_SUCCESS || size_status == PDH_MORE_DATA);
 
     std::vector<yuzu::power_health::PdhThermalSample> samples;
-    if (item_count > 0 && buffer_size > 0) {
+    if (fetch_ok && item_count > 0 && buffer_size > 0) {
         std::vector<std::byte> buf(buffer_size);
         auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buf.data());
-        if (PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, items) ==
-            ERROR_SUCCESS) {
+        const PDH_STATUS fetch_status =
+           PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE, &buffer_size, &item_count, items);
+        fetch_ok = (fetch_status == ERROR_SUCCESS);
+        if (fetch_ok) {
             for (DWORD i = 0; i < item_count; ++i) {
                 // Only a VALID/NEW sample is an honest reading (PH-10) —
                 // PDH_CSTATUS_* error codes (a stale/invalid instance, a
@@ -386,6 +422,13 @@ int do_thermal(yuzu::CommandContext& ctx) {
         }
     }
     PdhCloseQuery(query);
+
+    if (!fetch_ok) {
+        // Distinct from both "no zones" and "the query would not open".
+        ctx.write_output(
+           yuzu::power_health::format_thermal_line({"unavailable", "pdh_fetch_failed", {}}));
+        return 0;
+    }
 
     ctx.write_output(yuzu::power_health::format_thermal_line(
         yuzu::power_health::interpret_windows_pdh_thermal(samples, /*query_opened_ok=*/true)));

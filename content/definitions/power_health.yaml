@@ -105,7 +105,11 @@ metadata:
     Reports thermal state. On Windows and Linux this is per-zone Celsius, OR
     an explicit CONSTRAINED "no_thermal_zones_exposed" success line when the
     mechanism reports zero live zone instances — the measured normal case on
-    desktop hardware, never an error and never a fabricated zero. On macOS
+    desktop hardware, never an error and never a fabricated zero. It is a
+    POSITIVE claim that no sensors exist, so every way the read can FAIL
+    (pdh_open_failed, pdh_add_counter_failed, pdh_collect_failed,
+    pdh_collect_timed_out, pdh_collect_rejected, pdh_fetch_failed) reports
+    "unavailable" instead — an empty result never means we failed to look. On macOS
     this is NSProcessInfo's 4-level thermal-pressure enum (nominal/fair/
     serious/critical), never a temperature reading; IOPMGetThermalWarningLevel
     supplements it and a "not found" result (no thermal event ever recorded)

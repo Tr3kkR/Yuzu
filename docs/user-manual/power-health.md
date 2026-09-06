@@ -44,7 +44,12 @@ thermal|<status>|<detail_or_zone>[|<celsius>]
 live thermal-zone instances is the **measured normal case on desktop
 hardware** and produces the explicit success line
 `thermal|constrained|no_thermal_zones_exposed` — never an error, never a
-fabricated zero-degree reading. On macOS, `status` is always `ok` and
+fabricated zero-degree reading. That line is a POSITIVE claim that the host
+exposes no thermal sensors, so it is kept distinct from every way the read
+itself can fail: `pdh_open_failed`, `pdh_add_counter_failed`,
+`pdh_collect_failed`, `pdh_collect_timed_out`, `pdh_collect_rejected` and
+`pdh_fetch_failed` all report `unavailable` instead. An empty result means the
+sensors are absent; it never means we failed to look. On macOS, `status` is always `ok` and
 `detail` carries `NSProcessInfo.thermalState`'s 4-level enum
 (`nominal`/`fair`/`serious`/`critical`), never a temperature; a "no thermal
 warning ever recorded" result from `IOPMGetThermalWarningLevel`
@@ -75,7 +80,15 @@ fully specified:
    against a partial list that might be hiding a duplicate name.
 3. Reading the active scheme fails (before any mutation) → typed error, no
    mutation.
-4. `PowerSetActiveScheme` fails → typed error, no mutation.
+4. `PowerSetActiveScheme` fails **or times out** → typed error, and the
+   outcome is **NOT** "no mutation". The call is made through a bounded
+   wait, so a timeout means it did not report back in time — not that it
+   did not happen. The status text says so in as many words ("the mutation
+   was NOT confirmed and, on a timeout, may still have been applied — final
+   state is unknown") and `previous_guid` is reported so the scheme can be
+   reverted. **Go and check the machine.** Claiming no mutation here is the
+   one wording that would stop an operator doing that, which is why the
+   code refuses to.
 5. The post-set read-back fails or does not match the target scheme after
    `PowerSetActiveScheme` already reported success → typed error naming
    both GUIDs (mismatch case) or `previous_guid` alone (read-back-failed

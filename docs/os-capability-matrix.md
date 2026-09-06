@@ -121,6 +121,7 @@ duplicates.
 | network_config | ✅ | ✅ | ✅ | win/linux/apple throughout, no `/bin/sh` on any leg. Linux rtnetlink + `/proc/net/arp`; macOS getifaddrs + `SIOCGIFMEDIA` link speed + PF_ROUTE + SCDynamicStore. `arp` is now live on Linux and macOS; `dns_cache` stays an honest `unsupported` sentinel on macOS (`network_config_plugin.cpp`) |
 | network_diag | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
+| power_health | ✅ | 🟡 | 🟡 | Windows is the only full leg: battery via GetSystemPowerStatus + CallNtPowerInformation, thermal via PDH `\Thermal Zone Information(*)`, and power_plan/set_power_plan via PowrProf. macOS has battery (IOPS) and a thermal *pressure enum* (NSProcessInfo), never a temperature; power schemes are unsupported (no named schemes; IOPMSetPMPreferences is SPI, deliberately not adopted). Linux has battery and thermal via `/sys`; power schemes are planned (platform_profile) |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
 | quarantine | ✅ | ✅ | ✅ | full per-OS blocks; Linux covers IPv4 and IPv6 (honest `note\|ipv6_unavailable` on hosts with no IPv6 stack), macOS verifies pf is actually ENABLED and not merely loaded, and status on all three platforms reports partial/degraded containment rather than a clean `active` (#3282, #3283, #3285). Windows containment now blocks via profile-default policy rather than named Block rules, so the loopback/whitelist Allow rules actually take effect once quarantined (#3284) — see docs/quarantine-windows-firewall-precedence.md |
@@ -164,7 +165,7 @@ merely shrink it — the script exits 1 on a *lower* count too until
 adoption gain is sticky rather than leaving room for a later regression back
 up to the old baseline.
 
-Adoption is now **complete**: all 50 plugins the CI gate tracks populate
+Adoption is now **complete**: all 51 plugins the CI gate tracks populate
 `action_descriptors`, so the undeclared count and `RATCHET_BASELINE_UNDECLARED`
 are both **0** and the "Undeclared plugins" section below is empty. From here
 the ratchet is equivalent to a hard fail — a new plugin directory landing

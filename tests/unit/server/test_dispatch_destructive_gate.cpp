@@ -337,13 +337,14 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
           "[server][dispatch][security]") {
     namespace capdecls = yuzu::server::capdecls;
 
-    const std::array<std::span<const CommandCapability>, 8> sources{{
+    const std::array<std::span<const CommandCapability>, 9> sources{{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
         capdecls::plugin_action_catalogue_b(),
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
         capdecls::plugin_action_catalogue_disk_actions(),
+        capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     }};
@@ -365,7 +366,11 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
             CHECK_FALSE(row.system_reserved);
         }
     }
-    CHECK(destructive_count == 17);
+    // 18, not 17: power_health's set_power_plan is a Destructive row and the
+// mirror must include it, or a FUTURE Destructive row in that fragment
+// lands with the aggregate tripwire still passing -- which is exactly the
+// drift this test's own title forbids.
+    CHECK(destructive_count == 18);
     // D4's rationale (dispatch_destructive_gate.hpp doc comment): exactly
     // the four Execution:Execute rows rely on the chokepoint's
     // AdminOrApproval gate as their elevation ceiling. This sub-claim WAS
@@ -386,6 +391,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_c(),
         capdecls::plugin_action_catalogue_d(),
         capdecls::plugin_action_catalogue_disk_actions(),
+        capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::core_dispatch_capabilities(),
     };
