@@ -3273,6 +3273,20 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                               esc(with_output->output.substr(6, 200)));
                 return;
             }
+            // #4035: the poll route is where the parsed perf history actually
+            // reaches the operator — the /perf dispatch above audits the
+            // REQUEST, but only THIS route renders the output, so the access
+            // must be audited here too (mirrors device_routes.cpp's
+            // audit_live_result: fires ONLY on a branch that actually serves
+            // rendered data, never on the pending/error/failed/timeout notes,
+            // so a 700ms poll loop doesn't spam one audit row per attempt).
+            // Same verb as the dispatch half (dex.device.perf.query) so the
+            // audit trail reads as one capability regardless of which half of
+            // the dispatch/poll pair produced the row. Set-and-proceed HTML
+            // posture, same #1647 chokepoint as every other dashboard fragment.
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, "dex.device.perf.query", "rendered", "Agent", id,
+                "poll result rendered for command_id=" + command_id);
             res.set_content(render_dex_perf_panel(parse_dex_perf_output(with_output->output)),
                             "text/html; charset=utf-8");
             return;
@@ -3401,6 +3415,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                        esc(with_output->output.substr(6, 200)));
                          return;
                      }
+                     // #4035: same audit-gap fix as the sibling /device/perf/result
+                     // route — the poll is where the per-app output actually
+                     // reaches the operator, so it needs its own audit row
+                     // (usage-class, dex.device.procperf.query, matching the
+                     // dispatch half's verb). Fires only on the branch that
+                     // actually serves data, never on pending/error/failed/timeout.
+                     (void)detail::emit_behavioral_audit(
+                         audit_fn_, req, res, "dex.device.procperf.query", "rendered", "Agent", id,
+                         "poll result rendered for command_id=" + command_id);
                      res.set_content(render_dex_procperf_panel(
                                          parse_dex_procperf_output(with_output->output), w),
                                      "text/html; charset=utf-8");
