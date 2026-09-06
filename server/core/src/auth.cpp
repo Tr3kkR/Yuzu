@@ -769,6 +769,22 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
             spdlog::warn("Auth failed: user '{}' not active in AuthDB", username);
             return std::nullopt;
         }
+        // #4020 adversarial-review follow-up: this read was ALREADY firing for the
+        // active-status check above; make it authoritative for ROLE too, not just
+        // existence. `entry->role` can be stale — a role change made through a
+        // DIFFERENT AuthManager (another replica, or this same process's own
+        // update_role call racing this one) does not touch an already-cached
+        // users_ entry, so a JUST-demoted user re-authenticating against a manager
+        // that cached them pre-demotion would otherwise mint a fresh session at the
+        // OLD (higher) role — durable session invalidation only kills PRIOR
+        // sessions, it does nothing to protect a brand-new login. Refresh the
+        // cache too (not just this local `entry` copy), so get_user_role() etc.
+        // on this manager also stop reporting the stale role, not merely this one
+        // session mint.
+        entry->role = db_user->role;
+        std::unique_lock lock(mu_);
+        if (auto it = users_.find(username); it != users_.end())
+            it->second.role = db_user->role;
     }
 
     auto token = generate_session_token();
@@ -839,6 +855,12 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
             spdlog::warn("verify_password failed: user '{}' not active in AuthDB", username);
             return std::nullopt;
         }
+        // #4020 adversarial-review follow-up: same authoritative-role refresh as
+        // authenticate() above — see its comment for the full rationale.
+        role = db_user->role;
+        std::unique_lock lock(mu_);
+        if (auto it = users_.find(username); it != users_.end())
+            it->second.role = db_user->role;
     }
     if (metrics_) {
         const auto elapsed =

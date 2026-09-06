@@ -399,6 +399,47 @@ TEST_CASE("cold-cache hydration never resurrects a soft-deleted user (#4020)",
     REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // nothing cached
 }
 
+TEST_CASE("authenticate fails closed (not unknown-user) when AuthDB is pool-saturated "
+          "(#4020 adversarial-review follow-up)",
+          "[pg][auth][session][cold_cache]") {
+    // Mirrors the #2396 pool-saturation precedent (test_auth_db_pg.cpp): the
+    // UserLookupMiss::DbError branch find_user_or_hydrate takes on a genuine
+    // AuthDB query failure (vs UserNotFound) was previously untested — nothing
+    // pinned that a future change couldn't collapse it into "unknown user"
+    // (which would mislabel a store outage as a bad-username signal and could
+    // mask a fail-closed auth substrate problem).
+    yuzu::test::AuthDbPg auth_db;
+    // Seeds through AuthManager (real kPbkdf2Iterations), not a DB-direct upsert at
+    // the cheap test-only 1000 iterations the OTHER cold_cache tests use — this
+    // test's own final "pool released" check re-authenticates for real.
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("pool-target", "password1234", Role::user));
+
+    AuthManager cold_mgr; // never caches "pool-target" itself
+    cold_mgr.set_auth_db(auth_db.get());
+
+    // Saturate the fixture's size-4 pool (mirrors test_auth_db_pg.cpp's #2396
+    // pattern exactly) so find_user_or_hydrate's get_user() cannot acquire a
+    // connection and returns QueryFailed, not UserNotFound.
+    std::vector<yuzu::server::pg::PgPool::Lease> held;
+    for (int i = 0; i < 4; ++i) {
+        auto lease = auth_db.pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        held.push_back(std::move(lease));
+    }
+
+    // Fails closed - no credential check performed, no session minted - and
+    // (unlike a genuine unknown user) this must NOT be treated as a bad
+    // username; find_user_or_hydrate's DbError branch is what enforces that.
+    CHECK_FALSE(cold_mgr.authenticate("pool-target", "password1234").has_value());
+    CHECK_FALSE(cold_mgr.verify_password("pool-target", "password1234").has_value());
+
+    // Releasing the pool restores normal service - a blip is transient.
+    held.clear();
+    CHECK(cold_mgr.authenticate("pool-target", "password1234").has_value());
+}
+
 TEST_CASE("authenticate on a cold cache is a plain miss for an unknown user (#4020)",
           "[pg][auth][session][cold_cache]") {
     yuzu::test::AuthDbPg auth_db;
@@ -407,6 +448,60 @@ TEST_CASE("authenticate on a cold cache is a plain miss for an unknown user (#40
     cold_mgr.set_auth_db(auth_db.get());
     REQUIRE_FALSE(cold_mgr.authenticate("nonexistent", "password1234").has_value());
     REQUIRE_FALSE(cold_mgr.verify_password("nonexistent", "password1234").has_value());
+}
+
+TEST_CASE("authenticate mints a session at the CURRENT role after a cross-manager demotion "
+          "(#4020 adversarial-review follow-up)",
+          "[pg][auth][session][cold_cache]") {
+    // A second AuthManager over the same AuthDB models a different replica (or a
+    // concurrent request on this same process): its users_ cache is independent
+    // of the manager that performs the demotion below. authenticate()'s existing
+    // active-status AuthDB read must be authoritative for role too, not just
+    // existence — otherwise a just-demoted operator's next login mints a fresh
+    // session at their OLD (higher) role, since durable session invalidation only
+    // protects ALREADY-issued sessions, not a brand-new one.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr_a;
+    mgr_a.set_auth_db(auth_db.get());
+    REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
+    // Cache mgr_a's copy at admin (this call is what previously would have gone
+    // stale) before the demotion below.
+    REQUIRE(mgr_a.authenticate("cora", "password1234").has_value());
+
+    AuthManager mgr_b;
+    mgr_b.set_auth_db(auth_db.get());
+    REQUIRE(mgr_b.update_role("cora", Role::user)); // the "other replica" demotes
+
+    // mgr_a's cache still says admin at this point; the fix must not trust it.
+    auto token = mgr_a.authenticate("cora", "password1234");
+    REQUIRE(token.has_value());
+    auto session = mgr_a.validate_session(*token);
+    REQUIRE(session.has_value());
+    REQUIRE(session->role == Role::user); // NOT the stale cached admin
+
+    // The cache itself is refreshed too, not just this one session mint.
+    REQUIRE(mgr_a.get_user_role("cora") == Role::user);
+}
+
+TEST_CASE("verify_password returns the CURRENT role after a cross-manager demotion "
+          "(#4020 adversarial-review follow-up)",
+          "[pg][auth][session][cold_cache]") {
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr_a;
+    mgr_a.set_auth_db(auth_db.get());
+    REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(mgr_a.verify_password("cora", "password1234").has_value()); // caches admin
+
+    AuthManager mgr_b;
+    mgr_b.set_auth_db(auth_db.get());
+    REQUIRE(mgr_b.update_role("cora", Role::user));
+
+    auto role = mgr_a.verify_password("cora", "password1234");
+    REQUIRE(role.has_value());
+    REQUIRE(*role == Role::user); // NOT the stale cached admin
+    REQUIRE(mgr_a.get_user_role("cora") == Role::user);
 }
 
 TEST_CASE("a hydrated entry is superseded by a later in-process role change (#4020)",
