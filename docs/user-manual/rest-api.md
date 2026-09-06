@@ -3170,6 +3170,39 @@ Delete a policy fragment.
 
 ---
 
+#### `GET /api/v1/policy-fragments`
+
+REST v1 twin of `GET /api/policy-fragments` above (api-parity #4034) — same query
+parameters, same row shape, A4-enveloped. MCP twin: `list_policy_fragments`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": [
+    {
+      "id": "frag-abc123",
+      "name": "ensure-defender-enabled",
+      "description": "Verify Windows Defender is active",
+      "check_instruction": "security.defender-status",
+      "check_compliance": "result.enabled == true",
+      "fix_instruction": "security.enable-defender",
+      "post_check_instruction": "",
+      "created_at": 1710849600,
+      "updated_at": 1710849600
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (503):** `{"error":{"code":503,"message":"policy store not available"},"meta":{"api_version":"v1"}}`
+
+---
+
 ### Policies
 
 Policies bind fragments to devices via scope expressions, triggers, and management group bindings.
@@ -3457,6 +3490,64 @@ is a store degrade, never a business rejection).
 
 ---
 
+#### `GET /api/v1/policies`
+
+REST v1 twin of `GET /api/policies` above (api-parity #4034) — same query
+parameters, same row shape, A4-enveloped. MCP twin: `list_policies` (a narrower
+5-field subset of this row shape — id/name/description/enabled/scope_expression
+only).
+
+**Permission:** `Policy:Read`
+
+**Response:** same `data`/`pagination`/`meta` envelope shape as
+`GET /api/v1/policy-fragments` above, wrapping the same per-policy row
+`GET /api/policies` documents.
+
+---
+
+#### `GET /api/v1/policies/{id}`
+
+REST v1 twin of `GET /api/policies/{id}` above (api-parity #4034) — flat
+top-level fields (not nested under a `"policy"` key), A4-enveloped. MCP twin:
+`get_policy`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "id": "pol-xyz789",
+    "name": "baseline-security",
+    "description": "",
+    "yaml_source": "apiVersion: yuzu.io/v1alpha1\nkind: Policy\n...",
+    "fragment_id": "frag-abc123",
+    "scope_expression": "tag:environment = 'production'",
+    "enabled": true,
+    "remediation_available": true,
+    "inputs": { "severity": "high" },
+    "triggers": [{ "id": 1, "type": "interval", "config": { "interval_seconds": 300 } }],
+    "management_groups": ["eu-production"],
+    "created_at": 1710849600,
+    "updated_at": 1710849600,
+    "compliance": {
+      "compliant": 42,
+      "non_compliant": 3,
+      "unknown": 5,
+      "fixing": 1,
+      "error": 0,
+      "total": 51
+    }
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Response (404):** `{"error":{"code":404,"message":"policy not found"},"meta":{"api_version":"v1"}}`
+
+---
+
 ### Compliance
 
 Fleet and per-policy compliance status endpoints.
@@ -3519,6 +3610,84 @@ Per-policy compliance detail with per-agent statuses.
 
 **Response (503):** `policy store degraded`, on either the summary or the
 per-agent-status read.
+
+---
+
+#### `GET /api/v1/compliance`
+
+REST v1 twin of `GET /api/compliance` above (api-parity #4034), A4-enveloped.
+MCP twin: `get_fleet_compliance`.
+
+**Permission:** `Policy:Read`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "compliance_pct": 92.5,
+    "total_checks": 200,
+    "compliant": 185,
+    "non_compliant": 8,
+    "unknown": 5,
+    "fixing": 2,
+    "error": 0
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+---
+
+#### `GET /api/v1/compliance/{policy_id}`
+
+REST v1 twin of `GET /api/compliance/{policy_id}` above (api-parity #4034),
+A4-enveloped, plus a `policy_id` sibling field the legacy route also returns
+(the legacy route's own doc example above omits it — pre-existing doc drift,
+not introduced by this route). **Authorization is `require_fleet_read`
+(`Policy:Read`), not a bare permission check** — the per-agent `agents` array
+is a fan-out read of per-agent data (routed-concerns RBAC row), so a
+management-group- or service-scope-confined caller sees only the agents
+visible to it, and `summary` is tallied from exactly that filtered set, never
+the store's unfiltered fleet-wide aggregate. MCP twin: `get_policy_agent_statuses`
+(same shape) — `get_compliance_summary` covers the `summary`-only half.
+
+**Permission:** `Policy:Read` (fleet-read gate)
+
+**Response:**
+
+```json
+{
+  "data": {
+    "policy_id": "pol-xyz789",
+    "summary": {
+      "compliant": 42,
+      "non_compliant": 3,
+      "unknown": 5,
+      "fixing": 1,
+      "error": 0,
+      "total": 51
+    },
+    "agents": [
+      {
+        "agent_id": "agent-01",
+        "status": "compliant",
+        "last_check_at": 1710936000,
+        "last_fix_at": 0,
+        "check_result": "{\"realtime_protection\": true}"
+      }
+    ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Audit:** `compliance.agent_statuses.view` — set-and-proceed (not
+fail-closed): compliance/policy status is not per-device behavioural PII the
+way DEX/device-live data is, but the per-agent list does name `agent_id`s
+fleet-wide, so this route records a proportionate trail (`Sec-Audit-Failed:
+true` on a persist miss, never a 503) rather than staying silent like the
+five sibling routes above it.
 
 ---
 
