@@ -18,10 +18,10 @@
 ##            — CONSTRAINED, fixture-verified with no live venue in this
 ##            run. power_plan is PLANNED (platform_profile), not implemented.
 ##
-## Hardware checks needed from you (reviewer): see
-## docs/user-manual/power-health.md for the copy-pasteable battery-leg
-## verification block. The battery-PRESENT path is unverified on real
-## hardware until that run lands.
+## Battery-PRESENT hardware verification: DONE on Windows (HP ZBook Firefly,
+## PR #4009 review) — it caught the AC-resting state being reported as
+## `unknown`, now `not_charging`. macOS battery-PRESENT is still fixture-only.
+## docs/user-manual/power-health.md carries the pass criteria.
 
 ---
 apiVersion: yuzu.io/v1alpha1

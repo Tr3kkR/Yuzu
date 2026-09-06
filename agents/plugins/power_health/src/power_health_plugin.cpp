@@ -32,9 +32,9 @@
  *                       planned posture as "power_plan" and never mutates.
  *
  * Mechanisms are bound by 2026-09-04 hardware measurement (runDir/
- * probe-findings.md), not the roadmap: Windows battery-PRESENT is unverified
- * on real hardware pending a reviewer's laptop run (see
- * docs/user-manual/power-health.md's "Hardware checks needed from you").
+ * probe-findings.md), not the roadmap. Windows battery-PRESENT was verified
+ * on real hardware during PR #4009's review (HP ZBook Firefly); macOS
+ * battery-PRESENT remains fixture-only — the run host was a desktop.
  *
  * BOUNDED CALLS (P-001 adapted, #3925 — never worsen bounded_wait.hpp's
  * contract): PowrProf's PowerEnumerate/PowerReadFriendlyName/
@@ -774,8 +774,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState)",
          "no-system-battery path measured live on the-rig (BatteryFlag=128); the "
-         "battery-PRESENT path is fixture-tested through the injected boundary and is "
-         "UNVERIFIED on real battery hardware pending the reviewer's laptop run"},
+         "battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, "
+         "PR #4009 review), which is what caught the AC-resting state being reported "
+         "as unknown rather than not_charging"},
     },
     {
         /* .action      = */ "thermal",

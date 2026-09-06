@@ -34,9 +34,11 @@ never a fabricated value.
 
 On a Windows desktop with no system battery, `GetSystemPowerStatus` reports
 `BatteryFlag=128`, which this plugin honestly maps to
-`present=false, state=ac_no_battery` (measured live, not inferred). **The
-battery-PRESENT path on Windows has no verification venue in this run** — see
-"Hardware checks needed from you" below.
+`present=false, state=ac_no_battery` (measured live, not inferred). The
+battery-PRESENT path on Windows **has since been verified on real hardware**
+(HP ZBook Firefly, PR #4009 review) — see "Hardware checks" below for what that
+run found and the criteria it now passes. macOS battery-PRESENT remains
+fixture-only.
 
 ## `thermal`
 
@@ -116,12 +118,20 @@ macOS and Linux never mutate: macOS has no named power schemes
 `power_plan` support is PLANNED (`platform_profile`) but not implemented in
 this package.
 
-## Hardware checks needed from you
+## Hardware checks
 
 The battery-PRESENT path on Windows was built and fixture-tested against an
-injected boundary, but this run had **no Windows laptop to verify it on real
-battery hardware** (only a desktop, which correctly reports
-`ac_no_battery`). If you have a Windows laptop:
+injected boundary, and has **since been verified on real battery hardware** —
+an HP ZBook Firefly, during PR #4009's review. That run earned its keep: it
+found the plugin reporting `battery|1|unknown|99|-1|-1|-1` for a battery
+resting on AC at a firmware charge threshold, i.e. the "could not read it"
+sentinel for a reading the OS had supplied in full. That state is now
+`not_charging` and has a parser fixture on each branch that reaches it.
+
+**macOS battery-PRESENT is still fixture-only** — the run host was a desktop,
+and the same class of defect could be hiding there.
+
+To repeat the check on a Windows laptop, or to close the macOS gap:
 
 1. Get an API token (`docs/user-manual/authentication.md`) and run this
    exact command against your agent's server, targeting only that one

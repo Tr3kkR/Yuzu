@@ -109,9 +109,11 @@ struct BatteryRow {
 // without <windows.h>. BatteryFlag == 128 is the measured (the-rig,
 // 2026-09-04) honest "no system battery" result: ACLineStatus=1,
 // BatteryFlag=128, BatteryLifePercent=255, BatteryLifeTime=-1. The
-// battery-PRESENT branch below is driven purely through this struct and is
-// UNVERIFIED ON REAL BATTERY HARDWARE pending the reviewer's laptop run
-// (docs/user-manual/power-health.md's "Hardware checks needed from you").
+// battery-PRESENT branch below is driven purely through this struct, and that
+// injected boundary is what kept it testable — but fixtures only prove the
+// mapping you thought to write. A real HP ZBook Firefly run (PR #4009 review)
+// found the AC-resting case classified as `unknown`, a state no fixture
+// covered; it is `not_charging` now, with its own fixture on each branch.
 struct WindowsBatteryRaw {
     uint8_t ac_line_status{0};      // 0 offline, 1 online, 255 unknown
     uint8_t battery_flag{255};      // 128 = no system battery; 255 = unknown
