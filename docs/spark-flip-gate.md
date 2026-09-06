@@ -668,9 +668,9 @@ defect in it:
   gap), so not filed as its own #2818-scoped issue; recorded here since several of this
   PR's own non-blocking dispositions depend on it.
 - Owner: not assigned for any item above.
-- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + two pre-PR-5 GATING items
-  (guard.errored census recognition; the three sre observability gaps) - no issue numbers,
-  tracked here.
+- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + three pre-PR-5 GATING items
+  (guard.errored census recognition; the three sre observability gaps; the
+  yuzu.guardian_backend server-side-reader gap) - no issue numbers, tracked here.
 - Revisit trigger: before PR-5's sign-off, everything above re-checked; #4051 specifically
   re-checked before any production fleet (dedup races become far more frequent under
   real load than in this PR's own governance testing).

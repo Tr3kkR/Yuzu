@@ -733,14 +733,14 @@ void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
         // Lifecycle wire event's schema is a protocol change, deliberately deferred (folded
         // into this doc's pre-PR-5 list) rather than made under a hardening round's time
         // pressure. This log line is the interim "why", for local debugging only.
+        const std::vector<std::string> rule_ids = index_->rules_for(key); // copy: mutates below
         try {
             spdlog::warn("Guardian spark: key '{}' subscription {} lost ({}) - detaching {} "
                          "rule(s) as errored",
                          key, subscription_id, detail.empty() ? "no reason given" : detail,
-                         index_->rules_for(key).size());
+                         rule_ids.size());
         } catch (...) {
         }
-        const std::vector<std::string> rule_ids = index_->rules_for(key); // copy: mutates below
         for (const auto& rid : rule_ids)
             detach_rule_locked(rid, "errored"); // DisarmWork discarded: the guard above
                                                  // already proves this id is dead, so any

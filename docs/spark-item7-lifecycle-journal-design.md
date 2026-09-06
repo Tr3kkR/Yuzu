@@ -118,8 +118,9 @@ split OUT of PR-Ag into two separate PRs: ingest-duration histogram (lands first
 
 ## 1. Problem (verified)
 `GuardianLifecycleLog` (`guardian_outbox.hpp:314-377`) is in-memory, reject-new-on-full, never-evict
-(`:322-329`); lifecycle events (`guard.armed`/`guard.disarmed`; `guard.errored` has **no producer**, §Scope)
-pop on gRPC `Write()==true` (`guardian_spark_runtime.cpp:496-501`, `agent.cpp:2733`). No per-event ack
+(`:322-329`); lifecycle events (`guard.armed`/`guard.disarmed`/`guard.errored` - the last gained its
+first producer in #2818, see §Scope) pop on gRPC `Write()==true` (`guardian_spark_runtime.cpp:496-501`,
+`agent.cpp:2733`). No per-event ack
 (`ClientReaderWriter<CommandResponse,CommandRequest>` `agent.cpp:149`). Losses: at-most-once (pop on buffered
 `Write`), capacity-lossy (ignored `false`), crash-lossy (RAM only). → **bounded-durable-retry** (§2).
 
@@ -127,7 +128,10 @@ pop on gRPC `Write()==true` (`guardian_spark_runtime.cpp:496-501`, `agent.cpp:27
 
 ## 2. Guarantee (honest)
 
-> **Process-crash-durable, duplicate-tolerant, bounded-retry** of **armed/disarmed** lifecycle events. Once
+> **Process-crash-durable, duplicate-tolerant, bounded-retry** of **armed/disarmed/errored** lifecycle
+> events (the replay-validation allowlist that gates this guarantee was fixed in #2818/PR-2d to
+> recognize "errored" too - before that fix an errored record would have been quarantined as tampered
+> on any restart, not durably delivered). Once
 > **persisted**, an event survives a process crash/restart and is **re-sent on every reconnect/restart -
 > regardless of any possible prior acceptance (acceptance is unknowable, there is no ack) - until it ages out
 > of retention.** A local `Write()` is **never** delivery confirmation. **Retention eviction and quarantine

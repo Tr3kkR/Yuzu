@@ -2551,7 +2551,9 @@ names and buckets changed during implementation and that doc is a point-in-time
 design record, not maintained against the code afterward.
 
 **The guarantee.** Process-crash-durable, duplicate-tolerant, bounded-retry delivery
-of armed/disarmed lifecycle events. Once persisted, an event survives a process
+of armed/disarmed/errored lifecycle events (`"errored"` gained the same durable
+treatment as the other two in #2818/PR-2d, which fixed a replay-validation allowlist
+that had quarantined it as tampered on any restart until then). Once persisted, an event survives a process
 crash or restart and is re-sent on every reconnect/restart — regardless of any
 possible prior acceptance (acceptance is unknowable; there is no ack) — until it
 ages out of retention. A local gRPC `Write()` returning true is never delivery
