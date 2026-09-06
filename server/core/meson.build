@@ -465,6 +465,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_stream_bridge.cpp',
     'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
+    'src/compliance_model.cpp',
     'src/compliance_routes.cpp',
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',

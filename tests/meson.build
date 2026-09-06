@@ -831,6 +831,7 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
