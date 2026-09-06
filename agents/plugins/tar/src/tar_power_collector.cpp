@@ -61,9 +61,8 @@
 #endif
 #include <windows.h>
 #include <powrprof.h> // PowerRegisterSuspendResumeNotification / PowerSettingRegisterNotification
-                      // (spawn-manifest-adjacent note: needs `-lPowrProf` linked at the
-                      // integrator's meson wiring -- this leg is source-only per this
-                      // package's boundaries, which forbid editing tar/meson.build)
+                      // (links `-lPowrProf`, wired in agents/plugins/tar/meson.build
+                      // alongside this source file, both added by this PR)
 #else
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002 rung 2)
 
@@ -109,12 +108,16 @@ std::int64_t next_power_snapshot_id() {
 }
 
 std::int64_t power_lookback_seconds(TarDatabase& db) {
-    try {
-        return power_clamp_lookback(
-            std::stoll(db.get_config("power_lookback_seconds", std::to_string(kPowerLookbackDefaultS))));
-    } catch (...) {
-        return kPowerLookbackDefaultS;
-    }
+    // tar_cursor.hpp rule 5: a source that cannot READ its lookback treats it
+    // as 0 (forward-only), never as the default -- db.get_config() returns
+    // the caller's default on ANY read failure, so calling it directly here
+    // turns a transient SQLite failure into a 7-day retrospective read on a
+    // host where the operator set 0 precisely because that is not lawful
+    // (PR #4017 review, blocker #1). lookback_seconds_or_forward_only()
+    // floors at 0 on any read failure or malformed value; clamp still applies
+    // the 90-day ceiling on top.
+    return power_clamp_lookback(
+        lookback_seconds_or_forward_only(db, "power", kPowerLookbackDefaultS));
 }
 
 } // namespace
@@ -200,7 +203,16 @@ CursorCollectResult mac_power_collect_impl(TarDatabase& db,
     // A truncated read forces the gap-and-re-baseline path even when no
     // re-enable did. If BOTH apply, the re-enable reason wins -- it is the more
     // specific statement and the operator needs the pause named.
+    //
+    // truncation_owns_gap tracks whether THIS branch is the one that set
+    // forced_gap_reason: truncation is a PERSISTENT condition (a host past the
+    // cap stays past it every tick until the log is trimmed), so its gap key
+    // must be time-independent -- see mac_power_gap_record_key_stable()
+    // (PR #4017 review, should-fix #5). A re-enable-owned reason is a one-shot
+    // event and keeps the existing now-keyed form.
+    bool truncation_owns_gap = false;
     if (truncated && !forced_gap_reason.has_value()) {
+        truncation_owns_gap = true;
         forced_gap_reason =
            "pmset -g log exceeded the agent's read cap, so this read could not be trusted "
            "relative to the stored position -- re-baselined forward; sleep/wake history beyond "
@@ -209,7 +221,7 @@ CursorCollectResult mac_power_collect_impl(TarDatabase& db,
 
     auto decision = decide_mac_power_collect(entries, had_prior_cursor, cursor,
                                              power_lookback_seconds(db), now_epoch_seconds(),
-                                             std::move(forced_gap_reason));
+                                             std::move(forced_gap_reason), truncation_owns_gap);
 
     // R-014: one snapshot_id per collection CYCLE (this tick), not per
     // event -- snapshot_id's documented purpose (PowerEvent, tar_db.hpp) is
@@ -287,27 +299,44 @@ public:
     // this flag set and retries next tick -- same rule-1 retry shape as
     // every other transient failure here).
     void on_enabled_changed(bool enabled) override {
-        if (enabled)
+        if (enabled) {
             owed_reenable_gap_.store(true, std::memory_order_release);
+        } else {
+            // Record the disable instant so the owed gap can name the window's
+            // bounds, matching the Windows/Linux legs (PR #4017 review,
+            // should-fix #6) -- previously this leg reported non-replay with
+            // no since/until at all.
+            disabled_at_ms_.store(now_epoch_ms(), std::memory_order_release);
+        }
     }
 
     CursorCollectResult collect(TarDatabase& db,
                                 const std::optional<std::string>& cursor_json) override {
         std::optional<std::string> forced_gap_reason;
         if (owed_reenable_gap_.load(std::memory_order_acquire)) {
+            const auto since_ms = disabled_at_ms_.load(std::memory_order_acquire);
             forced_gap_reason =
-                "power source re-enabled -- the disabled window's pmset history is never "
-                "replayed (forensic-pause contract)";
+                since_ms > 0
+                    ? ("power source re-enabled -- the disabled window (" +
+                       std::to_string(since_ms) +
+                       "ms until now, epoch ms) is never replayed (forensic-pause contract)")
+                    : "power source re-enabled -- the disabled window's pmset history is never "
+                      "replayed (forensic-pause contract)";
         }
         auto result = mac_power_collect_impl(db, cursor_json, run_, forced_gap_reason);
-        if (forced_gap_reason.has_value())
+        if (forced_gap_reason.has_value()) {
             owed_reenable_gap_.store(false, std::memory_order_release);
+            disabled_at_ms_.store(0, std::memory_order_release);
+        }
         return result;
     }
 
 private:
     RunSubprocessFn run_;
     std::atomic<bool> owed_reenable_gap_{false};
+    // 0 = no disable instant recorded (either never disabled, or already
+    // consumed by a successful re-enable gap report above).
+    std::atomic<std::int64_t> disabled_at_ms_{0};
 };
 
 } // namespace
@@ -384,6 +413,14 @@ public:
         // until both handles are armed.
         needs_rearm_.store(suspend_handle_ == nullptr || acdc_handle_ == nullptr,
                            std::memory_order_release);
+        // PR #4017 review, should-fix #4: stamp the ACTUAL arm instant, not
+        // the instant some later collect() tick happens to notice it armed --
+        // a restart's first tick can land tens of seconds after this, and a
+        // future restart-gap calculation reading the tick-time stamp back
+        // would overstate the outage by that much. Only stamp on the
+        // false->true transition so a still-armed retry doesn't move it.
+        if (suspend_handle_ && acdc_handle_ && !armed_at_ms_.has_value())
+            armed_at_ms_ = now_epoch_ms();
     }
 
     void stop() noexcept override {
@@ -407,6 +444,7 @@ public:
             stop();
             queue_.discard_all();
             disabled_at_ms_ = now_epoch_ms();
+            armed_at_ms_.reset(); // re-arm on the next enable gets a fresh stamp
             return;
         }
         // Re-enable: re-arm the live subscription and record that exactly
@@ -414,6 +452,13 @@ public:
         // has no `db` parameter to persist one directly -- see tar_cursor.hpp).
         // start() takes no db either, so re-registration happens lazily on
         // the next collect() if not already armed.
+        //
+        // Only the window's START is stamped here. The END is stamped in
+        // collect(), and ONLY once is_armed() actually confirms the
+        // subscription is live again -- stamping `until` at this instant (as
+        // this used to) closes the gap before start() has even run, so the
+        // table asserted continuous coverage for exactly the window it did
+        // NOT have (PR #4017 review, blocker #3).
         if (disabled_at_ms_.has_value()) {
             // WIDEN, never replace. Two disable->enable cycles inside one
             // collect interval would otherwise overwrite the first window
@@ -423,11 +468,8 @@ public:
             // two windows fall inside one tick the honest single report is the
             // span that covers both.
             const std::int64_t since = *disabled_at_ms_;
-            const std::int64_t until = now_epoch_ms();
             pending_gap_since_ms_ =
                pending_gap_since_ms_ ? std::min(*pending_gap_since_ms_, since) : since;
-            pending_gap_until_ms_ =
-               pending_gap_until_ms_ ? std::max(*pending_gap_until_ms_, until) : until;
             disabled_at_ms_.reset();
         }
         std::lock_guard<std::mutex> lock(handle_mu_);
@@ -439,6 +481,17 @@ public:
                                 const std::optional<std::string>& cursor_json) override {
         if (needs_rearm_.exchange(false, std::memory_order_acq_rel))
             start(db);
+
+        // Close a pending re-enable gap only once the subscription is
+        // ACTUALLY re-armed (PR #4017 review, blocker #3) -- see
+        // on_enabled_changed()'s comment. A tick where start() just failed
+        // (still not armed) leaves pending_gap_until_ms_ unset, so no gap row
+        // is emitted yet and the next tick's rearm attempt gets another
+        // chance; the ever-present unarmed_gap_reason below covers "no
+        // coverage right now" in the meantime.
+        if (pending_gap_since_ms_.has_value() && !pending_gap_until_ms_.has_value() &&
+            is_armed())
+            pending_gap_until_ms_ = armed_at_ms_.value_or(now_epoch_ms());
 
         bool had_prior_cursor = cursor_json.has_value();
         auto decoded = decode_subscription_ac_cursor("subscribed_since_ms",
@@ -464,8 +517,22 @@ public:
         } else if (decoded.subscription_present && decoded.subscription_valid &&
                    decoded.subscribed_since_ms > 0 &&
                    decoded.subscribed_since_ms < this_run_start_ms_) {
-            restart_gap_since_ms = decoded.subscribed_since_ms;
-            subscribed_since_ms = is_armed() ? now_epoch_ms() : decoded.subscribed_since_ms;
+            // PR #4017 review, should-fix #4: name the window from whichever
+            // lower bound is LATER (tighter/more honest) -- the persisted
+            // subscription-start can be days old, but power_last_collect_ts
+            // (tar_plugin.cpp, written by the driver after every committed
+            // tick) is a positive "we know this source was working AT LEAST
+            // until here" heartbeat. Taking the max never understates the
+            // gap, only avoids overstating it. A read failure/absent key
+            // yields 0 and falls back to the old bound unchanged.
+            std::int64_t last_collect_ms = 0;
+            try {
+                last_collect_ms = std::stoll(db.get_config("power_last_collect_ts", "0")) * 1000;
+            } catch (...) {
+            }
+            restart_gap_since_ms = std::max(decoded.subscribed_since_ms, last_collect_ms);
+            subscribed_since_ms =
+                is_armed() ? armed_at_ms_.value_or(now_epoch_ms()) : decoded.subscribed_since_ms;
         } else if (decoded.subscription_present && decoded.subscription_valid &&
                    decoded.subscribed_since_ms > 0) {
             subscribed_since_ms = decoded.subscribed_since_ms; // continuous, healthy
@@ -508,6 +575,13 @@ public:
         tick_in.last_ac = last_ac;
         tick_in.pending_gap_since_ms = pending_gap_since_ms_;
         tick_in.pending_gap_until_ms = pending_gap_until_ms_;
+        // Captured BEFORE the post-commit reset below: a pending gap whose
+        // `until` is still unset (not yet re-armed) must survive this tick --
+        // resetting pending_gap_since_ms_ unconditionally here would silently
+        // drop the gap's start marker before it was ever reported, on any
+        // tick that commits successfully for OTHER reasons while still
+        // unarmed (PR #4017 review, blocker #3 follow-through).
+        const bool gap_reported_this_tick = pending_gap_until_ms_.has_value();
         tick_in.subscription_gap_reason = subscription_gap_reason;
         tick_in.unarmed_gap_reason = unarmed_gap_reason;
         tick_in.unarmed_since_ms = subscribed_since_ms;
@@ -573,8 +647,10 @@ public:
         // can never be removed here, regardless of any overflow eviction in
         // between.
         queue_.ack_through(batch.last_seq);
-        pending_gap_since_ms_.reset();
-        pending_gap_until_ms_.reset();
+        if (gap_reported_this_tick) {
+            pending_gap_since_ms_.reset();
+            pending_gap_until_ms_.reset();
+        }
         last_reported_dropped_ = dropped_now;
 
         CursorCollectResult result;
@@ -600,8 +676,14 @@ private:
                 return ERROR_SUCCESS;
             if (type == PBT_APMSUSPEND) {
                 self->queue_.push(RawPowerItem{self->next_seq(), now_epoch_seconds(), "sleep"});
+                self->wake_pending_.store(true, std::memory_order_release);
             } else if (type == PBT_APMRESUMESUSPEND || type == PBT_APMRESUMEAUTOMATIC) {
-                self->queue_.push(RawPowerItem{self->next_seq(), now_epoch_seconds(), "wake"});
+                // Windows can broadcast BOTH resume types for one real wake
+                // (PR #4017 review, minor #8) -- only the first resume
+                // notification after a suspend produces a row; a second one
+                // for the same wake is suppressed rather than double-counted.
+                if (self->wake_pending_.exchange(false, std::memory_order_acq_rel))
+                    self->queue_.push(RawPowerItem{self->next_seq(), now_epoch_seconds(), "wake"});
             }
         } catch (...) {
             // R-006: an OS C callback boundary must never let an exception
@@ -642,8 +724,15 @@ private:
     HPOWERNOTIFY suspend_handle_{nullptr};
     HPOWERNOTIFY acdc_handle_{nullptr};
     std::atomic<bool> needs_rearm_{false};
+    // Suppresses a second "wake" row when Windows broadcasts both
+    // PBT_APMRESUMESUSPEND and PBT_APMRESUMEAUTOMATIC for one real resume
+    // (minor #8) -- set on suspend, consumed by the first resume after it.
+    std::atomic<bool> wake_pending_{false};
     std::atomic<bool> enabled_{true}; // seeded from persisted config in start()
     std::optional<std::int64_t> disabled_at_ms_;
+    // Set by start() only on the false->true arm transition; cleared on
+    // disable. The honest "actually armed at" instant (should-fix #4).
+    std::optional<std::int64_t> armed_at_ms_;
     std::optional<std::int64_t> pending_gap_since_ms_;
     std::optional<std::int64_t> pending_gap_until_ms_;
     std::size_t last_reported_dropped_{0};
@@ -737,7 +826,20 @@ public:
         if (bus_thread_.joinable())
             return;
         stop_requested_.store(false, std::memory_order_release);
-        bus_thread_ = std::thread(&LinuxPowerCursorSource::bus_loop, this);
+        // tar_cursor.hpp: "start() ... throw[s] nothing at all" -- std::thread's
+        // constructor can throw std::system_error (resource_unavailable_try_again)
+        // if the OS refuses to create the thread. The driver's generic catch
+        // backstops it either way, but start() should honor its own contract
+        // rather than rely on that (PR #4017 review, minor #11): treat a failed
+        // spawn exactly like a failed sd_bus_open_system -- arm_failed_ so
+        // collect() retries next tick, no exception escapes.
+        try {
+            bus_thread_ = std::thread(&LinuxPowerCursorSource::bus_loop, this);
+        } catch (const std::exception& e) {
+            spdlog::error("TAR: power std::thread spawn failed ({}) -- will retry next tick",
+                          e.what());
+            arm_failed_.store(true, std::memory_order_release);
+        }
 #endif
     }
 
@@ -756,8 +858,14 @@ public:
             stop();
             queue_.discard_all();
             disabled_at_ms_ = now_epoch_ms();
+            armed_at_ms_.store(0, std::memory_order_release); // fresh stamp on next arm
             return;
         }
+        // Only the window's START is stamped here. The END is stamped in
+        // collect(), and ONLY once is_armed() confirms sd_bus_match_signal
+        // actually re-registered -- stamping `until` at this instant (as this
+        // used to) closes the gap before the bus thread has even respawned
+        // (PR #4017 review, blocker #3, same defect as the Windows leg).
         if (disabled_at_ms_.has_value()) {
             // WIDEN, never replace. Two disable->enable cycles inside one
             // collect interval would otherwise overwrite the first window
@@ -767,11 +875,8 @@ public:
             // two windows fall inside one tick the honest single report is the
             // span that covers both.
             const std::int64_t since = *disabled_at_ms_;
-            const std::int64_t until = now_epoch_ms();
             pending_gap_since_ms_ =
                pending_gap_since_ms_ ? std::min(*pending_gap_since_ms_, since) : since;
-            pending_gap_until_ms_ =
-               pending_gap_until_ms_ ? std::max(*pending_gap_until_ms_, until) : until;
             disabled_at_ms_.reset();
         }
         needs_rearm_.store(true, std::memory_order_release);
@@ -785,6 +890,14 @@ public:
             needs_rearm_.store(true, std::memory_order_release);
         if (needs_rearm_.exchange(false, std::memory_order_acq_rel))
             start(db);
+
+        // Close a pending re-enable gap only once actually re-armed
+        // (PR #4017 review, blocker #3) -- see on_enabled_changed()'s comment.
+        if (pending_gap_since_ms_.has_value() && !pending_gap_until_ms_.has_value() &&
+            is_armed()) {
+            const auto a = armed_at_ms_.load(std::memory_order_acquire);
+            pending_gap_until_ms_ = a != 0 ? a : now_epoch_ms();
+        }
 
         bool had_prior_cursor = cursor_json.has_value();
         auto decoded =
@@ -811,8 +924,22 @@ public:
         } else if (decoded.subscription_present && decoded.subscription_valid &&
                    decoded.subscribed_since_ms > 0 &&
                    decoded.subscribed_since_ms < this_run_start_ms_) {
-            restart_gap_since_ms = decoded.subscribed_since_ms;
-            armed_since_ms = is_armed() ? now_epoch_ms() : decoded.subscribed_since_ms;
+            // PR #4017 review, should-fix #4: same fix as the Windows leg --
+            // name the window from whichever lower bound is LATER (tighter),
+            // using power_last_collect_ts as a positive "known working until
+            // here" heartbeat instead of trusting only the possibly-stale
+            // persisted subscription-start.
+            std::int64_t last_collect_ms = 0;
+            try {
+                last_collect_ms = std::stoll(db.get_config("power_last_collect_ts", "0")) * 1000;
+            } catch (...) {
+            }
+            restart_gap_since_ms = std::max(decoded.subscribed_since_ms, last_collect_ms);
+            {
+                const auto a = armed_at_ms_.load(std::memory_order_acquire);
+                armed_since_ms = is_armed() ? (a != 0 ? a : now_epoch_ms())
+                                            : decoded.subscribed_since_ms;
+            }
         } else if (decoded.subscription_present && decoded.subscription_valid &&
                    decoded.subscribed_since_ms > 0) {
             armed_since_ms = decoded.subscribed_since_ms;
@@ -864,6 +991,10 @@ public:
         tick_in.last_ac = last_ac;
         tick_in.pending_gap_since_ms = pending_gap_since_ms_;
         tick_in.pending_gap_until_ms = pending_gap_until_ms_;
+        // Captured BEFORE the post-commit reset below -- see the Windows
+        // leg's identical guard for the full rationale (PR #4017 review,
+        // blocker #3 follow-through).
+        const bool gap_reported_this_tick = pending_gap_until_ms_.has_value();
         tick_in.subscription_gap_reason = subscription_gap_reason;
         tick_in.unarmed_gap_reason = unarmed_gap_reason;
         tick_in.unarmed_since_ms = armed_since_ms;
@@ -917,8 +1048,10 @@ public:
         // P-003 ack-after-commit; see the Windows leg's identical call site
         // for the identity-based ack_through() rationale (R-005).
         queue_.ack_through(batch.last_seq);
-        pending_gap_since_ms_.reset();
-        pending_gap_until_ms_.reset();
+        if (gap_reported_this_tick) {
+            pending_gap_since_ms_.reset();
+            pending_gap_until_ms_.reset();
+        }
         last_reported_dropped_ = dropped_now;
 
         CursorCollectResult result;
@@ -975,6 +1108,7 @@ private:
         // The match is registered: from here a PrepareForSleep signal can
         // actually reach us, and only now is this source honestly "armed".
         arm_confirmed_.store(true, std::memory_order_release);
+        armed_at_ms_.store(now_epoch_ms(), std::memory_order_release); // should-fix #4
         while (!stop_requested_.load(std::memory_order_acquire)) {
             // R-015: a negative return is a real bus error (e.g. logind/
             // dbus-daemon disconnected mid-run), not a transient "nothing
@@ -988,6 +1122,7 @@ private:
                               process_rc);
                 arm_failed_.store(true, std::memory_order_release);
                 arm_confirmed_.store(false, std::memory_order_release);
+                armed_at_ms_.store(0, std::memory_order_release);
                 break;
             }
             if (process_rc > 0)
@@ -1002,6 +1137,7 @@ private:
                               wait_rc);
                 arm_failed_.store(true, std::memory_order_release);
                 arm_confirmed_.store(false, std::memory_order_release);
+                armed_at_ms_.store(0, std::memory_order_release);
                 break;
             }
         }
@@ -1048,6 +1184,9 @@ private:
     std::atomic<bool> arm_failed_{false};
     // Set by bus_loop() ONLY after sd_bus_match_signal succeeds.
     std::atomic<bool> arm_confirmed_{false};
+    // The honest "actually armed at" instant, stamped by bus_loop() alongside
+    // arm_confirmed_; 0 = not currently armed (should-fix #4).
+    std::atomic<std::int64_t> armed_at_ms_{0};
     std::atomic<bool> enabled_{true}; // seeded from persisted config in start() -- R-002
     std::optional<std::int64_t> disabled_at_ms_;
     std::optional<std::int64_t> pending_gap_since_ms_;

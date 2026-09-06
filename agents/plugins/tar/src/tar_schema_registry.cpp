@@ -992,7 +992,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // seconds (ADR-0020).
         //
         // os_support: mechanisms are the 2026-09-04 measured bindings
-        // (hardware-probe measurement, Wave 6); collectors land wave 2.
+        // (hardware-probe measurement, Wave 6); the collector ships in this
+        // same PR (tar_power_collector.cpp) -- PR #4017 review, minor #12.
         {
             .name = "power",
             .dollar_name = "Power",

@@ -261,6 +261,19 @@ inline std::string mac_power_gap_record_key(std::int64_t ts, const std::string& 
     return "pmset:gap:" + std::to_string(ts) + ":" + power_hex8(power_crc32(reason));
 }
 
+/// Record key for a PERSISTENT-CONDITION gap (currently: pmset output stuck
+/// truncated) -- deliberately time-INDEPENDENT, unlike mac_power_gap_record_key
+/// above. A host whose pmset log stays past the read cap re-derives the exact
+/// same forced_gap_reason on every tick; keying on `now` (as every other gap
+/// does) makes each tick's row distinct and the table fills with one row per
+/// tick forever. Keying on the condition alone means the FIRST tick's row
+/// wins and the store's record_key dedupe collapses every later tick onto it
+/// -- one standing row, matching the intent already stated in
+/// tar_power_collector.cpp's truncation comment.
+inline std::string mac_power_gap_record_key_stable(const std::string& reason) {
+    return "pmset:gap:stable:" + power_hex8(power_crc32(reason));
+}
+
 // ── macOS cursor: {"v":1,"last_ts":...,"last_line_crc":...,"occurrence":...,
 // "last_ac":"ac|batt|unknown"} (P-007 exact-tail model). ────────────────────
 
@@ -474,12 +487,18 @@ struct MacPowerCollectDecision {
 ///    tick instead behaves exactly like a rule-2 lost cursor: one
 ///    capture_gap using this reason, re-baselined at the current log end,
 ///    CursorOutcome::CursorLost.
+///  - `forced_gap_stable_key`: true only for a PERSISTENT condition (pmset
+///    output stuck truncated) whose forced_gap_reason text is re-derived
+///    identically every tick -- see mac_power_gap_record_key_stable() above.
+///    False (the default) covers the one-shot re-enable gap, which legitimately
+///    keys on `now` since it fires (and clears) at most once per disable window.
 inline MacPowerCollectDecision decide_mac_power_collect(const std::vector<PmsetLogEntry>& entries,
                                                          bool had_prior_cursor,
                                                          const std::optional<MacPowerCursor>& cursor,
                                                          std::int64_t lookback_seconds,
                                                          std::int64_t now,
-                                                         std::optional<std::string> forced_gap_reason = std::nullopt) {
+                                                         std::optional<std::string> forced_gap_reason = std::nullopt,
+                                                         bool forced_gap_stable_key = false) {
     MacPowerCollectDecision out;
     auto occurrences = compute_pmset_occurrences(entries);
 
@@ -543,8 +562,10 @@ inline MacPowerCollectDecision decide_mac_power_collect(const std::vector<PmsetL
     // whether or not a cursor exists.
     if (forced_gap_reason.has_value()) {
         out.cursor_lost = true;
-        out.events.push_back(PowerEventDraft{now, "capture_gap", *forced_gap_reason,
-                                             mac_power_gap_record_key(now, *forced_gap_reason)});
+        const std::string key = forced_gap_stable_key
+                                     ? mac_power_gap_record_key_stable(*forced_gap_reason)
+                                     : mac_power_gap_record_key(now, *forced_gap_reason);
+        out.events.push_back(PowerEventDraft{now, "capture_gap", *forced_gap_reason, key});
         rebaseline_at_log_end(cursor.has_value() ? cursor->last_ac : std::string("unknown"));
         out.detail = *forced_gap_reason;
         return out;

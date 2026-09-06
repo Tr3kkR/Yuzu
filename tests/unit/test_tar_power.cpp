@@ -43,6 +43,7 @@
 #include "test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <sqlite3.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -53,6 +54,8 @@
 #ifdef __APPLE__
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <chrono>
+#include <cstdio>
+#include <ctime>
 #include <functional>
 #endif
 
@@ -1180,6 +1183,56 @@ TEST_CASE("mac_power_collect_impl: an output-cap truncation reports a gap and re
     auto c = t.db.get_cursor("power");
     REQUIRE(c.has_value());
     CHECK(c->has_value());
+}
+
+TEST_CASE("mac_power_collect_impl: an unreadable power_lookback_seconds fails CLOSED -- the "
+          "first collect is forward-only, NOT a 7-day replay",
+          "[tar_power][collect][macos][lookback]") {
+    // PR #4017 review, blocker #1: power_lookback_seconds() used to call
+    // db.get_config() directly, which returns the CALLER'S DEFAULT on any read
+    // failure -- so a corrupt/unreadable config table produced a 7-day
+    // retrospective replay instead of the forward-only behaviour this privacy
+    // control promises. Prove the fix end-to-end through the real collector
+    // entry point (test_tar_cursor.cpp already covers
+    // lookback_seconds_or_forward_only() itself in isolation).
+    auto t = make_test_db();
+
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(raw, "DROP TABLE tar_config", nullptr, nullptr, nullptr) == SQLITE_OK);
+    sqlite3_close(raw);
+
+    // A "Wake" line at (approximately) the current instant: trivially inside
+    // ANY positive lookback window, so whether this line gets emitted is a
+    // clean signal of whether the lookback resolved to 0 (forward-only, the
+    // fix) or 604800 (the old fails-open default) -- no need to depend on the
+    // wall-clock date the test happens to run on.
+    const auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count();
+    std::time_t now_time = static_cast<std::time_t>(now_epoch);
+    std::tm utc{};
+#ifdef _WIN32
+    gmtime_s(&utc, &now_time);
+#else
+    gmtime_r(&now_time, &utc);
+#endif
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d +0000", utc.tm_year + 1900,
+                 utc.tm_mon + 1, utc.tm_mday, utc.tm_hour, utc.tm_min, utc.tm_sec);
+    const std::string line = std::string(buf) + " Wake                \tnow";
+
+    auto fake_run = [&](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.exit_code = 0;
+        res.lines = {line};
+        return res;
+    };
+
+    auto result = mac_power_collect_impl(t.db, std::nullopt, fake_run);
+    CHECK(result.outcome == CursorOutcome::Baseline);
+    CHECK(result.events_emitted == 0); // forward-only: the "Wake" line above must NOT replay
 }
 
 TEST_CASE("mac_power_collect_impl: a DEADLINE is still transient and still throws",
