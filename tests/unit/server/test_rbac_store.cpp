@@ -170,8 +170,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     auto types = store.list_securable_types();
     // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
-    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
-    REQUIRE(types.size() == 27);
+    // +UploadGrant (PR1.9a, peer finding PLAN-001) +PowerManagement (Wave 6)
+    // +Forensics (28th) +Decommission (29th, Wave 7 PR7.2) = 29.
+    REQUIRE(types.size() == 29);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -197,6 +198,8 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("UploadGrant"));  // PR1.9a: upload-grant mint/revoke lifecycle
     CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
                                    // cut away from the over-broad Security:Read
+    CHECK(has("Forensics")); // Wave 7 forensics class (execution_artifacts, app_usage)
+    CHECK(has("Decommission")); // Wave 7 PR7.2: whole-device erasure cascade
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -231,17 +234,18 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 27 types * 5 CRUD ops = 135 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 136), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 137), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 138 permissions total. Push, Attest, and
+    // 29 types * 5 CRUD ops = 145 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 146), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 147), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 148 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (27th: PowerManagement, Wave 6
-    // power_health set_power_plan; 26th-24th: UploadGrant/
+    // rationale in rbac_store.cpp seed_defaults(). (29th: Decommission, Wave 7
+    // PR7.2; 28th: Forensics, Wave 7 forensics class; 27th: PowerManagement,
+    // Wave 6 power_health set_power_plan; 26th-24th: UploadGrant/
     // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
     // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
     // SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 138);
+    CHECK(perms.size() == 148);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -1179,12 +1183,17 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 
     auto perms = store.get_role_permissions("ITServiceOwner");
     // 18 types * 5 CRUD ops = 90 permissions, plus the targeted Push grant on
-    // GuaranteedState = 91 permissions total. Push is deliberately NOT
-    // cross-seeded on non-Guardian securables — see the rationale in
+    // GuaranteedState = 91 permissions, plus the targeted Decommission:Delete
+    // grant (Wave 7 PR7.2 — the promoted erasure securable; ITSO could
+    // decommission under the old SoftwareLicensing∧Inventory∧
+    // GuaranteedState:Delete conjunction and still can) = 92 permissions
+    // total. Push and the Decommission grant are deliberately NOT
+    // cross-seeded on other securables — see the rationale in
     // rbac_store.cpp seed_defaults(). (18th type: SoftwareLicensing, ADR-0024 —
     // ITServiceOwner full CRUD per the D-9 matrix.)
-    CHECK(perms.size() == 91);
+    CHECK(perms.size() == 92);
     size_t push_count = 0;
+    size_t decommission_count = 0;
     for (auto& p : perms) {
         CHECK(p.effect == "allow");
         // Should not include UserManagement, Security, ApiToken
@@ -1195,8 +1204,13 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
             ++push_count;
             CHECK(p.securable_type == "GuaranteedState");
         }
+        if (p.securable_type == "Decommission") {
+            ++decommission_count;
+            CHECK(p.operation == "Delete");
+        }
     }
     CHECK(push_count == 1);
+    CHECK(decommission_count == 1);
 }
 
 // ── check_scoped_permission ──────────────────────────────────────────────────

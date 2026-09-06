@@ -324,6 +324,40 @@ Administrator-only, unlike `PluginConfig`/`UploadGrant` where Operator gets read
 day-to-day triage. No other role (Viewer, ITServiceOwner, ApiTokenManager, Reviewer) is touched by
 this PR.
 
+## 4. Wave 7 PR7.2: `Forensics` and `Decommission` (28th/29th securables)
+
+Two more securables appended to `rbac_store.cpp`'s `types[]` (27→29) and its `mcp_server.cpp`
+mirror (`kRbacSecurables`):
+
+| Securable | Purpose | Consumed operations | Roles |
+|---|---|---|---|
+| `Forensics` | Read-only forensic artefact reads (ShimCache/AmCache/Prefetch, application usage). Every catalogue row on it is `ExecuteGate::AdminOrApproval` AND single-target (below) — Administrator only. | `Read`, plus the unused CRUD-loop ops (harmless, keeps the loop uniform) | Administrator (CRUD via the loop); deliberately ABSENT from the Viewer read-list — a forensic read is never a Viewer-tier operation |
+| `Decommission` | The whole-device erasure cascade (`DELETE /api/v1/sle/agents/{id}`). Replaces the three-way `SoftwareLicensing`∧`Inventory`∧`GuaranteedState:Delete` conjunction ADR-0024 Decision 9 originally rejected promoting a dedicated securable for. | `Delete` is the ONLY consumed operation — `Read`/`Write`/`Execute`/`Approve` are meaningless on this securable and are never widened onto it | Administrator (CRUD via the loop, PowerManagement/PluginConfig precedent); ITServiceOwner gets a TARGETED `Decommission:Delete` grant only (preserves the population that could decommission under the old conjunction — ITServiceOwner held CRUD on all three of its members) |
+
+`Decommission` has **no MCP consumer by design** — the erasure verb is REST-only (ADR-1005
+twin-existence exception #2102). It is still listed in `kRbacSecurables` purely so the
+seeded-catalogues binding test (`test_rbac_store.cpp`, "seeded catalogues match the MCP C8
+validator mirrors") keeps the two mirrors equal; no MCP tool or dispatch path ever checks it.
+
+**Forensics is SINGLE-TARGET, not Destructive-classified.** `dispatch_destructive_gate.hpp`'s
+`requires_explicit_targets` extends the existing Destructive-class targeting rule to any row on
+the `Forensics` securable: exactly one explicit, in-scope `agent_id`, no `scope` key (including
+`"__all__"`) — a fan-out (zero ids, more than one id, or any scope) is refused with a distinct
+message (`kForensicUntargetedMessage`) from the Destructive refusal
+(`kDestructiveUntargetedMessage`, unchanged byte-for-byte). A Forensics row that passes
+(`Targeted`) is still run through `confine_destructive_targets`: **mgmt-group confinement APPLIES
+to the read** — a forensic read never reaches an agent outside the operator's visible set, and the
+existing 404 `no reachable in-scope agent` answers an out-of-group id, same as a Destructive row.
+`ScheduleRunner`'s approval-gated fan-out (D3 in that header) is unchanged by this addition: an
+approved scheduled forensics read remains permitted by the schedule-approval posture, not by this
+gate.
+
+**`execution_artifacts` (the first Forensics-class plugin) ships default-off.**
+`PluginConfigStore::seed_kill_switch_default_off` seeds a plugin-level kill-switch row
+(`enabled=false`, `set_by="system"`) at boot, `ON CONFLICT (scope_key) DO NOTHING` so it never
+clobbers an operator's own kill-switch decision. An operator enables it explicitly via
+`PUT /api/v1/plugin-config/execution_artifacts/kill-switch`.
+
 ## Testing
 
 `tests/unit/server/test_authz_model.cpp` covers:

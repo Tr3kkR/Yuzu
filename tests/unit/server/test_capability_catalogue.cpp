@@ -50,7 +50,7 @@ namespace {
 // updating too — that is the intended failure mode: a securable this
 // catalogue references but rbac_store.cpp stops seeding should fail loudly,
 // not silently pass.
-constexpr std::array<std::string_view, 26> kSeededSecurableTypes{{
+constexpr std::array<std::string_view, 28> kSeededSecurableTypes{{
     "Infrastructure",
     "UserManagement",
     "InstructionDefinition",
@@ -77,6 +77,8 @@ constexpr std::array<std::string_view, 26> kSeededSecurableTypes{{
     "PluginSecret",
     "UploadGrant",
     "PowerManagement",
+    "Forensics",
+    "Decommission",
 }};
 
 // Mirrors rbac_store.cpp's `seed_defaults()` `ops[]` — the full seven-value

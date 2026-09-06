@@ -556,7 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 27> types = {
+    const std::array<std::string_view, 29> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -583,7 +583,20 @@ void RbacStore::seed_defaults() {
         // mutating action). Administrator-only via the CRUD loop below —
         // same PluginConfig/UploadGrant precedent, deliberately absent from
         // the explicit Viewer read-list further down this function.
-        "PowerManagement"};
+        "PowerManagement",
+        // Wave 7 forensics class: execution_artifacts, app_usage, later
+        // shell_history/yara_scan. Administrator CRUD via the loop below;
+        // deliberately ABSENT from the Viewer read-list.
+        "Forensics",
+        // Wave 7 PR7.2: the device-level securable ADR-0024 Decision 9
+        // promoted when the erasure gate's conjunction reached a fourth
+        // securable (app_usage_store, Forensics). `Decommission:Delete` is
+        // the ONLY consumed operation (the DELETE /sle/agents/{id} cascade,
+        // sle_routes.cpp); Administrator gets CRUD via the loop (the
+        // PowerManagement/PluginConfig precedent — unused ops are harmless
+        // and keep the loop uniform); ITServiceOwner gets a TARGETED
+        // Decommission:Delete grant below (see that grant's comment).
+        "Decommission"};
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
@@ -595,6 +608,13 @@ void RbacStore::seed_defaults() {
          "'gates the /api/v1/sle/* detected-licence reads and the agent-decommission erasure; "
          "the /inventory software catalog remains under Inventory:Read' "
          "WHERE name = 'SoftwareLicensing' AND description = ''");
+    // Wave 7 PR7.2: describe the Decommission securable — set only when
+    // empty, same shape as the SoftwareLicensing UPDATE above.
+    exec("UPDATE rbac_store.securable_types SET description = "
+         "'gates the whole-device erasure cascade behind DELETE "
+         "/api/v1/sle/agents/{id}; per-device scoped; Delete is the only "
+         "consumed operation' "
+         "WHERE name = 'Decommission' AND description = ''");
 
     // Operations. "Rotate" (dev P2 #11, SOC 2 CC6.3, merged from origin/dev):
     // ApiToken-specific self-service rotation
@@ -746,6 +766,13 @@ void RbacStore::seed_defaults() {
             grant("ITServiceOwner", t, o);
     }
     grant("ITServiceOwner", "GuaranteedState", "Push");
+    // Wave 7 PR7.2: preserves the SEEDED population that could decommission
+    // under the old SoftwareLicensing∧Inventory∧GuaranteedState:Delete
+    // conjunction (ITSO held CRUD on all three above) — scoped per-device
+    // by the route's gate as before. Deliberately NOT in the ITSO crud_ops
+    // list above: Read/Write/Execute/Approve on Decommission are
+    // meaningless — do not widen.
+    grant("ITServiceOwner", "Decommission", "Delete");
 
     // Viewer: read on all except Infrastructure.
     // #2376 (task A) — Viewer held Security:Read (the only non-Administrator
