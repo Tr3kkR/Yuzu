@@ -49,9 +49,18 @@ RAII-wrapped" kind exists in this diff — there is no manual cleanup to wrap.
   code) TSan's own deadlock/lock-order detection is positioned to catch, and the new regression
   test (`Pre-start replay fault delivery does not deadlock an inline self-disarm`) additionally
   proves it empirically via a real bounded-hang check under plain, TSan, and ASan.
-- **ASan** (against the properly-instrumented `x64-linux-asan` triplet): clean, except the
-  pre-existing, independently-confirmed-present-on-unmodified-`origin/dev` flake class in
-  `test_guardian_engine_spark_reconcile.cpp` (18-27 assertions, timing-sensitive under ASan
-  overhead) — not introduced by this diff.
+- **ASan** (against the properly-instrumented `x64-linux-asan` triplet): clean, except a
+  pre-existing flake class in `test_guardian_engine_spark_reconcile.cpp` — confirmed, via a
+  dedicated re-verification pass (run after merging `origin/dev` into this branch, NOT
+  after this PR's own merge - PR-2d has not yet been pushed or opened as a PR), to be
+  `spark_spec_from_rule()`'s Service-type
+  `service_name` param lookup (`guardian_spark_bridge.hpp:146-150`) intermittently reading
+  back empty on ANY `make_service_rule(...)`-based test, ASan-only (10/10 clean on a plain
+  build, ~1/3 failure rate under ASan), reproduced identically on an unmodified sibling test
+  this PR never touched (`"a supported type arms via spark, never in legacy guards_"`), and
+  NOT a caught ASan memory-safety violation (no `ERROR: AddressSanitizer` report ever
+  printed across dozens of reproductions) — pointing to a logic-level race ASan's overhead
+  makes more likely to manifest, not memory corruption ASan itself would catch. Filed as
+  **#4067**; not introduced by this diff, not fixed here.
 - No new resource type in this diff falls outside what plain + TSan + ASan already cover; no
   additional sanitizer configuration was needed.
