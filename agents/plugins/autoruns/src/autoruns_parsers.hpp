@@ -1,0 +1,1018 @@
+/**
+ * autoruns_parsers.hpp — pure parsing and formatting for the autoruns plugin.
+ *
+ * Everything in this header is a PURE function: no OS call, no file read, no
+ * process spawn. Every OS-facing byte a per-OS leg (P12/P13/P14) reads is
+ * handed to something here already extracted into plain strings/bytes, which
+ * is what makes every parser fixture-testable without an OS harness.
+ *
+ * ROW SCHEMA (fixed-width; "-" where a value is inapplicable to that row):
+ *   autorun|<source_id>|<catalog_version>|<location>|<entry>|<target>|<args>|
+ *          <enabled>|<scope>|<user>|<signed>|<mtime>
+ *   source|<id>|<supported|constrained|unsupported>|<row_count>|<reason>
+ *
+ * ESCAPING. This plugin does NOT use yuzu::util::safe_output_field's
+ * backslash-pipe convention. Untrusted fields here (location, entry, target,
+ * args, user) fold a literal '|' to U+2502 (BOX DRAWINGS LIGHT VERTICAL, │)
+ * and CR/LF to a space, which keeps every row a fixed field count under a
+ * naive split('|') -- deliberate, because a positional consumer reading
+ * `autorun|` rows should never need an escape-aware splitter to find field 7
+ * (enabled). The substitution is lossy (a literal │ in source data is
+ * indistinguishable from an escaped │), which is an accepted trade for
+ * positional simplicity -- the same trade-off class as safe_output_field's
+ * own documented lossiness on backslashes.
+ */
+#pragma once
+
+#include "autoruns_catalog.hpp"
+
+#include <yuzu/plugin.h> // YuzuSupportLevel
+
+#include <cctype>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace yuzu::autoruns {
+
+// ── fixed vocabularies ───────────────────────────────────────────────────
+
+/// `unmodelled` is a DIFFERENT fact from `unknown`: unmodelled means the
+/// input was in a shape this parser deliberately does not decode (e.g. a
+/// StartupApproved blob whose byte0 is neither 0x02 nor 0x03, or a truncated
+/// one) -- the parser saw the byte and chose not to guess. `unknown` means no
+/// enablement signal exists on this source at all (e.g. a launchd plist with
+/// no `Disabled` key: launchd's own documented default is enabled, but this
+/// plugin reports enabled once it has actually reasoned about the default --
+/// `unknown` is reserved for sources with no default to reason from).
+enum class Enabled { enabled, disabled, unmodelled, unknown };
+
+constexpr std::string_view enabled_token(Enabled e) noexcept {
+    switch (e) {
+    case Enabled::enabled:    return "enabled";
+    case Enabled::disabled:   return "disabled";
+    case Enabled::unmodelled: return "unmodelled";
+    case Enabled::unknown:    return "unknown";
+    }
+    return "unknown";
+}
+
+enum class Scope { system, user };
+
+constexpr std::string_view scope_token(Scope s) noexcept {
+    switch (s) {
+    case Scope::system: return "system";
+    case Scope::user:   return "user";
+    }
+    return "system";
+}
+
+/// Deliberately narrow (Decision, PR11.4). `apple_system` is a PATH judgement
+/// only -- anything under /System/Library is Apple's, verbatim, with no code-
+/// signature check performed. `not_checked` is the honest default everywhere
+/// else: this plugin has not asked SecStaticCode anything. A future PR11.4
+/// wiring a real signature check adds values here; it does not repurpose
+/// these two.
+enum class Signed { apple_system, not_checked, unmodelled };
+
+constexpr std::string_view signed_token(Signed s) noexcept {
+    switch (s) {
+    case Signed::apple_system: return "apple_system";
+    case Signed::not_checked:  return "not_checked";
+    case Signed::unmodelled:   return "unmodelled";
+    }
+    return "not_checked";
+}
+
+/// macOS-only judgement, callable on any OS (it is pure path text matching --
+/// no filesystem call). Anything not under /System/Library is `not_checked`.
+inline Signed signed_from_path(std::string_view path) noexcept {
+    constexpr std::string_view kSystemPrefix = "/System/Library/";
+    if (path.size() >= kSystemPrefix.size() && path.substr(0, kSystemPrefix.size()) == kSystemPrefix)
+        return Signed::apple_system;
+    return Signed::not_checked;
+}
+
+constexpr std::string_view support_token(YuzuSupportLevel s) noexcept {
+    switch (s) {
+    case YUZU_SUPPORT_SUPPORTED:   return "supported";
+    case YUZU_SUPPORT_CONSTRAINED: return "constrained";
+    default:                       return "unsupported"; // UNSUPPORTED / PLANNED / UNDECLARED
+    }
+}
+
+// ── the row, and its formatter ───────────────────────────────────────────
+
+struct Row {
+    SourceId source_id;
+    int catalog_version;
+    std::string location;
+    std::string entry;
+    std::string target;
+    std::string args;
+    Enabled enabled;
+    Scope scope;
+    std::string user;
+    Signed signed_state;
+    std::int64_t mtime;
+};
+
+/// Fold '|' -> U+2502 and CR/LF -> space. See the file banner for why this is
+/// a different convention from yuzu::util::safe_output_field.
+inline std::string sanitize_autorun_field(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char ch : value) {
+        if (ch == '\r' || ch == '\n')
+            out += ' ';
+        else if (ch == '|')
+            out += "\u2502";
+        else
+            out += ch;
+    }
+    return out;
+}
+
+/// autorun|<source_id>|<catalog_version>|<location>|<entry>|<target>|<args>|
+///        <enabled>|<scope>|<user>|<signed>|<mtime>
+inline std::string format_row(const Row& row) {
+    std::string out = "autorun|";
+    out += source_id_string(row.source_id);
+    out += '|';
+    out += std::to_string(row.catalog_version);
+    out += '|';
+    out += sanitize_autorun_field(row.location);
+    out += '|';
+    out += sanitize_autorun_field(row.entry);
+    out += '|';
+    out += sanitize_autorun_field(row.target);
+    out += '|';
+    out += sanitize_autorun_field(row.args);
+    out += '|';
+    out += enabled_token(row.enabled);
+    out += '|';
+    out += scope_token(row.scope);
+    out += '|';
+    out += sanitize_autorun_field(row.user);
+    out += '|';
+    out += signed_token(row.signed_state);
+    out += '|';
+    out += std::to_string(row.mtime);
+    return out;
+}
+
+/// source|<id>|<supported|constrained|unsupported>|<row_count>|<reason>
+/// `rows` is std::nullopt for a DECLARED-only status (the `catalog` action,
+/// which never executed a read) -- rendered "-", distinct from a REAL zero
+/// count from an actual (constrained-or-supported) collection attempt that
+/// genuinely found nothing.
+inline std::string format_source_status(SourceId id, YuzuSupportLevel support,
+                                        std::optional<std::size_t> rows,
+                                        std::string_view reason) {
+    std::string out = "source|";
+    out += source_id_string(id);
+    out += '|';
+    out += support_token(support);
+    out += '|';
+    out += rows ? std::to_string(*rows) : "-";
+    out += '|';
+    out += sanitize_autorun_field(reason);
+    return out;
+}
+
+// ── UTF-16LE decode (pure; needed for reg(1)-export hex(2) blobs) ────────
+
+/// Decodes UTF-16LE bytes to UTF-8, stopping at a trailing NUL code unit if
+/// present (registry string data is NUL-terminated within its declared
+/// length). BMP-only: a real autorun target is never a supplementary-plane
+/// path, and this is not a general-purpose text codec. An odd byte count (a
+/// truncated code unit) stops decoding at the last complete unit rather than
+/// reading past the buffer -- the truncation is silent by design here because
+/// callers that care (parse_reg_run_values) detect truncation themselves from
+/// the surrounding hex-byte count.
+inline std::string utf16le_to_utf8(std::span<const unsigned char> bytes) {
+    std::string out;
+    out.reserve(bytes.size());
+    std::size_t i = 0;
+    while (i + 1 < bytes.size()) {
+        const std::uint16_t unit =
+            static_cast<std::uint16_t>(bytes[i]) | (static_cast<std::uint16_t>(bytes[i + 1]) << 8);
+        i += 2;
+        if (unit == 0) break; // NUL terminator
+        const std::uint32_t cp = unit; // BMP-only, no surrogate pairing
+        if (cp < 0x80) {
+            out += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    return out;
+}
+
+// ── 1. split_command_line ────────────────────────────────────────────────
+
+struct SplitCommand {
+    std::string target;
+    std::string args;
+};
+
+/// Splits a Windows command-line string into the invoked target and its
+/// argument tail. Handles a QUOTED target (the common Run-key shape --
+/// `"C:\Program Files\...\x.exe" -flag`) and a bare, space-delimited target
+/// (rundll32-style -- `rundll32.exe shell32.dll,Control_RunDLL` splits at the
+/// first space; the DLL/entry-point tail travels in `args` unparsed, which is
+/// correct here since this function's job is target/args separation, not DLL
+/// entry-point resolution).
+inline SplitCommand split_command_line(std::string_view raw) {
+    std::size_t start = raw.find_first_not_of(' ');
+    if (start == std::string_view::npos) return {};
+    raw.remove_prefix(start);
+
+    SplitCommand out;
+    if (raw.front() == '"') {
+        std::size_t close = 1;
+        while (close < raw.size()) {
+            if (raw[close] == '"' && (close == 0 || raw[close - 1] != '\\')) break;
+            ++close;
+        }
+        out.target = std::string{raw.substr(1, close - 1)};
+        if (close < raw.size()) {
+            std::size_t rest = raw.find_first_not_of(' ', close + 1);
+            if (rest != std::string_view::npos) out.args = std::string{raw.substr(rest)};
+        }
+    } else {
+        std::size_t sp = raw.find(' ');
+        if (sp == std::string_view::npos) {
+            out.target = std::string{raw};
+        } else {
+            out.target = std::string{raw.substr(0, sp)};
+            std::size_t rest = raw.find_first_not_of(' ', sp + 1);
+            if (rest != std::string_view::npos) out.args = std::string{raw.substr(rest)};
+        }
+    }
+    return out;
+}
+
+// ── 2. parse_reg_run_values (reg(1)-export text) ─────────────────────────
+
+struct RegValue {
+    std::string name;
+    std::string data; // resolved string data; empty for a type this parser skips
+};
+
+namespace detail {
+
+inline std::string strip_cr(std::string_view line) {
+    if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+    return std::string{line};
+}
+
+/// Unescapes reg(1)-export quoted-string syntax: `\"` -> `"`, `\\` -> `\`.
+inline std::string unescape_reg_quoted(std::string_view body) {
+    std::string out;
+    out.reserve(body.size());
+    for (std::size_t i = 0; i < body.size(); ++i) {
+        if (body[i] == '\\' && i + 1 < body.size() && (body[i + 1] == '"' || body[i + 1] == '\\')) {
+            out += body[i + 1];
+            ++i;
+        } else {
+            out += body[i];
+        }
+    }
+    return out;
+}
+
+/// Parses a comma-separated hex byte list, following reg(1)'s `\`-continued-
+/// line convention (a trailing backslash means "more bytes follow on the next
+/// physical line"). `lines` starts at the value's first line and `idx` is
+/// advanced past every line this value consumed.
+inline std::vector<unsigned char> collect_hex_bytes(const std::vector<std::string>& lines,
+                                                    std::size_t& idx, std::string_view first_tail) {
+    std::vector<unsigned char> out;
+    std::string_view tail = first_tail;
+    for (;;) {
+        bool continued = !tail.empty() && tail.back() == '\\';
+        std::string_view body = continued ? tail.substr(0, tail.size() - 1) : tail;
+        std::size_t pos = 0;
+        while (pos < body.size()) {
+            while (pos < body.size() && (body[pos] == ' ' || body[pos] == ',')) ++pos;
+            std::size_t start = pos;
+            while (pos < body.size() && body[pos] != ',') ++pos;
+            if (pos > start) {
+                std::string_view tok = body.substr(start, pos - start);
+                // trim trailing spaces inside the token
+                while (!tok.empty() && tok.back() == ' ') tok.remove_suffix(1);
+                if (!tok.empty()) {
+                    unsigned int v = 0;
+                    for (char c : tok) {
+                        v <<= 4;
+                        if (c >= '0' && c <= '9') v |= static_cast<unsigned int>(c - '0');
+                        else if (c >= 'a' && c <= 'f') v |= static_cast<unsigned int>(c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') v |= static_cast<unsigned int>(c - 'A' + 10);
+                    }
+                    out.push_back(static_cast<unsigned char>(v & 0xFF));
+                }
+            }
+        }
+        if (!continued || idx >= lines.size()) break;
+        tail = lines[idx];
+        ++idx;
+        // reg-export continuation lines carry leading whitespace indentation
+        std::size_t nz = tail.find_first_not_of(' ');
+        tail = nz == std::string_view::npos ? std::string_view{} : tail.substr(nz);
+    }
+    return out;
+}
+
+} // namespace detail
+
+/// Parses reg(1)-export text (`Windows Registry Editor Version 5.00` header,
+/// `[KEY]` section markers, `"name"=value` assignments) and returns the
+/// REG_SZ / REG_EXPAND_SZ values found, across every section in the text --
+/// callers pass text scoped to the one key they care about. Every other
+/// value type (`dword:`, `hex(b):` QWORD, bare `hex:` binary) is recognised
+/// and skipped rather than mis-decoded: those are not string targets a
+/// Run-style key needs, and this parser never guesses at binary data it
+/// cannot resolve to text.
+///
+/// Input is UTF-8 text: the real capture this is fixture-tested against is a
+/// UTF-16LE file (`reg export`'s own output encoding) and callers decode that
+/// file-level encoding themselves before calling this -- this function's
+/// concern is reg(1)'s TEXT GRAMMAR, not the file's byte encoding, and hex(2)
+/// blobs (which ARE UTF-16LE bytes, just spelled as hex inside that grammar)
+/// go through utf16le_to_utf8 internally regardless.
+inline std::vector<RegValue> parse_reg_run_values(std::string_view text) {
+    std::vector<std::string> lines;
+    {
+        std::size_t pos = 0;
+        while (pos <= text.size()) {
+            std::size_t nl = text.find('\n', pos);
+            if (nl == std::string_view::npos) {
+                if (pos < text.size()) lines.push_back(detail::strip_cr(text.substr(pos)));
+                break;
+            }
+            lines.push_back(detail::strip_cr(text.substr(pos, nl - pos)));
+            pos = nl + 1;
+        }
+    }
+
+    std::vector<RegValue> out;
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        std::string_view line = lines[i];
+        if (line.empty() || line.front() != '"') continue;
+        std::size_t name_end = 1;
+        while (name_end < line.size() &&
+              !(line[name_end] == '"' && line[name_end - 1] != '\\'))
+            ++name_end;
+        if (name_end >= line.size()) continue;
+        std::string name = detail::unescape_reg_quoted(line.substr(1, name_end - 1));
+        std::size_t eq = line.find('=', name_end + 1);
+        if (eq == std::string_view::npos) continue;
+        std::string_view rhs = line.substr(eq + 1);
+
+        RegValue rv;
+        rv.name = std::move(name);
+        if (!rhs.empty() && rhs.front() == '"') {
+            std::size_t close = 1;
+            while (close < rhs.size() && !(rhs[close] == '"' && rhs[close - 1] != '\\')) ++close;
+            rv.data = detail::unescape_reg_quoted(rhs.substr(1, close - 1));
+            out.push_back(std::move(rv));
+        } else if (rhs.rfind("hex(2):", 0) == 0) {
+            std::size_t consumed = i + 1;
+            auto bytes = detail::collect_hex_bytes(lines, consumed, rhs.substr(7));
+            i = consumed - 1;
+            rv.data = utf16le_to_utf8(std::span<const unsigned char>{bytes.data(), bytes.size()});
+            out.push_back(std::move(rv));
+        }
+        // dword:, hex:, hex(b): and any other type: not a string target; skipped.
+    }
+    return out;
+}
+
+// ── 3. parse_startup_approved_blob ───────────────────────────────────────
+
+/// StartupApproved\Run stores a 12-byte blob per value; byte 0 is the
+/// enablement flag (0x02 = enabled, 0x03 = disabled), the rest a FILETIME the
+/// UI last toggled it. Any other length, or a byte 0 outside {0x02, 0x03},
+/// is `unmodelled` -- this plugin does not guess at an undocumented blob
+/// shape, which is exactly what a 3-byte reconstruction (truncated read)
+/// pins.
+inline Enabled parse_startup_approved_blob(std::span<const unsigned char> blob) noexcept {
+    if (blob.size() != 12) return Enabled::unmodelled;
+    if (blob[0] == 0x02) return Enabled::enabled;
+    if (blob[0] == 0x03) return Enabled::disabled;
+    return Enabled::unmodelled;
+}
+
+// ── 4. parse_winlogon_shell / parse_winlogon_userinit ────────────────────
+
+struct WinlogonValue {
+    std::vector<std::string> entries; // non-empty, comma-split tokens
+    bool flag_beyond_default = false;
+};
+
+namespace detail {
+
+inline std::vector<std::string> comma_split_nonempty(std::string_view value) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos <= value.size()) {
+        std::size_t comma = value.find(',', pos);
+        std::string_view tok = comma == std::string_view::npos ? value.substr(pos)
+                                                                : value.substr(pos, comma - pos);
+        if (!tok.empty()) out.emplace_back(tok);
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1;
+    }
+    return out;
+}
+
+inline bool ends_with_ci(std::string_view s, std::string_view suffix) {
+    if (s.size() < suffix.size()) return false;
+    std::string_view tail = s.substr(s.size() - suffix.size());
+    for (std::size_t i = 0; i < suffix.size(); ++i)
+        if (std::tolower(static_cast<unsigned char>(tail[i])) !=
+            std::tolower(static_cast<unsigned char>(suffix[i])))
+            return false;
+    return true;
+}
+
+inline WinlogonValue parse_winlogon_value(std::string_view value, std::string_view default_exe) {
+    WinlogonValue out;
+    out.entries = comma_split_nonempty(value);
+    for (const auto& e : out.entries)
+        if (!ends_with_ci(e, default_exe)) out.flag_beyond_default = true;
+    return out;
+}
+
+} // namespace detail
+
+/// Windows' documented default Shell is `explorer.exe`; anything else in the
+/// comma list (a second shell, or a hijacked path) flags.
+inline WinlogonValue parse_winlogon_shell(std::string_view value) {
+    return detail::parse_winlogon_value(value, "explorer.exe");
+}
+
+/// Userinit's documented default is `C:\Windows\system32\userinit.exe,` --
+/// note the trailing comma producing an EMPTY second token, which
+/// comma_split_nonempty drops rather than flagging (an empty slot is not an
+/// extra program).
+inline WinlogonValue parse_winlogon_userinit(std::string_view value) {
+    return detail::parse_winlogon_value(value, "userinit.exe");
+}
+
+// ── 5. parse_appinit_dlls ─────────────────────────────────────────────────
+
+/// AppInit_DLLs is a whitespace- (historically also comma-) separated DLL
+/// path list. An empty value (the common, unpopulated case -- this plugin's
+/// own real-capture fixture) yields an empty list, not a one-element list
+/// containing "".
+inline std::vector<std::string> parse_appinit_dlls(std::string_view value) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos < value.size()) {
+        while (pos < value.size() && (value[pos] == ' ' || value[pos] == ',')) ++pos;
+        std::size_t start = pos;
+        while (pos < value.size() && value[pos] != ' ' && value[pos] != ',') ++pos;
+        if (pos > start) out.emplace_back(value.substr(start, pos - start));
+    }
+    return out;
+}
+
+// ── 6. parse_ifeo_debugger ────────────────────────────────────────────────
+
+struct IfeoEntry {
+    std::string exe_name;
+    std::string debugger;
+    bool has_debugger = false;
+};
+
+/// IFEO's persistence mechanism is the OPTIONAL `Debugger` value under an
+/// exe's subkey: when present, that program launches instead of the named
+/// exe. `debugger_value` empty means "no Debugger value was read for this
+/// subkey" (this plugin's own real-capture fixture: `appverif.exe` carries
+/// only `CfgOptions`, no Debugger) -- has_debugger is false, not a guess.
+inline IfeoEntry parse_ifeo_debugger(std::string_view exe_name, std::string_view debugger_value) {
+    IfeoEntry out;
+    out.exe_name = std::string{exe_name};
+    if (!debugger_value.empty()) {
+        out.debugger = std::string{debugger_value};
+        out.has_debugger = true;
+    }
+    return out;
+}
+
+// ── 7. parse_task_xml (minimal tag scanner, no XML library) ──────────────
+
+struct TaskInfo {
+    std::string command;
+    std::string arguments;
+    bool enabled = true; // Task Scheduler's own documented default
+    std::string user_id;
+    bool has_triggers = false;
+};
+
+namespace detail {
+
+inline std::optional<std::string> extract_tag(std::string_view xml, std::string_view tag) {
+    std::string open = "<" + std::string{tag} + ">";
+    std::size_t start = xml.find(open);
+    if (start == std::string_view::npos) return std::nullopt;
+    start += open.size();
+    std::string close = "</" + std::string{tag} + ">";
+    std::size_t end = xml.find(close, start);
+    if (end == std::string_view::npos) return std::nullopt; // truncated: caller keeps the default
+    return std::string{xml.substr(start, end - start)};
+}
+
+} // namespace detail
+
+/// Scans for `<Command>`, `<Arguments>`, `<Enabled>`, `<UserId>` and whether
+/// `<Triggers>` is empty (self-closed `<Triggers/>` / `<Triggers />`, or an
+/// open/close pair with nothing between) versus carries at least one real
+/// trigger element. A truncated document (a tag opened but never closed)
+/// leaves the corresponding field at its default rather than throwing --
+/// this is a best-effort scanner over untrusted XML, not a validating parser.
+inline TaskInfo parse_task_xml(std::string_view xml) {
+    TaskInfo out;
+    if (auto v = detail::extract_tag(xml, "Command")) out.command = *v;
+    if (auto v = detail::extract_tag(xml, "Arguments")) out.arguments = *v;
+    if (auto v = detail::extract_tag(xml, "Enabled")) out.enabled = (*v == "true");
+    if (auto v = detail::extract_tag(xml, "UserId")) out.user_id = *v;
+
+    std::size_t t = xml.find("<Triggers");
+    if (t != std::string_view::npos) {
+        std::size_t gt = xml.find('>', t);
+        if (gt != std::string_view::npos) {
+            bool self_closed = gt > 0 && xml[gt - 1] == '/';
+            if (!self_closed) {
+                std::size_t close = xml.find("</Triggers>", gt + 1);
+                if (close != std::string_view::npos && close > gt + 1) out.has_triggers = true;
+            }
+        }
+    }
+    return out;
+}
+
+// ── 8. parse_wmi_subscription_triple ─────────────────────────────────────
+
+struct WmiTriple {
+    bool filter_found = false;
+    bool consumer_found = false;
+    bool binding_found = false;
+    std::string filter_name;
+    std::string query;
+    std::string consumer_name;
+    std::string target; // first of CommandLineTemplate | ScriptText | ExecutablePath present
+};
+
+namespace detail {
+
+using KvBlock = std::vector<std::pair<std::string, std::string>>;
+
+inline std::string trim(std::string_view s) {
+    std::size_t b = s.find_first_not_of(" \t");
+    if (b == std::string_view::npos) return {};
+    std::size_t e = s.find_last_not_of(" \t");
+    return std::string{s.substr(b, e - b + 1)};
+}
+
+inline std::string kv_get(const KvBlock& block, std::string_view key) {
+    for (const auto& [k, v] : block)
+        if (k == key) return v;
+    return {};
+}
+
+} // namespace detail
+
+/// Parses PowerShell `Format-List`-style output (`Key : Value` lines, blocks
+/// separated by blank lines) -- the shape `Get-CimInstance | Format-List`
+/// produces for `__EventFilter` / an event-consumer class /
+/// `__FilterToConsumerBinding`, which is A1's real capture format for this
+/// source. Blocks are distinguished by their own `CimClass` value rather than
+/// position, since a real capture may order Filter/Consumer/Binding blocks
+/// arbitrarily. `target` tries three known consumer fields in the documented
+/// priority order; a subscription whose consumer is a built-in type carrying
+/// none of them (this plugin's own real capture: an `NTEventLogEventConsumer`
+/// forwarding to the event log, not executing anything) leaves `target` empty
+/// -- there is genuinely nothing to run, not a parse failure.
+inline WmiTriple parse_wmi_subscription_triple(std::string_view text) {
+    std::vector<detail::KvBlock> blocks;
+    detail::KvBlock current;
+    std::size_t pos = 0;
+    auto flush = [&] {
+        if (!current.empty()) blocks.push_back(std::move(current));
+        current.clear();
+    };
+    while (pos <= text.size()) {
+        std::size_t nl = text.find('\n', pos);
+        std::string_view line = nl == std::string_view::npos ? text.substr(pos) : text.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (detail::trim(line).empty()) {
+            flush();
+        } else {
+            std::size_t colon = line.find(':');
+            if (colon != std::string_view::npos) {
+                std::string key = detail::trim(line.substr(0, colon));
+                std::string val = detail::trim(line.substr(colon + 1));
+                if (!key.empty()) current.emplace_back(std::move(key), std::move(val));
+            }
+        }
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    flush();
+
+    WmiTriple out;
+    for (const auto& block : blocks) {
+        std::string cim_class = detail::kv_get(block, "CimClass");
+        if (cim_class.find("__EventFilter") != std::string::npos) {
+            out.filter_found = true;
+            out.filter_name = detail::kv_get(block, "Name");
+            out.query = detail::kv_get(block, "Query");
+        } else if (cim_class.find("__FilterToConsumerBinding") != std::string::npos) {
+            out.binding_found = true;
+        } else if (cim_class.find("Consumer") != std::string::npos) {
+            out.consumer_found = true;
+            out.consumer_name = detail::kv_get(block, "Name");
+            for (const char* field : {"CommandLineTemplate", "ScriptText", "ExecutablePath"}) {
+                std::string v = detail::kv_get(block, field);
+                if (!v.empty()) { out.target = v; break; }
+            }
+        }
+    }
+    return out;
+}
+
+// ── 9. parse_crontab ──────────────────────────────────────────────────────
+
+struct CronEntry {
+    std::string schedule; // the 5 schedule fields, space-joined
+    std::string user;     // "-" for a user crontab (no user field)
+    std::string command;
+};
+
+struct CrontabParseResult {
+    std::vector<CronEntry> entries;
+    int rejected_lines = 0;
+};
+
+namespace detail {
+
+inline std::vector<std::string_view> split_ws(std::string_view line, std::size_t max_tokens) {
+    std::vector<std::string_view> out;
+    std::size_t pos = 0;
+    while (pos < line.size() && out.size() + 1 < max_tokens) {
+        while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+        std::size_t start = pos;
+        while (pos < line.size() && line[pos] != ' ' && line[pos] != '\t') ++pos;
+        if (pos > start) out.push_back(line.substr(start, pos - start));
+        else break;
+    }
+    while (pos < line.size() && (line[pos] == ' ' || line[pos] == '\t')) ++pos;
+    if (pos < line.size()) out.push_back(line.substr(pos));
+    return out;
+}
+
+inline bool is_comment_or_blank_or_assignment(std::string_view line) {
+    std::size_t nb = line.find_first_not_of(" \t");
+    if (nb == std::string_view::npos) return true;
+    if (line[nb] == '#') return true;
+    // VAR=VALUE: an identifier followed by '=' before any whitespace.
+    std::size_t sp = line.find_first_of(" \t", nb);
+    std::string_view first = sp == std::string_view::npos ? line.substr(nb) : line.substr(nb, sp - nb);
+    return first.find('=') != std::string_view::npos;
+}
+
+} // namespace detail
+
+/// Parses crontab(5) text. `system_format` selects the 6-field shape
+/// (5 schedule fields + a user field, `/etc/crontab` and `/etc/cron.d/*`) vs
+/// the 5-field per-user shape (no user field). A line with fewer fields than
+/// its format requires is REJECTED AND COUNTED, never silently dropped nor
+/// guessed at -- `rejected_lines` is how a caller learns the input was
+/// malformed rather than merely empty.
+inline CrontabParseResult parse_crontab(std::string_view text, bool system_format) {
+    CrontabParseResult result;
+    const std::size_t required = system_format ? 7 : 6; // 5 schedule + [user] + command
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        std::size_t nl = text.find('\n', pos);
+        std::string_view line = nl == std::string_view::npos ? text.substr(pos) : text.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (detail::is_comment_or_blank_or_assignment(line)) {
+            if (nl == std::string_view::npos) break;
+            pos = nl + 1;
+            continue;
+        }
+        auto tokens = detail::split_ws(line, required);
+        if (tokens.size() < required) {
+            ++result.rejected_lines;
+        } else {
+            CronEntry e;
+            e.schedule = std::string{tokens[0]} + ' ' + std::string{tokens[1]} + ' ' +
+                        std::string{tokens[2]} + ' ' + std::string{tokens[3]} + ' ' +
+                        std::string{tokens[4]};
+            std::size_t cmd_idx = 5;
+            if (system_format) { e.user = std::string{tokens[5]}; cmd_idx = 6; }
+            else e.user = "-";
+            e.command = std::string{tokens[cmd_idx]};
+            result.entries.push_back(std::move(e));
+        }
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    return result;
+}
+
+// ── 10. parse_anacrontab ──────────────────────────────────────────────────
+
+struct AnacronEntry {
+    std::string period;   // days, or an @-shorthand (@monthly, @weekly...)
+    std::string delay;    // minutes
+    std::string job_id;
+    std::string command;
+};
+
+/// anacrontab(5): `period  delay  job-identifier  command`. Comments, blank
+/// lines and VAR=VALUE lines (SHELL=, HOME=, LOGNAME=) are skipped exactly
+/// like crontab(5)'s.
+inline std::vector<AnacronEntry> parse_anacrontab(std::string_view text) {
+    std::vector<AnacronEntry> out;
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        std::size_t nl = text.find('\n', pos);
+        std::string_view line = nl == std::string_view::npos ? text.substr(pos) : text.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (!detail::is_comment_or_blank_or_assignment(line)) {
+            auto tokens = detail::split_ws(line, 4);
+            if (tokens.size() == 4) {
+                out.push_back(AnacronEntry{std::string{tokens[0]}, std::string{tokens[1]},
+                                           std::string{tokens[2]}, std::string{tokens[3]}});
+            }
+        }
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    return out;
+}
+
+// ── 11. parse_systemd_timer / timer_enabled_from_wants ───────────────────
+
+struct SystemdTimerFields {
+    std::string on_calendar;
+    std::string on_boot_sec;
+    std::string on_active_sec; // OnUnitActiveSec
+    std::string unit;          // explicit Unit= override; often absent
+    std::string wanted_by;
+};
+
+/// Minimal INI-section reader over a systemd unit file: tracks the current
+/// `[Section]` and reads `Key=Value` lines only from `[Timer]` (OnCalendar,
+/// OnBootSec, OnUnitActiveSec, Unit) and `[Install]` (WantedBy).
+inline SystemdTimerFields parse_systemd_timer(std::string_view text) {
+    SystemdTimerFields out;
+    std::string section;
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        std::size_t nl = text.find('\n', pos);
+        std::string_view line = nl == std::string_view::npos ? text.substr(pos) : text.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        std::string_view trimmed = line;
+        std::size_t nb = trimmed.find_first_not_of(" \t");
+        trimmed = nb == std::string_view::npos ? std::string_view{} : trimmed.substr(nb);
+        if (!trimmed.empty() && trimmed.front() == '[' && trimmed.back() == ']') {
+            section = std::string{trimmed.substr(1, trimmed.size() - 2)};
+        } else if (!trimmed.empty() && trimmed.front() != '#' && trimmed.front() != ';') {
+            std::size_t eq = trimmed.find('=');
+            if (eq != std::string_view::npos) {
+                std::string key = std::string{trimmed.substr(0, eq)};
+                std::string val = std::string{trimmed.substr(eq + 1)};
+                if (section == "Timer") {
+                    if (key == "OnCalendar") out.on_calendar = val;
+                    else if (key == "OnBootSec") out.on_boot_sec = val;
+                    else if (key == "OnUnitActiveSec") out.on_active_sec = val;
+                    else if (key == "Unit") out.unit = val;
+                } else if (section == "Install" && key == "WantedBy") {
+                    out.wanted_by = val;
+                }
+            }
+        }
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    return out;
+}
+
+/// A timer is enabled iff its unit file is symlinked into the matching
+/// `<target>.wants/` directory -- `wants_dir_listing` is that directory's
+/// `ls -l` text and `timer_filename` the unit's own filename (e.g.
+/// `apt-daily.timer`), matched as a whole path component so a name that is
+/// merely a substring of another (`apt-daily.timer` vs
+/// `apt-daily-upgrade.timer`) cannot false-positive.
+inline bool timer_enabled_from_wants(std::string_view wants_dir_listing,
+                                     std::string_view timer_filename) {
+    std::size_t pos = 0;
+    while (pos <= wants_dir_listing.size()) {
+        std::size_t nl = wants_dir_listing.find('\n', pos);
+        std::string_view line = nl == std::string_view::npos ? wants_dir_listing.substr(pos)
+                                                              : wants_dir_listing.substr(pos, nl - pos);
+        std::size_t arrow = line.find(" -> ");
+        std::string_view name_field = arrow == std::string_view::npos ? line : line.substr(0, arrow);
+        std::size_t last_space = name_field.find_last_of(' ');
+        std::string_view name = last_space == std::string_view::npos ? name_field
+                                                                     : name_field.substr(last_space + 1);
+        if (name == timer_filename) return true;
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    return false;
+}
+
+// ── 12. parse_desktop_entry ───────────────────────────────────────────────
+
+struct DesktopEntry {
+    std::string exec;
+    bool hidden = false;
+    std::string only_show_in;
+    std::string not_show_in;
+    bool gnome_autostart_enabled_present = false;
+    bool gnome_autostart_enabled = true;
+    Enabled enabled = Enabled::enabled;
+};
+
+/// Parses the `[Desktop Entry]` group of a `.desktop` file (XDG Desktop Entry
+/// spec). `enabled` is `disabled` when `Hidden=true` OR
+/// `X-GNOME-Autostart-enabled=false` -- either alone is sufficient, matching
+/// the two independent ways a DE hides an autostart entry without deleting
+/// the file.
+inline DesktopEntry parse_desktop_entry(std::string_view text) {
+    DesktopEntry out;
+    bool in_group = false;
+    std::size_t pos = 0;
+    while (pos <= text.size()) {
+        std::size_t nl = text.find('\n', pos);
+        std::string_view line = nl == std::string_view::npos ? text.substr(pos) : text.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (!line.empty() && line.front() == '[') {
+            in_group = (line == "[Desktop Entry]");
+        } else if (in_group) {
+            std::size_t eq = line.find('=');
+            if (eq != std::string_view::npos) {
+                std::string_view key = line.substr(0, eq);
+                std::string_view val = line.substr(eq + 1);
+                if (key == "Exec") out.exec = std::string{val};
+                else if (key == "Hidden") out.hidden = (val == "true");
+                else if (key == "OnlyShowIn") out.only_show_in = std::string{val};
+                else if (key == "NotShowIn") out.not_show_in = std::string{val};
+                else if (key == "X-GNOME-Autostart-enabled") {
+                    out.gnome_autostart_enabled_present = true;
+                    out.gnome_autostart_enabled = (val == "true");
+                }
+            }
+        }
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    out.enabled = (out.hidden || (out.gnome_autostart_enabled_present && !out.gnome_autostart_enabled))
+                     ? Enabled::disabled
+                     : Enabled::enabled;
+    return out;
+}
+
+// ── 13. LaunchdFields / launchd_row_from_fields ──────────────────────────
+
+/// The fields a launchd plist read (CFPropertyListCreateWithData, P14's
+/// concern) needs to hand this pure layer. `program` is the plist's own
+/// `Program` key when present; when absent, launchd itself falls back to
+/// `ProgramArguments[0]` as the executable, and `launchd_row_from_fields`
+/// follows that same documented fallback.
+struct LaunchdFields {
+    std::string label;
+    std::string program; // may be empty -- fall back to program_arguments[0]
+    std::vector<std::string> program_arguments;
+    bool disabled_present = false;
+    bool disabled_value = false;
+};
+
+/// Builds a Row from already-extracted plist fields plus the OS-known
+/// context (which source this came from, the plist's own path, and whether
+/// it is a system or user location). `enabled` is `enabled` when `Disabled`
+/// is absent -- launchd's own documented default -- and only `unknown` if
+/// this function is ever called with no way to reason about it (it always
+/// can, so this branch does not occur; kept for symmetry with other row
+/// builders that DO have a genuine unknown case).
+inline Row launchd_row_from_fields(SourceId source_id, const LaunchdFields& fields,
+                                   std::string_view plist_path, Scope scope,
+                                   std::int64_t mtime) {
+    Row row;
+    row.source_id = source_id;
+    row.catalog_version = kAutorunSourceCatalogVersion;
+    row.location = std::string{plist_path};
+    row.entry = fields.label;
+    if (!fields.program.empty()) {
+        row.target = fields.program;
+        // ProgramArguments[0] conventionally duplicates Program itself (it is
+        // what launchd execs argv[0] as); the REAL extra arguments start at
+        // index 1. Skip index 0 here so `args` does not repeat the target.
+        std::string joined;
+        for (std::size_t i = 1; i < fields.program_arguments.size(); ++i) {
+            if (i > 1) joined += ' ';
+            joined += fields.program_arguments[i];
+        }
+        row.args = joined;
+    } else if (!fields.program_arguments.empty()) {
+        row.target = fields.program_arguments.front();
+        std::string joined;
+        for (std::size_t i = 1; i < fields.program_arguments.size(); ++i) {
+            if (i > 1) joined += ' ';
+            joined += fields.program_arguments[i];
+        }
+        row.args = joined;
+    }
+    row.enabled = fields.disabled_present ? (fields.disabled_value ? Enabled::disabled : Enabled::enabled)
+                                          : Enabled::enabled;
+    row.scope = scope;
+    row.user = "-";
+    row.signed_state = signed_from_path(plist_path);
+    row.mtime = mtime;
+    return row;
+}
+
+// ── 14. parse_periodic_dir_listing ────────────────────────────────────────
+
+/// Parses `ls -l`-style text and returns each entry's filename (the last
+/// whitespace-separated field), skipping the `total N` header line. Used for
+/// `/etc/periodic/{daily,weekly,monthly}` script directories.
+inline std::vector<std::string> parse_periodic_dir_listing(std::string_view ls_output) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    while (pos <= ls_output.size()) {
+        std::size_t nl = ls_output.find('\n', pos);
+        std::string_view line = nl == std::string_view::npos ? ls_output.substr(pos)
+                                                              : ls_output.substr(pos, nl - pos);
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        // A real `ls -l` entry line always opens with a file-type/permission
+        // character (-, d, l, ...); this rejects both the `total N` header
+        // and prose (e.g. a recorded "ABSENT: ..." note standing in for a
+        // directory that does not exist on this host) that a naive
+        // last-whitespace-token split would otherwise mistake for a listing.
+        constexpr std::string_view kEntryLeadChars = "-dlbcps";
+        if (!line.empty() && kEntryLeadChars.find(line.front()) != std::string_view::npos) {
+            std::size_t last_space = line.find_last_of(' ');
+            std::string_view name = last_space == std::string_view::npos ? line
+                                                                         : line.substr(last_space + 1);
+            if (!name.empty()) out.emplace_back(name);
+        }
+        if (nl == std::string_view::npos) break;
+        pos = nl + 1;
+    }
+    return out;
+}
+
+// ── 15. parse_emond_rule_plist_fields ────────────────────────────────────
+
+/// Mirrors LaunchdFields' shape: the caller (P14) extracts these from an
+/// emond rule plist dict and this pure layer turns them into a Row.
+struct EmondRuleFields {
+    std::string name;
+    bool enabled_present = false;
+    bool enabled_value = true;
+    std::string command;      // the rule's StartProgram/command path, if any
+    std::vector<std::string> args;
+};
+
+inline Row parse_emond_rule_plist_fields(const EmondRuleFields& fields, std::string_view plist_path,
+                                         std::int64_t mtime) {
+    Row row;
+    row.source_id = SourceId::mac_emond;
+    row.catalog_version = kAutorunSourceCatalogVersion;
+    row.location = std::string{plist_path};
+    row.entry = fields.name;
+    row.target = fields.command;
+    std::string joined;
+    for (std::size_t i = 0; i < fields.args.size(); ++i) {
+        if (i) joined += ' ';
+        joined += fields.args[i];
+    }
+    row.args = joined;
+    row.enabled = fields.enabled_present ? (fields.enabled_value ? Enabled::enabled : Enabled::disabled)
+                                         : Enabled::unknown;
+    row.scope = Scope::system;
+    row.user = "-";
+    row.signed_state = signed_from_path(plist_path);
+    row.mtime = mtime;
+    return row;
+}
+
+} // namespace yuzu::autoruns
