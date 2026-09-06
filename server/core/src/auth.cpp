@@ -767,6 +767,21 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         auto db_user = auth_db_->get_user(username);
         if (!db_user) {
             spdlog::warn("Auth failed: user '{}' not active in AuthDB", username);
+            // #4020 adversarial-review follow-up (Gate 2, governance): evict the
+            // now-stale cache entry, mirroring remove_user()'s own eviction. A
+            // removal made through a DIFFERENT AuthManager (another replica) never
+            // touches this process's `users_` map, so without this a removed
+            // principal stays "active, role R" forever in cache-only readers like
+            // get_user_role() on this manager — reachable via a still-valid API
+            // token (removing a user does not itself revoke their tokens; see
+            // auth_routes.cpp's synthesize_token_session, which falls back to
+            // get_user_role() for the legacy-role synthesis path). The durable
+            // session wipe that accompanied the ORIGINAL remove_user() call on the
+            // other manager already invalidated any session fleet-wide; this only
+            // needs to catch up the local in-memory map, which is not shared.
+            std::unique_lock lock(mu_);
+            users_.erase(username);
+            lock.unlock();
             return std::nullopt;
         }
         // #4020 adversarial-review follow-up: this read was ALREADY firing for the
@@ -853,6 +868,11 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
         auto db_user = auth_db_->get_user(username);
         if (!db_user) {
             spdlog::warn("verify_password failed: user '{}' not active in AuthDB", username);
+            // #4020 adversarial-review follow-up: same cache eviction as
+            // authenticate() above — see its comment for the full rationale.
+            std::unique_lock lock(mu_);
+            users_.erase(username);
+            lock.unlock();
             return std::nullopt;
         }
         // #4020 adversarial-review follow-up: same authoritative-role refresh as

@@ -504,6 +504,36 @@ TEST_CASE("verify_password returns the CURRENT role after a cross-manager demoti
     REQUIRE(mgr_a.get_user_role("cora") == Role::user);
 }
 
+TEST_CASE("a cross-manager removal evicts the stale cache entry, not just the login "
+          "(Gate 2 governance follow-up)",
+          "[pg][auth][session][cold_cache]") {
+    // Companion to the demotion tests above: removing a user through a DIFFERENT
+    // AuthManager never touches this manager's users_ map (the durable session
+    // wipe that accompanies remove_user() is fleet-wide, but the in-memory cache
+    // is per-process). Without evicting on the !db_user branch, get_user_role()
+    // (cache-only, no AuthDB fallback) would keep reporting the removed user as
+    // "active, pre-removal role" indefinitely on this manager - reachable via a
+    // still-valid API token, since removing a user does not itself revoke their
+    // tokens (auth_routes.cpp's synthesize_token_session falls back to
+    // get_user_role() for legacy-role synthesis).
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr_a;
+    mgr_a.set_auth_db(auth_db.get());
+    REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(mgr_a.authenticate("cora", "password1234").has_value()); // caches admin
+    REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
+
+    AuthManager mgr_b;
+    mgr_b.set_auth_db(auth_db.get());
+    REQUIRE(mgr_b.remove_user("cora")); // the "other replica" removes the account
+
+    // mgr_a's cache still says "active, admin" at this point; both credential
+    // paths must evict it on discovering the removal, not just deny this login.
+    REQUIRE_FALSE(mgr_a.authenticate("cora", "password1234").has_value());
+    REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value()); // evicted, not just denied
+}
+
 TEST_CASE("a hydrated entry is superseded by a later in-process role change (#4020)",
           "[pg][auth][session][cold_cache]") {
     // upsert_user against an AuthDB-backed store is create-only (INSERT ... ON
