@@ -38,10 +38,15 @@ churns the ledger. Each row records:
 
 **What populated this first PR.** Every row was extracted mechanically by
 `check-api-parity.py`'s lexical scanner (verified self-consistent against
-this session's fresh measurement: 173 registered `/api/v1/*` routes, 133
-OpenAPI path+method entries, 91 MCP tools, 278 fragment/legacy routes, 40
-routes registered but undocumented in OpenAPI - all seeded into this PR's
-`ALLOWLIST_OPENAPI_MISSING`). An initial version of the extractor matched
+this session's fresh measurement, AT THAT TIME: 173 registered `/api/v1/*`
+routes, 133 OpenAPI path+method entries, 91 MCP tools, 278 fragment/legacy
+routes, 40 routes registered but undocumented in OpenAPI - all seeded into
+this PR's `ALLOWLIST_OPENAPI_MISSING`). Those OpenAPI/allowlist counts are
+historical - #3992 backfilled 39 of the 40 shortly after, and this branch's
+own allowlist was reconciled to match (commit `3871688f6`); do not hand-edit
+this paragraph's numbers again to "fix" them, since they will drift the
+same way on the next such change - the summary table below is the
+generated, self-updating source of current counts. An initial version of the extractor matched
 only dot-notation verb calls (`receiver.Get(...)`) and missed the ~107
 arrow-notation registrations `server.cpp` makes directly on `web_server_`
 (`web_server_->Get(...)`, the same false-negative class `docs/architecture.md`

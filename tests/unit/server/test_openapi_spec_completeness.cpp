@@ -127,22 +127,18 @@ std::string canonicalize(const std::string& path) {
 }
 
 /// Small, hand-verified subset of check-api-parity.py's
-/// ALLOWLIST_OPENAPI_MISSING - see file header comment.
+/// ALLOWLIST_OPENAPI_MISSING - see file header comment. Cross-check against
+/// the Python script's list before adding here. The ten F2-backlog entries
+/// this set used to carry (statistics, topology, inventory/evaluate,
+/// elevation-eligibility, execution-statistics, sessions, tar purge) were
+/// backfilled into openapi_spec() by #3992 (merged 2026-09-06) and pruned
+/// here in lockstep with the Python side's own reconciliation
+/// (commit 3871688f6) - do not let the two allowlists drift again.
 const std::set<std::pair<std::string, std::string>>& allowlisted_missing() {
     static const std::set<std::pair<std::string, std::string>> kAllowlist = {
         // Blanket CORS preflight - every /api/v1/* path answers OPTIONS the
         // same way; not a discrete documentable capability.
         {"OPTIONS", "/api/v1/{param}"},
-        {"GET", "/api/v1/statistics"},
-        {"GET", "/api/v1/topology"},
-        {"POST", "/api/v1/inventory/evaluate"},
-        {"POST", "/api/v1/users/elevation-eligibility"},
-        {"GET", "/api/v1/execution-statistics"},
-        {"GET", "/api/v1/execution-statistics/agents"},
-        {"GET", "/api/v1/execution-statistics/definitions"},
-        {"DELETE", "/api/v1/sessions"},
-        {"DELETE", "/api/v1/sessions/me"},
-        {"POST", "/api/v1/tar/retention-paused/purge"},
     };
     return kAllowlist;
 }

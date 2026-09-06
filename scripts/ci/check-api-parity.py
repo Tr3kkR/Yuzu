@@ -267,6 +267,42 @@ def parse_literal_at(text, pos):
     return None, pos
 
 
+def parse_adjacent_literals(text, pos):
+    """Like `parse_literal_at`, but concatenates every C++ string/raw-string
+    literal that is ADJACENT to the first - i.e. separated only by
+    whitespace and/or full-line `//` comments - per ordinary C++ adjacent-
+    string-literal concatenation (`"/api/v1" "/route"` is one string,
+    `/api/v1/route`, at compile time). Mirrors the chunk-concatenation loop
+    `extract_openapi_paths()` already needs for the MSVC-16KB-split case;
+    without this, a route registration split across two adjacent literals
+    (the natural place a human wraps a long path - at a version-prefix
+    boundary, exactly like the existing split convention this script's own
+    module docstring documents for the OpenAPI literal) silently truncates
+    to the first chunk instead of erroring or warning, and a truncated path
+    like "/api/v1" satisfies neither ledger bucket in `extract_all_routes`
+    and is dropped with no requirement and no `::warning::` at all."""
+    literal, end = parse_literal_at(text, pos)
+    if literal is None:
+        return None, pos
+    parts = [literal]
+    n = len(text)
+    while True:
+        i = end
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if text[i:i + 2] == "//":
+            eol = text.index("\n", i)
+            i = eol + 1
+            while i < n and text[i] in " \t\r\n":
+                i += 1
+        nxt, nxt_end = parse_literal_at(text, i)
+        if nxt is None:
+            break
+        parts.append(nxt)
+        end = nxt_end
+    return "".join(parts), end
+
+
 _VERB_CALL = re.compile(r"\b(\w+)(?:\.|->)(" + "|".join(VERBS) + r")\s*\(")
 
 # httplib::Client call sites (directory_sync.cpp, analytics_sinks.cpp,
@@ -296,7 +332,7 @@ def extract_verb_calls(text, path):
     for m in _VERB_CALL.finditer(text):
         receiver = m.group(1)
         method = m.group(2).upper()
-        literal, _end = parse_literal_at(text, m.end())
+        literal, _end = parse_adjacent_literals(text, m.end())
         if literal is None:
             if receiver in _KNOWN_CLIENT_RECEIVERS:
                 continue
@@ -803,6 +839,97 @@ def baseline_inventory():
     return 0
 
 
+def _selftest():
+    """Unit-tests the extraction/parsing/canonicalization logic itself against
+    synthetic fixtures, per this repo's established precedent for CI tooling
+    scripts of this shape (flake-retry.py, check-plugin-spawn-lexical.sh,
+    tsan-gdb-capture.py all carry --selftest; #3443 is the governance finding
+    that made it a standing expectation). Targets, in particular, the two
+    concrete false-negative shapes this script has already shipped once each:
+    a receiver-notation blind spot (dot-only vs `->`, the #3991 BLOCKING-1
+    fix) and an adjacent-string-literal blind spot (the Doomgoose #4003
+    review finding) - both are exactly the "route registration silently
+    produces no requirement and no warning" failure class this script exists
+    to prevent in the PRODUCT, and neither would be caught by running the
+    script against the real tree, since the real tree doesn't (yet) contain
+    either shape. Runs no filesystem I/O against the real source tree."""
+    failures = []
+
+    def check(cond, label):
+        if not cond:
+            failures.append(label)
+
+    # -- parse_literal_at: the two literal forms it must recognise --------
+    lit, end = parse_literal_at('"/api/v1/foo"', 0)
+    check(lit == "/api/v1/foo", f"parse_literal_at: plain string, got {lit!r}")
+    lit, end = parse_literal_at('R"(/api/v1/(bar)/baz)"', 0)
+    check(lit == "/api/v1/(bar)/baz", f"parse_literal_at: raw string, got {lit!r}")
+    lit, end = parse_literal_at('R"json({"a":1})json"', 0)
+    check(lit == '{"a":1}', f"parse_literal_at: custom raw-string delimiter, got {lit!r}")
+    lit, end = parse_literal_at("not_a_literal", 0)
+    check(lit is None, "parse_literal_at: non-literal input must return None")
+    lit, end = parse_literal_at(r'"esc\"aped"', 0)
+    check(lit == 'esc"aped', f"parse_literal_at: escaped quote, got {lit!r}")
+
+    # -- parse_adjacent_literals: the Doomgoose #4003 finding --------------
+    # Two plain literals split at the natural version-prefix boundary - the
+    # exact reported bypass (previously silently truncated to "/api/v1").
+    lit, _end = parse_adjacent_literals('"/api/v1" "/route", h)', 0)
+    check(lit == "/api/v1/route",
+          f"parse_adjacent_literals: two plain literals must concatenate, got {lit!r}")
+    # Raw string followed by a plain literal (mixed forms).
+    lit, _end = parse_adjacent_literals('R"(/api/v1/foo)" "/bar", h)', 0)
+    check(lit == "/api/v1/foo/bar",
+          f"parse_adjacent_literals: raw+plain must concatenate, got {lit!r}")
+    # Three-way split.
+    lit, _end = parse_adjacent_literals('"/api" "/v1" "/three", h)', 0)
+    check(lit == "/api/v1/three",
+          f"parse_adjacent_literals: three-way split must concatenate, got {lit!r}")
+    # A single literal (the common case) must still work unchanged.
+    lit, _end = parse_adjacent_literals('"/api/v1/simple", h)', 0)
+    check(lit == "/api/v1/simple",
+          f"parse_adjacent_literals: single literal regressed, got {lit!r}")
+    # A comment between two adjacent literals (legal C++) must not break it.
+    lit, _end = parse_adjacent_literals('"/api/v1" // note\n"/commented", h)', 0)
+    check(lit == "/api/v1/commented",
+          f"parse_adjacent_literals: comment-separated literals, got {lit!r}")
+
+    # -- extract_verb_calls: both known false-negative shapes, end-to-end -
+    # Shape 1 (#3991 BLOCKING-1): arrow-notation receiver, not just dot.
+    calls = list(extract_verb_calls('web_server_->Get("/api/legacy", h);', "s.cpp"))
+    check(calls == [("GET", "/api/legacy")],
+          f"extract_verb_calls: arrow-notation receiver, got {calls}")
+    # Shape 2 (#4003 review): adjacent-literal split must not silently vanish.
+    calls = list(extract_verb_calls('sink.Post("/api/v1" "/split", h);', "s.cpp"))
+    check(calls == [("POST", "/api/v1/split")],
+          f"extract_verb_calls: adjacent-literal call site, got {calls}")
+    # A genuinely non-literal first argument on a route-sink receiver must
+    # still be reported (never silently dropped) - this is `gh("warning",
+    # ...)`, which prints rather than raising, so we only check it doesn't
+    # crash and doesn't yield a route.
+    calls = list(extract_verb_calls('sink.Get(kSomeConstant, h);', "s.cpp"))
+    check(calls == [], "extract_verb_calls: non-literal first arg must yield nothing")
+    # The known httplib::Client false-positive exemption must still apply.
+    calls = list(extract_verb_calls('client.Get(url_var, h);', "s.cpp"))
+    check(calls == [], "extract_verb_calls: known client receiver must be silently skipped")
+
+    # -- canonicalize: paren-masking must not let a capture group's own '/'
+    #    cause a wrong split, and must collapse both capture groups and
+    #    {param}-style OpenAPI segments to the same token. -----------------
+    check(canonicalize("/api/v1/tags/([^/]+)/([^/]+)") == "/api/v1/tags/{param}/{param}",
+          "canonicalize: two capture groups")
+    check(canonicalize("/api/v1/result-sets/{id}") == "/api/v1/result-sets/{param}",
+          "canonicalize: OpenAPI {id}-style segment")
+    check(canonicalize("/api/v1/plain") == "/api/v1/plain",
+          "canonicalize: no-capture-group path is unchanged")
+
+    if failures:
+        print("SELFTEST FAILURES:", *failures, sep="\n  ")
+        return 1
+    print("check-api-parity selftest: OK")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -816,8 +943,14 @@ def main():
     ap.add_argument("--render-doc", action="store_true",
                      help="print docs/api-parity-ledger.md's generated block "
                           "(splice between the BEGIN/END GENERATED markers)")
+    ap.add_argument("--selftest", action="store_true",
+                     help="run internal extraction/parsing logic checks "
+                          "against synthetic fixtures and exit (no real-tree "
+                          "I/O)")
     args = ap.parse_args()
 
+    if args.selftest:
+        return _selftest()
     if args.dump_json:
         return dump_json()
     if args.baseline_inventory:
