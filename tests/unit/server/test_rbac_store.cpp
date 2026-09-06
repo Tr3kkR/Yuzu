@@ -170,8 +170,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     auto types = store.list_securable_types();
     // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
     // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
-    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
-    REQUIRE(types.size() == 27);
+    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26. +PowerManagement (Wave 6
+    // W1B) = 27. +Workflow (#4030/#4032 — previously gated but never seeded) = 28.
+    REQUIRE(types.size() == 28);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -197,6 +198,7 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("UploadGrant"));  // PR1.9a: upload-grant mint/revoke lifecycle
     CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
                                    // cut away from the over-broad Security:Read
+    CHECK(has("Workflow")); // #4030/#4032: previously gated but never seeded
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
@@ -231,17 +233,18 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 27 types * 5 CRUD ops = 135 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 136), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 137), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 138 permissions total. Push, Attest, and
+    // 28 types * 5 CRUD ops = 140 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 141), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 142), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 143 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (27th: PowerManagement, Wave 6
+    // rationale in rbac_store.cpp seed_defaults(). (28th: Workflow, #4030/#4032
+    // — previously gated but never seeded; 27th: PowerManagement, Wave 6
     // power_health set_power_plan; 26th-24th: UploadGrant/
     // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
     // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
     // SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 138);
+    CHECK(perms.size() == 143);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -271,9 +274,10 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Viewer");
-    // 21 types * Read only (everything except Infrastructure; incl. Inventory +
-    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376)
-    CHECK(perms.size() == 21);
+    // 22 types * Read only (everything except Infrastructure; incl. Inventory +
+    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376, + Workflow,
+    // #4030/#4032)
+    CHECK(perms.size() == 22);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -1179,11 +1183,13 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 
     auto perms = store.get_role_permissions("ITServiceOwner");
     // 18 types * 5 CRUD ops = 90 permissions, plus the targeted Push grant on
-    // GuaranteedState = 91 permissions total. Push is deliberately NOT
+    // GuaranteedState (= 91), plus a single Workflow:Read grant (#4030/#4032,
+    // NOT via the CRUD loop — the issue's prerequisite scopes this fix to
+    // granting Read only) = 92 permissions total. Push is deliberately NOT
     // cross-seeded on non-Guardian securables — see the rationale in
     // rbac_store.cpp seed_defaults(). (18th type: SoftwareLicensing, ADR-0024 —
     // ITServiceOwner full CRUD per the D-9 matrix.)
-    CHECK(perms.size() == 91);
+    CHECK(perms.size() == 92);
     size_t push_count = 0;
     for (auto& p : perms) {
         CHECK(p.effect == "allow");
