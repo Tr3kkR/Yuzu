@@ -102,9 +102,18 @@
 
 #include "win_str.hpp" // yuzu::win::from_wide — ../../shared include dir
 
-#ifndef ACCESS_SCHEME
-#define ACCESS_SCHEME 16 // Power Management Functions: PowerEnumerate access flag for schemes
-#endif
+// ACCESS_SCHEME comes from <powrprof.h> as an ENUMERATOR of POWER_DATA_ACCESSOR,
+// which is what PowerEnumerate's 4th parameter is typed as.
+//
+// DO NOT REINTRODUCE A `#ifndef ACCESS_SCHEME` FALLBACK. An enumerator is not a
+// macro, so the preprocessor cannot see it: `#ifndef ACCESS_SCHEME` is ALWAYS
+// true, the fallback ALWAYS fires, and a `#define ACCESS_SCHEME 16` then
+// shadows the real enumerator with a plain int at every call site. C++ does not
+// implicitly convert int to an unscoped enum, so PowerEnumerate stops compiling
+// (MSVC C2664, "cannot convert argument 4 from 'int' to 'POWER_DATA_ACCESSOR'")
+// — and the numeric value being correct is what makes it look harmless. There is
+// no preprocessor test for an enumerator; the header either declares it or the
+// build fails loudly on an undeclared identifier, which is the outcome we want.
 
 #elif defined(__APPLE__)
 // Battery/thermal come from power_health_macos.mm's Objective-C++ boundary
