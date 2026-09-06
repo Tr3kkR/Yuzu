@@ -76,7 +76,12 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
 - [ ] **4. Gateway path evidence** - spark detection/heartbeat data surviving a gateway-proxied
       agent, not just direct-connect.
 - [x] **5. UAT smoke**: arm on spark → induced drift → dashboard edge; `--spark-disable` rollback
-      drill restores legacy enforcement (procedure in §6); journal gauges live; `/status`
+      drill restores legacy enforcement (procedure in §6); journal gauges live (confirmed
+      2026-09-06 - a collaborator review found this sub-clause had no citation, unlike its
+      siblings; `GET /metrics` against Rig B mid-session showed real non-zero values:
+      `yuzu_fleet_guardian_journal_sent_labels 8`, `_pages 124`, `_batch_count 11`,
+      `_batches_written 2` - a live confirmation, not §4's CH-5-PROM alerting-rule logic);
+      `/status`
       reports real `errored_rules` (this is PR #3175's fix - confirmed shipped, see "#2298
       sub-item confirmation" below). **The rollback-drill half was DONE 2026-09-04/05 (Rig B on
       BigColin, §6, §8)** - `--spark-disable` restart confirmed to restore legacy enforcement in
