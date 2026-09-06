@@ -293,15 +293,19 @@ Operator                     Server                                  Agent
 
 Most HTTP surfaces the server exposes — REST, dashboard fragments, MCP — are registered by a
 **route owner**: a class with a `register_routes(...)` method that the server calls once at
-startup. `server.cpp` wires those owners, *and* registers a further **79 routes inline** on
+startup. `server.cpp` wires those owners, *and* registers a further **69 routes inline** on
 `web_server_->{Get,Post,Put,Delete}` — the health and readiness probes and much of the `/api/*`
 dashboard JSON. It constructs no persistent `HttplibRouteSink` of its own for these remaining
-inline routes, so none of them is reachable from the in-process test harness. (Two surfaces this
+inline routes, so none of them is reachable from the in-process test harness. (Four surfaces this
 prose previously credited to this inline count have since moved to their own `HttpRouteSink`
-modules and are no longer part of it: `POST /api/command` is `command_routes.cpp` (#2557), and the
+modules and are no longer part of it: `POST /api/command` is `command_routes.cpp` (#2557), the
 page-shell/static-asset surface — `/static/*`, `/`, `/chargen`, `/procfetch`, `/api/help*`,
 `/help`, `/tar`, `/result-sets`, `/viz/fleet`, `/viz/host/:id`, `/instructions`; 25 routes — is
-`page_routes.{hpp,cpp}` (#2542), registered against the stack-local `inline_sink` constructed in
+`page_routes.{hpp,cpp}` (#2542), and a #2542 follow-up split 10 further scattered routes into two
+more owners, both registered against the same stack-local `inline_sink`: `/api/me`, `/api/agents`,
+`/api/audit`, `POST /api/export/json-to-csv`, `POST /api/scope/validate`,
+`/api/analytics/{status,recent}` (7 routes) are `dashboard_api_routes.{hpp,cpp}`, and
+`/api/nvd/{status,sync,match}` (3 routes) are `nvd_routes.{hpp,cpp}` — both constructed in
 `start_web_server()`.)
 
 Counting the surface therefore needs a receiver-agnostic pattern, not a search for one variable
@@ -338,16 +342,19 @@ fragments shipped a destructive operation with no route-handler coverage until #
 register through the sink that owner already uses. Do not add a handler that only the
 `httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
 Registrations outside the sink are pre-existing debt, not a precedent to copy: after #2542 PR-1
-(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern) and the page-shell/static-asset
-extraction (`page_routes.{hpp,cpp}`, 25 routes registered against `inline_sink`), `mcp_server.cpp`
-is the only remaining route owner registering directly on a raw `svr.{Get,Post,Delete}` (3
-registrations) — plus `server.cpp`'s own 79 inline routes, which are not a route-owner class and
-are untouched by this migration; 82 registrations remain outside the sink in total. Count these
-with the anchored pattern `grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
+(`VerifyRoutes` and `NotificationRoutes` joined the sink pattern), the page-shell/static-asset
+extraction (`page_routes.{hpp,cpp}`, 25 routes registered against `inline_sink`), and a #2542
+follow-up (`dashboard_api_routes.{hpp,cpp}` + `nvd_routes.{hpp,cpp}`, 10 more scattered routes
+registered against the same `inline_sink`), `mcp_server.cpp` is the only remaining route owner
+registering directly on a raw `svr.{Get,Post,Delete}` (3 registrations) — plus `server.cpp`'s own
+69 inline routes, which are not a route-owner class and are untouched by this migration; 72
+registrations remain outside the sink in total. Count these with the anchored pattern
+`grep -cE '^\s*web_server_->(Get|Post|Put|Delete|Patch|Options)\('
 server/core/src/server.cpp`, not a bare `grep -c` of the receiver-agnostic pattern above — the
 unanchored form over-counts by picking up at least one comment-line false match, which is how a
 105/106 figure was previously published here; the anchored count was 104 immediately before the
-page-shell extraction (independently re-verified during that extraction) and is 79 after it.
+page-shell extraction (independently re-verified during that extraction), was 79 after it, and is
+69 after the `dashboard_api_routes`/`nvd_routes` follow-up.
 
 ## Storage Architecture
 
