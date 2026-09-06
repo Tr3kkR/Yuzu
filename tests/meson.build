@@ -626,7 +626,7 @@ agent_test_exe = executable(
 # reasons it is not a source of yuzu_agent_tests:
 #   * a sanitizer owns the allocator, so the replacement must be ABSENT from
 #     those binaries, not merely disabled inside them;
-#   * a global allocator replacement has no business in the 1500-case agent
+#   * a global allocator replacement has no business in the agent test
 #     binary that gates every push.
 # Executable-side interposition for libyuzu_agent_core.so is an ELF/libstdc++
 # property (measured on Linux, and it does hold) — not a portable contract, so
@@ -675,12 +675,25 @@ if get_option('b_sanitize') != 'none'
   # plus contention. Do NOT replace this with a wall-clock cap inside the tests themselves -
   # that was tried and backed out (comment above): a busy main thread starves the worker
   # threads whose progress it is waiting on.
+  #
+  # is_parallel: false on Windows ONLY (governance Gate 4/6, #4018 hardening round):
+  # neither this entry nor 'agent unit tests' caps --num-processes, so meson's own
+  # scheduler is free to run both as concurrent OS processes sharing suite: 'agent' -
+  # exactly the shared-disk/Defender-minifilter contention docs/ci-architecture.md's
+  # "Windows test-phase concurrency gate" measures as real ACROSS jobs, now possible
+  # WITHIN one job between these two sibling entries. A barrier is nearly free on
+  # windows-asan (its only sibling under --suite agent is the ~28s-baseline fast
+  # entry) but must NOT apply on Linux's unfiltered `meson test` (sanitize-asan/tsan):
+  # forcing a full drain-then-run-alone there adds real critical-path time to legs
+  # already sized close to their timeout-minutes budget.
+  tsan_heavy_checkpoints_is_parallel = host_machine.system() != 'windows'
   test(
     'agent tsan-heavy checkpoints',
     agent_test_exe,
     args: ['[tsan-heavy]'],
     suite: 'agent',
     timeout: 600,
+    is_parallel: tsan_heavy_checkpoints_is_parallel,
     depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
   )
 endif

@@ -2,9 +2,11 @@
 // (#4018). Silent by default so every leg's output stays byte-identical; when set,
 // prints one flushed stderr line per test start/end (and the run's Catch2 seed), so
 // a stalled CI job's log shows the last TEST_CASE that started rather than nothing.
-// Flushed stderr survives meson's taskkill /F /T on a Windows timeout kill
-// (test_runner_main.cpp documents the same partial-output-survives-cancel fact for
-// its own diagnostic line) - Catch2's own buffered reporter output may not.
+// Flushed stderr survives meson's taskkill /F /T on a Windows timeout kill -
+// Catch2's own buffered reporter output may not. (test_runner_main.cpp documents a
+// related but DIFFERENT survival property - exit-code integrity across a clean
+// Session::run() return followed by teardown corruption, #1648/#3507 - not this
+// mid-run kill scenario; don't conflate the two.)
 //
 // One dedicated TU, same reasoning as test_pg_template_cleanup.cpp's listener: a
 // CATCH_REGISTER_LISTENER in a header would register once per including TU.
@@ -69,6 +71,9 @@ private:
     // taking its address); a plain functor deleter sidesteps that cleanly.
     struct FileCloser {
         void operator()(std::FILE* f) const noexcept {
+            // fclose's return value (an I/O-error signal) is deliberately unobserved:
+            // this is a best-effort diagnostic mirror with no durability contract, and
+            // stderr (emitted first, above) is the primary, unconditional output.
             if (f)
                 std::fclose(f);
         }

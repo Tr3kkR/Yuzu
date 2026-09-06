@@ -71,14 +71,31 @@ jobs:
         id: health
         env:
           GH_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN || secrets.GITHUB_TOKEN }}
-        run: >-
-          python3 scripts/ci/runner-health-check.py --mode preflight
-          --require-pool bigtam --require-pool weetam
+          DISPATCH_JOBS: ${{ inputs.jobs }}
+        run: |
+          # #4018 hardening: a `jobs=windows-asan` dispatch only needs Wee Tam
+          # healthy. Requiring Big Tam unconditionally (as before) meant an
+          # unrelated Big Tam outage failed THIS job, which - via windows-asan's
+          # bare `if:` (no status function, so an implicit success() is ANDed on
+          # per CLAUDE.md's own standing invariant) - silently skipped
+          # windows-asan too, defeating the selector's whole point in exactly the
+          # case a cheap, isolated Wee Tam check is most valuable.
+          pools=(--require-pool weetam)
+          if [[ "$DISPATCH_JOBS" != "windows-asan" ]]; then
+            pools+=(--require-pool bigtam)
+          fi
+          python3 scripts/ci/runner-health-check.py --mode preflight "${pools[@]}"
 
   # ── Sanitizers (ASan + UBSan) ──────────────────────────────────────────
   sanitize-asan:
     name: "Sanitizers (ASan+UBSan)"
     needs: [preflight]
+    # inputs.jobs is null on a schedule trigger (no workflow_dispatch inputs), and
+    # `null != 'windows-asan'` is true - so this guard, and its four siblings on
+    # sanitize-tsan/coverage/alert/close-on-green, are no-ops on the daily cron and
+    # a plain `jobs=all` dispatch. Only `jobs=windows-asan` skips them. A future edit
+    # comparing against `'all'` instead of `!= 'windows-asan'` would silently skip
+    # every one of these jobs on the cron - don't make that change here.
     if: needs.preflight.outputs.bigtam_pool_healthy == 'true' && inputs.jobs != 'windows-asan'
     # Pinned to the Big Tam pool (native Ubuntu 26.04, GCC 15). The ASan
     # triplet (x64-linux-asan) is a forced cold-cache rebuild every run
@@ -88,7 +105,13 @@ jobs:
     # fast; the bigtam-linux label guarantees the gcc-15 toolchain (Shulgi
     # 24.04 can't build it).
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
-    timeout-minutes: 60
+    # 60->75 (#4018 hardening round): the #2373 tsan-heavy split adds a second,
+    # separately-budgeted test() entry (up to 600s x this leg's own
+    # --timeout-multiplier 2 = 1200s worst case) that this job's own timeout-minutes
+    # never accounted for. sanitizer-tests.yml's equivalent ASan/TSan legs already
+    # run the identical surface + multiplier at 75 minutes - match that, don't leave
+    # nightly as the tighter of the two jobs doing the same work.
+    timeout-minutes: 75
     env:
       # detect_odr_violation=0 mirrors ci.yml's matrix linux: gRPC's
       # libgpr.so embeds a static copy of abseil's kToUpper while the
@@ -230,7 +253,8 @@ jobs:
     # safely shared with the standard or ASan triplets. The bigtam-linux
     # label guarantees the gcc-15 toolchain (Shulgi 24.04 can't build it).
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
-    timeout-minutes: 60
+    # 60->75: see the sanitize-asan job's identical comment above (#4018 hardening).
+    timeout-minutes: 75
     env:
       TSAN_OPTIONS: "halt_on_error=1:second_deadlock_stack=1"
       # Shared 4-runner Big Tam host: harmless gateway-eunit default-cookie
@@ -601,6 +625,7 @@ jobs:
         # test workdir is the build directory itself (verified against meson's own
         # source), so a bare "build-windows-asan/meson-logs/..." value would resolve
         # relative to a cwd that's already build-windows-asan and double-prefix.
+        id: test
         env:
           YUZU_TEST_SLOT_TIMEOUT_MIN: "30"
         run: |
@@ -610,12 +635,24 @@ jobs:
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
           bash scripts/ci/with-test-slot.sh 2 -- \
-            meson test -C build-windows-asan --suite agent --print-errorlogs --timeout-multiplier 2
+            meson test -C build-windows-asan --suite agent --timeout-multiplier 2 --print-errorlogs
 
-      - name: Process snapshot (on stall/cancel)
-        # #4018 Gate-4 ask: a process inventory before teardown, so a future stall's
-        # contention theory can be checked against evidence instead of staying a guess.
-        if: failure() || cancelled()
+      - name: Process snapshot (on Test stall/cancel)
+        # #4018 Gate-4 ask: a process inventory captured as soon as possible after a
+        # stall or cancel, so a future recurrence's contention theory can be checked
+        # against evidence instead of staying a guess. Runs after meson's own kill (or
+        # the job-level cancel) has already happened, not "before teardown" - it
+        # inspects co-tenant processes on the box, not the killed process itself.
+        # Scoped to THIS step's own outcome (id: test above), matching the TSan job's
+        # gdb-capture step's pattern above - an unrelated Configure/Build/vcpkg
+        # failure earlier in this job must not trigger an irrelevant process dump.
+        if: steps.test.outcome == 'failure' || steps.test.outcome == 'cancelled'
+        # `tasklist /v` shows PID/session/user/CPU/window-title, not command lines -
+        # it will list every process on this SYSTEM-identity, 4-runner-shared box
+        # (CLAUDE.md's standing single-identity invariant), which lands in this
+        # repo's public run log. No new confidentiality issue - equivalent to the
+        # box's existing routine CI-log visibility - but worth this acknowledgment
+        # given that shared-identity posture is treated as significant elsewhere.
         run: tasklist //v
 
       - name: ccache stats
