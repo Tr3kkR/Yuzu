@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,72 @@ AgentLastUsedRow row(const std::string& exe_key, std::int64_t first_seen, std::i
     return r;
 }
 
+// ── Shared pre-migrated fixture (behaviour-preserving DB-provisioning swap) ──
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between tests instead of a fresh CREATE DATABASE + new pool per test — the
+// same substrate swap already applied in test_software_licensing_store.cpp.
+// Behaviour-preserving: identical store calls + CHECKs; only the DB
+// provisioning/isolation substrate changes. At testRunEnded the pool is drained
+// and the clone dropped (keep_until_run_end), leaving static destruction inert.
+// CARVE-OUT: the migration-at-construction test needs a genuinely fresh
+// database (a clone would find schema_meta already current and skip
+// migration, proving nothing) — it keeps its own per-test database
+// (YUZU_REQUIRE_PG_DB).
+yuzu::test::PgTestTemplate ausg_tpl{"ausgstore", [](const std::string& dsn) {
+                                        PgPool pool{{.conninfo = dsn, .size = 1}};
+                                        AppUsageStore store{pool};
+                                        // Throw, don't return: a silently-unmigrated template
+                                        // would make every clone fall back to in-test migration —
+                                        // correct but slow, defeating the point.
+                                        if (!store.is_open())
+                                            throw std::runtime_error(
+                                                "ausgstore template: store failed to migrate");
+                                    }};
+
+struct AusgShared {
+    yuzu::test::PostgresTestDb db{ausg_tpl};
+    std::optional<PgPool> pool;
+    AusgShared() {
+        REQUIRE(db.available());
+        pool.emplace(PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+AusgShared& ausg_shared() {
+    static AusgShared s;
+    return s;
+}
+
+// Restore the shared DB to its fresh-clone state: TRUNCATE both data tables.
+// public.schema_meta is deliberately untouched, so the per-test store ctor
+// finds the schema current and skips migration (a cheap SELECT, no new
+// backend).
+void ausg_reset() {
+    auto lease = ausg_shared().pool->acquire();
+    REQUIRE(lease);
+    auto trunc =
+        pg::exec_params(lease.get(),
+                        "TRUNCATE app_usage_store.usage_state, "
+                        "app_usage_store.agent_last_used RESTART IDENTITY CASCADE",
+                        std::vector<std::string>{});
+    REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+}
+
+// Preamble for a convertible test: same skip contract as YUZU_REQUIRE_PG_DB,
+// then TRUNCATE-reset the shared DB and bind `pool` (reference to the
+// persistent pool) + `store` (fresh; the ctor's migration check is a no-op on
+// the already-migrated clone). `pool` is [[maybe_unused]] — most tests only
+// touch `store`.
+#define AUSG_SHARED(store, pool)                                                                   \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                               \
+    ausg_reset();                                                                                  \
+    [[maybe_unused]] PgPool& pool = *ausg_shared().pool;                                           \
+    AppUsageStore store{pool};                                                                     \
+    REQUIRE(store.is_open())
+
 } // namespace
 
 TEST_CASE("AppUsageStore: opens and migrates on a fresh database", "[app_usage_store][pg]") {
@@ -55,11 +122,7 @@ TEST_CASE("AppUsageStore: opens and migrates on a fresh database", "[app_usage_s
 
 TEST_CASE("AppUsageStore: stored_hash on a cold cache is a value holding nullopt",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
     auto result = store.stored_hash("never-seen-agent");
     REQUIRE(result.has_value());  // not degraded
     CHECK_FALSE(result->has_value()); // cold cache
@@ -67,11 +130,7 @@ TEST_CASE("AppUsageStore: stored_hash on a cold cache is a value holding nullopt
 
 TEST_CASE("AppUsageStore: replace_agent_last_used round-trips rows and the raw hash",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
 
     const std::string agent = "agent-1";
     std::vector<AgentLastUsedRow> rows = {row("chrome.exe", 1699000000, 1700000500, 12, 43200),
@@ -95,11 +154,7 @@ TEST_CASE("AppUsageStore: replace_agent_last_used round-trips rows and the raw h
 
 TEST_CASE("AppUsageStore: a second replace supersedes the first (old rows gone)",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
 
     const std::string agent = "agent-2";
     REQUIRE(store.replace_agent_last_used(
@@ -120,11 +175,7 @@ TEST_CASE("AppUsageStore: a second replace supersedes the first (old rows gone)"
 
 TEST_CASE("AppUsageStore: an empty rows replace is a legitimate replace-to-empty",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
 
     const std::string agent = "agent-3";
     REQUIRE(store.replace_agent_last_used(
@@ -142,11 +193,7 @@ TEST_CASE("AppUsageStore: an empty rows replace is a legitimate replace-to-empty
 
 TEST_CASE("AppUsageStore: touch bumps freshness without altering child rows",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
 
     const std::string agent = "agent-4";
     REQUIRE(store.replace_agent_last_used(
@@ -164,22 +211,14 @@ TEST_CASE("AppUsageStore: touch bumps freshness without altering child rows",
 
 TEST_CASE("AppUsageStore: touch on a cold cache (no state row) fails",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
     CHECK_FALSE(store.touch("never-seen-agent"));
 }
 
 TEST_CASE("AppUsageStore: get_agent_last_used with an empty agent_id is an empty value, "
           "not a degrade",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
     auto got = store.get_agent_last_used("");
     REQUIRE(got.has_value());
     CHECK(got->empty());
@@ -190,11 +229,7 @@ TEST_CASE("AppUsageStore: get_agent_last_used with an empty agent_id is an empty
 
 TEST_CASE("AppUsageStore: delete_agent guards an empty id and reports commit status",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
     REQUIRE(store.replace_agent_last_used(
         "agent-5", {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1"));
 
@@ -210,11 +245,7 @@ TEST_CASE("AppUsageStore: delete_agent erases usage_state AND agent_last_used in
           "commit — pinned: post-delete stored_hash==nullopt and get_agent_last_used=={} "
           "(not nullopt)",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
 
     const std::string agent = "agent-6";
     REQUIRE(store.replace_agent_last_used(
@@ -246,21 +277,13 @@ TEST_CASE("AppUsageStore: delete_agent erases usage_state AND agent_last_used in
 
 TEST_CASE("AppUsageStore: delete_agent on an agent with no rows still commits",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
     CHECK(store.delete_agent("agent-never-existed"));
 }
 
 TEST_CASE("AppUsageStore: count_stale_agents counts by last_seen threshold",
           "[app_usage_store][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_SHARED(store, pool);
     REQUIRE(store.replace_agent_last_used(
         "agent-stale-1", {row("chrome.exe", 1699000000, 1700000500)}, "h1"));
 

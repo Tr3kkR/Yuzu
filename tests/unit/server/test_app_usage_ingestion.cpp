@@ -86,6 +86,65 @@ agentpb::InventoryReport hash_only_report(const std::string& claimed_hash) {
     return rpt;
 }
 
+// ── Shared pre-migrated fixture (behaviour-preserving DB-provisioning swap) ──
+// One migrated clone + one persistent pool for the whole FILE, TRUNCATE-reset
+// between the store-backed [pg] ingest tests instead of a fresh CREATE DATABASE
+// + new pool per test (mirrors test_software_licensing_ingestion.cpp). SEPARATE
+// template key from test_app_usage_store.cpp: same schema, but a cross-file
+// shared-key replay-verification mismatch is an environmental risk on local
+// PG16 (see test_software_licensing_ingestion.cpp's comment on the same
+// choice) — a distinct key sidesteps it. Behaviour-preserving: identical
+// ingest calls + CHECKs; only the DB provisioning/isolation changes. At
+// testRunEnded the pool is drained before the clone is dropped
+// (keep_until_run_end), leaving static destruction inert. The [parse]/[hash]
+// tests need no DB and the degraded-store test uses a deliberately-broken DSN
+// — neither is converted.
+yuzu::test::PgTestTemplate ausg_ingest_tpl{"ausgingest", [](const std::string& dsn) {
+                                               PgPool pool{{.conninfo = dsn, .size = 1}};
+                                               AppUsageStore store{pool};
+                                               if (!store.is_open())
+                                                   throw std::runtime_error(
+                                                       "ausgingest template: store failed to "
+                                                       "migrate");
+                                           }};
+
+struct AusgIngestShared {
+    yuzu::test::PostgresTestDb db{ausg_ingest_tpl};
+    std::optional<PgPool> pool;
+    AusgIngestShared() {
+        REQUIRE(db.available());
+        pool.emplace(PgPool::Options{.conninfo = db.dsn(), .size = 4});
+        REQUIRE(pool->valid());
+        db.keep_until_run_end([this]() noexcept { pool.reset(); });
+    }
+};
+AusgIngestShared& ausg_ingest_shared() {
+    static AusgIngestShared s;
+    return s;
+}
+
+// TRUNCATE both data tables between tests; public.schema_meta is untouched, so
+// the per-test store ctor finds the clone migrated and skips migration.
+void ausg_ingest_reset() {
+    auto lease = ausg_ingest_shared().pool->acquire();
+    REQUIRE(lease);
+    auto trunc =
+        pg::exec_params(lease.get(),
+                        "TRUNCATE app_usage_store.usage_state, "
+                        "app_usage_store.agent_last_used RESTART IDENTITY CASCADE",
+                        std::vector<std::string>{});
+    REQUIRE(trunc.status() == PGRES_COMMAND_OK);
+}
+
+#define AUSG_INGEST_SHARED(store, pool)                                                            \
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {                                               \
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");                            \
+    }                                                                                               \
+    ausg_ingest_reset();                                                                           \
+    [[maybe_unused]] PgPool& pool = *ausg_ingest_shared().pool;                                    \
+    AppUsageStore store{pool};                                                                     \
+    REQUIRE(store.is_open())
+
 } // namespace
 
 // ── parse: wire shape ────────────────────────────────────────────────────────
@@ -180,11 +239,7 @@ TEST_CASE("hash: app_usage_raw_hash is sha256 over the RAW received bytes",
 // ── ingest: not-due / malformed report guards ───────────────────────────────
 
 TEST_CASE("ingest: an empty agent_id is a no-op", "[app_usage_ingest]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_INGEST_SHARED(store, pool);
     agentpb::InventoryReport rpt = full_report("claim", sample_blob());
     agentpb::InventoryAck ack;
     ingest_app_usage_report(store, "", rpt, ack);
@@ -198,11 +253,7 @@ TEST_CASE("ingest: an empty agent_id is a no-op", "[app_usage_ingest]") {
 TEST_CASE("ingest: trichotomy — cold cache -> need_full; full store -> stored; "
           "matching hash-only -> touched; drifted hash-only -> need_full",
           "[app_usage_ingest][pg]") {
-    YUZU_REQUIRE_PG_DB(db);
-    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
-    REQUIRE(pool.valid());
-    AppUsageStore store{pool};
-    REQUIRE(store.is_open());
+    AUSG_INGEST_SHARED(store, pool);
 
     const std::string agent = "agent-app-usage-1";
     const std::string blob = sample_blob();
