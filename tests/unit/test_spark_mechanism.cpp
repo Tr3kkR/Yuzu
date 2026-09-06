@@ -3646,14 +3646,22 @@ TEST_CASE("Service spark (real mechanism): rapid arm/unwatch churn does not UAF 
     // static create/delete-without-ever-toggling case would never exercise.
     // If teardown_watch's drain were wrong this would UAF/crash under ASan
     // (or corrupt heap state observably) well before kChurn iterations —
-    // but the crash-only oracle is only as strong as the sanitizer coverage
-    // behind it, and per docs/ci-architecture.md sanitizers are Linux-
-    // self-hosted-nightly only: this Windows test never runs under ASan in
-    // CI, so a heap-corrupting-but-non-crashing variant of the bug could
-    // pass silently here (governance Gate-3 quality-engineer finding). The
-    // production fix (spark_service.cpp's retiring_/retire_grace mechanism)
-    // no longer frees a SvcWatch synchronously on removal specifically to
-    // remove the UAF this test targets, independent of this gap.
+    // and the crash-only oracle is only as strong as the sanitizer coverage
+    // behind it. This test IS part of yuzu_agent_tests, which the nightly
+    // windows-asan job (.github/workflows/nightly.yml) builds and runs
+    // under real Windows ASan (coverage-limited: heap/stack-buffer-overflow
+    // and use-after-free, not STL container-overflow — see that job's own
+    // header comment). So a heap-corrupting UAF here would be caught on
+    // that leg even where it wouldn't crash under a plain debug build —
+    // see nightly.yml's own run history for which refs that job currently
+    // runs against, since that governs how quickly a regression here is
+    // actually caught, AND whether that run's own `--order rand` shuffle
+    // reaches this case before an unrelated stall (#4018) kills the suite
+    // first — coverage here is real but conditional on the job completing.
+    // The production fix
+    // (spark_service.cpp's retiring_/retire_grace mechanism) no longer
+    // frees a SvcWatch synchronously on removal specifically to remove the
+    // UAF this test targets, independent of this coverage.
     SparkEngine engine;
     REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
     Collector got;

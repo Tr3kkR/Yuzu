@@ -25,6 +25,7 @@
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "command_capability.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -34,6 +35,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility> // std::pair in kReversibleDestructive
 #include <vector>
 
 using namespace yuzu::server;
@@ -48,7 +50,7 @@ namespace {
 // updating too — that is the intended failure mode: a securable this
 // catalogue references but rbac_store.cpp stops seeding should fail loudly,
 // not silently pass.
-constexpr std::array<std::string_view, 25> kSeededSecurableTypes{{
+constexpr std::array<std::string_view, 26> kSeededSecurableTypes{{
     "Infrastructure",
     "UserManagement",
     "InstructionDefinition",
@@ -74,6 +76,7 @@ constexpr std::array<std::string_view, 25> kSeededSecurableTypes{{
     "PluginConfig",
     "PluginSecret",
     "UploadGrant",
+    "PowerManagement",
 }};
 
 // Mirrors rbac_store.cpp's `seed_defaults()` `ops[]` — the full seven-value
@@ -112,6 +115,7 @@ struct LabeledSpan {
         {"d", capdecls::plugin_action_catalogue_d(), false},
         {"disk_actions", capdecls::plugin_action_catalogue_disk_actions(), false},
         {"filesystem_posture", capdecls::plugin_action_catalogue_filesystem_posture(), false},
+        {"power_health", capdecls::plugin_action_catalogue_power_health(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
 }
@@ -129,6 +133,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_d(),
         capdecls::plugin_action_catalogue_disk_actions(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
+        capdecls::plugin_action_catalogue_power_health(),
         capdecls::core_dispatch_capabilities(),
     };
 }
@@ -160,7 +165,27 @@ TEST_CASE("capability catalogue: every securable and operation is one rbac_store
     }
 }
 
-TEST_CASE("capability catalogue: every Destructive row is Irreversible",
+/// Destructive rows that are deliberately `Reversible`, with the reason. Every
+/// other Destructive row must be `Irreversible`.
+///
+/// `command_capability.hpp:42-46` is explicit that mutability reflects "the
+/// actual device-side effect, never inferred from `DispatchClass` alone", so
+/// Destructive+Reversible is a legal combination rather than a contradiction —
+/// but until Wave 6 every shipped Destructive row happened to be Irreversible,
+/// and this case asserted that coincidence as a universal. It is kept as an
+/// explicit allowlist so a NEW Destructive+Reversible row still fails loudly
+/// and has to be justified here, which is the property the original assertion
+/// was really providing.
+constexpr std::array<std::pair<std::string_view, std::string_view>, 1> kReversibleDestructive{{
+    {"power_health.set_power_plan",
+     "switching the active Windows power scheme is undone by setting the previous scheme back; "
+     "the action captures and emits previous_guid precisely so the operator can. It is "
+     "Destructive (not Mutating) because it must inherit the destructive-targeting gate — "
+     "explicit device IDs, no unapproved broadcast — not because the effect is unrecoverable."},
+}};
+
+TEST_CASE("capability catalogue: every Destructive row is Irreversible unless explicitly "
+          "allowlisted",
           "[server][dispatch][capability]") {
     for (const auto& source : all_labeled_sources()) {
         for (const auto& row : source.rows) {
@@ -168,6 +193,17 @@ TEST_CASE("capability catalogue: every Destructive row is Irreversible",
                 continue;
             INFO("source=" << source.label << " plugin=" << row.plugin
                             << " action=" << row.action);
+            const std::string pair = std::string{row.plugin} + "." + std::string{row.action};
+            const bool allowlisted =
+                std::find_if(kReversibleDestructive.begin(), kReversibleDestructive.end(),
+                             [&](const auto& e) { return e.first == pair; }) !=
+                kReversibleDestructive.end();
+            if (allowlisted) {
+                // The allowlist exists for Reversible rows; an allowlisted row that
+                // is Irreversible means the entry is stale and should be removed.
+                CHECK(row.mutability == Mutability::Reversible);
+                continue;
+            }
             CHECK(row.mutability == Mutability::Irreversible);
         }
     }

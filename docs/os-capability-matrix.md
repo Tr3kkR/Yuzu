@@ -121,6 +121,7 @@ duplicates.
 | network_config | ✅ | ✅ | ✅ | win/linux/apple throughout, no `/bin/sh` on any leg. Linux rtnetlink + `/proc/net/arp`; macOS getifaddrs + `SIOCGIFMEDIA` link speed + PF_ROUTE + SCDynamicStore. `arp` is now live on Linux and macOS; `dns_cache` stays an honest `unsupported` sentinel on macOS (`network_config_plugin.cpp`) |
 | network_diag | ✅ | ✅ | ✅ | win/linux/apple all implemented |
 | os_info | ✅ | ✅ | ✅ | linux/apple/win branches |
+| power_health | ✅ | 🟡 | 🟡 | Windows is the only full leg: battery via GetSystemPowerStatus + CallNtPowerInformation, thermal via PDH `\Thermal Zone Information(*)`, and power_plan/set_power_plan via PowrProf. macOS has battery (IOPS) and a thermal *pressure enum* (NSProcessInfo), never a temperature; power schemes are unsupported (no named schemes; IOPMSetPMPreferences is SPI, deliberately not adopted). Linux has battery and thermal via `/sys`; power schemes are planned (platform_profile) |
 | processes | ✅ | ✅ | ✅ | win/linux/apple branches (point-in-time enum; streaming capture is under TAR `process`) |
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
 | quarantine | ✅ | ✅ | ✅ | full per-OS blocks; Linux covers IPv4 and IPv6 (honest `note\|ipv6_unavailable` on hosts with no IPv6 stack), macOS verifies pf is actually ENABLED and not merely loaded, and status on all three platforms reports partial/degraded containment rather than a clean `active` (#3282, #3283, #3285). Windows containment now blocks via profile-default policy rather than named Block rules, so the loopback/whitelist Allow rules actually take effect once quarantined (#3284) — see docs/quarantine-windows-firewall-precedence.md |
@@ -164,7 +165,7 @@ merely shrink it — the script exits 1 on a *lower* count too until
 adoption gain is sticky rather than leaving room for a later regression back
 up to the old baseline.
 
-Adoption is now **complete**: all 50 plugins the CI gate tracks populate
+Adoption is now **complete**: all 51 plugins the CI gate tracks populate
 `action_descriptors`, so the undeclared count and `RATCHET_BASELINE_UNDECLARED`
 are both **0** and the "Undeclared plugins" section below is empty. From here
 the ratchet is equivalent to a hard fail — a new plugin directory landing
@@ -491,6 +492,18 @@ implementation is.
 | os_info | uptime | linux | supported | 1 | /proc/uptime | - |
 | os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
 | os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
+| power_health | battery | linux | constrained | 1 | /sys/class/power_supply uevent parsing | fixture-verified; no live Linux venue in this run |
+| power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop |
+| power_health | battery | windows | supported | 1 | GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, PR #4009 review), which is what caught the AC-resting state being reported as unknown rather than not_charging |
+| power_health | thermal | linux | constrained | 1 | /sys/class/thermal zone parsing | fixture-verified; no live Linux venue in this run |
+| power_health | thermal | macos | constrained | 1 | NSProcessInfo.thermalState + IOPMGetThermalWarningLevel | reports a 4-level thermal-pressure enum, never a temperature reading |
+| power_health | thermal | windows | constrained | 1 | PDH \\Thermal Zone Information(*)\\Temperature | zero live counter instances is the measured normal case on desktop hardware (the-rig, 2026-09-04); reports no_thermal_zones_exposed as an explicit success, never an error or a fabricated zero |
+| power_health | power_plan | linux | planned | 1 | platform_profile | declared only; not implemented in this package |
+| power_health | power_plan | macos | unsupported | - | - | macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted |
+| power_health | power_plan | windows | supported | 1 | PowrProf PowerEnumerate + PowerReadFriendlyName + PowerGetActiveScheme | 4 schemes verified live on the-rig, 2026-09-04 (agrees with powercfg /list) |
+| power_health | set_power_plan | linux | planned | 1 | platform_profile | declared only; not implemented in this package |
+| power_health | set_power_plan | macos | unsupported | - | - | macOS has no named power schemes; IOPMSetPMPreferences is SPI — not adopted |
+| power_health | set_power_plan | windows | supported | 1 | PowrProf PowerSetActiveScheme | - |
 | processes | list | linux | supported | 1 | /proc enumeration | - |
 | processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |

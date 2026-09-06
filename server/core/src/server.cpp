@@ -121,6 +121,7 @@
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
+#include "page_routes.hpp" // #2542: page-shell/static-asset routes, extracted onto the HttpRouteSink seam
 #include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
 #include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
 // PR1.9c: the seven capability spans build_classified_command's registry composes over —
@@ -134,6 +135,7 @@
 #include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "capability_decls/plugin_action_catalogue_disk_actions.hpp"
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
+#include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -13109,6 +13111,193 @@ private:
                 .increment();
         });
 
+        // -- Extracted route modules ------------------------------------------------
+        // Common callback lambdas shared by all extracted route modules.
+        HttplibRouteSink inline_sink{*web_server_};
+        auto auth_fn = [this](const httplib::Request& req,
+                              httplib::Response& res) -> std::optional<auth::Session> {
+            return require_auth(req, res);
+        };
+        auto perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                              const std::string& type, const std::string& op) -> bool {
+            return require_permission(req, res, type, op);
+        };
+
+        // #2542: page-shell/static-asset routes (25), extracted onto inline_sink
+        // (this call's own HttpRouteSink seam) rather than any per-owner sink —
+        // these routes are pure page-shell/static-asset serving with no owning
+        // store of their own.
+        yuzu::server::page::register_page_routes(inline_sink, yuzu::server::page::Deps{
+            .auth_fn = auth_fn,
+            .perm_fn = perm_fn,
+            .viz_disabled = &viz_disabled_,
+            .registry = &registry_,
+        });
+
+        // Per-device tier + management-group scope gate (wraps
+        // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
+        // operator can only open / read / live-query a device inside their scope.
+        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& type, const std::string& op,
+                                     const std::string& agent_id) -> bool {
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
+        // The fleet guaranteed-state status route's SOLE authorization gate —
+        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type,
+                                   const std::string& op) -> yuzu::server::ListReadGate {
+            return require_list_read(req, res, type, op);
+        };
+        // #3290 Phase 2 admit-then-filter fleet-read gate (wraps
+        // require_fleet_read). GET /api/v1/inventory/software's SOLE
+        // authorization gate — never stacked with perm_fn (see
+        // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
+        // above). Shared, byte-identical, with the MCP query_installed_software
+        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
+        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                    const std::string& type,
+                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
+            return require_fleet_read(req, res, type, op);
+        };
+        // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
+        // device drills). SAME policy as get_visible_agents_json / the /devices list:
+        // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
+        // off); else the caller's management-group members. The global-read branch is
+        // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        //
+        // #2703 Gate 7: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled())
+        // — the latter can read stale-false while RBAC is durably enabled elsewhere (a
+        // degraded generation-refresh cache), which would silently disclose the whole
+        // fleet to a confined operator. Mirrors get_visible_agents_json's identical
+        // fix immediately above.
+        auto visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+                bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
+                if (!global_read) {
+                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
+                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
+                    // nothing), NOT nullopt here (which means "sees all fleet").
+                    auto v = mgmt_group_store_->get_visible_agents(username);
+                    if (!v)
+                        return std::set<std::string>{};
+                    return std::set<std::string>(v->begin(), v->end());
+                }
+            }
+            return std::nullopt; // global read or RBAC disabled → sees all
+        };
+        // D3: the dashboard facet/scope surfaces' Response:Read-visible set
+        // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
+        // mgmt_group_store_->get_visible_agents the way visible_set_fn above
+        // is. That join is permission-AGNOSTIC (it returns agents reachable
+        // via ANY management-group role the caller holds), so a user with
+        // Response:Read scoped to group G1 and some unrelated role on group
+        // G2 would leak/materialise G2's agents into these dropdowns/groups.
+        // Instead this resolves through visible_agents_for_permission — the
+        // set-form of the SAME resolve_perm_groups/expand_visible_set
+        // resolver that check_scoped_permission and authorize_list_read use
+        // for admission — so the set is permission-specific, deny-aware,
+        // hierarchy-expanded, and set-equivalent to the committed per-agent
+        // predicate response_agent_in_scope (server.cpp) by shared
+        // construction. This is the RbacStore PRIMITIVE, not the
+        // authorize_list_read transport gate — the dashboard routes' flat
+        // perm_fn_ admission gates are untouched by this resolver.
+        auto response_visible_set_fn =
+            [this](const std::string& username) -> std::optional<std::set<std::string>> {
+            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
+            bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                               rbac_store_->check_permission(username, "Response", "Read");
+            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
+            if (!rbac_store_ || !mgmt_group_store_) {
+                return std::set<std::string>{}; // fail-closed, no store to resolve against
+            }
+            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
+                                                                 mgmt_group_store_.get());
+            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
+            return std::set<std::string>(v->begin(), v->end());
+        };
+        auto audit_fn = [this](const httplib::Request& req, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            return audit_log(req, action, result, target_type, target_id, detail);
+        };
+
+        // Shared command-dispatch closure — sends a CommandRequest to agents via
+        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
+        // background consumer drives the EXACT same dispatch path.
+        //
+        // PLAN-006 (caller list corrected per #3133 round-2 review — it used to
+        // claim PolicyEvaluator was the only caller): the production consumers
+        // are PolicyEvaluator (compliance-check tick), PreflightRunner +
+        // PreflightRoutes (read-only preflight dispatch/re-dispatch), and the
+        // DexRoutes / DeviceRoutes live-info panels' canned read-only queries.
+        // All are either genuine background engines with no Session in the
+        // loop, or pre-existing read-only surfaces behind their own scoped
+        // gates (the latter tracked for caller-widening as a follow-up — see
+        // the #3133 round-1/2 review minors). It constructs
+        // `DispatchCaller{.system = true}` explicitly rather than leaving
+        // `principal` merely empty by default: a background dispatch is a
+        // deliberate, greppable statement.
+        auto command_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id) -> yuzu::server::ConfinedDispatchOutcome {
+            // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
+            // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
+            // that must confine call command_dispatch_caller_fn / the caller-typed
+            // sibling below instead. Both funnel through the ONE dispatch_confined
+            // seam. broadcast_on_none=false: an unnamed target here reaches nobody
+            // (#2500), never the fleet.
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, yuzu::server::DispatchCaller{.system = true},
+                                     /*broadcast_on_none=*/false);
+        };
+
+        // #1788 / CDX-R7-02 / K-R7-02: the operator-facing confined entry.
+        // Identical to command_dispatch_fn but carries the caller (identity +
+        // Execution:Execute visible set) so every operator dispatch surface —
+        // REST v1, dashboard, workflow, MCP — narrows to it, exactly as
+        // /api/command does. Same seam (dispatch_confined), one extra parameter.
+        //
+        // PR1.9c: there used to be a second, bare-VisibleSet sibling here
+        // (`command_dispatch_confined_fn`) kept only because
+        // `RestApiV1::CommandDispatchFn` had not been widened. It built a
+        // `DispatchCaller` with an EMPTY principal, which
+        // `build_classified_command` refuses as `AnonymousOperator` before the
+        // legacy-open bypass — so every REST v1 dispatch was undeliverable.
+        // REST now takes the caller like everyone else and that closure is
+        // deleted; there is deliberately only ONE confined entry point again.
+        auto command_dispatch_caller_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id,
+                   const yuzu::server::DispatchCaller& caller)
+                -> yuzu::server::ConfinedDispatchOutcome {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false);
+        };
+
+        // ADR-1007 — a deliberate SIBLING of command_dispatch_caller_fn, not
+        // a widening of it (see workflow_routes.hpp's ConcurrencyDispatchFn
+        // doc comment for why). Routes through the identical dispatch_confined
+        // seam, two extra trailing arguments.
+        auto command_dispatch_concurrency_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                   const std::unordered_map<std::string, std::string>& parameters,
+                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
+                   const std::string& definition_id, const std::string& concurrency_mode)
+                -> yuzu::server::ConfinedDispatchOutcome {
+            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
+                                     execution_id, caller, /*broadcast_on_none=*/false,
+                                     definition_id, concurrency_mode);
+        };
+
         // -- Prometheus metrics endpoint ----------------------------------------
         web_server_->Get("/metrics", [this](const httplib::Request&, httplib::Response& res) {
             // Refresh management group gauges before serializing
@@ -14328,125 +14517,7 @@ private:
             res.set_content(j.dump(), "application/json");
         });
 
-        // -- Static design-system assets ----------------------------------------
-        // CSS is served with no-cache so dashboard skin iteration during
-        // active dev/UAT is picked up on a normal browser reload. The bundle
-        // is ~22 KB; revalidation cost is negligible. Switch back to
-        // max-age + content-hashed URL for prod once the skin stabilises.
-        web_server_->Get("/static/yuzu.css", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-            res.set_content(yuzu::server::kYuzuCss, "text/css; charset=utf-8");
-        });
-        web_server_->Get("/static/icons.svg", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=3600");
-            res.set_content(kYuzuIconsSvg, "image/svg+xml");
-        });
-        web_server_->Get("/static/htmx.js", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(kHtmxJs, "application/javascript; charset=utf-8");
-        });
-        web_server_->Get("/static/sse.js", [](const httplib::Request&, httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(kSseJs, "application/javascript; charset=utf-8");
-        });
-        // Issue #253: response visualization renderer.
-        // /static/echarts.min.js is the vendored Apache ECharts 5 library
-        // (Apache-2.0). /static/yuzu-charts.js is the thin Yuzu adapter
-        // that maps our chart payload onto ECharts options and reads
-        // Yuzu design-system CSS tokens for theming. Both are cached aggressively
-        // because the bundle is content-addressed by binary version.
-        web_server_->Get(
-            "/static/echarts.min.js", [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "public, max-age=86400");
-                res.set_content(yuzu::server::kEChartsJs, "application/javascript; charset=utf-8");
-            });
-
-        // PR 4 of feat/viz-engine: vendored Three.js r168 (MIT) + OrbitControls
-        // (MIT, ES module). Modern Three.js (r150+) ships only as ES modules,
-        // so PR 5's page scaffold loads these via `<script type="importmap">`
-        // mapping `"three"` to `/static/three.module.min.js` and
-        // `"three/addons/controls/OrbitControls.js"` to
-        // `/static/three-orbit-controls.js`. Cache-Control matches the
-        // ECharts pattern: public, max-age=86400, content-addressed by
-        // server binary version.
-        web_server_->Get(
-            "/static/three.module.min.js", [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "public, max-age=86400");
-                res.set_content(yuzu::server::kThreeJs, "application/javascript; charset=utf-8");
-            });
-        web_server_->Get("/static/three-orbit-controls.js",
-                         [](const httplib::Request&, httplib::Response& res) {
-                             res.set_header("Cache-Control", "public, max-age=86400");
-                             res.set_content(yuzu::server::kThreeOrbitControlsJs,
-                                             "application/javascript; charset=utf-8");
-                         });
-        // PR 5 of feat/viz-engine: yuzu-viz.js renderer module. Loaded as
-        // type="module" so it can resolve the `import 'three'` bare
-        // specifier through the importmap declared in viz_page_ui.cpp.
-        //
-        // Cache-Control: no-cache, no-store, must-revalidate -- matches the
-        // /viz/fleet page shell. The renderer bundles change on every
-        // feat/viz-engine PR; a `max-age` here means operators serve a
-        // stale renderer (wrong tier classification, missing features,
-        // outdated layout code) for up to the max-age window after a
-        // server upgrade, with no signal that anything is wrong. The page
-        // shell already revalidates; the bundle it pulls must too, or the
-        // skew window just moves from the HTML to the JS. ~88 KB of
-        // revalidated body per page load is cheap next to a silently-stale
-        // renderer. Vendored libs below (cytoscape, three) keep max-age --
-        // they're content-stable and only change on a deliberate refresh.
-        web_server_->Get(
-            "/static/yuzu-viz.js", [](const httplib::Request&, httplib::Response& res) {
-                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-                res.set_content(yuzu::server::kYuzuVizJs, "application/javascript; charset=utf-8");
-            });
-
-        // PR 9-pre: per-host renderer + vendored Cytoscape.js 3.33.3 (MIT).
-        // yuzu-viz-host.js is the ES module entry; cytoscape.min.js is the
-        // ESM minified Cytoscape bundle resolved via the importmap in
-        // viz_host_page_ui.cpp. The renderer uses cytoscape's built-in
-        // `cose` layout — no layout-extension asset is served.
-        //
-        // yuzu-viz-host.js gets the same no-cache treatment as yuzu-viz.js
-        // (it's our renderer code, changes every viz PR); cytoscape.min.js
-        // keeps max-age (vendored, content-stable).
-        web_server_->Get("/static/yuzu-viz-host.js", [](const httplib::Request&,
-                                                        httplib::Response& res) {
-            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-            res.set_content(yuzu::server::kYuzuVizHostJs, "application/javascript; charset=utf-8");
-        });
-        web_server_->Get("/static/cytoscape.min.js", [](const httplib::Request&,
-                                                        httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(yuzu::server::kCytoscapeJs, "application/javascript; charset=utf-8");
-        });
-        // Inter variable webfont (SIL OFL) — the Yuzu design system's
-        // default family. Single woff2 covers all weights via font-
-        // variation-settings on the @font-face declaration in
-        // css_bundle.cpp.
-        web_server_->Get("/static/fonts/InterVariable.woff2", [](const httplib::Request&,
-                                                                 httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=2592000, immutable");
-            // Zero-copy: pass the byte view's data+size directly so we
-            // don't allocate a 345 KB std::string per fetch. (Gate 3
-            // cpp-S1.) httplib's set_content(const char*, size_t, ...)
-            // copies into the response buffer once.
-            res.set_content(yuzu::server::kInterVariableWoff2.data(),
-                            yuzu::server::kInterVariableWoff2.size(), "font/woff2");
-        });
-
-        web_server_->Get("/static/yuzu-charts.js", [](const httplib::Request&,
-                                                      httplib::Response& res) {
-            res.set_header("Cache-Control", "public, max-age=86400");
-            res.set_content(yuzu::server::kYuzuChartsJs, "application/javascript; charset=utf-8");
-        });
-
         // Issue #253 fragment route lives in dashboard_routes.cpp now (#589).
-
-        // -- Dashboard (unified UI) -------------------------------------------
-        web_server_->Get("/", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kDashboardIndexHtml, "text/html; charset=utf-8");
-        });
 
         // PR2 — MFA step-up gate. Single shared closure (governance Gate 2
         // sec-M5: was duplicated at the SettingsRoutes and RestApiV1
@@ -14534,14 +14605,6 @@ private:
         // F1: live-apply hook for the DEX alerts settings (wired before the
         // listener starts, so no request races the set).
         settings_routes_->set_dex_alert_apply_fn([this]() { apply_dex_alert_config(); });
-
-        // Legacy routes — redirect to dashboard
-        web_server_->Get("/chargen", [](const httplib::Request&, httplib::Response& res) {
-            res.set_redirect("/");
-        });
-        web_server_->Get("/procfetch", [](const httplib::Request&, httplib::Response& res) {
-            res.set_redirect("/");
-        });
 
         // SSE endpoint
         web_server_->Get("/events", [this](const httplib::Request& req, httplib::Response& res) {
@@ -14645,53 +14708,6 @@ private:
         });
 
         // /fragments/scope-list — moved to DashboardRoutes (with groups support)
-
-        web_server_->Get("/api/help", [this](const httplib::Request& req, httplib::Response& res) {
-            if (!require_permission(req, res, "Infrastructure", "Read"))
-                return;
-            res.set_content(registry_.help_json(), "application/json");
-        });
-
-        // Help table HTML fragment (HTMX)
-        web_server_->Get("/api/help/html",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             std::string filter;
-                             if (req.has_param("filter"))
-                                 filter = req.get_param_value("filter");
-                             res.set_content(registry_.help_html(filter), "text/html");
-                         });
-
-        // Autocomplete HTML fragment (HTMX)
-        web_server_->Get("/api/help/autocomplete",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             std::string q;
-                             if (req.has_param("q"))
-                                 q = req.get_param_value("q");
-                             if (q.empty()) {
-                                 res.set_content("", "text/html");
-                                 return;
-                             }
-                             res.set_content(registry_.autocomplete_html(q), "text/html");
-                         });
-
-        // Command palette instruction search HTML fragment (HTMX)
-        web_server_->Get("/api/help/palette",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             if (!require_permission(req, res, "Infrastructure", "Read"))
-                                 return;
-                             std::string q;
-                             if (req.has_param("q"))
-                                 q = req.get_param_value("q");
-                             if (q.empty()) {
-                                 res.set_content("", "text/html");
-                                 return;
-                             }
-                             res.set_content(registry_.palette_html(q), "text/html");
-                         });
 
         // -- NVD CVE feed endpoints -------------------------------------------
 
@@ -15677,40 +15693,6 @@ private:
                             "application/json");
         });
 
-        // -- Help page --------------------------------------------------------
-        web_server_->Get("/help", [](const httplib::Request&, httplib::Response& res) {
-            res.set_content(kHelpHtml, "text/html; charset=utf-8");
-        });
-
-        // -- TAR dashboard page (Phase 15.A — issue #547) --------------------
-        // Auth required because the page makes HTMX calls to retention-paused
-        // and (later) SQL fragment endpoints that themselves require auth +
-        // RBAC; loading the page unauthenticated would just produce a blank
-        // shell that immediately redirects on first fragment request. Mirror
-        // the /instructions pattern.
-        web_server_->Get("/tar", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session) {
-                res.set_redirect("/login");
-                return;
-            }
-            res.set_content(kTarPageHtml, "text/html; charset=utf-8");
-        });
-
-        // ── Result Sets (scope walking — capability §30) ─────────────────
-        // Page shell + HTML fragment routes. Per-operator, owner-scoped: every
-        // fragment authenticates and filters/loads by the session principal.
-        // Rendering lives in result_sets_ui.cpp; store I/O happens here.
-        web_server_->Get("/result-sets",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             auto session = require_auth(req, res);
-                             if (!session) {
-                                 res.set_redirect("/login");
-                                 return;
-                             }
-                             res.set_content(kResultSetsPageHtml, "text/html; charset=utf-8");
-                         });
-
         // Owner-scoped sidebar list.
         //
         // guardian-confinement-2298 PR3 §3e: every result-set fragment below
@@ -15973,109 +15955,6 @@ private:
                 res.set_content(render_result_sets_sidebar(sets, created->id),
                                 "text/html; charset=utf-8");
             });
-
-        // PR 5 of feat/viz-engine: Fleet visualization page. Auth-gated
-        // (same posture as /tar) but the per-request RBAC check happens
-        // inside VizRoutes when the page's JS hits /api/v1/viz/fleet/topology.
-        // The page itself is just the renderer scaffold + nav chrome -- no
-        // per-machine data is rendered server-side; the JSON fetch on the
-        // client is what enforces Response.Read.
-        //
-        // Cache-Control: no-cache, no-store, must-revalidate forces the
-        // browser to revalidate the page HTML on every navigation. This
-        // closes the gov R4 UP-10 / DEP-1 / CHAOS-C3 "stale page + new
-        // bundle" skew window: the page references a hard-coded importmap
-        // for `/static/three.module.min.js` etc. that are themselves
-        // cached for 24 hours. Without revalidation, a heuristically-
-        // cached stale page after a server upgrade pairs with new asset
-        // bytes (or vice versa), producing a silent blank canvas with a
-        // module-resolution console error.
-        //
-        // Future-PR ordering note (gov R4 arch-S1): if a future PR
-        // introduces a regex route like `R"(/viz/([^/]+))"` for per-
-        // machine drill-in, register it AFTER this literal route or the
-        // first-match-wins routing in cpp-httplib would swallow `fleet`
-        // as a path parameter.
-        web_server_->Get("/viz/fleet", [this](const httplib::Request& req, httplib::Response& res) {
-            auto session = require_auth(req, res);
-            if (!session) {
-                res.set_redirect("/login");
-                return;
-            }
-            // Gate 7 sec-L1 / cons-N1 — honour the kill switch on the page
-            // shell, not just the REST/fragment endpoints. Previously the
-            // shell rendered and only the JSON fetch 503'd, leaving the
-            // operator with a half-working page and a console error. 503
-            // here matches the VizRoutes posture and the invariant doc's
-            // "a disabled viz surface returns 503".
-            if (viz_disabled_.load(std::memory_order_acquire)) {
-                res.status = 503;
-                res.set_content("fleet visualization is disabled by an administrator "
-                                "(--viz-disable / YUZU_VIZ_DISABLE)",
-                                "text/plain; charset=utf-8");
-                return;
-            }
-            res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-            res.set_content(kVizFleetPageHtml, "text/html; charset=utf-8");
-        });
-
-        // PR 9-pre: per-host drill-down page. Opened by the 3D viz's
-        // dblclick handler in a new tab. Must be registered AFTER
-        // /viz/fleet (literal match wins; the regex below would otherwise
-        // swallow `fleet` as a parameter — gov R4 arch-S1 ordering).
-        // Agent_id is URL-decoded by httplib (req.matches[1]); we replace
-        // `{{AGENT_ID}}` in the static HTML with the sanitised id so the
-        // renderer can read it from data-agent-id without parsing the URL.
-        // Allow-list: a-z A-Z 0-9 dash underscore dot — anything else is
-        // 400 (the agent_id schema is hexadecimal-uuid-ish; nothing else
-        // should reach this route).
-        web_server_->Get(
-            R"(/viz/host/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
-                auto session = require_auth(req, res);
-                if (!session) {
-                    res.set_redirect("/login");
-                    return;
-                }
-                // Gate 7 sec-L1 / cons-N1 — kill switch on the host
-                // drill-down page shell too (cons-N1 confirmed the gap
-                // spans both viz page routes, not just /viz/fleet).
-                if (viz_disabled_.load(std::memory_order_acquire)) {
-                    res.status = 503;
-                    res.set_content("fleet visualization is disabled by an administrator "
-                                    "(--viz-disable / YUZU_VIZ_DISABLE)",
-                                    "text/plain; charset=utf-8");
-                    return;
-                }
-                const std::string raw_id = req.matches.size() > 1 ? req.matches[1].str() : "";
-                for (char c : raw_id) {
-                    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                                    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-                    if (!ok) {
-                        res.status = 400;
-                        res.set_content("invalid agent_id", "text/plain");
-                        return;
-                    }
-                }
-                std::string html(kVizHostPageHtml);
-                const std::string token = "{{AGENT_ID}}";
-                for (auto pos = html.find(token); pos != std::string::npos;
-                     pos = html.find(token, pos + raw_id.size())) {
-                    html.replace(pos, token.size(), raw_id);
-                }
-                res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-                res.set_content(std::move(html), "text/html; charset=utf-8");
-            });
-
-        // -- Instruction management page --------------------------------------
-        web_server_->Get("/instructions",
-                         [this](const httplib::Request& req, httplib::Response& res) {
-                             auto session = require_auth(req, res);
-                             if (!session) {
-                                 res.set_redirect("/login");
-                                 return;
-                             }
-                             res.set_content(kInstructionPageHtml, "text/html; charset=utf-8");
-                         });
 
         // -- Generic JSON-to-CSV export -----------------------------------------
         web_server_->Post("/api/export/json-to-csv", [this](const httplib::Request& req,
@@ -18559,180 +18438,6 @@ private:
                                 .dump(),
                             "application/json");
         });
-
-        // -- Extracted route modules ------------------------------------------------
-        // Common callback lambdas shared by all extracted route modules.
-        auto auth_fn = [this](const httplib::Request& req,
-                              httplib::Response& res) -> std::optional<auth::Session> {
-            return require_auth(req, res);
-        };
-        auto perm_fn = [this](const httplib::Request& req, httplib::Response& res,
-                              const std::string& type, const std::string& op) -> bool {
-            return require_permission(req, res, type, op);
-        };
-        // Per-device tier + management-group scope gate (wraps
-        // require_scoped_permission). Used by DeviceRoutes' per-device routes so an
-        // operator can only open / read / live-query a device inside their scope.
-        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                     const std::string& type, const std::string& op,
-                                     const std::string& agent_id) -> bool {
-            return require_scoped_permission(req, res, type, op, agent_id);
-        };
-        // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
-        // The fleet guaranteed-state status route's SOLE authorization gate —
-        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
-        auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                   const std::string& type,
-                                   const std::string& op) -> yuzu::server::ListReadGate {
-            return require_list_read(req, res, type, op);
-        };
-        // #3290 Phase 2 admit-then-filter fleet-read gate (wraps
-        // require_fleet_read). GET /api/v1/inventory/software's SOLE
-        // authorization gate — never stacked with perm_fn (see
-        // rest_api_v1.cpp's route comment; same BLOCKING rule as list_read_fn
-        // above). Shared, byte-identical, with the MCP query_installed_software
-        // twin's set_fleet_read_fn wiring below — one conversion, two surfaces.
-        auto fleet_read_fn = [this](const httplib::Request& req, httplib::Response& res,
-                                    const std::string& type,
-                                    const std::string& op) -> yuzu::server::authz::FleetReadGate {
-            return require_fleet_read(req, res, type, op);
-        };
-        // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
-        // device drills). SAME policy as get_visible_agents_json / the /devices list:
-        // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
-        // off); else the caller's management-group members. The global-read branch is
-        // load-bearing — a bare get_visible_agents would blank an admin in no group.
-        //
-        // #2703 Gate 7: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled())
-        // — the latter can read stale-false while RBAC is durably enabled elsewhere (a
-        // degraded generation-refresh cache), which would silently disclose the whole
-        // fleet to a confined operator. Mirrors get_visible_agents_json's identical
-        // fix immediately above.
-        auto visible_set_fn =
-            [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
-                bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
-                if (!global_read) {
-                    // ADR-0042: get_visible_agents nullopt means the mgmt-store
-                    // DEGRADED — return an EMPTY confined set (fail-closed: sees
-                    // nothing), NOT nullopt here (which means "sees all fleet").
-                    auto v = mgmt_group_store_->get_visible_agents(username);
-                    if (!v)
-                        return std::set<std::string>{};
-                    return std::set<std::string>(v->begin(), v->end());
-                }
-            }
-            return std::nullopt; // global read or RBAC disabled → sees all
-        };
-        // D3: the dashboard facet/scope surfaces' Response:Read-visible set
-        // (dashboard_routes.hpp VisibleSetFn) — deliberately NOT built on
-        // mgmt_group_store_->get_visible_agents the way visible_set_fn above
-        // is. That join is permission-AGNOSTIC (it returns agents reachable
-        // via ANY management-group role the caller holds), so a user with
-        // Response:Read scoped to group G1 and some unrelated role on group
-        // G2 would leak/materialise G2's agents into these dropdowns/groups.
-        // Instead this resolves through visible_agents_for_permission — the
-        // set-form of the SAME resolve_perm_groups/expand_visible_set
-        // resolver that check_scoped_permission and authorize_list_read use
-        // for admission — so the set is permission-specific, deny-aware,
-        // hierarchy-expanded, and set-equivalent to the committed per-agent
-        // predicate response_agent_in_scope (server.cpp) by shared
-        // construction. This is the RbacStore PRIMITIVE, not the
-        // authorize_list_read transport gate — the dashboard routes' flat
-        // perm_fn_ admission gates are untouched by this resolver.
-        auto response_visible_set_fn =
-            [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (!rbac_enforcement_in_effect(rbac_store_.get())) return std::nullopt;
-            bool global_read = rbac_store_ && rbac_store_->is_open() &&
-                               rbac_store_->check_permission(username, "Response", "Read");
-            if (global_read) return std::nullopt; // global Response:Read sees all, #1715(b)
-            if (!rbac_store_ || !mgmt_group_store_) {
-                return std::set<std::string>{}; // fail-closed, no store to resolve against
-            }
-            auto v = rbac_store_->visible_agents_for_permission(username, "Response", "Read",
-                                                                 mgmt_group_store_.get());
-            if (!v) return std::set<std::string>{}; // degrade → fail-closed, never nullopt
-            return std::set<std::string>(v->begin(), v->end());
-        };
-        auto audit_fn = [this](const httplib::Request& req, const std::string& action,
-                               const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) -> bool {
-            return audit_log(req, action, result, target_type, target_id, detail);
-        };
-
-        // Shared command-dispatch closure — sends a CommandRequest to agents via
-        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
-        // background consumer drives the EXACT same dispatch path.
-        //
-        // PLAN-006 (caller list corrected per #3133 round-2 review — it used to
-        // claim PolicyEvaluator was the only caller): the production consumers
-        // are PolicyEvaluator (compliance-check tick), PreflightRunner +
-        // PreflightRoutes (read-only preflight dispatch/re-dispatch), and the
-        // DexRoutes / DeviceRoutes live-info panels' canned read-only queries.
-        // All are either genuine background engines with no Session in the
-        // loop, or pre-existing read-only surfaces behind their own scoped
-        // gates (the latter tracked for caller-widening as a follow-up — see
-        // the #3133 round-1/2 review minors). It constructs
-        // `DispatchCaller{.system = true}` explicitly rather than leaving
-        // `principal` merely empty by default: a background dispatch is a
-        // deliberate, greppable statement.
-        auto command_dispatch_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id) -> yuzu::server::ConfinedDispatchOutcome {
-            // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
-            // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
-            // that must confine call command_dispatch_caller_fn / the caller-typed
-            // sibling below instead. Both funnel through the ONE dispatch_confined
-            // seam. broadcast_on_none=false: an unnamed target here reaches nobody
-            // (#2500), never the fleet.
-            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, yuzu::server::DispatchCaller{.system = true},
-                                     /*broadcast_on_none=*/false);
-        };
-
-        // #1788 / CDX-R7-02 / K-R7-02: the operator-facing confined entry.
-        // Identical to command_dispatch_fn but carries the caller (identity +
-        // Execution:Execute visible set) so every operator dispatch surface —
-        // REST v1, dashboard, workflow, MCP — narrows to it, exactly as
-        // /api/command does. Same seam (dispatch_confined), one extra parameter.
-        //
-        // PR1.9c: there used to be a second, bare-VisibleSet sibling here
-        // (`command_dispatch_confined_fn`) kept only because
-        // `RestApiV1::CommandDispatchFn` had not been widened. It built a
-        // `DispatchCaller` with an EMPTY principal, which
-        // `build_classified_command` refuses as `AnonymousOperator` before the
-        // legacy-open bypass — so every REST v1 dispatch was undeliverable.
-        // REST now takes the caller like everyone else and that closure is
-        // deleted; there is deliberately only ONE confined entry point again.
-        auto command_dispatch_caller_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id,
-                   const yuzu::server::DispatchCaller& caller)
-                -> yuzu::server::ConfinedDispatchOutcome {
-            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, caller, /*broadcast_on_none=*/false);
-        };
-
-        // ADR-1007 — a deliberate SIBLING of command_dispatch_caller_fn, not
-        // a widening of it (see workflow_routes.hpp's ConcurrencyDispatchFn
-        // doc comment for why). Routes through the identical dispatch_confined
-        // seam, two extra trailing arguments.
-        auto command_dispatch_concurrency_fn =
-            [this](const std::string& plugin, const std::string& action,
-                   const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-                   const std::unordered_map<std::string, std::string>& parameters,
-                   const std::string& execution_id, const yuzu::server::DispatchCaller& caller,
-                   const std::string& definition_id, const std::string& concurrency_mode)
-                -> yuzu::server::ConfinedDispatchOutcome {
-            return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, caller, /*broadcast_on_none=*/false,
-                                     definition_id, concurrency_mode);
-        };
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
         // A background thread ticks it: dispatch due policies' check
@@ -22411,6 +22116,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
         yuzu::server::capdecls::plugin_action_catalogue_disk_actions(),
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
+        yuzu::server::capdecls::plugin_action_catalogue_power_health(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail

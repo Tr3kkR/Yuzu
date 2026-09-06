@@ -187,9 +187,16 @@ echo_argv_fixture = executable(
 #     -fvisibility=default that lets every symbol cross the DLL boundary
 #     without __declspec(dllexport). So libyuzu_agent_core.dll's import
 #     lib does not surface proto symbols and the test binary must link
-#     yuzu_proto.lib directly. Same proto archive, double-registered —
-#     but ASan isn't part of the Windows MSVC build matrix, so the
-#     duplicate-descriptor CHECK that drove #572 doesn't fire here.
+#     yuzu_proto.lib directly. Same proto archive, double-registered — the
+#     nightly windows-asan job (.github/workflows/nightly.yml) builds and
+#     runs this exact configuration under MSVC ASan, so whatever the
+#     underlying reason, the duplicate-descriptor CHECK that drove #572
+#     does not fire here either — not, as previously stated here, because
+#     ASan is absent from Windows MSVC coverage entirely (it isn't — it
+#     runs as nightly.yml's standalone windows-asan job; it genuinely IS
+#     absent from ci.yml's own build matrix, a separate and narrower term
+#     per docs/ci-architecture.md). See that job's own run history for
+#     current pass/fail status per ref.
 #
 # Without this split, Windows MSVC fails LNK2019 on every .pb.o symbol
 # in test_guardian_engine.cpp (the canary that surfaces the broken link).
@@ -450,6 +457,11 @@ agent_test_exe = executable(
     'unit/test_filesystem_posture_local_dispatcher.cpp', # Wave 6 PR6.1-b: real filesystem_posture dylib
                                                 # driven end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
+    'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
+                                                # LocalDispatcher. Deliberately NOT platform-guarded — it
+                                                # runs on every OS, and on a host with no battery it emits an
+                                                # explicit named SKIP rather than passing silently.
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -458,6 +470,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
+    include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -584,6 +597,7 @@ agent_test_exe = executable(
                 software_actions_plugin_lib,
                 users_plugin_lib,
                 wifi_plugin_lib,
+                power_health_plugin_lib,
                 windows_updates_plugin_lib,
                 ],
 )
@@ -847,6 +861,7 @@ if build_server
       'unit/server/test_verify_routes.cpp',
       'unit/server/test_notification_routes.cpp',
       'unit/server/test_command_routes.cpp',
+      'unit/server/test_page_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
       'unit/server/test_agent_health_store.cpp',
@@ -854,6 +869,7 @@ if build_server
       'unit/server/test_instruction_store_signing.cpp',
       'unit/server/test_instruction_yaml.cpp',
       'unit/server/test_execution_tracker.cpp',
+      'unit/server/test_leader_elector.cpp',
       'unit/server/test_execution_event_bus.cpp',
       'unit/server/test_approval_manager.cpp',
       'unit/server/test_schedule_engine.cpp',
@@ -1023,6 +1039,7 @@ if build_server
       'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
       'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
       'unit/server/test_rest_api_events.cpp',
+      'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
