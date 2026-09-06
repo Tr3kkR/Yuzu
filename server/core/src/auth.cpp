@@ -714,9 +714,55 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
     // reactivate_user that landed while the read above was in flight has already
     // installed a NEWER entry than the row we hold; clobbering it would make the
     // new password fail until the next restart. Whatever is cached now wins.
-    auto [it, inserted] = users_.try_emplace(username, *db_user);
+    auto [it, inserted] = users_.try_emplace(username, std::move(*db_user));
     (void)inserted;
     return it->second;
+}
+
+std::optional<Role>
+AuthManager::recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
+                                                  std::string_view context) {
+    if (!auth_db_)
+        return pre_check_role; // cfg-file mode: users_ IS the truth, nothing to re-check
+    auto db_user = auth_db_->get_user(username);
+    if (!db_user) {
+        // #4020 Gate 3 quality-engineer follow-up: only a genuine UserNotFound
+        // (soft-deleted/removed) means the cache is actually stale - evicting on
+        // ANY get_user() failure (a transient QueryFailed/StoreBusy from pool
+        // contention) would erase a perfectly valid, freshly-verified entry over
+        // a momentary DB hiccup on an otherwise-successful credential check,
+        // forcing a needless re-hydrate on this user's very next request. Fail
+        // closed for THIS call either way (a DB outage must not silently fall
+        // back to trusting a role we can no longer confirm), but only evict when
+        // we've actually confirmed removal.
+        if (yuzu::server::AuthDBError::UserNotFound == db_user.error()) {
+            spdlog::warn("{}: user '{}' not active in AuthDB", context, username);
+            std::unique_lock lock(mu_);
+            users_.erase(username);
+        } else {
+            spdlog::error("{}: AuthDB re-check for '{}' failed (store error, not a removal) - "
+                         "failing closed without touching the cache",
+                         context, username);
+        }
+        return std::nullopt;
+    }
+    std::unique_lock lock(mu_);
+    // Guard against clobbering a NEWER write from a concurrent update_role():
+    // only overwrite when the cache still holds the exact role this call
+    // observed before its own DB re-read (see this method's header doc for the
+    // interleaving this closes). A divergence means some other write already
+    // landed and must win over this call's now-stale observation.
+    if (auto it = users_.find(username); it != users_.end() && it->second.role == pre_check_role)
+        it->second.role = db_user->role;
+    // Gate 3 authdb follow-up: this refreshes ONLY `.role` from `db_user`, never
+    // `.salt_hex`/`.hash_hex` - currently safe (verified: no AuthDB/AuthManager
+    // method changes an existing user's password; `upsert_user` is
+    // create-only, INSERT...ON CONFLICT DO NOTHING), so a cached hash can never
+    // diverge from the DB today. A FUTURE password-change/reset feature MUST
+    // extend this same refresh to the credential fields too, or it reintroduces
+    // the exact stale-credential class this function exists to close - just for
+    // password material instead of role.
+    return db_user->role;
 }
 
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
@@ -762,45 +808,14 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         return std::nullopt;
     }
 
-    // If using DB, verify user is still active in DB (could have been soft-deleted)
-    if (auth_db_) {
-        auto db_user = auth_db_->get_user(username);
-        if (!db_user) {
-            spdlog::warn("Auth failed: user '{}' not active in AuthDB", username);
-            // #4020 adversarial-review follow-up (Gate 2, governance): evict the
-            // now-stale cache entry, mirroring remove_user()'s own eviction. A
-            // removal made through a DIFFERENT AuthManager (another replica) never
-            // touches this process's `users_` map, so without this a removed
-            // principal stays "active, role R" forever in cache-only readers like
-            // get_user_role() on this manager — reachable via a still-valid API
-            // token (removing a user does not itself revoke their tokens; see
-            // auth_routes.cpp's synthesize_token_session, which falls back to
-            // get_user_role() for the legacy-role synthesis path). The durable
-            // session wipe that accompanied the ORIGINAL remove_user() call on the
-            // other manager already invalidated any session fleet-wide; this only
-            // needs to catch up the local in-memory map, which is not shared.
-            std::unique_lock lock(mu_);
-            users_.erase(username);
-            lock.unlock();
-            return std::nullopt;
-        }
-        // #4020 adversarial-review follow-up: this read was ALREADY firing for the
-        // active-status check above; make it authoritative for ROLE too, not just
-        // existence. `entry->role` can be stale — a role change made through a
-        // DIFFERENT AuthManager (another replica, or this same process's own
-        // update_role call racing this one) does not touch an already-cached
-        // users_ entry, so a JUST-demoted user re-authenticating against a manager
-        // that cached them pre-demotion would otherwise mint a fresh session at the
-        // OLD (higher) role — durable session invalidation only kills PRIOR
-        // sessions, it does nothing to protect a brand-new login. Refresh the
-        // cache too (not just this local `entry` copy), so get_user_role() etc.
-        // on this manager also stop reporting the stale role, not merely this one
-        // session mint.
-        entry->role = db_user->role;
-        std::unique_lock lock(mu_);
-        if (auto it = users_.find(username); it != users_.end())
-            it->second.role = db_user->role;
-    }
+    // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
+    // this the authoritative role for the session about to be minted (#4020 +
+    // Gate 2/3 governance follow-ups — see recheck_role_after_credential_check's
+    // doc for the full rationale, including the race the compare-guard closes).
+    auto current_role = recheck_role_after_credential_check(username, entry->role, "Auth failed");
+    if (!current_role)
+        return std::nullopt;
+    entry->role = *current_role;
 
     auto token = generate_session_token();
     yuzu::server::SessionWriteParams params;
@@ -863,25 +878,14 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
         }
         return std::nullopt;
     }
-    auto role = entry->role;
-    if (auth_db_) {
-        auto db_user = auth_db_->get_user(username);
-        if (!db_user) {
-            spdlog::warn("verify_password failed: user '{}' not active in AuthDB", username);
-            // #4020 adversarial-review follow-up: same cache eviction as
-            // authenticate() above — see its comment for the full rationale.
-            std::unique_lock lock(mu_);
-            users_.erase(username);
-            lock.unlock();
-            return std::nullopt;
-        }
-        // #4020 adversarial-review follow-up: same authoritative-role refresh as
-        // authenticate() above — see its comment for the full rationale.
-        role = db_user->role;
-        std::unique_lock lock(mu_);
-        if (auto it = users_.find(username); it != users_.end())
-            it->second.role = db_user->role;
-    }
+    // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
+    // this the authoritative role for the caller (same rationale as
+    // authenticate() — see recheck_role_after_credential_check's doc).
+    auto current_role =
+        recheck_role_after_credential_check(username, entry->role, "verify_password failed");
+    if (!current_role)
+        return std::nullopt;
+    auto role = *current_role;
     if (metrics_) {
         const auto elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();

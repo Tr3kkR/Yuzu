@@ -399,15 +399,21 @@ TEST_CASE("cold-cache hydration never resurrects a soft-deleted user (#4020)",
     REQUIRE_FALSE(cold_mgr.get_user_role("cora").has_value()); // nothing cached
 }
 
-TEST_CASE("authenticate fails closed (not unknown-user) when AuthDB is pool-saturated "
+TEST_CASE("authenticate fails closed when AuthDB is pool-saturated on a cold-cache lookup "
           "(#4020 adversarial-review follow-up)",
           "[pg][auth][session][cold_cache]") {
     // Mirrors the #2396 pool-saturation precedent (test_auth_db_pg.cpp): the
     // UserLookupMiss::DbError branch find_user_or_hydrate takes on a genuine
     // AuthDB query failure (vs UserNotFound) was previously untested — nothing
-    // pinned that a future change couldn't collapse it into "unknown user"
-    // (which would mislabel a store outage as a bad-username signal and could
-    // mask a fail-closed auth substrate problem).
+    // pinned that a future change couldn't collapse it into the UserNotFound
+    // branch instead. This proves the FUNCTIONAL fail-closed outcome (nullopt,
+    // no credential check performed) on both entry points; it does NOT assert
+    // anything about the unknown_user metrics histogram (metrics_ isn't wired
+    // in this fixture) — the code-level distinction between the two
+    // UserLookupMiss enum values (never conflated into one metrics label) is
+    // verified by reading find_user_or_hydrate's implementation, not by this
+    // test (Gate 3 quality-engineer follow-up: narrowed this test's own claim
+    // to what it actually observes).
     yuzu::test::AuthDbPg auth_db;
     // Seeds through AuthManager (real kPbkdf2Iterations), not a DB-direct upsert at
     // the cheap test-only 1000 iterations the OTHER cold_cache tests use — this
@@ -532,6 +538,64 @@ TEST_CASE("a cross-manager removal evicts the stale cache entry, not just the lo
     // paths must evict it on discovering the removal, not just deny this login.
     REQUIRE_FALSE(mgr_a.authenticate("cora", "password1234").has_value());
     REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value()); // evicted, not just denied
+}
+
+TEST_CASE("a cross-manager removal evicts the stale cache entry via verify_password too "
+          "(Gate 3 authdb follow-up)",
+          "[pg][auth][session][cold_cache]") {
+    // Sibling of the authenticate() case above, exercised through
+    // verify_password()'s OWN call site - both share
+    // recheck_role_after_credential_check now, but this pins that shared
+    // behavior against EACH entry point rather than trusting a single test to
+    // stand in for both if they ever diverge again.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager mgr_a;
+    mgr_a.set_auth_db(auth_db.get());
+    REQUIRE(mgr_a.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(mgr_a.verify_password("cora", "password1234").has_value()); // caches admin
+    REQUIRE(mgr_a.get_user_role("cora") == Role::admin);
+
+    AuthManager mgr_b;
+    mgr_b.set_auth_db(auth_db.get());
+    REQUIRE(mgr_b.remove_user("cora"));
+
+    REQUIRE_FALSE(mgr_a.verify_password("cora", "password1234").has_value());
+    REQUIRE_FALSE(mgr_a.get_user_role("cora").has_value()); // evicted, not just denied
+}
+
+TEST_CASE("authenticate fails closed WITHOUT evicting the cache on a genuine AuthDB store "
+          "error (Gate 3 quality-engineer follow-up)",
+          "[pg][auth][session][cold_cache]") {
+    // Distinguishes a genuine removal (UserNotFound - evict) from a transient
+    // store error (QueryFailed/StoreBusy on pool saturation - do NOT evict) on
+    // the post-password re-check: only the FIRST call below saturates the
+    // pool, so it fails closed but the cache entry survives; the SECOND call
+    // (pool free again) succeeds normally, proving the entry was never lost.
+    yuzu::test::AuthDbPg auth_db;
+
+    AuthManager warm_mgr;
+    warm_mgr.set_auth_db(auth_db.get());
+    REQUIRE(warm_mgr.upsert_user("cora", "password1234", Role::admin));
+    REQUIRE(warm_mgr.authenticate("cora", "password1234").has_value()); // caches admin
+
+    std::vector<yuzu::server::pg::PgPool::Lease> held;
+    for (int i = 0; i < 4; ++i) {
+        auto lease = auth_db.pool().try_acquire_for(std::chrono::seconds(2));
+        REQUIRE(lease);
+        held.push_back(std::move(lease));
+    }
+
+    // The PBKDF2 check itself succeeds (cache hit, no DB needed); only the
+    // post-check AuthDB re-verify hits the saturated pool and fails closed.
+    REQUIRE_FALSE(warm_mgr.authenticate("cora", "password1234").has_value());
+
+    held.clear(); // release the pool
+    // If the cache had been wrongly evicted above, this would still succeed
+    // (find_user_or_hydrate would just re-hydrate) - the real assertion is
+    // that the role survived UNTOUCHED, which get_user_role proves directly
+    // without going through another credential check.
+    REQUIRE(warm_mgr.get_user_role("cora") == Role::admin);
 }
 
 TEST_CASE("a hydrated entry is superseded by a later in-process role change (#4020)",

@@ -877,7 +877,39 @@ private:
     /// overwrites an entry an in-process write installed while that read was in
     /// flight. Returns a COPY so callers run PBKDF2 without holding `mu_`.
     /// Caller must NOT hold `mu_`.
-    std::expected<UserEntry, UserLookupMiss> find_user_or_hydrate(const std::string& username);
+    [[nodiscard]] std::expected<UserEntry, UserLookupMiss>
+    find_user_or_hydrate(const std::string& username);
+
+    /// Shared by authenticate()/verify_password(): the post-password-check
+    /// re-read of AuthDB (already firing to catch a soft-deleted user) made
+    /// authoritative for role too (#4020 Gate 2 adversarial-review/governance
+    /// follow-up), hardened per a Gate 3 cpp-expert finding: the cache write is
+    /// guarded against clobbering a NEWER write from a concurrent update_role()
+    /// racing this call. `pre_check_role` is the role `find_user_or_hydrate`
+    /// returned for THIS call, captured before any DB re-read - the cache is
+    /// overwritten only when it still holds that exact value; a divergence
+    /// means some other write already landed since this call last observed the
+    /// cache, and that write must never be reverted by this call's now-stale
+    /// read (interleaving: this call reads AuthDB pre-demotion, a concurrent
+    /// update_role() commits the demotion and its own cache write, THEN this
+    /// call's unconditional write would silently revert the cache back to the
+    /// pre-demotion role — the guard below closes exactly that ordering).
+    ///
+    /// Returns the current role on success (cfg-file mode, no `auth_db_`,
+    /// trivially returns `pre_check_role` unchanged - there's no DB to
+    /// re-check against). Returns nullopt if AuthDB reports the user no longer
+    /// active (soft-deleted/removed) - in which case the stale cache entry is
+    /// ALSO evicted, mirroring remove_user()'s own eviction: a removal made
+    /// through a DIFFERENT AuthManager never touches this process's map, so
+    /// without this a removed principal stays "active, role R" forever in
+    /// cache-only readers like get_user_role() - reachable via a still-valid
+    /// API token, since remove_user() only wipes sessions, never tokens.
+    /// `context` is the log-message prefix ("Auth failed" / "verify_password
+    /// failed") so both callers keep their existing distinct wording. Caller
+    /// must NOT hold `mu_`.
+    [[nodiscard]] std::optional<Role>
+    recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
+                                        std::string_view context);
 
     // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
     // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.
