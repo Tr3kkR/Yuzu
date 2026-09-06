@@ -294,6 +294,13 @@ parse_linux_power_supply_uevent(std::string_view uevent) {
         return row;
     }
 
+    // The kernel's POWER_SUPPLY_STATUS is a CLOSED set of five values
+    // (power_supply.h): Unknown, Charging, Discharging, Not charging, Full.
+    // All five are handled, and "Not charging" is one of them — dropping it
+    // into `unknown` is the same information loss the Windows and macOS legs
+    // carried until PR #4009's review found it on real hardware. Linux states
+    // it outright rather than leaving it to be inferred from two booleans, so
+    // there is nothing to classify: the kernel already answered.
     const auto status = find_value("POWER_SUPPLY_STATUS").value_or("");
     if (status == "Charging")
         row.state = BatteryState::charging;
@@ -301,7 +308,11 @@ parse_linux_power_supply_uevent(std::string_view uevent) {
         row.state = BatteryState::discharging;
     else if (status == "Full")
         row.state = BatteryState::full;
+    else if (status == "Not charging")
+        row.state = BatteryState::not_charging;
     else
+        // "Unknown", an absent key, or a value outside the documented set —
+        // the only cases where the kernel genuinely has not told us.
         row.state = BatteryState::unknown;
 
     auto to_int = [](std::string_view s) -> std::optional<int> {
