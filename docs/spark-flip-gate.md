@@ -599,6 +599,44 @@ tracked separately below)
 - Revisit trigger: fired, and resolved. All four of this row's issues are now fixed or
   accepted-by-documentation.
 
+**PR-2d follow-up hardening (governance Gate 4/5, filed 2026-09-06)** - four findings
+from PR-2d's own review, none blocking (all SHOULD, all OOM/backpressure-only or bounded
+by the ~5s poll backstop), tracked here rather than re-litigated as new #2815-class
+entries since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in
+it:
+- **#4051** (P1) - the dedup-race window named in `revalidate_subscriptions()`'s own doc
+  comment: a Lost notification can be discarded as stale by `on_subscription_lost`'s
+  staleness guard if it's processed before the sibling arm's own commit lands, stranding
+  a dead subscription for up to the poll backstop's ~5s cadence instead of catching it
+  instantly. Needs a new pre-commit test seam to reproduce deterministically - real but
+  small design work, not rushed into PR-2d.
+- **#4052** (P2) - `revalidate_subscriptions()`'s sweep has no per-key throw isolation
+  (`firewalled_sweep` aborts the WHOLE pass on one key's throw) and a `bad_alloc` mid-
+  detach can strand a `keys_` row with no self-heal path. Both require allocation
+  failure to trigger.
+- **#4053** (P2) - `guardian_outbox`'s `enqueue_all` all-or-nothing semantics can drop an
+  entire multi-rule Health batch under backpressure, with larger fan-out (more rules
+  sharing a key) making total loss MORE likely exactly when blast radius is biggest.
+- **C-1, folded here rather than filed standalone** (consistency-auditor,
+  dormant-until-flip, PRE-PR-5 GATING) - `server/core/src/guaranteed_state_store.cpp`'s
+  `event_state_from_type` does not recognize the new `guard.errored` wire event (falls
+  through to "no census change", identically to the pre-existing `armed`/`disarmed`
+  events). A rule detached as errored keeps showing its LAST PRIOR compliance verdict
+  (e.g. "compliant") on the dashboard/REST census even though it is no longer armed or
+  evaluated - a real, customer-visible staleness gap once `prefer_spark_` flips, though
+  inert today. Not filed as its own issue (chaos-injector's recommendation): it lands
+  squarely on the Guardian routed-concern row (`security-guardian` + `docs-writer`
+  trigger on any `guaranteed_state*` change) regardless of when it's picked up, and
+  belongs with this doc's own pre-PR-5 checklist rather than a freestanding ticket that
+  could drift out of sync with it. **Must be resolved (or explicitly re-risk-accepted)
+  before PR-5's sign-off** - added to this doc's own gating surface, not merely noted.
+- Owner: not assigned for any of the four.
+- Milestone: pre-PR-5 hardening package (#4051/#4052/#4053) + a pre-PR-5 GATING item
+  (guard.errored census recognition, no issue number - tracked here).
+- Revisit trigger: before PR-5's sign-off, all four re-checked; #4051 specifically
+  re-checked before any production fleet (dedup races become far more frequent under
+  real load than in this PR's own governance testing).
+
 **#2012 + #2011 + #3840** (+#2014, confirm at execution)
 - Detection signal: **none today**, named explicitly in the source ruling - a stuck
   `arm_ancestor` walk (File, #2012) or a stuck `CreateThreadpoolWait`/`RegNotifyChangeKeyValue`
