@@ -82,9 +82,10 @@ All start unchecked. Each gets its evidence link recorded here by PR-6.
       BigColin, §6, §8)** - `--spark-disable` restart confirmed to restore legacy enforcement in
       ~8.6s, with a subsequent 14-hour clean run showing zero spark-state leak. **The
       arm-on-spark → induced-drift → dashboard-edge half is now ALSO DONE (2026-09-06, DGRHP,
-      Windows, `file-change` mechanism - a second data point on Linux/`service-status-change`
-      followed the same day, Rig B/BigColin, see §8's later update)** - root-caused and fixed the two blockers the prior
-      attempt left open, then attempted the full path three times across two arm windows: the
+      Windows, `file-change` mechanism)** - root-caused and fixed the two blockers the prior
+      attempt left open, then attempted the full path three times across two arm windows (a
+      second data point on Linux/`service-status-change` followed the same day, Rig B/BigColin -
+      see §8's later update for that half): the
       first (corroborating-only - its `Emit` fired but was lost to an outbox stall before
       reaching the server, so it doesn't close the loop on its own) in the first window; the
       second and third (no restart between them) in the second window, each closing the full
@@ -1030,26 +1031,45 @@ now also DONE, on Rig B/BigColin.** Dave authorized the scoped `NOPASSWD` sudoer
 (`docs/agent-privilege-model.md`'s sudoers-construction pattern, narrowed to `dgr ALL=(root)
 NOPASSWD: /usr/bin/systemctl stop yuzu-drift-test-dummy.service, /usr/bin/systemctl start
 yuzu-drift-test-dummy.service` - a scratch no-op unit created for this test only, never a real
-system service) and ran it himself since the assistant has no passwordless sudo on that box.
+system service) and ran it himself since the assistant has no passwordless sudo on that box. The
+unit file lives at the standard `/etc/systemd/system/` path, root:root-owned via `install`; both
+the sudoers entry and the scratch unit were left in place after the test (narrowly scoped to
+that one unit only - not reverted, but also not a live risk beyond it).
+
 **Real, non-obvious blocker found and fixed along the way**: a freshly-created Guardian rule
 does not arm just because it exists in the store - per CLAUDE.md's own Guardian invariant, a
 **Baseline** is the deployable unit, and enforcement gates on `deployed_member_rule_ids()` from
 a baseline's `deployed_snapshot`, not the live rule set. The new rule (`rigb-drift-test-dummy-
 service`) sat silently un-armed through TWO agent restarts (confirmed via `Guardian engine
 started (cached_rules=3, ...)` / `network-connected (..., rules=3)` never reflecting the 4th
-rule) with no error anywhere - creating it via `POST /api/v1/guaranteed-state/rules` alone was
-never going to work; it needed a new Baseline (`POST /fragments/guardian/baselines`, no clean
-JSON API exists for this - HTMX-form-only) containing it, then an explicit `.../deploy` call.
-Once deployed: `SparkEngine: armed 'service|29:yuzu-drift-test-dummy.service'` confirmed via
-agent log, `guard.armed`/`guard.compliant` events at `2026-09-06T15:44:39Z`. `sudo -n systemctl
+rule) with no error via the REST create response or the agent logs - the signal an operator
+debugging this WOULD find is on the dashboard itself: the Guards list shows an explicit
+"not deployed" badge per rule, and the guard detail page says "not in a deployed Baseline"
+(`guardian_routes.cpp`) - this session went straight to the logs/REST and didn't check there
+first, so "no error anywhere" (an earlier draft's framing) overstated it. Creating the rule via
+`POST /api/v1/guaranteed-state/rules` alone was never going to work regardless; it needed a new
+Baseline (`POST /fragments/guardian/baselines` - no clean JSON API exists for baseline
+create/deploy, HTMX-form-only, a known gap tracked at **#3266**, this session corroborated it)
+containing it, then an explicit `.../deploy` call. Once deployed:
+`SparkEngine: armed 'service|29:yuzu-drift-test-dummy.service'` confirmed via agent log,
+`guard.armed`/`guard.compliant` events at `2026-09-06T15:44:39Z`. **The `guard.compliant` emission
+itself is worth flagging**: `docs/user-manual/guaranteed-state.md` documents the LEGACY Linux
+systemd service guard as "still observe-only on the compliant edge - detects and reports drift
+but does not yet emit `guard.compliant`." This rule ran the SPARK path instead
+(`guardian_engine.cpp`'s `attach_rule` call passes `emit_compliant_edge=true` unconditionally,
+not platform-gated the way the legacy guard is) - so this may be live evidence that spark's
+Linux Service mechanism closes that documented legacy parity gap, not a discrepancy. Worth
+reconciling into `guaranteed-state.md` separately; not done in this doc-only PR. `sudo -n systemctl
 stop` (same second: `2026-09-06T15:45:06Z` for both the command and the resulting `drift.detected`
 event) produced `{"event_type":"drift.detected","guard_type":"service","detected_value":
 "stopped","expected_value":"running"}` - confirmed via REST AND the live dashboard fragment
 (`GET /fragments/guardian/events?type=drift.detected` rendered this exact rule/event at the top
 of the list, `.et-drift_detected` class, no ambiguity with another rule family this time).
-Service restored to running immediately after. This closes the gate doc's own explicit "genuinely
+Service manually restored via the same granted `systemctl start` (not Guardian remediation -
+Linux service enforcement remains deferred/observe-only per `docs/os-capability-matrix.md`;
+this test exercised detection only). This closes the gate doc's own explicit "genuinely
 optional... not attempted here" deferral - both `file-change` (DGRHP) and `service-status-change`
-(Rig B) spark mechanisms now have live, event-driven, dashboard-confirmed evidence.
+(Rig B) spark mechanisms now have live, event-driven, dashboard-confirmed detection evidence.
 
 ## Also closed out by this PR
 
