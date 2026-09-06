@@ -111,15 +111,51 @@ struct SparkEngineStats {
     /// Monotonic. Surfaced as the sparse heartbeat tag `yuzu.spark_arm_race_unwatch_failures`;
     /// the fleet rollup, metrics.md row and alert rule are deferred to the
     /// prefer_spark flip alongside `retiring`/`retiring_cap` (spark_fleet_tags.hpp).
+    ///
+    /// #2833 — WHEN THAT TAG IS UNREACHABLE, which is exactly when it would matter most.
+    /// Increments that happen during SHUTDOWN never reach the wire: the agent's heartbeat
+    /// composer emits NOTHING once stop_requested_ is set (agent.cpp:2582 / :3311). The
+    /// two shutdown paths' spark-stop and heartbeat-join calls (:1086 / :3345 vs :3125 /
+    /// :3774) run on different threads and aren't ordered relative to each other, but
+    /// that isn't load-bearing here — the engine's own gate says the same thing
+    /// independently: emit_spark_heartbeat_tags() takes the ABSENT posture on !running, and stop() has
+    /// already cleared running_. So a shutdown-window increment is JOURNAL-ONLY: its sole
+    /// egress is the spdlog::error at the increment site.
+    ///
+    /// OPERATOR CONSEQUENCE: a zero reading for this tag during a shutdown is NOT evidence
+    /// that nothing was orphaned. Accepted, not fixed — adding an egress here would be
+    /// inert, because the gate that suppresses it is the agent's and is deliberate
+    /// (STOPPED is not FAILED: a cleanly-stopping agent must not page on-call). Pinned by
+    /// "#2833 — a shutdown-window unwatch failure is counted but has NO heartbeat egress"
+    /// in test_spark_mechanism.cpp.
     std::uint64_t arm_race_unwatch_failures_total{0};
     /// Mechanism unwatch() calls that THREW during an ordinary disarm() teardown (#2270).
     /// The counterpart of the counter above, scoped the same way on purpose: that one
     /// covers teardown_arm_race, this one covers disarm(). Neither covers
     /// unregister_consumer() (#2814, worse in kind — see above), so a zero across
     /// BOTH is still not "no orphaned watches fleet-wide". Same per-mechanism
-    /// reclamation bound as its counterpart.
+    /// reclamation bound as its counterpart — and the same #2833 shutdown-window
+    /// unreachability, stated in full at that counter: an increment during shutdown is
+    /// journal-only, so a zero reading then is not evidence nothing was orphaned.
     std::uint64_t disarm_unwatch_failures_total{0};
     std::uint64_t consumer_threads_detached{0}; ///< handlers that blocked past the shutdown budget
+    /// stop() calls whose BOUNDED wait for the in-flight mechanism-teardown lease
+    /// expired, so stop() proceeded to tear the mechanisms down with a caller still
+    /// inside the post-mu_ window (#2815). Monotonic.
+    ///
+    /// JOURNAL-ONLY BY CONSTRUCTION, and deliberately absent from
+    /// emit_spark_heartbeat_tags(): this counter can only ever increment INSIDE stop(),
+    /// which runs after running_ = false, and the heartbeat gate at agent.cpp:2582 emits
+    /// nothing once shutdown has been requested. A heartbeat tag for it would be
+    /// unreachable on every path that can set it — the same shape as the two
+    /// unwatch-failure counters' shutdown-window increments (#2833). Its egress is the
+    /// spdlog::warn at the expiry site, plus this field for tests.
+    ///
+    /// Non-zero does NOT mean a use-after-free happened: ~SparkEngine's wait is
+    /// UNBOUNDED and is what actually closes that. It means the late unwatch may have
+    /// reached an already-stopped mechanism (benign — every real mechanism fails a
+    /// post-stop unwatch closed) and that some caller outstayed the budget.
+    std::uint64_t teardown_join_timeouts_total{0};
     std::uint64_t events_total{0};       ///< spark fires (post-dedup, pre-fan-out)
     std::uint64_t queued_delivered_total{0};
     std::uint64_t queued_dropped_total{0}; ///< bounded-queue overflow + shutdown drops
@@ -609,6 +645,66 @@ private:
     std::atomic<std::uint64_t> watch_faults_{0}; ///< monotonic mechanism fault-report count
     std::atomic<std::uint64_t> arm_race_unwatch_failures_{0}; ///< monotonic; teardown_arm_race ONLY (#2270)
     std::atomic<std::uint64_t> disarm_unwatch_failures_{0};   ///< monotonic; disarm() ONLY (#2270)
+    std::atomic<std::uint64_t> teardown_join_timeouts_{0};    ///< monotonic; stop()'s lease wait expired (#2815)
+
+    /// #2815 TEARDOWN LEASE. Callers currently inside one of the FOUR windows that
+    /// resolve a raw `ISparkMechanism*` (and this engine's mech_ops_mu_by_type_ entry)
+    /// under mu_, RELEASE mu_, and then call into the mechanism: disarm(),
+    /// teardown_arm_race(), unregister_consumer(), and the live arm path in arm_impl().
+    /// Armed as the last statement of the SAME mu_ block that resolves the mechanism,
+    /// released when the enclosing function returns (an RAII lease in spark_engine.cpp).
+    ///
+    /// stop() waits on it BOUNDED before stopping the mechanisms; ~SparkEngine waits on
+    /// it UNBOUNDED before any member is destroyed. The unbounded one is the actual
+    /// safety mechanism: without it, ~SparkEngine frees mech_ops_mu_by_type_ out from
+    /// under a caller parked in that window (use-after-free). The bounded one is an
+    /// API-contract nicety, and stop() must never become a place shutdown can hang.
+    ///
+    /// NO NEW CALLER CAN ARM A LEASE BEHIND stop() on three of the four doors: disarm(),
+    /// teardown_arm_race() and arm_impl() gate their own entry on running_/stopped_
+    /// under mu_ BEFORE they resolve a mechanism, so once stop()'s early locked block
+    /// has flipped both flags a later caller resolves nothing and arms nothing. (Door 3
+    /// is the exception to THIS claim only — its unwatch()-gating is uniform across all
+    /// four doors; see below.)
+    /// unregister_consumer() (door 3) gates ENTRY differently — on whether `id` is
+    /// still present in consumers_, which stop() doesn't empty until its OWN later
+    /// step 3 (the consumers.swap) — so a call landing in that window still arms a
+    /// lease (governance Gate 8 cpp-expert finding, correcting an earlier draft of
+    /// this paragraph that overstated door 3's residual risk: it does NOT still call
+    /// unwatch() on a mechanism stop() may be concurrently tearing down). The actual
+    /// unwatch() call is gated by the SAME running_ check as the other three doors —
+    /// it sits on the to_unwatch collection inside this window, not on the lease —
+    /// so once stop() flips running_ false, a racing unregister_consumer() collects
+    /// nothing and its post-mu_ unwatch loop runs zero times. What's genuinely
+    /// different about door 3 is narrower: the lease itself is armed
+    /// UNCONDITIONALLY (see unregister_consumer()'s own comment), because this
+    /// function's tail — quiesce_consumer() — touches consumer_join_budget_ms_/
+    /// consumer_threads_detached_ regardless of whether any mechanism call happened.
+    /// So a post-flip caller can still arm a lease with an empty unwatch loop
+    /// (harmless, slightly conservative over-counting), never a live unwatch()
+    /// racing a concurrently-stopping mechanism. What's not true is that the ENTRY
+    /// GATE on the LEASE is uniform across all four doors — it is uniform on the
+    /// mechanism-unwatch path.
+    ///
+    /// A PLAIN ATOMIC, POLLED — a simplicity choice, not a forced one (governance
+    /// Gate 3 cpp-expert review: worth recording precisely, since the original
+    /// wording here overclaimed that a condition_variable was ruled out entirely).
+    /// The lease is released from an RAII DESTRUCTOR on the door caller's thread. A
+    /// destructor that itself LOCKED a mutex would std::terminate on the
+    /// std::system_error std::mutex::lock is permitted to raise, in a subsystem whose
+    /// whole design premise is that an observe-only component may never take the
+    /// agent down (see stop()'s noexcept rationale) — that part is a real, load-
+    /// bearing constraint. But `condition_variable::notify_all()` itself takes no
+    /// lock and is noexcept, so a hybrid (atomic fetch_sub, then a lock-free
+    /// notify_all, with this same poll retained only as a much-longer-interval
+    /// lost-wakeup backstop) was a real option that was not implemented, not one
+    /// that couldn't be. fetch_sub cannot throw, so the count is always correct
+    /// either way; the waiters absorb the cost as a 1 ms sleep-poll, which is paid
+    /// only at shutdown and only while a caller is genuinely in flight — judged not
+    /// worth the added complexity for a dormant subsystem's teardown path. Ordering:
+    /// the releasing fetch_sub and the waiters' acquiring load give the waiter
+    /// happens-before over everything the door caller did.
+    std::atomic<std::uint64_t> inflight_teardowns_{0};
 
     // Counters updated outside mu_ (delivery paths) — atomics.
     std::atomic<std::uint64_t> events_total_{0};

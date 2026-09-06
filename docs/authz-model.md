@@ -112,7 +112,7 @@ group). It classifies securables/operations/risk-tiers and composes strictly on 
 
 ### The gap
 
-`/api/command` (`server.cpp`, referenced at the handler's `#1788` comment) base-gates a single,
+`/api/command` (`command_routes.cpp` as of #2557, moved out of `server.cpp`; referenced at the handler's `#1788` comment) base-gates a single,
 possibly-**global** `Execution:Execute` permission and then dispatches through one of four arms:
 
 1. **Ids** — an explicit `agent_ids` list.
@@ -193,7 +193,7 @@ Every OPERATOR dispatch surface reaches the second through one of two callers �
 `execute_bundle`, the dashboard execute and TAR `purge_source` routes, the per-device DEX live
 query, the three async result-set producers (`POST /api/v1/result-sets/from-tar-query`,
 `/from-instruction-result`, `/{id}/re-eval`), and `POST /api/instructions|workflows/{id}/execute`)
-or the `/api/command` inline handler. Those two
+or `command_routes.cpp`'s `/api/command` handler (moved out of server.cpp by #2557). Those two
 callers legitimately differ in how they RESOLVE targets (management-group store, scope engine,
 principal from a live session versus an execution row) and in how they report failure
 (`/api/command` answers 400/503; the shared closure has no response object — background runners call
