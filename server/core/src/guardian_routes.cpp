@@ -8,6 +8,11 @@
 #include "baseline_store.hpp"
 #include "http_route_sink.hpp"
 #include "guardian_form_render.hpp"
+#include "guardian_model.hpp" // #4037 — shared per-guard census builder
+                              // (guardian_rule_agent_status_rows), so this
+                              // fragment computes the SAME census as the REST
+                              // /rules/{rule_id}/status and MCP
+                              // get_guardian_rule_status twins
 #include "guardian_push_builder.hpp"  // guardian_enforced_on_platform / platform_display_name / os_target_matches
 #include "guardian_rule_spec.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — mints/reuses X-Correlation-Id so
@@ -1952,7 +1957,16 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
                     }
         }
         std::unordered_set<std::string> seen;  // agent_ids that already have a status row
-        for (const auto& s : store_->agent_rule_statuses(guard_id).value_or(std::vector<GuardianAgentRuleStatus>{})) {
+        // #4037: same shared builder as the REST/MCP twins
+        // (guardian_model.hpp::guardian_rule_agent_status_rows), so all three
+        // surfaces compute this census identically. Preserves this fragment's
+        // pre-existing degrade posture unchanged — a degraded read still
+        // falls back to an empty vector here (`value_or`), not a 503; that is
+        // the dashboard fragment's own set-and-proceed contract per the
+        // recipe's per-surface audit fail-mode table (see docs/api-twin-recipe.md
+        // §4), not something this refactor changes.
+        for (const auto& s : yuzu::server::guardian_rule_agent_status_rows(*store_, guard_id)
+                                  .value_or(std::vector<yuzu::server::GuardianRuleAgentStatusRow>{})) {
             seen.insert(s.agent_id);
             DevRow d;
             d.online = hostname.count(s.agent_id) > 0;
