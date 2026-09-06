@@ -41,9 +41,10 @@
 ///   - `dispatch_confined_arms` (dispatch_confined_arms.hpp) decides WHO IS
 ///     REACHED for every caller — the per-arm visible-set intersection (#1788).
 ///     `ServerImpl::dispatch_confined` (the shared closure serving Dashboard,
-///     MCP, workflow and instruction execute) and the `/api/command` inline
-///     path BOTH route through it; the two byte-identical four-arm copies that
-///     previously existed are gone.
+///     MCP, workflow and instruction execute) and `command_routes.cpp`'s
+///     `/api/command` handler (moved out of server.cpp by #2557) BOTH route
+///     through it; the two byte-identical four-arm copies that previously
+///     existed are gone.
 ///   - What each caller still owns is its own TARGET RESOLUTION (group store,
 ///     scope engine, principal from a live session vs an execution row) and
 ///     its own audit/HTTP shaping. Those legitimately differ, which is why one
@@ -152,14 +153,28 @@ inline constexpr std::string_view kReasonScopeUnsupported{"scope_unsupported"};
 /// containment static_assert in `mcp_input_bounds.hpp` for no reason — this
 /// reason already has its own emit sites on both surfaces without that.
 inline constexpr std::string_view kReasonDestructiveUntargeted{"destructive_untargeted"};
+/// #2557: a Destructive-class capability WAS explicitly targeted (a non-empty
+/// `agent_ids` list, so `kReasonDestructiveUntargeted` above does not apply),
+/// but confining that list to the operator's visible agents
+/// (`confine_destructive_targets`) emptied it out — every named id was
+/// outside the caller's management-group confinement. `/api/command`'s
+/// Destructive gate previously answered 404 here with NO metric increment
+/// and NO audit row: an incident review of a near-miss "dispatch a purge at
+/// devices I can't see" attempt found nothing. Distinct from
+/// `kReasonDestructiveUntargeted` — that reason means "named nothing at
+/// all"; this one means "named something, but none of it was visible" — an
+/// auditor needs to tell the two apart the same way every other reason in
+/// this family is kept apart by name rather than collapsed.
+inline constexpr std::string_view kReasonDestructiveNoVisibleTarget{"destructive_no_visible_target"};
 
-inline constexpr std::array<std::string_view, 6> kRouteRejectReasons{
+inline constexpr std::array<std::string_view, 7> kRouteRejectReasons{
     kReasonBodyType,             ///< the request body was not a JSON object
     kReasonParentIdType,         ///< parent_id was supplied and is not a string
     kReasonParentIdEmpty,        ///< parent_id was supplied and is an empty string
     kReasonClosureNoTarget,      ///< a dispatch closure was called naming no target
     kReasonScopeUnsupported,     ///< the route cannot honour `scope` and refuses it
     kReasonDestructiveUntargeted, ///< a Destructive-class capability lacked explicit targeting
+    kReasonDestructiveNoVisibleTarget, ///< explicit targeting resolved to no VISIBLE agent
 };
 
 /// #881: a target the caller was AUTHORISED to reach (it survived the
@@ -218,14 +233,16 @@ inline constexpr std::string_view kReasonUnknownPlugin{"unknown_plugin"};
 ///
 /// Both REST callers reject a non-object body before reaching this function.
 /// That rejection is pinned by a test on `POST /api/instructions/{id}/execute`
-/// only (`test_workflow_routes.cpp`, "a non-object body is refused"). It is
-/// NOT pinned on `/api/command`, which no test can reach — that route is
-/// registered inline on a raw httplib::Server inside `Server::start()` rather
-/// than through HttpRouteSink (#2557). Earlier revisions of this comment cited
-/// #1786 for it, which is a different gap entirely — the TAR retention-paused
-/// dashboard fragments in `dashboard_routes.cpp`, closed by #2534 without
-/// touching `/api/command`. That citation was inherited from a review summary
-/// and repeated without reading the issue.
+/// (`test_workflow_routes.cpp`, "a non-object body is refused") AND, since
+/// #2557 extracted `/api/command` onto the `HttpRouteSink` seam
+/// (`command_routes.{hpp,cpp}`), by `test_command_routes.cpp` too — that route
+/// no longer runs inline on a raw `httplib::Server` inside `Server::start()`,
+/// so the in-process `TestRouteSink` harness can reach it directly. Earlier
+/// revisions of this comment cited #1786 for the prior gap, which was a
+/// different issue entirely — the TAR retention-paused dashboard fragments in
+/// `dashboard_routes.cpp`, closed by #2534 without touching `/api/command`.
+/// That citation was inherited from a review summary and repeated without
+/// reading the issue.
 /// An earlier version of this paragraph
 /// claimed both routes were pinned; they are not, and a false verification
 /// claim in the header that is the source of truth for this invariant is worse
@@ -317,6 +334,28 @@ enum class DispatchArm {
     if (scope_expr == kBroadcastScope)
         return DispatchArm::Broadcast;
     return DispatchArm::None;
+}
+
+/// The string spelling of a `DispatchArm`, fed into
+/// `build_classified_command`'s `target_arm` (-> `compute_plan_hash`) so two
+/// dispatches of the same `plugin.action` differing only in HOW targets were
+/// selected (an explicit id list vs. a scope match that happens to resolve to
+/// the same set) mint distinct plan identities. Never parsed back, only
+/// hashed, so the exact spelling is a private implementation detail — but
+/// #2557 gave it a SECOND caller (`command_routes.cpp`, alongside
+/// `server.cpp`'s own dispatch closure), so it moved here rather than being
+/// copied: both callers feed the same `build_classified_command` chokepoint,
+/// and a copy that drifted in spelling would silently mint two different
+/// plan-hash families for what is otherwise the identical dispatch.
+[[nodiscard]] inline std::string_view dispatch_arm_label(DispatchArm arm) {
+    switch (arm) {
+    case DispatchArm::Group: return "group";
+    case DispatchArm::Scope: return "scope";
+    case DispatchArm::Ids: return "ids";
+    case DispatchArm::Broadcast: return "broadcast";
+    case DispatchArm::None: return "none";
+    }
+    return "none";
 }
 
 /// Did the caller name a target at all?

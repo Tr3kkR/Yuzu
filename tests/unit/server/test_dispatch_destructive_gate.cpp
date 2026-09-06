@@ -468,22 +468,29 @@ TEST_CASE("#3685 composition: /api/command's require_permission call is present 
           "pin (a runtime bind is awkward here: both live on ServerImpl/agent_registry.hpp "
           "internals with no test-reachable seam of their own)",
           "[server][dispatch][security]") {
-    const std::string server_cpp = read_src_file("server.cpp");
+    // #2557: the Destructive-gate composition moved from server.cpp's inline
+    // /api/command handler to command_routes.cpp (the HttpRouteSink
+    // extraction) — this scan follows it there. `require_permission` itself
+    // became `deps.perm_fn` at the extraction boundary (every ServerImpl
+    // method call in the handler became a `Deps` closure call), so the
+    // literal this test looks for changed to match — the SEMANTIC property
+    // being pinned (a caller-owned re-check, textually distinct from the
+    // chokepoint's `has_permission` callback) is unchanged.
+    const std::string command_routes_cpp = read_src_file("command_routes.cpp");
 
     // The Destructive-gate call site itself must still exist.
-    const auto gate_pos = server_cpp.find("evaluate_destructive_targeting(");
+    const auto gate_pos = command_routes_cpp.find("evaluate_destructive_targeting(");
     REQUIRE(gate_pos != std::string::npos);
 
     // Within a bounded window after the gate call, /api/command's own
-    // JIT-elevation-aware require_permission(cap.securable, cap.operation)
-    // re-check must still be present — this is D3/D4's "do not collapse the
-    // two" invariant: the caller keeps its own authorization call, never
-    // folded into or replaced by the chokepoint's has_permission callback.
+    // JIT-elevation-aware perm_fn(cap.securable, cap.operation) re-check
+    // must still be present — this is D3/D4's "do not collapse the two"
+    // invariant: the caller keeps its own authorization call, never folded
+    // into or replaced by the chokepoint's has_permission callback.
     constexpr std::size_t kWindow = 4000;
-    const std::string window =
-        server_cpp.substr(gate_pos, std::min(kWindow, server_cpp.size() - gate_pos));
-    CHECK(window.find("require_permission(req, res, std::string(cap.securable)") !=
-          std::string::npos);
+    const std::string window = command_routes_cpp.substr(
+        gate_pos, std::min(kWindow, command_routes_cpp.size() - gate_pos));
+    CHECK(window.find("deps.perm_fn(req, res, std::string(cap.securable)") != std::string::npos);
 
     // And the chokepoint's own has_permission callback usage
     // (agent_registry.hpp) is a TEXTUALLY DISTINCT call — a different
