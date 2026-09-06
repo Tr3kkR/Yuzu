@@ -430,6 +430,19 @@ public:
     /// production caller.
     [[nodiscard]] std::string last_file_expected_hash_for_test() const;
 
+    /// Gate 3 quality-engineer follow-up (#4021): `last_file_expected_hash_for_test`
+    /// only proves the SEED lookup ran — it says nothing about whether the
+    /// CAPTURE callback (`FileGuard::Config::on_baseline`) was actually attached,
+    /// since a seeded (non-empty `expected_hash`) rule never re-enters the
+    /// capture branch at all. Set unconditionally, right after the assignment,
+    /// on every file-hash-equals arm attempt — true regardless of seeding, so a
+    /// test can assert the wiring itself happened (deleting the assignment
+    /// would otherwise leave every Linux test green, since no real FileGuard
+    /// runs off Windows to observe the callback firing). Locked, returned by
+    /// value — same rationale as the sibling accessors above. No production
+    /// caller.
+    [[nodiscard]] bool last_file_on_baseline_wired_for_test() const;
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -595,6 +608,9 @@ private:
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
     /// arm attempt has run yet.
     std::string last_file_expected_hash_for_test_;
+    /// TEST-ONLY (see last_file_on_baseline_wired_for_test); false = no
+    /// file-hash-equals arm attempt has run yet.
+    bool last_file_on_baseline_wired_for_test_{false};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported

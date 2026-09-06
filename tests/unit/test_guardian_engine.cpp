@@ -235,6 +235,14 @@ TEST_CASE("full_sync clears the prior rule set but PRESERVES a persisted baselin
     j["hash"] = std::string(64, 'e');
     REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
 
+    // r1 must be a REAL pushed rule first (Gate 3 quality-engineer follow-up:
+    // otherwise the closing CHECK_FALSE below is vacuously true regardless of
+    // whether the scoped-delete fix works, since rule:r1 was never written in
+    // the first place).
+    f.engine->apply_rules(
+        GuardianFixture::make_push({GuardianFixture::make_rule("r1", "r1")}, /*full_sync=*/true));
+    REQUIRE(f.kv->exists(GuardianEngine::kv_namespace(), "rule:r1"));
+
     // r1's baseline was captured BEFORE this push; the new full_sync push doesn't
     // even name r1 (an unrelated rule's fleet edit, mirroring #3990's amplifier) —
     // r1 is genuinely gone from this push, same as the server omitting a
@@ -359,6 +367,62 @@ TEST_CASE("persist writes normally over a malformed existing record (self-heals)
     auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
     REQUIRE(seeded.has_value());
     CHECK(*seeded == hash);
+}
+
+// ── schema-version mismatch (Gate 3 quality-engineer follow-up) ────────────
+//
+// Pins the exact scenario the 7451b67df fingerprint/schema-version-separation
+// fix was written for: a record from a future/incompatible schema must be
+// treated as Malformed (recapture/rewrite, self-heals), never silently
+// matched as-is or misread as "a different target" — deleting the schema
+// check in read_baseline_record should flip both of these red.
+
+TEST_CASE("seed does not match a record with a mismatched schema version",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "file-hash-equals|/tmp/x";
+    nlohmann::json j;
+    j["schema"] = 2; // future/incompatible - kBaselineSchemaVersion is 1
+    j["fingerprint"] = fp;
+    j["hash"] = std::string(64, 'a');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    CHECK_FALSE(seeded.has_value()); // Malformed, not a false match
+}
+
+TEST_CASE("persist overwrites a record with a mismatched schema version",
+          "[guardian][engine][baseline][persist]") {
+    GuardianFixture f;
+    const std::string fp = "file-hash-equals|/tmp/x";
+    nlohmann::json j;
+    j["schema"] = 2;
+    j["fingerprint"] = fp; // matching fingerprint - only the schema differs
+    j["hash"] = std::string(64, 'a');
+    REQUIRE(f.kv->set(GuardianEngine::kv_namespace(), "baseline:r1", j.dump()));
+
+    // A schema mismatch must be read as Malformed, NOT as a same-fingerprint
+    // match — otherwise the persist-side overwrite guard would (wrongly)
+    // refuse this write, permanently wedging the record at the old schema.
+    const std::string mismatch_hash(64, 'b');
+    yuzu::agent::guardian_persist_baseline_for_test(*f.kv, "r1", fp, mismatch_hash);
+
+    auto seeded = yuzu::agent::guardian_seed_baseline_for_test(*f.kv, "r1", fp);
+    REQUIRE(seeded.has_value());
+    CHECK(*seeded == mismatch_hash); // the write landed, not refused
+}
+
+TEST_CASE("arming a file-hash-equals rule wires the on_baseline capture callback",
+          "[guardian][engine][baseline]") {
+    // Gate 3 quality-engineer follow-up: distinct from
+    // last_file_expected_hash_for_test (which only proves the seed lookup
+    // ran) - this proves the CAPTURE callback was actually attached, since a
+    // seeded rule never re-enters the branch that would exercise it.
+    GuardianFixture f;
+    CHECK_FALSE(f.engine->last_file_on_baseline_wired_for_test()); // nothing armed yet
+    f.engine->apply_rules(GuardianFixture::make_push({GuardianFixture::make_file_hash_rule("r1", "/tmp/x")},
+                                                     /*full_sync=*/true));
+    CHECK(f.engine->last_file_on_baseline_wired_for_test());
 }
 
 TEST_CASE("GuardianEngine: start_local on fresh KV reports zero rules",

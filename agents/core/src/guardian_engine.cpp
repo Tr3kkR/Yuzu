@@ -225,22 +225,36 @@ BaselineReadOutcome read_baseline_record(KvStore& kv, const std::string& rule_id
         return BaselineReadOutcome::ReadError;
     if (!raw->has_value())
         return BaselineReadOutcome::Absent;
+    // Gate 3 governance (cpp-safety): the try below now covers EVERY
+    // nlohmann::json call on this record, not just parse() - a well-formed
+    // JSON document with a wrong-typed field (e.g. "schema" as a string, or a
+    // top-level array, so .value<int>()/.value<string>() throws type_error)
+    // must degrade to Malformed like every other corrupt-record case, never
+    // escape as an uncaught exception. Before this fix such a record threw
+    // out of read_baseline_record entirely: on the seed side that escaped
+    // into apply_rules's push-application loop (degrading the WHOLE push,
+    // not just this rule); on the persist side it escaped out of a guard
+    // worker thread's on_baseline callback into FileGuard::run()'s own
+    // top-level catch, permanently stopping that one guard until the next
+    // full_sync/restart - both contradicting this function's own "never
+    // propagated as an arm failure" contract.
     nlohmann::json j;
     try {
         j = nlohmann::json::parse(**raw);
+        // Schema-version drift is a DISTINCT failure from a fingerprint
+        // mismatch (Gate 2 governance): a record from a future/incompatible
+        // schema must never be silently treated as "a different target,
+        // capture fresh" (which would recapture EVERY existing baseline
+        // fleet-wide, unlogged, the moment kBaselineSchemaVersion is ever
+        // bumped) - it needs its own migration path when one is written, not
+        // a silent reinterpretation as a retarget.
+        if (j.value("schema", -1) != kBaselineSchemaVersion)
+            return BaselineReadOutcome::Malformed;
+        out.fingerprint = j.value("fingerprint", std::string{});
+        out.hash = j.value("hash", std::string{});
     } catch (const nlohmann::json::exception&) {
         return BaselineReadOutcome::Malformed;
     }
-    // Schema-version drift is a DISTINCT failure from a fingerprint mismatch
-    // (Gate 2 governance): a record from a future/incompatible schema must
-    // never be silently treated as "a different target, capture fresh" (which
-    // would recapture EVERY existing baseline fleet-wide, unlogged, the moment
-    // kBaselineSchemaVersion is ever bumped) - it needs its own migration path
-    // when one is written, not a silent reinterpretation as a retarget.
-    if (j.value("schema", -1) != kBaselineSchemaVersion)
-        return BaselineReadOutcome::Malformed;
-    out.fingerprint = j.value("fingerprint", std::string{});
-    out.hash = j.value("hash", std::string{});
     if (!is_valid_baseline_hash(out.hash))
         return BaselineReadOutcome::Malformed;
     return BaselineReadOutcome::Ok;
@@ -1140,6 +1154,11 @@ std::string GuardianEngine::last_file_expected_hash_for_test() const {
     return last_file_expected_hash_for_test_;
 }
 
+bool GuardianEngine::last_file_on_baseline_wired_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_file_on_baseline_wired_for_test_;
+}
+
 std::uint64_t GuardianEngine::policy_generation() const {
     std::lock_guard lock(mtx_);
     return policy_generation_;
@@ -1333,6 +1352,13 @@ bool GuardianEngine::start_guard_for_rule_locked(const gpb::GuaranteedStateRule&
                                fp = baseline_fingerprint](const std::string& hash) {
                 guardian_persist_baseline(kv, rule_id, fp, hash);
             };
+            // Gate 3 quality-engineer follow-up: last_file_expected_hash_for_test_
+            // only proves the SEED lookup ran, not that the capture callback was
+            // actually attached — deleting the assignment above would leave every
+            // Linux test (which never runs a real FileGuard to observe the
+            // callback firing) green. This is set unconditionally right after the
+            // assignment so a test can assert it happened.
+            last_file_on_baseline_wired_for_test_ = true;
         } else {
             // file-exists: "absent" → drift when the file EXISTS; anything else
             // (default "present") → drift when the file is missing / has been deleted.

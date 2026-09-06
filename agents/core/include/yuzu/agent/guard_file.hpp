@@ -77,6 +77,23 @@ public:
         /// emit_guard_event's doc — applies here too); the production wiring
         /// (guardian_engine.cpp) captures only a raw KvStore* by value, never
         /// `this`/GuardianEngine&.
+        ///
+        /// Resource Ledger (Gate 3 governance, cpp-safety — recorded here since
+        /// this branch has no PR body yet): new callback context, a movable
+        /// value member (RAII, no manual cleanup). Owner: whichever
+        /// `FileGuard::Config` holds it, moved into the `FileGuard` ctor at
+        /// construction (guardian_engine.cpp's start_guard_for_rule_locked).
+        /// Acquired: assignment of the lambda at arm time. Released: `~FileGuard()`
+        /// -> `stop()` -> worker thread join (the callback, if mid-execution, has
+        /// always fully returned by the time the join completes, since it runs
+        /// synchronously inside the same worker's call stack — see run()).
+        /// Transfer: none beyond the initial move into the guard; no ownership
+        /// hand-off elsewhere. Captured resource: a BORROWED, non-owning
+        /// `KvStore*` (owner: `AgentImpl::kv_store_`, agent.cpp — declared before
+        /// `guardian_`, so it destructs AFTER every guard thread is joined via
+        /// `GuardianEngine::stop()`'s `stop_all_guards_locked()`, which runs
+        /// before either unique_ptr tears down). Failure cleanup: none needed —
+        /// nothing owned by the callback itself requires it.
         std::function<void(const std::string& hash)> on_baseline;
     };
 
