@@ -690,6 +690,7 @@ endif
 # ── TAR plugin unit tests ────────────────────────────────────────────────────
 tar_test_deps = [yuzu_agent_core_dep, yuzu_sdk_dep, nlohmann_dep, spdlog_dep, sqlite3_dep, catch2_dep]
 tar_test_cpp_args = []
+tar_test_objcpp_args = []
 if host_machine.system() == 'windows'
   # tar_perf.cpp (compiled directly into this exe) → GetIfTable2 / FreeMibTable
   tar_test_deps += cxx.find_library('iphlpapi')
@@ -730,6 +731,17 @@ elif host_machine.system() == 'darwin'
     # -fblocks required for the ES block literal in tar_proc_es.cpp (see plugin meson).
     tar_test_cpp_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
   endif
+  # Wave 6 PR6.3: test_tar_removable.cpp calls make_removable_cursor_source(), so
+  # this exe compiles the removable collector — which on darwin needs its
+  # DiskArbitration Objective-C++ TU and framework, exactly as the plugin does.
+  tar_test_deps += dependency('appleframeworks', modules: ['DiskArbitration', 'Foundation'],
+                              include_type: 'system')
+  tar_test_objcpp_args += apple_objcpp_args
+endif
+
+tar_test_removable_darwin_sources = []
+if host_machine.system() == 'darwin'
+  tar_test_removable_darwin_sources = files('../agents/plugins/tar/src/tar_removable_diskarb.mm')
 endif
 
 tar_test_exe = executable(
@@ -758,6 +770,7 @@ tar_test_exe = executable(
     'unit/test_tar_win_raii_guards.cpp', # Gate 3 remediation: injectable-closer RAII guard coverage (Windows-only body, empty TU elsewhere)
     'unit/test_tar_cursor.cpp',                  # Wave 6: cursor-source seam — lifecycle + persistence, atomic event+cursor commit, record_key dedupe, ack-by-sequence incl. the R-005 overflow regression (on-disk TarDb via unique_temp_path)
     'unit/test_tar_power.cpp',                   # Wave 6 PR6.2-b: pmset parser + exact-tail cursor/gap decisions, REAL-CAPTURE fixtures, RunFn-injected
+    'unit/test_tar_removable.cpp',               # Wave 6 PR6.3: event-log channel parsers + identity + per-channel cursors, REAL-CAPTURE fixtures
     'unit/test_fleet_snapshot.cpp',
     '../agents/plugins/tar/src/tar_db.cpp',
     # Wave 6: the cursor seam's factory AND lookback_seconds_or_forward_only,
@@ -787,13 +800,16 @@ tar_test_exe = executable(
     # Wave 6 PR6.2-b: test_tar_power.cpp drives mac_power_collect_impl with an
     # injected runner, so the real collector links into this exe.
     '../agents/plugins/tar/src/tar_power_collector.cpp',
-  ),
+    # Wave 6 PR6.3: the TU exercises the real CursorSource via the factory.
+    '../agents/plugins/tar/src/tar_removable_collector.cpp',
+  ) + tar_test_removable_darwin_sources,
   include_directories: [
     include_directories('../agents/plugins/tar/src'),
     include_directories('../agents/shared'),  # win_str.hpp — tar_module_etw.cpp is compiled into this test exe (#1681, relocated plugins/shared -> agents/shared)
     include_directories('../agents/core/src'),        # sync_source_app_perf.hpp — app_perf rollup-query integration test
   ],
   cpp_args: tar_test_cpp_args,
+  objcpp_args: tar_test_objcpp_args,
   dependencies: tar_test_deps,
 )
 test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)

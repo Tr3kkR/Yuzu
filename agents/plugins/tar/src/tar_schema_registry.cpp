@@ -1051,20 +1051,19 @@ const std::vector<CaptureSourceDef>& build_sources() {
             .default_enabled = true,
             .unique_key_column = "record_key",
             .os_support = {
-                {"windows", OsSupportStatus::kPlanned, "wevtapi",
+                {"windows", OsSupportStatus::kSupported, "wevtapi",
                  "EvtQuery over Microsoft-Windows-Partition/Diagnostic (+ "
                  "Kernel-PnP/Configuration, Storsvc/Diagnostic), channels "
                  "measured LIVE on the-rig 2026-09-04; the roadmap's "
                  "DriverFrameworks-UserMode channel is disabled by default "
-                 "and is NOT the binding (hardware-probe measurement, Wave 6). Collector "
-                 "lands wave 2."},
-                {"linux",   OsSupportStatus::kPlanned, "udev_netlink",
+                 "and is NOT the binding (hardware-probe measurement, Wave 6)."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "udev_netlink",
                  "udev netlink monitor (block subsystem, removable), "
-                 "cursor-model — collector lands wave 2."},
-                {"macos",   OsSupportStatus::kPlanned, "diskarbitration",
+                 "cursor-model."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "diskarbitration",
                  "DiskArbitration DADiskAppeared/Disappeared callbacks "
                  "(headers confirmed in the CLT SDK, hardware-probe measurement, Wave 6), "
-                 "cursor-model — collector lands wave 2."},
+                 "cursor-model."},
             },
             .granularities = {
                 {

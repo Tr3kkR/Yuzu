@@ -612,7 +612,7 @@ spec:
           pattern: "^[0-9]+$"
       removable_enabled:
         type: string
-        displayName: Removable Media Capture Enabled (collector not yet shipped)
+        displayName: Removable Media Capture Enabled
         description: >
           Enable or disable the removable-media attach/detach source
           (removable → $Removable_Live, cursor-model seam), including
@@ -632,14 +632,11 @@ spec:
           Treat it as co-determination-relevant and set
           removable_lookback_seconds=0 where a retrospective read of OS-retained
           removable history is not lawful.
-          **No collector is registered in this release.** The schema, this key
-          and its default ship now; the collector that fills $Removable_Live lands
-          in a following change, so the tables stay queryable and EMPTY until
-          then — an empty result means "not yet collecting", never "nothing
-          happened".
           The source WILL use the same durable log-position cursor model as
           power (see power_enabled) — a lost/invalid cursor will re-baseline
-          forward and record a capture_gap rather than replaying history. Set to "false"
+          forward and record a capture_gap rather than replaying history.
+          Queried via tar.sql only ($Removable_Live); the legacy tar.query /
+          tar.export actions do not surface removable. Set to "false"
           to opt out. Requires agent v0.12.0+; older agents silently ignore.
           Valid: "true" | "false".
         validation:

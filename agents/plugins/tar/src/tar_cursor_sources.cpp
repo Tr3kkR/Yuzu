@@ -30,6 +30,7 @@ std::int64_t lookback_seconds_or_forward_only(TarDatabase& db, const std::string
 std::vector<std::unique_ptr<CursorSource>> make_cursor_sources() {
     std::vector<std::unique_ptr<CursorSource>> sources;
     sources.push_back(make_power_cursor_source());
+    sources.push_back(make_removable_cursor_source());
     return sources;
 }
 
