@@ -3715,3 +3715,121 @@ TEST_CASE("REST gs.device-compliance: rule_names_for chunks the IN-list past 500
     }
     CHECK(resolved == 600);
 }
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4037 — per-guard fleet-wide agent-status drilldown
+// (GET /api/v1/guaranteed-state/rules/{rule_id}/status)
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST gs.rule-status: returns agent_id/state/updated_at for every reporting agent",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-one");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    CHECK(j["data"].size() == 2);
+    CHECK(j["pagination"]["total"].get<int>() == 2);
+    std::unordered_map<std::string, std::string> by_agent;
+    for (auto& row : j["data"])
+        by_agent[row["agent_id"].get<std::string>()] = row["state"].get<std::string>();
+    CHECK(by_agent["WS-1"] == "errored");
+    CHECK(by_agent["WS-2"] == "compliant");
+}
+
+TEST_CASE("REST gs.rule-status: unknown rule_id → 404 (not a store degrade)",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/no-such-rule/status",
+                          h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("REST gs.rule-status: an unwired list_read_fn fails closed (503)",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
+                    /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
+                    /*wire_list_read_fn=*/false);
+    h.seed_rule("r1", "rule-one");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("REST gs.rule-status: a service-scoped token is denied outright (same posture as "
+          "the fleet /status route)",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-one");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status",
+                          h.service_scoped_token_headers("printers"));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4037 — per-device all-guards view
+// (GET /api/v1/guaranteed-state/agents/{agent_id}/rules)
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST gs.device-all-guards: every guard's state for one device, unscoped to any "
+          "Baseline",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "guard-one");
+    h.seed_rule("r2", "guard-two");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r2", "guard.compliant", "2026-06-20T10:00:00Z");
+    // Different device — must NOT appear in WS-1's response.
+    h.seed_status("e3", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-1/rules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    CHECK(j["data"]["total_guards"].get<int>() == 2);
+    REQUIRE(j["data"]["guards"].is_array());
+    CHECK(j["data"]["guards"].size() == 2);
+    std::unordered_map<std::string, std::string> by_rule;
+    for (auto& g : j["data"]["guards"])
+        by_rule[g["rule_id"].get<std::string>()] = g["state"].get<std::string>();
+    CHECK(by_rule["r1"] == "errored");
+    CHECK(by_rule["r2"] == "compliant");
+}
+
+TEST_CASE("REST gs.device-all-guards: a device with no reported guards returns an empty list, "
+          "not an error",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/never-seen/rules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["total_guards"].get<int>() == 0);
+    CHECK(j["data"]["guards"].empty());
+}
+
+TEST_CASE("REST gs.device-all-guards: scoped_perm_fn denies the queried device → 403",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h;
+    h.deny_scoped_agent = "WS-9";
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-9/rules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_scoped_agent_id == "WS-9"); // scoped by the queried device
+}
+
+TEST_CASE("REST gs.device-all-guards: an unwired scoped_perm_fn fails closed (503)",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/false);
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-1/rules");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}

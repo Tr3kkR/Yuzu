@@ -65,7 +65,9 @@
 
 #include <algorithm>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -426,6 +428,14 @@ constexpr TwinRow kExpectedTwins[] = {
     {"mint_upload_grant", "UploadGrant", "Write", false},
     {"list_upload_grants", "UploadGrant", "Read", true},
     {"revoke_upload_grant", "UploadGrant", "Delete", false},
+    // #4037 — Guardian read twins (api-parity #2146 Batch A). Pinned against
+    // rest_api_v1.cpp's /api/v1/guaranteed-state/{status,rules,events,
+    // rules/{id}/status,agents/{id}/rules} routes.
+    {"get_guardian_status", "GuaranteedState", "Read", true},
+    {"list_guardian_rules", "GuaranteedState", "Read", true},
+    {"list_guardian_events", "GuaranteedState", "Read", true},
+    {"get_guardian_rule_status", "GuaranteedState", "Read", true},
+    {"get_guardian_device_guards", "GuaranteedState", "Read", true},
 };
 
 } // namespace
@@ -479,10 +489,20 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
         CHECK(schema_it->schema_json.find("\"type\":\"object\"") != std::string::npos);
         CHECK(schema_it->schema_json.find("\"properties\"") != std::string::npos);
         // A bare {"type":"object","properties":{}} with no further structure
-        // would be the free-form-object footgun the spec forbids for every
-        // tool that takes an argument at all — every one of these 11 takes
-        // at least one property.
-        CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
+        // would be the free-form-object footgun the spec forbids for any
+        // tool that DOES take an argument — the original 11 rows here all
+        // do. A tool that genuinely takes ZERO arguments (#4037's
+        // get_guardian_status/list_guardian_rules — the same "{}" shape
+        // get_guardian_schemas already uses, outside this array) is not a
+        // footgun; "{}" correctly documents "no arguments," it isn't a
+        // lazily-typed free-form object. Exempted explicitly so the check
+        // stays a real signal for every tool that DOES take arguments.
+        static const std::unordered_set<std::string_view> kNoArgTools = {
+            "get_guardian_status",
+            "list_guardian_rules",
+        };
+        if (!kNoArgTools.contains(expected.tool))
+            CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
     }
 }
 
