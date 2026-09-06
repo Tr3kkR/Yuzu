@@ -248,7 +248,8 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
     // assertion in the cursor-seam tests: the whole point of this case is that
     // one file states the enable posture for every source, so a source added
     // with the wrong default fails here rather than nowhere.
-    for (const auto* name : {"process", "tcp", "service", "user", "perf", "power", "removable"}) {
+    for (const auto* name : {"process", "tcp", "service", "user", "perf", "power", "removable",
+                             "usage"}) {  // usage: Wave 7 PR7.2, default-ON per the 2026-09-04 ruling
         INFO("always-on source=" << name);
         CHECK(source_default_enabled(name));
     }

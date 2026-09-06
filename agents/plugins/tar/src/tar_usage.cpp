@@ -247,7 +247,8 @@ UsageFoldResult run_usage_fold(TarDatabase& db, int64_t now, int64_t max_events_
 
     std::set<std::pair<int64_t, std::string>> touched_days; // (day_ts, exe_key)
     for (const auto& c : closed) {
-        const int64_t day_ts = (c.start_ts / 86400) * 86400;
+        // Same floor-toward-negative-infinity bucketing as fold_daily() (review M2: keep usage_daily_user on the same day as usage_daily).
+        const int64_t day_ts = (c.start_ts >= 0) ? (c.start_ts / 86400) * 86400 : -(((-c.start_ts) + 86399) / 86400) * 86400;
         stmts.push_back(std::format(
             "INSERT OR IGNORE INTO usage_daily_user (day_ts, exe_key, user) VALUES ({}, {}, {})",
             day_ts, sql_str(c.exe_key), sql_str(c.user)));
