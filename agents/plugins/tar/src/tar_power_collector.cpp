@@ -229,7 +229,20 @@ CursorCollectResult mac_power_collect_impl(TarDatabase& db,
     }
     auto new_cursor_json = encode_mac_power_cursor(decision.new_cursor);
 
-    if (!db.insert_power_events_and_cursor(events, new_cursor_json)) {
+    if (auto ins = db.insert_power_events_and_cursor(events, new_cursor_json); !ins) {
+        // A KeyCollision is PERMANENT (tar_db.hpp): the source re-derives the
+        // same batch every tick and the store refuses it every tick, so
+        // retrying is not recovery -- it is a silent wedge with a repeating log
+        // line. It means this source has violated rule 3(a) by persisting a
+        // field that is not deterministically re-derivable, which is a bug
+        // here, not a condition to wait out. Say so distinctly and loudly
+        // rather than dressing it up as a transient.
+        if (ins.error() == TarDatabase::CursorInsertError::KeyCollision) {
+            spdlog::critical("TAR: power record_key COLLISION -- this source persisted a field "
+                             "that is not deterministically re-derivable (rule 3a). Capture is "
+                             "STUCK and retrying cannot clear it.");
+            throw IncompleteCaptureError("TAR: power insert refused: record_key collision");
+        }
         // Nothing committed -- the persisted cursor is unchanged, so a retry
         // next tick re-reads from the same position (rule 1).
         spdlog::error("TAR: power snapshot incomplete (insert_power_events_and_cursor failed) -- "
@@ -253,7 +266,7 @@ class MacPowerCursorSource : public CursorSource {
 public:
     explicit MacPowerCursorSource(RunSubprocessFn run) : run_(std::move(run)) {}
 
-    [[nodiscard]] std::string name() const override { return "power"; }
+    [[nodiscard]] std::string name() const noexcept override { return "power"; }
 
     // Pure-replay source (tar_cursor.hpp: "A no-op for a pure-replay source
     // that only reads a log on collect()") -- there is no live subscription
@@ -326,7 +339,7 @@ public:
     // callback targeting a freed `this`.
     ~WindowsPowerCursorSource() override { stop(); }
 
-    [[nodiscard]] std::string name() const override { return "power"; }
+    [[nodiscard]] std::string name() const noexcept override { return "power"; }
 
     void start(TarDatabase& db) override {
         // R-002: seed the disabled-window guard from the PERSISTED config on
@@ -537,7 +550,20 @@ public:
         auto new_cursor_json =
             encode_subscription_ac_cursor("subscribed_since_ms", subscribed_since_ms, last_ac);
 
-        if (!db.insert_power_events_and_cursor(events, new_cursor_json)) {
+        if (auto ins = db.insert_power_events_and_cursor(events, new_cursor_json); !ins) {
+        // A KeyCollision is PERMANENT (tar_db.hpp): the source re-derives the
+        // same batch every tick and the store refuses it every tick, so
+        // retrying is not recovery -- it is a silent wedge with a repeating log
+        // line. It means this source has violated rule 3(a) by persisting a
+        // field that is not deterministically re-derivable, which is a bug
+        // here, not a condition to wait out. Say so distinctly and loudly
+        // rather than dressing it up as a transient.
+            if (ins.error() == TarDatabase::CursorInsertError::KeyCollision) {
+                spdlog::critical("TAR: power record_key COLLISION -- this source persisted a "
+                                 "field that is not deterministically re-derivable (rule 3a). "
+                                 "Capture is STUCK and retrying cannot clear it.");
+                throw IncompleteCaptureError("TAR: power insert refused: record_key collision");
+            }
             spdlog::error("TAR: power snapshot incomplete (insert_power_events_and_cursor failed) "
                           "-- retrying next tick");
             throw IncompleteCaptureError("TAR: power insert failed");
@@ -704,7 +730,7 @@ class LinuxPowerCursorSource : public CursorSource {
 public:
     ~LinuxPowerCursorSource() override { stop(); } // R-007
 
-    [[nodiscard]] std::string name() const override { return "power"; }
+    [[nodiscard]] std::string name() const noexcept override { return "power"; }
 
     void start(TarDatabase& db) override {
         enabled_.store(source_enabled(db, name()), std::memory_order_release); // R-002
@@ -867,7 +893,20 @@ public:
         auto new_cursor_json =
             encode_subscription_ac_cursor("armed_since_ms", armed_since_ms, last_ac);
 
-        if (!db.insert_power_events_and_cursor(events, new_cursor_json)) {
+        if (auto ins = db.insert_power_events_and_cursor(events, new_cursor_json); !ins) {
+        // A KeyCollision is PERMANENT (tar_db.hpp): the source re-derives the
+        // same batch every tick and the store refuses it every tick, so
+        // retrying is not recovery -- it is a silent wedge with a repeating log
+        // line. It means this source has violated rule 3(a) by persisting a
+        // field that is not deterministically re-derivable, which is a bug
+        // here, not a condition to wait out. Say so distinctly and loudly
+        // rather than dressing it up as a transient.
+            if (ins.error() == TarDatabase::CursorInsertError::KeyCollision) {
+                spdlog::critical("TAR: power record_key COLLISION -- this source persisted a "
+                                 "field that is not deterministically re-derivable (rule 3a). "
+                                 "Capture is STUCK and retrying cannot clear it.");
+                throw IncompleteCaptureError("TAR: power insert refused: record_key collision");
+            }
             spdlog::error("TAR: power snapshot incomplete (insert_power_events_and_cursor failed) "
                           "-- retrying next tick");
             throw IncompleteCaptureError("TAR: power insert failed");
@@ -1030,7 +1069,7 @@ namespace {
 
 class NullPowerCursorSource : public CursorSource {
 public:
-    [[nodiscard]] std::string name() const override { return "power"; }
+    [[nodiscard]] std::string name() const noexcept override { return "power"; }
     void start(TarDatabase&) override {}
     void stop() noexcept override {}
     void on_enabled_changed(bool) override {}
