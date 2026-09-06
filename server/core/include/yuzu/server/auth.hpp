@@ -911,10 +911,14 @@ private:
     /// ALSO evicted, mirroring remove_user()'s own eviction: a removal made
     /// through a DIFFERENT AuthManager never touches this process's map, so
     /// without this a removed principal stays "active, role R" forever in
-    /// cache-only readers like get_user_role() - reachable via a still-valid
+    /// any consumer of that stale `users_` entry - reachable via a still-valid
     /// API token, since remove_user() only wipes sessions, never tokens.
-    /// `context` is the log-message prefix ("Auth failed" / "verify_password
-    /// failed") so both callers keep their existing distinct wording. Caller
+    /// (get_user_role() itself is no longer such a consumer - a later fix
+    /// made it AuthDB-authoritative on every call, independent of this
+    /// eviction entirely; this comment's original wording named it as the
+    /// example before that fix landed.) `context` is the log-message prefix
+    /// ("Auth failed" / "verify_password failed") so both callers keep their
+    /// existing distinct wording. Caller
     /// must NOT hold `mu_`.
     [[nodiscard]] std::optional<Role>
     recheck_role_after_credential_check(const std::string& username, Role pre_check_role,

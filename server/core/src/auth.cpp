@@ -1773,7 +1773,21 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
     // not a bare TTL.
     if (auth_db_) {
         auto db_user = auth_db_->get_user(username);
-        return db_user ? std::optional{db_user->role} : std::nullopt;
+        if (!db_user) {
+            // Gate 3 re-review follow-up (cpp-expert + authdb, converged): log
+            // a genuine store error distinctly from a plain not-found, so a PG
+            // outage that silently floors every legacy-token session to
+            // Role::user (auth_routes.cpp's `.value_or(Role::user)`) leaves an
+            // operational trail instead of zero diagnostic signal - mirrors
+            // find_user_or_hydrate's own UserNotFound-vs-DbError split in this
+            // same file.
+            if (db_user.error() != yuzu::server::AuthDBError::UserNotFound)
+                spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
+                             "a genuine miss) - returning nullopt",
+                             username);
+            return std::nullopt;
+        }
+        return db_user->role;
     }
     std::shared_lock lock(mu_);
     auto it = users_.find(username);
