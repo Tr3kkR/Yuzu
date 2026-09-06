@@ -315,7 +315,7 @@ DeleteResult walk_delete(typename Ops::DirHandle root, Ops& ops, const MatchFn& 
                 if (needs_real_match) {
                     bool matched = false;
                     try {
-                        matched = match(rel_path);
+                        matched = match(rel_path, dir_entry.meta);
                     } catch (...) {
                         result.stop_reason = Reason::MatchError;
                         stopped = true;

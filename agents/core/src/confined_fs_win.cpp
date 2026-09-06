@@ -597,8 +597,12 @@ EnumerateResult enumerate_at(HANDLE dir, [[maybe_unused]] const FileIdentity& ro
                 else
                     type = EntryType::RegularFile;
 
+                // LastWriteTime is in the SAME FILE_FULL_DIR_INFO record as the
+                // EndOfFile already read -- no extra call, and the enumeration
+                // itself is handle-relative.
                 de.meta = EntryMeta{type, static_cast<std::uint64_t>(entry->EndOfFile.QuadPart),
-                                     /*same_device_as_root=*/true};
+                                     /*same_device_as_root=*/true,
+                                     filetime_to_unix_seconds(entry->LastWriteTime.QuadPart)};
                 de.stat_error = 0;
                 result.entries.push_back(std::move(de));
             }

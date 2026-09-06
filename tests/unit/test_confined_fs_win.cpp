@@ -25,6 +25,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <limits>
+#include <map>
 
 #include <algorithm>
 #include <chrono>
@@ -111,7 +112,7 @@ struct JunctionCleanup {
     ~JunctionCleanup() { RemoveDirectoryW(path.c_str()); }
 };
 
-MatchFn always_match = [](std::string_view) { return true; };
+MatchFn always_match = [](std::string_view, const EntryMeta&) { return true; };
 
 DeleteLimits open_limits() {
     return DeleteLimits{/*max_entries=*/1000, /*max_bytes=*/1'000'000,
@@ -292,7 +293,7 @@ TEST_CASE("delete_matching honours a non-default entry cap", "[confined_fs]") {
 
     DeleteLimits limits = open_limits();
     limits.max_entries = 3;
-    DeleteResult result = delete_matching(*opened.root, [](std::string_view) { return true; },
+    DeleteResult result = delete_matching(*opened.root, [](std::string_view, const EntryMeta&) { return true; },
                                           limits);
 
     CHECK(result.stop_reason == Reason::EntryCap);
@@ -311,7 +312,7 @@ TEST_CASE("delete_matching happy path deletes matched files with exact sorted ou
     OpenRootResult opened = open_root(root_dir.path);
     REQUIRE(opened.root.has_value());
 
-    MatchFn match_txt = [](std::string_view p) { return p.ends_with(".txt"); };
+    MatchFn match_txt = [](std::string_view p, const EntryMeta&) { return p.ends_with(".txt"); };
     DeleteResult result = delete_matching(*opened.root, match_txt, open_limits());
 
     REQUIRE(result.stop_reason == Reason::None);
@@ -449,14 +450,14 @@ TEST_CASE("delete_matching can run twice against the same ConfinedRoot (root reu
     OpenRootResult opened = open_root(root_dir.path);
     REQUIRE(opened.root.has_value());
 
-    MatchFn match_a = [](std::string_view p) { return p == "a.txt"; };
+    MatchFn match_a = [](std::string_view p, const EntryMeta&) { return p == "a.txt"; };
     DeleteResult first = delete_matching(*opened.root, match_a, open_limits());
     CHECK(first.stop_reason == Reason::None);
     REQUIRE(first.entries.size() == 1);
     CHECK(first.entries[0].status == EntryStatus::Deleted);
     CHECK_FALSE(std::filesystem::exists(root_dir.path / "a.txt"));
 
-    MatchFn match_b = [](std::string_view p) { return p == "b.txt"; };
+    MatchFn match_b = [](std::string_view p, const EntryMeta&) { return p == "b.txt"; };
     DeleteResult second = delete_matching(*opened.root, match_b, open_limits());
     CHECK(second.stop_reason == Reason::None);
     REQUIRE(second.entries.size() == 1);
@@ -580,6 +581,75 @@ TEST_CASE("Unsupported fail-closed path via the ntdll injection seam deletes not
     CHECK(result.entries[0].status == EntryStatus::Failed);
     CHECK(result.entries[0].reason == Reason::Unsupported);
     CHECK(std::filesystem::exists(root_dir.path / "a.txt"));
+}
+
+
+// ── Windows end-to-end: the real enumerator's LastWriteTime ─────────────────
+//
+// Gate 1 (Codex FV-3, Kimi F3): the pure FILETIME conversion is exhaustively
+// tested, but nothing observed the value the ACTUAL enumerator supplies.
+// Reverting the assignment in confined_fs_win.cpp to drop the timestamp left
+// every Windows assertion green — and that TU does not compile on the macOS
+// dev host at all, so this case is also the only thing that will exercise the
+// wiring before it reaches production.
+//
+// This runs on the CI Windows leg. It sets an exact whole-second FILETIME with
+// SetFileTime, reads it back through the held root handle, and then lets an age
+// policy decide what is unlinked.
+TEST_CASE("Windows enumeration supplies LastWriteTime and age can select on it",
+          "[confined_fs][mtime]") {
+    yuzu::test::TempDir tmp{"yuzu_test_confined_win_mtime_"};
+    std::filesystem::create_directories(tmp.path);
+    write_file(tmp.path / "old.tmp", "old");
+    write_file(tmp.path / "new.tmp", "new");
+
+    // Whole-second Unix instants, converted to FILETIME ticks with the inverse
+    // of the arithmetic under test — written out longhand here deliberately, so
+    // this case cannot pass by sharing a bug with filetime_to_unix_seconds.
+    constexpr std::int64_t kTicksPerSecond = 10'000'000;
+    constexpr std::int64_t kEpochDeltaSeconds = 11'644'473'600;
+    constexpr std::int64_t kOldSeconds = 946'684'800;   // 2000-01-01T00:00:00Z
+    constexpr std::int64_t kNewSeconds = 1'893'456'000; // 2030-01-01T00:00:00Z
+    auto set_mtime = [](const std::filesystem::path& p, std::int64_t unix_seconds) {
+        const std::int64_t ticks = (unix_seconds + kEpochDeltaSeconds) * kTicksPerSecond;
+        FILETIME ft;
+        ft.dwLowDateTime = static_cast<DWORD>(ticks & 0xFFFFFFFFULL);
+        ft.dwHighDateTime = static_cast<DWORD>(static_cast<std::uint64_t>(ticks) >> 32);
+        // Adopted immediately into the file's own RAII owner rather than
+        // closed by hand: a REQUIRE between acquisition and CloseHandle would
+        // unwind past the manual close and leak the HANDLE.
+        WinHandle owned{::CreateFileW(p.wstring().c_str(), FILE_WRITE_ATTRIBUTES,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                                      FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
+        REQUIRE(owned.get() != INVALID_HANDLE_VALUE);
+        REQUIRE(::SetFileTime(owned.get(), nullptr, nullptr, &ft));
+    };
+    set_mtime(tmp.path / "old.tmp", kOldSeconds);
+    set_mtime(tmp.path / "new.tmp", kNewSeconds);
+
+    OpenRootResult opened = open_root(tmp.path);
+    REQUIRE(opened.root.has_value());
+
+    // 1. The enumerator reports the real values.
+    const EnumBudget budget{1000, std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+    EnumerateResult enumerated =
+        enumerate_at(opened.root->h_.get(), opened.root->identity(), budget);
+    REQUIRE(enumerated.reason == Reason::None);
+    std::map<std::string, std::optional<std::int64_t>> by_name;
+    for (const auto& e : enumerated.entries) by_name[e.name] = e.meta.mtime;
+    CHECK(by_name["old.tmp"] == std::optional<std::int64_t>{kOldSeconds});
+    CHECK(by_name["new.tmp"] == std::optional<std::int64_t>{kNewSeconds});
+
+    // 2. And an age policy over them selects correctly end-to-end.
+    constexpr std::int64_t kCutoff = 1'500'000'000;
+    MatchFn older_than_cutoff = [](std::string_view, const EntryMeta& meta) {
+        if (!meta.mtime) return false;
+        return *meta.mtime < kCutoff;
+    };
+    DeleteResult result = delete_matching(*opened.root, older_than_cutoff, open_limits());
+    REQUIRE(result.stop_reason == Reason::None);
+    CHECK_FALSE(std::filesystem::exists(tmp.path / "old.tmp"));
+    CHECK(std::filesystem::exists(tmp.path / "new.tmp"));
 }
 
 #endif // _WIN32

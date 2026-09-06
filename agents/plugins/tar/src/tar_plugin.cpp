@@ -22,6 +22,7 @@
 
 #include "tar_capture_status.hpp" // yuzu::tar::collect_or_retain
 #include "tar_collectors.hpp"
+#include "tar_cursor.hpp" // yuzu::tar::CursorSource, make_cursor_sources
 #include "tar_netqual_nstat.hpp"
 #include "tar_proc_etw.hpp"
 #include "tar_proc_es.hpp"
@@ -918,6 +919,63 @@ public:
             }
         }
 
+        // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
+        // Built once here as TarPlugin-owned members (P-002 — never a
+        // function-local static); make_cursor_sources() returns an empty
+        // vector this wave, so this loop is a no-op until wave 2's
+        // integrator adds the two push_backs. start()ed unconditionally
+        // (like proc_stream_/nstat_client_ above) so an operator flipping
+        // `<name>_enabled` later has a live subscription to resume against —
+        // the `<name>_enabled` gate itself is applied in collect_slow_impl's
+        // per-source region, not here.
+        cursor_sources_ = yuzu::tar::make_cursor_sources();
+        // A consumer's factory returning a null entry would be dereferenced
+        // unguarded at four sites; drop them once, here, rather than checking
+        // at each. (cpp-safety, Gate 3.)
+        std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
+        // start() is not noexcept in the CursorSource contract, and this runs
+        // inside init(): an escaping exception would cross the plugin C-ABI.
+        // One source failing to arm its subscription must not take the whole
+        // TAR plugin down with it -- the mapdrive block above guards the same
+        // hazard for the same reason.
+        for (auto& src : cursor_sources_) {
+            try {
+                src->start(*db_);
+                // A source is constructed CAPTURING. start() arms the OS
+                // subscription regardless of the configured enable state --
+                // deliberately, so a later enable does not have to pay a cold
+                // arm -- so a source whose persisted state is DISABLED must be
+                // told so immediately, before the first callback can arrive.
+                // Without this, an agent restarted while the source is disabled
+                // buffers the forbidden window (macOS queues callbacks, Linux's
+                // netlink socket fills) and commits it on the first later
+                // enable: on_enabled_changed(true) is a no-op because the fresh
+                // process never saw a disable. tar_cursor.hpp's lifecycle rule
+                // is absolute -- NOTHING from a paused window is ever stored --
+                // and the disabled-collect path only skips the tick, it does
+                // not discard what the OS already handed the source.
+                if (!source_enabled(*db_, src->name()))
+                    src->on_enabled_changed(false);
+            } catch (const std::exception& e) {
+                spdlog::error("TAR: cursor source '{}' failed to start: {} -- dropping it",
+                              src->name(), e.what());
+                src.reset();
+            } catch (...) {
+                spdlog::error("TAR: cursor source '{}' failed to start (unknown exception) -- "
+                              "dropping it",
+                              src->name());
+                src.reset();
+            }
+        }
+        // A source whose start() threw has NO armed subscription, so leaving it
+        // in the vector meant collect() ran against it every tick and returned
+        // an ordinary Advanced/0-events result -- a dead source reporting
+        // health, which is worse than an absent one. It also never received the
+        // on_enabled_changed(false) that the block above argues must land
+        // before the first callback can arrive, because that call is inside the
+        // same try. Found by both the architect and cpp-safety.
+        std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
+
         spdlog::info("TAR plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
                      slow_interval, db_path.string());
         return {};
@@ -963,6 +1021,14 @@ public:
                 // nstat_client_ under collect_mu_ (collect_fast_impl).
                 nstat_client_->stop();
             }
+            // Cursor-model sources (tar_cursor.hpp): every source's stop() is
+            // a bounded unregister/drain/join of everything it owns — called
+            // here, under collect_mu_, BEFORE db_.reset() below, exactly the
+            // proc_stream_/module_stream_/nstat_client_ ordering above. A
+            // source's stop() contract forbids it from touching db_ (or
+            // taking collect_mu_ itself) once this returns.
+            for (auto& src : cursor_sources_)
+                src->stop();
         }
         db_.reset();
         spdlog::info("TAR plugin shut down");
@@ -1111,6 +1177,14 @@ private:
     // every already-open tcp connection as newly "connected" (see the tcp
     // block's self-heal comment). Guarded by collect_mu_.
     bool nstat_tcp_primary_prev_{false};
+
+    // Cursor-model sources (tar_cursor.hpp: power, removable — wave 2). Built
+    // once in init() from make_cursor_sources() (empty this wave); NOT a
+    // function-local static (P-002) — these are TarPlugin-owned members with
+    // the same lifetime discipline as proc_stream_/module_stream_/
+    // nstat_client_ above: start()ed at init, stop()ped under collect_mu_
+    // in shutdown() BEFORE db_.reset() (see shutdown()).
+    std::vector<std::unique_ptr<yuzu::tar::CursorSource>> cursor_sources_;
 
     // ── collect_fast: processes + network ─────────────────────────────────────
     // Unlocked implementation -- caller must hold collect_mu_
@@ -2045,6 +2119,131 @@ private:
             }
         }
 
+        // ── Cursor-model sources (tar_cursor.hpp: power, removable — wave 2) ──
+        // Generic driver over every constructed cursor source -- empty this
+        // wave (make_cursor_sources() returns {}), so this loop is a no-op
+        // until the wave-2 integrator adds the two push_backs; nothing else
+        // in tar_plugin.cpp needs to change when it does. Honours
+        // `<name>_enabled` the same way every other source above does
+        // (registry default via source_enabled -- power/removable default
+        // TRUE per the Alex ruling, tar_schema_registry.cpp).
+        for (auto& src : cursor_sources_) {
+            const std::string src_name = src->name();
+            if (!source_enabled(*db_, src_name)) {
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusSourceDisabled));
+                continue;
+            }
+            auto cursor_read = db_->get_cursor(src_name);
+            if (!cursor_read) {
+                // The cursor could not be READ. That is a transient failure of
+                // the store, not evidence about this source, so rule 1 applies:
+                // retain the cursor exactly as last written and skip the tick.
+                // Passing nullopt through would tell the source it had never
+                // run, and it would re-baseline forward -- skipping everything
+                // between the durable cursor and now, with no capture_gap.
+                spdlog::warn("TAR: {} cursor read failed ({}) -- retaining cursor, skipping tick",
+                            src_name, cursor_read.error());
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+                continue;
+            }
+            const auto& cursor = *cursor_read;
+            try {
+                // The source persists its own events+cursor atomically via
+                // insert_power_events_and_cursor / insert_removable_events_
+                // and_cursor (tar_db.hpp) from inside collect() -- this
+                // driver only orchestrates the enable gate, cursor load, the
+                // transient-failure skip (rule 1), and the status line.
+                auto result = src->collect(*db_, cursor);
+                total_events += static_cast<int>(result.events_emitted);
+                std::string_view token;
+                switch (result.outcome) {
+                case yuzu::tar::CursorOutcome::Baseline:
+                    token = yuzu::tar::kCollectStatusBaseline;
+                    break;
+                case yuzu::tar::CursorOutcome::Advanced:
+                    token = yuzu::tar::kCollectStatusCursorAdvanced;
+                    break;
+                case yuzu::tar::CursorOutcome::CursorLost:
+                    token = yuzu::tar::kCollectStatusCursorLost;
+                    break;
+                }
+                // S1: a heartbeat an operator can alert on. `live_rows == 0` is
+                // ambiguous -- a healthy quiet source and a wedged one look the
+                // same -- so record WHEN this source last completed a tick.
+                // Staleness relative to slow_interval is then an expressible
+                // alert, which absence never was.
+                db_->set_config(std::string(src_name) + "_last_collect_ts",
+                                std::to_string(now_epoch_seconds()));
+                ctx.write_output(std::format("tar|collect_{}|{}|{}", src_name,
+                                             result.events_emitted, token));
+            } catch (const yuzu::tar::IncompleteCaptureError& e) {
+                // Rule 1: a transient read failure. The source must not have
+                // persisted anything on this path, so the cursor stays
+                // exactly as last written -- skip this tick's status/persist
+                // entirely, same collect_or_retain skip-and-retain contract
+                // as service/mapdrive above (tar_capture_status.hpp:187).
+                spdlog::warn("TAR: {} cursor collect incomplete ({}) -- retaining cursor",
+                            src_name, e.what());
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+            } catch (const std::exception& e) {
+                // ABI containment. The SDK's execute trampoline
+                // (sdk/include/yuzu/plugin.hpp) is an extern "C" boundary with
+                // no try/catch of its own, so ANY exception that escapes here
+                // crosses it and std::terminate()s the whole agent -- and TAR
+                // is in-process and default-on, so that is the agent, not just
+                // this plugin. A collector is REQUIRED to map its failures to
+                // IncompleteCaptureError or CursorLost (tar_cursor.hpp rules 1
+                // and 2), but rule 2 names "the cursor JSON fails to parse" as
+                // a first-class outcome and nlohmann::json throws by default,
+                // so the single most likely consumer mistake is exactly the one
+                // that would take the process down. Contain it and lose the
+                // tick instead. Same reasoning as start()'s guard above and the
+                // dns/netqual pre-collection stage's catch (...).
+                spdlog::error("TAR: {} cursor collect threw ({}) -- source skipped this tick; "
+                              "a CursorSource must map failures to IncompleteCaptureError or "
+                              "CursorOutcome::CursorLost, never throw",
+                              src_name, e.what());
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+            } catch (...) {
+                spdlog::error("TAR: {} cursor collect threw a non-std exception -- source "
+                              "skipped this tick", src_name);
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                // Say so on the collect stream too. do_collect_slow passes
+                // nullptr for skipped_sources, so without this line the source
+                // is simply ABSENT from the output -- indistinguishable from a
+                // healthy source with nothing to report, while status still
+                // shows it enabled with a frozen row count.
+                ctx.write_output(std::format("tar|collect_{}|0|{}", src_name,
+                                             yuzu::tar::kCollectStatusCaptureIncomplete));
+            }
+        }
+
         // Legacy purge removed — retention is now handled by run_retention() in rollup action
 
         ctx.write_output(std::format("tar|collect_slow|{}|events_recorded", total_events));
@@ -2846,6 +3045,8 @@ private:
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
         auto netconn_lookback = params.get("netconn_lookback_seconds");
+        auto power_lookback = params.get("power_lookback_seconds");
+        auto removable_lookback = params.get("removable_lookback_seconds");
         auto redaction = params.get("redaction_patterns");
 
         bool changed = false;
@@ -2862,6 +3063,15 @@ private:
         // fat-fingered bound; a non-numeric value is rejected.
         int64_t netconn_lookback_secs = 0;
         bool netconn_lookback_provided = false;
+        // The same forward-only privacy control for the two cursor sources. The
+        // manual and the SOC 2 data inventory both present `0` as the works-council
+        // lawfulness lever, so the key has to be REACHABLE: do_configure enumerates
+        // a fixed key set and silently ignores anything outside it, which would have
+        // made a documented control inert.
+        int64_t power_lookback_secs = 0;
+        bool power_lookback_provided = false;
+        int64_t removable_lookback_secs = 0;
+        bool removable_lookback_provided = false;
 
         // M13 contract: validate EVERY parameter in the request in PHASE 1 and
         // only persist them in PHASE 2 once all pass. A request that mixes a
@@ -2934,6 +3144,35 @@ private:
             }
             // Clamp rather than reject an out-of-range bound (see the field decl).
             netconn_lookback_secs = yuzu::tar::nq_clamp_lookback(netconn_lookback_secs);
+        }
+
+        struct LookbackSpec {
+            const char* key;
+            std::string_view raw;
+            int64_t* out;
+            bool* provided;
+        };
+        LookbackSpec power_lookback_spec{"power_lookback_seconds", power_lookback,
+                                         &power_lookback_secs, &power_lookback_provided};
+        LookbackSpec removable_lookback_spec{"removable_lookback_seconds", removable_lookback,
+                                             &removable_lookback_secs,
+                                             &removable_lookback_provided};
+        for (auto* spec : {&power_lookback_spec, &removable_lookback_spec}) {
+            if (spec->raw.empty())
+                continue;
+            *spec->provided = true;
+            bool parsed = false;
+            try {
+                *spec->out = std::stoll(std::string{spec->raw});
+                parsed = true;
+            } catch (...) {}
+            if (!parsed) {
+                ctx.write_output(std::format("error|{} must be an integer 0-7776000 "
+                                             "(0 = forward-only, no pre-enablement read)",
+                                             spec->key));
+                return 1;
+            }
+            *spec->out = yuzu::tar::nq_clamp_lookback(*spec->out);
         }
 
         // Cross-field validation BEFORE any writes
@@ -3101,6 +3340,17 @@ private:
                 std::format("config|netconn_lookback_seconds|{}", netconn_lookback_secs));
             changed = true;
         }
+        if (power_lookback_provided) {
+            db_->set_config("power_lookback_seconds", std::to_string(power_lookback_secs));
+            ctx.write_output(std::format("config|power_lookback_seconds|{}", power_lookback_secs));
+            changed = true;
+        }
+        if (removable_lookback_provided) {
+            db_->set_config("removable_lookback_seconds", std::to_string(removable_lookback_secs));
+            ctx.write_output(
+                std::format("config|removable_lookback_seconds|{}", removable_lookback_secs));
+            changed = true;
+        }
         if (have_redaction) {
             db_->set_config("redaction_patterns", std::string{redaction});
             ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
@@ -3155,6 +3405,23 @@ private:
                 // loss would be unobservable).
                 const bool tcp_prev_enabled =
                     (src_name == "tcp") ? source_enabled(*db_, "tcp") : false;
+                // Same capture-before-apply for cursor sources (see the routing
+                // block below): read the prior state while it is still prior.
+                //
+                // Canonicalised the way apply_source_enabled_transition itself
+                // does it, NOT via source_enabled(). The two disagree on a
+                // corrupt value: source_enabled() fails closed, so "errored"
+                // reads as NOT enabled, while the transition's disable leg fires
+                // on any non-"false" prev -- errored included. Deriving the edge
+                // from the collect-time gate therefore made
+                // `<name>_enabled=false` over a tampered value write paused_at
+                // while routing NO on_enabled_changed(false), so the source
+                // never drained and discarded the paused window and committed it
+                // on the next enable. The forensic-pause contract is exactly
+                // what that breaks, so the edge must be the transition's own.
+                const std::string_view cursor_prev_canon = yuzu::tar::canonical_source_enabled(
+                   db_->get_config(std::string(src_name) + "_enabled",
+                                   yuzu::tar::source_default_enabled(src_name) ? "true" : "false"));
                 transition_ok = yuzu::tar::apply_source_enabled_transition(*db_, src_name, v,
                                                                            now_epoch_seconds());
                 if (transition_ok && v == "false") {
@@ -3189,6 +3456,54 @@ private:
                     (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
                     pending_nstat_evs_.clear();
+                }
+                // Cursor-model sources (tar_cursor.hpp, P-002): forward the
+                // toggle to the matching source's on_enabled_changed(), under
+                // the same collect_mu_ a collection tick holds, so the
+                // transition is atomic w.r.t. an in-flight collect() -- same
+                // rationale as the #538 baseline-clear atomicity above. The
+                // source itself owns the disable-drain-discard /
+                // re-enable-rebaseline-and-gap contract (tar_cursor.hpp); this
+                // call site only routes the edge.
+                // Routed on an EDGE only. `cursor_prev_enabled` is captured before
+                // apply_source_enabled_transition() above, for the same reason the
+                // tcp/nstat drain is edge-gated (C1): an idempotent
+                // `<name>_enabled=true` re-assert is routine from desired-state
+                // reconciliation and is NOT a pause boundary. Routing it as one
+                // makes the source re-baseline forward and emit a capture_gap,
+                // silently discarding history it had not yet replayed -- the
+                // consumer cannot defend against this, because it cannot tell an
+                // edge from a re-assert.
+                // An EDGE is exactly what the transition treated as one.
+                const bool cursor_edge = (v == "false" && cursor_prev_canon != "false") ||
+                                         (v == "true" && cursor_prev_canon != "true");
+                if (transition_ok && cursor_edge) {
+                    for (auto& cs : cursor_sources_) {
+                        if (cs->name() == src_name) {
+                            // ABI containment, same reason as the collect loop:
+                            // on_enabled_changed() is declared noexcept-free and
+                            // the SDK execute trampoline is an extern "C"
+                            // boundary with no catch, so an escaping exception
+                            // here terminates the agent from a plain
+                            // configuration write. Losing the pause/resume
+                            // bookkeeping for one toggle is the strictly better
+                            // outcome, and it is logged loudly because a source
+                            // that throws here has an un-honoured P-002 contract.
+                            try {
+                                cs->on_enabled_changed(v == "true");
+                            } catch (const std::exception& e) {
+                                spdlog::error("TAR: {} on_enabled_changed threw ({}) -- the "
+                                              "source's pause/resume bookkeeping for this "
+                                              "toggle is not applied", src_name, e.what());
+                            } catch (...) {
+                                spdlog::error("TAR: {} on_enabled_changed threw a non-std "
+                                              "exception -- the source's pause/resume "
+                                              "bookkeeping for this toggle is not applied",
+                                              src_name);
+                            }
+                            break;
+                        }
+                    }
                 }
             }
             if (!transition_ok) {
