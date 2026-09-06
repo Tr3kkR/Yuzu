@@ -150,12 +150,13 @@ TEST_CASE("parse: unknown record kinds are skipped without error (forward-compat
 }
 
 TEST_CASE("parse: fields are UTF-8-scrubbed and §3.3-stripped", "[app_usage_ingest][parse]") {
-    std::string exe = "ch\rrome\n.ex\x1f"
-                      "e\xFF"
-                      "N"; // CR/LF/0x1F stripped, 0xFF scrubbed
+    std::string exe = "ch\rrome\n.exe\xFF"
+                      "N"; // CR/LF stripped (§3.3), 0xFF scrubbed to U+FFFD in place. 0x1F is the
+                           // FIELD separator and can never appear inside a field (the agent-side
+                           // clamp_field strips it), so it is not exercised here.
     AppUsageParse p = parse_app_usage_blob(rec({"lu", exe, "1699000000"}));
     REQUIRE(p.rows.size() == 1);
-    CHECK(p.rows[0].exe_key == "chrome.exeN\xEF\xBF\xBD");
+    CHECK(p.rows[0].exe_key == "chrome.exe\xEF\xBF\xBDN");  // U+FFFD replaces 0xFF in place, before the trailing N
 }
 
 TEST_CASE("parse: over the record cap drops the whole blob (no truncate-and-store)",
