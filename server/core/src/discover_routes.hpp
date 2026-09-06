@@ -105,6 +105,25 @@ DiscoveryDoc build_routes_catalog(const std::string& openapi_json);
 /// (static local) and cached.
 const DiscoveryDoc& scope_kinds_catalog();
 
+/// `/discover/plugin-docs`. Fully static, like `scope_kinds_catalog()`: the
+/// per-plugin documentation manifests `tools/plugin-doc-gen` generates from
+/// each `agents/plugins/<name>/README.md` (docs/plugin-readme-standard.md
+/// rule 10), embedded at build time as `kBundledPluginDocs`
+/// (bundled_content.cpp) and served verbatim — compiled-in content only,
+/// never fleet-derived, so it cannot become a prompt-injection channel. One
+/// builder, three surfaces: this REST route, the MCP resource
+/// `yuzu://plugin-docs` (byte-identical), and the per-plugin `docs` summary
+/// `build_plugins_catalog` joins into `/discover/plugins` / `discover_plugins`.
+/// A manifest that fails to parse is skipped with a warning and counted in
+/// `skipped_invalid` so the gap is visible rather than silent. Built once and
+/// cached; answers even when every store is down.
+const DiscoveryDoc& plugin_docs_catalog();
+
+/// The per-plugin summary `build_plugins_catalog` joins by plugin name, or
+/// `nullptr` when no manifest documents that plugin. Exposed for the join and
+/// its tests; the full manifest is `plugin_docs_catalog()`.
+const nlohmann::json* plugin_docs_summary(std::string_view plugin_name);
+
 /// One row per `yuzu::scope::CompOp` value, hand-maintained (C++ has no enum
 /// reflection). Shared by `build_routes_catalog`'s scope-kinds sibling
 /// (`scope_kinds_catalog`, which builds the "operators" array from this) AND

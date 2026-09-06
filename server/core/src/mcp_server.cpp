@@ -1449,7 +1449,7 @@ static const ToolDef kTools[] = {
      // and fixed; only actions[].parameter_schema is conditional (present
      // only when the action has a matching published InstructionDefinition),
      // typed generically for the same reason as discover_instructions above.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"docs":{"type":["object","null"],"description":"Build-embedded documentation summary {summary, platforms, readme, resource} when the plugin has adopted the README standard; null when it has not. The full manifest is the yuzu://plugin-docs resource.","properties":{"summary":{"type":"string"},"platforms":{"type":"object"},"readme":{"type":"string"},"resource":{"type":"string"}}},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","docs","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -2549,6 +2549,12 @@ static const ResourceDef kResources[] = {
     {"yuzu://scope-dsl", "Scope DSL Reference",
      "Scope-kind and comparison-operator catalog — same builder as GET "
      "/api/v1/discover/scope-kinds and the discover_scope_kinds tool",
+     "application/json"},
+    {"yuzu://plugin-docs", "Plugin Documentation Manifests",
+     "Per-plugin documentation as data — how each agent plugin works, on which OS, "
+     "what it needs and what it emits (generated from agents/plugins/<name>/README.md) — "
+     "same builder as GET /api/v1/discover/plugin-docs; discover_plugins carries a "
+     "per-plugin summary that points here",
      "application/json"},
 };
 
@@ -3914,6 +3920,30 @@ McpServer::HandlerFn McpServer::build_handler(
                 // Compiled-in — no store dependency, same builder as REST
                 // /api/v1/discover/scope-kinds and discover_scope_kinds.
                 const auto& doc = yuzu::server::scope_kinds_catalog();
+                JArr contents;
+                contents.add(
+                    JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));
+                res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
+                                "application/json");
+                return;
+            }
+            if (uri == "yuzu://plugin-docs") {
+                // Plugin README standard (docs/plugin-readme-standard.md rule 10):
+                // the build-embedded per-plugin manifests, byte-identical to REST
+                // GET /api/v1/discover/plugin-docs — same static builder, same
+                // tier-then-perm order as yuzu://scope-dsl above. Compiled-in
+                // content only, never fleet-derived.
+                if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
+                                          yuzu::server::detail::make_correlation_id(),
+                                          kResourceTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                const auto& doc = yuzu::server::plugin_docs_catalog();
                 JArr contents;
                 contents.add(
                     JObj().add("uri", uri).add("mimeType", "application/json").add("text", doc.json));

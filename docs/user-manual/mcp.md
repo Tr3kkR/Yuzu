@@ -720,6 +720,7 @@ URI.
 | `yuzu://golden-prompts/enterprise-it-v1` | Enterprise IT Golden Prompts v1 | Versioned prompt/eval catalogue for enterprise incident workflows. | `Infrastructure:Read` |
 | `yuzu://openapi` | OpenAPI Specification | REST API v1 OpenAPI spec, raw -- byte-identical to `GET /api/v1/openapi.json`; `discover_routes` wraps the same source in a distinct routes-catalog projection, not this shape. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_routes`) |
 | `yuzu://scope-dsl` | Scope DSL Reference | Scope-kind and comparison-operator catalog -- same builder as `discover_scope_kinds` / `GET /api/v1/discover/scope-kinds`. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_scope_kinds`) |
+| `yuzu://plugin-docs` | Plugin Documentation Manifests | Per-plugin documentation as data -- how each agent plugin works, on which OS (support, rung, mechanism per action), what privileges it needs, its inputs and output columns with vocabularies, sample rows, caveats and source paths -- generated from `agents/plugins/<name>/README.md` (`docs/plugin-readme-standard.md`) and embedded at build time. Byte-identical to `GET /api/v1/discover/plugin-docs`; `discover_plugins` carries a per-plugin `docs` summary that points here. | `Infrastructure:Read` (tier- and RBAC-gated, matching `discover_plugins`) |
 
 ### Example: reading a resource
 
