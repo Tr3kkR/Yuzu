@@ -12,14 +12,17 @@
 ///     passes), the null/closed-store 503 degrade, and the two body-shape
 ///     400s (missing 'value', invalid JSON) all run WITHOUT Postgres — each
 ///     returns before the handler would dereference `deps.store`.
-///   - The CRUD round-trip, the audit-row shapes (including the two
-///     documented audit ASYMMETRIES this module preserves verbatim from the
-///     pre-extraction inline code: both GET routes are unaudited, and a
-///     POST /api/property-schemas failure is unaudited while PUT/DELETE
-///     property failures are not), and the GET-properties store-degrade
-///     503 (forced via a DROP TABLE, mirroring test_props_scope_authz.cpp's
-///     technique) are `[pg]`, gated behind YUZU_TEST_POSTGRES_DSN via a
-///     pre-migrated PgTestTemplate.
+///   - The CRUD round-trip, the audit-row shapes (including the AUDIT
+///     ASYMMETRIES this module preserves verbatim from the pre-extraction
+///     inline code — see custom_properties_routes.hpp's file header for the
+///     full per-route breakdown: both GET routes are unaudited; PUT audits
+///     its store-level failure/success but NOT its own body-validation
+///     400s; DELETE (no body-validation stage) audits both not_found and
+///     success; POST /api/property-schemas audits ONLY success, unaudited
+///     on both its body-validation 400s AND its store-level failure), and
+///     the GET-properties store-degrade 503 (forced via a DROP TABLE,
+///     mirroring test_props_scope_authz.cpp's technique) are `[pg]`, gated
+///     behind YUZU_TEST_POSTGRES_DSN via a pre-migrated PgTestTemplate.
 ///
 /// #3700 regression coverage: this file's gate-pinning TEST_CASEs are also
 /// the wiring-regression tripwire that used to live in
