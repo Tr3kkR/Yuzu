@@ -701,7 +701,15 @@ AuthManager::find_user_or_hydrate(const std::string& username) {
     // soft-deleted account stays a miss here.
     auto db_user = auth_db_->get_user(username);
     if (!db_user) {
-        if (db_user.error() == yuzu::server::AuthDBError::UserNotFound)
+        // Gate 2/4 re-review follow-up (security-guardian + authdb, converged
+        // independently): InvalidUsername (get_user()'s own input-validation
+        // rejection, #2755e3871) is NOT a store-health signal - it's a
+        // rejected-shape input, the same class as a plain miss from the
+        // caller's point of view. Routing it through the DbError branch below
+        // would log a real attack attempt as a false "AuthDB lookup failed",
+        // masking a genuine outage during exactly that attack.
+        if (db_user.error() == yuzu::server::AuthDBError::UserNotFound ||
+            db_user.error() == yuzu::server::AuthDBError::InvalidUsername)
             return std::unexpected(UserLookupMiss::NotFound);
         spdlog::error("AuthManager: AuthDB lookup for '{}' failed on a cold cache - failing "
                       "closed (no credential check)",
@@ -1781,7 +1789,14 @@ std::optional<Role> AuthManager::get_user_role(const std::string& username) cons
             // operational trail instead of zero diagnostic signal - mirrors
             // find_user_or_hydrate's own UserNotFound-vs-DbError split in this
             // same file.
-            if (db_user.error() != yuzu::server::AuthDBError::UserNotFound)
+            // Gate 2/4 re-review follow-up (security-guardian + authdb,
+            // converged): InvalidUsername (get_user()'s own input-validation
+            // rejection, #2755e3871) is a rejected-shape input, not a store
+            // health signal - bucket it with UserNotFound so a real attack
+            // attempt is never logged as a false store-error, masking a
+            // genuine outage during exactly that attack.
+            if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
+                db_user.error() != yuzu::server::AuthDBError::InvalidUsername)
                 spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
                              "a genuine miss) - returning nullopt",
                              username);

@@ -1077,14 +1077,20 @@ TEST_CASE("ScimRoutes: deprovision refused once an operator elevates the SCIM ac
 TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a COLD "
          "AuthManager cache (H2, 2026-07-08 review — fail-closed, not fail-open)",
          "[pg][scim][routes][deprov_role][cold_cache]") {
-    // H2: AuthManager::get_user_role only ever reads the in-memory `users_`
-    // cache, which nothing preloads at construction. A freshly-started
-    // process (modeled here by a SECOND AuthManager wired to the SAME
-    // AuthDB, whose cache has never seen this username) previously read
-    // back nullopt for a DB-elevated admin and treated that as "no
-    // elevation on file" — deactivating an admin an operator had promoted
-    // out of SCIM's ownership. The fix reads the role authoritatively from
-    // AuthDB (db_authoritative_role) instead.
+    // H2 (2026-07-08 review): AuthManager::get_user_role ONLY EVER read the
+    // in-memory `users_` cache at the time, which nothing preloads at
+    // construction. A freshly-started process (modeled here by a SECOND
+    // AuthManager wired to the SAME AuthDB, whose cache has never seen this
+    // username) previously read back nullopt for a DB-elevated admin and
+    // treated that as "no elevation on file" — deactivating an admin an
+    // operator had promoted out of SCIM's ownership. THIS test's fix
+    // (contemporaneous with H2) reads the role authoritatively from AuthDB
+    // via a dedicated helper (db_authoritative_role) at the specific
+    // deprovision-role-check call site. (get_user_role() ITSELF stayed
+    // cache-only until a much later, separate governance BLOCKING fix — see
+    // the NOTE a few lines below — so as of THIS test's own authoring date
+    // the description above was accurate; it is preserved for history, not
+    // because it's still true of the function today.)
     Fixture f;
     auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "cora"}})->body);
     auto id = created["id"].get<std::string>();
